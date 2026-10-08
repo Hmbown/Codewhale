@@ -1,10 +1,13 @@
 # Skills Manager
 
+In the terminal, `/skills` opens **Extensions → Skills**. Enter on a skill opens the dedicated manager, also available directly through `/skills manage`, for existing install, update, remove, and trust operations. `/skill <name>` still activates a skill, and the explicit inspection, remote, sync, and suggestion subcommands remain available.
+
+
 > 阅读简体中文版：[zh_hans/SKILLS.md](zh_hans/SKILLS.md)
 
 Skills are reusable `SKILL.md` instruction packs. Codewhale discovers them from
 several roots, but **only Codewhale-owned directories are writable**. The unified
-`/skills` manager is the interactive surface for audit and mutation; slash
+`/skills manage` manager is the interactive surface for audit and mutation; slash
 aliases share the same write path.
 
 For Claude Code plugin boundaries, see [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md).
@@ -40,6 +43,7 @@ and similar harness layouts.
 
 **Audit-only (not runtime-active)**
 
+- Flat `<workspace>/skills` is an audit candidate until `[skills] flat_workspace_root = true`; an explicit `skills_dir` can also select it.
 - `.codex/skills` appears in **compatible** audit scans so operators can see it.
   It does **not** join the runtime discovery set.
 
@@ -47,11 +51,23 @@ Configured `skills_dir` that is not one of the owned Codewhale roots stays
 read-only. Discovery and the manager can list it; mutations still target owned
 project/global roots only.
 
+Within each scope, the owned `.codewhale/skills` root wins name collisions.
+Project order is `.codewhale`, `.agents`, `.claude`, `.opencode`, `.cursor`, then
+an opted-in flat `skills` root. Global order is `.codewhale`, `.agents`, `.claude`,
+then legacy `.deepseek`. Project roots precede global roots. Shadowing warnings
+name both copies, so install and update select the owned copy in that scope.
+
+Every root inside the workspace — owned, compatible, or a configured
+`skills_dir` that resolves there — loads only once the workspace is trusted
+(`/trust on --save`). Until then discovery names the skipped directories in its
+warning, and the session's skills directory falls back to the global one.
+
 ## Slash commands
 
 | Command | Behavior |
 | --- | --- |
-| `/skills` | Opens the Skills Manager (owned-only scan, **no network**). |
+| `/skills` | Opens Extensions → Skills (owned-only scan, **no network**). |
+| `/skills manage` | Opens the dedicated Skills Manager for audit and mutation. |
 | `/skills <prefix>` | Text list filtered by name prefix. |
 | `/skills inspect` | Text discovery mode, searched directories, and source paths. |
 | `/skills --remote` | Explicit registry listing (network). |
@@ -76,11 +92,11 @@ Notes:
 - If the same name exists in both project and global owned roots, update /
   uninstall / trust require `--project` or `--global`.
 - If a name exists only under a compatible external root, writes are refused;
-  import it through `/skills` instead of editing harness directories.
+  import it through `/skills manage` instead of editing harness directories.
 
 ## Skills Manager (TUI)
 
-Default open path: type `/skills` and confirm. The surface is zero-network on
+Direct manager path: type `/skills manage` and confirm. The surface is zero-network on
 open (owned-only audit).
 
 | Key | Action |
@@ -120,7 +136,7 @@ Repository-maintenance and release-operator helpers (the `gh-*` skills and
 of the end-user starter pack and are never auto-installed; a catalog-matrix
 test pins that boundary. Shipping them as an optional bundle is plugin-delivery
 work tracked separately in
-[#4836](https://github.com/Hmbown/CodeWhale/issues/4836).
+[#4836](https://github.com/codewhale-hq/CodeWhale/issues/4836).
 
 ### Invocation and alias metadata
 
@@ -132,14 +148,64 @@ Bundled and user skills may declare two runtime-routing fields in frontmatter:
 | `invocation: explicit-only` | The skill remains loadable by an explicit name, but is omitted from the model catalogue so opt-in instructions do not become ambient context. |
 | `aliases-for: name, other-name` | Additional lookup names for the same canonical skill. Aliases are not separate catalogue entries and do not duplicate prompt content. |
 
+`disable-model-invocation: true` makes a skill explicit-only. `user-invocable:
+false` hides it from user menus and refuses explicit activation while preserving
+model selection. Setting both disables both paths. Boolean spellings `true/false`,
+`yes/no`, `on/off`, and `1/0` are accepted; invalid policy booleans fail closed.
+The model's catalog, list/query, and `load_skill` enforce model eligibility; the
+user's slash and command palettes enforce user eligibility. `argument-hint` is
+shown beside user-facing descriptions. `when_to_use` joins the routing description
+as `Use when:`.
+
+The runtime and installer share one frontmatter validator. Runtime accepts missing
+descriptions and heading-only Markdown with warnings; installation requires a
+frontmatter block, a nonempty description, and a path-safe name. A name/directory
+mismatch warns without renaming the file. Nested `metadata` stays nested; flow
+and block lists share the same interpretation. `license`, `compatibility`,
+`metadata`, localized descriptions, and `x-*` extension keys are accepted silently.
+Unknown keys warn once. `allowed-tools` / `disallowed-tools`, `model`, `context`,
+and `agent` warn because they grant no tool, approval, provider, or fork authority.
+The existing workspace-trust and reviewed-plugin byte/hash gates still apply.
+
 Missing or unknown invocation values retain the historical `model+user`
 behavior. Canonical names win over aliases when a collision exists. Loading a
 skill reports its canonical invocation and aliases so receipts remain
 inspectable.
 
+### Non-ASCII names and saved activation
+
+ASCII names keep their existing command spelling. A name containing non-ASCII
+characters gets a stable ASCII ID: a shortened old slug plus 32 hexadecimal
+SHA-256 digits, at most 64 characters per skill-name segment. The hash uses
+trimmed UTF-8 with ASCII case folding; it does not transliterate or merge Unicode
+normalization forms. Unqualified raw names and those IDs select the same body.
+Package directories stay in place. Qualified lookup requires the declared canonical
+namespace, with ASCII case folding and no punctuation folding: `Team.Plugin:技能`
+cannot select a skill in `team-plugin`.
+
+Previously disabled lossy names such as `skill` or `pdf` continue to suppress
+every corresponding renamed skill. Enabling one exact catalog ID enables only
+that identity, including a literal ASCII skill named `skill`; it does not enable
+its formerly colliding siblings. Toggle requests use the exact ID returned by
+`GET /v1/skills`. Plugin bundle trust remains a separate gate.
+
+Activation still uses one `skills_state.toml` file and its `disabled` array.
+Reserved `!codewhale-skill-state:1:*` entries preserve legacy veto history and
+exact enable choices through older writers, using the same lock and atomic
+write. Listing/discovery do not rewrite the file. Unknown versions or malformed
+reserved entries are errors and are left untouched; existing recovery behavior
+keeps native skills available but hides reviewed plugin skills when policy
+cannot be read.
+
+This is **not simultaneous-version activation compatibility**. v0.10.0 readers
+cannot enforce new per-identity disables, and their lossy or no-op toggles cannot
+express every new choice. Upgrade every runtime sharing the state directory
+before relying on consistent controls. Retaining marker strings through an old
+write does not give that old binary the new identity semantics.
+
 ### Starter-pack parity decisions
 
-The v0.9.2 parity audit in [#4698](https://github.com/Hmbown/CodeWhale/issues/4698)
+The v0.9.2 parity audit in [#4698](https://github.com/codewhale-hq/CodeWhale/issues/4698)
 compared the five `xai-grok-memory` / `xai-grok-shell` reference skills with
 the actual Codewhale bundle. This is a decision matrix, not a request to copy
 reference text or advertise unsupported tools:
@@ -195,8 +261,8 @@ Collision and prompt-budget invariants asserted today:
 | Canonical wins | A canonical bundled name always beats another skill's alias (`docx` → `docx`, never `documents`). |
 | Single alias owner | No two bundled skills may claim the same alias. |
 | No duplicate entries | Each canonical name renders at most one catalogue line; aliases render zero. |
-| Budget headroom | The shipped pack alone renders under `MAX_AVAILABLE_SKILLS_CHARS` (2 400 chars) with **no** "additional skills omitted" line, so user skills are never silently displaced. |
-| No context poisoning | Descriptions stay single-line and are truncated to `MAX_SKILL_DESCRIPTION_CHARS` (280) before entering the prompt. |
+| Budget headroom | The shipped pack alone renders under the window-scaled skills budget (25 600 chars at the default 128k window; 2 400-char floor) with **no** "additional skills omitted" line, so user skills are never silently displaced. |
+| No context poisoning | Descriptions stay single-line and are truncated to `MAX_SKILL_DESCRIPTION_CHARS` (400) before entering the prompt. |
 
 ### Locale-aware routing metadata
 
@@ -208,7 +274,7 @@ explicit, tested fallback:
 
 - For every skill in the bundle × every locale in `Locale::shipped()` — all 15
   of `en`, `ja`, `zh-Hans`, `zh-Hant`, `pt-BR`, `es-419`, `vi`, `ko`, `ca`,
-  `de`, `fr`, `id`, `hi`, `ru`, `uk` (`crates/tui/src/localization.rs:70-88`) —
+  `de`, `fr`, `id`, `hi`, `ru`, `uk` (`crates/localization/src/lib.rs:70-88`) —
   `description_for_locale` returns the canonical English description.
 - The rendered catalogue block is byte-identical across all shipped locales.
 - Exact-tag match, primary-subtag fallback (`pt-BR` → `description_pt`), and
@@ -288,7 +354,7 @@ Audit and mutation share a bounded package digest:
 ## Readiness
 
 The audit model has a readiness field and optional provider hook for a future
-readiness cache ([#4407](https://github.com/Hmbown/CodeWhale/issues/4407)).
+readiness cache ([#4407](https://github.com/codewhale-hq/CodeWhale/issues/4407)).
 Today, when no cache is wired, readiness is always **`Unknown`**. The manager
 does not run readiness probes and does not block mutations on readiness.
 
@@ -313,7 +379,7 @@ See [CONFIGURATION.md](CONFIGURATION.md) for the full config surface.
 
 ## Operator checklist
 
-1. Prefer `/skills` for day-to-day management; keep `--remote` / `sync` explicit.
+1. Prefer `/skills manage` for day-to-day management; keep `--remote` / `sync` explicit.
 2. Never hand-edit `.claude` / `.agents` / `.cursor` trees to “install” for
    Codewhale — import into `.codewhale/skills` instead.
 3. Treat `.trusted` as advisory documentation of review, not a security boundary.

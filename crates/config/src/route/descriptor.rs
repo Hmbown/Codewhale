@@ -142,7 +142,7 @@ pub enum TransportKind {
     ModelAware,
     /// ChatGPT Codex OAuth route.
     Codex,
-    /// Google Antigravity consent-gated OAuth.
+    /// Retired Antigravity identity retained for legacy config inspection.
     Antigravity,
     /// Local runtime (Ollama / vLLM / SGLang).
     LocalRuntime,
@@ -165,7 +165,9 @@ impl TransportKind {
             ProviderKind::Antigravity => Self::Antigravity,
             ProviderKind::Ollama | ProviderKind::Vllm | ProviderKind::Sglang => Self::LocalRuntime,
             ProviderKind::Custom => Self::Custom,
-            ProviderKind::Deepseek | ProviderKind::OpencodeZen => Self::ModelAware,
+            ProviderKind::Deepseek | ProviderKind::OpencodeZen | ProviderKind::OpencodeGo => {
+                Self::ModelAware
+            }
             _ => match kind.provider().wire_policy() {
                 WirePolicy::ModelAware => Self::ModelAware,
                 WirePolicy::Fixed(crate::provider::WireFormat::Responses) => Self::OpenAiResponses,
@@ -184,22 +186,15 @@ impl TransportKind {
 /// `select` whose option value **is a route id**.
 #[must_use]
 pub fn family_for(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic => "deepseek",
-        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => "minimax",
-        ProviderKind::ModelstudioTokenPlan
-        | ProviderKind::ModelstudioTokenPlanAnthropic
-        | ProviderKind::ModelstudioCodingPlan
-        | ProviderKind::ModelstudioCodingPlanAnthropic => "alibaba-modelstudio",
-        ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => "siliconflow",
-        ProviderKind::Ollama | ProviderKind::OllamaCloud => "ollama",
-        other => other.as_str(),
-    }
+    crate::descriptors::builtin_provider_descriptor(kind).family
 }
 
 /// Auth methods declared for a provider kind. OAuth is a type, not an adapter.
 #[must_use]
 pub fn auth_methods_for(kind: ProviderKind) -> &'static [AuthMethod] {
+    if kind == ProviderKind::Antigravity {
+        return &[];
+    }
     match kind.provider().credential_help().acquisition {
         CredentialAcquisition::ApiKey => &[AuthMethod::API_KEY],
         CredentialAcquisition::ApiKeyOrOAuth => &[AuthMethod::API_KEY, AuthMethod::OAUTH],

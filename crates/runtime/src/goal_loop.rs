@@ -1,0 +1,632 @@
+//! Goal loop orchestrator — the persistent-objective control layer (#3215, and
+//! its lineage #891 / #1976 / #2058 / #2029).
+//!
+//! This is the **Workflow goal layer**: the decision core that turns a one-shot
+//! `/goal` into a persistent work loop. Given the durable goal status, the
+//! accumulated usage (from the per-goal accounting wired in `crates/state`
+//! `record_thread_goal_usage`), and a budget, it decides whether to **continue**
+//! (re-dispatch another worker turn toward the objective) or **stop** with a
+//! terminal status. It is the orchestrator in the Workflow≈ultracode mapping —
+//! the loop that fans work out to workers (`worker_profile`) and verifies before
+//! committing.
+//!
+//! Scope: **decision logic + types**. The engine (`core/engine.rs`) reads the
+//! `SharedGoalState` snapshot after each turn and calls `decide_continuation`
+//! to decide whether to re-dispatch. For operate-mode goals the terminal stops
+//! are a verified completion, a blocked report, the stall pause that fires
+//! when a critical verifier reports the same gap set
+//! [`MAX_REPEATED_GAP_PASSES`] times running (enforced in
+//! `GoalState::record_not_achieved`), and the opt-in continuation backstop
+//! (`[goal] max_continuations`); token/time accounting stays visible as
+//! telemetry but does not gate continuation — spend is bounded by stalling,
+//! not by a pass count, like grokbuild (`DEFAULT_AGENT_BUDGET` as call cap)
+//! and kimicode swarm (`turnBudget` per-task, resumable after
+//! budget-reached). Log when the backstop fires.
+
+use std::time::Duration;
+
+/// Default automatic cross-turn continuation policy for one goal run (#5052).
+///
+/// Goals are unlimited by default: completion, blocked status, or explicit
+/// user control ends the run. Operators who want a circuit breaker can opt in
+/// with `[goal] max_continuations`; `0` keeps the default unlimited behavior.
+pub const DEFAULT_MAX_GOAL_CONTINUATIONS: u32 = 0;
+
+/// Default per-engine-turn step allowance while a goal is active (#5994).
+/// Deliberate maintainer policy, not a measured number: five times the
+/// ordinary interactive allowance (200), so intentional goal work has room
+/// while every provider turn stays finite. The count of continuation passes
+/// remains governed separately (`[goal] max_continuations`).
+pub const DEFAULT_GOAL_MAX_STEPS: u32 = 1_000;
+
+/// How many consecutive critical `not_achieved` reviews naming the *same*
+/// normalized gap set a goal may accumulate before it pauses itself with
+/// `GoalPauseReason::NoProgress`.
+///
+/// This is the bound the continuation prompt promises the model, and it is the
+/// only default stop on a goal run: `DEFAULT_MAX_GOAL_CONTINUATIONS` is `0`, so
+/// without it the loop runs until the model volunteers a terminal status.
+/// Enforcement lives in `GoalState::record_not_achieved`, and it reuses the
+/// existing pause authority rather than adding a second one — both continuation
+/// dispatchers already refuse to re-dispatch a non-active goal, and
+/// `RuntimeThreadManager` already mirrors a non-limit pause into the durable
+/// `ThreadGoalStatus::Paused`, so the stop survives a restart and needs an
+/// explicit resume.
+///
+/// The counter is `1` on the first report of a gap set, so `3` means the
+/// verifier named identical remaining work three times running: two whole
+/// continuation passes that moved nothing the verifier can see. Two is too
+/// eager — one pass legitimately fails to land a fix and retries — and anything
+/// larger just buys more identical passes.
+pub const MAX_REPEATED_GAP_PASSES: u32 = 3;
+
+/// Upper bound for one between-turn quiet period. A day is long enough for
+/// coordinator cadences while preventing an accidental giant integer from
+/// becoming a practically uninterruptible-looking schedule receipt.
+pub const MAX_GOAL_CONTINUATION_DELAY_SECONDS: u64 = 24 * 60 * 60;
+
+/// Terminal or active state of a persistent goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalRunStatus {
+    /// Still working toward the objective.
+    Active,
+    /// The objective was achieved (the model self-reported done and, ideally, a
+    /// verifier confirmed — see `GoalGate`).
+    Completed,
+    /// The model reported it is blocked and needs the user.
+    Blocked,
+}
+
+/// Why the loop stopped, for a terminal decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Objective achieved.
+    Completed,
+    /// Model reported blocked.
+    Blocked,
+    /// Continuation circuit-breaker tripped (too many continuations without a
+    /// terminal signal).
+    ContinuationLimit,
+    /// The goal's token budget was reached while `[goal] enforce_token_budget`
+    /// opted the budget into a hard stop (#6013). Default-off: without the
+    /// opt-in the budget stays advisory telemetry and never produces this.
+    BudgetLimit,
+}
+
+/// Accumulated, durable progress for a goal run. Mirrors the fields wired by
+/// `crates/state` `record_thread_goal_usage` (tokens_used / time_used_seconds)
+/// plus a continuation counter the loop maintains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoalProgress {
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub continuations: u32,
+}
+
+/// The optional token/time bounds on a goal run. `None` fields mean unbounded
+/// for that resource; the continuation backstop (`max_continuations`) still
+/// applies unless configured to `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalBudget {
+    pub token_budget: Option<u64>,
+    pub time_budget_seconds: Option<u64>,
+    /// Whether `token_budget` stops the run when reached (#6013). `false`
+    /// keeps the default advisory behavior: crossing the budget logs and
+    /// continues. There is no time-budget enforcement because goals carry no
+    /// `time_budget` field — only `token_budget` can gate.
+    pub enforce_token_budget: bool,
+    /// Safety backstop on automatic continuation passes (#5052). `0` disables
+    /// the backstop: only terminal status stops the run.
+    pub max_continuations: u32,
+}
+
+impl GoalBudget {
+    /// No token or time cap. Terminal status, user control, and the default
+    /// continuation backstop still stop the run.
+    pub const fn unbounded() -> Self {
+        Self {
+            token_budget: None,
+            time_budget_seconds: None,
+            enforce_token_budget: false,
+            max_continuations: DEFAULT_MAX_GOAL_CONTINUATIONS,
+        }
+    }
+
+    /// A token budget for telemetry/UI. It never pauses an unbounded goal.
+    pub const fn with_token_budget(token_budget: u64) -> Self {
+        Self {
+            token_budget: Some(token_budget),
+            time_budget_seconds: None,
+            enforce_token_budget: false,
+            max_continuations: DEFAULT_MAX_GOAL_CONTINUATIONS,
+        }
+    }
+
+    /// Opt the token budget into a hard stop (`[goal] enforce_token_budget`).
+    /// With no `token_budget` set this is a no-op by construction — there is
+    /// no ceiling to reach.
+    #[must_use]
+    pub const fn with_enforced_token_budget(mut self, enforce: bool) -> Self {
+        self.enforce_token_budget = enforce;
+        self
+    }
+
+    /// Override the continuation backstop (`0` = unlimited until terminal
+    /// status).
+    #[must_use]
+    pub const fn with_max_continuations(mut self, max_continuations: u32) -> Self {
+        self.max_continuations = max_continuations;
+        self
+    }
+}
+
+/// The decision the loop makes after each worker turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationDecision {
+    /// Re-dispatch another turn toward the objective.
+    Continue,
+    /// Stop; the goal run is terminal.
+    Stop(StopReason),
+}
+
+/// Decide whether a persistent goal run should continue after a turn.
+///
+/// Precedence (most authoritative first):
+/// 1. A terminal model status (Completed / Blocked) ends the run.
+/// 2. The configurable continuation backstop stops a pathological loop
+///    (skipped entirely when configured to `0`).
+/// 3. Otherwise continue — the loop runs to the completion gate, not to a
+///    fixed pass count (#5052). Token/time budgets are advisory telemetry;
+///    they are surfaced in the UI but do not stop the run (unbounded).
+#[must_use]
+pub fn decide_continuation(
+    status: GoalRunStatus,
+    progress: GoalProgress,
+    budget: GoalBudget,
+) -> ContinuationDecision {
+    // 1. Terminal model signal wins.
+    match status {
+        GoalRunStatus::Completed => return ContinuationDecision::Stop(StopReason::Completed),
+        GoalRunStatus::Blocked => return ContinuationDecision::Stop(StopReason::Blocked),
+        GoalRunStatus::Active => {}
+    }
+
+    // 2. Token budget: advisory telemetry by default, or a hard stop when
+    //    `[goal] enforce_token_budget` opts in (#6013). Time stays advisory —
+    //    goals carry no time budget to enforce against.
+    if budget
+        .token_budget
+        .is_some_and(|limit| progress.tokens_used >= limit)
+    {
+        if budget.enforce_token_budget {
+            tracing::info!(
+                tokens_used = progress.tokens_used,
+                token_budget = ?budget.token_budget,
+                "goal token budget reached; stopping ([goal] enforce_token_budget)"
+            );
+            return ContinuationDecision::Stop(StopReason::BudgetLimit);
+        }
+        tracing::debug!(
+            tokens_used = progress.tokens_used,
+            token_budget = ?budget.token_budget,
+            "goal over token budget but continuing (unbounded)"
+        );
+    }
+    if let Some(secs) = budget.time_budget_seconds
+        && progress.time_used_seconds >= secs
+    {
+        tracing::debug!(
+            time_used_seconds = progress.time_used_seconds,
+            time_budget_seconds = secs,
+            "goal over time budget but continuing (unbounded)"
+        );
+    }
+
+    // 3. Runaway-cost backstop. This deliberately uses the already-durable
+    // continuation counter instead of adding verifier fingerprints or another
+    // orchestration subsystem. `0` disables it — budget/terminal stops only.
+    if budget.max_continuations > 0 && progress.continuations >= budget.max_continuations {
+        tracing::warn!(
+            continuations = progress.continuations,
+            max_continuations = budget.max_continuations,
+            "goal continuation backstop fired: no terminal signal after the configured \
+             continuation limit ([goal] max_continuations)"
+        );
+        return ContinuationDecision::Stop(StopReason::ContinuationLimit);
+    }
+
+    // 4. Keep going.
+    ContinuationDecision::Continue
+}
+
+/// Outcome of waiting out the between-continuation quiet period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationWaitOutcome {
+    /// The quiet period elapsed — dispatch the continuation.
+    Elapsed,
+    /// Cancelled during the quiet period — never dispatch.
+    Cancelled,
+}
+
+/// Compute the quiet-period wait for a configured between-continuation delay.
+/// `None` continues immediately (unset or zero delay); a positive delay
+/// returns the capped wait shared by every dispatch path so no caller can
+/// construct an effectively uninterruptible schedule receipt.
+#[must_use]
+pub const fn continuation_wait(delay_seconds: u64) -> Option<Duration> {
+    if delay_seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(
+            if delay_seconds > MAX_GOAL_CONTINUATION_DELAY_SECONDS {
+                MAX_GOAL_CONTINUATION_DELAY_SECONDS
+            } else {
+                delay_seconds
+            },
+        ))
+    }
+}
+
+/// Wait out the between-continuation quiet period, honoring cancellation.
+/// `None` resolves immediately so callers have a single dispatch gate: to
+/// `Cancelled` when the token is already cancelled, otherwise `Elapsed`.
+/// Cancellation is biased and always wins over a racing expiry — the same
+/// semantics as the interactive cadence (#5508), including a zero delay. Two dispatchers await
+/// this gate: the turn loop's intra-turn passes (every session), and the
+/// runtime host's cross-turn re-arm for host-managed engines
+/// (`RuntimeThreadManager::spawn_goal_continuation`), which never
+/// self-continue.
+pub async fn await_continuation_wait(
+    wait: Option<Duration>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> ContinuationWaitOutcome {
+    if cancel_token.is_cancelled() {
+        return ContinuationWaitOutcome::Cancelled;
+    }
+    let Some(wait) = wait else {
+        return ContinuationWaitOutcome::Elapsed;
+    };
+    tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => ContinuationWaitOutcome::Cancelled,
+        () = tokio::time::sleep(wait) => ContinuationWaitOutcome::Elapsed,
+    }
+}
+
+/// Whether the durable token usage has reached an *enforced* token budget —
+/// the same condition on which [`decide_continuation`] stops with
+/// [`StopReason::BudgetLimit`]. Budgets are telemetry-only unless
+/// `[goal] enforce_token_budget` opts in, so without it this stays false and
+/// crossing a budget never closes the outbound gate. Preview and the live
+/// continuation loop share this predicate so they cannot disagree about spend.
+#[must_use]
+pub const fn token_budget_exhausted(progress: GoalProgress, budget: GoalBudget) -> bool {
+    budget.enforce_token_budget
+        && match budget.token_budget {
+            Some(limit) => progress.tokens_used >= limit,
+            None => false,
+        }
+}
+
+/// Whether a stop reason represents success (Completed) vs. an early/forced exit.
+/// Useful for the UI/status projection (#2666 token/time visibility).
+#[must_use]
+pub fn is_success(reason: StopReason) -> bool {
+    matches!(reason, StopReason::Completed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_status_stops_with_success() {
+        let d = decide_continuation(
+            GoalRunStatus::Completed,
+            GoalProgress::default(),
+            GoalBudget::unbounded(),
+        );
+        assert_eq!(d, ContinuationDecision::Stop(StopReason::Completed));
+        assert!(is_success(StopReason::Completed));
+    }
+
+    #[test]
+    fn blocked_status_stops_without_success() {
+        let d = decide_continuation(
+            GoalRunStatus::Blocked,
+            GoalProgress::default(),
+            GoalBudget::unbounded(),
+        );
+        assert_eq!(d, ContinuationDecision::Stop(StopReason::Blocked));
+        assert!(!is_success(StopReason::Blocked));
+    }
+
+    #[test]
+    fn active_under_budget_continues() {
+        let progress = GoalProgress {
+            tokens_used: 10,
+            time_used_seconds: 5,
+            continuations: 2,
+        };
+        let budget = GoalBudget {
+            token_budget: Some(1000),
+            time_budget_seconds: Some(600),
+            enforce_token_budget: false,
+            max_continuations: DEFAULT_MAX_GOAL_CONTINUATIONS,
+        };
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Continue
+        );
+    }
+
+    #[test]
+    fn default_goal_has_no_continuation_limit() {
+        let progress = GoalProgress {
+            continuations: 10_000,
+            ..GoalProgress::default()
+        };
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, GoalBudget::unbounded()),
+            ContinuationDecision::Continue
+        );
+    }
+
+    #[test]
+    fn explicit_continuation_limit_stops_run() {
+        let configured_limit = 100;
+        let progress = GoalProgress {
+            continuations: configured_limit,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget::unbounded().with_max_continuations(configured_limit);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Stop(StopReason::ContinuationLimit)
+        );
+    }
+
+    #[test]
+    fn operate_goal_continues_past_ten_when_budget_remains() {
+        // #5052 regression: the old hardcoded cap of 10 must not be a terminal
+        // stop. With no terminal signal, pass 10, 11, and far beyond keep
+        // continuing because the default has no hidden ceiling.
+        for continuations in [10, 11, 100, 10_000] {
+            let progress = GoalProgress {
+                tokens_used: 5_000,
+                time_used_seconds: 300,
+                continuations,
+            };
+            let budget = GoalBudget::with_token_budget(1_000_000);
+            assert_eq!(
+                decide_continuation(GoalRunStatus::Active, progress, budget),
+                ContinuationDecision::Continue,
+                "pass {continuations} must continue toward the completion gate",
+            );
+        }
+    }
+
+    #[test]
+    fn configured_backstop_halts_pathological_loop() {
+        let backstop = 25;
+        let progress = GoalProgress {
+            continuations: backstop,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget::unbounded().with_max_continuations(backstop);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Stop(StopReason::ContinuationLimit)
+        );
+    }
+
+    #[test]
+    fn zero_backstop_is_unlimited_and_budget_advisory() {
+        // 0 = unlimited-with-budget-stops: no continuation count ends the run…
+        let progress = GoalProgress {
+            continuations: 10_000,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget::unbounded().with_max_continuations(0);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Continue
+        );
+
+        // exceeded token budget is advisory — must still continue (unbounded)
+        let progress = GoalProgress {
+            tokens_used: 1_000,
+            continuations: 10_000,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget::with_token_budget(1_000).with_max_continuations(0);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Continue,
+            "budget advisory — must continue even when over budget"
+        );
+    }
+
+    #[test]
+    fn enforced_token_budget_stops_the_run() {
+        let progress = GoalProgress {
+            tokens_used: 1000,
+            continuations: 1,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget::with_token_budget(1000).with_enforced_token_budget(true);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Stop(StopReason::BudgetLimit),
+            "enforce_token_budget makes an exhausted token budget terminal"
+        );
+        assert!(!is_success(StopReason::BudgetLimit));
+    }
+
+    #[test]
+    fn enforce_flag_without_a_token_budget_cannot_stop() {
+        // A goal created without `token_budget` has no ceiling to reach — the
+        // flag must not invent one.
+        let progress = GoalProgress {
+            tokens_used: u64::MAX / 2,
+            continuations: 1,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget::unbounded().with_enforced_token_budget(true);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Continue
+        );
+    }
+
+    #[test]
+    fn enforced_budget_still_yields_to_a_terminal_status() {
+        let budget = GoalBudget::with_token_budget(1000).with_enforced_token_budget(true);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Completed, GoalProgress::default(), budget),
+            ContinuationDecision::Stop(StopReason::Completed),
+            "a clean completion outranks the budget gate"
+        );
+    }
+
+    #[test]
+    fn token_budget_is_advisory_not_terminal() {
+        let progress = GoalProgress {
+            tokens_used: 1000,
+            continuations: 1,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget::with_token_budget(1000);
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Continue,
+            "token budget is advisory — unbounded run must continue"
+        );
+    }
+
+    #[test]
+    fn time_budget_is_advisory_not_terminal() {
+        let progress = GoalProgress {
+            time_used_seconds: 601,
+            continuations: 1,
+            ..GoalProgress::default()
+        };
+        let budget = GoalBudget {
+            token_budget: None,
+            time_budget_seconds: Some(600),
+            enforce_token_budget: false,
+            max_continuations: DEFAULT_MAX_GOAL_CONTINUATIONS,
+        };
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Active, progress, budget),
+            ContinuationDecision::Continue,
+            "time budget is advisory — unbounded run must continue"
+        );
+    }
+
+    #[test]
+    fn terminal_status_outranks_remaining_budget() {
+        // Completed wins even if there is plenty of budget left.
+        let progress = GoalProgress::default();
+        let budget = GoalBudget {
+            token_budget: Some(1_000_000),
+            time_budget_seconds: Some(86_400),
+            enforce_token_budget: false,
+            max_continuations: DEFAULT_MAX_GOAL_CONTINUATIONS,
+        };
+        assert_eq!(
+            decide_continuation(GoalRunStatus::Completed, progress, budget),
+            ContinuationDecision::Stop(StopReason::Completed)
+        );
+    }
+
+    #[test]
+    fn continuation_wait_honors_configured_delay() {
+        assert_eq!(
+            continuation_wait(300),
+            Some(Duration::from_secs(300)),
+            "a positive configured delay must become the quiet-period wait"
+        );
+        assert_eq!(
+            continuation_wait(MAX_GOAL_CONTINUATION_DELAY_SECONDS + 1),
+            Some(Duration::from_secs(MAX_GOAL_CONTINUATION_DELAY_SECONDS)),
+            "the shared cap must bound an oversized configured delay"
+        );
+    }
+
+    #[test]
+    fn zero_delay_continues_immediately() {
+        assert_eq!(
+            continuation_wait(0),
+            None,
+            "an unset or zero delay must dispatch immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_pending_quiet_period() {
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            canceller.cancel();
+        });
+        assert_eq!(
+            await_continuation_wait(
+                continuation_wait(MAX_GOAL_CONTINUATION_DELAY_SECONDS),
+                &cancel_token,
+            )
+            .await,
+            ContinuationWaitOutcome::Cancelled,
+            "an explicit cancel during the quiet period must win and never dispatch"
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_predicate_matches_the_live_stop() {
+        let progress = GoalProgress {
+            tokens_used: 1_000,
+            ..GoalProgress::default()
+        };
+        for enforce in [false, true] {
+            let budget = GoalBudget {
+                token_budget: Some(1_000),
+                time_budget_seconds: None,
+                enforce_token_budget: enforce,
+                max_continuations: 0,
+            };
+            assert_eq!(
+                token_budget_exhausted(progress, budget),
+                decide_continuation(GoalRunStatus::Active, progress, budget)
+                    == ContinuationDecision::Stop(StopReason::BudgetLimit),
+                "preview must report exactly the budget stop the live loop takes (enforce={enforce})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_a_zero_delay() {
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
+        assert_eq!(
+            await_continuation_wait(continuation_wait(0), &cancel_token).await,
+            ContinuationWaitOutcome::Cancelled,
+            "a cancelled goal with no quiet period must never dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn elapsed_quiet_period_dispatches() {
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            await_continuation_wait(None, &cancel_token).await,
+            ContinuationWaitOutcome::Elapsed,
+            "an unset wait must gate the dispatch through immediately"
+        );
+        assert_eq!(
+            await_continuation_wait(Some(Duration::from_millis(1)), &cancel_token).await,
+            ContinuationWaitOutcome::Elapsed,
+            "an expired quiet period must dispatch"
+        );
+    }
+}

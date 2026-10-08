@@ -1,47 +1,74 @@
-//! `/relay` command.
+//! `/relay` command — portable handler over the session-control facet.
 
 use std::fmt::Write as _;
 
-use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
-use crate::tui::app::{App, AppAction};
-
 use super::CommandResult;
-
-pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
-    name: "relay",
-    aliases: &["batonpass", "接力"],
-    usage: "/relay [focus]",
-    description_id: MessageId::CmdRelayDescription,
+use codewhale_command_contract::facets::{
+    CommandSessionControlContext, PlanProjection, PlanStepStatus,
+};
+use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
+use codewhale_command_contract::metadata::{
+    CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
 
 pub(in crate::commands) struct RelayCmd;
 
-impl RegisterCommand for RelayCmd {
-    fn info() -> &'static CommandInfo {
-        &COMMAND_INFO
-    }
+// ---------------------------------------------------------------------------
+// FEAT-024 Phase 4 (D4/D6/D7): portable contextual registration and handler.
+// The handler owns complete relay-instruction composition (sections, labels,
+// list formatting, focus normalization, byte-identical text); the facet
+// supplies the semantic projection. Missing control authority fails safely
+// with the exact capability error (never a panic).
+// ---------------------------------------------------------------------------
 
-    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        relay(app, arg)
+pub(in crate::commands) const CONTRACT_INFO: ContractInfo = ContractInfo {
+    name: "relay",
+    aliases: &["batonpass", "接力"],
+    usage: "/relay [focus]",
+    description_key: "cmd_relay_description",
+};
+
+impl ContractRegisterCommand<CommandResult> for RelayCmd {
+    fn info() -> &'static ContractInfo {
+        &CONTRACT_INFO
+    }
+    fn handler() -> CommandHandler<CommandResult> {
+        CommandHandler::Contextual {
+            capabilities: codewhale_command_contract::handler::CommandCapabilities::SESSION_CONTROL,
+            handler: relay_contextual,
+        }
     }
 }
 
-/// Ask the active model to write a compact relay artifact for the next thread.
-///
-/// The visible command is `/relay` (with `/接力` for Chinese users), but the
-/// durable file path remains `.deepseek/handoff.md` for compatibility with
-/// existing sessions and startup prompt loading.
-pub fn relay(app: &mut App, arg: Option<&str>) -> CommandResult {
+pub(in crate::commands) fn relay_contextual(
+    contexts: CommandContexts<'_>,
+    arg: Option<&str>,
+) -> CommandResult {
+    let mut parts = contexts.into_parts();
+    let Some(control) = parts.control.as_deref_mut() else {
+        return CommandResult::error("Command capability unavailable: session_control".to_string());
+    };
+    relay_portable(control, arg)
+}
+
+pub(in crate::commands) fn relay_portable(
+    control: &mut dyn CommandSessionControlContext,
+    arg: Option<&str>,
+) -> CommandResult {
     let focus = arg.map(str::trim).filter(|value| !value.is_empty());
-    let message = build_relay_instruction(app, focus);
+    let message = build_relay_instruction(control, focus);
     CommandResult::with_message_and_action(
         "Preparing session relay at .deepseek/handoff.md...",
-        AppAction::SendMessage(message),
+        codewhale_command_contract::outcome::SessionAction::SendMessage(message),
     )
 }
 
-fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
+/// Compose the byte-identical relay instruction from the portable snapshot.
+fn build_relay_instruction(
+    control: &dyn CommandSessionControlContext,
+    focus: Option<&str>,
+) -> String {
+    let projection = control.relay_projection();
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -56,83 +83,81 @@ fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "Use this relay structure:");
     let _ = writeln!(out);
-    let _ = writeln!(out, "{}", crate::prompts::COMPACT_TEMPLATE.trim());
+    let _ = writeln!(out, "{}", projection.compact_template.trim());
     let _ = writeln!(out);
     let _ = writeln!(out, "Current session snapshot:");
-    let _ = writeln!(out, "- Workspace: {}", app.workspace.display());
-    let _ = writeln!(out, "- Mode: {}", app.mode.label());
-    let _ = writeln!(out, "- Model: {}", app.model_display_label());
+    let _ = writeln!(out, "- Workspace: {}", projection.workspace);
+    let _ = writeln!(out, "- Mode: {}", projection.mode);
+    let _ = writeln!(out, "- Model: {}", projection.model);
     if let Some(focus) = focus {
         let _ = writeln!(out, "- Requested relay focus: {focus}");
     }
-    if let Some(objective) = app.goal.objective.as_deref() {
+    if let Some(objective) = projection.goal_objective.as_deref() {
         let _ = writeln!(out, "- Goal objective: {objective}");
     }
-    if let Some(budget) = app.goal.token_budget {
+    if let Some(budget) = projection.goal_token_budget {
         let _ = writeln!(out, "- Goal token budget: {budget}");
     }
-    // Read through the same authoritative graph-backed snapshot seam used by
-    // persistence. A model can call `work_update` immediately before `/relay`;
-    // the UI projection may not have published yet, but the handoff must still
-    // describe the staged To-do rather than a stale compatibility list.
-    match app.work_state_snapshot() {
-        Ok(Some(state)) => {
-            if let Some(body) = crate::todo_snapshot::todo_snapshot_body(&state.todos) {
-                let _ = writeln!(out, "\nCurrent To-do:");
-                let _ = writeln!(out, "{body}");
-            }
+    match projection.todos {
+        codewhale_command_contract::facets::TodoProjection::Body(body) => {
+            let _ = writeln!(out, "\nCurrent To-do:");
+            let _ = writeln!(out, "{body}");
         }
-        Ok(None) => {}
-        Err(_) => {
+        codewhale_command_contract::facets::TodoProjection::Absent => {}
+        codewhale_command_contract::facets::TodoProjection::Unavailable => {
             let _ = writeln!(out, "\nTo-do: unavailable because the list is busy.");
         }
     }
-
-    if let Ok(plan) = app.plan_state.try_lock() {
-        let snapshot = plan.snapshot();
-        if !snapshot.is_empty() {
+    match projection.plan {
+        PlanProjection::Sections(sections) => {
             let _ = writeln!(
                 out,
                 "\nConversational strategy notes from update_plan (reasoning context, not a Work surface):"
             );
-            write_plan_field(&mut out, "Title", snapshot.title.as_deref());
-            write_plan_field(&mut out, "Objective", snapshot.objective.as_deref());
-            write_plan_field(&mut out, "Context", snapshot.context_summary.as_deref());
-            write_plan_field(&mut out, "Explanation", snapshot.explanation.as_deref());
-            write_plan_list(&mut out, "Source", &snapshot.sources_used);
-            write_plan_list(&mut out, "Critical file", &snapshot.critical_files);
-            write_plan_list(&mut out, "Constraint", &snapshot.constraints);
+            write_plan_field(&mut out, "Title", sections.title.as_deref());
+            write_plan_field(&mut out, "Objective", sections.objective.as_deref());
+            write_plan_field(&mut out, "Context", sections.context_summary.as_deref());
+            write_plan_field(&mut out, "Explanation", sections.explanation.as_deref());
+            write_plan_list(&mut out, "Source", &sections.sources_used);
+            write_plan_list(&mut out, "Critical file", &sections.critical_files);
+            write_plan_list(&mut out, "Constraint", &sections.constraints);
             write_plan_field(
                 &mut out,
                 "Recommended approach",
-                snapshot.recommended_approach.as_deref(),
+                sections.recommended_approach.as_deref(),
             );
             write_plan_field(
                 &mut out,
                 "Verification plan",
-                snapshot.verification_plan.as_deref(),
+                sections.verification_plan.as_deref(),
             );
             write_plan_field(
                 &mut out,
                 "Risks and unknowns",
-                snapshot.risks_and_unknowns.as_deref(),
+                sections.risks_and_unknowns.as_deref(),
             );
             write_plan_field(
                 &mut out,
                 "Handoff packet",
-                snapshot.handoff_packet.as_deref(),
+                sections.handoff_packet.as_deref(),
             );
-            for item in snapshot.items {
-                let _ = writeln!(out, "- [{}] {}", plan_status_label(&item.status), item.step);
+            for item in sections.items {
+                let _ = writeln!(
+                    out,
+                    "- [{}] {}",
+                    plan_step_status_label(item.status),
+                    item.text
+                );
             }
         }
-    } else {
-        let _ = writeln!(
-            out,
-            "\nStrategy metadata: unavailable because plan state is busy."
-        );
+        PlanProjection::Absent => {}
+        PlanProjection::Busy => {
+            let _ = writeln!(
+                out,
+                "\nStrategy metadata: unavailable because plan state is busy."
+            );
+        }
     }
-
     let _ = writeln!(
         out,
         "\nBefore writing, inspect the current transcript context and any live tool evidence you need. Do not invent test results, file changes, blockers, or decisions."
@@ -142,6 +167,14 @@ fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
         "\nKeep it under about 900 words unless the session genuinely needs more. After writing, report the path and the single next action."
     );
     out
+}
+
+fn plan_step_status_label(status: PlanStepStatus) -> &'static str {
+    match status {
+        PlanStepStatus::Pending => "pending",
+        PlanStepStatus::InProgress => "in_progress",
+        PlanStepStatus::Completed => "completed",
+    }
 }
 
 fn write_plan_field(out: &mut String, label: &str, value: Option<&str>) {
@@ -159,10 +192,139 @@ fn write_plan_list(out: &mut String, label: &str, values: &[String]) {
     }
 }
 
-fn plan_status_label(status: &crate::tools::plan::StepStatus) -> &'static str {
-    match status {
-        crate::tools::plan::StepStatus::Pending => "pending",
-        crate::tools::plan::StepStatus::InProgress => "in_progress",
-        crate::tools::plan::StepStatus::Completed => "completed",
+#[cfg(test)]
+mod tests {
+    use super::super::control_test_support::message;
+    use super::*;
+    use codewhale_command_contract::facets::{
+        PlanSections, PlanStep, RelayProjection, TodoProjection,
+    };
+
+    #[test]
+    fn relay_composes_exact_instruction_and_action() {
+        let mut fake = super::super::control_test_support::FakeControl {
+            relay: Some(super::super::control_test_support::relay_projection_fixture()),
+            ..super::super::control_test_support::FakeControl::default()
+        };
+        let result = relay_portable(&mut fake, Some("focus on the handoff"));
+        assert!(!result.is_error);
+        let message = match result.action {
+            Some(codewhale_command_contract::outcome::SessionAction::SendMessage(message)) => {
+                message
+            }
+            other => panic!("expected SendMessage action, got {other:?}"),
+        };
+        assert!(
+            message
+                .contains("Create a compact session relay (接力) for a future Codewhale thread.")
+        );
+        assert!(message.contains("- Workspace: /work"));
+        assert!(message.contains("- Mode: operate"));
+        assert!(message.contains("- Model: model-x"));
+        assert!(message.contains("- Requested relay focus: focus on the handoff"));
+        assert!(message.contains("- Goal objective: objective-y"));
+        assert!(message.contains("- Goal token budget: 900"));
+        assert!(message.contains("Keep the existing file path for compatibility, but title the artifact `# Session relay`."));
+        assert!(message.contains("Before writing, inspect the current transcript context"));
+        assert!(message.contains("Keep it under about 900 words"));
+        assert!(!message.contains("Current To-do:"));
+        assert!(!message.contains("strategy notes"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|m| m == "Preparing session relay at .deepseek/handoff.md...")
+        );
+        assert_eq!(fake.calls.borrow().as_slice(), ["relay_projection"]);
+    }
+
+    #[test]
+    fn relay_render_optional_sections_and_busy_states_exactly() {
+        let mut fake = super::super::control_test_support::FakeControl {
+            relay: Some(RelayProjection {
+                compact_template: "# Session relay".to_string(),
+                workspace: "/work".to_string(),
+                mode: "operate".to_string(),
+                model: "model-x".to_string(),
+                goal_objective: None,
+                goal_token_budget: None,
+                todos: TodoProjection::Unavailable,
+                plan: codewhale_command_contract::facets::PlanProjection::Busy,
+            }),
+            ..super::super::control_test_support::FakeControl::default()
+        };
+        let result = relay_portable(&mut fake, None);
+        let message = match result.action {
+            Some(codewhale_command_contract::outcome::SessionAction::SendMessage(message)) => {
+                message
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        };
+        assert!(message.contains("\nTo-do: unavailable because the list is busy."));
+        assert!(message.contains("\nStrategy metadata: unavailable because plan state is busy."));
+        assert!(!message.contains("Requested relay focus"));
+        assert!(!message.contains("Goal objective"));
+        assert!(!message.contains("Goal token budget"));
+    }
+
+    #[test]
+    fn relay_renders_plan_sections_with_exact_labels() {
+        let mut fake = super::super::control_test_support::FakeControl {
+            relay: Some(RelayProjection {
+                compact_template: "template".to_string(),
+                workspace: "/w".to_string(),
+                mode: "m".to_string(),
+                model: "mo".to_string(),
+                goal_objective: None,
+                goal_token_budget: None,
+                todos: TodoProjection::Absent,
+                plan: codewhale_command_contract::facets::PlanProjection::Sections(PlanSections {
+                    title: Some("Relay Plan".to_string()),
+                    explanation: Some("  because  ".to_string()),
+                    sources_used: vec!["repo-a".to_string(), "  ".to_string()],
+                    items: vec![PlanStep {
+                        status: PlanStepStatus::InProgress,
+                        text: "port relay".to_string(),
+                    }],
+                    ..PlanSections::default()
+                }),
+            }),
+            ..super::super::control_test_support::FakeControl::default()
+        };
+        let result = relay_portable(&mut fake, None);
+        let message = match result.action {
+            Some(codewhale_command_contract::outcome::SessionAction::SendMessage(message)) => {
+                message
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        };
+        assert!(message.contains("- Title: Relay Plan"));
+        assert!(message.contains("- Explanation: because"));
+        assert!(message.contains("- Source: repo-a"));
+        assert!(message.contains("- [in_progress] port relay"));
+    }
+
+    #[test]
+    fn relay_owns_every_portable_plan_status_label() {
+        assert_eq!(plan_step_status_label(PlanStepStatus::Pending), "pending");
+        assert_eq!(
+            plan_step_status_label(PlanStepStatus::InProgress),
+            "in_progress"
+        );
+        assert_eq!(
+            plan_step_status_label(PlanStepStatus::Completed),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn relay_missing_control_authority_fails_safely() {
+        let contexts = codewhale_command_contract::handler::CommandContexts::empty();
+        let result = relay_contextual(contexts, None);
+        assert!(result.is_error);
+        assert_eq!(
+            message(&result),
+            "Command capability unavailable: session_control"
+        );
     }
 }

@@ -1,19 +1,33 @@
 # winget packaging for CodeWhale
 
-This directory holds the source winget manifest for `Hmbown.CodeWhale` (resolves #1561).
-Winget installs the single runtime under `codewhale` + `codew`; it never
-installs a `codewhale-tui` command. GitHub Releases retain byte-identical
-`codewhale-tui-*` filenames only for legacy updater compatibility.
+This directory holds a source winget manifest for `HunterBown.CodeWhale` (resolves #1561).
+
+> **Not what winget serves today.** The package published in
+> [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/tree/master/manifests/h/HunterBown/CodeWhale)
+> (checked 2026-10-04, latest 0.10.0) is a different, multi-file manifest:
+> `InstallerType: portable`, one x64 installer
+> (`codewhale-tui-windows-x64.exe`), `Commands: codewhale`, and a VC++ 2015+
+> x64 runtime dependency. It has no ARM64 installer and no `codew` alias.
+> The singleton below (NSIS + ZIP, x64/arm64, `codewhale` + `codew`) is stale
+> at 0.9.6 and has never been what winget installs. Before the next
+> submission, base it on the published manifest or update both together, and
+> keep the identifier `HunterBown.CodeWhale` (this file used `Hmbown.CodeWhale`
+> until 2026-10-04, which would have created a second package).
+
+The singleton was written so winget installs the single runtime under
+`codewhale` + `codew` and never a `codewhale-tui` command. GitHub Releases
+retain byte-identical `codewhale-tui-*` filenames only for legacy updater
+compatibility.
 
 ## Files
 
-- `Hmbown.CodeWhale.yaml` — singleton manifest for `winget install Hmbown.CodeWhale`. The
+- `HunterBown.CodeWhale.yaml` — singleton manifest for `winget install HunterBown.CodeWhale`. The
   installers all point at the signed (or checksum-verified) GitHub Release assets for the same
   version (`CodeWhaleSetup.exe` for x64 NSIS, plus portable ZIP fallbacks for x64/arm64).
 - `generate-winget-manifest.sh` — bumps `PackageVersion`, `ReleaseDate`, and the four
   `InstallerSha256` placeholders from a local `release-assets/` checkout.
-- `.winget/Hmbown.CodeWhale.yaml` (repo root) is a verbatim mirror for tooling that expects `.winget/`.
-  Keep both in sync; `packaging/winget/Hmbown.CodeWhale.yaml` is canonical.
+- `.winget/HunterBown.CodeWhale.yaml` (repo root) is a verbatim mirror for tooling that expects `.winget/`.
+  Keep both in sync; `packaging/winget/HunterBown.CodeWhale.yaml` is canonical.
 
 ## Version flow
 
@@ -24,23 +38,23 @@ installs a `codewhale-tui` command. GitHub Releases retain byte-identical
    ```bash
    ./packaging/winget/generate-winget-manifest.sh X.Y.Z /path/to/release-assets
    ```
-   It rewrites both `packaging/winget/Hmbown.CodeWhale.yaml` and `.winget/Hmbown.CodeWhale.yaml`
+   It rewrites both `packaging/winget/HunterBown.CodeWhale.yaml` and `.winget/HunterBown.CodeWhale.yaml`
    with the fresh version and the four SHA-256 values extracted from `codewhale-artifacts-sha256.txt`.
 3. Validate locally with `winget validate` (requires winget + the manifest schema):
    ```bash
-   winget validate --manifest packaging/winget/Hmbown.CodeWhale.yaml
+   winget validate --manifest packaging/winget/HunterBown.CodeWhale.yaml
    # or the Microsoft validator in winget-pkgs CI:
    # https://github.com/microsoft/winget-pkgs#validation
    ```
 4. Submit to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) via
-   `wingetcreate` or a manual PR that adds `manifests/h/Hmbown/CodeWhale/X.Y.Z/`:
+   `wingetcreate` or a manual PR that adds `manifests/h/HunterBown/CodeWhale/X.Y.Z/`:
    ```bash
-   wingetcreate update Hmbown.CodeWhale --version X.Y.Z --urls \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/CodeWhaleSetup.exe \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64-portable.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64-portable.zip
+   wingetcreate update HunterBown.CodeWhale --version X.Y.Z --urls \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/CodeWhaleSetup.exe \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64-portable.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64-portable.zip
    ```
    The generated PR must pass the winget-pkgs validation workflow before merge.
 

@@ -17,15 +17,31 @@ use axum::http::{HeaderName, StatusCode};
 use axum::response::IntoResponse;
 use codewhale_agent::ModelRegistry;
 use codewhale_config::{
-    ConfigApiKeyValueKind, ConfigToml, ProviderKind, auth_mode_disables_api_key,
-    classify_config_api_key_value, is_upstream_auth_header,
+    ConfigApiKeyValueKind, ConfigToml, ProviderKind, apply_openrouter_vendor,
+    auth_mode_disables_api_key, classify_config_api_key_value, is_upstream_auth_header,
     provider::WireFormat,
     provider_base_url_is_official, provider_preserves_custom_base_url_model,
     route::{LogicalModelRef, RouteError, RouteRequest, RouteResolver},
+    validate_openrouter_vendor,
 };
 use serde_json::Value;
 
 use super::AppState;
+
+// ── Upstream deadlines ─────────────────────────────────────────────────
+
+/// Connect budget for the upstream forward. Matches the 10s connect bound
+/// used by the TUI client's non-streaming requests (vision, the shared
+/// retry client).
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Total budget for one upstream forward, connect through body end. The
+/// handler rejects streaming (`stream: true`) and reads the full upstream
+/// body, so without a client-level total a provider that accepts the
+/// connection and stalls — or trickles the body — wedges this handler (and
+/// the caller's connection) indefinitely. 1800s mirrors the TUI client's
+/// non-streaming envelope for the same request class.
+const UPSTREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 // ── Resolved endpoint ──────────────────────────────────────────────────
 
@@ -114,11 +130,7 @@ fn resolve_endpoint(
     });
     let auth_disabled = auth_mode_disables_api_key(auth_mode);
 
-    let configured_api_key = provider_cfg.api_key.as_deref().or_else(|| {
-        (provider_kind == ProviderKind::Deepseek)
-            .then_some(config.api_key.as_deref())
-            .flatten()
-    });
+    let configured_api_key = provider_cfg.api_key.as_deref();
 
     // Provider auth comes only from the resolved endpoint configuration. The
     // HTTP request's Authorization header authenticates the caller to the local
@@ -190,11 +202,6 @@ fn provider_base_url(config: &ConfigToml, provider: ProviderKind) -> String {
         .for_provider(provider)
         .base_url
         .clone()
-        .or_else(|| {
-            (provider == ProviderKind::Deepseek)
-                .then(|| config.base_url.clone())
-                .flatten()
-        })
         .unwrap_or_else(|| metadata.default_base_url().to_string())
 }
 
@@ -312,9 +319,38 @@ pub(crate) async fn chat_completions_handler(
     // Extract model from body.
     let request_model = body.get("model").and_then(|v| v.as_str());
 
-    // Resolve endpoint.
+    // Resolve endpoint. Everything the upstream call needs is copied out of
+    // the config here and the read guard is released before any network
+    // I/O: a slow upstream must never hold the shared config lock, because
+    // a queued `app/config/set` writer would then stall every later reader.
     let config = state.config.read().await;
-    let endpoint = match resolve_endpoint(&config, &state.registry, request_model) {
+    let vendor = config
+        .providers
+        .for_provider(config.provider)
+        .vendor
+        .as_deref()
+        .unwrap_or_default();
+    let openrouter_vendor = match validate_openrouter_vendor(vendor) {
+        Ok(vendor) if vendor.is_none() || config.provider == ProviderKind::Openrouter => {
+            vendor.map(str::to_owned)
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "vendor is supported only for OpenRouter and must be a slug without whitespace or control characters",
+                        "type": "invalid_request_error",
+                        "code": "invalid_vendor"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let resolved = resolve_endpoint(&config, &state.registry, request_model);
+    drop(config);
+    let endpoint = match resolved {
         Ok(endpoint) => endpoint,
         Err(error) => {
             return (
@@ -353,6 +389,9 @@ pub(crate) async fn chat_completions_handler(
     // byte-for-byte passthrough values, while known aliases become their exact
     // provider wire ids before forwarding.
     body["model"] = serde_json::Value::String(endpoint.model.clone());
+    // The operator pin overrides caller ordering/fallback preferences while
+    // retaining caller restrictions such as only, ignore, and privacy policy.
+    apply_openrouter_vendor(&mut body, openrouter_vendor.as_deref());
 
     let url = upstream_url(&endpoint, &body);
 
@@ -373,8 +412,12 @@ pub(crate) async fn chat_completions_handler(
             .into_response();
     }
 
-    // Build upstream request.
+    // Build upstream request. The shared platform builder sets no timeouts,
+    // so the proxy would hang forever on an accept-and-stall upstream;
+    // bound both the connect and the whole non-streaming round trip.
     let upstream_req = codewhale_release::platform_http_client_builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .timeout(UPSTREAM_TOTAL_TIMEOUT)
         .build()
         .map_err(|e| {
             (
@@ -472,6 +515,29 @@ mod tests {
 
     fn install_crypto_provider() {
         crate::install_test_crypto_provider();
+    }
+
+    // The proxy forwards with a client built per request, and reqwest gives
+    // no accessor for a built client's budgets, so a behavioral test would
+    // need an accept-and-stall upstream and a multi-second (connect) or
+    // half-hour (total) wait. Pin the values instead: if the handler stops
+    // applying them this test cannot see it, but a silent constant change
+    // or an inversion of the connect/total ordering cannot slip through.
+    #[test]
+    fn upstream_deadlines_are_bounded_and_ordered() {
+        assert_eq!(UPSTREAM_CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
+        assert_eq!(UPSTREAM_TOTAL_TIMEOUT, std::time::Duration::from_secs(1800));
+        assert!(
+            UPSTREAM_TOTAL_TIMEOUT > UPSTREAM_CONNECT_TIMEOUT,
+            "the total forward budget must leave room beyond the connect budget"
+        );
+        // The shared platform builder must accept both bounds; the handler
+        // chains them onto this builder.
+        codewhale_release::platform_http_client_builder()
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .timeout(UPSTREAM_TOTAL_TIMEOUT)
+            .build()
+            .expect("platform builder accepts the proxy deadlines");
     }
 
     /// Start a minimal upstream mock server that echoes back what it received.
@@ -675,6 +741,167 @@ api_key = {provider_api_key:?}
             .await
             .expect("body bytes");
         serde_json::from_slice(&bytes).expect("json response")
+    }
+
+    #[tokio::test]
+    async fn openrouter_vendor_forwarding_preserves_pin_and_caller_restrictions() {
+        install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_url = format!("http://{}", listener.local_addr().unwrap());
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel::<Value>();
+        let upstream = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |Json(body): Json<Value>| {
+                let captured = captured_tx.clone();
+                async move {
+                    captured.send(body).unwrap();
+                    Json(serde_json::json!({"choices": []}))
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        for (provider, vendor, status) in [
+            ("openrouter", "deepinfra/turbo", StatusCode::OK),
+            ("openrouter", "", StatusCode::OK),
+            ("openrouter", "bad vendor fixture", StatusCode::BAD_REQUEST),
+            ("arcee", "deepinfra/turbo", StatusCode::BAD_REQUEST),
+            ("arcee", "", StatusCode::OK),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let openrouter_vendor = if provider == "openrouter" {
+                vendor
+            } else {
+                "dormant/pin"
+            };
+            let arcee_vendor = if provider == "arcee" { vendor } else { "" };
+            fs::write(&config_path, format!(
+                "provider = {provider:?}\n\
+                 [providers.openrouter]\nbase_url = {mock_url:?}\napi_key = \"fixture-openrouter-key\"\nvendor = {openrouter_vendor:?}\n\
+                 [providers.arcee]\nbase_url = {mock_url:?}\napi_key = \"fixture-arcee-key\"\nvendor = {arcee_vendor:?}\n"
+            )).unwrap();
+            let state = build_state(Some(config_path), None).unwrap();
+            let app = app_router(state, &[]);
+            let caller_policy = serde_json::json!({
+                "order": ["caller/escape"],
+                "allow_fallbacks": true,
+                "only": ["caller/restriction"],
+                "ignore": ["caller/blocked"],
+                "zdr": true,
+                "data_collection": "deny",
+                "require_parameters": true
+            });
+            let body = serde_json::json!({
+                "model": "fixture/model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "provider": caller_policy
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{provider}: {vendor}");
+            if status == StatusCode::BAD_REQUEST {
+                let error = response_body_json(response).await;
+                assert_eq!(error["error"]["code"], "invalid_vendor");
+                assert!(!error.to_string().contains(vendor));
+                assert!(
+                    captured_rx.try_recv().is_err(),
+                    "invalid config reached upstream"
+                );
+            } else {
+                let forwarded = captured_rx.try_recv().expect("captured forwarded request");
+                let mut expected = caller_policy;
+                if provider == "openrouter" && !vendor.is_empty() {
+                    expected["order"] = serde_json::json!([vendor]);
+                    expected["allow_fallbacks"] = serde_json::json!(false);
+                }
+                assert_eq!(forwarded["provider"], expected, "{provider}: {vendor}");
+                assert_eq!(forwarded["model"], "fixture/model");
+            }
+        }
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_request_does_not_hold_the_config_lock() {
+        // A slow upstream used to keep `state.config.read()` alive for the
+        // whole request, so a concurrent `app/config/set` (a writer) blocked
+        // and, with tokio's writer-preferring lock, every later reader
+        // queued behind it.
+        install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_url = format!("http://{}", listener.local_addr().unwrap());
+        let (arrived_tx, mut arrived_rx) = mpsc::unbounded_channel::<()>();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let upstream_release = release.clone();
+        let upstream = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let arrived = arrived_tx.clone();
+                let release = upstream_release.clone();
+                async move {
+                    arrived.send(()).unwrap();
+                    release.notified().await;
+                    Json(serde_json::json!({"choices": []}))
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "provider = \"arcee\"\n[providers.arcee]\nbase_url = {mock_url:?}\nmodel = \"trinity-large-thinking\"\napi_key = \"arcee-configured-key\"\n"
+            ),
+        )
+        .expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+        let app = app_router(state.clone(), &[]);
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
+        let request = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx.recv())
+            .await
+            .expect("upstream should receive the request")
+            .expect("arrival signal");
+        assert!(
+            state.config.try_write().is_ok(),
+            "config must be writable while the upstream request is in flight"
+        );
+
+        release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+            .await
+            .expect("request should finish once upstream answers")
+            .expect("join request");
+        assert_eq!(response.status(), StatusCode::OK);
+        upstream_task.abort();
     }
 
     #[tokio::test]
@@ -942,61 +1169,45 @@ api_key = {provider_api_key:?}
     }
 
     #[test]
-    fn opencode_go_app_route_cannot_cross_route_or_bypass_chat_allowlist() {
+    fn opencode_go_app_route_uses_model_protocol_without_cross_provider_fallback() {
         let registry = ModelRegistry::default();
-        let messages_models = [
-            "minimax-m3",
-            "minimax-m2.7",
-            "minimax-m2.5",
-            "qwen3.7-max",
-            "qwen3.7-plus",
-            "qwen3.6-plus",
-        ];
-
-        for model in messages_models {
+        for (model, wire) in [
+            ("grok-4.5", WireFormat::ChatCompletions),
+            ("kimi-k3", WireFormat::ChatCompletions),
+            ("grok-4.6", WireFormat::Responses),
+            ("gpt-5.6-luna", WireFormat::Responses),
+            ("minimax-m3", WireFormat::AnthropicMessages),
+            ("qwen3.8-max", WireFormat::AnthropicMessages),
+        ] {
             for requested in [model.to_string(), format!("opencode-go/{model}")] {
-                let mut config = ConfigToml {
-                    provider: ProviderKind::OpencodeGo,
-                    ..ConfigToml::default()
-                };
-                config.providers.opencode_go.model = Some(requested.clone());
-                assert!(
-                    matches!(
-                        resolve_endpoint(&config, &registry, None),
-                        Err(RouteError::ForeignModelForDirectProvider { .. })
-                    ),
-                    "static {requested} must be rejected"
-                );
-                assert!(
-                    matches!(
-                        resolve_endpoint(&config, &registry, Some(&requested)),
-                        Err(RouteError::ForeignModelForDirectProvider { .. })
-                    ),
-                    "request {requested} must not cross-route"
-                );
-
-                config.providers.opencode_go.base_url =
-                    Some("https://go-gateway.example.test/v1".to_string());
-                assert!(
-                    matches!(
-                        resolve_endpoint(&config, &registry, Some(&requested)),
-                        Err(RouteError::ForeignModelForDirectProvider { .. })
-                    ),
-                    "custom-base {requested} must still be rejected"
-                );
+                for base_url in [None, Some("https://go-gateway.example.test/v1".into())] {
+                    let mut config = ConfigToml {
+                        provider: ProviderKind::OpencodeGo,
+                        ..ConfigToml::default()
+                    };
+                    config.providers.opencode_go.model = Some(requested.clone());
+                    config.providers.opencode_go.base_url = base_url;
+                    for selection in [None, Some(requested.as_str())] {
+                        let endpoint = resolve_endpoint(&config, &registry, selection)
+                            .expect("documented Go route");
+                        assert_eq!(endpoint.provider, ProviderKind::OpencodeGo);
+                        assert_eq!(endpoint.model, model);
+                        assert_eq!(endpoint.wire_format, wire);
+                    }
+                }
             }
         }
-
-        for model in ["grok-4.5", "kimi-k3"] {
-            let mut valid = ConfigToml {
+        for model in ["claude-unproven", "gpt-unlisted", "openai/gpt-5.6-luna"] {
+            let mut config = ConfigToml {
                 provider: ProviderKind::OpencodeGo,
                 ..ConfigToml::default()
             };
-            valid.providers.opencode_go.model = Some(format!("opencode-go/{model}"));
-            let endpoint = resolve_endpoint(&valid, &registry, None).expect("valid Go route");
-            assert_eq!(endpoint.provider, ProviderKind::OpencodeGo);
-            assert_eq!(endpoint.model, model);
-            assert_eq!(endpoint.wire_format, WireFormat::ChatCompletions);
+            config.providers.opencode_go.model = Some(model.into());
+            assert!(resolve_endpoint(&config, &registry, None).is_err());
+            assert!(resolve_endpoint(&config, &registry, Some(model)).is_err());
+            config.providers.opencode_go.base_url =
+                Some("https://go-gateway.example.test/v1".into());
+            assert!(resolve_endpoint(&config, &registry, Some(model)).is_err());
         }
     }
 

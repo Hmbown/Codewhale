@@ -552,7 +552,7 @@ def validate_baseline_transition(current: dict, previous: dict | None) -> list[M
 
 
 def detect_local_baseline_ref(root: Path = REPO_ROOT) -> str | None:
-    """Use the local feature-branch merge-base when available."""
+    """Use the feature-branch merge-base, or the first parent on main."""
     process = subprocess.run(
         ["git", "merge-base", "HEAD", "origin/main"],
         cwd=root,
@@ -560,9 +560,7 @@ def detect_local_baseline_ref(root: Path = REPO_ROOT) -> str | None:
         text=True,
         check=False,
     )
-    if process.returncode != 0:
-        return None
-    baseline = process.stdout.strip()
+    baseline = process.stdout.strip() if process.returncode == 0 else None
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=root,
@@ -570,7 +568,18 @@ def detect_local_baseline_ref(root: Path = REPO_ROOT) -> str | None:
         text=True,
         check=False,
     ).stdout.strip()
-    return baseline if baseline and baseline != head else None
+    if baseline and baseline != head:
+        return baseline
+    # A main checkout aligned with origin/main still has migration history.
+    # Comparing its parent preserves the ratchet after push and in manual CI.
+    parent = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return parent.stdout.strip() if parent.returncode == 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -1090,6 +1099,20 @@ def scan_leaf_handlers(leaf_scope: list[str], root: Path) -> tuple[list[RustItem
     return items, violations
 
 
+def group_source_scope(group_name: str, node: dict, root: Path) -> list[str]:
+    """Preserve the immutable historical topology and scan every debug source.
+
+    Recursive discovery includes receipts, module roots, helpers, tests and new
+    nested files even when the historical manifest never listed them. Retaining
+    declared paths also preserves missing-file diagnostics; no scope is removed.
+    """
+    scope = set(node.get("scope", []))
+    if group_name == "debug":
+        directory = root / "crates/tui/src/commands/groups/debug"
+        scope.update(path.relative_to(root).as_posix() for path in directory.rglob("*.rs"))
+    return sorted(scope)
+
+
 def check_source_frontier(topology: dict, frontier: list[str], root: Path = REPO_ROOT) -> list[SourceScanViolation]:
     """Bidirectional scan: the frontier must exactly equal the leaves whose
     scopes still contain concrete-App handlers.
@@ -1106,7 +1129,9 @@ def check_source_frontier(topology: dict, frontier: list[str], root: Path = REPO
     frontier_set = set(frontier)
 
     for group_name, node in topology.items():
-        group_items, scan_violations = scan_leaf_handlers(node.get("scope", []), root)
+        group_items, scan_violations = scan_leaf_handlers(
+            group_source_scope(group_name, node, root), root
+        )
         violations.extend(scan_violations)
         handlers = [it for it in group_items if it.is_concrete_app]
 

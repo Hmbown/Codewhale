@@ -1,11 +1,17 @@
 # Build and test performance
 
+> 阅读简体中文版：[zh_hans/BUILD_PERFORMANCE.md](zh_hans/BUILD_PERFORMANCE.md)。
+
 Measured facts about how long Codewhale takes to build and test, what was
 changed to make the contributor loop faster, and what is deferred. Numbers
 are from one machine (Apple Silicon, 14 cores, rustc 1.97.0, Xcode 26.2
 `ld-1230`) taken while four other cargo jobs were running (1-minute load
 average 10–27, recorded next to each number), so treat them as relative
 before/after evidence, not benchmarks.
+
+> Split plan: [TUI deconstruction](design/TUI_DECONSTRUCTION.md) contains the
+> September 9 source audit and current proposed extraction order. Measurements
+> below are historical; the B3/deferred candidate lists are not an execution queue.
 
 ## Where the time goes (baseline, commit 533c530b)
 
@@ -33,7 +39,16 @@ Structural facts behind those numbers:
   no default features). `cargo tree -d` shows only routine duplicates
   (`toml` 0.8/1.1, `thiserror` 1/2, `strum` 0.27/0.28, `syn` 2/3,
   `sha2` 0.10/0.11) that come from third-party crates, not from workspace
-  choices.
+  choices. The global allocator is mimalloc by default; the off-by-default
+  `rusty-alloc` cargo feature on `codewhale-tui`/`codewhale-cli` swaps it for
+  the pure-Rust `rusty_alloc` remake (#5872). Use
+  `cargo build -p codewhale-cli --no-default-features --features rusty-alloc`
+  (or `-p codewhale-tui`) to exclude mimalloc and its C build dependency.
+  Cargo features are additive: `--features rusty-alloc` alone retains the
+  default mimalloc dependency even though the Rust allocator handles allocations.
+  This removes the allocator's C build path; other native dependencies may still
+  require a C toolchain. With neither allocator feature, the standard library
+  system allocator is used.
 - `[profile.dev] debug = "line-tables-only"` is already set (#5246) and
   Cargo already uses `split-debuginfo = unpacked` on macOS.
 - `target/debug` grows past 50 GB only through accumulation across
@@ -49,7 +64,7 @@ a0-incremental-lib-test-timing.html, a0-llvm-lines-top40.txt).
 | Receipt | Wall | Load (1 min) |
 | --- | --- | --- |
 | Cold `cargo test -p codewhale-tui --lib --locked --no-run --timings` | 127 s (user 329 s) | 8.9 |
-| `touch crates/tui/src/elapsed.rs` + same command | 21 s | 12.3 |
+| `touch crates/runtime/src/elapsed.rs` + same command | 21 s | 12.3 |
 | `touch` + `cargo test -p codewhale-tui --lib --locked elapsed::` (the everyday loop) | 20 s (4 tests run) | 11.2 |
 | Lib-test binary size | 357 MB (`codewhale_tui-<hash>`); links with the `__eh_frame section too large (max 16MB)` compact-unwind warning | — |
 | `cargo check -p codewhale-tui --lib --tests` incremental after `touch` (frontend only) | 14 s | 6.2 |
@@ -138,12 +153,14 @@ Defaults never contain a machine-specific absolute path:
 export CODEWHALE_CACHE_ROOT=/path/to/cache/codewhale
 
 scripts/dev-cache.sh --self-check
-scripts/dev-test.sh crates/tui/src/elapsed.rs
+scripts/dev-test.sh crates/runtime/src/elapsed.rs
 CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked --no-run
 ```
 
-Hermetic script tests (no rustc compile): `sh scripts/dev-cache.test.sh` and
-`sh scripts/dev-test.test.sh`.
+Hermetic script test (no rustc compile): `sh scripts/dev-cache.test.sh`.
+`scripts/dev-test.sh --self-check` reports the helper's resolved cache
+topology; its own script test, `scripts/dev-test.test.sh`, was removed in
+`d64b9429b7`.
 
 ### Helper verification (2026-08-15, this worktree)
 
@@ -165,7 +182,7 @@ helper now stays isolated unless `CODEWHALE_DEV_CACHE=local` or `0`.
 | Warm isolated same command (after the stub-target fix) | 0.13 s | `Finished` in 0.07 s |
 | `touch crates/config/src/lib.rs` + isolated `--no-run` | 0.93 s | only `codewhale-config` rebuilt |
 | First isolated `codewhale-tui --lib --no-run` | **121.5 s** (user 305 s) | 600 units; 340 MB binary; A0 empty-target was 127 s / 329 s |
-| `touch crates/tui/src/elapsed.rs` + isolated `--no-run` | **18.15 s** | everyday compile loop; A0 was 21 s / 19 s |
+| `touch crates/runtime/src/elapsed.rs` + isolated `--no-run` | **18.15 s** | everyday compile loop; A0 was 21 s / 19 s |
 | `CODEWHALE_SCCACHE=1` config `--no-run` on the already-warm tree | 5.21 s then 0.14 s | wrapper and `SCCACHE_DIR=…/sccache/<rustc-commit>` set; 0 sccache hits because only workspace crates recompiled and the build-dir was not emptied |
 
 **Test-runtime**:
@@ -174,14 +191,15 @@ helper now stays isolated unless `CODEWHALE_DEV_CACHE=local` or `0`.
 | --- | ---: | --- |
 | `scripts/dev-test.sh config` (nextest, 557 tests) | run 0.479 s / real 2.40 s | includes a 0.85 s profile flip compile |
 | `CODEWHALE_DEV_NEXTEST=0 scripts/dev-test.sh config` (libtest) | body 0.11 s / real 0.27 s | 557 tiny tests: process-per-test is slower here |
-| `scripts/dev-test.sh crates/tui/src/elapsed.rs` | run 0.023 s / real 2.81 s | 4 passed, 10,516 skipped; nextest filter works |
+| `scripts/dev-test.sh crates/runtime/src/elapsed.rs` | run 0.023 s / real 2.81 s | 4 passed, 10,516 skipped; nextest filter works |
 
 The 268 s → ~100 s nextest win remains the earlier tui-unit-suite receipt.
 Config is too small for that win; nextest is still the right default for
 unfiltered crate/workspace runs.
 
-**Ergonomics:** `sh` and `dash` both pass `dev-cache.test.sh` (22) and
-`dev-test.test.sh` (27). Missing sccache is a fallback. `--list` covers
+**Ergonomics:** `sh` and `dash` both passed `dev-cache.test.sh` (22) and
+`dev-test.test.sh` (27) at the time; `dev-test.test.sh` has since been removed
+(`d64b9429b7`). Missing sccache is a fallback. `--list` covers
 every workspace crate.
 
 ### A2 nextest in CI
@@ -285,19 +303,67 @@ manifest,profile,progress,retry,terminal,work}.rs` have zero consumers and
 zero build cost (`core/mod.rs` documents them as staged scaffolding,
 TUI-DOG-017) — left as they are.
 
-### B3 order (not started)
+### B3 order
 
 1. `ApiProvider` + the exact-route helpers (`is_exact_*_route`) out of
    `crates/tui/src/config.rs` into codewhale-config, unblocking
-   `ReasoningEffort`.
-2. `localization` + `locales/*.json` → `codewhale-i18n` (the 312 k-line
-   `rust_i18n` closure leaves the tui unit; locale-only edits stop
-   rebuilding the TUI).
-3. `palette` + `glyphs` → `codewhale-palette` (also fixes web/CWC token
-   drift).
-4. `client/` (provider wire adapters) → `codewhale-client`, then
-   `fleet/`, `tools/`, `core/engine` — each behind the crate boundary its
-   tests already respect, measured with the A0 table.
+   `ReasoningEffort`. **Not started, and now the critical path** — see
+   item 4.
+2. **Landed.** `localization` + `locales/*.json` →
+   `codewhale-localization` (the 312 k-line `rust_i18n` closure left the
+   tui unit; locale-only edits no longer rebuild the TUI).
+3. **Landed.** `palette` → `codewhale-palette`; `command_safety` →
+   `codewhale-execpolicy` (it already owned `ApprovalMode`, so that move
+   removes a dependency edge rather than adding one).
+4. `client/` (provider wire adapters) → `codewhale-client`: **blocked on
+   item 1, not merely ordered after it.** With doc comments and
+   `#[cfg(test)]` blocks excluded, `client` still has 20 production
+   `crate::` edges. Three of them are hard:
+   - `crate::config` — `Config`, `ProvidersConfig`, `ProviderConfig`,
+     `TuiConfig`, `ApiProvider`, `RetryPolicy`, `validate_route`,
+     `wire_model_for_provider_route` and ~130 provider base-URL / model-id
+     constants. `crates/tui/src/config` is 29.7 k lines and itself reaches
+     `config_persistence`, `oauth`, `credentials`, `tui`, `fleet`,
+     `goal_loop`, `sandbox`, `lsp` … in production, so it cannot follow
+     `client` out.
+   - `crate::tools` ⇄ `client` is a genuine cycle: `client` uses
+     `tools::schema_sanitize`, `tools::large_output_router` and
+     `tools::truncate`, while `tools/{spec,review,registry,rlm,verify,
+     speech,fim,web_search,web/backend,subagent/advisor}.rs` use
+     `client::{CodewhaleClient, ProviderNativeSearchClient,
+     ProviderNativeSearchRequest, SpeechSynthesisRequest,
+     RemoteControlInferencePermit}`.
+   - `crate::core` ⇄ `client` is the same shape: `client` uses
+     `core::events::bounded_tool_projection_warning_names`, while
+     `core/{engine,engine/preview,engine/dispatch,engine/turn_loop,
+     engine/reviewer,protocol_parity}.rs` use `client::{CodewhaleClient,
+     PreparedOutboundRequest, canonical_json, parse_usage,
+     is_reasoning_replay_placeholder, redact_url_for_display}`.
+   Item 1 is therefore the whole precondition: move `ApiProvider`, the
+   exact-route helpers and the provider constants into codewhale-config
+   first, then re-measure the `tools` and `core` cycles.
+5. **Landed as the tractable part of item 4.** `models` +
+   `model_catalog` → `codewhale-models` (1,835 lines, 140 consumer files).
+   These sit directly under `client` on its dependency spine, had exactly
+   one production edge between them and none to the rest of the TUI, and
+   `models` was already half a re-export facade over
+   `codewhale_core::{request, role}`.
+6. Then `fleet/`, `tools/`, `core/engine` — each behind the crate boundary
+   its tests already respect, measured with the A0 table.
+
+## One build per machine
+
+`scripts/dev-cargo.sh` and `scripts/dev-test.sh` hold an exclusive machine-wide
+build lock (`<cache root>/build.lock`, via `scripts/build-lock.py`) for the
+whole Cargo invocation. Cargo's own lock is per target directory, so two
+agents building into different target dirs still ran concurrently and exhausted
+memory. A second build waits and prints who holds the lock. Set
+`CODEWHALE_BUILD_LOCK=0` to skip it, or `CODEWHALE_BUILD_LOCK_FILE` to name the
+lock file. A self-hosted CI runner on the same machine joins the lock when its
+`.env` sets `CODEWHALE_BUILD_LOCK_FILE` to the same path: the macOS Test job
+then holds it from the first test build to the end of the job. The lock is advisory: Cargo started
+directly, outside these scripts, does not take it, and on platforms without
+`fcntl` (Windows) the build runs unlocked after a warning.
 
 ## What changed (this lane)
 
@@ -305,7 +371,8 @@ TUI-DOG-017) — left as they are.
    isolated build-dir topology** from `scripts/dev-test.sh`. New worktrees
    no longer compile into a private cold `./target` unless the helper is
    disabled. sccache is opt-in and incremental-gated. Script self-checks
-   live in `scripts/dev-cache.test.sh` and `scripts/dev-test.test.sh`.
+   live in `scripts/dev-cache.test.sh` and `scripts/dev-test.sh --self-check`
+   (`scripts/dev-test.test.sh` was removed in `d64b9429b7`).
 2. **`cargo nextest` is supported and documented** (`.config/nextest.toml`).
    Same test binaries, one process per test, so the tui unit suite runs in
    ~100 s instead of ~270 s here and slow or hanging tests are named instead
@@ -359,8 +426,7 @@ path today):
 | Candidate crate | From | Why it is a clean cut | Consumers to re-export from |
 | --- | --- | --- | --- |
 | `codewhale-glyphs` | `crates/tui/src/tui/glyphs.rs` | Constant tables + pure fns; no crate-internal deps. | `crate::tui::glyphs` |
-| `codewhale-palette` | `crates/tui/src/palette/{tokens,themes,adapt,contrast,detect,osc11,user_theme}.rs` + `assets/user-theme.schema.json` | Pure color math and theme tables; depends on ratatui `Color` and `codewhale_config::codewhale_home` only. Also unblocks the web/CWC token drift noted in the tokens survey. | `crate::palette` |
-| `codewhale-i18n` | `crates/tui/src/localization.rs` + `crates/tui/locales/*.json` | The `rust_i18n::i18n!` macro compiles all 15 packs into whichever crate hosts it; moving it out means locale-only edits no longer rebuild the TUI. `MessageId` is a plain enum. | `crate::localization` |
+| `codewhale-i18n` | `crates/localization/src/lib.rs` + `crates/localization/locales/*.json` | The `rust_i18n::i18n!` macro compiles all 15 packs into whichever crate hosts it; moving it out means locale-only edits no longer rebuild the TUI. `MessageId` is a plain enum. | `crate::localization` |
 | `codewhale-mcp-transport` | `crates/tui/src/mcp/{sse,stdio,external_import}.rs` | Already talks to `codewhale-mcp`; the reviewed-launch binding is the only tui coupling. | `crate::mcp` |
 
 Rules for the split: pure moves plus `pub use` re-exports at the old

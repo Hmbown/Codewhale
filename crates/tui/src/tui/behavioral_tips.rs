@@ -7,9 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use crate::localization::{Locale, MessageId, tr};
 use crate::settings::Settings;
-use crate::tui::app::{App, AppMode, StatusToastLevel};
+use crate::tui::app::{App, StatusToast, StatusToastKind, StatusToastLevel};
+use codewhale_localization::{Locale, MessageId, tr};
 
 const MAX_TIPS_PER_SESSION: u8 = 1;
 const MAX_LIFETIME_IMPRESSIONS: u8 = 2;
@@ -17,20 +17,18 @@ const MAX_TRACKED_MANUAL_COMMANDS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BehavioralTip {
-    PlanningMode,
     BackgroundJobReceipt,
     ClearedInputRestore,
     McpValidation,
     RepeatedCommandHotbar,
     DurableStateWritten,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     TodoWriteHint,
 }
 
 impl BehavioralTip {
     const fn key(self) -> &'static str {
         match self {
-            Self::PlanningMode => "planning_mode",
             Self::BackgroundJobReceipt => "background_job_receipt",
             Self::ClearedInputRestore => "cleared_input_restore",
             Self::McpValidation => "mcp_validation",
@@ -42,7 +40,6 @@ impl BehavioralTip {
 
     const fn message_id(self) -> MessageId {
         match self {
-            Self::PlanningMode => MessageId::BehavioralTipPlanning,
             Self::BackgroundJobReceipt => MessageId::BehavioralTipBackgroundReceipt,
             Self::ClearedInputRestore => MessageId::BehavioralTipClearedInput,
             Self::McpValidation => MessageId::BehavioralTipMcpValidation,
@@ -55,7 +52,6 @@ impl BehavioralTip {
     fn message(self, locale: Locale) -> String {
         let template = tr(locale, self.message_id());
         match self {
-            Self::PlanningMode => template.replace("{key}", "Tab"),
             Self::BackgroundJobReceipt => template.replace("{key}", "Enter"),
             Self::ClearedInputRestore => template.replace("{chord}", "Ctrl+Z"),
             Self::McpValidation => template.replace("{command}", "codewhale mcp validate"),
@@ -66,16 +62,40 @@ impl BehavioralTip {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BehavioralTipState {
+    enabled: bool,
     shown_this_session: HashSet<BehavioralTip>,
     session_impressions: u8,
     manual_command_counts: HashMap<u64, u8>,
 }
 
+impl Default for BehavioralTipState {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
 impl BehavioralTipState {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            shown_this_session: HashSet::new(),
+            session_impressions: 0,
+            manual_command_counts: HashMap::new(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn guidance_available(&self) -> bool {
+        self.enabled && self.session_impressions < MAX_TIPS_PER_SESSION
+    }
+
     fn eligible_in_session(&self, tip: BehavioralTip) -> bool {
-        self.session_impressions < MAX_TIPS_PER_SESSION && !self.shown_this_session.contains(&tip)
+        self.guidance_available() && !self.shown_this_session.contains(&tip)
     }
 
     fn eligible(&self, tip: BehavioralTip, lifetime_impressions: u8) -> bool {
@@ -84,6 +104,10 @@ impl BehavioralTipState {
 
     fn record_impression(&mut self, tip: BehavioralTip) {
         self.shown_this_session.insert(tip);
+        self.record_guidance_impression();
+    }
+
+    pub(crate) fn record_guidance_impression(&mut self) {
         self.session_impressions = self.session_impressions.saturating_add(1);
     }
 
@@ -103,6 +127,23 @@ impl BehavioralTipState {
 }
 
 impl App {
+    /// A preference change never acknowledges errors, approvals, or recovery
+    /// notices. Keep impression caps intact when tips are enabled again.
+    pub fn set_contextual_tips_enabled(&mut self, enabled: bool) {
+        self.behavioral_tips.enabled = enabled;
+        if !enabled {
+            self.status_toasts.retain(|toast| {
+                !matches!(
+                    toast.kind,
+                    StatusToastKind::BehavioralTip(_) | StatusToastKind::PluginSuggestion
+                )
+            });
+            // One switch governs every plugin offer, the review row included.
+            self.plugin_cta.phase = crate::tui::plugin_suggestions::PluginCtaPhase::Hidden;
+        }
+        self.needs_redraw = true;
+    }
+
     /// Show a behavioral tip when both the quiet session cap and the persisted
     /// lifetime cap allow it. Persistence is best-effort: a read-only home
     /// must not make a useful in-session hint fail closed.
@@ -148,22 +189,19 @@ impl App {
             }
             self.behavioral_tips.record_impression(tip);
         }
-        self.push_status_toast(
+        let mut toast = StatusToast::new(
             tip.message(self.ui_locale),
             StatusToastLevel::Info,
             Some(8_000),
         );
+        toast.kind = StatusToastKind::BehavioralTip(tip);
+        self.push_status_toast_record(toast);
         true
     }
 
-    pub fn maybe_nudge_for_planning_prompt(&mut self, input: &str) -> bool {
-        self.mode != AppMode::Plan
-            && looks_like_planning_prompt(input)
-            && self.maybe_show_behavioral_tip(BehavioralTip::PlanningMode)
-    }
-
     pub fn note_manual_command_for_tip(&mut self, input: &str) -> bool {
-        self.behavioral_tips.note_manual_command(input)
+        self.behavioral_tips.enabled
+            && self.behavioral_tips.note_manual_command(input)
             && self.maybe_show_behavioral_tip(BehavioralTip::RepeatedCommandHotbar)
     }
 }
@@ -180,50 +218,21 @@ fn manual_command_fingerprint(input: &str) -> Option<u64> {
     Some(hasher.finish())
 }
 
-fn looks_like_planning_prompt(input: &str) -> bool {
-    let normalized = input
-        .to_ascii_lowercase()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
-        .collect::<String>();
-    let words = normalized.split_whitespace().collect::<Vec<_>>();
-    let has_word = |needle: &str| words.contains(&needle);
-
-    ["plan", "planning", "roadmap", "strategy", "outline"]
-        .into_iter()
-        .any(has_word)
-        || normalized.contains("how should we")
-        || normalized.contains("before we start")
-        || normalized.contains("step by step")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn planning_detector_matches_intent_without_substring_false_positives() {
-        assert!(looks_like_planning_prompt(
-            "Please outline a migration strategy"
-        ));
-        assert!(looks_like_planning_prompt("How should we approach this?"));
-        assert!(!looks_like_planning_prompt(
-            "Explain the planetary boundary"
-        ));
-        assert!(!looks_like_planning_prompt("Fix the failing test"));
-    }
-
-    #[test]
     fn session_and_lifetime_caps_keep_tips_quiet() {
         let mut state = BehavioralTipState::default();
-        assert!(state.eligible(BehavioralTip::PlanningMode, 0));
-        state.record_impression(BehavioralTip::PlanningMode);
-        assert!(!state.eligible(BehavioralTip::PlanningMode, 0));
+        assert!(state.eligible(BehavioralTip::McpValidation, 0));
+        state.record_impression(BehavioralTip::McpValidation);
         assert!(!state.eligible(BehavioralTip::McpValidation, 0));
+        assert!(!state.eligible(BehavioralTip::BackgroundJobReceipt, 0));
 
         let fresh_session = BehavioralTipState::default();
-        assert!(fresh_session.eligible(BehavioralTip::PlanningMode, 1));
-        assert!(!fresh_session.eligible(BehavioralTip::PlanningMode, MAX_LIFETIME_IMPRESSIONS));
+        assert!(fresh_session.eligible(BehavioralTip::McpValidation, 1));
+        assert!(!fresh_session.eligible(BehavioralTip::McpValidation, MAX_LIFETIME_IMPRESSIONS));
     }
 
     #[test]
@@ -241,7 +250,6 @@ mod tests {
     #[test]
     fn every_complete_locale_renders_tips_with_code_owned_controls() {
         let tips = [
-            BehavioralTip::PlanningMode,
             BehavioralTip::BackgroundJobReceipt,
             BehavioralTip::ClearedInputRestore,
             BehavioralTip::McpValidation,
@@ -255,10 +263,6 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            BehavioralTip::PlanningMode.message(Locale::En),
-            "Planning? Tab cycles to Plan mode"
-        );
         assert_eq!(
             BehavioralTip::BackgroundJobReceipt.message(Locale::En),
             "Receipts live in the Work panel — Enter opens the inspector"

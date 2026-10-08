@@ -10,8 +10,8 @@ use super::{
     NotificationKind, TidelineInbox, TidelineInboxRecord, render_tideline_inbox,
     tideline_inbox_hitboxes,
 };
-use crate::palette::UI_THEME;
 use crate::tui::golden_harness::{BLOCKER_SIZES, assert_matches_golden, render_golden_text};
+use codewhale_palette::UI_THEME;
 
 fn record(kind: NotificationKind, title: &str, at: &str, read: bool) -> TidelineInboxRecord {
     TidelineInboxRecord {
@@ -121,8 +121,8 @@ fn notifications_ascii_safe_projects_marks() {
     let text = draw(80, 24, &inbox);
     assert!(text.contains("* approval"), "gold ◆ projects to *: {text}");
     assert!(
-        text.contains(". whale done"),
-        "read ○ projects to .: {text}"
+        text.contains("o whale done"),
+        "read ○ projects to o, distinct from the filled marker: {text}"
     );
     for ch in text.chars() {
         if ch != '\n' {

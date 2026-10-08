@@ -1,0 +1,63 @@
+{
+  "description": "A tools-only server on an older protocol revision: no resource or prompt meta-tools may be advertised, and one call succeeds exactly once.",
+  "server_name": "conformance",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "serverInfo": {
+          "name": "tools-only",
+          "version": "0.1.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": {
+      "result": {
+        "tools": [
+          {
+            "name": "act",
+            "description": "Do the one thing.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "tools/call": [
+      {
+        "match": {
+          "name": "act"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "acted"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_act",
+      "input": {
+        "target": "fixture"
+      }
+    }
+  ]
+}

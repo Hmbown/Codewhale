@@ -40,6 +40,10 @@ pub enum FakeReply {
     /// Admit the task but never complete it (for cancellation tests). The
     /// completion sender is held so the channel stays open.
     Never,
+    /// Never finish admission: `spawn_task` itself stays pending, like a
+    /// saturated concurrency gate (for cancellation tests). The request is
+    /// still recorded, so `spawn_count` shows the task reached admission.
+    HoldAdmission,
 }
 
 #[derive(Debug)]
@@ -166,6 +170,9 @@ impl WorkflowDriver for FakeDriver {
             inner.next_id += 1;
             (format!("agent_{:04}", inner.next_id), reply, delay)
         };
+        if matches!(reply, FakeReply::HoldAdmission) {
+            return std::future::pending().await;
+        }
 
         let (tx, rx) = oneshot::channel();
         match reply {
@@ -182,6 +189,7 @@ impl WorkflowDriver for FakeDriver {
                     FakeReply::Reject(_)
                     | FakeReply::Unavailable(_)
                     | FakeReply::Never
+                    | FakeReply::HoldAdmission
                     | FakeReply::DropCompletion => unreachable!("handled above"),
                 };
                 match delay {

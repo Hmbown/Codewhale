@@ -40,7 +40,7 @@ test("prompt command starts a tracked background turn instead of blocking update
   const promptCase = handleCommand.slice(handleCommand.indexOf('case "prompt":'));
 
   assert.match(source, /const activeTurnTasks = new Map\(\);/);
-  assert.match(promptCase, /startPromptTurn\(chatId, action\.prompt\);/);
+  assert.match(promptCase, /startPromptTurn\(chatId, action\.prompt, identity\);/);
   assert.doesNotMatch(promptCase, /await\s+runPrompt\(/);
 
   const starter = extractFunction(source, "startPromptTurn");
@@ -56,7 +56,7 @@ test("stale callback acknowledgements cannot skip modal actions", async () => {
 
   assert.doesNotMatch(callbackHandler, /await\s+answerCallback\(query\.id,\s*"Working\.\.\."\)/);
   assert.match(callbackHandler, /answerCallback\(query\.id,\s*"Working\.\.\."\)\.catch/);
-  assert.match(callbackHandler, /await handleModalAction\(identity\.chatId, action, query\);/);
+  assert.match(callbackHandler, /await handleModalAction\(identity\.chatId, action, query, identity\);/);
 });
 
 test("polling persists offsets only after successful update handling", async () => {
@@ -106,7 +106,7 @@ test("callback replay is ignored before modal dispatch", async () => {
   assert.match(replayHelper, /if \(update\.update_id == null\) return false;/);
   assert.match(replayHelper, /return threadStore\.recordMessage\(`callback:\$\{update\.update_id\}`\);/);
   assert.ok(
-    resumeCase.indexOf("await threadStore.takeAction(action.token);") <
+    resumeCase.indexOf("await threadStore.takeAction(action.token, owner);") <
       resumeCase.indexOf("await resumeThread(chatId, stored.threadId);"),
     "resume callback actions should be consumed before dispatch"
   );

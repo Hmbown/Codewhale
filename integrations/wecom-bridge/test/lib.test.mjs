@@ -147,3 +147,20 @@ test("no keyword is both approval and denial", () => {
     );
   }
 });
+
+test("WeCom accepted turn origin survives reload and cannot transfer to a later member", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-wecom-origin-"));
+  try {
+    const statePath = path.join(dir, "thread-map.json");
+    const store = await ThreadStore.open(statePath);
+    await store.setChat("group-a", { threadId: "thread-a" });
+    await store.recordTurnOrigin("group-a", "thread-a", "turn-a", "wecom-user:alice");
+    await store.patchChat("group-a", { authorizedIdentity: { userId: "bob" }, activeTurnId: "turn-b" });
+    const reopened = await ThreadStore.open(statePath);
+    assert.equal(reopened.turnOrigin("group-a", "thread-a", "turn-a").actorId, "wecom-user:alice");
+    await assert.rejects(reopened.recordTurnOrigin("group-a", "thread-a", "turn-a", "wecom-user:bob"));
+    assert.equal(reopened.turnOrigin("group-a", "thread-a", "turn-a").actorId, "wecom-user:alice");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

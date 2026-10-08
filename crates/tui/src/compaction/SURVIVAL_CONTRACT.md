@@ -1,6 +1,13 @@
 # Compaction survival contract
 
-Schema version 1.
+Schema version 2.
+
+The protected last round means the current user instructions and the two
+most recent complete tool exchanges (including their assistant output).
+Short rounds remain intact. Older completed steps within a long uninterrupted
+task may be summarized; otherwise a single user request could grow forever.
+Tool-call batches and their results are never split, and unresolved calls
+prevent a split across them. Original history is saved before any rewrite.
 
 Language-invariant schema for session-tree journal entry types. Compaction
 may summarize older turns; it must not drop the fields marked **survive**
@@ -28,7 +35,7 @@ Journal kinds are the protocol `kind` strings (`header`, `user`,
 | --- | --- | --- | --- | --- | --- |
 | `header` | `payload` identity, `id`, `created_at` | always | — | — | secrets |
 | `user` | `payload` text / `SessionEntryKind::User.text` / `Message` text blocks | last-round verbatim (bounded token budget for older user text) | older user turns | obsolete narration | secrets, raw dumps |
-| `assistant` | `payload` text / `SessionEntryKind::Assistant.text` / `Message` text + `tool_use` | last-round verbatim | older assistant text | unsigned thinking beyond cap | internal placeholders |
+| `assistant` | `payload` text / `SessionEntryKind::Assistant.text` / `Message` text + `tool_use` | protected last-round verbatim | older assistant text and reasoning | — | internal placeholders |
 | `tool_result` | `payload.tool_use_id`, `content`, `is_error`, `content_blocks` | last-round bounded (8KiB) | older results | nested images, oversized blocks | secrets, raw large outputs |
 | `compaction` | `payload.summary`, `tokens_before`, `tokens_after`, `model`, coverage receipt | latest checkpoint only | prior summaries replaced | stacked prior summaries | placeholder-only summaries |
 | `branch_summary` | `payload.branch_id`, `summary`, `parent_branch_id` | always (not rewritten by compact) | — | — | — |
@@ -42,7 +49,7 @@ Journal kinds are the protocol `kind` strings (`header`, `user`,
 | `text` | `text` on the last user round | older user text may truncate to the retained-user token budget |
 | `tool_use` | `id`, `name`, `input`, `thought_signature` | last-round only; `id` is the join key for `tool_result` |
 | `tool_result` | `tool_use_id`, `content`, `is_error` | last-round; `content` truncated at 8KiB, `content_blocks` dropped if truncated |
-| `thinking` | `signature` (byte-for-byte) | unsigned `thinking` truncated at 4KiB; signed thinking is never rewritten |
+| `thinking` | `thinking`, `signature` (byte-for-byte) | all retained reasoning is replay protocol; older exchanges may be summarized as complete units |
 | `image_url` | last-round images | older images may be pruned with tool results |
 | `server_tool_use` / `*_tool_result` | last-round ids | older blocks may be summarized |
 
@@ -66,12 +73,12 @@ work.
 
 Rust now:
 
-- `last_round::build_replacement_history` keeps the bounded last user round
+- `last_round::build_replacement_history` keeps the bounded protected last round
   (assistant + tool results) and appends one checkpoint receipt. A trailing
   toolless user/assistant tail still walks back to the last tool-bearing
   round; chat-only sessions keep only the latest user turn.
 - `validate_last_round_coverage` refuses the rewrite if any of that round's
-  user texts, tool-call ids, tool-result ids, or assistant texts would vanish.
+  user texts, protected tool-call ids, tool-result ids, or assistant texts would vanish.
   Every user turn in the round is checked, not just the first: the round spans
   a tool-bearing turn plus the toolless tail after it, so checking one would
   let the latest turn -- the one this contract exists for -- be dropped. The

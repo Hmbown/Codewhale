@@ -24,6 +24,7 @@ function repoText(path: string): string {
 
 const matrix = JSON.parse(repoText("docs/public-surface-facts.json")) as {
   product: { terminology: Record<string, string> };
+  install: { recommended: string };
   control: { modes: string[]; permissionPostures: string[] };
 };
 
@@ -90,44 +91,33 @@ describe("shared product vocabulary", () => {
 });
 
 describe("shared getting-started path", () => {
-  it("keeps the four-step order: install → offline session → provider → fleet", () => {
+  it("connects a provider before the first task, with Fleet optional afterward", () => {
     expect(GETTING_STARTED_STEPS.map((s) => s.id)).toEqual([
       "install",
-      "first-session",
       "connect-provider",
+      "first-session",
       "fleet-workflow",
     ]);
   });
 
   it("points every step and next link at a real on-site route", () => {
-    const knownRoutes = [
-      "/install",
-      "/models",
-      "/docs",
-      "/docs/guide",
-      "/docs/vocabulary",
-      "/docs/fleet",
-      "/docs/hooks",
-      "/docs/modes",
-    ];
+    // A link is real when its locale-relative route has an app-router page.
+    const routeExists = (href: string) =>
+      existsSync(new URL(`../../app/[locale]${href}/page.tsx`, import.meta.url));
     for (const step of GETTING_STARTED_STEPS) {
-      expect(knownRoutes, step.link.href).toContain(step.link.href);
+      expect(routeExists(step.link.href), step.link.href).toBe(true);
       expect(step.title.en.trim().length).toBeGreaterThan(0);
       expect(step.title.zh.trim().length).toBeGreaterThan(0);
       expect(`${step.body.en}\n${step.body.zh}`).not.toMatch(BANNED_COPY);
     }
     for (const link of GUIDE_NEXT_LINKS) {
-      expect(knownRoutes, link.href).toContain(link.href);
+      expect(routeExists(link.href), link.href).toBe(true);
     }
     // Hooks discovery is a first-class next step, not buried prose.
     expect(GUIDE_NEXT_LINKS.some((l) => l.href === "/docs/hooks")).toBe(true);
   });
 
-  it("describes the first session truthfully: keyless launch, provider for replies", () => {
-    const first = GETTING_STARTED_STEPS.find((s) => s.id === "first-session")!;
-    expect(first.body.en).toContain("without any API key");
-    expect(first.body.en).toContain("Plan mode");
-    expect(first.body.en).toMatch(/Model replies need a provider/);
+  it("keeps offline setup documented without requiring it before a first task", () => {
     // The keyless-launch claim must stay backed by documented runtime
     // behavior. Assert the meaning docs/GUIDE.md owes this step -- a first
     // launch that asks only for the decisions still needed, and a provider
@@ -148,7 +138,8 @@ describe("shared getting-started path", () => {
     // leading with the Fleet noun; see its naming/compatibility section.
     const fleetDoc = repoText("docs/FLEET.md");
     const install = GETTING_STARTED_STEPS.find((s) => s.id === "install")!;
-    expect(install.commands).toContain("npm install -g codewhale");
+    expect(install.commands[0]).toBe(matrix.install.recommended);
+    expect(repoText("docs/INSTALL.md")).toContain(install.commands[0]);
     expect(guide).toContain("codewhale doctor");
     const provider = GETTING_STARTED_STEPS.find((s) => s.id === "connect-provider")!;
     expect(provider.commands).toContain("codewhale auth set --provider deepseek");

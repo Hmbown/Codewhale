@@ -1,13 +1,6 @@
-//! `codewhale mcp-server` must proxy to the user's configured servers.
-//!
-//! Regression coverage for #4727, where every configured server was wired to
-//! an in-process stub: `command`/`args`/`env` were never executed, `health`
-//! and `capabilities` answered `{"status": "ok"}` from a hardcoded literal,
-//! and every real tool came back "not found". A client had no way to tell a
-//! working integration from a fabricated one, which is why these tests assert
-//! on the *origin* of the answer, not merely that an answer arrived.
-
-#![cfg(unix)]
+//! The retired aggregation proxy's CLI spelling delegates to the native server.
+//! Exercise both real binary entrypoints with isolated config; never launch or
+//! rewrite legacy child-server definitions. The active MCP client is separate.
 
 use std::fs;
 use std::io::Write;
@@ -16,38 +9,6 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-
-/// A minimal MCP server in POSIX sh, so the test depends on nothing beyond the
-/// shell already present on every unix runner.
-const FAKE_SERVER: &str = r#"#!/bin/sh
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
-  if [ -z "$id" ]; then
-    continue
-  fi
-  case "$method" in
-    initialize)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"fake-mcp","version":"0"}}}\n' "$id"
-      ;;
-    tools/list)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"whoami","description":"report the spawned process","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
-      ;;
-    tools/call)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"spawned-child"}]}}\n' "$id"
-      ;;
-    resources/list)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"uri":"file:///fake/readme.txt","name":"Fake readme","description":"resource from the spawned process","mimeType":"text/plain","size":16,"annotations":{"audience":["assistant"],"priority":0.75}}]}}\n' "$id"
-      ;;
-    resources/read)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"contents":[{"uri":"file:///fake/readme.txt","mimeType":"text/plain","text":"spawned-resource"}]}}\n' "$id"
-      ;;
-    *)
-      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unsupported method"}}\n' "$id"
-      ;;
-  esac
-done
-"#;
 
 struct Fixture {
     _root: TempDir,
@@ -69,6 +30,7 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(codewhale_binary());
         command
+            .current_dir(&self.home)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", &self.home)
@@ -76,12 +38,6 @@ impl Fixture {
             .env("CODEWHALE_HOME", self.home.join(".codewhale"))
             .env("CODEWHALE_SECRET_BACKEND", "file");
         command
-    }
-
-    fn write_fake_server(&self) -> PathBuf {
-        let script = self.home.join("fake-mcp-server.sh");
-        fs::write(&script, FAKE_SERVER).expect("write fake MCP server");
-        script
     }
 
     fn configure_servers(&self, definitions: Value) {
@@ -101,10 +57,10 @@ impl Fixture {
 
     /// Drive `codewhale mcp-server` over stdio with `requests`, returning the
     /// parsed JSON-RPC responses plus stderr.
-    fn run_mcp_server(&self, requests: &[Value]) -> (Vec<Value>, String) {
+    fn run_mcp_server(&self, args: &[&str], requests: &[Value]) -> (Vec<Value>, String) {
         let mut child = self
             .command()
-            .arg("mcp-server")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -120,9 +76,13 @@ impl Fixture {
 
         let output = child.wait_with_output().expect("mcp-server output");
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            output.status.success(),
+            "native MCP server failed: {stderr}"
+        );
         let responses = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|line| serde_json::from_str::<Value>(line).expect("stdout is only JSON-RPC"))
             .collect();
         (responses, stderr)
     }
@@ -143,229 +103,77 @@ fn codewhale_binary() -> PathBuf {
     path.join("codewhale")
 }
 
-fn response_for(responses: &[Value], id: i64) -> &Value {
-    responses
-        .iter()
-        .find(|response| response["id"] == json!(id))
-        .unwrap_or_else(|| panic!("no response with id {id} in {responses:?}"))
+fn initialize() -> Value {
+    json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+        "protocolVersion": "2024-11-05",
+        "clientInfo": {"name": "native-alias-test", "version": "1"},
+        "capabilities": {}
+    }})
 }
 
 #[test]
-fn mcp_server_enforces_jsonrpc_identity_and_initialize_lifecycle() {
+fn both_cli_spellings_expose_the_same_native_read_only_tools() {
     let fixture = Fixture::new();
-    let (responses, stderr) = fixture.run_mcp_server(&[
-        json!({"id": 1, "method": "ping"}),
-        json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
-        json!({"jsonrpc": "2", "id": 2, "method": "ping"}),
-        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "clientInfo": {"name": "lifecycle-test", "version": "1"},
-                "capabilities": {}
-            }
-        }),
-        json!({"jsonrpc": "2.0", "id": 5, "method": "resources/list"}),
-        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        json!({"jsonrpc": "2.0", "method": "ping"}),
-        json!({"jsonrpc": "2.0", "id": 6, "method": "tools/list"}),
-        json!({"jsonrpc": "2.0", "id": 7, "method": "shutdown"}),
-    ]);
-
-    let null_id_responses: Vec<&Value> = responses
-        .iter()
-        .filter(|response| response["id"].is_null())
-        .collect();
-    assert_eq!(
-        null_id_responses.len(),
-        2,
-        "missing id must be a notification while explicit null receives a response: {responses:?}"
-    );
-    assert_eq!(null_id_responses[0]["error"]["code"], -32600);
-    assert!(null_id_responses[1]["result"].is_object());
-
-    assert_eq!(response_for(&responses, 2)["error"]["code"], -32600);
-    assert_eq!(response_for(&responses, 3)["error"]["code"], -32600);
-    assert!(
-        response_for(&responses, 3)["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("completed initialize"))
-    );
-    assert_eq!(
-        response_for(&responses, 4)["result"]["protocolVersion"],
-        "2024-11-05"
-    );
-    assert_eq!(response_for(&responses, 5)["error"]["code"], -32600);
-    assert_eq!(response_for(&responses, 6)["result"]["tools"], json!([]));
-    assert!(
-        stderr.contains("codewhale mcp-server: stdio server exited"),
-        "missing clean shutdown receipt:\n{stderr}"
-    );
-}
-
-#[test]
-fn mcp_server_proxies_tools_and_resources_from_the_configured_child_process() {
-    let fixture = Fixture::new();
-    let script = fixture.write_fake_server();
-    fixture.configure_servers(json!([{
-        "config": {
-            "name": "fake",
-            "command": "/bin/sh",
-            "args": [script.to_str().expect("utf-8 script path")],
-        }
-    }]));
-
-    let (responses, stderr) = fixture.run_mcp_server(&[
-        json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "clientInfo": {"name": "proxy-test", "version": "1"},
-                "capabilities": {}
-            }
-        }),
+    let requests = [
+        initialize(),
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
         json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "mcp__fake__whoami", "arguments": {}}
-        }),
-        json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "resources/read",
-            "params": {"uri": "file:///fake/readme.txt"}
-        }),
-        json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown"}),
-    ]);
-
-    let initialize = response_for(&responses, 0);
-    assert_eq!(initialize["result"]["protocolVersion"], "2024-11-05");
+        json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "file_write", "approved": true,
+            "arguments": {"path": "forbidden.txt", "content": "must not be written"}
+        }}),
+    ];
+    let (alias, _) = fixture.run_mcp_server(&["mcp-server"], &requests);
+    let (native, _) = fixture.run_mcp_server(&["serve", "--mcp"], &requests);
+    assert_eq!(alias, native);
+    assert_eq!(alias.len(), 4);
     assert_eq!(
-        initialize["result"]["serverInfo"]["name"],
+        alias[0]["result"]["serverInfo"]["name"],
         "codewhale-mcp-server"
     );
-    assert!(initialize["result"]["capabilities"]["tools"].is_object());
-    assert!(initialize["result"]["capabilities"]["resources"].is_object());
-
-    let tools = response_for(&responses, 1)["result"]["tools"]
+    assert_eq!(alias[0]["result"]["protocolVersion"], "2024-11-05");
+    let names: Vec<&str> = alias[1]["result"]["tools"]
         .as_array()
-        .unwrap_or_else(|| panic!("tools/list returned no array; stderr:\n{stderr}"))
-        .clone();
-    let names: Vec<&str> = tools
+        .unwrap()
         .iter()
-        .filter_map(|tool| tool["name"].as_str())
+        .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        names,
-        vec!["mcp__fake__whoami"],
-        "only the child's real tools may be exposed; the stub's fabricated \
-         `health`/`capabilities` must be gone. stderr:\n{stderr}"
-    );
-    assert_eq!(tools[0]["tool_name"], "whoami");
-    assert!(tools[0]["inputSchema"].is_object());
-
-    let call = response_for(&responses, 2);
-    assert_eq!(
-        call["result"]["content"][0]["text"], "spawned-child",
-        "the standard MCP result must come from the spawned process: {call}"
-    );
-    assert_eq!(
-        call["result"]["result"]["content"][0]["text"], "spawned-child",
-        "the legacy nested result must remain available: {call}"
-    );
-
-    let resources = response_for(&responses, 3)["result"]["resources"]
-        .as_array()
-        .unwrap_or_else(|| panic!("resources/list returned no array; stderr:\n{stderr}"));
-    assert_eq!(resources.len(), 1);
-    assert_eq!(resources[0]["uri"], "file:///fake/readme.txt");
-    assert_eq!(resources[0]["name"], "Fake readme");
-    assert_eq!(resources[0]["mimeType"], "text/plain");
-    assert_eq!(resources[0]["size"], 16);
-    assert_eq!(
-        resources[0]["annotations"]["audience"],
-        json!(["assistant"])
-    );
-    assert_eq!(resources[0]["annotations"]["priority"], 0.75);
-    assert_eq!(resources[0]["server_name"], "fake");
-
-    let read = response_for(&responses, 4);
-    assert_eq!(read["result"]["contents"][0]["text"], "spawned-resource");
-    assert_eq!(
-        read["result"]["resource"]["contents"][0]["text"], "spawned-resource",
-        "the legacy nested resource must remain available: {read}"
-    );
-    assert!(
-        !stderr.contains("deepseek-mcp"),
-        "stale identity in stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("codewhale mcp-server: stdio server exited"),
-        "missing Codewhale shutdown identity in stderr:\n{stderr}"
-    );
+    assert_eq!(names, ["file_read", "search"]);
+    assert_eq!(alias[2]["result"], json!({}));
+    assert_eq!(alias[3]["error"]["code"], -32602);
+    assert!(!fixture.home.join("forbidden.txt").exists());
 }
 
 #[test]
-fn mcp_server_reports_a_server_it_could_not_spawn() {
+fn alias_neither_launches_nor_rewrites_legacy_child_server_definitions() {
     let fixture = Fixture::new();
-    fixture.configure_servers(json!([{
-        "config": {
-            "name": "broken",
-            "command": "codewhale-nonexistent-mcp-server-binary",
-        }
-    }]));
-
-    let (responses, stderr) = fixture.run_mcp_server(&[
-        json!({"jsonrpc": "2.0", "id": 1, "method": "server/list"}),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 10,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "clientInfo": {"name": "failure-test", "version": "1"},
-                "capabilities": {}
-            }
-        }),
-        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "mcp__broken__health", "arguments": {}}
-        }),
-        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
-    ]);
-
-    let server = response_for(&responses, 1)["result"]["lifecycle"]["servers"][0].clone();
+    let marker = fixture.home.join("legacy-child-was-launched");
+    // Even an invalid executable would produce a visible startup failure in
+    // the old proxy. The native server must never attempt this launch.
+    fixture.configure_servers(json!([{"config": {
+        "name": "retired-proxy", "command": marker,
+        "env": {"PRIVATE_TOKEN": "test-only-sentinel"}
+    }}]));
+    let config = fixture.home.join(".codewhale/config.toml");
+    let before = fs::read(&config).unwrap();
+    let (responses, stderr) = fixture.run_mcp_server(
+        &["mcp-server"],
+        &[
+            initialize(),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 2);
     assert_eq!(
-        server["running"],
-        json!(false),
-        "an unspawnable server must not report as running: {server}"
+        fs::read(config).unwrap(),
+        before,
+        "saved legacy data is untouched"
     );
-    assert!(
-        server["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("failed to spawn command")),
-        "the lifecycle must carry the spawn failure: {server}"
-    );
-    assert!(
-        stderr.contains("is not available"),
-        "the failure must also be loud on stderr, got:\n{stderr}"
-    );
-
-    let call = response_for(&responses, 2);
-    assert!(
-        call["error"].is_object(),
-        "a dead server must return an error, never a fabricated success: {call}"
-    );
+    assert!(!stderr.contains("retired-proxy"), "{stderr}");
+    assert!(!stderr.contains("PRIVATE_TOKEN"), "{stderr}");
+    assert!(!stderr.contains("test-only-sentinel"), "{stderr}");
+    assert!(!marker.exists());
 }

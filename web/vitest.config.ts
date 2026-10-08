@@ -8,6 +8,7 @@ export default defineConfig({
     },
   },
   test: {
+    globalSetup: ["./vitest.global-setup.ts"],
     include: [
       "lib/**/*.test.ts",
       "components/**/*.test.tsx",

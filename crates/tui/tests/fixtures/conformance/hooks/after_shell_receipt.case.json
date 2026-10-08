@@ -1,0 +1,38 @@
+{
+  "description": "tool_call_after for a shell call that reported a schema-1 execution receipt: the observer receives the versioned JSON document on stdin and the receipt in its environment.",
+  "event": "tool_call_after",
+  "tool": {
+    "name": "exec_shell",
+    "call_id": "call_hook_after",
+    "outcome": {
+      "ok": {
+        "content": "hello\n",
+        "success": true,
+        "metadata": {
+          "exit_code": 0,
+          "status": "Completed",
+          "execution_receipt": {
+            "schema_version": 1,
+            "scope": "local",
+            "state": "completed",
+            "command": "echo hello",
+            "cwd": "/conformance/workspace",
+            "exit_code": 0,
+            "output_kind": "separate",
+            "stdout": "hello\n",
+            "stderr": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false
+          }
+        }
+      }
+    }
+  },
+  "hooks": [
+    {
+      "event": "tool_call_after",
+      "name": "observer",
+      "command": "{{capture}} observer; echo observed"
+    }
+  ]
+}

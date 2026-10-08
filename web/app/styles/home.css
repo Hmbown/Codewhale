@@ -1,0 +1,253 @@
+/* ------------------------------------------------------------------ */
+/*  Home — paper above, sea below                                      */
+/* ------------------------------------------------------------------ */
+/*
+ * Paper holds the promise and the install command. The live whale rests on
+ * one horizon line where the paper meets the sea; the real terminal floats
+ * in the deep water just under it. The reading sections return to paper,
+ * and the page ends in the sea with the install command, which runs on into
+ * the footer. Two sea moments, one horizon each; nothing else decorates.
+ */
+
+.home { --home-measure: 36rem; }
+
+/* ---------- paper: the hero ---------- */
+.home-hero {
+  position: relative;
+  padding-block: clamp(3.5rem, 9vw, 7.5rem) 0;
+  background: var(--bg);
+}
+
+.home-hero-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.75fr);
+  align-items: end;
+  gap: var(--space-6) clamp(2rem, 6vw, 5rem);
+  width: var(--container);
+  margin-inline: auto;
+}
+
+.home-hero-copy {
+  display: grid;
+  gap: var(--space-5);
+  padding-bottom: clamp(3rem, 7vw, 5.5rem);
+  min-width: 0;
+}
+
+/* Type is the hero's structure: large, tight, set in the brand face. */
+/* Measured in em, not ch, so CJK and long compound words wrap the same as
+   English; hyphenation lets German compounds break at syllables. */
+.home-title {
+  max-width: 9.5em;
+  font-size: clamp(2.5rem, 1.4rem + 4.4vw, 5rem);
+  hyphens: auto;
+  font-weight: 650;
+  line-height: 0.98;
+  letter-spacing: -0.035em;
+  text-wrap: balance;
+  color: var(--text);
+}
+
+.home-lede {
+  max-width: var(--home-measure);
+  color: var(--muted);
+  font-size: clamp(1.0625rem, 1rem + 0.35vw, 1.25rem);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+.home-lede strong { color: var(--text); font-weight: 600; }
+
+/* CJK headlines carry more meaning per glyph: a step smaller, wider measure,
+   and no breaks inside words (Korean) or mid-phrase where avoidable. */
+:lang(zh) .home-title,
+:lang(ja) .home-title,
+:lang(ko) .home-title {
+  max-width: 11em;
+  font-size: clamp(2.125rem, 1.2rem + 3.4vw, 4rem);
+  line-height: 1.12;
+  letter-spacing: -0.01em;
+  word-break: keep-all;
+  line-break: strict;
+}
+
+.home-hero-copy .hero-install { max-width: 32rem; margin-top: var(--space-2); }
+.home-hero-copy .actions { margin-top: calc(var(--space-2) * -1); }
+
+/* The whale rests on the horizon: its lowest point meets the line. */
+.home-whale {
+  display: flex;
+  justify-content: center;
+  align-self: end;
+  min-width: 0;
+}
+.home-whale .whale-live {
+  --whale-size: clamp(18rem, 40vw, 34rem);
+  width: var(--whale-size);
+  /* The rig fills the middle 72% of the canvas; drop its belly onto the
+     waterline where the tide begins. */
+  margin-bottom: calc(var(--whale-size) * -0.26);
+  position: relative;
+  z-index: 2;
+}
+
+/* ---------- the live whale ---------- */
+.whale-live {
+  position: relative;
+  aspect-ratio: 1;
+}
+.whale-live > .whale-live-poster,
+.whale-live > .whale-live-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+/* The phase, in a word: a small point of light and a label, above the
+   whale's back. Light means live work (DIRECTION.md). */
+.whale-live-state {
+  position: absolute;
+  inset-inline-start: 50%;
+  top: 8%;
+  translate: -50% 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0.3rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--text-caption);
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 6px 18px -10px rgb(11 72 187 / 0.35);
+}
+.whale-live-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: var(--radius-pill);
+  background: var(--brand-light);
+}
+.whale-live-state[data-state="done"] .whale-live-dot { background: var(--live); }
+.whale-live-state[data-state="rest"] .whale-live-dot { background: var(--muted); }
+@media (prefers-reduced-motion: no-preference) {
+  .whale-live-state:not([data-state="rest"]):not([data-state="done"]) .whale-live-dot {
+    animation: whale-pulse 1.4s var(--ease-out) infinite;
+  }
+}
+@keyframes whale-pulse {
+  0% { box-shadow: 0 0 0 0 rgb(30 143 216 / 0.55); }
+  100% { box-shadow: 0 0 0 0.5rem rgb(30 143 216 / 0); }
+}
+.whale-live-poster { --pose-size: 100%; padding: 14%; box-sizing: border-box; }
+.whale-live-canvas { opacity: 0; }
+.whale-live[data-ready] .whale-live-canvas { opacity: 1; }
+.whale-live[data-ready] .whale-live-poster { visibility: hidden; }
+
+/* ---------- the sea: the terminal ---------- */
+/* The tide: paper fades through light aqua into cobalt and the deep, like
+   the merch's Tide ombré (light at the top, navy at the hem). No hard edge;
+   the whale rests where the water begins, and the terminal floats in calm,
+   dark water below. */
+.home-terminal {
+  position: relative;
+  background: var(--tide), var(--ocean-floor);
+}
+
+/* The install band ends the page in the sea: one line of light at its top,
+   and water that reaches the floor colour by its own bottom edge, so it runs
+   into the footer without a seam. */
+.home-install {
+  position: relative;
+  background: var(--sea-band), var(--ocean-floor);
+}
+.home-install::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  background: var(--horizon-light);
+}
+
+.home-terminal-inner {
+  display: grid;
+  gap: var(--space-6);
+  width: min(var(--container), 64rem);
+  margin-inline: auto;
+  padding-block: clamp(9rem, 16vw, 13rem) clamp(4rem, 8vw, 6.5rem);
+}
+
+.home-terminal-title {
+  max-width: 22ch;
+  font-size: var(--text-section);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  text-wrap: balance;
+}
+
+.home-shot .figure-frame {
+  border: 0;
+  box-shadow:
+    0 0 0 1px rgb(var(--gpui-dark-primary-rgb) / 0.14),
+    0 40px 80px -40px rgb(0 0 0 / 0.75);
+}
+.home-shot figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+
+/* ---------- paper: the reading sections ---------- */
+.home-body {
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: clamp(4.5rem, 9vw, 7rem);
+}
+.home-body > .home-section { padding-block: 0; }
+.home-body > .home-section + .home-section {
+  margin-top: clamp(2.5rem, 6vw, 5rem);
+  padding-top: clamp(2.5rem, 6vw, 5rem);
+  border-top: 1px solid var(--line);
+}
+
+/* Terms read as words, not as code: the brand face, a little weight. */
+.home-body .ruled-list dt {
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text);
+}
+.home-modes dt { font-family: var(--font-body); }
+
+.product-start-links { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-5); margin-top: var(--space-5); }
+
+/* ---------- the sea: install, into the footer ---------- */
+.home-install-inner {
+  display: grid;
+  gap: var(--space-6);
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: clamp(4.5rem, 9vw, 7rem) clamp(2.5rem, 5vw, 4rem);
+}
+@media (min-width: 900px) {
+  .home-install-inner { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); }
+}
+.home-install-channels { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
+
+/* ---------- narrow screens ---------- */
+@media (max-width: 900px) {
+  .home-hero-inner { grid-template-columns: minmax(0, 1fr); }
+  .home-hero-copy { padding-bottom: var(--space-4); }
+  .home-whale { justify-content: flex-end; }
+  .home-whale .whale-live { --whale-size: clamp(14rem, 70vw, 20rem); margin-inline: auto; }
+}
+
+@media (forced-colors: active) {
+  .home-install::before { background: CanvasText; }
+}

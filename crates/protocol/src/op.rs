@@ -15,8 +15,8 @@
 //!
 //! What is deliberately stripped at this boundary:
 //!
-//! - `mpsc` / `oneshot` reply channels (`GetSessionSnapshot`,
-//!   `GetProviderRuntimeStatus`, `BootstrapMcp`, `RetryMcpServer`,
+//! - `mpsc` / `oneshot` reply channels (`GetSubAgentSettlement`, `GetSessionSnapshot`,
+//!   `GetContextBudget`, `GetProviderRuntimeStatus`, `BootstrapMcp`, `RetryMcpServer`,
 //!   `ReloadMcp`). Over the wire the reply is an `EventMsg` or a response
 //!   frame, not a channel.
 //! - `Arc<HookExecutor>` on `SendMessage`: hooks are host configuration, not
@@ -102,6 +102,78 @@ fn default_capability_state() -> String {
     "unknown".to_string()
 }
 
+/// Per-turn authority payload carried by [`Op::SendMessage`]. Serializable
+/// twin of `crates/tui/src/core/ops::TurnSpec`; extracted from the enum arm so
+/// new per-turn fields accrete here instead of widening the variant. The
+/// `SendMessage(TurnSpec)` newtype keeps the internally-tagged wire shape
+/// byte-identical: `{"kind":"send_message", ...fields}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution: Option<serde_json::Value>,
+    #[serde(
+        default,
+        rename = "maxOutputTokens",
+        alias = "max_output_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_tokens: Option<std::num::NonZeroU32>,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::runtime::RuntimeImageInput>,
+    /// Effective mode for this turn (`"plan" | "agent" | "operate"` etc).
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Optional explicit route/model the caller resolved already (mirrors
+    /// `ResolvedRuntimeRoute` in `crates_tui::route_runtime`). `None` means
+    /// "use the thread's current route".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    /// Tool restriction from slash-command frontmatter.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Runtime-supplied dynamic tools for this turn only.
+    #[serde(default)]
+    pub dynamic_tools: Vec<DynamicToolSpec>,
+    /// Structural input provenance — only `external_user` may inherit
+    /// YOLO/auto-approval authority (mirrors `UserInputProvenance`).
+    #[serde(default = "default_provenance")]
+    pub provenance: String,
+    /// Compaction policy carried atomically with the route receipt.
+    /// Boxed only to keep the enum small; the wire shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<Box<CompactionPolicy>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_token_budget: Option<u32>,
+    /// `active | paused | complete | blocked`.
+    #[serde(default = "default_goal_status")]
+    pub goal_status: String,
+    /// `"off" | "low" | "medium" | "high" | "max"`; `None` = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort_auto: bool,
+    #[serde(default)]
+    pub auto_model: bool,
+    #[serde(default)]
+    pub allow_shell: bool,
+    #[serde(default)]
+    pub trust_mode: bool,
+    #[serde(default)]
+    pub auto_approve: bool,
+    /// `auto | bypass | suggest | never`.
+    #[serde(default = "default_approval_mode")]
+    pub approval_mode: String,
+    #[serde(default)]
+    pub translation_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
+}
+
 /// Operations that can be submitted to the core engine. This is the
 /// protocol view of `crates/tui/src/core/ops::Op` — same lifecycle,
 /// same provenance gate — but serializable and free of `mpsc` / `oneshot`
@@ -114,60 +186,7 @@ pub enum Op {
     /// receipt the engine will freeze at the client-freeze boundary. Headless
     /// and TUI must produce byte-identical `MessageRequest`s for identical
     /// `Op::SendMessage` payloads.
-    SendMessage {
-        content: String,
-        /// Effective mode for this turn (`"plan" | "agent" | "operate"` etc).
-        #[serde(default = "default_mode")]
-        mode: String,
-        /// Optional explicit route/model the caller resolved already (mirrors
-        /// `ResolvedRuntimeRoute` in `crates_tui::route_runtime`). `None` means
-        /// "use the thread's current route".
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model_provider: Option<String>,
-        /// Tool restriction from slash-command frontmatter.
-        #[serde(default)]
-        allowed_tools: Option<Vec<String>>,
-        /// Runtime-supplied dynamic tools for this turn only.
-        #[serde(default)]
-        dynamic_tools: Vec<DynamicToolSpec>,
-        /// Structural input provenance — only `external_user` may inherit
-        /// YOLO/auto-approval authority (mirrors `UserInputProvenance`).
-        #[serde(default = "default_provenance")]
-        provenance: String,
-        /// Compaction policy carried atomically with the route receipt.
-        /// Boxed only to keep the enum small; the wire shape is unchanged.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        compaction: Option<Box<CompactionPolicy>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        goal_objective: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        goal_token_budget: Option<u32>,
-        /// `active | paused | complete | blocked`.
-        #[serde(default = "default_goal_status")]
-        goal_status: String,
-        /// `"off" | "low" | "medium" | "high" | "max"`; `None` = provider default.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning_effort: Option<String>,
-        #[serde(default)]
-        reasoning_effort_auto: bool,
-        #[serde(default)]
-        auto_model: bool,
-        #[serde(default)]
-        allow_shell: bool,
-        #[serde(default)]
-        trust_mode: bool,
-        #[serde(default)]
-        auto_approve: bool,
-        /// `auto | bypass | suggest | never`.
-        #[serde(default = "default_approval_mode")]
-        approval_mode: String,
-        #[serde(default)]
-        translation_enabled: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        verbosity: Option<String>,
-    },
+    SendMessage(TurnSpec),
 
     /// Steer an in-flight turn with additional user content (drains into
     /// the turn loop's `rx_steer` channel).
@@ -217,6 +236,8 @@ pub enum Op {
         status: String,
         #[serde(default)]
         clear: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_id: Option<String>,
     },
 
     /// Set (or replace) the active goal objective and start goal work.
@@ -224,6 +245,8 @@ pub enum Op {
         objective: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_budget: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_id: Option<String>,
     },
 
     Cancel,
@@ -272,6 +295,9 @@ pub enum Op {
     },
 
     ListSubAgents,
+    /// Inspect live children and pending handbacks at the Engine's idle
+    /// boundary. The host owns the response channel; it is not wire input.
+    GetSubAgentSettlement,
     CancelSubAgent {
         agent_id: String,
     },
@@ -307,7 +333,9 @@ pub enum Op {
         config: CompactionPolicy,
     },
 
-    /// Replace the live user permission rules (`Ruleset` serialized).
+    /// Legacy serialized permission-update operation, retained for wire
+    /// compatibility. The in-process runtime now publishes directly through
+    /// its shared policy store instead of queuing a second replacement.
     SetPermissionRuleset {
         ruleset: Value,
     },
@@ -356,6 +384,14 @@ pub enum Op {
         mode: String,
     },
 
+    /// Rewind an unchanged conversation. `expected` is the complete observed
+    /// session snapshot; a receiver must compare it before changing history.
+    /// The success/refusal receipt travels out-of-band.
+    RewindConversation {
+        expected: Value,
+        messages: Vec<Value>,
+    },
+
     /// Run context compaction on one exact provider route.
     CompactContext {
         id: String,
@@ -370,6 +406,9 @@ pub enum Op {
 
     /// Request a session snapshot; the reply travels out-of-band.
     GetSessionSnapshot,
+    /// Request the live context-window budget for the session's route; the
+    /// reply travels out-of-band.
+    GetContextBudget,
     /// Request provider concurrency state; the reply travels out-of-band.
     GetProviderRuntimeStatus,
     /// Populate the engine-owned MCP pool once at boot; reply out-of-band.
@@ -418,6 +457,7 @@ pub const OP_KINDS: &[&str] = &[
     "shutdown",
     "preview_outbound_request",
     "list_sub_agents",
+    "get_sub_agent_settlement",
     "cancel_sub_agent",
     "follow_up_sub_agent",
     "change_mode",
@@ -429,9 +469,11 @@ pub const OP_KINDS: &[&str] = &[
     "set_search_provider",
     "set_fleet_roster",
     "sync_session",
+    "rewind_conversation",
     "compact_context",
     "cancel_compaction",
     "get_session_snapshot",
+    "get_context_budget",
     "get_provider_runtime_status",
     "bootstrap_mcp",
     "retry_mcp_server",
@@ -444,13 +486,13 @@ pub const OP_KINDS: &[&str] = &[
 impl Op {
     #[must_use]
     pub fn is_send_message(&self) -> bool {
-        matches!(self, Self::SendMessage { .. })
+        matches!(self, Self::SendMessage(_))
     }
 
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
         match self {
-            Self::SendMessage { .. } => "send_message",
+            Self::SendMessage(_) => "send_message",
             Self::Steer { .. } => "steer",
             Self::ContinueGoal { .. } => "continue_goal",
             Self::RunShellCommand { .. } => "run_shell_command",
@@ -460,6 +502,7 @@ impl Op {
             Self::Shutdown => "shutdown",
             Self::PreviewOutboundRequest { .. } => "preview_outbound_request",
             Self::ListSubAgents => "list_sub_agents",
+            Self::GetSubAgentSettlement => "get_sub_agent_settlement",
             Self::CancelSubAgent { .. } => "cancel_sub_agent",
             Self::FollowUpSubAgent { .. } => "follow_up_sub_agent",
             Self::ChangeMode { .. } => "change_mode",
@@ -471,9 +514,11 @@ impl Op {
             Self::SetSearchProvider { .. } => "set_search_provider",
             Self::SetFleetRoster { .. } => "set_fleet_roster",
             Self::SyncSession { .. } => "sync_session",
+            Self::RewindConversation { .. } => "rewind_conversation",
             Self::CompactContext { .. } => "compact_context",
             Self::CancelCompaction { .. } => "cancel_compaction",
             Self::GetSessionSnapshot => "get_session_snapshot",
+            Self::GetContextBudget => "get_context_budget",
             Self::GetProviderRuntimeStatus => "get_provider_runtime_status",
             Self::BootstrapMcp => "bootstrap_mcp",
             Self::RetryMcpServer { .. } => "retry_mcp_server",
@@ -494,8 +539,11 @@ pub fn headless_send_message_op(thread_id: ThreadId, content: impl Into<String>)
         op_id: format!("op-{}", uuid::Uuid::new_v4()),
         thread_id: thread_id.clone(),
         session_id: SessionId::new(),
-        op: Op::SendMessage {
+        op: Op::SendMessage(TurnSpec {
+            profile_constitution: None,
+            max_output_tokens: None,
             content: content.into(),
+            images: Vec::new(),
             mode: default_mode(),
             model: None,
             model_provider: None,
@@ -515,7 +563,7 @@ pub fn headless_send_message_op(thread_id: ThreadId, content: impl Into<String>)
             approval_mode: default_approval_mode(),
             translation_enabled: false,
             verbosity: None,
-        },
+        }),
     }
 }
 
@@ -560,10 +608,12 @@ mod tests {
                 approval_mode: "suggest".into(),
             },
             Op::SetGoalStatus {
+                goal_id: None,
                 status: "paused".into(),
                 clear: false,
             },
             Op::SetGoalObjective {
+                goal_id: None,
                 objective: "ship".into(),
                 token_budget: Some(10),
             },
@@ -588,6 +638,7 @@ mod tests {
                 unresolved: None,
             },
             Op::ListSubAgents,
+            Op::GetSubAgentSettlement,
             Op::CancelSubAgent {
                 agent_id: "a1".into(),
             },
@@ -642,6 +693,10 @@ mod tests {
                 workspace: PathBuf::from("/ws"),
                 mode: "agent".into(),
             },
+            Op::RewindConversation {
+                expected: json!({"session_id": "s", "messages": []}),
+                messages: vec![],
+            },
             Op::CompactContext {
                 id: "cmp-1".into(),
                 model: "m".into(),
@@ -650,6 +705,7 @@ mod tests {
             },
             Op::CancelCompaction { id: "cmp-1".into() },
             Op::GetSessionSnapshot,
+            Op::GetContextBudget,
             Op::GetProviderRuntimeStatus,
             Op::BootstrapMcp,
             Op::RetryMcpServer { name: "fs".into() },
@@ -720,13 +776,13 @@ mod tests {
             "content": "hello"
         }))
         .unwrap();
-        let Op::SendMessage {
+        let Op::SendMessage(TurnSpec {
             mode,
             provenance,
             goal_status,
             approval_mode,
             ..
-        } = op
+        }) = op
         else {
             panic!("expected send_message");
         };

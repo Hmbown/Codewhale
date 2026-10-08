@@ -6,8 +6,8 @@
 //! fields and are unaffected by fleet extensions.
 //!
 //! See:
-//! - <https://github.com/Hmbown/CodeWhale/issues/3154> (Agent Fleet control plane)
-//! - <https://github.com/Hmbown/CodeWhale/issues/3096> (Runtime API sub-agent direction)
+//! - <https://github.com/codewhale-hq/CodeWhale/issues/3154> (Agent Fleet control plane)
+//! - <https://github.com/codewhale-hq/CodeWhale/issues/3096> (Runtime API sub-agent direction)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -432,9 +432,8 @@ pub enum FleetHostSpec {
         /// Known hosts file for host-key verification.
         #[serde(skip_serializing_if = "Option::is_none")]
         known_hosts: Option<PathBuf>,
-        /// Expected host key fingerprint (SHA256:...) for key pinning.
-        /// When set, the connection is only trusted if the server's
-        /// host key matches this fingerprint exactly.
+        /// Legacy field retained for decoding; the SSH host adapter rejects it
+        /// when set. Configure `known_hosts` for host-key verification instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         host_key_fingerprint: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -666,7 +665,9 @@ pub enum FleetWorkerAuth {
         /// Known hosts file for host-key verification.
         #[serde(skip_serializing_if = "Option::is_none")]
         known_hosts: Option<PathBuf>,
-        /// Expected host key fingerprint for pinning.
+        /// Legacy metadata; does not enforce key pinning. The SSH host adapter
+        /// rejects `FleetHostSpec::Ssh::host_key_fingerprint` when set; configure
+        /// `known_hosts` on the host spec for host-key verification instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         host_key_fingerprint: Option<String>,
         /// SSH user for the connection.
@@ -1126,6 +1127,13 @@ pub struct FleetReceipt {
     /// existed) deserializable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_route: Option<FleetResolvedRoute>,
+    /// Saved exec session id holding the worker's full transcript, when the
+    /// local worker persisted its parent-assigned capture in the Runtime's
+    /// session store (the exec stream's `session_capture.saved_session_id`).
+    /// Remote-only or unavailable transcripts omit this field. Callers resolve the final
+    /// assistant reply via `GET /v1/sessions/{id}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_session_id: Option<String>,
     /// Effective worker authority for this task (#3211).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_permissions: Option<FleetEffectivePermissions>,
@@ -1493,6 +1501,7 @@ mod tests {
                 notes: None,
             }),
             resolved_route: None,
+            saved_session_id: None,
             effective_permissions: None,
         };
         let json = serde_json::to_string(&receipt).unwrap();
@@ -1521,6 +1530,7 @@ mod tests {
                 notes: Some("manual verification required".to_string()),
             }),
             resolved_route: None,
+            saved_session_id: None,
             effective_permissions: None,
         };
 
@@ -1689,6 +1699,7 @@ mod tests {
                 model_source: Some("task.model".to_string()),
                 source: "resolver".to_string(),
             }),
+            saved_session_id: None,
             effective_permissions: Some(FleetEffectivePermissions {
                 write: true,
                 network: true,

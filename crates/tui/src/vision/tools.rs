@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
-use crate::client::DeepSeekClient;
-use crate::config::ApiProvider;
+use crate::client::CodewhaleClient;
+use crate::config::ProviderKind;
 use crate::config::VisionModelConfig;
 use crate::llm_client::{LlmError, RetryConfig, sanitize_http_error_body, with_retry};
 use crate::tools::spec::{
@@ -18,7 +18,27 @@ use crate::tools::spec::{
 pub struct ImageAnalyzeTool {
     config: VisionModelConfig,
     client: reqwest::Client,
-    route_client: Option<DeepSeekClient>,
+    route_client: Option<CodewhaleClient>,
+}
+
+/// Total envelope for one image_analyze call, retry attempts and response
+/// body consumption included. reqwest's `read_timeout` is *not* a per-read
+/// idle bound for the request phase: its timer starts at `send()` and is
+/// never reset until the response headers arrive, so it silently acts as a
+/// total deadline on the multi-MB upload plus the full non-streaming vision
+/// generation — precisely the healthy work a 120s cap used to kill. The
+/// client therefore bounds only the connect handshake, and this envelope
+/// (the same 30-minute wall clock as engine streaming,
+/// `STREAM_MAX_DURATION_SECS`) is the sole total bound; a stalled
+/// connection errors out through it instead of hanging.
+const VISION_REQUEST_ENVELOPE: Duration = Duration::from_secs(1800);
+
+fn vision_request_envelope() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(2)
+    } else {
+        VISION_REQUEST_ENVELOPE
+    }
 }
 
 impl ImageAnalyzeTool {
@@ -31,10 +51,15 @@ impl ImageAnalyzeTool {
     #[must_use]
     pub fn new_with_route_client(
         config: VisionModelConfig,
-        route_client: Option<DeepSeekClient>,
+        route_client: Option<CodewhaleClient>,
     ) -> Self {
         let client = crate::tls::reqwest_client_builder()
-            .timeout(Duration::from_secs(120))
+            // Bound only the connect handshake. A client- or request-level
+            // `read_timeout` would start counting at `send()` and never
+            // reset before the response headers, quietly re-introducing a
+            // total deadline on the upload + long non-streaming generation;
+            // the total bound lives in VISION_REQUEST_ENVELOPE instead.
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to build HTTP client");
         Self {
@@ -44,14 +69,13 @@ impl ImageAnalyzeTool {
         }
     }
 
-    async fn read_image_file(path: &Path) -> Result<(String, String), ToolError> {
+    async fn read_image_file(path: &Path) -> Result<(Vec<u8>, String), ToolError> {
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| ToolError::execution_failed(format!("Failed to read image file: {e}")))?;
 
         let mime_type = Self::detect_mime_type(path)?;
-        let base64_data = BASE64.encode(&bytes);
-        Ok((base64_data, mime_type))
+        Ok((bytes, mime_type))
     }
 
     fn resolve_image_path(workspace: &Path, image_path: &str) -> Result<PathBuf, ToolError> {
@@ -80,6 +104,20 @@ impl ImageAnalyzeTool {
             ));
         }
         Ok(resolved)
+    }
+
+    /// Header-only dimensions of the same bytes sent to the vision model,
+    /// using the extension-derived MIME type. Run on a blocking worker; omit
+    /// metadata for unparsable containers (including unsupported BMP).
+    /// Animated GIF/WebP yield the first frame's size.
+    fn image_dimensions(bytes: &[u8], mime_type: &str) -> Option<(u32, u32, String)> {
+        let format = mime_type.strip_prefix("image/")?.to_string();
+        let reader = image::ImageReader::with_format(
+            std::io::Cursor::new(bytes),
+            image::ImageFormat::from_mime_type(mime_type)?,
+        );
+        let (width, height) = reader.into_dimensions().ok()?;
+        Some((width, height, format))
     }
 
     fn detect_mime_type(path: &Path) -> Result<String, ToolError> {
@@ -174,7 +212,7 @@ impl ImageAnalyzeTool {
                     // request; a matched active client above carries exact
                     // route limits when the vision route is shared.
                     crate::route_budget::effective_max_output_tokens_for_route(
-                        ApiProvider::Custom,
+                        ProviderKind::Custom,
                         &self.config.model,
                         None,
                     )
@@ -183,6 +221,11 @@ impl ImageAnalyzeTool {
                 |client| client.effective_max_output_tokens(&self.config.model),
             );
         payload[token_limit_field] = json!(route_cap);
+        if let Some(client) = self.route_client.as_ref().filter(|client| {
+            client.base_url().trim_end_matches('/') == configured_base.trim_end_matches('/')
+        }) {
+            client.apply_provider_routing(&mut payload);
+        }
 
         payload
     }
@@ -196,7 +239,13 @@ impl ToolSpec for ImageAnalyzeTool {
 
     fn description(&self) -> &str {
         "Analyze an image using the configured vision model. \
-         Supports PNG, JPEG, GIF, WebP, and BMP formats."
+         Supports PNG, JPEG, GIF, WebP, and BMP formats. \
+         When the runtime can determine them from the image container, the \
+         result includes the image's stored pixel width and height, plus a \
+         format label derived from the file extension — describe image size \
+         from that metadata instead of guessing by eye. The dimensions are \
+         as stored: camera rotation metadata is not applied, and the fields \
+         are omitted when the container cannot be sized."
     }
 
     fn input_schema(&self) -> Value {
@@ -228,7 +277,16 @@ impl ToolSpec for ImageAnalyzeTool {
             .unwrap_or("Describe this image in detail.");
 
         let resolved_path = Self::resolve_image_path(&context.workspace, image_path)?;
-        let (image_data, mime_type) = Self::read_image_file(&resolved_path).await?;
+        let (image_bytes, mime_type) = Self::read_image_file(&resolved_path).await?;
+        let dimension_mime_type = mime_type.clone();
+        // Header parsing and encoding stay off the async worker and use one
+        // file snapshot. A failed probe omits metadata without failing vision.
+        let (image_data, dimensions) = tokio::task::spawn_blocking(move || {
+            let dimensions = Self::image_dimensions(&image_bytes, &dimension_mime_type);
+            (BASE64.encode(&image_bytes), dimensions)
+        })
+        .await
+        .map_err(|e| ToolError::execution_failed(format!("Failed to prepare image file: {e}")))?;
 
         let payload = self.request_payload(prompt, &image_data, &mime_type);
 
@@ -247,50 +305,56 @@ impl ToolSpec for ImageAnalyzeTool {
             None => Some(crate::client::acquire_remote_control_inference_participant().await),
         };
 
-        let response = with_retry(
-            &retry_config,
-            || {
-                let client = self.client.clone();
-                let url = url.clone();
-                let api_key = api_key.clone();
-                let payload = payload.clone();
-                async move {
-                    let response = client
-                        .post(&url)
-                        .header("Content-Type", "application/json")
-                        .header("Authorization", format!("Bearer {api_key}"))
-                        .json(&payload)
-                        .send()
-                        .await
-                        .map_err(|e| LlmError::from_reqwest(&e))?;
-
-                    let status = response.status();
-                    if !status.is_success() {
-                        let error_text = response
-                            .text()
+        let response_json = tokio::time::timeout(vision_request_envelope(), async {
+            let response = with_retry(
+                &retry_config,
+                || {
+                    let client = self.client.clone();
+                    let url = url.clone();
+                    let api_key = api_key.clone();
+                    let payload = payload.clone();
+                    async move {
+                        let response = client
+                            .post(&url)
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", format!("Bearer {api_key}"))
+                            .json(&payload)
+                            .send()
                             .await
-                            .unwrap_or_else(|_| "Unknown error".to_string());
-                        let error_text = sanitize_http_error_body(
-                            Some("Vision provider"),
-                            status.as_u16(),
-                            &error_text,
-                        );
-                        return Err(LlmError::from_http_response(status.as_u16(), &error_text));
+                            .map_err(|e| LlmError::from_reqwest(&e))?;
+
+                        let status = response.status();
+                        if !status.is_success() {
+                            let error_text = response
+                                .text()
+                                .await
+                                .unwrap_or_else(|_| "Unknown error".to_string());
+                            let error_text = sanitize_http_error_body(
+                                Some("Vision provider"),
+                                status.as_u16(),
+                                &error_text,
+                            );
+                            return Err(LlmError::from_http_response(status.as_u16(), &error_text));
+                        }
+                        Ok(response)
                     }
-                    Ok(response)
-                }
-            },
-            None,
-        )
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Vision API request failed: {e}")))?;
-
-        let json: Value = response
-            .json()
+                },
+                None,
+            )
             .await
-            .map_err(|e| ToolError::execution_failed(format!("Failed to parse response: {e}")))?;
+            .map_err(|e| ToolError::execution_failed(format!("Vision API request failed: {e}")))?;
 
-        let content = json
+            let json: Value = response.json().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to parse response: {e}"))
+            })?;
+            Ok::<Value, ToolError>(json)
+        })
+        .await
+        .map_err(|_| ToolError::Timeout {
+            seconds: vision_request_envelope().as_secs(),
+        })??;
+
+        let content = response_json
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("message"))
@@ -299,16 +363,21 @@ impl ToolSpec for ImageAnalyzeTool {
             .unwrap_or("")
             .to_string();
 
-        let model = json
+        let model = response_json
             .get("model")
             .and_then(|m| m.as_str())
             .unwrap_or(&self.config.model)
             .to_string();
 
-        let result = json!({
+        let mut result = json!({
             "analysis": content,
             "model": model,
         });
+        if let Some((width, height, format)) = dimensions {
+            result["width"] = json!(width);
+            result["height"] = json!(height);
+            result["format"] = json!(format);
+        }
 
         ToolResult::json(&result)
             .map_err(|e| ToolError::execution_failed(format!("Failed to serialize result: {e}")))
@@ -319,6 +388,8 @@ impl ToolSpec for ImageAnalyzeTool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[cfg(unix)]
     fn create_file_symlink(
@@ -344,10 +415,14 @@ mod tests {
         }
     }
 
+    /// The cap reads the `*_MAX_OUTPUT_TOKENS` override from the process
+    /// environment, as the payload does. Tests that compare the two hold the
+    /// test env lock, so an engine test setting the override cannot land
+    /// between the two reads in a shared process.
     fn standalone_vision_cap(model: &str) -> u64 {
         u64::from(
             crate::route_budget::effective_max_output_tokens_for_route(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 model,
                 None,
             )
@@ -390,6 +465,7 @@ mod tests {
 
     #[test]
     fn generic_vision_payload_uses_max_tokens() {
+        let _env = crate::test_support::lock_test_env();
         let tool = ImageAnalyzeTool::new(fake_config());
 
         let payload = tool.request_payload("describe", "abc123", "image/png");
@@ -404,6 +480,7 @@ mod tests {
 
     #[test]
     fn xiaomi_mimo_vision_payload_uses_max_completion_tokens() {
+        let _env = crate::test_support::lock_test_env();
         let mut config = fake_config();
         config.model = "mimo-v2.5".to_string();
         config.base_url = Some("https://api.xiaomimimo.com/v1".to_string());
@@ -421,6 +498,7 @@ mod tests {
 
     #[test]
     fn xiaomi_mimo_vision_payload_uses_max_completion_tokens_with_custom_proxy() {
+        let _env = crate::test_support::lock_test_env();
         let mut config = fake_config();
         config.model = "mimo-v2.5".to_string();
         config.base_url = Some("https://vision-proxy.example.invalid/v1".to_string());
@@ -436,13 +514,59 @@ mod tests {
     }
 
     #[test]
+    fn vision_vendor_pin_requires_the_matching_bound_route() {
+        let _lock = crate::test_support::lock_test_env();
+        let base_url = "http://127.0.0.1:18080/v1";
+        let client = CodewhaleClient::new(&crate::config::Config {
+            provider: Some("openrouter".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    api_key: Some("fixture-openrouter-key".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    model: Some("fixture/vision".to_string()),
+                    vendor: Some("chutes/region-fixture".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        for (vision_base, matched_client, pinned) in [
+            (base_url, Some(client.clone()), true),
+            ("http://127.0.0.1:18081/v1", Some(client.clone()), false),
+            (base_url, None, false),
+        ] {
+            let tool = ImageAnalyzeTool::new_with_route_client(
+                VisionModelConfig {
+                    model: "fixture/vision".to_string(),
+                    api_key: Some("fixture-vision-key".to_string()),
+                    base_url: Some(vision_base.to_string()),
+                },
+                matched_client,
+            );
+            let body = tool.request_payload("describe", "abc123", "image/png");
+            if pinned {
+                assert_eq!(
+                    body["provider"],
+                    json!({
+                        "order": ["chutes/region-fixture"], "allow_fallbacks": false
+                    })
+                );
+            } else {
+                assert!(body.get("provider").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn matched_vision_route_uses_bound_client_window_cap() {
         let _lock = crate::test_support::lock_test_env();
         let _canonical =
             crate::test_support::EnvVarGuard::set("CODEWHALE_MAX_OUTPUT_TOKENS", "384000");
         let base_url = "http://127.0.0.1:18080/v1".to_string();
         let model = "DeepSeek-V4-Flash".to_string();
-        let client = DeepSeekClient::new(&crate::config::Config {
+        let client = CodewhaleClient::new(&crate::config::Config {
             provider: Some("vllm".to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 vllm: crate::config::ProviderConfig {
@@ -531,5 +655,259 @@ mod tests {
             err.to_string().contains("resolve within the workspace"),
             "error must call out the canonical workspace boundary; got {err}"
         );
+    }
+
+    fn vision_response_body() -> Value {
+        json!({
+            "model": "test-vision-model",
+            "choices": [
+                { "message": { "content": "a red square" } }
+            ]
+        })
+    }
+
+    fn tool_with_base_url(base_url: String) -> ImageAnalyzeTool {
+        ImageAnalyzeTool::new(VisionModelConfig {
+            model: "test-vision-model".to_string(),
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+        })
+    }
+
+    fn write_workspace_image(workspace: &std::path::Path) {
+        std::fs::write(workspace.join("sample.png"), b"not a real png")
+            .expect("write sample image");
+    }
+
+    #[tokio::test]
+    async fn envelope_bounds_a_stalled_vision_provider() {
+        let server = MockServer::start().await;
+        // The stalled provider never answers within the test envelope: the
+        // upload + non-streaming generation window must be cut off by the
+        // envelope, not by a client read timeout (which reqwest turns into
+        // a hidden total deadline from `send()`).
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vision_response_body())
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let workspace = tempdir().expect("workspace tempdir");
+        write_workspace_image(workspace.path());
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let tool = tool_with_base_url(server.uri());
+
+        let err = tool
+            .execute(json!({"image_path": "sample.png"}), &ctx)
+            .await
+            .expect_err("a provider that never answers must hit the envelope");
+        assert!(
+            err.to_string().contains("timed out after"),
+            "envelope timeout must be reported as such; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_answer_within_the_envelope_is_returned() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vision_response_body()))
+            .mount(&server)
+            .await;
+
+        let workspace = tempdir().expect("workspace tempdir");
+        write_workspace_image(workspace.path());
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let tool = tool_with_base_url(server.uri());
+
+        let result = tool
+            .execute(
+                json!({"image_path": "sample.png", "prompt": "what is this?"}),
+                &ctx,
+            )
+            .await
+            .expect("a prompt answer must flow through the envelope");
+        let payload: Value =
+            serde_json::from_str(&result.content).expect("tool result must carry json");
+        assert_eq!(payload["analysis"], "a red square");
+    }
+
+    fn create_test_png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("fixture png encodes");
+        cursor.into_inner()
+    }
+
+    fn create_test_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(width, height, image::Rgb([120, 200, 50]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Jpeg)
+            .expect("fixture jpeg encodes");
+        cursor.into_inner()
+    }
+
+    /// Stand-in vision endpoint answering `/chat/completions` the way the
+    /// tool expects, so `execute` can be exercised end to end offline.
+    async fn mock_vision_endpoint() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "test-vision-model",
+                "choices": [{"message": {"content": "a tiny square"}}]
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn execute_reports_real_pixel_dimensions_and_format() {
+        let server = mock_vision_endpoint().await;
+        let workspace = tempdir().expect("workspace tempdir");
+        std::fs::write(
+            workspace.path().join("tiny.png"),
+            create_test_png(64, 48, [12, 34, 56, 255]),
+        )
+        .expect("write fixture");
+        std::fs::write(workspace.path().join("tiny.jpg"), create_test_jpeg(30, 20))
+            .expect("write fixture");
+
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let tool = tool_with_base_url(server.uri());
+
+        let cases: [(&str, u32, u32, &str); 2] =
+            [("tiny.png", 64, 48, "png"), ("tiny.jpg", 30, 20, "jpeg")];
+        for (name, width, height, format) in cases {
+            let result = tool
+                .execute(json!({"image_path": name}), &ctx)
+                .await
+                .expect("tool must succeed");
+            assert!(result.success);
+            let payload: Value = serde_json::from_str(&result.content).expect("json tool content");
+            assert_eq!(
+                payload.get("width").and_then(Value::as_u64),
+                Some(u64::from(width)),
+                "{name} must report real pixel width"
+            );
+            assert_eq!(
+                payload.get("height").and_then(Value::as_u64),
+                Some(u64::from(height)),
+                "{name} must report real pixel height"
+            );
+            assert_eq!(
+                payload.get("format").and_then(Value::as_str),
+                Some(format),
+                "{name} format must match the mime-derived label"
+            );
+            let requests = server.received_requests().await.expect("recorded requests");
+            let request: Value = requests
+                .last()
+                .expect("vision request")
+                .body_json()
+                .unwrap();
+            let image_url = request["messages"][0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .expect("uploaded image URL");
+            let uploaded = BASE64
+                .decode(
+                    image_url
+                        .strip_prefix(&format!("data:image/{format};base64,"))
+                        .expect("uploaded image MIME type matches metadata"),
+                )
+                .expect("uploaded image base64");
+            assert_eq!(
+                ImageAnalyzeTool::image_dimensions(&uploaded, &format!("image/{format}")),
+                Some((width, height, format.to_string())),
+                "{name} metadata must describe the actual uploaded bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_omits_dimension_metadata_for_unparsable_bytes() {
+        let server = mock_vision_endpoint().await;
+        let workspace = tempdir().expect("workspace tempdir");
+        std::fs::write(
+            workspace.path().join("broken.png"),
+            b"definitely not a png header",
+        )
+        .expect("write fixture");
+
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let tool = tool_with_base_url(server.uri());
+
+        let result = tool
+            .execute(json!({"image_path": "broken.png"}), &ctx)
+            .await
+            .expect("metadata failure must not fail the tool");
+        assert!(result.success);
+        let payload: Value = serde_json::from_str(&result.content).expect("json tool content");
+        assert!(payload.get("width").is_none(), "width must be omitted");
+        assert!(payload.get("height").is_none(), "height must be omitted");
+        assert!(payload.get("format").is_none(), "format must be omitted");
+        assert_eq!(
+            payload.get("analysis").and_then(Value::as_str),
+            Some("a tiny square")
+        );
+    }
+
+    #[test]
+    fn image_dimensions_respects_the_available_bmp_decoder() {
+        // Workspace feature unification can enable BMP on some platforms.
+        // Report its dimensions when supported; otherwise omit metadata.
+        const MINIMAL_BMP: &[u8] = &[
+            b'B', b'M', //
+            0x3a, 0x00, 0x00,
+            0x00, // file size: 14-byte header + 40-byte DIB + 4-byte padded row
+            0x00, 0x00, 0x00, 0x00, // reserved
+            0x36, 0x00, 0x00, 0x00, // pixel data offset: 54
+            0x28, 0x00, 0x00, 0x00, // DIB header size: 40
+            0x01, 0x00, 0x00, 0x00, // width: 1
+            0x01, 0x00, 0x00, 0x00, // height: 1
+            0x01, 0x00, // planes
+            0x18, 0x00, // bits per pixel: 24
+            0x00, 0x00, 0x00, 0x00, // compression: none
+            0x04, 0x00, 0x00, 0x00, // image size: one padded row
+            0x00, 0x00, 0x00, 0x00, // x pixels per meter
+            0x00, 0x00, 0x00, 0x00, // y pixels per meter
+            0x00, 0x00, 0x00, 0x00, // colors used
+            0x00, 0x00, 0x00, 0x00, // important colors
+            0x00, 0x00, 0x00, 0x00, // single BGR pixel plus 1 pad byte
+        ];
+        let decoder = image::ImageReader::with_format(
+            std::io::Cursor::new(MINIMAL_BMP),
+            image::ImageFormat::Bmp,
+        )
+        .into_decoder();
+        match decoder {
+            Ok(decoder) => {
+                assert_eq!(image::ImageDecoder::dimensions(&decoder), (1, 1));
+                assert_eq!(
+                    ImageAnalyzeTool::image_dimensions(MINIMAL_BMP, "image/bmp"),
+                    Some((1, 1, "bmp".to_string()))
+                );
+            }
+            Err(image::ImageError::Unsupported(error)) => {
+                assert!(matches!(
+                    error.kind(),
+                    image::error::UnsupportedErrorKind::Format(
+                        image::error::ImageFormatHint::Exact(image::ImageFormat::Bmp)
+                    )
+                ));
+                assert_eq!(
+                    ImageAnalyzeTool::image_dimensions(MINIMAL_BMP, "image/bmp"),
+                    None
+                );
+            }
+            Err(error) => panic!("invalid BMP fixture: {error}"),
+        }
     }
 }

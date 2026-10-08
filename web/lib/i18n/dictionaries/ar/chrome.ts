@@ -20,12 +20,9 @@ export const chrome: ChromeDict = {
   navCommunity: "المجتمع",
   navContribute: "المساهمة",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
+  navProduct: "المنتج",
+  navModels: "النماذج",
+  navPlugins: "الإضافات",
 
   skipToContent: "الانتقال إلى المحتوى الرئيسي",
 
@@ -35,30 +32,8 @@ export const chrome: ChromeDict = {
   installCta: "ثبّت ←",
 
   authSignIn: "تسجيل الدخول",
-  authRegister: "إنشاء حساب",
-  authGroupAria: "الحساب",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "أي نموذج، على جهازك",
-
-  issueLabel: "عدد {date}",
   dateLocale: "ar",
-
-  starsAria: "نجوم GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "مباشر",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "دُمج",
-  tickerOpened: "فُتح",
-  tickerClosed: "أُغلق",
-  tickerReleased: "أُصدر",
-  tickerFirstContribution: "أول مساهمة",
-  tickerBy: "بواسطة {handle}",
-  tickerAria: "آخر نشاط في المستودع",
-
-  traceLabel: "أثر الاستدلال",
-  traceTabsAria: "مقتطفات الجلسات",
 
   menuOpen: "افتح القائمة",
   menuClose: "أغلق القائمة",
@@ -66,11 +41,11 @@ export const chrome: ChromeDict = {
   themeAuto: "تلقائي",
   themeLight: "فاتح",
   themeDark: "داكن",
-  themeAria: "سمة التوثيق: {mode} (انقر للتبديل)",
-  themeTitle: "سمة التوثيق · تلقائي / فاتح / داكن",
+  themeAria: "السمة: {mode} (انقر للتبديل)",
+  themeTitle: "السمة · تلقائي / فاتح / داكن",
 
   footerTagline:
-    "Codewhale يغوص في الأعماق بدلًا منك — توثيق ومصدر ومجتمع لِ Runtime مفتوح المصدر.",
+    "عدّل الشيفرة وشغّل الاختبارات وراجع التغييرات باستخدام النماذج التي تختارها.",
   footerProduct: "المنتج",
   footerProject: "المشروع",
   footerDocs: "التوثيق",
@@ -82,11 +57,10 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "المساهمة",
   footerLicense: "رخصة MIT",
-  footerPricing: "الأسعار",
   footerTerms: "شروط الخدمة",
   footerPrivacy: "الخصوصية",
   footerChangelog: "سجل التغييرات",
-  footerCanonicalSource: "المصدر القانوني: ",
+  footerCanonicalSource: "المصدر الرسمي: ",
   footerReleases: " · الإصدارات: ",
   footerReleasesLink: "إصدارات GitHub",
   footerSecurity: "الأمن",

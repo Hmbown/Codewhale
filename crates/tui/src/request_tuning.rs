@@ -10,7 +10,7 @@
 //! ## Reasoning-effort enum reuse
 //!
 //! [`RequestTuning::reasoning_effort`] reuses the canonical
-//! [`crate::tui::app::ReasoningEffort`] enum rather than defining a local
+//! [`crate::reasoning_preference::ReasoningEffort`] enum rather than defining a local
 //! `Off/Low/Medium/High` copy. That enum is the single source of truth for the
 //! effort tiers across the DeepSeek and Codex effort pickers, it is already
 //! imported by sibling top-level modules (`auto_reasoning`, `model_routing`),
@@ -19,7 +19,7 @@
 //! Defining a parallel local enum here would duplicate that surface and risk
 //! drift, so we import the existing type.
 //!
-use crate::tui::app::ReasoningEffort;
+use crate::reasoning_preference::ReasoningEffort;
 
 /// Optional request-tuning knobs a caller may attach to a model request.
 ///

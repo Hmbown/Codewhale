@@ -1,7 +1,10 @@
 # Opt-in Codewhale toolbox workflow.
 #
+# The published base is currently 0.10.0. Build current main from the root
+# Dockerfile when testing unreleased source.
+#
 # Usage:
-#   CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:vX.Y.Z \
+#   CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:v0.10.0 \
 #   CODEWHALE_TOOLBOX_IMAGE=codewhale-toolbox:my-project \
 #   CODEWHALE_HOME_VOLUME=codewhale-my-project-home \
 #   CODEWHALE_WORKSPACE="$PWD" \

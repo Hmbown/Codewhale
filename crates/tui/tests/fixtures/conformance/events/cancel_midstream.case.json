@@ -1,0 +1,74 @@
+{
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "approval_mode": "suggest",
+  "auto_approve": false,
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "workspace_files": {
+    "README.md": "conformance fixture\n",
+    "NOTES.md": "second file\n"
+  },
+  "description": "The provider streams part of an answer and then stalls; the host cancels. The turn ends interrupted without waiting for any provider timeout.",
+  "user_message": "Tell me a long story.",
+  "provider_script": [
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_stall",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 120,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "text",
+            "text": ""
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "Here is a partial"
+          }
+        }
+      ],
+      "then": "hang"
+    }
+  ],
+  "driver": [
+    {
+      "when": {
+        "event": "response_delta",
+        "delta_contains": "partial"
+      },
+      "action": "cancel"
+    }
+  ]
+}

@@ -3,8 +3,8 @@
 //! entry, for mouse-less users.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 
@@ -30,15 +30,7 @@ impl RegisterCommand for PinCmd {
             Some(_) => return CommandResult::error(format!("Usage: {}", COMMAND_INFO.usage)),
             None => {}
         }
-        let pinned = crate::tui::window_control::toggle_pin();
-        app.needs_redraw = true;
-        CommandResult::message(
-            app.tr(if pinned {
-                MessageId::WindowPinActive
-            } else {
-                MessageId::WindowPinReleased
-            })
-            .into_owned(),
-        )
+        crate::tui::window_control::toggle_pin(app);
+        CommandResult::ok()
     }
 }

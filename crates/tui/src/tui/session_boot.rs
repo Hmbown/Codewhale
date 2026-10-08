@@ -5,16 +5,23 @@
 //! (`MCP · 4 connecting` or `Plugins · Problems: 2 · /plugins`); detailed
 //! diagnosis and actions belong in `/mcp` or `/plugins`, never as multi-row
 //! boot output between the transcript and composer.
+//!
+//! One exception, and it is a place rather than a second source: the launch
+//! screen has the vertical room the footer does not, so
+//! [`crate::tui::underwater::launch_empty_state`] projects the *same*
+//! [`SessionBootSurface`] into a block under the recent-work list that names
+//! the servers that failed or need a login. Nothing here computes MCP state
+//! twice; that renderer reads [`SessionBootSurface::servers`].
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::localization::{Locale, MessageId, tr};
 use crate::mcp::{McpManagerSnapshot, McpServerSnapshot};
 use crate::plugins::PluginRegistry;
 use crate::plugins::types::{PluginDiagnosticLevel, PluginTrustStatus};
 use crate::tui::app::App;
+use codewhale_localization::{Locale, MessageId, tr};
 
-const ITEM_SEPARATOR: &str = " · ";
+pub(crate) const ITEM_SEPARATOR: &str = " · ";
 const MAX_NAMED_CHIPS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,11 +66,6 @@ impl PluginBootSummary {
     }
 
     #[must_use]
-    pub fn has_failures(self) -> bool {
-        self.invalid > 0 || self.duplicate > 0
-    }
-
-    #[must_use]
     pub fn from_registry(registry: &PluginRegistry) -> Self {
         let loaded = registry.list().len();
         let mut invalid = 0usize;
@@ -83,7 +85,16 @@ impl PluginBootSummary {
                 .any(|diagnostic| diagnostic.level == PluginDiagnosticLevel::Error)
             {
                 invalid += 1;
-            } else if plugin_trust_needs_setup(plugin.trust_status) {
+            } else if plugin.enabled && plugin_trust_needs_setup(plugin.trust_status) {
+                // A bundle that is enabled but no longer trusted — its content
+                // or capabilities moved since the review, or it was switched on
+                // without one — is the problem this chip exists for. A disabled,
+                // never-reviewed bundle is a shipped default resting where it
+                // was shipped (every built-in starts that way), not a problem:
+                // counting it put "Plugins · Problems" in the footer of every
+                // fresh install until each built-in had been reviewed, whether
+                // or not anyone meant to enable it. Extensions still lists it
+                // with its review action.
                 needs_setup += 1;
             }
         }
@@ -94,6 +105,20 @@ impl PluginBootSummary {
             needs_setup,
         }
     }
+}
+
+/// Warm render-path caches (syntax highlighting) off the UI thread, once per
+/// process. Only the live TUI reads [`SessionBootSurface::from_app`], so
+/// headless and one-shot paths never pay for the load.
+fn spawn_render_prewarm_once() {
+    static PREWARM: std::sync::Once = std::sync::Once::new();
+    PREWARM.call_once(|| {
+        // Best effort: if the thread cannot start, the first code block
+        // loads the sets lazily exactly as before.
+        let _ = std::thread::Builder::new()
+            .name("cw-syntax-prewarm".to_string())
+            .spawn(crate::tui::markdown_render::prewarm_syntax_highlighting);
+    });
 }
 
 fn plugin_trust_needs_setup(status: PluginTrustStatus) -> bool {
@@ -136,6 +161,7 @@ pub struct SessionBootSurface {
 impl SessionBootSurface {
     #[must_use]
     pub fn from_app(app: &App) -> Self {
+        spawn_render_prewarm_once();
         Self::from_parts(
             app.mcp_snapshot.as_ref(),
             app.mcp_initializing,
@@ -157,7 +183,7 @@ impl SessionBootSurface {
             snapshot
                 .servers
                 .iter()
-                .map(|server| row_from_snapshot(server, initializing, connecting))
+                .filter_map(|server| row_from_snapshot(server, connecting))
                 .collect()
         } else if initializing {
             let mut names = connecting.to_vec();
@@ -177,11 +203,17 @@ impl SessionBootSurface {
             .iter()
             .filter(|row| row.state == McpServerBootState::Connecting)
             .count();
-        let unnamed_connecting = if connecting_count == 0 && initializing {
-            configured_count
-        } else {
-            0
-        };
+        // The pre-event gap is the only moment the in-flight names are
+        // genuinely unknown: once `connecting` arrives it is the engine's
+        // real in-flight set (#6033), and an empty set under lazy boot means
+        // nothing is connecting — not "names have not arrived yet".
+        let unnamed_connecting =
+            if connecting_count == 0 && initializing && connecting.is_empty() && snapshot.is_none()
+            {
+                configured_count
+            } else {
+                0
+            };
         let phase = if servers.is_empty() && plugins.is_quiet() && unnamed_connecting == 0 {
             SessionBootPhase::Hidden
         } else if initializing || connecting_count > 0 || unnamed_connecting > 0 {
@@ -196,6 +228,16 @@ impl SessionBootSurface {
             plugins,
             unnamed_connecting,
         }
+    }
+
+    /// Enabled servers known to be connecting before any name has arrived.
+    ///
+    /// The first launch frame can have `mcp_initializing` set with an empty
+    /// name list; without this a 23-server workspace would paint nothing at
+    /// all until the first boot event lands.
+    #[must_use]
+    pub fn connecting_without_names(&self) -> usize {
+        self.unnamed_connecting
     }
 
     #[must_use]
@@ -213,15 +255,19 @@ impl SessionBootSurface {
             .filter(|row| row.state == McpServerBootState::Connecting)
             .map(|row| row.name.as_str())
             .collect();
+        // A server whose login expired is not a failure: the engine already
+        // knows the remedy (`codewhale mcp login <server>` / the login tool),
+        // so the chip counts it under the shared auth-required label and only
+        // calls the rest failed (#5926).
+        let need_login = self
+            .servers
+            .iter()
+            .filter(|row| row.state == McpServerBootState::NeedsLogin)
+            .count();
         let failed = self
             .servers
             .iter()
-            .filter(|row| {
-                matches!(
-                    row.state,
-                    McpServerBootState::Failed | McpServerBootState::NeedsLogin
-                )
-            })
+            .filter(|row| row.state == McpServerBootState::Failed)
             .count();
         let connected = self
             .servers
@@ -238,19 +284,32 @@ impl SessionBootSurface {
                 budget,
             );
         }
-        if failed > 0 {
-            return activity_notice_from_candidates(
-                SessionBootActivityLevel::Failure,
-                vec![
-                    format!(
-                        "MCP{ITEM_SEPARATOR}{connected} {}{ITEM_SEPARATOR}{failed} {}",
-                        tr(locale, MessageId::ExtensionsStateConnected),
-                        tr(locale, MessageId::PhaseFailed)
-                    ),
-                    format!("MCP{ITEM_SEPARATOR}{failed} failed"),
-                ],
-                budget,
+        if failed > 0 || need_login > 0 {
+            let auth_label = mcp_auth_required_state_label();
+            let mut full = format!(
+                "MCP{ITEM_SEPARATOR}{connected} {}",
+                tr(locale, MessageId::ExtensionsStateConnected)
             );
+            // The narrow form drops the glyph and shortens the verb so both
+            // counts survive an 80-column footer.
+            let mut compact = String::from("MCP");
+            if need_login > 0 {
+                full.push_str(&format!("{ITEM_SEPARATOR}{need_login} {auth_label}"));
+                compact.push_str(&format!("{ITEM_SEPARATOR}{need_login} login"));
+            }
+            if failed > 0 {
+                full.push_str(&format!(
+                    "{ITEM_SEPARATOR}{failed} {}",
+                    tr(locale, MessageId::PhaseFailed)
+                ));
+                compact.push_str(&format!("{ITEM_SEPARATOR}{failed} failed"));
+            }
+            let level = if failed > 0 {
+                SessionBootActivityLevel::Failure
+            } else {
+                SessionBootActivityLevel::Attention
+            };
+            return activity_notice_from_candidates(level, vec![full, compact], budget);
         }
         if self.phase == SessionBootPhase::Booting {
             let count = self.servers.len().max(self.unnamed_connecting);
@@ -263,27 +322,23 @@ impl SessionBootSurface {
             }
         }
 
-        if self.plugins.is_quiet() {
-            return None;
-        }
-
-        let plugins = tr(locale, MessageId::ExtensionsTabPlugins);
-        let problems = tr(locale, MessageId::ExtensionsGroupProblems);
-        let count = self.plugins.problem_count();
-        let level = if self.plugins.has_failures() {
-            SessionBootActivityLevel::Failure
-        } else {
-            SessionBootActivityLevel::Attention
-        };
-        activity_notice_from_candidates(
-            level,
-            vec![
-                format!("{plugins}{ITEM_SEPARATOR}{problems}: {count}{ITEM_SEPARATOR}/plugins"),
-                format!("{plugins}{ITEM_SEPARATOR}{problems}: {count}"),
-                format!("{plugins}{ITEM_SEPARATOR}{count}"),
-            ],
-            budget,
-        )
+        // Plugins contribute no footer chip.
+        //
+        // "Plugins · Problems: N" sat in the footer of every session for as
+        // long as the condition held, and a person could do nothing about it
+        // from there. Worse, its number and the Plugins tab disagreed by
+        // construction: the chip counted enabled-but-unreviewed bundles,
+        // while the tab's Problems group lists only registry-level
+        // diagnostics, so the rows that made the count were somewhere else
+        // entirely — "it says 2 problems ... it's not even clear what the
+        // problems are because there are actually 3".
+        //
+        // A bundle waiting on a review is not an incident; it is a row with
+        // an action. `/plugins` states it per bundle, next to the key that
+        // resolves it. `self.plugins` is still computed: it decides whether
+        // this surface is `Hidden`, and the launch block reads the same
+        // summary.
+        None
     }
 }
 
@@ -300,42 +355,41 @@ fn activity_notice_from_candidates(
 
 fn row_from_snapshot(
     server: &McpServerSnapshot,
-    initializing: bool,
     connecting: &[String],
-) -> McpServerBootRow {
+) -> Option<McpServerBootRow> {
     if !server.enabled {
-        return McpServerBootRow {
+        return Some(McpServerBootRow {
             name: server.name.clone(),
             state: McpServerBootState::Disabled,
-        };
+        });
     }
     if server.connected {
-        return McpServerBootRow {
+        return Some(McpServerBootRow {
             name: server.name.clone(),
             state: McpServerBootState::Connected,
-        };
+        });
     }
     if let Some(error) = server.error.as_deref() {
-        if server.auth_required || mcp_error_requires_login(error) {
-            return McpServerBootRow {
-                name: server.name.clone(),
-                state: McpServerBootState::NeedsLogin,
-            };
-        }
-        return McpServerBootRow {
-            name: server.name.clone(),
-            state: McpServerBootState::Failed,
-        };
-    }
-    let connecting_now = initializing || connecting.iter().any(|name| name == &server.name);
-    McpServerBootRow {
-        name: server.name.clone(),
-        state: if connecting_now {
-            McpServerBootState::Connecting
+        let state = if server.auth_required || mcp_error_requires_login(error) {
+            McpServerBootState::NeedsLogin
         } else {
             McpServerBootState::Failed
-        },
+        };
+        return Some(McpServerBootRow {
+            name: server.name.clone(),
+            state,
+        });
     }
+    if connecting.iter().any(|name| name == &server.name) {
+        return Some(McpServerBootRow {
+            name: server.name.clone(),
+            state: McpServerBootState::Connecting,
+        });
+    }
+    // Enabled, unconnected, no diagnosis, not in flight: a lazy server
+    // nobody has asked for yet (#6033). It is not boot activity, so it gets
+    // no row — calling it Failed or Connecting would both be lies.
+    None
 }
 
 /// Text fallback for the typed [`McpServerSnapshot::auth_required`] state:
@@ -452,64 +506,70 @@ mod tests {
         assert!(!plugin_trust_needs_setup(PluginTrustStatus::Trusted));
     }
 
+    /// A fresh install ships every built-in bundle disabled and never
+    /// reviewed. That is the shipped resting state, not a problem: counting
+    /// it kept "Plugins · Problems" in the footer of every new install until
+    /// each built-in had been reviewed.
     #[test]
-    fn plugin_problems_have_a_compact_footer_action() {
-        let surface = SessionBootSurface::from_parts(
-            None,
-            false,
-            &[],
-            0,
+    fn fresh_install_built_ins_keep_the_plugin_chip_quiet() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(&workspace);
+        let shipped_disabled = registry
+            .list()
+            .into_iter()
+            .filter(|plugin| {
+                !plugin.enabled && plugin.trust_status == PluginTrustStatus::NeverReviewed
+            })
+            .count();
+        assert!(
+            shipped_disabled > 0,
+            "fixture must discover at least one disabled, never-reviewed built-in"
+        );
+
+        let summary = PluginBootSummary::from_registry(&registry);
+        assert_eq!(summary.loaded, registry.list().len());
+        assert!(
+            summary.is_quiet(),
+            "a fresh install must not report plugin problems: {summary:?}"
+        );
+    }
+
+    /// Plugin state never reaches the footer, at any width and at any
+    /// severity. The chip it replaced was permanent, unactionable, and
+    /// counted a different set than the tab it pointed at.
+    #[test]
+    fn plugin_problems_never_produce_a_footer_chip() {
+        for summary in [
             PluginBootSummary {
                 loaded: 3,
                 invalid: 1,
                 duplicate: 1,
                 needs_setup: 1,
             },
-        );
-        assert_eq!(surface.phase, SessionBootPhase::Settled);
-        assert_eq!(
-            surface.activity_notice(Locale::En, 40),
-            Some(SessionBootActivityChip {
-                text: "Plugins · Problems: 3 · /plugins".to_string(),
-                level: SessionBootActivityLevel::Failure,
-            })
-        );
-    }
-
-    #[test]
-    fn plugin_review_notice_uses_attention_and_sheds_whole_fields() {
-        let surface = SessionBootSurface::from_parts(
-            None,
-            false,
-            &[],
-            0,
             PluginBootSummary {
                 loaded: 1,
                 needs_setup: 1,
                 ..PluginBootSummary::default()
             },
-        );
-        assert_eq!(
-            surface.activity_notice(Locale::En, 40),
-            Some(SessionBootActivityChip {
-                text: "Plugins · Problems: 1 · /plugins".to_string(),
-                level: SessionBootActivityLevel::Attention,
-            })
-        );
-        assert_eq!(
-            surface
-                .activity_notice(Locale::En, 22)
-                .map(|notice| notice.text)
-                .as_deref(),
-            Some("Plugins · Problems: 1")
-        );
-        assert_eq!(
-            surface
-                .activity_notice(Locale::En, 12)
-                .map(|notice| notice.text)
-                .as_deref(),
-            Some("Plugins · 1")
-        );
+        ] {
+            let surface = SessionBootSurface::from_parts(None, false, &[], 0, summary);
+            assert_eq!(surface.phase, SessionBootPhase::Settled);
+            for budget in [12, 22, 40, 80] {
+                assert_eq!(
+                    surface.activity_notice(Locale::En, budget),
+                    None,
+                    "plugin summary {summary:?} produced a chip at width {budget}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -644,12 +704,59 @@ mod tests {
                 .map(|row| row.state),
             Some(McpServerBootState::NeedsLogin)
         );
-        // The compact activity chip counts a needs-login server with the
-        // failure band (the receipt-line renderer this pinned moved to the
-        // chip in the Tideline boot-surface refactor).
+        // The compact activity chip names a needs-login server under the
+        // shared auth-required label, at attention level: the remedy is a
+        // login, not a repair (#5926).
         assert_eq!(surface.servers.len(), 1);
-        let chip = surface.activity_notice(Locale::En, 100);
-        assert!(chip.is_some(), "needs-login must surface on the boot chip");
+        let chip = surface
+            .activity_notice(Locale::En, 100)
+            .expect("needs-login must surface on the boot chip");
+        assert_eq!(chip.level, SessionBootActivityLevel::Attention);
+        assert_eq!(
+            chip.text,
+            format!(
+                "MCP{ITEM_SEPARATOR}0 connected{ITEM_SEPARATOR}1 {}",
+                mcp_auth_required_state_label()
+            )
+        );
+        assert!(!chip.text.contains("failed"), "{}", chip.text);
+    }
+
+    #[test]
+    fn chip_separates_expired_logins_from_real_failures() {
+        let mut expired = server("slack", true, false, Some("401 Unauthorized"));
+        expired.auth_required = true;
+        let snap = snapshot(vec![
+            server("alpha", true, true, None),
+            expired,
+            server("beta", true, false, Some("Stdio transport closed")),
+        ]);
+        let surface = SessionBootSurface::from_parts(
+            Some(&snap),
+            false,
+            &[],
+            3,
+            PluginBootSummary::default(),
+        );
+        let chip = surface
+            .activity_notice(Locale::En, 100)
+            .expect("mixed states surface on the boot chip");
+        assert_eq!(chip.level, SessionBootActivityLevel::Failure);
+        assert_eq!(
+            chip.text,
+            format!(
+                "MCP{ITEM_SEPARATOR}1 connected{ITEM_SEPARATOR}1 {}{ITEM_SEPARATOR}1 failed",
+                mcp_auth_required_state_label()
+            )
+        );
+        // Under a tight budget the compact form keeps both counts.
+        let compact = surface
+            .activity_notice(Locale::En, 30)
+            .expect("compact chip");
+        assert_eq!(
+            compact.text,
+            format!("MCP{ITEM_SEPARATOR}1 login{ITEM_SEPARATOR}1 failed")
+        );
     }
 
     #[test]

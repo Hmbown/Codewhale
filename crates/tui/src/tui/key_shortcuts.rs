@@ -366,11 +366,11 @@ mod tests {
     /// truth so bare-`v` "details" copy cannot regress while bare `v` types `v`.
     #[test]
     fn tool_details_hint_tracks_keybinding_catalog_and_handler() {
-        use crate::localization::MessageId;
         use crate::tui::keybindings::KEYBINDINGS;
         use crate::tui::shell_key_routing::{
             ShellBindingId, binding, is_tool_details_shortcut, tool_details_chord,
         };
+        use codewhale_localization::MessageId;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let catalog_chords: Vec<&str> = KEYBINDINGS

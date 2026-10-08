@@ -11,12 +11,11 @@ const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 const CHROME_DEVTOOLS_MCP_PACKAGE: &str = "chrome-devtools-mcp@1.7.0";
 const PLAYWRIGHT_MCP_PACKAGE: &str = "@playwright/mcp@0.0.79";
 const PLAYWRIGHT_MCP_SOURCE: &str = "https://github.com/microsoft/playwright-mcp";
-const CUA_DRIVER_SOURCE: &str = "https://github.com/trycua/cua";
 const CONTAINER_USE_SOURCE: &str = "https://github.com/dagger/container-use";
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "mcp",
-    aliases: &[],
+    aliases: &["mcps"],
     usage: "/mcp [init|import|import approve <name>|import decline <name>|recommendations|add recommended <id>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>|retry <name>|doctor|validate|restart|reload]",
     description_key: "cmd_mcp_description",
 };
@@ -46,7 +45,12 @@ fn mcp_contextual(contexts: CommandContexts<'_>, args: Option<&str>) -> CommandR
 
 fn mcp(presentation: &mut dyn CommandPresentationContext, args: Option<&str>) -> CommandResult {
     let raw = args.unwrap_or("").trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("status") || raw.eq_ignore_ascii_case("list") {
+    if raw.is_empty() {
+        return CommandResult::action(AppAction::OpenExtensions {
+            tab: crate::tui::views::extensions::ExtensionsTab::Mcp,
+        });
+    }
+    if raw.eq_ignore_ascii_case("status") || raw.eq_ignore_ascii_case("list") {
         return CommandResult::action(AppAction::Mcp(McpUiAction::Show));
     }
 
@@ -118,7 +122,12 @@ fn mcp(presentation: &mut dyn CommandPresentationContext, args: Option<&str>) ->
                 }
             }
         }
-        "validate" | "doctor" => CommandResult::action(AppAction::Mcp(McpUiAction::Validate)),
+        "validate" | "doctor" => match parts.next() {
+            Some(name) => CommandResult::action(AppAction::Mcp(McpUiAction::Diagnose {
+                name: name.to_string(),
+            })),
+            None => CommandResult::action(AppAction::Mcp(McpUiAction::Validate)),
+        },
         "reload" | "reconnect" | "restart" => {
             CommandResult::action(AppAction::Mcp(McpUiAction::Reload))
         }
@@ -184,13 +193,6 @@ fn parse_add_for_platform(
                     ],
                 }))
             }
-            [_, id] if id.eq_ignore_ascii_case("cua") || id.eq_ignore_ascii_case("cua-driver") => {
-                CommandResult::action(AppAction::Mcp(McpUiAction::AddStdio {
-                    name: "cua-driver".to_string(),
-                    command: "cua-driver".to_string(),
-                    args: vec!["mcp".to_string()],
-                }))
-            }
             [_, id]
                 if id.eq_ignore_ascii_case("container-use")
                     || id.eq_ignore_ascii_case("container") =>
@@ -240,18 +242,14 @@ fn mcp_unknown_id(presentation: &mut dyn CommandPresentationContext) -> String {
             &[("recommendations_command", "/mcp recommendations")],
         )
         .unwrap_or_else(|_| {
-            "Unknown recommended MCP ID. Run /mcp recommendations to inspect the curated list."
-                .to_string()
+            "Unknown MCP suggestion. Run /mcp recommendations to see the list.".to_string()
         })
 }
 
 fn recommended_mcp_text(presentation: &mut dyn CommandPresentationContext) -> String {
     let heading = presentation
         .translate("mcp_recommendations_heading", &[])
-        .unwrap_or_else(|_| {
-            "Suggested Codewhale plugins (MCP components; nothing is installed automatically)"
-                .to_string()
-        });
+        .unwrap_or_else(|_| "Suggested MCP servers (nothing installs automatically)".to_string());
     let safety = presentation
         .translate(
             "mcp_recommendations_safety",
@@ -299,16 +297,6 @@ fn recommended_mcp_text(presentation: &mut dyn CommandPresentationContext) -> St
         .unwrap_or_else(|_| {
             format!("• playwright — Microsoft's official Playwright MCP via pinned npm package\n  package: {PLAYWRIGHT_MCP_PACKAGE}")
         });
-    let cua = presentation
-        .translate(
-            "mcp_recommendation_cua",
-            &[
-                ("source", CUA_DRIVER_SOURCE),
-                ("restart_command", "/mcp restart"),
-                ("add_command", "/mcp add recommended cua"),
-            ],
-        )
-        .unwrap_or_else(|_| format!("• cua — Cua Driver computer-use plugin (MCP server component)\n  source: {CUA_DRIVER_SOURCE}"));
     let container_use = presentation
         .translate(
             "mcp_recommendation_container_use",
@@ -333,8 +321,6 @@ fn recommended_mcp_text(presentation: &mut dyn CommandPresentationContext) -> St
          {chrome}\n\
          \n\
          {playwright}\n\
-         \n\
-         {cua}\n\
          \n\
          {container_use}\n\
          \n\
@@ -395,14 +381,13 @@ mod tests {
         fn translate(&self, key: &str, r: &[(&str, &str)]) -> Result<String, String> {
             let mut out = match key {
                 "mcp_recommended_unknown_id" => {
-                    "Unknown recommended MCP ID. Run {recommendations_command} to inspect the curated list.".to_string()
+                    "Unknown MCP suggestion. Run {recommendations_command} to see the list.".to_string()
                 }
                 "mcp_recommendations_heading" => {
-                    "Suggested Codewhale plugins (MCP components; nothing is installed automatically)"
-                        .to_string()
+                    "Suggested MCP servers (nothing installs automatically)".to_string()
                 }
                 "mcp_recommendations_safety" => {
-                    "Viewing this list adds or enables nothing. An explicit add writes config only; review it before {restart_command} connects the server."
+                    "Looking adds nothing. Adding writes config only — review it before {restart_command} connects anything."
                         .to_string()
                 }
                 "mcp_recommendation_github" => {
@@ -413,9 +398,6 @@ mod tests {
                 }
                 "mcp_recommendation_playwright" => {
                     "• playwright — Microsoft's official Playwright MCP via pinned npm package\n  package: {package} ({launcher})\n  source: {source}\n  --isolated starts a fresh browser profile. It can browse/control pages and read authenticated pages.\n  add: {add_command}".to_string()
-                }
-                "mcp_recommendation_cua" => {
-                    "• cua — Cua Driver computer-use plugin (MCP server component)\n  command: cua-driver mcp\n  source: {source}\n  preview: install and verify Cua Driver separately; Codewhale never downloads it. It can control the desktop and requires operating-system permissions.\n  add: {add_command}".to_string()
                 }
                 "mcp_recommendation_container_use" => {
                     "• container-use — Dagger's experimental container-use MCP\n  command: container-use stdio\n  source: {source}\n  requires the separately installed container-use binary; Codewhale never downloads or installs this binary.\n  add: {add_command}".to_string()
@@ -452,6 +434,12 @@ mod tests {
             doctor.action,
             Some(AppAction::Mcp(McpUiAction::Validate))
         ));
+        for command in ["validate github", "doctor github"] {
+            assert!(matches!(
+                mcp(&mut FakePresentation, Some(command)).action,
+                Some(AppAction::Mcp(McpUiAction::Diagnose { name })) if name == "github"
+            ));
+        }
         let restart = mcp(&mut FakePresentation, Some("restart"));
         assert!(matches!(
             restart.action,
@@ -461,21 +449,22 @@ mod tests {
         let recommended = mcp(&mut FakePresentation, Some("recommendations"))
             .message
             .expect("recommendations text");
-        assert!(recommended.contains("nothing is installed automatically"));
+        assert!(recommended.contains("nothing installs automatically"));
         assert!(recommended.contains("provenance:"));
         assert!(recommended.contains("https://api.githubcopilot.com/mcp/"));
         assert!(recommended.contains("chrome-devtools-mcp@1.7.0"));
         assert!(recommended.contains("@playwright/mcp@0.0.79"));
         assert!(recommended.contains("https://github.com/microsoft/playwright-mcp"));
         assert!(recommended.contains("https://github.com/dagger/container-use"));
-        assert!(recommended.contains("https://github.com/trycua/cua"));
+        assert!(!recommended.contains("https://github.com/trycua/cua"));
+        assert!(!recommended.to_ascii_lowercase().contains("cua-driver"));
         assert!(recommended.contains("least-privilege PAT outside command history"));
         assert!(recommended.contains("read authenticated pages"));
 
         let unknown = mcp(&mut FakePresentation, Some("add recommended unknown"))
             .message
             .expect("localized unknown recommendation error");
-        assert!(unknown.contains("Unknown recommended MCP ID"), "{unknown}");
+        assert!(unknown.contains("Unknown MCP suggestion"), "{unknown}");
 
         let add_recommended = mcp(&mut FakePresentation, Some("add recommended hugging-face"));
         assert!(matches!(
@@ -526,13 +515,18 @@ mod tests {
         ));
 
         let add_cua = mcp(&mut FakePresentation, Some("add recommended cua"));
-        assert!(matches!(
-            add_cua.action,
-            Some(AppAction::Mcp(McpUiAction::AddStdio { name, command, args }))
-                if name == "cua-driver"
-                    && command == "cua-driver"
-                    && args == vec!["mcp".to_string()]
-        ));
+        assert!(
+            add_cua.is_error,
+            "Cua is not a Codewhale computer-use recommendation"
+        );
+        assert!(
+            add_cua
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Unknown MCP suggestion")),
+            "{:?}",
+            add_cua.message
+        );
 
         let import_list = mcp(&mut FakePresentation, Some("import"));
         assert!(matches!(
@@ -601,13 +595,14 @@ mod tests {
     #[test]
     fn recommendations_state_execution_and_install_boundaries() {
         let text = recommended_mcp_text(&mut FakePresentation);
-        assert!(text.contains("nothing is installed automatically"));
-        assert!(text.contains("Suggested Codewhale plugins"));
+        assert!(text.contains("nothing installs automatically"));
+        assert!(text.contains("Suggested MCP servers"));
         assert!(text.contains("never downloads or"));
         assert!(text.contains("installs this binary"));
         assert!(text.contains("experimental"));
         assert!(text.contains("--isolated"));
-        assert!(text.contains("operating-system permissions"));
+        assert!(!text.contains("operating-system permissions"));
+        assert!(!text.to_ascii_lowercase().contains("cua"));
     }
 
     #[test]
@@ -627,6 +622,6 @@ mod tests {
             Some("Error: Command capability unavailable: presentation")
         );
         assert_eq!(McpCmd::info().description_key, "cmd_mcp_description");
-        assert_eq!(McpCmd::info().aliases, &[] as &[&str]);
+        assert_eq!(McpCmd::info().aliases, &["mcps"]);
     }
 }

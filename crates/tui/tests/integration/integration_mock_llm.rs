@@ -23,10 +23,10 @@
 //! # Why trait-level (not engine-level)
 //!
 //! As of v0.6.7 the engine (`crates/tui/src/core/engine.rs`) holds a concrete
-//! `Option<DeepSeekClient>` — the [`LlmClient`] trait is implemented but no
+//! `Option<CodewhaleClient>` — the [`LlmClient`] trait is implemented but no
 //! consumer takes `Arc<dyn LlmClient>` or generic `<C: LlmClient>`. Wiring the
 //! mock into a full engine turn-loop therefore requires a separate refactor:
-//! every `Option<DeepSeekClient>` consumer (engine, registry, rlm, review,
+//! every `Option<CodewhaleClient>` consumer (engine, registry, rlm, review,
 //! cycle_manager, compaction, subagent) must move to `Arc<dyn LlmClient>`.
 //!
 //! Per the v0.7.0 mock-LLM issue (the parent of this file): "If the engine's
@@ -54,8 +54,8 @@ use futures_util::StreamExt;
 
 use crate::llm_client::LlmClient;
 use crate::llm_client::mock::{MockLlmClient, canned};
-use crate::models::Role;
-use crate::models::{ContentBlock, Delta, Message, MessageRequest, StreamEvent, Usage};
+use codewhale_models::Role;
+use codewhale_models::{ContentBlock, Delta, Message, MessageRequest, StreamEvent, Usage};
 
 // === Helpers ===============================================================
 
@@ -90,6 +90,7 @@ fn assistant_tool_call(id: &str, name: &str, input: serde_json::Value) -> Messag
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: name.to_string(),
             input,
@@ -103,6 +104,7 @@ fn tool_result_message(tool_use_id: &str, content: &str) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: tool_use_id.to_string(),
             content: content.to_string(),
             is_error: None,
@@ -290,7 +292,7 @@ async fn tool_call_round_trip_streams_args_then_continues() {
     while let Some(ev) = s1.next().await {
         match ev.unwrap() {
             StreamEvent::ContentBlockStart { content_block, .. } => {
-                use crate::models::ContentBlockStart;
+                use codewhale_models::ContentBlockStart;
                 if let ContentBlockStart::ToolUse { name, .. } = content_block {
                     assert_eq!(name, "read_file");
                     tool_use_seen = true;
@@ -357,7 +359,7 @@ async fn parallel_tool_calls_preserve_ordering_in_turn_payload() {
             content_block,
         } = ev.unwrap()
         {
-            use crate::models::ContentBlockStart;
+            use codewhale_models::ContentBlockStart;
             if let ContentBlockStart::ToolUse { id, .. } = content_block {
                 starts.push((index, id));
             }
@@ -373,7 +375,7 @@ async fn parallel_tool_calls_preserve_ordering_in_turn_payload() {
 
 #[tokio::test]
 async fn compaction_non_streaming_returns_queued_message_response() {
-    use crate::models::MessageResponse;
+    use codewhale_models::MessageResponse;
 
     let mock = MockLlmClient::new(vec![]);
     mock.push_message_response(MessageResponse {
@@ -457,7 +459,7 @@ Child results are self-reports; verify side effects with tools like read_file or
     while let Some(ev) = stream.next().await {
         match ev.unwrap() {
             StreamEvent::ContentBlockStart { content_block, .. } => {
-                use crate::models::ContentBlockStart;
+                use codewhale_models::ContentBlockStart;
                 if let ContentBlockStart::ToolUse { name, .. } = content_block {
                     tool_name = Some(name);
                 }
@@ -544,7 +546,8 @@ fn compaction_config_defaults_are_enabled_for_session_survivability() {
     // This test is a smoke check that the defaults compile and are correct.
     // The production `CompactionConfig::default()` is exercised by
     // `compaction::tests::should_compact_respects_enabled_flag` etc.
-    let config = crate::models::compaction_threshold_for_model_at_percent("deepseek-v4-pro", 80.0);
+    let config =
+        codewhale_models::compaction_threshold_for_model_at_percent("deepseek-v4-pro", 80.0);
     // Verify the threshold is reasonable (> 0 and < context window).
     assert!(config > 0, "compaction threshold must be positive");
     assert!(config < 1_000_000, "compaction threshold must be below 1M");

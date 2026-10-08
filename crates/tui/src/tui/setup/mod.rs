@@ -20,8 +20,6 @@ use ratatui::{
 };
 
 use crate::config::{Config, has_api_key};
-use crate::localization::{Locale, MessageId, tr};
-use crate::palette;
 use crate::prompts::{
     BASE_PROMPT_OVERRIDE_OPT_IN_ENV, CONSTITUTION_OVERRIDE_FILE, base_prompt_override_opt_in,
 };
@@ -31,6 +29,8 @@ use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_panel_scroll_rail, render_underwater_surface,
 };
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette as palette;
 
 use codewhale_config::{
     AutonomyPreference, ConstitutionAuthoring, ConstitutionChoice, ConstitutionSource,
@@ -50,6 +50,7 @@ mod tools_mcp;
 pub(crate) use fleet_draft::{draft_fleet_profile_with_model, workspace_fingerprint};
 pub(crate) use model_draft::draft_constitution_with_model;
 use persistence::SetupPersistenceFacts;
+pub(crate) use provider::record_configured_route;
 use remote::SetupRemoteFacts;
 
 /// Target lane for the once-per-version constitution checkpoint. Bumped per
@@ -190,6 +191,10 @@ pub struct SetupWizardView {
     /// Display label of the model that authored `model_draft` (safe metadata,
     /// e.g. "GLM-5.2"), for provenance copy only.
     model_draft_label: Option<String>,
+    /// The answers (and free-form note) the in-flight model draft was asked
+    /// to write. A draft lands only while they are still the wizard's
+    /// answers; one requested for answers since changed is stale (U08-06).
+    model_draft_request: Option<(GuidedConstitutionDraft, Option<String>)>,
     runtime_preset: SetupRuntimePreset,
     runtime_preset_preview_seen: bool,
     body_scroll: usize,
@@ -202,6 +207,7 @@ struct SetupRuntimeFacts {
     auth: String,
     health: String,
     provider_ready: bool,
+    provider_status: StepStatus,
     provider_result: String,
     work_intent: String,
     approval: String,
@@ -262,6 +268,7 @@ impl Default for SetupRuntimeFacts {
             auth: "not checked".to_string(),
             health: "not checked".to_string(),
             provider_ready: false,
+            provider_status: StepStatus::NeedsAction,
             provider_result: "provider/model not loaded".to_string(),
             work_intent: "not loaded".to_string(),
             approval: "not loaded".to_string(),
@@ -272,11 +279,11 @@ impl Default for SetupRuntimeFacts {
             sandbox_mode_value: "default".to_string(),
             network: "not configured".to_string(),
             network_default_value: "prompt".to_string(),
-            runtime_result: "runtime posture not loaded".to_string(),
+            runtime_result: "permissions not loaded".to_string(),
             operate_runtime_ready: false,
-            operate_runtime_result: "worker runtime not loaded".to_string(),
+            operate_runtime_result: "agent runtime not loaded".to_string(),
             fleet_roster_ready: false,
-            fleet_roster_result: "Fleet roster not loaded".to_string(),
+            fleet_roster_result: "Fleet not loaded".to_string(),
             operate_concurrency_result: "concurrency not loaded".to_string(),
             operate_result: "operate readiness not loaded".to_string(),
             hotbar_bindings_result: "Hotbar config not loaded".to_string(),
@@ -316,27 +323,39 @@ impl Default for SetupRuntimeFacts {
 impl SetupRuntimeFacts {
     fn from_app_config(app: &App, config: &Config) -> Self {
         let expert_override = SetupExpertOverrideState::load();
-        let readiness = crate::provider_readiness::resolve_for_model(
-            config,
-            app.api_provider,
-            if app.auto_model { "auto" } else { &app.model },
-            &app.provider_health,
-        );
+        let readiness = app
+            .admitted_provider_identity()
+            .ok()
+            .filter(|identity| config.verify_provider_identity(identity).is_ok())
+            .map_or(
+                crate::provider_readiness::ResolvedProviderReadiness::InvalidRoute,
+                |identity| {
+                    crate::provider_readiness::resolve_for_model(
+                        config,
+                        identity,
+                        if app.auto_model { "auto" } else { &app.model },
+                        &app.provider_health,
+                    )
+                },
+            );
         // A failed observed check remains retryable in route pickers, but the
         // setup receipt must not certify it as healthy. Saved-unchecked and
         // local-unchecked are honest reviewed configuration states; an actual
         // session failure is NeedsAction until a later success replaces it.
-        let provider_ready = readiness.can_attempt()
-            && !matches!(
-                &readiness,
-                crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
-            );
+        let provider_status = provider::step_status(&readiness);
+        let provider_ready = matches!(
+            provider_status,
+            StepStatus::Configured | StepStatus::Verified
+        );
         let model = app.model_display_label();
-        let provider_name = if app.api_provider == crate::config::ApiProvider::Custom {
-            app.provider_identity_for_persistence().to_string()
-        } else {
-            app.api_provider.display_name().to_string()
-        };
+        let provider_name = app
+            .admitted_provider_identity()
+            .map_or("unavailable", |identity| {
+                identity
+                    .compatibility()
+                    .map_or(identity.key.as_str(), |row| row.label)
+            })
+            .to_string();
         let context_window = crate::route_budget::route_context_window_tokens(
             app.api_provider,
             &app.model,
@@ -353,14 +372,14 @@ impl SetupRuntimeFacts {
             crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
         ) {
             format!("{}; retry or open /provider", readiness.label())
-        } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
+        } else if app.api_provider == crate::config::ProviderKind::OpenaiCodex {
             format!(
                 "{}; Sign in with ChatGPT via `codewhale auth chatgpt` or /provider setup openai-codex (subscription billing). Codex CLI import remains an explicit alternative.",
                 readiness.label()
             )
         } else if let Some(url) = crate::config::credential_help_for_provider_route(
             app.api_provider,
-            &config.deepseek_base_url(),
+            &config.active_route_base_url(),
         )
         .credential_url
         {
@@ -374,7 +393,7 @@ impl SetupRuntimeFacts {
                 readiness.label(),
                 crate::config::credential_help_for_provider_route(
                     app.api_provider,
-                    &config.deepseek_base_url(),
+                    &config.active_route_base_url(),
                 )
                 .guidance
             )
@@ -394,7 +413,7 @@ impl SetupRuntimeFacts {
         );
         let shell = if app.allow_shell { "enabled" } else { "hidden" }.to_string();
         let trust = if app.trust_mode {
-            "trusted workspace / writes allowed by posture"
+            "trusted workspace / writes allowed by permissions"
         } else {
             "workspace trust not elevated"
         }
@@ -486,6 +505,7 @@ impl SetupRuntimeFacts {
             auth,
             health,
             provider_ready,
+            provider_status,
             provider_result,
             work_intent: app.mode.display_name().to_string(),
             approval: app
@@ -2312,6 +2332,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2339,6 +2360,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2466,19 +2488,19 @@ impl SetupWizardView {
     }
 
     fn commit_provider_model_review(&mut self) -> ViewAction {
-        let status = provider::step_status(self.facts.provider_ready);
+        let status = self.facts.provider_status;
         let mut state = self.state.clone();
         state.set_step(
             SetupStep::ProviderModel,
             provider::step_entry(
-                self.facts.provider_ready,
+                status,
                 CONSTITUTION_CHECKPOINT_VERSION,
                 self.facts.provider_result.clone(),
             ),
         );
         self.state = state.clone();
         self.move_next();
-        let message_id = if status == StepStatus::Verified {
+        let message_id = if self.facts.provider_ready {
             MessageId::SetupProviderModelReviewed
         } else {
             MessageId::SetupProviderModelNeedsActionSaved
@@ -2840,10 +2862,11 @@ impl SetupWizardView {
     /// `A` on the constitution step: ask the first configured model to draft.
     /// Requires a ready provider route; otherwise the key is inert and the
     /// deterministic guided flow stands untouched.
-    fn request_model_draft(&self) -> ViewAction {
+    fn request_model_draft(&mut self) -> ViewAction {
         if !self.facts.provider_ready {
             return ViewAction::None;
         }
+        self.model_draft_request = Some(self.current_model_draft_request());
         ViewAction::Emit(ViewEvent::SetupConstitutionModelDraftRequested {
             draft: self.guided_draft,
             freeform_note: self.freeform_note_for_draft().map(str::to_string),
@@ -2856,6 +2879,13 @@ impl SetupWizardView {
             self.editing_freeform_note = !self.editing_freeform_note;
         }
         ViewAction::None
+    }
+
+    fn current_model_draft_request(&self) -> (GuidedConstitutionDraft, Option<String>) {
+        (
+            self.guided_draft,
+            self.freeform_note_for_draft().map(str::to_string),
+        )
     }
 
     fn freeform_note_for_draft(&self) -> Option<&str> {
@@ -2902,12 +2932,20 @@ impl SetupWizardView {
     /// ratification preview the host must open in the same breath — that is
     /// what satisfies the preview gate. Ratifying still takes the explicit
     /// `G` keypress afterwards.
+    ///
+    /// Returns `None`, installing nothing, when the answers or note changed
+    /// after the draft was requested: that draft is law for answers the
+    /// person no longer holds (U08-06).
     #[must_use]
     pub(crate) fn install_model_draft(
         &mut self,
         constitution: Box<UserConstitution>,
         model_label: String,
-    ) -> (String, String) {
+    ) -> Option<(String, String)> {
+        if self.model_draft_request.as_ref() != Some(&self.current_model_draft_request()) {
+            return None;
+        }
+        self.model_draft_request = None;
         let content = constitution_ratification_text(
             self.locale,
             &constitution,
@@ -2916,7 +2954,7 @@ impl SetupWizardView {
         self.model_draft = Some(constitution);
         self.model_draft_label = Some(model_label);
         self.guided_preview_seen = true;
-        (ratification_preview_title(self.locale).to_string(), content)
+        Some((ratification_preview_title(self.locale).to_string(), content))
     }
 
     fn commit_constitution(&self, kind: SetupCommitKind) -> ViewAction {
@@ -3014,6 +3052,7 @@ impl SetupWizardView {
                 StepStatus::Optional => MessageId::SetupStatusOptional,
                 StepStatus::Deferred => MessageId::SetupStatusDeferred,
                 StepStatus::InProgress => MessageId::SetupStatusInProgress,
+                StepStatus::Configured => MessageId::PickerActionConfigured,
                 StepStatus::NeedsAction => MessageId::SetupStatusNeedsAction,
                 StepStatus::Verified => MessageId::SetupStatusVerified,
                 StepStatus::Skipped => MessageId::SetupStatusSkipped,
@@ -3329,9 +3368,12 @@ impl ModalView for SetupWizardView {
         let scroll = self.body_scroll.min(max_scroll);
         let content_area =
             render_panel_scroll_rail(content_area, buf, visual_rows, scroll, visible_rows, true);
+        // Explicit base ink: same black-on-black hazard as the pager body;
+        // value spans below carry no fg of their own.
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0))
+            .style(Style::default().fg(palette::TEXT_PRIMARY))
             .render(content_area, buf);
     }
 
@@ -4080,7 +4122,7 @@ impl SetupWizardView {
         }
         if !matches!(
             self.state.status(SetupStep::ProviderModel),
-            StepStatus::Verified | StepStatus::NeedsAction
+            StepStatus::Configured | StepStatus::Verified | StepStatus::NeedsAction
         ) {
             return MessageId::SetupReportNextActionProvider;
         }
@@ -4233,15 +4275,11 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
     // workspace falls back to the user's baseline. Say so here rather than
     // only in a log line the TUI never shows.
     if let Some((path, reason)) = outcome.invalid() {
-        let path = path.display();
-        return Some(match locale {
-            Locale::ZhHans => format!(
-                "无法解析项目配置 {path}（{reason}）。此工作区的项目级运行姿态限制未生效，将回退到用户默认值。",
-            ),
-            _ => format!(
-                "Project config {path} could not be parsed ({reason}). Its runtime posture restrictions are NOT in effect; this workspace falls back to your user defaults.",
-            ),
-        });
+        return Some(
+            tr(locale, MessageId::SetupProjectPermissionsInvalid)
+                .replace("{path}", &path.display().to_string())
+                .replace("{reason}", reason),
+        );
     }
     let project = outcome.into_config()?;
     let mut fields = Vec::new();
@@ -4254,16 +4292,10 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
     if fields.is_empty() {
         return None;
     }
-    Some(match locale {
-        Locale::ZhHans => format!(
-            "此工作区的项目配置包含 {}。预设会保存用户默认值；项目配置仍可在此工作区收紧运行姿态。",
-            fields.join(", ")
-        ),
-        _ => format!(
-            "Project config contains {}. Presets save user defaults; project config can still tighten runtime posture in this workspace.",
-            fields.join(", ")
-        ),
-    })
+    Some(
+        tr(locale, MessageId::SetupProjectPermissionsOverride)
+            .replace("{fields}", &fields.join(", ")),
+    )
 }
 
 fn setup_report_result(state: &SetupState, facts: &SetupRuntimeFacts) -> String {
@@ -5369,7 +5401,7 @@ pub(crate) fn record_provider_model_setup_state_for_app(
     state.set_step(
         SetupStep::ProviderModel,
         provider::step_entry(
-            facts.provider_ready,
+            facts.provider_status,
             CONSTITUTION_CHECKPOINT_VERSION,
             facts.provider_result,
         ),
@@ -5459,6 +5491,11 @@ mod progressive_tests {
             model: "stub-model".to_string(),
             auth: if provider_ready { "ready" } else { "missing" }.to_string(),
             provider_ready,
+            provider_status: if provider_ready {
+                StepStatus::Configured
+            } else {
+                StepStatus::NeedsAction
+            },
             runtime_result: "approval=ask; sandbox=workspace; network=prompt".to_string(),
             tools_mcp_result: "mcp=off, skills=off, tools=off, plugins=off, overall=off"
                 .to_string(),
@@ -5493,6 +5530,65 @@ mod progressive_tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn wizard_body_cells_carry_explicit_ink_on_the_dark_surface() {
+        // The setup surface paints WHALE_BG while the blurb span carries no
+        // fg of its own, so without the base paragraph style it inherits the
+        // terminal default: black-on-black on light-profile terminals. Every
+        // blurb cell must pin to the body ink; the explicitly styled title
+        // must patch over the base unchanged.
+        let view = SetupWizardView::new_with_facts(SetupState::default(), Locale::En, facts(false));
+        let blurb_head: String = tr(Locale::En, MessageId::OnboardProviderBlurb)
+            .chars()
+            .take(16)
+            .collect();
+        let title_head: String = tr(Locale::En, MessageId::OnboardProviderTitle)
+            .chars()
+            .take(16)
+            .collect();
+        assert!(
+            !blurb_head.is_empty() && !title_head.is_empty(),
+            "test needs non-empty title and blurb heads to locate rows"
+        );
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buffer = Buffer::empty(area);
+        ModalView::render(&view, area, &mut buffer);
+        let mut blurb_hit = false;
+        let mut title_hit = false;
+        let mut checked = 0;
+        for y in 0..area.height {
+            let row: String = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+            let expected = if row.contains(blurb_head.as_str()) {
+                blurb_hit = true;
+                Some(palette::TEXT_PRIMARY)
+            } else if row.contains(title_head.as_str()) {
+                title_hit = true;
+                Some(palette::WHALE_ACTION)
+            } else {
+                None
+            };
+            let Some(fg) = expected else {
+                continue;
+            };
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol().trim().is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    cell.style().fg,
+                    Some(fg),
+                    "setup body cell ({x}, {y}) must carry explicit ink"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            blurb_hit && title_hit && checked > 0,
+            "expected title and blurb rows in the rendered wizard"
+        );
     }
 
     #[test]

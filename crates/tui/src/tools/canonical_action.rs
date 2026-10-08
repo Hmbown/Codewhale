@@ -37,6 +37,9 @@ pub(crate) const CANONICAL_ACTION_ALIASES: &[(&str, &str, &str)] = &[
     ("Git", "log", "git_log"),
     ("Git", "show", "git_show"),
     ("Git", "blame", "git_blame"),
+    ("Git", "commit_plan", "git_commit_plan"),
+    ("Git", "fetch", "git_fetch"),
+    ("Git", "merge_tree", "git_merge_tree"),
     ("Run", "tests", "run_tests"),
     ("Run", "verifiers", "run_verifiers"),
     ("Web", "search", "web_search"),
@@ -88,6 +91,8 @@ pub(crate) const CANONICAL_ACTION_ALIASES: &[(&str, &str, &str)] = &[
     ("github", "comment", "github_comment"),
     ("github", "close_issue", "github_close_issue"),
     ("github", "close_pr", "github_close_pr"),
+    ("github", "report_draft", "github_report_draft"),
+    ("github", "report_read", "github_report_read"),
 ];
 
 /// The conservative action label policy uses when the model omits `action`.
@@ -202,20 +207,23 @@ pub(crate) fn canonical_action_alias<'a>(tool_name: &'a str, input: &Value) -> &
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Names the v0.9.3 consolidation retired. None of them can dispatch —
-    /// `ToolRegistry::resolve` has no fuzzy step — so any one of them inside a
-    /// model-visible description or schema teaches a call that cannot work.
+    /// Names the v0.9.3 consolidation retired from the model-facing catalog.
+    /// Each stays registered only as a hidden (`model_visible=false`)
+    /// replay alias or is gone entirely, so any one of them inside a
+    /// model-visible description or schema teaches a call the catalog never
+    /// offers. `retired_names_are_not_model_visible` pins that invariant.
+    ///
+    /// `list_dir`, `file_search`, and `grep_files` are deliberately absent:
+    /// they are live, model-visible (deferred) tools, not retired names
+    /// (#6747).
     const RETIRED_TOOL_NAMES: &[&str] = &[
         "read_file",
         "write_file",
         "edit_file",
-        "list_dir",
-        "file_search",
-        "grep_files",
         "git_status",
         "git_diff",
         "git_log",
@@ -231,6 +239,90 @@ mod tests {
         "exec_shell_interact",
         "exec_shell_cancel",
     ];
+
+    fn full_native_registry(root: &std::path::Path) -> crate::tools::registry::ToolRegistry {
+        use crate::tools::registry::ToolRegistryBuilder;
+        use crate::tools::spec::ToolContext;
+
+        ToolRegistryBuilder::new()
+            .with_file_tools()
+            .with_shell_tools()
+            .with_search_tools()
+            .with_git_tools()
+            .with_git_history_tools()
+            .with_test_runner_tool()
+            .with_web_tools()
+            .with_patch_tools()
+            .with_handle_tools()
+            .with_rlm_tool()
+            .build(ToolContext::new(root.to_path_buf()))
+    }
+
+    /// Assert that model-facing `text` names only tools a model can call
+    /// (#6747): no hidden (`model_visible=false`) registry name and no
+    /// retired name, and any deferred tool it names comes with the
+    /// `tool_search` activation path. Shared by every site that writes
+    /// tool names into prompts, briefs, or tool output.
+    pub(crate) fn assert_text_names_only_callable_tools(label: &str, text: &str) {
+        use crate::core::engine::tool_catalog::DEFAULT_ACTIVE_NATIVE_TOOLS;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = full_native_registry(tmp.path());
+        let mut hidden: Vec<String> = RETIRED_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
+        let mut deferred = Vec::new();
+        for tool in registry.all() {
+            let name = tool.name().to_string();
+            if !tool.model_visible() {
+                hidden.push(name);
+            } else if !DEFAULT_ACTIVE_NATIVE_TOOLS.contains(&name.as_str()) {
+                deferred.push(name);
+            }
+        }
+        // Snake-case names are unambiguous as bare words; short names such as
+        // `File` or `Bash` only count as tool references inside backticks.
+        let names = |name: &str, text: &str| {
+            text.contains(&format!("`{name}`")) || (name.contains('_') && text.contains(name))
+        };
+        for name in &hidden {
+            assert!(
+                !names(name, text),
+                "{label} names `{name}`, which the model-visible catalog never offers:\n{text}"
+            );
+        }
+        for name in &deferred {
+            if names(name, text) {
+                assert!(
+                    text.contains("`tool_search`"),
+                    "{label} names deferred `{name}` without teaching `tool_search`:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_names_are_not_model_visible() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = full_native_registry(tmp.path());
+        for tool in registry.all() {
+            let name = tool.name().to_string();
+            assert!(
+                !(tool.model_visible() && RETIRED_TOOL_NAMES.contains(&name.as_str())),
+                "`{name}` is model-visible, so it is live rather than retired"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_prompt_text_names_only_callable_tools() {
+        assert_text_names_only_callable_tools(
+            "GOAL_CONTINUATION_PROMPT",
+            crate::prompts::GOAL_CONTINUATION_PROMPT,
+        );
+        assert_text_names_only_callable_tools(
+            "HANDLE_READ_ACTIVATION_HINT",
+            crate::tools::handle::HANDLE_READ_ACTIVATION_HINT,
+        );
+    }
 
     /// The catalog is re-sent on every request, so a retired name in it is a
     /// per-turn lie to every model. `verifier.rs` already guarded one such

@@ -122,7 +122,7 @@ impl Default for DeployInputs {
             provider_slug: "deepseek".to_string(),
             region: String::new(),
             instance_name: "codewhale-remote".to_string(),
-            image: "ghcr.io/hmbown/codewhale:latest".to_string(),
+            image: "ghcr.io/codewhale-hq/codewhale:latest".to_string(),
         }
     }
 }
@@ -295,6 +295,7 @@ fn lighthouse_plan(inputs: &DeployInputs) -> Vec<ProvisionStep> {
 fn azure_plan(inputs: &DeployInputs) -> Vec<ProvisionStep> {
     let rg = format!("{}-rg", inputs.instance_name);
     let vault = format!("{}-kv", inputs.instance_name);
+    let nsg = format!("{}-nsg", inputs.instance_name);
     let provider_secret = format!("codewhale-{}-key", inputs.provider_slug);
     vec![
         ProvisionStep::new(
@@ -355,20 +356,40 @@ fn azure_plan(inputs: &DeployInputs) -> Vec<ProvisionStep> {
                 "--custom-data",
                 "cloud-init.yaml",
                 "--assign-identity",
+                // A Linux `vm create` otherwise adds an NSG rule admitting SSH
+                // from any address; the next step adds the caller-only rule.
+                "--nsg",
+                &nsg,
+                "--nsg-rule",
+                "NONE",
             ],
         ),
         ProvisionStep::new(
-            "Scope the NSG to SSH (22) from the caller IP only; 7878 stays on 127.0.0.1",
+            "Allow SSH (22) from the caller IP only (replace <your-public-ip>); 7878 stays on 127.0.0.1",
             "az",
             &[
-                "vm",
-                "open-port",
+                "network",
+                "nsg",
+                "rule",
+                "create",
                 "--resource-group",
                 &rg,
+                "--nsg-name",
+                &nsg,
                 "--name",
-                &inputs.instance_name,
-                "--port",
+                "allow-ssh-from-caller",
+                "--priority",
+                "1000",
+                "--direction",
+                "Inbound",
+                "--access",
+                "Allow",
+                "--protocol",
+                "Tcp",
+                "--destination-port-ranges",
                 "22",
+                "--source-address-prefixes",
+                "<your-public-ip>/32",
             ],
         ),
     ]
@@ -537,6 +558,45 @@ mod tests {
         assert!(
             az_steps.iter().any(|s| s.program == "az"),
             "Azure plan must use az"
+        );
+    }
+
+    #[test]
+    fn azure_plan_admits_ssh_from_the_caller_only() {
+        let steps = (AZURE.plan)(&DeployInputs::default());
+        let arg_after = |step: &ProvisionStep, flag: &str| {
+            let at = step.args.iter().position(|arg| arg == flag)?;
+            step.args.get(at + 1).cloned()
+        };
+        // `open-port` has no source restriction: it admits the whole internet.
+        assert!(
+            steps
+                .iter()
+                .all(|s| !s.args.iter().any(|a| a == "open-port")),
+            "Azure plan must not open a port to every source"
+        );
+        let create = steps
+            .iter()
+            .find(|s| {
+                s.args
+                    .starts_with(&["vm".to_string(), "create".to_string()])
+            })
+            .expect("vm create step");
+        assert_eq!(arg_after(create, "--nsg-rule").as_deref(), Some("NONE"));
+        let ssh_rules: Vec<_> = steps
+            .iter()
+            .filter(|s| arg_after(s, "--destination-port-ranges").as_deref() == Some("22"))
+            .collect();
+        assert_eq!(ssh_rules.len(), 1, "exactly one SSH rule");
+        let source = arg_after(ssh_rules[0], "--source-address-prefixes").unwrap();
+        assert!(
+            source.ends_with("/32") && !source.starts_with('*') && !source.starts_with("0.0.0.0"),
+            "SSH source must be a single caller address, got {source}"
+        );
+        assert_eq!(
+            arg_after(ssh_rules[0], "--nsg-name"),
+            arg_after(create, "--nsg"),
+            "the rule must land on the NSG the VM was created with"
         );
     }
 

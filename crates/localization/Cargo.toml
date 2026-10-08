@@ -1,0 +1,24 @@
+[package]
+name = "codewhale-localization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Localization registry for Codewhale's user-facing strings."
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-i18n = "4.1.0"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+[build-dependencies]
+rust-i18n-support = { version = "=4.2.2", features = ["codegen"] }
+codewhale-build-support = { path = "../build-support", version = "0.10.1" }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }

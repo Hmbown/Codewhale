@@ -1,5 +1,7 @@
 # Accessibility
 
+> 阅读简体中文版：[zh_hans/ACCESSIBILITY.md](zh_hans/ACCESSIBILITY.md)。
+
 Codewhale runs in a terminal, so the platform's own accessibility
 stack (screen readers, magnifiers, terminal-level themes) does most
 of the work. The TUI provides a small set of toggles that reduce
@@ -62,8 +64,14 @@ export NO_ANIMATIONS=1
 export CODEWHALE_ASCII_SAFE=1
 
 # Optional: respect the wider terminal-color convention.
-export NO_COLOR=1            # honored by the underlying ratatui backend
+export NO_COLOR=1            # terminal-owned colors; bold/underline remain
 ```
+
+A nonempty `NO_COLOR` value suppresses foreground, background, and underline
+colors in the TUI. An empty value leaves normal terminal color detection active.
+This follows the [NO_COLOR convention](https://no-color.org/) while retaining
+text modifiers and selection symbols. ASCII rendering and reduced motion are
+separate choices.
 
 `NO_ANIMATIONS` accepts any of `1`, `true`, `yes`, or `on`
 (case-insensitive). Any other value (including `0`, `false`, empty,
@@ -106,14 +114,14 @@ version renders cleanly.
   Terminal) will pass the rendered content straight through.
 * If you find a UI surface that still produces motion when
   `low_motion = true`, please file an issue against
-  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/Hmbown/CodeWhale/issues/450)
+  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/codewhale-hq/CodeWhale/issues/450)
   with a screenshot or terminal recording.
 
 ## Related issues / history
 
-* [#450](https://github.com/Hmbown/CodeWhale/issues/450) —
+* [#450](https://github.com/codewhale-hq/CodeWhale/issues/450) —
   documenting the existing flag, adding the `NO_ANIMATIONS`
   startup overlay, and writing this page.
-* [#449](https://github.com/Hmbown/CodeWhale/issues/449) —
+* [#449](https://github.com/codewhale-hq/CodeWhale/issues/449) —
   footer statusline now uses the active theme's contrast pair
   instead of a bespoke palette.

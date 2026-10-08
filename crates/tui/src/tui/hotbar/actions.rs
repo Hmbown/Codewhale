@@ -3,15 +3,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::Result;
+use codewhale_config::AppMode;
 
 use crate::commands::{self, CommandInfo, CommandResult};
-use crate::config::{ApiProvider, Config};
-use crate::localization::{Locale, MessageId, tr};
-use crate::provider_lake::all_catalog_models_for_provider;
-use crate::tui::app::{App, AppAction, AppMode};
+use crate::config::{Config, ProviderIdentity, ProviderKind};
+use crate::provider_lake::models_for_provider;
+use crate::tui::app::{App, AppAction};
 use crate::tui::command_palette::{
-    CommandPaletteView, build_entries as build_command_palette_entries,
+    CommandPaletteView, build_entries_with_plugins as build_command_palette_entries,
 };
+use codewhale_localization::{Locale, MessageId, tr};
 
 pub const HOTBAR_COMPACT_LABEL_MAX_WIDTH: usize = 7;
 
@@ -330,7 +331,7 @@ pub trait HotbarAction: Send + Sync {
     }
 
     /// Fire the action.
-    fn dispatch(&self, app: &mut App) -> Result<HotbarDispatch>;
+    fn dispatch(&self, app: &mut App, config: &Config) -> Result<HotbarDispatch>;
 }
 
 #[must_use]
@@ -451,7 +452,7 @@ impl HotbarActionRegistry {
     #[must_use]
     pub fn with_configured_routes(
         config: &Config,
-        active_provider: ApiProvider,
+        active_provider: Option<&ProviderIdentity>,
         active_model: &str,
         provider_models: &HashMap<String, String>,
     ) -> Self {
@@ -504,7 +505,7 @@ impl HotbarActionRegistry {
     pub(crate) fn register_configured_routes(
         &mut self,
         config: &Config,
-        active_provider: ApiProvider,
+        active_provider: Option<&ProviderIdentity>,
         active_model: &str,
         provider_models: &HashMap<String, String>,
     ) {
@@ -571,7 +572,7 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "session.compact",
             "compact",
             "Compact session",
-            "Compact the current conversation context.",
+            "Shrink this conversation to free context.",
             AppHotbarKind::SessionCompact,
         ));
         registry.register(AppHotbarAction::new(
@@ -599,7 +600,7 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "reasoning.cycle",
             "reason",
             "Cycle reasoning",
-            "Cycle the configured reasoning effort for the active provider.",
+            "Step through reasoning levels for the active provider.",
             AppHotbarKind::ReasoningCycle,
         ));
         registry.register(AppHotbarAction::new(
@@ -627,7 +628,7 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "trust.toggle",
             "trust",
             "Toggle trust",
-            "Enable or disable workspace trust mode.",
+            "Turn workspace trust on or off.",
             AppHotbarKind::TrustToggle,
         ));
     }
@@ -645,6 +646,13 @@ impl HotbarActionSource for SlashCommandHotbarActionSource {
     }
 
     fn register_actions(&self, registry: &mut HotbarActionRegistry) {
+        // Every command registers, including unlisted ones. The hotbar is a
+        // binding substrate, not a discovery surface: `codewhale-lane`'s
+        // control-plane descriptors resolve their `slash.<verb>` action id
+        // through this registry, so dropping an unlisted command here breaks
+        // a real contract (`control_plane_commands_are_bound_and_bare_dispatch_is_read_only`).
+        // Unlisted governs what is *advertised* — the slash menu, `/help`,
+        // and the command palette.
         for info in commands::command_infos() {
             registry.register(SlashHotbarAction::new(info));
         }
@@ -726,7 +734,7 @@ impl HotbarActionSource for McpToolHotbarActionSource<'_> {
 
 struct ConfiguredRouteHotbarActionSource<'a> {
     config: &'a Config,
-    active_provider: ApiProvider,
+    active_provider: Option<&'a ProviderIdentity>,
     active_model: &'a str,
     provider_models: &'a HashMap<String, String>,
 }
@@ -741,22 +749,39 @@ impl HotbarActionSource for ConfiguredRouteHotbarActionSource<'_> {
     }
 
     fn register_actions(&self, registry: &mut HotbarActionRegistry) {
-        for provider in ApiProvider::sorted_for_display() {
-            if !crate::config::provider_is_configured_for_active(
-                self.config,
-                provider,
-                self.active_provider,
-            ) {
+        let Some(active) = self
+            .active_provider
+            .filter(|identity| self.config.verify_provider_identity(identity).is_ok())
+        else {
+            return;
+        };
+        let mut identities = self.config.provider_identities();
+        identities.sort_by(|left, right| {
+            let left_label = left
+                .compatibility()
+                .map_or(left.key.as_str(), |row| row.label);
+            let right_label = right
+                .compatibility()
+                .map_or(right.key.as_str(), |row| row.label);
+            left_label
+                .cmp(right_label)
+                .then_with(|| left.key.as_str().cmp(right.key.as_str()))
+        });
+        for identity in identities {
+            if identity.provider == ProviderKind::Antigravity {
+                continue;
+            }
+            if !crate::config::provider_is_configured_for_active(self.config, &identity, active) {
                 continue;
             }
             for model in configured_route_models_for_provider(
                 self.config,
-                provider,
-                self.active_provider,
+                &identity,
+                active,
                 self.active_model,
                 self.provider_models,
             ) {
-                registry.register(RouteHotbarAction::new(provider, model));
+                registry.register(RouteHotbarAction::new(identity.clone(), model));
             }
         }
     }
@@ -968,7 +993,7 @@ impl HotbarAction for AppHotbarAction {
             AppHotbarKind::SessionCompact => app.is_compacting || app.manual_compaction_queued,
             AppHotbarKind::Mode(mode) => app.mode == mode,
             AppHotbarKind::ReasoningCycle => {
-                app.reasoning_effort != crate::tui::app::ReasoningEffort::Off
+                app.reasoning_effort != crate::reasoning_preference::ReasoningEffort::Off
             }
             AppHotbarKind::SidebarToggle => {
                 app.work_surface.placement != crate::tui::work_surface::WorkSurfacePlacement::Off
@@ -979,7 +1004,7 @@ impl HotbarAction for AppHotbarAction {
         }
     }
 
-    fn dispatch(&self, app: &mut App) -> Result<HotbarDispatch> {
+    fn dispatch(&self, app: &mut App, _config: &Config) -> Result<HotbarDispatch> {
         match self.kind {
             AppHotbarKind::VoiceToggle => {
                 let result = crate::commands::voice::voice(app);
@@ -1044,10 +1069,11 @@ impl HotbarAction for AppHotbarAction {
                     build_command_palette_entries(
                         app.ui_locale,
                         &app.skills_dir,
-                        app.skills_scan_codewhale_only,
+                        app.skills_discovery_mode,
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
+                        app.extension_plugin_view().as_ref(),
                     ),
                 ));
                 Ok(HotbarDispatch::Handled)
@@ -1142,36 +1168,36 @@ impl HotbarAction for SlashHotbarAction {
         false
     }
 
-    fn dispatch(&self, app: &mut App) -> Result<HotbarDispatch> {
+    fn dispatch(&self, app: &mut App, config: &Config) -> Result<HotbarDispatch> {
         if self.info.requires_required_argument() {
             self.prefill_composer(app);
             return Ok(HotbarDispatch::Handled);
         }
 
         let input = format!("/{}", self.info.name);
-        let result = commands::execute(&input, app);
+        let result = commands::execute_with_config(&input, app, config);
         Ok(dispatch_command_result(app, result))
     }
 }
 
 struct RouteHotbarAction {
-    provider: ApiProvider,
+    identity: ProviderIdentity,
     model: String,
     id: String,
     short_label: String,
 }
 
 impl RouteHotbarAction {
-    fn new(provider: ApiProvider, model: String) -> Self {
+    fn new(identity: ProviderIdentity, model: String) -> Self {
         let trimmed_model = model.trim().to_string();
         Self {
-            provider,
-            id: route_action_id(provider, &trimmed_model),
+            id: route_action_id(&identity, &trimmed_model),
             short_label: crate::tui::ui_text::truncate_line_to_width(
-                provider.as_str(),
+                identity.key.as_str(),
                 HOTBAR_COMPACT_LABEL_MAX_WIDTH,
             ),
             model: trimmed_model,
+            identity,
         }
     }
 }
@@ -1184,13 +1210,21 @@ impl HotbarAction for RouteHotbarAction {
     fn metadata(&self, _locale: Locale) -> HotbarActionMetadata {
         HotbarActionMetadata {
             id: self.id.clone(),
-            source_id: format!("route:{}", self.provider.as_str()),
-            display_name: format!("{} · {}", self.provider.display_name(), self.model),
+            source_id: format!("route:{}", self.identity.key.as_str()),
+            display_name: format!(
+                "{} · {}",
+                self.identity
+                    .compatibility()
+                    .map_or(self.identity.key.as_str(), |row| row.label),
+                self.model
+            ),
             compact_label: self.short_label.clone(),
             description: format!(
                 "Switch to {} on {} through the existing /model route path.",
                 self.model,
-                self.provider.display_name()
+                self.identity
+                    .compatibility()
+                    .map_or(self.identity.key.as_str(), |row| row.label)
             ),
             category: HotbarActionCategory::Route,
             args: HotbarArgsBehavior::None,
@@ -1209,13 +1243,17 @@ impl HotbarAction for RouteHotbarAction {
 
     fn is_active(&self, app: &App) -> bool {
         !app.auto_model
-            && app.api_provider == self.provider
-            && app.model.trim().eq_ignore_ascii_case(self.model.trim())
+            && app.provider_identity.as_ref() == Some(&self.identity)
+            && if self.identity.provider == ProviderKind::Custom {
+                app.model.trim() == self.model.trim()
+            } else {
+                app.model.trim().eq_ignore_ascii_case(self.model.trim())
+            }
     }
 
-    fn dispatch(&self, _app: &mut App) -> Result<HotbarDispatch> {
+    fn dispatch(&self, _app: &mut App, _config: &Config) -> Result<HotbarDispatch> {
         Ok(HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
-            provider: self.provider,
+            identity: self.identity.clone(),
             model: self.model.clone(),
         }))
     }
@@ -1282,12 +1320,12 @@ impl HotbarAction for SkillHotbarAction {
             .is_some_and(|instruction| instruction.contains(&format!("# Skill: {}\n", self.name)))
     }
 
-    fn dispatch(&self, app: &mut App) -> Result<HotbarDispatch> {
+    fn dispatch(&self, app: &mut App, config: &Config) -> Result<HotbarDispatch> {
         // Same path as typing `$<name>`: activates the skill for the next
         // message (local state plus a visible receipt cell); nothing is sent
         // to the model until the user submits a message.
         let input = format!("${}", self.name);
-        let result = commands::execute(&input, app);
+        let result = commands::execute_with_config(&input, app, config);
         Ok(dispatch_command_result(app, result))
     }
 }
@@ -1368,7 +1406,7 @@ impl HotbarAction for McpToolHotbarAction {
         false
     }
 
-    fn dispatch(&self, app: &mut App) -> Result<HotbarDispatch> {
+    fn dispatch(&self, app: &mut App, _config: &Config) -> Result<HotbarDispatch> {
         // Never execute the tool from the hotbar: prefill the composer with
         // the model-visible tool name (same text the command palette's
         // "> use" entry inserts) and let the user describe the call. The
@@ -1380,25 +1418,25 @@ impl HotbarAction for McpToolHotbarAction {
 
 fn configured_route_models_for_provider(
     config: &Config,
-    provider: ApiProvider,
-    active_provider: ApiProvider,
+    identity: &ProviderIdentity,
+    active: &ProviderIdentity,
     active_model: &str,
     provider_models: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut models = Vec::new();
-    if provider == active_provider {
+    if identity == active {
         push_route_model(&mut models, active_model);
     }
-    if let Some(model) = provider_models.get(provider.as_str()) {
+    if let Some(model) = provider_models.get(identity.key.as_str()) {
         push_route_model(&mut models, model);
     }
     if let Some(model) = config
-        .provider_config_for(provider)
-        .and_then(|provider| provider.model.as_deref())
+        .provider_config_for(identity)
+        .and_then(|entry| entry.model.as_deref())
     {
         push_route_model(&mut models, model);
     }
-    for model in all_catalog_models_for_provider(provider)
+    for model in models_for_provider(config, identity)
         .into_iter()
         .filter(|model| !model.trim().eq_ignore_ascii_case("auto"))
         .take(1)
@@ -1413,17 +1451,14 @@ fn push_route_model(models: &mut Vec<String>, model: &str) {
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
         return;
     }
-    if models
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
-    {
+    if models.iter().any(|existing| existing == trimmed) {
         return;
     }
     models.push(trimmed.to_string());
 }
 
-fn route_action_id(provider: ApiProvider, model: &str) -> String {
-    format!("route.{}.{}", provider.as_str(), model.trim())
+fn route_action_id(identity: &ProviderIdentity, model: &str) -> String {
+    format!("route.{}.{}", identity.key, model.trim())
 }
 
 #[cfg(test)]
@@ -1431,8 +1466,9 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
 
-    use crate::config::{ApiProvider, Config};
-    use crate::tui::app::{ReasoningEffort, TuiOptions};
+    use crate::config::{Config, ProviderKind};
+    use crate::reasoning_preference::ReasoningEffort;
+    use crate::tui::app::TuiOptions;
     use crate::tui::views::ModalKind;
 
     use super::*;
@@ -1448,7 +1484,7 @@ mod tests {
             ..crate::test_support::test_tui_options(workspace)
         };
         let mut app = App::new(options, config);
-        app.ui_locale = crate::localization::Locale::En;
+        app.ui_locale = codewhale_localization::Locale::En;
         app
     }
 
@@ -1552,7 +1588,7 @@ mod tests {
             false
         }
 
-        fn dispatch(&self, _app: &mut App) -> Result<HotbarDispatch> {
+        fn dispatch(&self, _app: &mut App, _config: &Config) -> Result<HotbarDispatch> {
             Ok(HotbarDispatch::Handled)
         }
     }
@@ -1787,10 +1823,11 @@ mod tests {
         let palette_slash_ids = build_command_palette_entries(
             Locale::En,
             tmp.path(),
-            true,
+            crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
             tmp.path(),
             &tmp.path().join("mcp.json"),
             None,
+            &crate::plugins::PluginRegistry::empty(tmp.path()),
         )
         .into_iter()
         .filter(|entry| entry.section() == crate::tui::command_palette::PaletteSection::Command)
@@ -1809,7 +1846,26 @@ mod tests {
             .map(|action| action.id().to_string())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(hotbar_slash_ids, palette_slash_ids);
+        // The hotbar is a binding substrate and registers every command; the
+        // palette is a browsing surface and omits the unlisted ones. So the
+        // palette is a subset, and the difference is exactly the unlisted set.
+        let unlisted_ids = commands::command_infos()
+            .iter()
+            .filter(|info| info.is_unlisted())
+            .map(|info| format!("slash.{}", info.name))
+            .collect::<BTreeSet<_>>();
+        assert!(
+            palette_slash_ids.is_subset(&hotbar_slash_ids),
+            "the palette must not offer a command the hotbar cannot bind"
+        );
+        assert_eq!(
+            hotbar_slash_ids
+                .difference(&palette_slash_ids)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            unlisted_ids,
+            "the only commands the hotbar has and the palette hides are the unlisted ones"
+        );
     }
 
     #[test]
@@ -2059,16 +2115,21 @@ mod tests {
     fn configured_routes_register_provider_model_actions() {
         let mut config = Config::default();
         config
-            .provider_config_for_mut(ApiProvider::Openrouter)
+            .provider_config_for_mut(
+                &config
+                    .builtin_provider_identity(ProviderKind::Openrouter)
+                    .unwrap(),
+            )
+            .unwrap()
             .model = Some("anthropic/claude-sonnet-4".to_string());
         let mut provider_models = HashMap::new();
         provider_models.insert(
-            ApiProvider::Openrouter.as_str().to_string(),
+            ProviderKind::Openrouter.as_str().to_string(),
             "openai/gpt-4o".to_string(),
         );
         let registry = HotbarActionRegistry::with_configured_routes(
             &config,
-            ApiProvider::Deepseek,
+            Some(&config.active_provider_identity().unwrap()),
             "deepseek-v4-pro",
             &provider_models,
         );
@@ -2092,9 +2153,13 @@ mod tests {
 
         let mut app = test_app();
         assert_eq!(
-            openrouter.dispatch(&mut app).expect("dispatch route"),
+            openrouter
+                .dispatch(&mut app, &config)
+                .expect("dispatch route"),
             HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
-                provider: ApiProvider::Openrouter,
+                identity: config
+                    .builtin_provider_identity(ProviderKind::Openrouter)
+                    .unwrap(),
                 model: "anthropic/claude-sonnet-4".to_string(),
             })
         );
@@ -2189,7 +2254,8 @@ mod tests {
         let mut app = test_app();
 
         assert_eq!(
-            mode.dispatch(&mut app).expect("dispatch /mode"),
+            mode.dispatch(&mut app, &Config::default())
+                .expect("dispatch /mode"),
             HotbarDispatch::AppAction(AppAction::OpenModePicker)
         );
         assert!(app.input.is_empty());
@@ -2202,7 +2268,8 @@ mod tests {
         let mut app = test_app();
 
         assert_eq!(
-            task.dispatch(&mut app).expect("dispatch /task"),
+            task.dispatch(&mut app, &Config::default())
+                .expect("dispatch /task"),
             HotbarDispatch::AppAction(AppAction::TaskList)
         );
         assert!(app.input.is_empty());
@@ -2217,7 +2284,9 @@ mod tests {
         app.cursor_position = app.input.chars().count();
 
         assert_eq!(
-            rename.dispatch(&mut app).expect("dispatch /rename"),
+            rename
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch /rename"),
             HotbarDispatch::Handled
         );
         assert_eq!(app.input, "/rename ");
@@ -2310,7 +2379,7 @@ mod tests {
             .expect("skill registered from the startup skill cache");
         assert!(!action.is_active(&app));
         assert_eq!(
-            action.dispatch(&mut app).expect("dispatch skill"),
+            action.dispatch(&mut app, &config).expect("dispatch skill"),
             HotbarDispatch::Handled
         );
         assert!(app.active_skill.is_some());
@@ -2341,7 +2410,9 @@ mod tests {
             .expect("stale skill action");
 
         assert_eq!(
-            action.dispatch(&mut app).expect("dispatch stale skill"),
+            action
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch stale skill"),
             HotbarDispatch::Handled
         );
         assert!(app.active_skill.is_none());
@@ -2390,7 +2461,9 @@ mod tests {
         app.cursor_position = app.input.chars().count();
 
         assert_eq!(
-            action.dispatch(&mut app).expect("dispatch mcp tool"),
+            action
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch mcp tool"),
             HotbarDispatch::Handled
         );
         assert_eq!(app.input, "mcp_search_web_search ");
@@ -2433,7 +2506,8 @@ mod tests {
         assert!(registry.get("mode.yolo").is_none());
 
         assert_eq!(
-            plan.dispatch(&mut app).expect("dispatch plan"),
+            plan.dispatch(&mut app, &Config::default())
+                .expect("dispatch plan"),
             HotbarDispatch::AppAction(AppAction::ModeChanged(AppMode::Plan))
         );
         assert_eq!(app.mode, AppMode::Plan);
@@ -2441,7 +2515,9 @@ mod tests {
         assert!(!agent.is_active(&app));
 
         assert_eq!(
-            operate.dispatch(&mut app).expect("dispatch operate"),
+            operate
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch operate"),
             HotbarDispatch::AppAction(AppAction::ModeChanged(AppMode::Operate))
         );
         assert_eq!(app.mode, AppMode::Operate);
@@ -2457,14 +2533,16 @@ mod tests {
 
         assert!(!compact.is_active(&app));
         assert_eq!(
-            compact.dispatch(&mut app).expect("dispatch compact"),
+            compact
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch compact"),
             HotbarDispatch::AppAction(AppAction::CompactContext { focus: None })
         );
         app.is_compacting = true;
         assert!(compact.is_active(&app));
         assert_eq!(
             compact
-                .dispatch(&mut app)
+                .dispatch(&mut app, &Config::default())
                 .expect("dispatch compact while busy"),
             HotbarDispatch::AppAction(AppAction::CompactContext { focus: None })
         );
@@ -2475,12 +2553,14 @@ mod tests {
         let registry = HotbarActionRegistry::with_builtins();
         let reasoning = registry.get("reasoning.cycle").expect("reasoning action");
         let mut app = test_app();
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
         app.reasoning_effort = ReasoningEffort::Off;
 
         assert!(!reasoning.is_active(&app));
         assert!(matches!(
-            reasoning.dispatch(&mut app).expect("dispatch reasoning"),
+            reasoning
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch reasoning"),
             HotbarDispatch::AppAction(AppAction::UpdateCompaction(_))
         ));
         assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
@@ -2491,7 +2571,7 @@ mod tests {
         assert!(reasoning.is_active(&app));
         assert!(matches!(
             reasoning
-                .dispatch(&mut app)
+                .dispatch(&mut app, &Config::default())
                 .expect("dispatch reasoning under auto model"),
             HotbarDispatch::AppAction(AppAction::UpdateCompaction(_))
         ));
@@ -2519,13 +2599,15 @@ mod tests {
         let registry = HotbarActionRegistry::with_builtins();
         let reasoning = registry.get("reasoning.cycle").expect("reasoning action");
         let mut app = test_app();
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Off;
         app.is_loading = true;
 
         assert_eq!(
-            reasoning.dispatch(&mut app).expect("dispatch while busy"),
+            reasoning
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch while busy"),
             HotbarDispatch::Handled
         );
         assert_eq!(app.reasoning_effort, ReasoningEffort::Off);
@@ -2542,21 +2624,34 @@ mod tests {
 
     #[test]
     fn reasoning_cycle_uses_codex_effort_tiers() {
+        // Codex tiers are now per-model, read from the OAuth roster. Point
+        // CODEX_HOME at an empty directory so this exercises the static
+        // fallback ladder instead of whatever roster the developer's own
+        // machine happens to have cached.
+        let _lock = crate::test_support::lock_test_env();
+        let codex_home = tempfile::TempDir::new().expect("codex home");
+        let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
         let registry = HotbarActionRegistry::with_builtins();
         let reasoning = registry.get("reasoning.cycle").expect("reasoning action");
         let mut app = test_app();
-        app.api_provider = ApiProvider::OpenaiCodex;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::OpenaiCodex.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
 
         for (expected_effort, expected_label) in [
             (ReasoningEffort::Medium, "medium"),
             (ReasoningEffort::High, "high"),
-            (ReasoningEffort::Max, "xhigh"),
+            (ReasoningEffort::Max, "max"),
             (ReasoningEffort::Low, "low"),
         ] {
             assert!(matches!(
-                reasoning.dispatch(&mut app).expect("dispatch reasoning"),
+                reasoning
+                    .dispatch(&mut app, &Config::default())
+                    .expect("dispatch reasoning"),
                 HotbarDispatch::AppAction(AppAction::UpdateCompaction(_))
             ));
             assert_eq!(app.reasoning_effort, expected_effort);
@@ -2577,7 +2672,9 @@ mod tests {
 
         assert!(sidebar.is_active(&app));
         assert_eq!(
-            sidebar.dispatch(&mut app).expect("dispatch rail hide"),
+            sidebar
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch rail hide"),
             HotbarDispatch::Handled
         );
         assert_eq!(
@@ -2586,7 +2683,9 @@ mod tests {
         );
         assert!(!sidebar.is_active(&app));
 
-        sidebar.dispatch(&mut app).expect("dispatch rail show");
+        sidebar
+            .dispatch(&mut app, &Config::default())
+            .expect("dispatch rail show");
         assert_eq!(
             app.work_surface.placement,
             crate::tui::work_surface::WorkSurfacePlacement::Bottom,
@@ -2603,14 +2702,16 @@ mod tests {
 
         assert!(!filetree.is_active(&app));
         assert_eq!(
-            filetree.dispatch(&mut app).expect("dispatch filetree open"),
+            filetree
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch filetree open"),
             HotbarDispatch::Handled
         );
         assert!(app.file_tree.is_some());
         assert!(filetree.is_active(&app));
 
         filetree
-            .dispatch(&mut app)
+            .dispatch(&mut app, &Config::default())
             .expect("dispatch filetree close");
         assert!(app.file_tree.is_none());
         assert!(!filetree.is_active(&app));
@@ -2624,7 +2725,9 @@ mod tests {
 
         assert!(!palette.is_active(&app));
         assert_eq!(
-            palette.dispatch(&mut app).expect("dispatch palette"),
+            palette
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch palette"),
             HotbarDispatch::Handled
         );
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::CommandPalette));
@@ -2639,13 +2742,17 @@ mod tests {
 
         assert!(!trust.is_active(&app));
         assert_eq!(
-            trust.dispatch(&mut app).expect("dispatch trust on"),
+            trust
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch trust on"),
             HotbarDispatch::Handled
         );
         assert!(app.trust_mode);
         assert!(trust.is_active(&app));
 
-        trust.dispatch(&mut app).expect("dispatch trust off");
+        trust
+            .dispatch(&mut app, &Config::default())
+            .expect("dispatch trust off");
         assert!(!app.trust_mode);
         assert!(!trust.is_active(&app));
     }
@@ -2661,7 +2768,9 @@ mod tests {
         // host it arms voice input and defers capture to the UI event loop;
         // without one it fails gracefully with a localized error. No audio
         // is recorded in either case.
-        let result = voice.dispatch(&mut app).expect("dispatch voice");
+        let result = voice
+            .dispatch(&mut app, &Config::default())
+            .expect("dispatch voice");
         assert!(app.status_message.is_some());
         // The old placeholder message must be gone — voice is implemented.
         assert_ne!(
@@ -2675,7 +2784,9 @@ mod tests {
             );
             assert!(voice.is_active(&app));
             // A second press toggles voice input back off.
-            let off = voice.dispatch(&mut app).expect("dispatch voice off");
+            let off = voice
+                .dispatch(&mut app, &Config::default())
+                .expect("dispatch voice off");
             assert_eq!(off, HotbarDispatch::Handled);
             assert!(!app.voice_enabled);
             assert!(!voice.is_active(&app));

@@ -1,16 +1,15 @@
 //! Anchor command: keep critical facts across compaction.
 //!
 //! Unlike `/note` (active lookup), anchors are passive. They are automatically
-//! re-injected into context after every compaction cycle. Use anchors to
+//! re-injected into context after compaction in trusted workspaces. Use anchors to
 //! preserve invariants like "This API's status field is unreliable" or
 //! ".ssh/ must never be touched".
 
-use std::fs;
 use std::io::Write;
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 
@@ -70,52 +69,41 @@ pub fn anchor(app: &mut App, content: Option<&str>) -> CommandResult {
 
 fn anchors_path(app: &App) -> std::path::PathBuf {
     let primary = app.workspace.join(".codewhale").join("anchors.md");
-    if primary.exists() {
+    if primary.symlink_metadata().is_ok() || app.workspace.join(".codewhale").is_symlink() {
         return primary;
     }
     app.workspace.join(".deepseek").join("anchors.md")
 }
 
 /// Read and split anchors from the file. Each anchor is separated by "\n---\n".
-fn read_anchors(app: &App) -> Vec<String> {
+fn read_anchors(app: &App) -> Result<Vec<String>, String> {
     let path = anchors_path(app);
-    let content = match fs::read_to_string(&path) {
+    let content = match crate::fs_confined::read_to_string(&app.workspace, &path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Failed to read anchors file: {e}")),
     };
 
-    content
+    Ok(content
         .split("\n---\n")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect()
+        .collect())
 }
 
 /// Write anchors back to the file, joined by "\n---\n".
 fn write_anchors(app: &App, anchors: &[String]) -> Result<(), String> {
     let path = anchors_path(app);
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create anchors directory: {e}"))?;
-    }
-
     let content = anchors.join("\n---\n");
-    fs::write(&path, content).map_err(|e| format!("Failed to write anchors file: {e}"))
+    crate::fs_confined::write(&app.workspace, &path, content.as_bytes())
+        .map_err(|e| format!("Failed to write anchors file: {e}"))
 }
 
 fn add_anchor(app: &mut App, text: &str) -> CommandResult {
     let path = anchors_path(app);
 
-    // Ensure parent directory exists.
-    if let Some(parent) = path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        return CommandResult::error(format!("Failed to create anchors directory: {e}"));
-    }
-
-    // Append to anchors file.
-    let mut file = match fs::OpenOptions::new().create(true).append(true).open(&path) {
+    let mut file = match crate::fs_confined::open_append(&app.workspace, &path) {
         Ok(f) => f,
         Err(e) => {
             return CommandResult::error(format!("Failed to open anchors file: {e}"));
@@ -127,15 +115,14 @@ fn add_anchor(app: &mut App, text: &str) -> CommandResult {
         return CommandResult::error(format!("Failed to write anchor: {e}"));
     }
 
-    CommandResult::message(format!(
-        "Anchor pinned. It will be auto-injected into context after each compaction.\n\
-         Stored in: {}",
-        path.display()
-    ))
+    CommandResult::message(format!("Anchor pinned.\nStored in: {}", path.display()))
 }
 
 fn list_anchors(app: &App) -> CommandResult {
-    let anchors = read_anchors(app);
+    let anchors = match read_anchors(app) {
+        Ok(anchors) => anchors,
+        Err(e) => return CommandResult::error(e),
+    };
 
     if anchors.is_empty() {
         return CommandResult::message(
@@ -162,7 +149,10 @@ fn remove_anchor(app: &mut App, index_str: &str) -> CommandResult {
         }
     };
 
-    let mut anchors = read_anchors(app);
+    let mut anchors = match read_anchors(app) {
+        Ok(anchors) => anchors,
+        Err(e) => return CommandResult::error(e),
+    };
 
     if index > anchors.len() {
         return CommandResult::error(format!(
@@ -195,6 +185,55 @@ mod tests {
             ..crate::test_support::test_tui_options(tmpdir.path())
         };
         App::new(options, &Config::default())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_anchors_refuse_linked_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        for directory in [".codewhale", ".deepseek"] {
+            for linked_directory in [false, true] {
+                let workspace = TempDir::new().unwrap();
+                let outside = TempDir::new().unwrap();
+                let mut app = create_test_app_with_tmpdir(&workspace);
+                let original = "first anchor\n---\nsecond anchor";
+                let target = outside.path().join("anchors.md");
+                std::fs::write(&target, original).unwrap();
+                let parent = workspace.path().join(directory);
+                if linked_directory {
+                    symlink(outside.path(), &parent).unwrap();
+                } else {
+                    std::fs::create_dir_all(&parent).unwrap();
+                    symlink(&target, parent.join("anchors.md")).unwrap();
+                }
+                for command in ["list", "next anchor", "remove 1"] {
+                    assert!(anchor(&mut app, Some(command)).is_error);
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+                }
+                // Exercise the truncate path independently of the read refusal.
+                assert!(write_anchors(&app, &[]).is_err());
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_anchors_refuse_dangling_links() {
+        for directory in [".codewhale", ".deepseek"] {
+            let workspace = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let mut app = create_test_app_with_tmpdir(&workspace);
+            let target = outside.path().join("missing.md");
+            let parent = workspace.path().join(directory);
+            std::fs::create_dir_all(&parent).unwrap();
+            std::os::unix::fs::symlink(&target, parent.join("anchors.md")).unwrap();
+            assert!(anchor(&mut app, Some("list")).is_error);
+            assert!(anchor(&mut app, Some("next anchor")).is_error);
+            assert!(write_anchors(&app, &[]).is_err());
+            assert!(!target.exists());
+        }
     }
 
     #[test]

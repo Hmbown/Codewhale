@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Position, Size},
 };
 
-use crate::palette::{self, ColorDepth, PaletteMode, ThemeId, UiTheme};
+use codewhale_palette::{self as palette, ColorDepth, PaletteMode, ThemeId, UiTheme};
 
 const RENDER_DEBUG_ENV: &str = "CODEWHALE_TUI_DEBUG";
 const ASCII_SAFE_ENV: &str = "CODEWHALE_ASCII_SAFE";
@@ -116,6 +116,26 @@ impl<W: Write> ColorCompatBackend<W> {
             render_debug: RenderDebugLog::from_env(),
             ascii_safe: self.ascii_safe,
             detected_background: self.detected_background,
+        }
+    }
+
+    /// Immutable frame input from this backend's already negotiated facts.
+    /// Unknown terminal background stays unknown; an explicitly painted pane
+    /// may separately establish its own known ground at the finishing boundary.
+    pub(crate) fn native_ocean_caps(&self) -> codewhale_ratatui::Caps {
+        use codewhale_ratatui::{Caps, color::ColorDepth as NativeDepth, detect::Appearance};
+        Caps {
+            depth: match self.depth {
+                ColorDepth::Monochrome => NativeDepth::Monochrome,
+                ColorDepth::Ansi16 => NativeDepth::Ansi16,
+                ColorDepth::Ansi256 => NativeDepth::Ansi256,
+                ColorDepth::TrueColor => NativeDepth::TrueColor,
+            },
+            ascii: self.ascii_safe,
+            appearance: self
+                .detected_background
+                .and_then(codewhale_ratatui::detect::appearance_for_background)
+                .unwrap_or(Appearance::Unknown),
         }
     }
 
@@ -432,7 +452,7 @@ fn enforce_cell_contrast(
     cell.fg = palette::enforce_contrast(cell.fg, surface, palette::AA_BODY_CONTRAST);
 }
 
-fn adapt_cell_colors(
+pub(crate) fn adapt_cell_colors(
     cell: &mut Cell,
     depth: ColorDepth,
     palette_mode: PaletteMode,
@@ -461,6 +481,36 @@ fn adapt_cell_colors(
     // Stage 3: depth (truecolor / 256 / 16) downsampling.
     cell.fg = palette::adapt_fg_for_depth(source_fg, cell.fg, depth, ui_theme);
     cell.bg = palette::adapt_bg(cell.bg, depth);
+    if depth == ColorDepth::Monochrome {
+        cell.underline_color = ratatui::style::Color::Reset;
+    }
+}
+
+/// Exact backend-visible proposed ink, reused by native Ocean's guard.
+pub(crate) fn project_ocean_ink(
+    cell: &Cell,
+    water: ratatui::style::Color,
+    depth: codewhale_ratatui::color::ColorDepth,
+    theme: &UiTheme,
+) -> ratatui::style::Color {
+    use codewhale_ratatui::color::ColorDepth as NativeDepth;
+    let depth = match depth {
+        NativeDepth::Monochrome => ColorDepth::Monochrome,
+        NativeDepth::Ansi16 => ColorDepth::Ansi16,
+        NativeDepth::Ansi256 => ColorDepth::Ansi256,
+        NativeDepth::TrueColor => ColorDepth::TrueColor,
+    };
+    let mut proposed = cell.clone();
+    proposed.set_bg(water);
+    adapt_cell_colors(
+        &mut proposed,
+        depth,
+        theme.mode,
+        ThemeId::Underwater,
+        theme,
+        None,
+    );
+    proposed.fg
 }
 
 #[cfg(test)]
@@ -568,6 +618,61 @@ mod tests {
             adapt_cell_symbol_for_ascii(&mut cell);
             assert_eq!(cell.symbol(), safe, "{rich} should map to {safe}");
             assert!(cell.symbol().is_ascii());
+        }
+    }
+
+    #[test]
+    fn monochrome_backend_suppresses_every_color_but_keeps_text_modifiers() {
+        use ratatui::style::{Modifier, Style};
+
+        let sgr = regex::Regex::new(r"\x1b\[([0-9;:]*)m").unwrap();
+        for theme_id in palette::SELECTABLE_THEMES {
+            let theme = theme_id.ui_theme();
+            let writer = SharedWriter::default();
+            let capture = writer.0.clone();
+            let mut backend =
+                ColorCompatBackend::new(writer.clone(), ColorDepth::Monochrome, theme.mode);
+            backend.set_theme(*theme_id, theme);
+            let modifiers = Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED;
+            let mut cell = Cell::default();
+            cell.set_symbol("x").set_style(
+                Style::default()
+                    .fg(theme.accent_primary)
+                    .bg(Color::Indexed(4))
+                    .underline_color(Color::Red)
+                    .add_modifier(modifiers),
+            );
+            let mut adapted = cell.clone();
+            adapt_cell_colors(
+                &mut adapted,
+                ColorDepth::Monochrome,
+                theme.mode,
+                *theme_id,
+                &theme,
+                None,
+            );
+            assert_eq!(
+                (adapted.fg, adapted.bg, adapted.underline_color),
+                (Color::Reset, Color::Reset, Color::Reset)
+            );
+            assert_eq!(adapted.modifier, modifiers);
+
+            // Screen-mode switches must carry the same color policy.
+            let mut backend = backend.respawn(writer);
+            backend.draw(std::iter::once((0, 0, &cell))).unwrap();
+            let output = String::from_utf8_lossy(&capture.borrow()).to_string();
+            assert!(output.contains('x'), "{theme_id:?}: {output:?}");
+            for codes in sgr.captures_iter(&output) {
+                for code in codes[1]
+                    .split([';', ':'])
+                    .filter_map(|code| code.parse::<u16>().ok())
+                {
+                    assert!(
+                        !matches!(code, 30..=38 | 40..=48 | 58 | 90..=97 | 100..=107),
+                        "{theme_id:?} emitted color SGR: {output:?}"
+                    );
+                }
+            }
         }
     }
 

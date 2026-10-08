@@ -1,0 +1,150 @@
+/* ------------------------------------------------------------------ */
+/*  Route boundaries and the connection banner                          */
+/* ------------------------------------------------------------------ */
+/*
+ * The empty / loading / error grammar itself lives in primitives.css
+ * (.empty-state, .state-block, .skeleton-bar); components/surface-state.tsx
+ * renders it.
+ * This file keeps the two containers around it.
+ */
+
+/* Route-level boundaries (loading.tsx / error.tsx / not-found.tsx) sit in
+   the site container with the page rhythm, so a boundary never looks like a
+   different site. */
+.route-state {
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: var(--space-6) var(--space-8);
+}
+
+/* ---------- not found: the Codwhale poster ---------- */
+.not-found {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(2rem, 6vw, 5.5rem);
+  max-width: 70rem;
+  margin-inline: auto;
+  padding-block: clamp(1rem, 4vw, 3rem);
+}
+.not-found-copy { display: grid; gap: var(--space-5); min-width: 0; }
+.not-found-title {
+  max-width: 11ch;
+  font-size: var(--text-display-lg);
+  font-weight: 600;
+  line-height: 1.04;
+  letter-spacing: -0.03em;
+  text-wrap: balance;
+}
+.not-found-code { display: block; margin-bottom: 0.2em; color: var(--accent); }
+.not-found-body {
+  color: var(--muted);
+  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.25rem);
+  line-height: 1.6;
+  white-space: pre-line;
+}
+/* The poster sits in the deep water: a navy plate with a hairline edge. */
+.not-found-frame {
+  justify-self: end;
+  width: 100%;
+  max-width: 30rem;
+  padding: clamp(0.75rem, 2vw, 1.25rem);
+  background: var(--ocean-floor);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sheet);
+  box-shadow: 0 30px 70px -30px rgb(3 10 28 / 0.7);
+}
+.not-found-poster { display: block; width: 100%; height: auto; border-radius: var(--radius-surface); }
+@media (max-width: 760px) {
+  .not-found { grid-template-columns: minmax(0, 1fr); }
+  .not-found-title { max-width: 15ch; }
+  .not-found-frame { justify-self: center; }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Connection banner — offline / reconnecting / degraded / restored    */
+/* ------------------------------------------------------------------ */
+/* A raised sheet with a dot and a word. The dot's hue is the state
+   vocabulary (danger offline, accent reconnecting, attention degraded, live
+   restored) and the title always says it in words. No blur, no pulse. */
+.connection-banner {
+  position: sticky;
+  top: 0;
+  z-index: 35;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--space-3);
+  align-items: center;
+  width: var(--container);
+  margin: var(--space-3) auto 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-surface);
+  background: var(--panel);
+  box-shadow: var(--shadow-popover);
+  color: var(--text);
+}
+
+.connection-mark {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-pill);
+  background: currentColor;
+  color: var(--muted);
+}
+
+.connection-banner-offline .connection-mark { color: var(--danger); }
+.connection-banner-reconnecting .connection-mark { color: var(--accent); box-shadow: var(--glow); }
+.connection-banner-degraded .connection-mark { color: var(--attention); box-shadow: var(--glow); }
+.connection-banner-restored .connection-mark { color: var(--live); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .connection-banner {
+    animation: mm-in var(--dur-arrive) var(--ease-out) both;
+  }
+}
+
+.connection-copy { min-width: 0; }
+.connection-title { font-size: var(--text-ui); font-weight: 500; }
+.connection-body { margin-top: 0.125rem; color: var(--muted); font-size: var(--text-caption); line-height: 1.5; }
+.connection-checked { color: var(--muted); }
+
+.connection-actions { display: flex; gap: var(--space-2); }
+
+/* The banner's buttons take the .btn secondary and primary paint under
+   the class names the component emits. */
+.connection-button {
+  display: inline-flex;
+  min-height: 2rem;
+  align-items: center;
+  padding-inline: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--panel);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  transition-property: background-color, border-color, color;
+  transition-duration: var(--dur-state);
+  transition-timing-function: var(--ease-out);
+}
+
+.connection-button:hover { background: var(--hover); }
+.connection-button-primary { border-color: transparent; background: var(--brand-fill); color: var(--on-brand); font-weight: 600; }
+.connection-button-primary:hover { background: var(--brand-fill-hover); color: var(--on-brand); }
+.connection-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.connection-button[aria-busy="true"] { cursor: progress; }
+
+@media (pointer: coarse) {
+  .connection-button { min-height: 2.75rem; }
+}
+
+@media (max-width: 560px) {
+  .connection-banner {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .connection-actions {
+    grid-column: 2;
+  }
+}

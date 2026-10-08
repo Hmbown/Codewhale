@@ -191,6 +191,61 @@ fn exact_replay_is_idempotent_and_a_mutated_binding_conflicts() {
 }
 
 #[test]
+fn replay_rejects_fields_the_supplied_digest_does_not_vouch_for() {
+    let case = fixtures()
+        .into_iter()
+        .find(|case| case.id == "accepted-standard-8")
+        .unwrap();
+    let first = issue_case(&case).unwrap();
+
+    // Same id and digest, different interval: the digest no longer matches
+    // the fields it claims to bind.
+    let mut shifted = first.clone();
+    shifted.started_at = "2026-08-31T13:00:00.000Z".to_string();
+    shifted.ended_at = "2026-08-31T13:10:00.000Z".to_string();
+    assert_eq!(
+        assert_computer_meter_receipt_replay(&first, &shifted)
+            .unwrap_err()
+            .code(),
+        "computer_meter_receipt_replay_conflict"
+    );
+
+    // A field outside the digest must still match exactly.
+    let mut restated = first.clone();
+    restated.provider_allocation.accepted = false;
+    assert_eq!(
+        assert_computer_meter_receipt_replay(&first, &restated)
+            .unwrap_err()
+            .code(),
+        "computer_meter_receipt_replay_conflict"
+    );
+}
+
+#[test]
+fn an_interval_that_runs_past_admission_expiry_is_refused() {
+    let case = fixtures()
+        .into_iter()
+        .find(|case| case.id == "accepted-standard-8")
+        .unwrap();
+    let mut admission_request = case.admission.clone().unwrap();
+    let observation = case.observation.clone().unwrap();
+    // Starts before expiry, ends after it.
+    admission_request.expires_at = "2026-08-31T12:05:00.000Z".to_string();
+    let admission = bind_computer_admission(admission_request.clone()).unwrap();
+    assert_eq!(
+        issue_computer_meter_receipt(&admission, observation.clone())
+            .unwrap_err()
+            .code(),
+        "computer_admission_expired"
+    );
+
+    // Ending exactly at expiry is inside the admission (end is exclusive).
+    admission_request.expires_at = observation.ended_at.clone();
+    let admission = bind_computer_admission(admission_request).unwrap();
+    assert!(issue_computer_meter_receipt(&admission, observation).is_ok());
+}
+
+#[test]
 fn admission_binds_profile_multiplier_account_and_expiry_before_dispatch() {
     let admission = bind_computer_admission(ComputerAdmissionRequest {
         admission_id: "adm_bind".to_string(),

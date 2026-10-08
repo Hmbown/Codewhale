@@ -32,7 +32,8 @@ use super::candidate::{
     SourcedLimitOverride, ValidationReport,
 };
 use super::capabilities::{
-    RouteCapabilities, documented_moonshot_web_search_for_route,
+    RouteCapabilities, documented_deepseek_files_api_for_route,
+    documented_deepseek_image_input_for_route, documented_moonshot_web_search_for_route,
     documented_zai_web_search_for_route,
 };
 use super::descriptor::ProviderDescriptor;
@@ -41,7 +42,7 @@ use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
 use super::offering::{ProviderModelOffering, RouteLimits, bundled_offerings};
 use crate::catalog::{CatalogOffering, bundled_catalog_offerings};
 use crate::provider::WirePolicy;
-use crate::{ProviderKind, opencode_go_chat_model_id, provider_preserves_custom_base_url_model};
+use crate::{ProviderKind, opencode_go_model_id, provider_preserves_custom_base_url_model};
 
 /// A request to resolve into an executable route.
 ///
@@ -68,6 +69,7 @@ pub struct RouteRequest {
 #[derive(Debug, Clone)]
 pub struct RouteResolver {
     offerings: Vec<ProviderModelOffering>,
+    configured_offerings: Vec<(String, ProviderModelOffering)>,
 }
 
 /// Offering-owned facts selected within one provider scope before the final
@@ -116,8 +118,8 @@ impl RouteResolver {
     ///
     /// The default offerings are the committed Models.dev-shaped catalog asset
     /// (`crate::catalog::bundled_catalog_offerings`, real context windows and
-    /// honest per-row `cost`) merged with the tiny hand seam
-    /// ([`bundled_offerings`]). The hand seam is kept and given precedence on a
+    /// honest per-row `cost`) merged with the reviewed transport projection
+    /// ([`bundled_offerings`]). The reviewed projection is given precedence on a
     /// `(provider, wire id)` collision: it encodes the curated canonical-model
     /// joins the route invariants depend on (e.g. a DeepSeek-native row and the
     /// aggregator rows that map a prefixed wire id back to `deepseek-v4-pro`),
@@ -136,7 +138,77 @@ impl RouteResolver {
     /// changing route-resolution semantics.
     #[must_use]
     pub fn from_offerings(offerings: Vec<ProviderModelOffering>) -> Self {
-        Self { offerings }
+        Self {
+            offerings,
+            configured_offerings: Vec::new(),
+        }
+    }
+
+    /// Add validated operator declarations for this exact route. This does
+    /// not grant provider-catalog authority or establish model availability.
+    pub fn with_configured_models(
+        mut self,
+        models: &[crate::catalog::configured::ConfiguredModel],
+        identity: &str,
+        provider: ProviderKind,
+        base_url: &str,
+    ) -> Self {
+        if crate::catalog::configured::validate_configured_models(models).is_err() {
+            return self;
+        }
+        for model in models
+            .iter()
+            .filter(|model| model.matches_route(identity, base_url))
+        {
+            let mut offering = model.to_catalog_offering().to_offering();
+            offering.provider = ProviderId::from(provider.as_str());
+            // Preserve an adapter's established protocol for an existing ID.
+            // The label/config declaration cannot choose a new wire dialect.
+            if let Some(existing) = self.offerings.iter().find(|row| {
+                row.provider == offering.provider && row.wire_model_id == offering.wire_model_id
+            }) {
+                offering.endpoint_key.clone_from(&existing.endpoint_key);
+                offering.default_for_provider = existing.default_for_provider;
+            } else if ProviderDescriptor::for_kind(provider).wire_policy() == WirePolicy::ModelAware
+                && provider != ProviderKind::Deepseek
+            {
+                continue;
+            }
+            // Positive declarations are not verified executable capabilities.
+            // Explicit negatives can still restrict a route conservatively.
+            let declared = offering.capabilities;
+            offering.capabilities = RouteCapabilities {
+                attachments: if model.attachment == Some(false) {
+                    declared.attachments
+                } else {
+                    Default::default()
+                },
+                image_input: if declared.image_input == super::CapabilityState::Unsupported {
+                    declared.image_input
+                } else {
+                    Default::default()
+                },
+                reasoning: if model.reasoning == Some(false) {
+                    declared.reasoning
+                } else {
+                    Default::default()
+                },
+                native_tool_calls: if model.tool_call == Some(false) {
+                    declared.native_tool_calls
+                } else {
+                    Default::default()
+                },
+                structured_output: if model.structured_output == Some(false) {
+                    declared.structured_output
+                } else {
+                    Default::default()
+                },
+                ..RouteCapabilities::default()
+            };
+            self.configured_offerings
+                .push((crate::catalog::base_url_fingerprint(base_url), offering));
+        }
+        self
     }
 
     /// Resolve a request into an executable route candidate.
@@ -145,9 +217,76 @@ impl RouteResolver {
     /// Returns [`RouteError`] when the model is empty, the provider is invalid,
     /// or a clearly-foreign model is requested for a strict direct provider.
     pub fn resolve(&self, req: &RouteRequest) -> Result<ReadyRouteCandidate, RouteError> {
+        self.resolve_inner(req, false)
+    }
+
+    /// Resolve with catalog facts authenticated against this exact endpoint.
+    ///
+    /// The ordinary [`Self::resolve`] path strips capabilities and pricing when
+    /// a route uses a custom base URL, because a same-named first-party model is
+    /// not evidence about an arbitrary proxy. Callers may use this seam only
+    /// when the injected offering came from the selected provider identity's
+    /// own endpoint and its base-URL fingerprint matches the request endpoint.
+    /// All normal routing and protocol validation still applies.
+    pub fn resolve_with_endpoint_catalog_authority(
+        &self,
+        req: &RouteRequest,
+    ) -> Result<ReadyRouteCandidate, RouteError> {
+        self.resolve_inner(req, true)
+    }
+
+    fn resolve_inner(
+        &self,
+        req: &RouteRequest,
+        endpoint_catalog_authoritative: bool,
+    ) -> Result<ReadyRouteCandidate, RouteError> {
+        if self.configured_offerings.is_empty() {
+            return self.resolve_scoped(req, endpoint_catalog_authoritative);
+        }
+        let mut scoped = self.clone();
+        scoped.configured_offerings.clear();
+        let provider = req.explicit_provider.unwrap_or_default();
+        let base_url = req
+            .base_url_override
+            .as_deref()
+            .unwrap_or_else(|| ProviderDescriptor::for_kind(provider).default_base_url());
+        let fingerprint = crate::catalog::base_url_fingerprint(base_url);
+        let selected_id = req
+            .model_selector
+            .as_ref()
+            .map(LogicalModelRef::raw)
+            .or_else(|| req.saved_provider_model.as_ref().map(WireModelId::as_str));
+        for (endpoint, offering) in &self.configured_offerings {
+            if !base_url.contains(['@', '?', '#'])
+                && *endpoint == fingerprint
+                && offering.provider.as_str() == provider.as_str()
+                && selected_id == Some(offering.wire_model_id.as_str())
+            {
+                scoped.offerings.retain(|row| {
+                    row.provider != offering.provider || row.wire_model_id != offering.wire_model_id
+                });
+                scoped.offerings.push(offering.clone());
+                scoped
+                    .configured_offerings
+                    .push((endpoint.clone(), offering.clone()));
+            }
+        }
+        scoped.resolve_scoped(req, endpoint_catalog_authoritative)
+    }
+
+    fn resolve_scoped(
+        &self,
+        req: &RouteRequest,
+        endpoint_catalog_authoritative: bool,
+    ) -> Result<ReadyRouteCandidate, RouteError> {
         // 1. Provider scope from explicit choice only; default otherwise.
         //    The provider is NEVER inferred from a model prefix.
         let provider_kind = req.explicit_provider.unwrap_or_default();
+        if provider_kind == ProviderKind::Antigravity {
+            return Err(RouteError::InvalidProvider(
+                crate::LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE.to_string(),
+            ));
+        }
         let descriptor = ProviderDescriptor::for_kind(provider_kind);
         let provider_id = descriptor.id();
         let default_offering = self.default_offering(&provider_id);
@@ -222,29 +361,73 @@ impl RouteResolver {
                 require_catalog_match,
             )?
         };
-        if provider_kind == ProviderKind::Deepseek {
-            if custom_endpoint {
-                selected.endpoint_key = "chat".to_string();
-            } else if selected.canonical_model.is_none()
-                && deepseek_versioned_model_prefers_responses(selected.wire_model_id.as_str())
-            {
-                // DeepSeek introduced its native agent wire on V4 Flash. Keep
-                // exact catalog rows authoritative (notably V4 Pro => Chat),
-                // while allowing future versioned direct models to adopt the
-                // new Responses surface without a Codewhale release.
-                selected.endpoint_key = "responses".to_string();
-            }
+        if provider_kind == ProviderKind::OpencodeGo {
+            selected.endpoint_key =
+                crate::opencode_go_endpoint_key(selected.wire_model_id.as_str())
+                    .ok_or_else(|| RouteError::UnsupportedModelProtocol {
+                        provider: provider_id.clone(),
+                        model: selected.wire_model_id.as_str().to_string(),
+                        endpoint_key: "unproven".to_string(),
+                    })?
+                    .to_string();
         }
-        if custom_endpoint {
+        if provider_kind == ProviderKind::Deepseek && custom_endpoint {
+            selected.endpoint_key = "chat".to_string();
+        }
+        if custom_endpoint && !endpoint_catalog_authoritative {
             // Capabilities and pricing belong to the exact provider endpoint
             // offering that reported them. Reusing a provider enum and a
             // first-party model id against a custom compatible endpoint does
-            // not prove that proxy serves the same modality, tool, reasoning,
-            // or billing contract. Keep the caller's model id and Chat
-            // pass-through above, but clear every unowned offering fact at the
-            // authority boundary instead of presenting it as verified.
+            // not prove that proxy serves the same canonical model, limits,
+            // modality, tool, reasoning, or billing contract. Keep the
+            // caller's wire model id, but clear every unowned offering fact at
+            // the authority boundary instead of presenting it as verified.
+            // The endpoint_key/protocol stays: it is the provider adapter's
+            // wire contract (a model-aware roster row or fixed policy), not an
+            // endpoint-catalog fact, and coercing it to Chat would silently
+            // change how a Responses- or Messages-bound route speaks.
+            // Deepseek's custom-endpoint Chat pass-through is handled above.
+            selected.canonical_model = None;
+            selected.limits = RouteLimits::default();
             selected.capabilities = RouteCapabilities::default();
             selected.pricing = PricingSku::UnknownOrStale;
+        }
+        let base_url = req
+            .base_url_override
+            .as_deref()
+            .unwrap_or_else(|| descriptor.default_base_url());
+        let mut declared_limit_overrides = Vec::new();
+        if let Some((_, offering)) =
+            self.configured_offerings
+                .iter()
+                .find(|(fingerprint, offering)| {
+                    !base_url.contains(['@', '?', '#'])
+                        && offering.provider == provider_id
+                        && offering.wire_model_id == selected.wire_model_id
+                        && req
+                            .model_selector
+                            .as_ref()
+                            .map(LogicalModelRef::raw)
+                            .or_else(|| req.saved_provider_model.as_ref().map(WireModelId::as_str))
+                            == Some(offering.wire_model_id.as_str())
+                        && *fingerprint == crate::catalog::base_url_fingerprint(base_url)
+                })
+        {
+            selected.canonical_model = None;
+            selected.limits = offering.limits;
+            selected.capabilities = offering.capabilities;
+            selected.pricing = offering.pricing.clone();
+            for (field, value) in [
+                (LimitField::ContextTokens, offering.limits.context_tokens),
+                (LimitField::InputTokens, offering.limits.input_tokens),
+                (LimitField::OutputTokens, offering.limits.output_tokens),
+            ] {
+                declared_limit_overrides.push(SourcedLimitOverride {
+                    field,
+                    value,
+                    source: super::OverrideSource::UserModelMetadata,
+                });
+            }
         }
         if provider_kind == ProviderKind::Zai {
             let effective_base_url = req
@@ -267,6 +450,32 @@ impl RouteResolver {
                 selected.wire_model_id.as_str(),
                 effective_base_url,
             );
+        }
+        if matches!(
+            provider_kind,
+            ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+        ) {
+            let effective_base_url = req
+                .base_url_override
+                .as_deref()
+                .unwrap_or_else(|| descriptor.default_base_url());
+            selected.capabilities.files_api = documented_deepseek_files_api_for_route(
+                provider_kind,
+                selected.wire_model_id.as_str(),
+                effective_base_url,
+            );
+            // Flash accepts images on every official DeepSeek dialect,
+            // including the Messages route the curated rows do not cover.
+            // Only ever widens: an official Pro row keeps its documented
+            // `Unsupported`, a custom host keeps its cleared `Unknown`.
+            if documented_deepseek_image_input_for_route(
+                provider_kind,
+                selected.wire_model_id.as_str(),
+                effective_base_url,
+            ) == super::CapabilityState::Supported
+            {
+                selected.capabilities.image_input = super::CapabilityState::Supported;
+            }
         }
 
         let protocol = descriptor
@@ -326,7 +535,10 @@ impl RouteResolver {
             // no offering was matched or the offering carried no price.
             Some(selected.pricing),
             validation,
-            req.limit_overrides.clone(),
+            declared_limit_overrides
+                .into_iter()
+                .chain(req.limit_overrides.iter().cloned())
+                .collect(),
         ))
     }
 
@@ -339,16 +551,14 @@ impl RouteResolver {
         class: ProviderClass,
         require_catalog_match: bool,
     ) -> Result<ResolvedOffering, RouteError> {
-        // OpenCode Go publishes one combined model roster across two wire
-        // protocols. Codewhale's provider is deliberately Chat Completions
-        // only, so this allowlist must sit at the sole route-candidate seam.
-        // In particular, a custom base URL must not reopen generic
-        // LocalOrCustom pass-through for Messages-only model ids.
+        // Go's provider roster owns each model's protocol, including when a
+        // custom base URL is configured. Unknown IDs must not fall through.
         let raw = if provider_kind == ProviderKind::OpencodeGo {
-            opencode_go_chat_model_id(logical_model.raw()).ok_or_else(|| {
-                RouteError::ForeignModelForDirectProvider {
+            opencode_go_model_id(logical_model.raw()).ok_or_else(|| {
+                RouteError::UnsupportedModelProtocol {
                     provider: provider_id.clone(),
                     model: logical_model.raw().to_string(),
+                    endpoint_key: "unproven".to_string(),
                 }
             })?
         } else if provider_kind == ProviderKind::OpencodeZen {
@@ -357,6 +567,12 @@ impl RouteResolver {
                 .strip_prefix("opencode/")
                 .or_else(|| logical_model.raw().strip_prefix("opencode-zen/"))
                 .unwrap_or_else(|| logical_model.raw())
+        } else if self.configured_offerings.iter().any(|(_, offering)| {
+            offering.provider == *provider_id
+                && offering.wire_model_id.as_str() == logical_model.raw()
+        }) {
+            // An explicitly declared wire ID is not a convenience selector.
+            logical_model.raw()
         } else if provider_kind == ProviderKind::Concentrate {
             // Concentrate's own namespace is not part of its wire ids.
             // `concentrate/auto` is the explicit spelling for the gateway's
@@ -371,6 +587,17 @@ impl RouteResolver {
         } else {
             provider_scoped_wire_alias(provider_kind, logical_model.raw(), class)
         };
+
+        // This list was scoped to the exact endpoint and raw selector in
+        // resolve_inner, after closed-protocol admission in the builder.
+        // Prefer that literal declaration over a bundled canonical alias.
+        // Keep this after provider protocol/allowlist normalization above;
+        // a declaration cannot preserve an alias those guards must rewrite.
+        if let Some((_, offering)) = self.configured_offerings.iter().find(|(_, offering)| {
+            offering.provider == *provider_id && offering.wire_model_id.as_str() == raw
+        }) {
+            return Ok(ResolvedOffering::from_offering(offering));
+        }
 
         // Try to match a catalog offering owned by THIS provider, either by
         // canonical model id or by exact wire id. This keeps interpretation
@@ -443,6 +670,25 @@ impl RouteResolver {
             // endpoints legitimately accept arbitrary / prefixed ids verbatim.
             ProviderClass::Aggregator | ProviderClass::LocalOrCustom => {
                 if require_catalog_match {
+                    // The Codewhale API's protocol roster is the *account's*
+                    // live catalog, not a compiled list: a customer who
+                    // connects a new provider gets new `provider/model` rows
+                    // without a Codewhale release. Failing closed on a row the
+                    // local catalog has not seen yet would make the account's
+                    // own connected provider unreachable, so infer the
+                    // protocol from the namespace the account API itself uses
+                    // (`anthropic/` is the Messages passthrough; everything
+                    // else is Chat Completions).
+                    if provider_kind == ProviderKind::Codewhale {
+                        return Ok(ResolvedOffering {
+                            wire_model_id: WireModelId::from(raw),
+                            canonical_model: None,
+                            endpoint_key: super::codewhale_endpoint_key_for_model(raw).to_string(),
+                            limits: RouteLimits::default(),
+                            capabilities: RouteCapabilities::default(),
+                            pricing: PricingSku::UnknownOrStale,
+                        });
+                    }
                     // Opencode Zen serves Muse Spark exclusively over Responses.
                     // Handle any future muse-spark variant (e.g. -free suffix)
                     // even when no exact bundled offering exists — fail open to
@@ -540,7 +786,26 @@ fn default_offerings() -> Vec<ProviderModelOffering> {
         .map(CatalogOffering::to_offering)
         .collect::<Vec<_>>();
     // Seam first so it wins identity collisions, then asset-only rows follow.
-    for offering in bundled_offerings().into_iter().chain(asset_rows) {
+    let go_metadata: std::collections::HashMap<_, _> = asset_rows
+        .iter()
+        .filter(|row| row.provider.as_str() == "opencode-go")
+        .map(|row| (row.wire_model_id.as_str(), row))
+        .collect();
+    for mut offering in bundled_offerings()
+        .into_iter()
+        .chain(asset_rows.iter().cloned())
+    {
+        // The transport seam must not erase already sourced Go limits/prices.
+        if offering.provider.as_str() == "opencode-go"
+            && let Some(metadata) = go_metadata.get(offering.wire_model_id.as_str())
+        {
+            offering
+                .canonical_model
+                .clone_from(&metadata.canonical_model);
+            offering.limits = metadata.limits;
+            offering.capabilities = metadata.capabilities;
+            offering.pricing.clone_from(&metadata.pricing);
+        }
         let key = (
             offering.provider.as_str().to_string(),
             offering.wire_model_id.as_str().to_string(),
@@ -588,15 +853,6 @@ fn request_uses_custom_endpoint(
 ) -> bool {
     base_url_override
         .is_some_and(|base_url| provider_preserves_custom_base_url_model(descriptor.kind, base_url))
-}
-
-fn deepseek_versioned_model_prefers_responses(model: &str) -> bool {
-    model
-        .trim()
-        .to_ascii_lowercase()
-        .strip_prefix("deepseek-v")
-        .and_then(|suffix| suffix.chars().next())
-        .is_some_and(|first| first.is_ascii_digit())
 }
 
 /// True when `base_url` is an `http://` endpoint whose host is NOT loopback

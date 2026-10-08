@@ -62,3 +62,71 @@ impl ApprovalMode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_approval_mode_labels() {
+        assert_eq!(ApprovalMode::Auto.label(), "AUTO");
+        assert_eq!(ApprovalMode::Suggest.label(), "SUGGEST");
+        assert_eq!(ApprovalMode::Never.label(), "NEVER");
+    }
+
+    #[test]
+    fn test_approval_mode_from_config_value_accepts_aliases() {
+        assert_eq!(
+            ApprovalMode::from_config_value("auto"),
+            Some(ApprovalMode::Auto)
+        );
+        assert_eq!(
+            ApprovalMode::from_config_value("on-request"),
+            Some(ApprovalMode::Suggest)
+        );
+        assert_eq!(
+            ApprovalMode::from_config_value("full_access"),
+            Some(ApprovalMode::Bypass)
+        );
+        assert_eq!(
+            ApprovalMode::from_config_value("deny"),
+            Some(ApprovalMode::Never)
+        );
+        assert_eq!(ApprovalMode::from_config_value("unknown"), None);
+    }
+
+    #[test]
+    fn permission_cycle_is_a_closed_loop_and_never_is_off_cycle() {
+        assert_eq!(
+            ApprovalMode::PERMISSION_CYCLE,
+            [
+                ApprovalMode::Suggest,
+                ApprovalMode::Auto,
+                ApprovalMode::Bypass
+            ]
+        );
+        assert_eq!(
+            ApprovalMode::Suggest.cycle_permission_next(),
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            ApprovalMode::Auto.cycle_permission_next(),
+            ApprovalMode::Bypass
+        );
+        assert_eq!(
+            ApprovalMode::Bypass.cycle_permission_next(),
+            ApprovalMode::Suggest
+        );
+        // Never is deliberately outside the Shift+Tab cycle; stepping from it
+        // must land on the safest posture rather than panicking or wrapping.
+        assert_eq!(
+            ApprovalMode::Never.cycle_permission_next(),
+            ApprovalMode::Suggest
+        );
+    }
+
+    #[test]
+    fn default_posture_is_suggest() {
+        assert_eq!(ApprovalMode::default(), ApprovalMode::Suggest);
+    }
+}

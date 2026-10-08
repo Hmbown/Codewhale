@@ -1,0 +1,5 @@
+# The released literal custom route: `provider = "custom"` with root fields.
+provider = "custom"
+base_url = "http://127.0.0.1:18181/v1"
+api_key = "sk-literal-custom"
+default_text_model = "my-local-model"

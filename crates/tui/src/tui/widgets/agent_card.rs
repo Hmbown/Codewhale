@@ -19,12 +19,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::fleet::role::public_role_label;
-use crate::palette;
 use crate::todo_snapshot::{TodoCardProjection, card_omission_line, card_todo_projection};
 use crate::tools::subagent::MailboxMessage;
 use crate::tools::todo::TodoListSnapshot;
 use crate::tui::ui_text::truncate_line_to_width;
 use crate::tui::widgets::tool_card::{ToolFamily, family_glyph};
+use codewhale_palette as palette;
 use unicode_width::UnicodeWidthStr;
 
 /// Maximum number of recent actions kept on a `DelegateCard`. Older entries
@@ -67,14 +67,14 @@ impl AgentLifecycle {
     /// Semantic status color only — never the whole-card identity tint.
     /// cyan/teal = running, amber = waiting/pending, green = done, red = failed.
     #[must_use]
-    pub fn ink(self) -> crate::palette::grammar::ChromeInk {
+    pub fn ink(self) -> codewhale_palette::grammar::ChromeInk {
         match self {
-            Self::Pending => crate::palette::grammar::ChromeInk::Waiting,
-            Self::Running => crate::palette::grammar::ChromeInk::Active,
-            Self::Completed => crate::palette::grammar::ChromeInk::Outcome,
-            Self::Failed => crate::palette::grammar::ChromeInk::Failure,
-            Self::Cancelled => crate::palette::grammar::ChromeInk::Metadata,
-            Self::Interrupted => crate::palette::grammar::ChromeInk::Attention,
+            Self::Pending => codewhale_palette::grammar::ChromeInk::Waiting,
+            Self::Running => codewhale_palette::grammar::ChromeInk::Active,
+            Self::Completed => codewhale_palette::grammar::ChromeInk::Outcome,
+            Self::Failed => codewhale_palette::grammar::ChromeInk::Failure,
+            Self::Cancelled => codewhale_palette::grammar::ChromeInk::Metadata,
+            Self::Interrupted => codewhale_palette::grammar::ChromeInk::Attention,
         }
     }
 
@@ -210,7 +210,8 @@ impl DelegateCard {
                 Span::styled(prefix, Style::default().fg(palette::TEXT_DIM)),
                 Span::styled(
                     truncate_action(&todo.header, line_detail_width(content_width, prefix)),
-                    Style::default().fg(crate::palette::grammar::ChromeInk::Metadata.color(theme)),
+                    Style::default()
+                        .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme)),
                 ),
             ]));
             let item_prefix = "  ";
@@ -220,7 +221,7 @@ impl DelegateCard {
                     Span::styled(
                         truncate_action(item, line_detail_width(content_width, item_prefix)),
                         Style::default()
-                            .fg(crate::palette::grammar::ChromeInk::Metadata.color(theme)),
+                            .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme)),
                     ),
                 ]));
             }
@@ -233,7 +234,7 @@ impl DelegateCard {
                             line_detail_width(content_width, item_prefix),
                         ),
                         Style::default()
-                            .fg(crate::palette::grammar::ChromeInk::Metadata.color(theme)),
+                            .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme)),
                     ),
                 ]));
             }
@@ -241,7 +242,7 @@ impl DelegateCard {
         if self.truncated {
             lines.push(Line::from(Span::styled(
                 "\u{2026}".to_string(), // …
-                Style::default().fg(crate::palette::grammar::ChromeInk::Metadata.color(theme)),
+                Style::default().fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme)),
             )));
         }
         for action in self
@@ -253,11 +254,13 @@ impl DelegateCard {
             lines.push(Line::from(vec![
                 Span::styled(
                     prefix,
-                    Style::default().fg(crate::palette::grammar::ChromeInk::Metadata.color(theme)),
+                    Style::default()
+                        .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme)),
                 ),
                 Span::styled(
                     truncate_action(action, line_detail_width(content_width, prefix).min(200)),
-                    Style::default().fg(crate::palette::grammar::ChromeInk::Metadata.color(theme)),
+                    Style::default()
+                        .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme)),
                 ),
             ]));
         }
@@ -348,7 +351,7 @@ impl FanoutCard {
     }
 
     /// Pre-seed worker slots when the fanout size is known up front.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn with_workers<I, S>(mut self, ids: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -362,14 +365,15 @@ impl FanoutCard {
     }
 
     /// Update or insert a worker by id. Returns whether the visible state
-    /// changed and the card should be redrawn.
+    /// changed and the card should be redrawn. A settled worker is final: a
+    /// delayed envelope for it never reopens or re-settles the slot.
     pub fn upsert_worker(&mut self, agent_id: &str, status: AgentLifecycle) -> bool {
         if let Some(slot) = self
             .workers
             .iter_mut()
             .find(|s| s.agent_id == agent_id || s.worker_id == agent_id)
         {
-            if slot.agent_id == agent_id && slot.status == status {
+            if slot.status.is_terminal() || (slot.agent_id == agent_id && slot.status == status) {
                 return false;
             }
             slot.agent_id = agent_id.to_string();
@@ -387,7 +391,7 @@ impl FanoutCard {
     /// circle for the same unit of work.
     pub fn claim_pending_worker(&mut self, agent_id: &str, status: AgentLifecycle) -> bool {
         if let Some(slot) = self.workers.iter_mut().find(|s| s.agent_id == agent_id) {
-            if slot.status == status {
+            if slot.status.is_terminal() || slot.status == status {
                 return false;
             }
             slot.status = status;
@@ -440,33 +444,57 @@ impl FanoutCard {
         s
     }
 
+    /// Header plus dot grid, one glyph per worker. The grid never runs past
+    /// `width`: when it does not fit beside the header it wraps onto its own
+    /// rows, so no worker's state is clipped off the transcript edge.
     #[must_use]
-    pub fn render_lines(&self, _width: u16, theme: &palette::UiTheme) -> Vec<Line<'static>> {
+    pub fn render_lines(&self, width: u16, theme: &palette::UiTheme) -> Vec<Line<'static>> {
         let header_status = self.aggregate_status();
         let count = self.workers.len();
         let count_label = if count == 1 { "agent" } else { "agents" };
-        vec![Line::from(vec![
-            Span::styled(
-                family_glyph(ToolFamily::Fanout),
+        let glyph = family_glyph(ToolFamily::Fanout);
+        let count_text = format!("{count} {count_label}");
+        let grid_style = Style::default()
+            .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme))
+            .add_modifier(Modifier::BOLD);
+        // Every span fits the painted width, down to zero columns (U05-m6):
+        // the glyph only when it fits, the count only with room after it.
+        let width = usize::from(width);
+        let glyph_width = UnicodeWidthStr::width(glyph);
+        let mut header = Vec::new();
+        if width >= glyph_width {
+            header.push(Span::styled(
+                glyph,
                 Style::default()
                     .fg(header_status.color(theme))
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{count} {count_label}"),
+            ));
+        }
+        if width > glyph_width + 1 {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(
+                truncate_action(&count_text, width - glyph_width - 1),
                 Style::default()
-                    .fg(crate::palette::grammar::ChromeInk::Identity.color(theme))
+                    .fg(codewhale_palette::grammar::ChromeInk::Identity.color(theme))
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                self.dot_grid(),
-                Style::default()
-                    .fg(crate::palette::grammar::ChromeInk::Metadata.color(theme))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])]
+            ));
+        }
+        if width == 0 {
+            return vec![Line::from(header)];
+        }
+        let grid: Vec<char> = self.dot_grid().chars().collect();
+        let header_width = glyph_width + 1 + count_text.width() + 1;
+        if header_width + grid.len() <= width {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(grid.iter().collect::<String>(), grid_style));
+            return vec![Line::from(header)];
+        }
+        let mut lines = vec![Line::from(header)];
+        lines.extend(
+            grid.chunks(width)
+                .map(|row| Line::from(Span::styled(row.iter().collect::<String>(), grid_style))),
+        );
+        lines
     }
 
     fn aggregate_status(&self) -> AgentLifecycle {
@@ -474,22 +502,25 @@ impl FanoutCard {
     }
 
     /// Public aggregate lifecycle for the activity shelf and other projectors.
+    ///
+    /// A settled fanout reports its worst outcome: one failed worker among
+    /// finished ones is a failed fanout, not a completed one; an
+    /// interrupted or cancelled worker likewise outranks the completions.
     #[must_use]
     pub fn aggregate_status_public(&self) -> AgentLifecycle {
-        let (done, running, failed, pending) = self.counts();
+        let (done, running, _, pending) = self.counts();
+        let any = |status: AgentLifecycle| self.workers.iter().any(|slot| slot.status == status);
         if running > 0 {
             AgentLifecycle::Running
         } else if pending > 0 {
             // Pending workers wait — amber attention, not "running" teal.
             AgentLifecycle::Pending
-        } else if self
-            .workers
-            .iter()
-            .any(|slot| matches!(slot.status, AgentLifecycle::Interrupted))
-        {
-            AgentLifecycle::Interrupted
-        } else if failed > 0 && done == 0 {
+        } else if any(AgentLifecycle::Failed) {
             AgentLifecycle::Failed
+        } else if any(AgentLifecycle::Interrupted) {
+            AgentLifecycle::Interrupted
+        } else if any(AgentLifecycle::Cancelled) {
+            AgentLifecycle::Cancelled
         } else if done > 0 {
             AgentLifecycle::Completed
         } else {
@@ -528,13 +559,13 @@ fn delegate_header(
         Span::styled(
             role.to_string(),
             Style::default()
-                .fg(crate::palette::grammar::ChromeInk::Identity.color(theme))
+                .fg(codewhale_palette::grammar::ChromeInk::Identity.color(theme))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             detail,
-            Style::default().fg(crate::palette::grammar::ChromeInk::Metadata.color(theme)),
+            Style::default().fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme)),
         ),
     ];
     Line::from(spans)
@@ -556,6 +587,25 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
         return false;
     }
     let was_terminal = card.status.is_terminal();
+    // A settled agent is final. Mailbox producers are concurrent (a tool
+    // task can outlive its agent), so a Started/Progress/tool envelope may
+    // land after the terminal one; it must not reopen the card, stretch its
+    // elapsed time, or rewrite its outcome. Only the child's own Work
+    // snapshot still applies (it keeps the terminal status), and a late
+    // `Started` may still name the role of a card that a completion-first
+    // delivery opened with the `unknown` placeholder — identity, not state.
+    if was_terminal {
+        if let MailboxMessage::Started { agent_type, .. } = msg
+            && card.agent_type == "unknown"
+            && agent_type != "unknown"
+        {
+            card.agent_type = agent_type.clone();
+            return true;
+        }
+        if !matches!(msg, MailboxMessage::WorkState { .. }) {
+            return false;
+        }
+    }
     if card.started_at.is_none()
         && matches!(
             msg,
@@ -637,6 +687,14 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
     true
 }
 
+/// Known limitation: this still matches on message text, while the footer
+/// path keys off the structured `routine_wait` flag (#6290). The mailbox is
+/// a stable cross-crate (`protocol`) surface whose payloads may come from
+/// another binary, so this arm cannot assume the flag exists — and no
+/// in-crate producer sends routine waits here anyway (only "queued" and
+/// "running" texts), so threading the flag would change nothing. If a future
+/// producer sends routine waits over the mailbox, give `Progress` the flag
+/// and match on it here instead of extending this list.
 fn is_low_signal_progress(status: &str) -> bool {
     let status = status.trim().to_ascii_lowercase();
     status.contains("requesting model response")
@@ -699,7 +757,7 @@ mod tests {
     fn delegate_card_header_does_not_duplicate_verb_as_role() {
         let card = DelegateCard::new("agent_1", "explore");
         let rendered =
-            render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(
             !rendered.contains("delegate"),
             "delegate must not be visible in the card: {rendered:?}"
@@ -707,7 +765,7 @@ mod tests {
         assert!(!rendered.contains("[running]"), "{rendered:?}");
         let explore = DelegateCard::new("agent_2", "scout");
         let explore_rendered =
-            render_to_strings(&explore.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&explore.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(explore_rendered.contains("explore"), "{explore_rendered:?}");
     }
 
@@ -720,7 +778,7 @@ mod tests {
         );
         card.push_action("objective: QUESTION: Add Zhipu GLM as a first-class provider-scoped route for 中文输出".to_string());
 
-        let rendered = render_to_strings(&card.render_lines(40, &crate::palette::UI_THEME));
+        let rendered = render_to_strings(&card.render_lines(40, &codewhale_palette::UI_THEME));
 
         assert!(rendered[0].contains("implement"), "{rendered:?}");
         for line in rendered {
@@ -748,7 +806,7 @@ mod tests {
             "stable steady-state size"
         );
 
-        let rendered = render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME));
+        let rendered = render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME));
         assert!(
             rendered.iter().any(|line| line.contains('\u{2026}')),
             "ellipsis indicator must render: got {rendered:?}"
@@ -782,7 +840,7 @@ mod tests {
         };
         assert!(apply_to_delegate(&mut card, &msg));
         assert_eq!(card.status, AgentLifecycle::Completed);
-        let rendered = render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME));
+        let rendered = render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME));
         assert!(
             rendered.iter().any(|line| line.contains("╰ done")),
             "terminal status row renders done: got {rendered:?}"
@@ -809,7 +867,7 @@ mod tests {
         );
 
         let rendered =
-            render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(!rendered.contains("step 1/100"), "{rendered}");
         assert!(
             !rendered.contains("requesting model response"),
@@ -844,7 +902,7 @@ mod tests {
         ));
 
         let rendered =
-            render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(rendered.contains("read_file"), "{rendered}");
         assert!(
             !rendered.contains("[7]"),
@@ -885,7 +943,7 @@ mod tests {
         card.upsert_worker("w_3", AgentLifecycle::Completed);
         card.upsert_worker("w_4", AgentLifecycle::Failed);
         let rendered =
-            render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(
             rendered.contains("4 agents"),
             "header should show count: {rendered}"
@@ -999,7 +1057,7 @@ mod tests {
         assert_eq!(card.status, AgentLifecycle::Interrupted);
 
         let rendered =
-            render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(rendered.contains("╰ interrupted"), "{rendered}");
         assert!(rendered.contains("API call timed out"), "{rendered}");
     }
@@ -1027,7 +1085,7 @@ mod tests {
         // Copy dedupe (Wave 5c #4): the counts line is gone — the header and
         // dot grid carry the aggregate state instead.
         let rendered =
-            render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(rendered.contains("2 agents"), "{rendered}");
         assert!(
             rendered.contains('\u{25D0}'),
@@ -1044,7 +1102,7 @@ mod tests {
         };
         assert!(apply_to_fanout(&mut card, &msg));
         let rendered =
-            render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME)).join("\n");
         assert!(rendered.contains("2 agents"), "{rendered}");
     }
 
@@ -1057,7 +1115,7 @@ mod tests {
         }
         card.upsert_worker("w_12", AgentLifecycle::Running);
 
-        let rendered = render_to_strings(&card.render_lines(80, &crate::palette::UI_THEME));
+        let rendered = render_to_strings(&card.render_lines(80, &codewhale_palette::UI_THEME));
         assert!(
             rendered.iter().any(|line| line.contains('\u{25CF}')),
             "dot grid should remain: {rendered:?}"
@@ -1123,7 +1181,7 @@ mod tests {
         ));
 
         let rendered =
-            render_to_strings(&card.render_lines(100, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(100, &codewhale_palette::UI_THEME)).join("\n");
         assert!(rendered.contains("To-do 1/2"), "{rendered}");
         assert!(rendered.contains("50% settled"), "{rendered}");
         assert!(
@@ -1151,7 +1209,7 @@ mod tests {
         ));
         assert!(card.todo_projection().is_none());
         let rendered =
-            render_to_strings(&card.render_lines(100, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(100, &codewhale_palette::UI_THEME)).join("\n");
         assert!(!rendered.contains("sibling only work"), "{rendered}");
         assert!(!rendered.contains("To-do"), "{rendered}");
     }
@@ -1195,7 +1253,7 @@ mod tests {
         );
 
         let rendered =
-            render_to_strings(&card.render_lines(100, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(100, &codewhale_palette::UI_THEME)).join("\n");
         assert_eq!(card.status, AgentLifecycle::Running, "still mid-turn");
         assert!(rendered.contains("[~] #2 add the regression"), "{rendered}");
         assert!(rendered.contains("[x] #1 draft the fix"), "{rendered}");
@@ -1228,7 +1286,7 @@ mod tests {
 
         assert!(card.todo_projection().is_none());
         let rendered =
-            render_to_strings(&card.render_lines(100, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(100, &codewhale_palette::UI_THEME)).join("\n");
         assert!(
             !rendered.contains("To-do"),
             "an empty list states nothing: {rendered}"
@@ -1279,7 +1337,7 @@ mod tests {
             "the active item is never the one dropped: {projection:?}"
         );
 
-        let rendered = render_to_strings(&card.render_lines(60, &crate::palette::UI_THEME));
+        let rendered = render_to_strings(&card.render_lines(60, &codewhale_palette::UI_THEME));
         assert!(
             rendered.iter().any(|line| line.contains("+6 more")),
             "elision must be stated: {rendered:?}"
@@ -1324,7 +1382,7 @@ mod tests {
             apply_to_delegate(&mut card, &terminal);
 
             let rendered =
-                render_to_strings(&card.render_lines(100, &crate::palette::UI_THEME)).join("\n");
+                render_to_strings(&card.render_lines(100, &codewhale_palette::UI_THEME)).join("\n");
             assert!(card.status.is_terminal(), "{:?}", card.status);
             assert!(
                 rendered.contains("[~] #2 run the suite"),
@@ -1346,7 +1404,7 @@ mod tests {
             ),
         ));
         let rendered =
-            render_to_strings(&card.render_lines(100, &crate::palette::UI_THEME)).join("\n");
+            render_to_strings(&card.render_lines(100, &codewhale_palette::UI_THEME)).join("\n");
         assert!(!rendered.contains("worker one work"), "{rendered}");
         assert!(!rendered.contains("To-do"), "{rendered}");
     }
@@ -1366,8 +1424,8 @@ mod tests {
             "shared compact lifecycle: {joined}"
         );
         assert!(
-            joined.contains("1 child") || joined.contains("children"),
-            "shared child count: {joined}"
+            joined.contains("1/1 done"),
+            "shared settled/total count: {joined}"
         );
         let expanded = panel.render_history_card(
             100,
@@ -1380,5 +1438,149 @@ mod tests {
         let joined = render_to_strings(&expanded).join("\n");
         assert!(joined.contains("result:"), "{joined}");
         assert!(joined.contains("mapped 4 call sites"), "{joined}");
+    }
+
+    /// U05-04: mailbox producers are concurrent, so a Started/Progress/tool
+    /// envelope can land after an agent's terminal one. It must not reopen
+    /// the card or its fanout slot, and must not move a settled count.
+    #[test]
+    fn late_envelopes_never_reopen_a_settled_agent() {
+        let role = || crate::tools::subagent::FleetRole::Worker;
+        let mut card = DelegateCard::new("agent_late", "general");
+        apply_to_delegate(&mut card, &MailboxMessage::started("agent_late", role()));
+        assert!(apply_to_delegate(
+            &mut card,
+            &MailboxMessage::Completed {
+                agent_id: "agent_late".into(),
+                summary: "done".into(),
+            },
+        ));
+        let finished_at = card.finished_at;
+        for late in [
+            MailboxMessage::started("agent_late", role()),
+            MailboxMessage::progress("agent_late", "step 4: reading files"),
+            MailboxMessage::ToolCallStarted {
+                agent_id: "agent_late".into(),
+                tool_name: "read_file".into(),
+                step: 4,
+            },
+            MailboxMessage::Failed {
+                agent_id: "agent_late".into(),
+                error: "late".into(),
+            },
+        ] {
+            assert!(!apply_to_delegate(&mut card, &late), "{late:?}");
+        }
+        assert_eq!(card.status, AgentLifecycle::Completed);
+        assert_eq!(card.summary.as_deref(), Some("done"));
+        assert_eq!(card.finished_at, finished_at);
+
+        // A completion-first recovery card may still learn its role from a
+        // late `Started`, but it stays settled.
+        let mut recovered = DelegateCard::new("agent_r", "unknown");
+        apply_to_delegate(
+            &mut recovered,
+            &MailboxMessage::Completed {
+                agent_id: "agent_r".into(),
+                summary: "done".into(),
+            },
+        );
+        assert!(apply_to_delegate(
+            &mut recovered,
+            &MailboxMessage::started("agent_r", role())
+        ));
+        assert_ne!(recovered.agent_type, "unknown");
+        assert_eq!(recovered.status, AgentLifecycle::Completed);
+
+        let mut fanout = FanoutCard::new("rlm");
+        for id in ["w_1", "w_2"] {
+            apply_to_fanout(
+                &mut fanout,
+                &MailboxMessage::ChildSpawned {
+                    parent_id: "root".into(),
+                    child_id: id.into(),
+                },
+            );
+            apply_to_fanout(&mut fanout, &MailboxMessage::started(id, role()));
+            apply_to_fanout(
+                &mut fanout,
+                &MailboxMessage::Completed {
+                    agent_id: id.into(),
+                    summary: "ok".into(),
+                },
+            );
+        }
+        assert!(!apply_to_fanout(
+            &mut fanout,
+            &MailboxMessage::progress("w_1", "step 9: late")
+        ));
+        assert!(!apply_to_fanout(
+            &mut fanout,
+            &MailboxMessage::started("w_2", role())
+        ));
+        assert_eq!(fanout.worker_count(), 2);
+        assert_eq!(fanout.counts(), (2, 0, 0, 0));
+        assert_eq!(fanout.aggregate_status_public(), AgentLifecycle::Completed);
+    }
+
+    /// U05-m2: a settled fanout headlines its worst outcome — one failure
+    /// among completions is a failed fanout, not a completed one.
+    #[test]
+    fn mixed_fanout_outcomes_never_aggregate_to_completed() {
+        let mut card = FanoutCard::new("rlm").with_workers(["w_1", "w_2", "w_3"]);
+        card.upsert_worker("w_1", AgentLifecycle::Completed);
+        card.upsert_worker("w_2", AgentLifecycle::Completed);
+        card.upsert_worker("w_3", AgentLifecycle::Failed);
+        assert_eq!(card.aggregate_status_public(), AgentLifecycle::Failed);
+
+        let mut card = FanoutCard::new("rlm").with_workers(["w_1", "w_2"]);
+        card.upsert_worker("w_1", AgentLifecycle::Completed);
+        card.upsert_worker("w_2", AgentLifecycle::Cancelled);
+        assert_eq!(card.aggregate_status_public(), AgentLifecycle::Cancelled);
+
+        let mut card = FanoutCard::new("rlm").with_workers(["w_1"]);
+        card.upsert_worker("w_1", AgentLifecycle::Completed);
+        assert_eq!(card.aggregate_status_public(), AgentLifecycle::Completed);
+    }
+
+    /// U05-m6: a wide fanout wraps its dot grid instead of running past the
+    /// transcript width, and every worker keeps its glyph.
+    #[test]
+    fn fanout_header_fits_zero_and_one_column_renders() {
+        let ids: Vec<String> = (0..5).map(|i| format!("w_{i}")).collect();
+        let card = FanoutCard::new("rlm").with_workers(ids.iter().cloned());
+        // Every width from nothing up past the header, including the ones
+        // where the count is truncated and the grid wraps.
+        for width in 0_u16..=16 {
+            let lines = render_to_strings(&card.render_lines(width, &codewhale_palette::UI_THEME));
+            assert!(!lines.is_empty(), "{width}");
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
+                    "{width}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fanout_grid_wraps_within_the_render_width() {
+        let ids: Vec<String> = (0..40).map(|i| format!("w_{i}")).collect();
+        let card = FanoutCard::new("rlm").with_workers(ids.iter().cloned());
+        for width in [12_u16, 20, 80] {
+            let lines = render_to_strings(&card.render_lines(width, &codewhale_palette::UI_THEME));
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
+                    "{width}: {line:?}"
+                );
+            }
+            let glyphs = lines
+                .join("")
+                .chars()
+                .filter(|ch| *ch == '\u{25CB}')
+                .count();
+            assert_eq!(glyphs, 40, "{width}: {lines:?}");
+        }
     }
 }

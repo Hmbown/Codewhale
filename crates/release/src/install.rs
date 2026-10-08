@@ -21,8 +21,24 @@ use std::process::{Command, Stdio};
 /// Accepts `npm`, `homebrew` (or `brew`), `cargo`, `omarchy`, and `binary`.
 /// Anything else is ignored and detection falls back to automatic detection.
 /// Packagers who relocate the binary somewhere the heuristics cannot read —
-/// and users debugging a wrong guess — set this.
+/// and users debugging a wrong guess — set this. Recognized managed paths
+/// take precedence; `binary` cannot authorize overwriting a package-owned file.
 pub const INSTALL_METHOD_ENV: &str = "CODEWHALE_INSTALL_METHOD";
+
+/// Shared migration instructions for every runtime update surface. The new
+/// directory avoids guessing ownership or overwriting a mixed installation.
+pub const GITHUB_MIGRATION_HELP: &str = r#"Install the official GitHub release into a fresh user directory (macOS/Linux):
+  mkdir -p "$HOME/.local"
+  codewhale_install_dir="$(mktemp -d "$HOME/.local/codewhale-release.XXXXXX")"
+  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR="$codewhale_install_dir" sh
+  "$codewhale_install_dir/codewhale" --version
+  export PATH="$codewhale_install_dir:$PATH"
+  hash -r
+  command -v codewhale codew
+Future updates: "$codewhale_install_dir/codewhale" update
+Keep the chosen PATH directory in your shell profile after verifying it.
+Windows: https://github.com/codewhale-hq/CodeWhale/releases/latest
+PATH and migration: https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md"#;
 
 /// The package manager (if any) that owns the running executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,19 +59,35 @@ pub enum InstallMethod {
 impl InstallMethod {
     /// Detect from an executable path, honouring [`INSTALL_METHOD_ENV`].
     ///
-    /// Pass the *resolved* path — `std::env::current_exe()` already follows
-    /// symlinks on the platforms we ship, which is what puts a globally
-    /// npm-installed binary inside `node_modules` and a Homebrew one inside
-    /// `Cellar` rather than in the manager's flat `bin` shim directory.
+    /// `std::env::current_exe()` follows symlinks on Linux but not on macOS,
+    /// where a Homebrew launch reports `/opt/homebrew/bin/codewhale` instead
+    /// of the `Cellar` file it points at. When the path as given looks
+    /// self-updatable, the symlink target is checked too, and a package
+    /// manager that owns the real file wins.
     #[must_use]
     pub fn detect(exe: &Path) -> Self {
+        let mut detected = Self::detect_with_omarchy_probe(exe, omarchy_package_owns);
+        if detected.supports_self_update()
+            && let Ok(real) = std::fs::canonicalize(exe)
+            && real != exe
+        {
+            let owner = Self::detect_with_omarchy_probe(&real, omarchy_package_owns);
+            if !owner.supports_self_update() {
+                detected = owner;
+            }
+        }
+        // An override can identify a relocated package, but cannot authorize
+        // replacing a file that a known package manager owns.
+        if !detected.supports_self_update() {
+            return detected;
+        }
         if let Some(forced) = std::env::var(INSTALL_METHOD_ENV)
             .ok()
             .and_then(|raw| Self::from_token(&raw))
         {
             return forced;
         }
-        Self::detect_with_omarchy_probe(exe, omarchy_package_owns)
+        detected
     }
 
     fn detect_with_omarchy_probe(exe: &Path, owns_package: impl FnOnce(&Path) -> bool) -> Self {
@@ -225,6 +257,30 @@ mod tests {
             "brew upgrade codewhale"
         );
         assert!(!InstallMethod::Homebrew.supports_self_update());
+    }
+
+    /// macOS reports the launcher symlink from `current_exe()`, so detection
+    /// must follow it into `Cellar` before allowing an in-place update.
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_symlink_launcher_is_detected_through_its_target() {
+        let root = tempfile::tempdir().unwrap();
+        let cellar_bin = root.path().join("Cellar/codewhale/0.10.0/bin");
+        std::fs::create_dir_all(&cellar_bin).unwrap();
+        let real = cellar_bin.join("codewhale");
+        std::fs::write(&real, b"binary").unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let launcher = bin.join("codewhale");
+        std::os::unix::fs::symlink(&real, &launcher).unwrap();
+
+        assert_eq!(InstallMethod::from_path(&launcher), InstallMethod::Binary);
+        assert_eq!(InstallMethod::detect(&launcher), InstallMethod::Homebrew);
+
+        // A plain release binary with no package owner stays self-updatable.
+        let plain = bin.join("codew");
+        std::fs::write(&plain, b"binary").unwrap();
+        assert!(InstallMethod::detect(&plain).supports_self_update());
     }
 
     #[test]

@@ -7,6 +7,12 @@
 use super::*;
 
 impl App {
+    /// Install the Config owner's current policy and refresh its read-only UI projection.
+    pub(crate) fn refresh_notification_settings(&mut self, config: &Config) {
+        self.notification_settings = config.notifications_config();
+        let _ = crate::tui::notifications::settings(config);
+    }
+
     #[cfg(test)]
     pub fn new(options: TuiOptions, config: &Config) -> Self {
         let workspace = options.workspace.clone();
@@ -114,6 +120,42 @@ impl App {
             false
         };
         settings.apply_env_overrides();
+        // Config::load resolves this once for every runtime. Direct in-memory
+        // callers use the same policy here, before any startup route is used.
+        let mut startup_config = config.clone();
+        if config_profile.is_some()
+            || (startup_config.remembered_selection_scope.is_none()
+                && (crate::config::explicit_launch_provider_override().is_some()
+                    || crate::config::explicit_launch_model_override().is_some()))
+        {
+            startup_config.remembered_selection_scope = Some(false);
+        }
+        let selected = startup_config.apply_saved_selection(&settings);
+        let config = &startup_config;
+        // First launch writes `default_text_model = DEFAULT_TEXT_MODEL` into
+        // the generated config.toml; that line is the template, not a choice,
+        // so it must not turn off local discovery on a later launch.
+        let generated_default_model = config.provider.is_none()
+            && config.default_text_model.as_deref() == Some(DEFAULT_TEXT_MODEL);
+        let startup_route_configured = config.provider.is_some()
+            || (config.default_text_model.is_some() && !generated_default_model)
+            || config.legacy_model.is_some()
+            || crate::config::explicit_launch_provider_override().is_some()
+            || crate::config::explicit_launch_model_override().is_some()
+            || config
+                .active_provider_identity()
+                .ok()
+                .as_ref()
+                .and_then(|identity| config.provider_config_for(identity))
+                .is_some_and(|entry| entry.model.is_some())
+            || config.active_route_endpoint_configured();
+        // Provider and model come from the same resolved config, even on the
+        // first run. An options default must not replace a configured model.
+        let model = if selected || startup_route_configured {
+            config.default_model()
+        } else {
+            model
+        };
         // Tideline Startup is the fresh interactive landing surface. It must
         // not be bypassed by a stale historical `launch_screen = false`, a
         // provider/config notice, or a previous session record: only an
@@ -136,51 +178,15 @@ impl App {
                 None
             }
         });
-        let tui_prefs_warning = crate::settings::TuiPrefs::path().ok().and_then(|p| {
-            if p.exists() {
-                std::fs::read_to_string(&p).ok().and_then(|raw| {
-                    ::toml::from_str::<::toml::Value>(&raw)
-                        .err()
-                        .map(|e| format!("⚠ tui.toml is malformed — using defaults ({e})"))
-                })
-            } else {
-                None
-            }
-        });
-
-        let mut provider = config.api_provider();
-
-        // A startup route saved explicitly from `/model` is a user choice and
-        // must win over a provider merely seeded in config.toml. A one-launch
-        // CLI/environment provider override still wins so scripts can pin
-        // their route without changing the user's next interactive launch.
-        let explicit_launch_provider = crate::config::explicit_launch_provider_override().is_some();
-        let mut provider_identity_record = config
-            .active_provider_identity(provider)
-            .unwrap_or_else(|_| {
-                let key = config.provider_identity_for(provider);
-                let exact_id = (!(provider == ApiProvider::Custom
-                    && config.uses_legacy_literal_custom_route()))
-                .then(|| key.clone());
-                crate::config::ProviderIdentity {
-                    provider,
-                    key,
-                    exact_id,
-                    migrated_legacy_ollama_cloud_route: false,
-                }
-            });
-        if !explicit_launch_provider
-            && !config.fleet_operator_route_applied
-            && let Some(ref provider_str) = settings.default_provider
-            && let Ok(resolved) = config.resolve_provider_identity(provider_str)
-        {
-            provider = resolved.provider;
-            provider_identity_record = resolved;
-        }
+        let admission = config.active_provider_identity();
+        let admission_error = admission.as_ref().err().cloned();
+        let provider_identity = admission.ok();
+        // An unadmitted selection remains visible as a refusal; this inert
+        // display kind cannot be used as request/config authority.
+        let provider = provider_identity
+            .as_ref()
+            .map_or(ProviderKind::Custom, |identity| identity.provider);
         let mut effective_auth_config = config.clone();
-        effective_auth_config.scope_to_provider_identity(&provider_identity_record);
-        let provider_identity = provider_identity_record.key;
-        let provider_exact_id = provider_identity_record.exact_id;
 
         // #5032: a stale `[providers.xai] oauth_credential_generation` pointer
         // whose owned credential file is gone makes `credentials_valid` return
@@ -197,23 +203,35 @@ impl App {
         // pointer, an expired/revoked token, or a never-completed login), repair
         // a stale pointer once, surface a truthful xAI message, and suppress the
         // picker-recovery path below.
-        let xai_oauth_needs_reauth = provider == ApiProvider::Xai
-            && effective_auth_config
-                .provider_config_for(ApiProvider::Xai)
+        let xai_oauth_needs_reauth = provider == ProviderKind::Xai
+            && provider_identity
+                .as_ref()
+                .and_then(|identity| effective_auth_config.provider_config_for(identity))
                 .and_then(|entry| entry.auth_mode.as_deref())
-                .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
-            && !crate::xai_oauth::credentials_present(&effective_auth_config);
+                .is_some_and(crate::oauth::auth_mode_uses_xai_oauth)
+            && !crate::oauth::credentials_present(
+                crate::oauth::OAuthProvider::Xai,
+                &effective_auth_config,
+            );
         let xai_dangling_repair_message = if xai_oauth_needs_reauth {
-            if crate::xai_oauth::owned_generation_is_dangling(&effective_auth_config) {
-                match crate::xai_oauth::clear_dangling_xai_oauth_generation(config_path.as_deref())
-                {
+            if crate::oauth::owned_generation_is_dangling(
+                crate::oauth::OAuthProvider::Xai,
+                &effective_auth_config,
+            ) {
+                match crate::oauth::clear_dangling_generation(
+                    crate::oauth::OAuthProvider::Xai,
+                    config_path.as_deref(),
+                ) {
                     Ok(()) => {
                         // Keep the in-memory route consistent with the repaired
                         // persisted file so the running app never reaches for
                         // the missing generation.
-                        effective_auth_config
-                            .provider_config_for_mut(ApiProvider::Xai)
-                            .oauth_credential_generation = None;
+                        if let Some(identity) = provider_identity.as_ref()
+                            && let Ok(entry) =
+                                effective_auth_config.provider_config_for_mut(identity)
+                        {
+                            entry.oauth_credential_generation = None;
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -233,24 +251,24 @@ impl App {
             None
         };
         let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
-        let provider_chain = provider
-            .kind()
-            .map(|kind| ProviderChain::new(kind, &config.fallback_providers))
+        let provider_chain = provider_identity
+            .as_ref()
+            .filter(|identity| {
+                identity.key.as_str() == identity.provider.as_str()
+                    && identity.provider != ProviderKind::Antigravity
+            })
+            .map(|identity| ProviderChain::new(identity.provider, &config.fallback_providers))
             .filter(|chain| chain.providers().len() > 1);
-
-        // Snapshot per-provider readiness for the fallback chain (#2574). Uses
-        // the same `has_api_key_for` helper the provider picker uses, so hosted
-        // providers require a key and self-hosted ones (Ollama/vLLM/SGLang) are
-        // reported ready without one. Empty when there is no fallback chain.
         let provider_readiness = provider_chain
             .as_ref()
             .map(|chain| {
                 chain
                     .providers()
                     .iter()
-                    .map(|kind| {
-                        let provider = ApiProvider::from_kind(*kind);
-                        (provider, has_api_key_for(config, provider))
+                    .filter_map(|kind| config.builtin_provider_identity(*kind).ok())
+                    .map(|identity| {
+                        let ready = has_api_key_for(config, &identity);
+                        (identity, ready)
                     })
                     .collect()
             })
@@ -266,6 +284,9 @@ impl App {
         let settings_auto_compact = settings.auto_compact;
         let auto_compact_user_configured = Settings::auto_compact_explicitly_configured();
         let auto_compact_threshold_percent = settings.auto_compact_threshold_percent;
+        let compaction_summary_instructions = config.compaction_summary_instructions();
+        let compaction_retained_user_message_tokens =
+            config.compaction_retained_user_message_tokens();
         let calm_mode = settings.calm_mode;
         let low_motion = settings.low_motion;
         let constrained_frame_rate = settings.constrained_frame_rate;
@@ -288,6 +309,13 @@ impl App {
         let show_tool_details = settings.show_tool_details;
         let inline_diff_mode = InlineDiffMode::parse(&settings.inline_diffs);
         let ui_locale = resolve_locale(&settings.locale);
+        // The dead `tui.toml` store was folded into settings.toml on load.
+        // Say so once, in the user's language, rather than letting a theme
+        // move under them unexplained.
+        let tui_prefs_migration_notice = settings
+            .tui_prefs_migration()
+            .map(|receipt| receipt.lines(ui_locale).join(" "))
+            .filter(|line| !line.is_empty());
         let cost_currency = match (settings.cost_currency.as_str(), ui_locale.tag()) {
             ("usd", "zh-Hans") => CostCurrency::Cny,
             _ => CostCurrency::from_setting(&settings.cost_currency).unwrap_or(CostCurrency::Usd),
@@ -301,13 +329,10 @@ impl App {
             .eq_ignore_ascii_case("vim");
         let transcript_spacing = TranscriptSpacing::from_setting(&settings.transcript_spacing);
         let max_input_history = settings.max_input_history;
-        // The rapid-keystroke heuristic is the fallback for terminals
-        // without bracketed paste, not a second guess layered on top of a
-        // working one: when bracketed paste is enabled it must stay off, or
-        // every fast-typed command goes through hold/buffer windows that
-        // scramble the composer (Y-7, 2026-08-31 QA). The setting remains
-        // the fallback's switch, honored only when bracketed paste is off.
-        let use_paste_burst_detection = settings.paste_burst_detection && !use_bracketed_paste;
+        // Requesting bracketed paste does not prove the terminal delivers it.
+        // Keep the fallback until handle_paste_burst_key observes a real paste
+        // via bracketed_paste_seen; otherwise raw pasted newlines can submit.
+        let use_paste_burst_detection = settings.paste_burst_detection;
         // Resolve the named theme from settings; unknown values were already
         // normalised to the underwater default in Settings::load. The
         // background_color setting still overlays on top.
@@ -324,7 +349,7 @@ impl App {
                 settings.theme
             )
         });
-        let (_, theme_id, ui_theme) = resolved_theme.unwrap_or_else(|_| {
+        let (theme_name, theme_id, ui_theme) = resolved_theme.unwrap_or_else(|_| {
             let id = palette::ThemeId::System;
             let mut theme = id.ui_theme();
             if let Some(background) = background_color_override {
@@ -332,48 +357,32 @@ impl App {
             }
             (id.name().to_string(), id, theme)
         });
-        let provider_models = settings.provider_models.clone().unwrap_or_default();
-        // `provider_models` remembers the last `/model` pick per provider. It
-        // is a convenience default, not an override: when this launch named a
-        // model explicitly (`--model`, forwarded as `CODEWHALE_MODEL`), that
-        // request wins. Before this fix the memory won unconditionally, so
-        // `codewhale --provider moonshot --model kimi-k3` silently kept running
-        // the remembered `kimi-k2.7-code` while `doctor` reported `kimi-k3`.
-        let model = if crate::config::explicit_launch_model_override().is_some()
-            || config.fleet_operator_route_applied
-        {
-            model
-        } else {
-            let configured = model;
-            provider_models
-                .get(&provider_identity)
-                .cloned()
-                .or_else(|| {
-                    // default_model is a DeepSeek-centric setting; other providers
-                    // get their model from config.toml / env (e.g. OPENAI_MODEL).
-                    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-                        settings.default_model.clone()
-                    } else {
-                        None
-                    }
-                })
-                // The remembered pick may be a catalog spelling of the model
-                // the config file already names. Case-sensitive self-hosted
-                // endpoints reject the wrong spelling, so config.toml wins a
-                // case-only disagreement (the selection itself is unchanged).
-                .map(|remembered| {
-                    crate::config::prefer_configured_model_spelling(&configured, remembered)
-                })
-                .unwrap_or(configured)
-        };
-        let auto_model = model.trim().eq_ignore_ascii_case("auto");
-        let mut enabled_provider_models = settings.enabled_models.clone().unwrap_or_default();
-        for (saved_provider, saved_model) in &provider_models {
-            push_enabled_provider_model(&mut enabled_provider_models, saved_provider, saved_model);
+        // Remembered route choices were resolved once into Config. The
+        // chooser and hotbar must not revive archived Settings values.
+        let mut provider_models = HashMap::new();
+        for identity in config.provider_identities() {
+            if let Some(model) = config
+                .provider_config_for(&identity)
+                .and_then(|entry| entry.model.as_ref())
+            {
+                provider_models.insert(identity.key.to_string(), model.clone());
+            }
         }
-        push_enabled_provider_model(&mut enabled_provider_models, &provider_identity, &model);
-        let active_context_window_override = config.context_window_for_provider_config(provider);
-        let configured_route_base_url = effective_auth_config.deepseek_base_url();
+        if let Some(identity) = &provider_identity {
+            provider_models.insert(identity.key.to_string(), model.clone());
+        }
+        let auto_model = model.trim().eq_ignore_ascii_case("auto");
+        // `settings.toml [enabled_models]` is no longer read (#6533): the
+        // picker ranks by use, which this index derives from saved sessions.
+        let route_usage = crate::model_relevance::SharedRouteUsage::default();
+        crate::model_relevance::spawn_build(route_usage.clone());
+        let active_context_window_override = provider_identity
+            .as_ref()
+            .and_then(|identity| config.context_window_for_provider_config(identity));
+        let active_model_context_windows = provider_identity
+            .as_ref()
+            .and_then(|identity| config.model_context_windows_for(identity).cloned());
+        let configured_route_base_url = effective_auth_config.active_route_base_url();
         let (active_route_limits, active_route_base_url, active_context_window_source) =
             if auto_model {
                 (
@@ -389,29 +398,28 @@ impl App {
                     },
                 )
             } else {
-                let saved_provider_model = config
-                    .provider_config_for(provider)
-                    .and_then(|provider| provider.model.as_deref());
-                crate::route_runtime::resolve_route_candidate_with_context_metadata(
-                    provider,
-                    Some(&model),
-                    saved_provider_model,
-                    Some(configured_route_base_url.clone()),
-                    active_context_window_override,
-                    None,
-                )
-                .map(|resolution| {
-                    (
-                        crate::route_budget::known_route_limits(resolution.candidate.limits()),
-                        resolution.candidate.endpoint().base_url.clone(),
-                        resolution.context_window.source,
-                    )
-                })
-                .unwrap_or((
-                    None,
-                    configured_route_base_url,
-                    crate::route_runtime::ContextWindowSource::Fallback,
-                ))
+                provider_identity
+                    .as_ref()
+                    .ok_or_else(|| "provider identity unavailable".to_string())
+                    .and_then(|identity| {
+                        crate::route_runtime::resolve_runtime_route_for_identity(
+                            &effective_auth_config,
+                            identity,
+                            Some(&model),
+                        )
+                    })
+                    .map(|resolution| {
+                        (
+                            crate::route_budget::known_route_limits(resolution.candidate.limits()),
+                            resolution.candidate.endpoint().base_url.clone(),
+                            resolution.context_window.source,
+                        )
+                    })
+                    .unwrap_or((
+                        None,
+                        configured_route_base_url,
+                        crate::route_runtime::ContextWindowSource::Fallback,
+                    ))
             };
         let reasoning_effort_explicit = config.fleet_operator_reasoning_applied
             || settings.reasoning_effort.is_some()
@@ -474,7 +482,7 @@ impl App {
             && !reasoning_effort_explicit
             && let Some(effort) = crate::config::legacy_deepseek_alias_effort_for_route(
                 provider,
-                &effective_auth_config.deepseek_base_url(),
+                &effective_auth_config.active_route_base_url(),
                 &model,
             )
         {
@@ -643,16 +651,20 @@ impl App {
         let work_runtime =
             crate::work_graph::new_shared_work_runtime(todos.clone(), plan_state.clone());
 
-        let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
+        let skills_discovery_mode =
+            crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
         let cached_skills = Self::discover_cached_skills(
             &workspace,
             &skills_dir,
-            skills_scan_codewhale_only,
+            skills_discovery_mode,
             plugin_registry.as_ref(),
         );
 
-        let input_history = crate::composer_history::load_history();
+        // The recall cap applies from the first keystroke, not only after the
+        // first submit: the persisted file keeps its own larger cap (U01-m2).
+        let mut input_history = crate::composer_history::load_history();
+        input_history.drain(..input_history.len().saturating_sub(max_input_history));
         let mention_cwd = std::env::current_dir().ok();
         let start_remote_control = matches!(initial_input, Some(InitialInput::RemoteControl));
         let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
@@ -679,10 +691,31 @@ impl App {
                 plugin_registry.as_ref(),
             )
             .map(|cfg| {
+                // Boot is lazy (#6033): the pre-event "connecting" prediction
+                // is the eager set — `required` servers plus ones the user's
+                // `tools.always_load` selection covers — not every enabled
+                // server. The engine's first boot event replaces this with
+                // the real in-flight set.
+                let requested = config
+                    .tools
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .always_load
+                            .iter()
+                            .map(|name| name.trim().to_ascii_lowercase())
+                            .filter(|name| name.starts_with("mcp_"))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let mut connecting = cfg
                     .servers
                     .iter()
                     .filter(|(_, server)| server.is_enabled())
+                    .filter(|(name, server)| {
+                        server.required
+                            || crate::mcp::tool_selection_covers_server(&requested, name)
+                    })
                     .map(|(name, _)| name.clone())
                     .collect::<Vec<_>>();
                 connecting.sort();
@@ -691,7 +724,7 @@ impl App {
             .unwrap_or((0, Vec::new()));
         let mut hotbar_actions = HotbarActionRegistry::with_configured_routes(
             config,
-            provider,
+            provider_identity.as_ref(),
             &model,
             &provider_models,
         );
@@ -722,7 +755,7 @@ impl App {
                 selected_attachment_index: None,
                 slash_menu_selected: 0,
                 slash_menu_hidden: false,
-                    mention_menu_selected: 0,
+                mention_menu_selected: 0,
                 mention_menu_hidden: false,
                 mention_completion_cache: None,
                 mention_discovery: crate::tui::mention_completion::MentionDiscovery::default(),
@@ -731,8 +764,20 @@ impl App {
                 vim_mode: VimMode::Normal,
                 vim_pending_d: false,
                 selection_anchor: None,
+                // Seeded text was not typed, so it makes no command claim;
+                // startup integrity is decided by the replay receipt (#5925).
+                line_began_with_slash: false,
+                startup_input_unproven: false,
             },
-            viewport: ViewportState::default(),
+            viewport: ViewportState {
+                selection_copy_markdown: config
+                    .tui
+                    .as_ref()
+                    .and_then(|tui| tui.selection_copy_markdown)
+                    .unwrap_or(true),
+                ..ViewportState::default()
+            },
+            pet_watch: crate::tui::pet_watch::PetWatch::default(),
             work_surface: {
                 let mut state = crate::tui::work_surface::WorkSurfaceState::with_layout(
                     work_surface_placement,
@@ -757,25 +802,32 @@ impl App {
             history_revisions: Vec::new(),
             tool_run_cache: ToolRunCache::default(),
             next_history_revision: 1,
-            api_messages: Vec::new(),
+            api_messages: Arc::new(Vec::new()),
+            api_message_stamps: Vec::new(),
+            session_journal: crate::session_tree::SessionJournal::new(),
             completed_assistant_outputs: Vec::new(),
             context_token_cache: std::cell::RefCell::new(Default::default()),
             remote_control: crate::remote_control::RemoteControlController::default(),
             start_remote_control_on_launch: start_remote_control,
             is_loading: false,
+            feedback_dispatch: None,
             dispatch_completion_tx: None,
             dispatch_in_flight: false,
+            dispatch_cancel: None,
             last_enter_instant: None,
             provider_wait_incident_logged: false,
             prompt_suggestion: None,
+            notification_settings: config.notifications_config(),
             prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
             turn_error_posted: false,
+            turn_error_notice: None,
             // Surface parse warnings so the user knows their config file is
             // broken instead of silently losing all settings.
-            status_message: xai_dangling_repair_message
+            status_message: admission_error
+                .or(xai_dangling_repair_message)
                 .or(settings_parse_warning)
-                .or(tui_prefs_warning)
+                .or(tui_prefs_migration_notice)
                 .or(theme_warning),
             status_toasts: VecDeque::new(),
             update_available: None,
@@ -783,13 +835,12 @@ impl App {
             last_status_message_seen: None,
             context_pressure_warning_dismissed: None,
             plugin_reload_nudge_stamp: None,
-            plugin_prompt_suggest_names: HashSet::new(),
-            plugin_prompt_suggest_count: 0,
             last_plugin_catalog_poll: None,
-            plugin_cta: crate::tui::plugin_suggestions::PluginCtaState::default(),
+            plugin_cta: crate::tui::plugin_suggestions::PluginCtaState::from_settings(&settings),
             model,
             provider_models,
-            enabled_provider_models,
+            route_usage,
+            configured_models: config.custom_models.clone().unwrap_or_default(),
             pinned_models: settings.pinned_models.clone(),
             auto_model,
             last_effective_model: None,
@@ -800,8 +851,7 @@ impl App {
             pending_auto_route_receipt: None,
             active_turn: None,
             api_provider: provider,
-            provider_identity,
-            provider_exact_id,
+            provider_identity: provider_identity.clone(),
             provider_chain,
             provider_readiness,
             provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
@@ -811,6 +861,7 @@ impl App {
             active_route_base_url,
             active_context_window_source,
             active_context_window_override,
+            active_model_context_windows,
             pending_provider_switch: None,
             reasoning_effort,
             reasoning_effort_preference,
@@ -818,11 +869,12 @@ impl App {
             workspace,
             workflow_config: config.workflow_config(),
             goal_max_continuations: config.goal_max_continuations(),
+            goal_enforce_token_budget: config.goal_enforce_token_budget(),
             goal_continuation_waiting: false,
             configured_sandbox_mode: config.sandbox_mode.clone(),
             configured_sandbox_network: config.sandbox_network_access,
             sandbox_backend: crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-                config.prefer_bwrap.unwrap_or(false),
+                config.prefers_bwrap(),
             ),
             // #4022: the worker thread is spawned lazily on first submit, so
             // constructing an App never costs a thread.
@@ -837,7 +889,7 @@ impl App {
                 .map(PathBuf::from),
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
-            skills_scan_codewhale_only,
+            skills_discovery_mode,
             project_context_pack_enabled: config.project_context_pack_enabled(),
             memory_path,
             use_memory,
@@ -847,10 +899,13 @@ impl App {
             use_bracketed_paste,
             use_paste_burst_detection,
             bracketed_paste_seen: false,
+            bracketed_paste_trusted: crate::tui::paste::terminal_delivers_bracketed_paste(),
             system_prompt: None,
             auto_compact,
             auto_compact_user_configured,
             auto_compact_threshold_percent,
+            compaction_summary_instructions,
+            compaction_retained_user_message_tokens,
             stopped_turn: false,
             calm_mode,
             low_motion,
@@ -880,7 +935,10 @@ impl App {
             inline_diff_mode,
             ui_locale,
             cost_currency,
-            billing_presentation: crate::route_billing::for_route(config, provider),
+            billing_presentation: provider_identity.as_ref().map_or(
+                crate::route_billing::BillingPresentation::Unknown,
+                |identity| crate::route_billing::for_route(config, identity),
+            ),
             composer_density,
             composer_border,
             composer_multiline_mode,
@@ -916,21 +974,35 @@ impl App {
             agent_activity_started_at: None,
             agent_counter: 0,
             agent_label_map: HashMap::new(),
+            background_finished: Vec::new(),
+            finished_shell_ids: HashMap::new(),
+            notified_shell_ids: HashSet::new(),
+            notified_task_ids: HashSet::new(),
+            subagent_cache_received_at: None,
             agent_focus: None,
             agent_queued_follow_ups: HashMap::new(),
-            agent_role_counters: HashMap::new(),
             last_agent_progress_redraw: None,
             last_workflow_budget_redraw: None,
             ui_theme,
             background_color_override,
             theme_id,
+            theme_name,
             onboarding,
+            redaction_gate: false,
+            redaction_gate_confirming: false,
+            redaction_gate_scroll: std::cell::Cell::new(0),
             onboarding_needs_api_key: needs_api_key,
+            startup_route_configured,
             onboarding_provider: provider,
             onboarding_workspace_trust_gate,
             onboarding_missing_key_recovery,
+            onboarding_key_rejected: None,
             onboarding_explore_offline: false,
-            onboarding_had_language_step: onboarding_needs_language,
+            // Language is asked in /setup, never at launch: counting it here
+            // made the one launch screen read "Getting started · 2/3" with no
+            // step 1 in sight (#6566).
+            onboarding_had_language_step: onboarding_needs_language
+                && onboarding == OnboardingState::Language,
             onboarding_had_provider_step: !was_onboarded && needs_api_key,
             onboarding_had_trust_step: !was_onboarded && needs_workspace_trust,
             api_key_env_only,
@@ -955,13 +1027,17 @@ impl App {
             },
             view_stack: ViewStack::new(),
             pending_user_input_prompt: None,
+            pending_child_requests: std::collections::BTreeMap::new(),
+            child_agent_sessions: std::collections::HashMap::new(),
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
+            offline_queue_lease: None,
             last_known_work_state: None,
             last_known_goal_state: None,
             pending_goal_controls: VecDeque::new(),
             current_session_metadata: None,
             session_artifacts: Vec::new(),
+            session_turn_outcomes: Vec::new(),
             trust_mode: yolo_compat || configured_trust_mode,
             translation_enabled: false,
             mini_window: config.mini_window.clone().unwrap_or_default(),
@@ -970,15 +1046,20 @@ impl App {
                 .as_ref()
                 .and_then(|tui| tui.status_items.clone())
                 .unwrap_or_else(crate::config::StatusItem::default_footer),
+            posture_bar: config
+                .tui
+                .as_ref()
+                .and_then(|tui| tui.posture_bar)
+                .unwrap_or_default(),
+            metrics_line: config
+                .tui
+                .as_ref()
+                .and_then(|tui| tui.metrics_line)
+                .unwrap_or(crate::config::ChromeRowPreset::Compact),
             // Prose wrap cap (`[transcript] prose_measure`, #5436). Resolved
             // once here so every render pass — main cache and full-screen
             // overlay — shares one effective width; `None` = full width.
             prose_measure: config.prose_measure(),
-            header_items: config
-                .tui
-                .as_ref()
-                .and_then(|tui| tui.header_items.clone())
-                .unwrap_or_else(crate::config::HeaderItem::default_header),
             project_doc: None,
             plan_state,
             todos,
@@ -1002,6 +1083,7 @@ impl App {
             // or malformed config simply hides the chip.
             mcp_configured_count,
             mcp_reload_required: false,
+            mcp_reload_in_flight: false,
             tool_log: Vec::new(),
             active_skill: None,
             active_skill_provenance: None,
@@ -1014,6 +1096,7 @@ impl App {
             active_cell_revision: 0,
             active_tool_details: HashMap::new(),
             agent_roster: Vec::new(),
+            agent_roster_session_id: None,
             agent_roster_print_requested: false,
             active_tool_entry_completed_at: HashMap::new(),
             exploring_cell: None,
@@ -1036,16 +1119,19 @@ impl App {
             queued_messages: VecDeque::new(),
             queued_draft: None,
             pending_steers: VecDeque::new(),
-            rejected_steers: VecDeque::new(),
+            inflight_steers: VecDeque::new(),
             submit_pending_steers_after_interrupt: false,
             turn_started_at: None,
             turn_last_activity_at: None,
             cumulative_turn_duration: std::time::Duration::ZERO,
             session_metrics: crate::tui::session_metrics::SessionMetrics::default(),
             balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            balance_route: None,
             draft_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            mcp_login: None,
+            mcp_retries: Vec::new(),
             prompt_suggestion_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             balance_initiated: false,
             last_balance_fetch: None,
@@ -1054,14 +1140,21 @@ impl App {
             turn_counter: 0,
             dispatch_started_at: None,
             workspace_context: None,
+            workspace_is_linked_worktree: false,
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             memory_size_hint: None,
+            workspace_notes: Vec::new(),
             task_panel: Vec::new(),
+            task_panel_session_id: None,
+            task_panel_unavailable: false,
             automation_panel: crate::tui::automation_panel::AutomationPanelState::default(),
             automation_scan: None,
-            behavioral_tips: crate::tui::behavioral_tips::BehavioralTipState::default(),
-            workflow_panel: None,
+            behavioral_tips: crate::tui::behavioral_tips::BehavioralTipState::new(
+                settings.contextual_tips,
+            ),
+            footer_hint_uses: settings.footer_hint_uses.clone(),
+            workflow_runs: Vec::new(),
             session_started_at: chrono::Utc::now(),
             needs_redraw: true,
             fleet_roster_stale: false,
@@ -1076,6 +1169,7 @@ impl App {
             user_scrolled_during_stream: false,
             last_send_at: None,
             last_submitted_prompt: None,
+            unanswered_submission: None,
             auto_submit_initial_input,
             quit_armed_until: None,
             prefix_change_count: 0,
@@ -1088,7 +1182,7 @@ impl App {
             prefix_drift_count: 0,
             prefix_context_updates: 0,
             collapsed_cells: HashSet::new(),
-            folded_thinking: HashSet::new(),
+            cell_folds: HashMap::new(),
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),

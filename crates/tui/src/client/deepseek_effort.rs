@@ -6,8 +6,9 @@
 //! across two files instead of one edit here.
 //!
 //! Source: <https://api-docs.deepseek.com/api/create-chat-completion> for the
-//! Chat Completions `reasoning_effort` values, and DeepSeek's Responses API
-//! reference for `reasoning.effort` (verified 2026-08-10).
+//! Chat Completions `reasoning_effort` values, and DeepSeek's Thinking Mode
+//! guide <https://api-docs.deepseek.com/guides/reasoning_model> for the
+//! requested-to-actual mapping (verified 2026-09-17).
 //!
 //! What the wires document, and what this table encodes:
 //!
@@ -18,15 +19,24 @@
 //! | High | `reasoning_effort: "high"`  | `effort: "high"`   |
 //! | Max  | `reasoning_effort: "max"`   | `effort: "max"`    |
 //!
-//! Neither wire documents a `medium`, so CodeWhale's medium rounds up to the
-//! nearest documented tier (high), which is also the server default in
-//! thinking mode.
+//! DeepSeek's Thinking Mode guide documents the requested-to-actual effort
+//! mapping; thinking is enabled by default with an actual effort of `high`:
 //!
-//! **DeepSeek documents that the Pro actual-effort mapping changes in early
-//! August 2026.** When it does, edit [`DeepseekEffortTier`]'s two wire
-//! accessors and [`DEEPSEEK_EFFORT_ALIASES`] below, bump the verified date in
-//! this comment, and both call sites move together — that is the whole point
-//! of this module.
+//! | Requested | Actual |
+//! |-----------|--------|
+//! | minimal   | low    |
+//! | low       | low    |
+//! | medium    | high   |
+//! | high      | high   |
+//! | xhigh     | high   |
+//! | max       | max    |
+//! | ultra     | max    |
+//!
+//! `medium`, `xhigh`, and `ultra` are client-side requests that collapse onto
+//! the documented wire tiers — they are not new wire values. When DeepSeek
+//! changes the mapping, edit [`DeepseekEffortTier`]'s two wire accessors and
+//! [`DEEPSEEK_EFFORT_ALIASES`] below, bump the verified date in this comment,
+//! and both call sites move together — that is the whole point of this module.
 
 /// A documented DeepSeek thinking tier, independent of which wire carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +101,7 @@ pub(super) const DEEPSEEK_EFFORT_ALIASES: &[(&str, DeepseekEffortTier)] = &[
     ("mid", DeepseekEffortTier::High),
     ("high", DeepseekEffortTier::High),
     ("", DeepseekEffortTier::High),
-    ("xhigh", DeepseekEffortTier::Max),
+    ("xhigh", DeepseekEffortTier::High),
     ("max", DeepseekEffortTier::Max),
     ("maximum", DeepseekEffortTier::Max),
     ("highest", DeepseekEffortTier::Max),
@@ -121,6 +131,24 @@ pub(super) fn deepseek_effort_tier_or_default(raw: &str) -> DeepseekEffortTier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DeepSeek's documented requested-to-actual mapping (Thinking Mode
+    /// guide, verified 2026-09-17). Pin every row so a future edit to the
+    /// table cannot silently disagree with the vendor.
+    #[test]
+    fn vendor_requested_to_actual_mapping_is_pinned() {
+        for (requested, tier) in [
+            ("minimal", DeepseekEffortTier::Low),
+            ("low", DeepseekEffortTier::Low),
+            ("medium", DeepseekEffortTier::High),
+            ("high", DeepseekEffortTier::High),
+            ("xhigh", DeepseekEffortTier::High),
+            ("max", DeepseekEffortTier::Max),
+            ("ultra", DeepseekEffortTier::Max),
+        ] {
+            assert_eq!(deepseek_effort_tier(requested), Some(tier), "{requested}");
+        }
+    }
 
     #[test]
     fn aliases_are_unique_and_normalized() {

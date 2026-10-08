@@ -1,5 +1,5 @@
 import { DOC_TOPICS, REPO_DOCS_BASE, docTopicHref } from "./docs-map";
-import { PUBLIC_MEMBERSHIP_COPY } from "./content/membership";
+import { computerUse } from "./i18n/dictionaries/en/computer-use";
 import { DISCORD_URL, REPO_URL } from "./i18n/links";
 import { IDENTITY_PHRASE, SITE_NAME, SITE_URL } from "./page-meta";
 
@@ -8,6 +8,12 @@ import { IDENTITY_PHRASE, SITE_NAME, SITE_URL } from "./page-meta";
  * English canonicals only — this file is the machine-readable index.
  */
 const EXTRA_PAGES: readonly { path: string; title: string; description: string }[] = [
+  {
+    path: "/product",
+    title: "Product",
+    description:
+      "What Codewhale is and what a person gains: their own models, capable agents, and control on their own machine — with availability stated per surface.",
+  },
   {
     path: "/docs",
     title: "Documentation",
@@ -24,7 +30,13 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     path: "/runtime",
     title: "Runtime & Integrations",
     description:
-      "Local Runtime API, HTTP/SSE, baseline ACP stdio adapter, MCP servers, and the Phase 0 VS Code companion.",
+      "Local Runtime API, HTTP/SSE, baseline ACP stdio adapter, MCP servers, an early VS Code companion, and a community VS Code GUI.",
+  },
+  {
+    // The page's own English copy, so the index cannot drift from it (W01-03).
+    path: "/computer-use",
+    title: computerUse.title,
+    description: computerUse.metaDescription,
   },
   {
     path: "/constitution",
@@ -56,11 +68,6 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     path: "/contribute",
     title: "Contribute",
     description: "The pull-request workflow: scoped issue, fork, test the change, explain the result.",
-  },
-  {
-    path: "/pricing",
-    title: "Pricing",
-    description: PUBLIC_MEMBERSHIP_COPY.metadata.description.en,
   },
   {
     path: "/legal/terms",

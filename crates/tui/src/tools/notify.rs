@@ -1,12 +1,14 @@
 //! `notify` tool — model-callable desktop notification (#1322).
 //!
-//! Routes through the existing `tui::notifications` infrastructure (OSC 9
+//! Delivered by the terminal host through `crate::host_terminal` (OSC 9
 //! for known capable terminals, BEL fallback on macOS / Linux, `MessageBeep`
 //! on Windows when explicitly opted in). The model decides when to fire —
 //! the tool is intended for "long task done, come back" beats and
 //! sub-agent-completion pings, not chatter.
 //!
-//! Auto-suppresses when `[notifications].method = "off"`. Output messages
+//! Honors the user's `[notifications]` config: `method = "off"` silences
+//! the tool entirely, and `quiet` / `events.model-notify = false` gate the
+//! category through the process-wide notification gate. Output messages
 //! are length-capped so a runaway model can't paint a paragraph into the
 //! terminal title bar.
 
@@ -17,7 +19,6 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_str, required_str,
 };
-use crate::tui::notifications::{NotificationPayload, notify_done};
 
 /// Maximum chars passed through for the title — keeps the OSC 9 escape
 /// reasonable on terminals that wrap long titles awkwardly.
@@ -64,8 +65,9 @@ impl ToolSpec for NotifyTool {
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        // No filesystem or shell side effects; the only output is a single
-        // terminal-escape write to stdout. Mark as ReadOnly so the
+        // No filesystem or shell side effects; the only output is one
+        // notification the terminal host delivers (or declines to, when
+        // none is installed). Mark as ReadOnly so the
         // approval-requirement default is `Auto` and the tool routes
         // through without prompting.
         vec![ToolCapability::ReadOnly]
@@ -91,33 +93,14 @@ impl ToolSpec for NotifyTool {
             return Err(ToolError::execution_failed("title must not be empty"));
         }
 
-        // #4834: model-authored text is the least trusted input that can
-        // reach Notification Center, so it goes through the typed payload
-        // like every other event kind — bounded, control-byte-stripped,
-        // and redacted for credentials, absolute paths, and raw tool JSON.
-        let payload = NotificationPayload::model_notify(
-            title,
-            if body.is_empty() { None } else { Some(body) },
-        );
+        // #4834: the host builds the typed payload from this text (bounded,
+        // control-byte-stripped, redacted) and applies the user's method,
+        // gate and attention policy. Threshold zero: the model has already
+        // decided this is the moment.
+        let receipt = crate::host_terminal::host()
+            .notify_model(title, if body.is_empty() { None } else { Some(body) });
 
-        let in_tmux = std::env::var("TMUX")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-
-        // Threshold = 0 so the notification always fires; the model has
-        // already decided this is the moment.
-        let outcome = notify_done(
-            crate::tui::notifications::configured_method(),
-            in_tmux,
-            &payload,
-            std::time::Duration::ZERO,
-            std::time::Duration::from_secs(1),
-        );
-
-        Ok(ToolResult::success(format!(
-            "{}: {title}",
-            outcome.receipt()
-        )))
+        Ok(ToolResult::success(format!("{receipt}: {title}")))
     }
 }
 
@@ -192,5 +175,27 @@ mod tests {
         let required = schema.get("required").unwrap().as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("title")));
         assert!(!required.iter().any(|v| v.as_str() == Some("body")));
+    }
+
+    #[tokio::test]
+    async fn the_model_sees_success_whatever_the_host_did() {
+        // The description promises a *silent* no-op: whatever the host did
+        // with the notification, the model sees success (nothing to retry).
+        // No host is installed in this test binary, so this is the no-host
+        // receipt; `method = "off"` through the TUI host is covered by
+        // `tui::notifications` (`notify_model_honors_the_installed_off_method`)
+        // and `tui::ui::terminal` (`tui_host_routes_the_notify_tool_through_the_installed_method`).
+
+        let result = NotifyTool
+            .execute(json!({"title": "done"}), &ctx())
+            .await
+            .expect("ok");
+        assert!(result.success);
+        // The receipt is the installed host's, not a hard-coded "sent": no
+        // host is installed in this test binary, so it is the no-host one.
+        assert_eq!(
+            result.content,
+            "notification not sent: no terminal host: done"
+        );
     }
 }

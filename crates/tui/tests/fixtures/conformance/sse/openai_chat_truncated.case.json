@@ -1,0 +1,5 @@
+{
+  "description": "OpenAI Chat Completions: the body ends after two content deltas with neither finish_reason nor [DONE]. A truncated stream must fail, not become a successful short answer.",
+  "route": "openai",
+  "model": "gpt-4.1"
+}

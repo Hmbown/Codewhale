@@ -187,7 +187,7 @@ fn classify_tool_name_activity(name: &str) -> ToolRunActivity {
     let normalized = name.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "read_file" | "list_dir" | "view_image" | "explore" | "git_status" | "git_diff"
-        | "git_log" | "git_show" | "git_blame" => ToolRunActivity::File,
+        | "git_log" | "git_show" | "git_blame" | "git_commit_plan" => ToolRunActivity::File,
         "grep_files" | "file_search" | "web_search" | "fetch_url" | "registry_sync" => {
             ToolRunActivity::Search
         }
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn normalized_git_and_run_actions_keep_truthful_activity_buckets() {
-        for action in ["status", "diff", "log", "show", "blame"] {
+        for action in ["status", "diff", "log", "show", "blame", "commit_plan"] {
             let input = json!({"action": action});
             assert_eq!(
                 classify_tool_name_activity(canonical_action_alias("Git", &input)),

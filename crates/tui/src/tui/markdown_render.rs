@@ -37,9 +37,9 @@ use syntect::parsing::{ParseState as SyntectParseState, SyntaxSet};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::palette;
 use crate::tui::osc8;
 use crate::tui::ui_text::CopyLineSeparator;
+use codewhale_palette as palette;
 
 // Thread-local counter incremented every time `parse` runs. Used by tests to
 // prove that width-only changes hit the cached-AST path and skip parsing.
@@ -136,6 +136,14 @@ fn theme_set() -> &'static ThemeSet {
     THEME_SET.get_or_init(ThemeSet::load_defaults)
 }
 
+/// Load the syntect syntax and theme sets ahead of the first fenced code
+/// block, so that render does not pay the one-time deserialization cost.
+/// Idempotent; intended to run once on a background thread at TUI boot.
+pub(crate) fn prewarm_syntax_highlighting() {
+    let _ = syntax_set();
+    let _ = theme_set();
+}
+
 fn syntax_color_depth() -> palette::ColorDepth {
     *COLOR_DEPTH.get_or_init(palette::ColorDepth::detect)
 }
@@ -209,6 +217,11 @@ pub struct ParseState {
     /// a caller that hands over unrelated text gets a full re-parse, not
     /// silently wrong output.
     prefix: String,
+    /// FNV-1a digest of every byte committed since the last reset. The live
+    /// incremental cache drops `prefix` to bound memory, so the
+    /// verified-append resume path compares this digest against the incoming
+    /// content instead of retaining a second copy of the source.
+    committed_digest: u64,
     /// Length of `prefix`. Always ends just past a newline, so only whole
     /// lines are ever committed.
     consumed: usize,
@@ -243,6 +256,16 @@ impl ParseState {
                 &mut self.code_block_id,
             );
         }
+        let mut digest = if self.consumed == 0 {
+            committed_prefix_digest(&[])
+        } else {
+            self.committed_digest
+        };
+        for &byte in complete.as_bytes() {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(FNV_1A_PRIME);
+        }
+        self.committed_digest = digest;
         self.prefix.push_str(complete);
         self.consumed += complete.len();
     }
@@ -284,17 +307,43 @@ impl ParseState {
             && self.committed_prefix_matches(content)
     }
 
-    /// Resume after the caller has proved that the only source mutation was an
-    /// append. The live transcript obtains that proof at the `push_str` seam;
-    /// avoiding a byte-for-byte prefix comparison is essential because such a
-    /// comparison on every chunk would itself retain the quadratic curve.
+    /// Resume after the caller has proved that the raw source mutation was an
+    /// append. The live transcript obtains that proof at the `push_str` seam.
+    ///
+    /// The receipt covers the *raw* stream, but this cache consumes the
+    /// latex-rendered projection of it, and a math block that closes late
+    /// rewrites already-committed bytes: an open `\[` is committed as literal
+    /// text and only becomes its rendered form once the closing `\]` arrives
+    /// (#6196). A length check cannot see that rewrite, so the committed
+    /// prefix is verified by digest. FNV-1a over hot cache lines costs orders
+    /// of magnitude less per beat than the render it guards, while retaining
+    /// the prefix itself would pin the whole message in memory.
     fn can_resume_verified_append(&self, content: &str) -> bool {
-        content.len() >= self.consumed && content.is_char_boundary(self.consumed)
+        content.len() >= self.consumed
+            && content.is_char_boundary(self.consumed)
+            && self.committed_digest
+                == committed_prefix_digest(&content.as_bytes()[..self.consumed])
     }
 
     fn committed_prefix_matches(&self, content: &str) -> bool {
         self.prefix == content[..self.consumed]
     }
+}
+
+/// FNV-1a constants. Chosen for speed and zero dependencies: the
+/// verified-append resume check hashes the whole committed prefix on every
+/// streaming beat, so the guard must stay far below the render cost it
+/// protects.
+const FNV_1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn committed_prefix_digest(bytes: &[u8]) -> u64 {
+    const FNV_1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut digest = FNV_1A_OFFSET_BASIS;
+    for &byte in bytes {
+        digest ^= u64::from(byte);
+        digest = digest.wrapping_mul(FNV_1A_PRIME);
+    }
+    digest
 }
 
 /// Deterministic work receipts for the live incremental renderer.
@@ -1704,6 +1753,19 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
     let mut rest = line;
 
     while !rest.is_empty() {
+        // Backslash escape (CommonMark §2.4): `\` before ASCII punctuation
+        // yields the literal character. Producers escape untrusted text
+        // (plugin names, paths) this way so it cannot open markup; without
+        // this arm the backslash itself reached the terminal
+        // (`computer\-use`, `0\.1\.0` — 0.9.12 defect #21).
+        if let Some(escaped) = rest.strip_prefix('\\')
+            && let Some(ch) = escaped.chars().next()
+            && ch.is_ascii_punctuation()
+        {
+            out.push(InlineToken::new(ch.to_string(), base_style, None));
+            rest = &escaped[ch.len_utf8()..];
+            continue;
+        }
         // **bold**
         if let Some(end) = rest.strip_prefix("**").and_then(|s| s.find("**")) {
             let inner = &rest[2..2 + end];
@@ -1741,9 +1803,19 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
         {
             let inner = &rest[1..1 + end];
             let after = &rest[1 + end + 1..];
+            // CommonMark forbids an intraword `_` from opening emphasis and
+            // requires the opener to be left-flanking (not followed by
+            // whitespace). Guarding only the closer let `b_p … t_?` italicize
+            // the prose between two math subscripts (#6042).
+            let preceded_by_word = line[..line.len() - rest.len()]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric);
+            let openable =
+                !preceded_by_word && inner.chars().next().is_some_and(|c| !c.is_whitespace());
             // Closing delimiter must not be immediately followed by a
             // letter, digit, or underscore.
-            if !after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            if openable && !after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
                 out.push(InlineToken::new(inner.to_string(), italic_style, None));
                 rest = after;
                 continue;
@@ -1905,7 +1977,8 @@ fn find_next_marker(s: &str) -> usize {
     while i < bytes.len() {
         let ch_len = s[i..].chars().next().map_or(1, |c| c.len_utf8());
         let slice = &s[i..];
-        if slice.starts_with("**")
+        if slice.starts_with('\\')
+            || slice.starts_with("**")
             || slice.starts_with("__")
             || slice.starts_with("~~")
             || slice.starts_with('`')
@@ -2316,6 +2389,19 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn backslash_escapes_yield_the_literal_punctuation() {
+        let lines = render_markdown(
+            "ID: computer\\-use 0\\.1\\.0 \\*not italic\\* trailing\\",
+            80,
+            Style::default(),
+        );
+        assert_eq!(
+            visible_lines(&lines),
+            vec!["ID: computer-use 0.1.0 *not italic* trailing\\"]
+        );
+    }
+
     fn rendered_fingerprint(lines: &[RenderedMarkdownLine]) -> Vec<String> {
         lines
             .iter()
@@ -2517,6 +2603,72 @@ mod tests {
     }
 
     #[test]
+    fn verified_append_resume_rejects_a_rewritten_committed_prefix() {
+        // #6196: the streaming cache consumes the latex-rendered projection
+        // of the raw stream. While a `\[` display block is open,
+        // `render_latex_in_text` passes it through as literal text and the
+        // incremental cache commits those lines. When the closing `\]`
+        // finally arrives the rendered form rewrites the *committed* bytes
+        // even though the raw stream only appended, so the append receipt
+        // stays valid and only a content-aware committed-prefix check can
+        // see the rewrite. A length-only check resumed from the stale lines
+        // and the un-rendered opener stuck in the cell forever. The strings
+        // below are the projections the latex layer produces for that
+        // sequence.
+        let mut cache = IncrementalMarkdownRenderCache::default();
+        let mut rendered = Vec::new();
+        // Beat 1: raw stream `para\n\[ \alpha\n` — the open block passes
+        // through literally and its complete line is committed.
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            "para\n\\[ \\alpha\n",
+            80,
+            palette::PaletteMode::Dark,
+            false,
+        );
+        assert_eq!(cache.work().invalidations, 1);
+
+        // Beat 2: the raw stream appended `\]` plus more prose; the
+        // projection rewrites the committed line and grows past its old
+        // length, so the resume guard cannot rely on length alone.
+        let closed = "para\nα\nthe identity holds for every pair of terms\n";
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            closed,
+            80,
+            palette::PaletteMode::Dark,
+            true,
+        );
+        assert_eq!(
+            cache.work().invalidations,
+            2,
+            "rewriting committed bytes must invalidate the resume"
+        );
+        let cold = render_markdown_tagged_with_palette(
+            closed,
+            80,
+            Style::default(),
+            palette::PaletteMode::Dark,
+        );
+        assert_eq!(
+            rendered_fingerprint(&rendered),
+            rendered_fingerprint(&cold),
+            "the re-render must match a cold render of the closed form"
+        );
+        assert!(
+            !rendered.iter().any(|line| {
+                line.line
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains("\\["))
+            }),
+            "the stale literal latex opener must not survive the close"
+        );
+    }
+
+    #[test]
     fn underscores_inside_identifiers_render_as_literal_text() {
         // Regression for PR #1455 / @tiger-dog: previously the inline
         // markdown parser ate the underscore in `codewhale_tui` because
@@ -2547,6 +2699,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn underscore_emphasis_does_not_open_mid_word_across_math_subscripts() {
+        // #6042: the closing-side guard alone let `b_p` open emphasis and
+        // `t_?` close it, italicizing 60 characters of prose. CommonMark
+        // forbids an intraword `_` from opening emphasis.
+        let source = "[t_, b_p]. Actually — hold on, do we even tile all the way from t_?";
+        let lines = render_parsed(&parse(source), 200, Style::default());
+        let italic: Vec<&str> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            italic.is_empty(),
+            "math subscripts must not open emphasis; italic spans: {italic:?}"
+        );
+
+        // A properly flanked `_italic_` run still renders italic…
+        let flanked = render_parsed(&parse("an _emphasised_ word"), 80, Style::default());
+        assert!(
+            flanked
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style.add_modifier.contains(Modifier::ITALIC)
+                    && span.content.as_ref() == "emphasised"),
+            "a flanked _italic_ run must still render italic"
+        );
+        // …and after punctuation it still opens.
+        let after_punct = render_parsed(&parse("word (_also_)"), 80, Style::default());
+        assert!(
+            after_punct
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style.add_modifier.contains(Modifier::ITALIC)
+                    && span.content.as_ref() == "also"),
+            "a _ run after punctuation must still open"
+        );
     }
 
     #[test]
@@ -2805,7 +2997,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_fence_renders_multiple_syntax_foregrounds_without_reserved_rgb() {
+    fn rust_fence_respects_terminal_color_depth_without_reserved_rgb() {
         let rendered = render_markdown_tagged(
             "```rust\nfn main() {\n    let answer: u32 = 42; // comment\n}\n```",
             100,
@@ -2816,7 +3008,11 @@ mod tests {
             .flat_map(|line| line.line.spans.iter())
             .filter_map(|span| span.style.fg)
             .collect::<std::collections::HashSet<_>>();
-        assert!(colors.len() > 1, "expected syntax colors, got: {colors:?}");
+        if syntax_color_depth() == palette::ColorDepth::Monochrome {
+            assert_eq!(colors, [Color::Reset].into(), "NO_COLOR: {colors:?}");
+        } else {
+            assert!(colors.len() > 1, "expected syntax colors, got: {colors:?}");
+        }
         for color in colors {
             assert_ne!(color, palette::WHALE_HUMAN);
             assert_ne!(color, palette::WHALE_LIVE);
@@ -3883,6 +4079,44 @@ mod tests {
                 text,
                 "width={width}: CJK transcript content changed while wrapping"
             );
+        }
+    }
+
+    // A deliberate measurement probe, not an assertion: run it with
+    // `--nocapture` to read the per-append cost. Printing is the whole point,
+    // so the module-wide stdout ban is lifted here the same way
+    // `core/engine/tests.rs` lifts it for its probes.
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn probe_incremental_stream_cost() {
+        // Faithful to one streaming message: the document grows a word at a
+        // time and the render path re-parses and re-renders the whole visible
+        // text on every tick. Reports the cost per 250 appends so growth with
+        // message size is visible.
+        use std::time::Instant;
+        let words: Vec<&str> =
+            "the quick brown fox jumps over a lazy dog and then keeps going for a while"
+                .split(' ')
+                .collect();
+        let mut doc = String::new();
+        let width = 100u16;
+        let mut window_start = Instant::now();
+        for i in 0..2000usize {
+            doc.push_str(words[i % words.len()]);
+            doc.push(' ');
+            let parsed = parse(&doc);
+            let lines = render_parsed(&parsed, width, Style::default());
+            std::hint::black_box(&lines);
+            if (i + 1) % 250 == 0 {
+                let elapsed = window_start.elapsed();
+                println!(
+                    "PROBE bytes={} per_append={:?} total={:?}",
+                    doc.len(),
+                    elapsed / 250,
+                    elapsed
+                );
+                window_start = Instant::now();
+            }
         }
     }
 }

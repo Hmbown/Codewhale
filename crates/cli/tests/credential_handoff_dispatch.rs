@@ -135,7 +135,15 @@ fn installed_unix_dispatcher_settles_a_closed_pipe_cleanly() {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    // A sealed fresh home has never seen the usage policy, so the only thing
+    // allowed on stderr is that one-time disclosure. Nothing else may leak.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.is_empty()
+            || stderr == format!("{}\n", codewhale_telemetry::notice::STARTUP_DISCLOSURE),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(!stderr.contains(SENTINEL));
 }
 
 fn isolated_command(home: &Path, codewhale_home: Option<&Path>) -> Command {

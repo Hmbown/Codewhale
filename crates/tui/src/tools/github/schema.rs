@@ -25,11 +25,14 @@ pub(super) fn canonical_schema(allowed_actions: &[&str], read_only: bool) -> Val
         "include_comments".to_string(),
         json!({ "type": "boolean", "default": true, "description": "(action=issue_context)" }),
     );
+    properties.insert("report_id".to_string(), json!({"type": "string", "maxLength": 73, "description": "(report_read) Opaque current-session draft ID returned by report_draft."}));
     properties.insert(
         "include_diff".to_string(),
         json!({ "type": "boolean", "default": false, "description": "(action=pr_context)" }),
     );
     if !read_only {
+        properties.insert("revises".to_string(), json!({"type": "string", "maxLength": 73, "description": "(report_draft) Existing current-session draft to revise. Old bytes are preserved."}));
+        properties.insert("report".to_string(), report_schema());
         properties.insert(
             "target".to_string(),
             json!({ "type": "string", "enum": ["issue", "pr"], "description": "(action=comment)" }),
@@ -61,7 +64,7 @@ pub(super) fn canonical_schema(allowed_actions: &[&str], read_only: bool) -> Val
         );
         properties.insert(
             "allow_dirty".to_string(),
-            json!({ "type": "boolean", "default": false, "description": "(action=close_issue/close_pr)" }),
+            json!({ "type": "boolean", "default": false, "description": "(action=close_issue/close_pr) Close is rejected when the worktree is dirty unless this is true." }),
         );
         properties.insert(
             "dry_run".to_string(),
@@ -72,6 +75,23 @@ pub(super) fn canonical_schema(allowed_actions: &[&str], read_only: bool) -> Val
         "type": "object",
         "properties": properties,
         "additionalProperties": false
+    })
+}
+
+fn report_schema() -> Value {
+    let narrative = json!({"type": "string", "minLength": 1, "maxLength": 1600});
+    let items = json!({"type": "array", "minItems": 1, "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 800}});
+    let context = json!({"type": "string", "minLength": 1, "maxLength": 100});
+    json!({"type": "object", "additionalProperties": false,
+        "description": "(report_draft) Bounded narrative about a likely Codewhale defect, written by the active agent from observed evidence. No logs, code blocks, attachments, paths or private URLs. Only a local draft; publication unavailable.",
+        "properties": {
+            "title": {"type": "string", "minLength": 1, "maxLength": 160},
+            "expected": narrative, "actual": narrative, "impact": narrative,
+            "steps": items, "observed": items,
+            "inferred": {"type": "array", "maxItems": 4, "items": {"type": "string", "minLength": 1, "maxLength": 800}},
+            "reported_provider": context, "reported_tool": context, "reported_terminal": context,
+            "related_issues": {"type": "array", "maxItems": 5, "items": {"type": "integer", "minimum": 1, "maximum": u32::MAX}, "description": "Already-known Codewhale issue numbers; displayed as agent-supplied, unverified references. No search is performed."}
+        }, "required": ["title", "expected", "actual", "impact", "steps", "observed"]
     })
 }
 

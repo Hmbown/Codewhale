@@ -23,7 +23,8 @@ digest-pinned Linux binary; nothing else in the image runs agent logic.
   `CODEWHALE_HOME=/home/agent/.codewhale`. `/work` and `/workspace` exist and
   are owned by `agent`.
 - Entrypoint: `sleep infinity` (Daytona injects its own toolbox daemon).
-- No provider credentials are baked in or supplied at sandbox create time.
+- No provider credentials are baked in. Provider credentials must not be
+  supplied at sandbox create time.
   Daytona create-time environment is server-visible, so a provider secret
   must never appear in `daytona create -e …` or an SDK `envVars` payload.
 
@@ -31,20 +32,23 @@ The pins are recorded as OCI labels (`org.opencontainers.image.revision`,
 `net.codewhale.binary.sha256`, ...) so a running Computer can be audited
 against the release it claims to run.
 
-## Current dispatcher state — not a runtime contract
+## Dispatcher wiring and acceptance limits
 
-The current product dispatcher wiring for this snapshot is absent.
-`crates/tui/src/cloud_dispatch.rs` creates a Daytona sandbox with a generated
-name and labels, then records its ID. It does **not** select
-`codewhale-cloud-agent`, clone into `/workspace`, inject sandbox environment,
-call the Daytona toolbox execution endpoint, or run `codewhale`. It also does
-not contain a server-side account-token-to-provider-credential resolution path.
+The image definition lives only in this directory. The launcher in
+`crates/tui/src/cloud_dispatch.rs` selects `codewhale-cloud-agent` (or
+`CODEWHALE_DISPATCH_SNAPSHOT`), sends the account machine token in
+`CODEWHALE_API_KEY`, applies job labels, and uses the Daytona toolbox to clone
+and execute commands. `crates/tui/src/dispatch_runner.rs` drives that lifecycle.
+See the [dispatch guide](../../../docs/DAYTONA_CLOUD_DISPATCH.md) for the
+command surface.
 
-This directory is consequently an image definition and a bounded manual
-inspection aid, not an end-to-end Cloud Agent implementation. A snapshot build,
-manual `daytona create`, or manual `codewhale exec` proves only the specific
-image/operator step observed; none is launch proof for dispatcher, entitlement,
-credential custody, Engine execution, lifecycle, metering, or customer use.
+This describes source wiring. The image remains pinned to the Engine version
+listed above, and this repository does not establish a server-side
+account-token-to-provider-credential resolution path. A snapshot build or
+manual `codewhale exec` is evidence for that specific operation; it does not
+qualify account entitlement, provider credential custody, dispatcher execution,
+metering or customer use. The historical manual image receipt below is not
+acceptance of the current dispatcher.
 
 ## Provider credentials inside the Computer
 

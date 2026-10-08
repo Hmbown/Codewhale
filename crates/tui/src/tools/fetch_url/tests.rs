@@ -120,7 +120,7 @@ async fn fetched_pdf_missing_helper_is_a_failed_typed_outcome() {
     )
     .await
     .expect_err("missing helper must fail the fetched PDF call");
-    let payload = match &error {
+    let payload = match &error.error {
         ToolError::NotAvailable { message } => {
             serde_json::from_str::<Value>(message).expect("structured unavailable payload")
         }
@@ -128,7 +128,117 @@ async fn fetched_pdf_missing_helper_is_a_failed_typed_outcome() {
     };
     assert_eq!(payload["type"], "binary_unavailable");
     assert_eq!(
-        crate::tools::spec::ToolExecutionOutcome::from_legacy(Err(error)).status,
+        crate::tools::spec::ToolExecutionOutcome::from_legacy(Err(error.into())).status,
         crate::tools::spec::ToolTerminalStatus::Failed
     );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn fetched_pdf_host_text_matches_default_and_raw_bypasses_host() {
+    use crate::extension_host::{ExtensionHostManager, ExtensionHostOptions, TestManagerGuard};
+    use crate::features::{Feature, Features};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    let _home = crate::test_support::SealedHome::new();
+    let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(false);
+    let Some(node) = crate::extension_host::tests::node_for_tests("fetched_pdf_host") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("fake-pdftotext");
+    std::fs::write(&binary, "#!/bin/sh\nprintf 'page one\\fpage two\\n'\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: crate::config::ExtensionHostRuntime::Node,
+        node_override: Some(node),
+        root: Some(root.path().join("host")),
+        ..ExtensionHostOptions::default()
+    }));
+    let _manager = TestManagerGuard::install(Arc::clone(&manager));
+    let rust = ToolContext::new(root.path());
+    let mut flags = Features::with_defaults();
+    flags.enable(Feature::PdfHost);
+    let host = ToolContext::new(root.path()).with_features(flags);
+    let bytes = b"%PDF-1.7\nfixture\n%%EOF";
+    for format in [Format::Text, Format::Markdown] {
+        let expected = extract_fetched_document(
+            format,
+            "https://example.com/fixture.pdf",
+            "application/pdf",
+            bytes,
+            true,
+            None,
+            PdfTextCommand::test(binary.as_os_str(), Duration::from_secs(10), None)
+                .with_context(&rust),
+        )
+        .await
+        .unwrap();
+        let actual = extract_fetched_document(
+            format,
+            "https://example.com/fixture.pdf",
+            "application/pdf",
+            bytes,
+            true,
+            None,
+            PdfTextCommand::test(binary.as_os_str(), Duration::from_secs(10), None)
+                .with_context(&host),
+        )
+        .await
+        .unwrap();
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(actual.markdown, expected.markdown);
+        assert_eq!(actual.pdf_pages, expected.pdf_pages);
+    }
+    manager.shutdown().await;
+    drop(_manager);
+    // A signed raw response deliberately has no extraction consumer, even with
+    // the Host flag selected and an unusable runtime/parser.
+    let unavailable = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: crate::config::ExtensionHostRuntime::Node,
+        node_override: Some(root.path().join("missing-node")),
+        root: Some(root.path().join("absent-host")),
+        ..ExtensionHostOptions::default()
+    }));
+    let _manager = TestManagerGuard::install(unavailable);
+    let missing = root.path().join("missing-parser");
+    let document = extract_fetched_document(
+        Format::Raw,
+        "https://example.com/fixture.pdf",
+        "application/pdf",
+        bytes,
+        true,
+        None,
+        PdfTextCommand::test(missing.as_os_str(), Duration::from_secs(1), None).with_context(&host),
+    )
+    .await
+    .unwrap();
+    assert_eq!(document.kind, DocumentKind::Pdf);
+    assert!(document.text.is_empty());
+    assert!(document.pdf_pages.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn raw_and_non_success_catches_do_not_hide_a_selected_host_failure() {
+    let _home = crate::test_support::SealedHome::new();
+    let root = tempfile::tempdir().unwrap();
+    let manager = std::sync::Arc::new(crate::extension_host::ExtensionHostManager::new(
+        crate::extension_host::ExtensionHostOptions {
+            runtime: crate::config::ExtensionHostRuntime::Node,
+            node_override: Some(root.path().join("missing-node")),
+            root: Some(root.path().join("host")),
+            ..crate::extension_host::ExtensionHostOptions::default()
+        },
+    ));
+    let _manager = crate::extension_host::TestManagerGuard::install(manager);
+    let mut flags = crate::features::Features::with_defaults();
+    flags.enable(crate::features::Feature::WebExtractHost);
+    let context = ToolContext::new(root.path()).with_features(flags);
+    for (format, success) in [(Format::Raw, true), (Format::Text, false)] {
+        let error=extract_fetched_document(format,"https://example.com/private", "text/html",b"<body><main>Five meaningful words survive this valid complete document content.</main></body>",success,None,PdfTextCommand::system(Some(&context))).await.unwrap_err();
+        assert!(
+            !error.content(),
+            "operational Host failure cannot become raw decoded text"
+        );
+    }
 }

@@ -6,10 +6,10 @@
 //! - a compact working-set summary block for the system prompt
 //! - pinned message indices that compaction should preserve
 
-use crate::models::{ContentBlock, Message};
 use crate::workspace_discovery::{
     DISCOVERY_ALWAYS_DIRS, path_is_excluded_from_discovery, should_skip_unignored_discovery_entry,
 };
+use codewhale_models::{ContentBlock, Message};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -537,7 +537,7 @@ impl Workspace {
             entries.push(candidate);
         }
 
-        entries.sort_by_key(|entry| entry.to_lowercase());
+        entries.sort_by_cached_key(|entry| entry.to_lowercase());
         entries
     }
 }
@@ -613,7 +613,9 @@ fn walk_always_discoverable_dirs(
             break;
         }
         let dot_dir = walk_root.join(dir_name);
-        if !dot_dir.is_dir() {
+        // A walker follows a symlink passed as its root even when ordinary
+        // symlink following is off. Keep that opt-out for the extra roots too.
+        if !dot_dir.is_dir() || (!follow_links && dot_dir.is_symlink()) {
             continue;
         }
         let mut builder = WalkBuilder::new(&dot_dir);
@@ -1067,7 +1069,7 @@ impl WorkingSet {
     pub fn summary_block(&self, workspace: &Path) -> Option<String> {
         // Only stat-verified paths reach the model. Prose observation happily
         // records tokens that merely look like paths ("120x40",
-        // "Hmbown/CodeWhale"), and a fabricated Active-paths line teaches the
+        // "codewhale-hq/CodeWhale"), and a fabricated Active-paths line teaches the
         // model false workspace facts it then spends turns disproving.
         // Re-statting at render time also drops files deleted mid-session.
         // Bytes only change when the filesystem genuinely changed — the same
@@ -1590,8 +1592,30 @@ const IGNORED_ROOT_DIRS: &[&str] = &["target", "node_modules", "dist", "build", 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Role;
+    use codewhale_models::Role;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_file_search_discovery_respects_symlink_opt_out_for_ai_directories() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        fs::write(external.path().join("outside.rs"), "").unwrap();
+        std::os::unix::fs::symlink(external.path(), workspace.path().join(".agents")).unwrap();
+        for follow_links in [false, true] {
+            let resolver = Workspace::with_cwd_depth_and_follow_links(
+                workspace.path().to_path_buf(),
+                None,
+                DEFAULT_COMPLETIONS_WALK_DEPTH,
+                follow_links,
+            );
+            let candidates = resolver.completion_discovery_candidates(100, &|| false);
+            assert_eq!(
+                candidates.iter().any(|path| path == ".agents/outside.rs"),
+                follow_links
+            );
+        }
+    }
 
     fn make_message(role: &str, text: &str) -> Message {
         Message {
@@ -1711,7 +1735,7 @@ mod tests {
     #[test]
     fn summary_block_renders_only_paths_that_stat_verify() {
         // Prose observation records tokens that merely look like paths
-        // ("120x40", "Hmbown/CodeWhale"); the rendered Active-paths list must
+        // ("120x40", "codewhale-hq/CodeWhale"); the rendered Active-paths list must
         // never teach the model a workspace fact the filesystem contradicts.
         let tmp = TempDir::new().expect("tempdir");
         let src = tmp.path().join("src");
@@ -1720,14 +1744,14 @@ mod tests {
 
         let mut ws = WorkingSet::default();
         ws.observe_user_message(
-            "Fix src/real.rs, test at 120x40/80x24, and check Hmbown/CodeWhale",
+            "Fix src/real.rs, test at 120x40/80x24, and check codewhale-hq/CodeWhale",
             tmp.path(),
         );
 
         let block = ws.summary_block(tmp.path()).expect("block");
         assert!(block.contains("- src/real.rs (file)"), "{block}");
         assert!(!block.contains("120x40"), "{block}");
-        assert!(!block.contains("Hmbown/CodeWhale"), "{block}");
+        assert!(!block.contains("codewhale-hq/CodeWhale"), "{block}");
 
         // A file deleted mid-session falls out on the next render — the same
         // filesystem-changed exception #280 makes for newly observed paths.
@@ -1886,6 +1910,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "tool_1".to_string(),
                 content: "Changed src/compaction.rs".to_string(),
                 is_error: None,

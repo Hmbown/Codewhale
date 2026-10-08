@@ -3,10 +3,13 @@
 //! and the action enums drained by the event loop.
 //!
 //! Everything here is pure data (plus parsing/labeling helpers that need no
-//! `App` state). All items are re-exported from `app.rs` so existing
-//! `crate::tui::app::X` paths are unchanged.
+//! `App` state). The TUI-owned items are re-exported from `app.rs` so existing
+//! `crate::tui::app::X` paths are unchanged; types owned by another crate
+//! (such as [`AppMode`]) are named at their own crate path instead.
 
 use super::*;
+
+use codewhale_config::AppMode;
 
 /// What an interactive setting selection actually did.
 ///
@@ -44,10 +47,6 @@ impl SettingSelection {
     }
 }
 
-/// The user-facing operating mode. Defined in codewhale-config; re-exported
-/// here so `crate::tui::app::types::AppMode` keeps working.
-pub use codewhale_config::AppMode;
-
 /// Localized, TUI-only presentation of [`AppMode`]. Kept out of
 /// codewhale-config so the mode type does not depend on the locale packs.
 pub trait AppModeUi {
@@ -83,45 +82,6 @@ impl AppModeUi for AppMode {
     }
 }
 
-/// Reasoning-effort tier, mirrored across DeepSeek and Codex effort pickers.
-///
-/// The config file accepts every supported string value for forward-compat with
-/// providers that expose the full spectrum; DeepSeek currently collapses
-/// `Low`/`Medium` → `high`. OpenAI Codex normalizes inherited DeepSeek-only
-/// `Off` to `Low` and displays/sends `Max` as `xhigh` at the provider
-/// boundary. The default keyboard cycler walks the three DeepSeek-distinct
-/// tiers: `Off` → `High` → `Max` → `Off`; provider-aware callers should use
-/// [`ReasoningEffort::cycle_next_in`] with the route's effort list. Auto
-/// routing has no concrete provider yet, so
-/// [`ReasoningEffort::cycle_next_for_auto_model`] retains the full
-/// provider-neutral preference vocabulary until dispatch.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningEffort {
-    Off,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Ultra,
-    Auto,
-    #[default]
-    Max,
-}
-
-/// Provider-effective reasoning state used by durable receipts and visible
-/// requested-to-effective labels.
-///
-/// Some routes, notably first-party GLM-5-Turbo, support a thinking toggle but
-/// publish no effort tiers. Keeping that state distinct prevents a requested
-/// `max` from being displayed or persisted as an effective `max` claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EffectiveReasoningEffort {
-    Tier(ReasoningEffort),
-    ThinkingEnabledGranularityUnavailable,
-    Unavailable,
-}
-
 /// Exact provider/model route whose prompt can be inspected or replayed.
 ///
 /// Auto-model sessions keep `model == "auto"` as the user's selection, so
@@ -130,437 +90,13 @@ pub(crate) enum EffectiveReasoningEffort {
 /// intentionally do not persist raw endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheReplayTarget {
-    pub(crate) provider: ApiProvider,
+    pub(crate) provider: ProviderKind,
     pub(crate) provider_identity: String,
     /// Additive exact provider id used by persisted-route resolution.
     /// `None` is meaningful for the legacy root-level `custom` route.
     pub(crate) provider_id: Option<String>,
     pub(crate) model: String,
     pub(crate) base_url: Option<String>,
-}
-
-impl EffectiveReasoningEffort {
-    /// Reconstruct a safe request tier for cache replay and inspection.
-    ///
-    /// Routes with an enabled-but-untiered receipt collapse every non-Off
-    /// request to the same wire toggle, so High is the canonical value that
-    /// keeps reasoning enabled without claiming a granular effective tier.
-    #[must_use]
-    pub(crate) const fn request_tier_for_replay(self) -> Option<ReasoningEffort> {
-        match self {
-            Self::Tier(tier) => Some(tier),
-            Self::ThinkingEnabledGranularityUnavailable => Some(ReasoningEffort::High),
-            Self::Unavailable => None,
-        }
-    }
-}
-
-impl From<EffectiveReasoningEffort> for crate::work_graph::ReasoningEffortTier {
-    fn from(value: EffectiveReasoningEffort) -> Self {
-        match value {
-            EffectiveReasoningEffort::Tier(tier) => tier.into(),
-            EffectiveReasoningEffort::ThinkingEnabledGranularityUnavailable => {
-                Self::ThinkingEnabledGranularityUnavailable
-            }
-            EffectiveReasoningEffort::Unavailable => Self::Unavailable,
-        }
-    }
-}
-
-impl From<crate::work_graph::ReasoningEffortTier> for EffectiveReasoningEffort {
-    fn from(value: crate::work_graph::ReasoningEffortTier) -> Self {
-        use crate::work_graph::ReasoningEffortTier as Tier;
-        match value {
-            Tier::Off => Self::Tier(ReasoningEffort::Off),
-            Tier::Low => Self::Tier(ReasoningEffort::Low),
-            Tier::Medium => Self::Tier(ReasoningEffort::Medium),
-            Tier::High => Self::Tier(ReasoningEffort::High),
-            Tier::Auto => Self::Tier(ReasoningEffort::Auto),
-            Tier::Max => Self::Tier(ReasoningEffort::Max),
-            Tier::ThinkingEnabledGranularityUnavailable => {
-                Self::ThinkingEnabledGranularityUnavailable
-            }
-            Tier::Unavailable => Self::Unavailable,
-        }
-    }
-}
-
-impl From<ReasoningEffort> for crate::work_graph::ReasoningEffortTier {
-    fn from(value: ReasoningEffort) -> Self {
-        match value {
-            ReasoningEffort::Off => Self::Off,
-            ReasoningEffort::Minimal => Self::Low,
-            ReasoningEffort::Low => Self::Low,
-            ReasoningEffort::Medium => Self::Medium,
-            ReasoningEffort::High => Self::High,
-            ReasoningEffort::XHigh => Self::Max,
-            ReasoningEffort::Ultra => Self::Max,
-            ReasoningEffort::Auto => Self::Auto,
-            ReasoningEffort::Max => Self::Max,
-        }
-    }
-}
-
-impl ReasoningEffort {
-    /// Parse an operator-supplied effort value.
-    ///
-    /// This is deliberately the one canonical spelling table for every
-    /// human-facing route.  Callers that read an old persisted config may use
-    /// [`Self::from_setting`] for its compatibility fallback, but a new CLI,
-    /// settings, or tool input must reject an unknown value instead of quietly
-    /// turning it into `max`.
-    pub fn parse_strict(value: &str) -> Result<Self, String> {
-        let trimmed = value.trim();
-        match trimmed.to_ascii_lowercase().as_str() {
-            "off" | "disabled" | "none" | "false" => Ok(Self::Off),
-            "low" | "minimum" | "minimal" | "light" => Ok(Self::Low),
-            "medium" | "mid" => Ok(Self::Medium),
-            "high" => Ok(Self::High),
-            "xhigh" => Ok(Self::XHigh),
-            "auto" | "automatic" => Ok(Self::Auto),
-            "ultra" | "ultracode" => Ok(Self::Ultra),
-            "max" | "maximum" => Ok(Self::Max),
-            _ => Err(format!(
-                "Unrecognized reasoning effort {trimmed:?}. Expected: auto, off, low, medium, high, xhigh, or max."
-            )),
-        }
-    }
-
-    /// Parse a persisted config-file string into an effort tier. Unknown
-    /// legacy values fall back to the default (`Max`) so an old malformed
-    /// settings file never prevents startup.  New user input should use
-    /// [`Self::parse_strict`] instead.
-    #[must_use]
-    pub fn from_setting(value: &str) -> Self {
-        Self::parse_strict(value).unwrap_or_default()
-    }
-
-    #[must_use]
-    pub fn from_setting_for_provider(value: &str, provider: ApiProvider) -> Self {
-        Self::from_setting(value).normalize_for_provider(provider)
-    }
-
-    /// Canonical lowercase label used for config storage and UI hints.
-    #[must_use]
-    pub fn as_setting(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Ultra => "ultra",
-            Self::Auto => "auto",
-            Self::Max => "max",
-        }
-    }
-
-    /// Short label for the header chip.
-    #[must_use]
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "med",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Ultra => "ultra",
-            Self::Auto => "auto",
-            Self::Max => "max",
-        }
-    }
-
-    /// Provider-facing label for user-visible surfaces.
-    #[must_use]
-    pub fn display_label_for_provider(self, provider: ApiProvider) -> &'static str {
-        match (provider, self.normalize_for_provider(provider)) {
-            (ApiProvider::OpenaiCodex, Self::Minimal) => "low",
-            (ApiProvider::OpenaiCodex, Self::Low) => "low",
-            (ApiProvider::OpenaiCodex, Self::Medium) => "medium",
-            (ApiProvider::OpenaiCodex, Self::High) => "high",
-            (ApiProvider::OpenaiCodex, Self::XHigh | Self::Ultra | Self::Max) => "xhigh",
-            (ApiProvider::Xai, Self::XHigh) => "xhigh",
-            (_, effort) => effort.short_label(),
-        }
-    }
-
-    /// Value forwarded to the engine/client. `None` means "provider default"
-    /// (for `Off` we still emit `"off"` so the client can inject
-    /// `thinking = {"type": "disabled"}`).
-    #[must_use]
-    pub fn api_value(self) -> Option<&'static str> {
-        Some(self.as_setting())
-    }
-
-    #[must_use]
-    pub fn normalize_for_provider(self, provider: ApiProvider) -> Self {
-        if provider != ApiProvider::OpenaiCodex {
-            return self;
-        }
-        match self {
-            Self::Off => Self::Low,
-            Self::Auto => Self::Medium,
-            other => other,
-        }
-    }
-
-    /// Resolve an effort against the exact provider route that will receive
-    /// the request. Both K3 routes are always-thinking, so `off` becomes the
-    /// lowest supported tier. The Kimi Code membership route otherwise keeps
-    /// its low/high/max mapping; direct Moonshot K3 additionally maps `medium`
-    /// to `high`. First-party DeepSeek routes keep `low` (the wire documents
-    /// low/high/max) while rounding `medium` up to `high`. Models that publish
-    /// a Models.dev `reasoning_options` effort list keep that vocabulary
-    /// instead of the historic Low/Medium collapse. Generic Moonshot and
-    /// every other non-Codex route retain the historic high coercion.
-    /// This intentionally does not change [`Self::normalize_for_provider`],
-    /// whose generic wire semantics are used by older callers that do not yet
-    /// have a route receipt.
-    #[must_use]
-    pub fn normalize_for_route(
-        self,
-        provider: ApiProvider,
-        base_url: &str,
-        wire_model: &str,
-    ) -> Self {
-        let normalized = self.normalize_for_provider(provider);
-        if crate::config::is_exact_kimi_code_k3_route(provider, base_url, wire_model) {
-            return match normalized {
-                Self::Off => Self::Low,
-                other => other,
-            };
-        }
-        if crate::config::is_exact_direct_moonshot_k3_route(provider, base_url, wire_model) {
-            return match normalized {
-                Self::Off => Self::Low,
-                Self::Medium => Self::High,
-                other => other,
-            };
-        }
-        if provider == ApiProvider::OpenaiCodex {
-            return normalized;
-        }
-        // First-party DeepSeek routes document `reasoning_effort` low/high/max
-        // on the wire (no medium), so `low` is a real, cheaper tier there and
-        // must reach the wire as low; `medium` rounds up to high because the
-        // dialect has no such value (#52).
-        if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-            return match normalized {
-                Self::Low => Self::Low,
-                Self::Medium => Self::High,
-                other => other,
-            };
-        }
-        // Ollama's current OpenAI-compatible Chat Completions contract
-        // documents the complete none/low/medium/high/max ladder. Keep every
-        // real tier distinct for normal turns; only Codewhale-only synonyms
-        // are folded onto the nearest documented spelling.
-        if provider == ApiProvider::OllamaCloud {
-            return match normalized {
-                Self::Minimal => Self::Low,
-                Self::XHigh | Self::Ultra => Self::Max,
-                other => other,
-            };
-        }
-        if let Some(values) = Self::catalog_effort_values(provider, wire_model) {
-            return Self::clamp_to_catalog_efforts(normalized, provider, wire_model, &values);
-        }
-        match normalized {
-            Self::Low | Self::Medium => Self::High,
-            other => other,
-        }
-    }
-
-    pub(crate) fn catalog_default(provider: ApiProvider, wire_model: &str) -> Option<Self> {
-        let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
-        offering.reasoning_options.iter().find_map(|option| {
-            option
-                .get("type")
-                .and_then(|value| value.as_str())
-                .filter(|kind| kind.eq_ignore_ascii_case("effort"))?;
-            option
-                .get("default")
-                .and_then(|value| value.as_str())
-                .and_then(Self::from_catalog_token)
-        })
-    }
-
-    pub(crate) fn catalog_effort_values(
-        provider: ApiProvider,
-        wire_model: &str,
-    ) -> Option<Vec<Self>> {
-        let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
-        let mut efforts = Vec::new();
-        for option in &offering.reasoning_options {
-            if !option
-                .get("type")
-                .and_then(|value| value.as_str())
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("effort"))
-            {
-                continue;
-            }
-            let Some(values) = option.get("values").and_then(|value| value.as_array()) else {
-                continue;
-            };
-            for value in values {
-                if let Some(effort) = value.as_str().and_then(Self::from_catalog_token)
-                    && !efforts.contains(&effort)
-                {
-                    efforts.push(effort);
-                }
-            }
-        }
-        (!efforts.is_empty()).then_some(efforts)
-    }
-
-    fn from_catalog_token(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" | "disabled" | "none" | "false" => Some(Self::Off),
-            "minimal" | "minimum" => Some(Self::Minimal),
-            "low" | "light" => Some(Self::Low),
-            "medium" | "mid" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "xhigh" => Some(Self::XHigh),
-            "ultra" | "ultracode" => Some(Self::Ultra),
-            "max" | "maximum" => Some(Self::Max),
-            "auto" | "automatic" | "adaptive" => Some(Self::Auto),
-            _ => None,
-        }
-    }
-
-    fn clamp_to_catalog_efforts(
-        normalized: Self,
-        provider: ApiProvider,
-        wire_model: &str,
-        values: &[Self],
-    ) -> Self {
-        if matches!(normalized, Self::Auto) || values.contains(&normalized) {
-            return normalized;
-        }
-        let aliased = match normalized {
-            Self::Minimal if values.contains(&Self::Low) => Self::Low,
-            Self::Max | Self::Ultra if values.contains(&Self::XHigh) => Self::XHigh,
-            Self::Off => Self::catalog_default(provider, wire_model).unwrap_or(Self::High),
-            other => other,
-        };
-        if values.contains(&aliased) {
-            aliased
-        } else {
-            Self::catalog_default(provider, wire_model).unwrap_or(Self::High)
-        }
-    }
-
-    #[must_use]
-    pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
-        if provider != ApiProvider::OpenaiCodex {
-            return self.api_value();
-        }
-        Some(match self.normalize_for_provider(provider) {
-            Self::Minimal => "low",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Ultra => "xhigh",
-            Self::Max => "xhigh",
-            Self::Off => "low",
-            Self::Auto => "medium",
-        })
-    }
-
-    /// Provider-facing value after exact-route normalization.
-    #[must_use]
-    pub fn api_value_for_route(
-        self,
-        provider: ApiProvider,
-        base_url: &str,
-        wire_model: &str,
-    ) -> Option<&'static str> {
-        self.normalize_for_route(provider, base_url, wire_model)
-            .api_value_for_provider(provider)
-    }
-
-    #[must_use]
-    pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
-        self.api_value_for_provider(provider)
-            .unwrap_or_else(|| self.as_setting())
-    }
-
-    /// Persist the canonical setting after exact-route normalization.
-    #[must_use]
-    pub fn as_setting_for_route(
-        self,
-        provider: ApiProvider,
-        base_url: &str,
-        wire_model: &str,
-    ) -> &'static str {
-        self.normalize_for_route(provider, base_url, wire_model)
-            .as_setting_for_provider(provider)
-    }
-
-    /// Cycle through the three behaviorally distinct tiers.
-    #[must_use]
-    pub fn cycle_next(self) -> Self {
-        match self {
-            Self::Off => Self::High,
-            Self::Auto => Self::Off,
-            Self::Minimal | Self::Low | Self::Medium | Self::High | Self::XHigh | Self::Ultra => {
-                Self::Max
-            }
-            Self::Max => Self::Off,
-        }
-    }
-
-    /// Advance through an exact-route effort list. Unknown current values
-    /// enter at the first listed tier so a persisted `max` on an `xhigh`
-    /// ladder, or `off` on an always-thinking model, still moves.
-    #[must_use]
-    pub fn cycle_next_in(self, efforts: &[Self]) -> Self {
-        if efforts.is_empty() {
-            return self.cycle_next();
-        }
-        if let Some(index) = self.index_in(efforts) {
-            return efforts[(index + 1) % efforts.len()];
-        }
-        efforts[0]
-    }
-
-    fn index_in(self, efforts: &[Self]) -> Option<usize> {
-        efforts
-            .iter()
-            .position(|&effort| effort == self)
-            .or_else(|| {
-                let aliases: &[Self] = match self {
-                    Self::Max | Self::Ultra => &[Self::XHigh],
-                    Self::XHigh => &[Self::Max],
-                    Self::Minimal => &[Self::Low],
-                    Self::Low => &[Self::Minimal],
-                    _ => return None,
-                };
-                aliases
-                    .iter()
-                    .find_map(|alias| efforts.iter().position(|&effort| effort == *alias))
-            })
-    }
-
-    /// Cycle the unresolved auto-model preference without applying any
-    /// provider's normalization rules prematurely.
-    #[must_use]
-    pub fn cycle_next_for_auto_model(self) -> Self {
-        match self {
-            Self::Auto => Self::Off,
-            Self::Off => Self::Minimal,
-            Self::Minimal => Self::Low,
-            Self::Low => Self::Medium,
-            Self::Medium => Self::High,
-            Self::High => Self::XHigh,
-            Self::XHigh => Self::Ultra,
-            Self::Ultra => Self::Max,
-            Self::Max => Self::Auto,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,15 +207,11 @@ pub struct TuiOptions {
     pub use_bracketed_paste: bool,
     /// Maximum number of concurrent sub-agents.
     pub max_subagents: usize,
-    #[allow(dead_code)]
     pub skills_dir: PathBuf,
-    #[allow(dead_code)]
     pub memory_path: PathBuf,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub notes_path: PathBuf,
-    #[allow(dead_code)]
     pub mcp_config_path: PathBuf,
-    #[allow(dead_code)]
     pub use_memory: bool,
     /// Start in agent mode (defaults to agent; --yolo starts in YOLO)
     pub start_in_agent_mode: bool,
@@ -745,11 +277,47 @@ impl VimMode {}
 pub struct QueuedMessage {
     pub display: String,
     pub skill_instruction: Option<String>,
-    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
+    pub skill_provenance: Option<crate::skills::SkillProvenance>,
     /// True once this turn has been painted into `history` as `HistoryCell::User`.
     /// Queue/offline submit echoes before the model runs; Immediate prepare skips
     /// a second paint when this is set so drained queued turns do not double.
     pub history_echoed: bool,
+}
+
+/// The message the current turn was dispatched with, and the transcript cell
+/// that shows it. When the engine reports the turn was never sent (a key
+/// rejected before any model output), this is what goes back in the composer,
+/// skill included, and the bubble that comes out of the transcript (#6566).
+#[derive(Debug, Clone)]
+pub struct UnansweredSubmission {
+    pub message: QueuedMessage,
+    pub history_cell: usize,
+}
+
+/// A steer handed to the engine that the engine has not yet recorded.
+///
+/// Live-only, and deliberately not in `api_messages`: `EngineHandle::steer`
+/// succeeding means the channel took the text, not that a turn accepted it.
+/// The engine commits a steer at a step boundary and drops one whose turn has
+/// already moved on, so painting a settled transcript cell at send time
+/// produced a cell that could sit above the work it followed, or survive
+/// forever for a steer the model never saw (#6190). It becomes a real cell
+/// when the engine's own record shows it, and a "could not send" receipt when
+/// the turn ends without it.
+#[derive(Debug, Clone)]
+pub struct InflightSteer {
+    /// The composed message, carried so acceptance can paint the same cell
+    /// (including the queue-time echo it may already own).
+    pub message: QueuedMessage,
+    /// Exactly what was handed to `EngineHandle::steer`. The engine records
+    /// this as the first text block of the accepted user message, which is
+    /// what acceptance matches on.
+    pub content: String,
+    /// `api_messages.len()` when the steer was sent — the lower bound for the
+    /// acceptance search, so an identical earlier message cannot claim it.
+    pub sent_after_index: usize,
+    /// Held until acceptance knows the message index to anchor them to.
+    pub references: Vec<codewhale_core::ContextReference>,
 }
 
 /// Prefix for the bounded, tool-less model turn produced by `/workflow`.
@@ -772,7 +340,7 @@ pub enum SubmitDisposition {
     Steer,
     /// Park on `queued_messages` for dispatch after TurnComplete.
     /// Legacy path; #382 unified busy states under `Queue`.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     QueueFollowUp,
 }
 
@@ -817,11 +385,15 @@ pub struct TaskPanelEntry {
     pub current_tool: Option<String>,
     pub role: Option<String>,
     pub files_touched: u32,
+    /// A finished shell's exit code. `None` while running, and for durable
+    /// tasks.
+    pub exit_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskPanelEntryKind {
     Background,
+    Shell,
 }
 
 impl QueuedMessage {
@@ -837,7 +409,7 @@ impl QueuedMessage {
     #[must_use]
     pub fn with_skill_provenance(
         mut self,
-        provenance: Option<crate::plugins::types::PluginAuthority>,
+        provenance: Option<crate::skills::SkillProvenance>,
     ) -> Self {
         self.skill_provenance = provenance;
         self
@@ -885,6 +457,7 @@ pub(crate) enum GoalControlIntent {
 /// already ordered in the engine channel; both remain pending until receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingGoalControl {
+    pub goal_id: Option<String>,
     pub intent: GoalControlIntent,
     pub dispatched: bool,
 }
@@ -950,6 +523,10 @@ impl ScreenMode {
 /// Actions emitted by the UI event loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppAction {
+    SetWorkspaceTrust {
+        trusted: bool,
+        save: bool,
+    },
     Quit,
     #[allow(dead_code)] // For explicit /load command
     LoadSession(PathBuf),
@@ -962,8 +539,10 @@ pub enum AppAction {
         workspace: PathBuf,
         mode: AppMode,
     },
-    OpenConfigEditor(ConfigUiMode),
     OpenConfigView,
+    /// Open this workspace's `.codewhale/hooks.toml` in `$EDITOR`, creating
+    /// it from a commented template first when it does not exist yet.
+    EditProjectHooks,
     /// Open the native git worktree manager.
     OpenWorktreeManager,
     /// Open the `/model` two-pane picker (Pro/Flash + Off/High/Max).
@@ -974,21 +553,22 @@ pub enum AppAction {
     /// Open the `/provider` picker in setup/catalog mode, optionally focused on
     /// a built-in provider that needs credentials before first use.
     OpenProviderSetup {
-        provider: Option<ApiProvider>,
+        provider: Option<codewhale_config::ProviderId>,
     },
     /// Open the named, keyless DS4 local-runtime preset for review and save.
     OpenDs4Setup,
-    /// Open a beginner provider setup template by catalog id (#5350).
-    OpenTemplateSetup {
-        template_id: String,
-    },
-    /// Open the beginner provider template list.
-    OpenProviderTemplateList,
     /// Run the xAI/Grok device-code flow with the TUI temporarily suspended.
     StartXaiDeviceLogin,
     /// Run native ChatGPT PKCE sign-in with the TUI temporarily suspended.
     StartChatgptPkceLogin,
     StartChatgptRevoke,
+    /// Run OrcaRouter OAuth 2.0 + PKCE sign-in (loopback redirect) with the TUI
+    /// temporarily suspended. Produces a durable `sk-orca-...` key in the
+    /// ordinary `orcarouter` credential slot — the same slot the API-key path
+    /// writes — so nothing downstream knows which adapter was used.
+    StartOrcarouterPkceLogin,
+    /// Clear the saved OrcaRouter credential.
+    StartOrcarouterRevoke,
     /// Open the `/mode` picker modal for Act / Plan / Operate.
     OpenModePicker,
     /// Switch the live terminal between `/fullscreen` and `/inline`. Handled
@@ -1012,9 +592,14 @@ pub enum AppAction {
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.
     OpenFeedbackPicker,
+    /// Read/review a scoped immutable issue draft without parking the UI.
+    ReviewIssueReport {
+        id: String,
+        change: Option<String>,
+    },
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
-    /// Open the `/skills` manager — audit inventory + owned mutations.
+    /// Open the `/skills manage` manager — audit inventory + owned mutations.
     OpenSkillsManager,
     /// Open the `/workflows` run dashboard — live and retained workflow runs.
     OpenWorkflowsManager,
@@ -1068,8 +653,26 @@ pub enum AppAction {
         url: String,
         label: String,
     },
+    /// Run an extension command in the extension host (`/name input`). The UI
+    /// event loop awaits it, then shows its text and/or submits its prompt
+    /// as the user's next message.
+    RunExtensionCommand {
+        command: crate::extension_host::command::ExtensionCommandRef,
+        name: String,
+        input: String,
+    },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
+    /// Same-session rollback. A retry is admitted only after the Engine
+    /// acknowledges this history and its persisted snapshot is durable.
+    ConversationUndo {
+        sync: codewhale_command_contract::facets::SessionSyncPayload,
+        retry_input: Option<String>,
+        /// `retry_input` is the text of a pending `/edit`, already taken from
+        /// the composer. If the rollback is refused it must go back there, with
+        /// edit mode re-armed, or the user's revision is lost.
+        edit_replacement: bool,
+    },
     /// Send a built-in Workflow planning turn with separate user-visible text
     /// and bounded runtime guidance. Draft instructions carry a typed marker
     /// that makes the dispatch path expose no tools for that turn.
@@ -1113,6 +716,18 @@ pub enum AppAction {
         title: String,
         content: String,
     },
+    /// Review a host-generated command; the pager carries its exact token
+    /// through explicit confirmation and the normal command dispatcher.
+    OpenCommandReview {
+        title: String,
+        content: String,
+        command: String,
+    },
+    /// Router setup (`/router`, `/model router`, #6525): open the view, test a
+    /// preset with one routing call, or save one to `[auto.router]`.
+    RouterSetup {
+        request: crate::tui::views::router_setup::RouterRequest,
+    },
     /// Live remaining-credit lookup for prepaid providers (`/balance`).
     FetchBalance,
     FetchModels,
@@ -1124,13 +739,13 @@ pub enum AppAction {
     /// the updated config. `model` overrides the post-switch model
     /// (already normalized but not yet provider-prefixed).
     SwitchProvider {
-        provider: ApiProvider,
+        provider: codewhale_config::ProviderId,
         model: Option<String>,
     },
     /// Switch provider+model through the same apply path as a `/model` route
     /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
     SwitchModelRoute {
-        provider: ApiProvider,
+        identity: crate::config::ProviderIdentity,
         model: String,
     },
     UpdateCompaction(CompactionConfig),
@@ -1197,16 +812,19 @@ pub enum AppAction {
     /// action; handled in the UI event loop where the live `Config` supplies
     /// provider credentials.
     VoiceCapture,
-    /// Export and share the current session as a web URL.
+    /// Upload an already-rendered, redacted session page as a secret gist.
+    /// Emitted only by `/share confirm`.
     ShareSession {
-        history_len: usize,
-        model: String,
-        mode: String,
+        html: String,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutomationAction {
+    /// Open the automations room, optionally focused on one id.
+    Open {
+        focus: Option<String>,
+    },
     List,
     Show(String),
     Pause(String),
@@ -1286,5 +904,9 @@ pub enum McpUiAction {
         name: String,
     },
     Validate,
+    /// Report this server's last observed state without starting a new pool.
+    Diagnose {
+        name: String,
+    },
     Reload,
 }

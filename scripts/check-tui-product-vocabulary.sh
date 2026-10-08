@@ -16,7 +16,7 @@ fi
 # contain retired terms (for example `PermissionsPostureBypass`). Inspect only
 # the serialized user-facing value so the check enforces the contract above
 # without flagging an allowed key.
-if grep -En '": "[^"]*(YOLO|Multitask|Bypass)' crates/tui/locales/*.json; then
+if grep -En '": "[^"]*(YOLO|Multitask|Bypass)' crates/localization/locales/*.json; then
   printf '%s\n' 'retired TUI vocabulary remains in localized product copy' >&2
   exit 1
 fi
@@ -25,7 +25,7 @@ fi
 # assembled model team; `Pod` is retired from customer-facing copy. The
 # English source locale is the gate; other locale packs migrate with their
 # translation sweep. `/pod` and `codewhale pod` remain parser aliases.
-if grep -En '": "[^"]*[Pp]od' crates/tui/locales/en.json; then
+if grep -En '": "[^"]*[Pp]od' crates/localization/locales/en.json; then
   printf '%s\n' 'retired Pod vocabulary remains in English product copy' >&2
   exit 1
 fi

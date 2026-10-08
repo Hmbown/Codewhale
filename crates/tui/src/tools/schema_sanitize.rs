@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use serde_json::{Map, Value};
 
-use crate::models::Tool;
+use codewhale_models::Tool;
 
 /// Sanitize a JSON Schema in-place for DeepSeek strict-tool compatibility.
 ///
@@ -213,10 +213,26 @@ fn inject_properties_on_bare_objects(schema: &mut Value) {
 }
 
 /// Remove entries from `required` that aren't keys in `properties`.
+///
+/// A schema with neither `properties` nor `type` is a composition branch
+/// whose `required` names properties declared by the enclosing schema —
+/// `oneOf: [{"required": ["patch"]}, ...]` (#6561 D04-11). Its list is kept:
+/// pruning emptied every branch, turning apply_patch's "exactly one of"
+/// into an unsatisfiable `oneOf` of three `{}` and the finance tool's
+/// "ticker or symbol" into no constraint.
+///
+/// Known limitation: a `type: "object"` schema without `properties` still
+/// loses `required` entries (a bare object gets `properties: {}` injected
+/// first). Strict validators (DeepSeek strict, MFJS) reject `required`
+/// names absent from local `properties`, and this provider-neutral pass
+/// cannot invent their property types.
 fn prune_dangling_required(schema: &mut Value) {
     let Some(obj) = schema.as_object_mut() else {
         return;
     };
+    if !obj.contains_key("properties") && !obj.contains_key("type") {
+        return;
+    }
     // Collect known property names first (immutable borrow), then prune.
     let known_keys: Vec<String> = obj
         .get("properties")
@@ -555,6 +571,41 @@ mod tests {
         });
         sanitize(&mut schema);
         assert!(schema.get("required").is_none());
+    }
+
+    /// #6561 D04-11: composition branches name the parent's properties.
+    #[test]
+    fn keeps_required_groups_of_composition_branches() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "patch": {"type": "string"},
+                "replace": {"type": "array"},
+                "changes": {"type": "array"}
+            },
+            "oneOf": [
+                {"required": ["patch"]},
+                {"required": ["replace"]},
+                {"required": ["changes"]}
+            ]
+        });
+        sanitize(&mut schema);
+        assert_eq!(
+            schema["oneOf"],
+            json!([
+                {"required": ["patch"]},
+                {"required": ["replace"]},
+                {"required": ["changes"]}
+            ])
+        );
+        // A typed object still has its dangling names pruned.
+        let mut typed = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name", "ghost"]
+        });
+        sanitize(&mut typed);
+        assert_eq!(typed["required"], json!(["name"]));
     }
 
     #[test]

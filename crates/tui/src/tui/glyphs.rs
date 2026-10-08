@@ -76,8 +76,10 @@ pub fn ascii_fallback(symbol: &str) -> Option<&'static str> {
         "▲" | "△" | "↑" => Some("^"),
         "◆" | "◇" | "♦" | "✦" | "◍" | "◉" | "★" | "☆" => Some("*"),
         "■" | "□" | "▪" | "▫" | "◼" | "◻" => Some("#"),
-        "●" | "○" | "∘" | "•" | "·" | "☐" => Some("."),
-        "◌" | "˚" | "°" | "◦" => Some("o"),
+        // Filled marks stay a dot; hollow ones become `o` so CURRENT and
+        // AVAILABLE stay distinguishable on ASCII terminals.
+        "●" | "∘" | "•" | "·" => Some("."),
+        "○" | "☐" | "◌" | "˚" | "°" | "◦" => Some("o"),
         "✓" | "✔" | "☑" => Some("Y"),
         "✕" | "×" | "⊘" | "✗" | "✘" | "☒" => Some("X"),
         "⏸" => Some("="),
@@ -91,6 +93,23 @@ pub fn ascii_fallback(symbol: &str) -> Option<&'static str> {
         "≈" | "～" => Some("~"),
         "🐳" | "🐋" => Some("w"),
         "…" => Some("."),
+        // Affordance and menu glyphs. Each fallback is one ASCII cell: the
+        // backend adapter swaps a single cell's symbol, so a wider spelling
+        // would shift every cell after it on the row.
+        "✎" => Some("e"),
+        "↳" | "⇒" => Some(">"),
+        "↩" => Some("<"),
+        "⎇" => Some("y"),
+        "◔" | "◎" => Some("*"),
+        "⎘" | "⧉" => Some("="),
+        "▣" | "⌘" => Some("#"),
+        "⚑" => Some("!"),
+        // A joined line break in a command preview: `;` keeps it reading as
+        // a separate command rather than a redirect.
+        "⏎" => Some(";"),
+        "⇧" => Some("^"),
+        "⌥" => Some("~"),
+        "ⓘ" => Some("i"),
         _ => None,
     }
 }
@@ -121,6 +140,11 @@ mod tests {
             (SELECTION, ">"),
             ("▷", ">"),
             (CURRENT, "."),
+            (AVAILABLE, "o"),
+            (READY, "o"),
+            ("☐", "o"),
+            ("•", "."),
+            (NEUTRAL, "."),
             (USER, "|"),
             (DONE, "Y"),
             (FAILED, "X"),
@@ -137,10 +161,39 @@ mod tests {
             ("∿", "~"),
             ("⋯", "."),
             ("⏱", "@"),
+            ("🐳", "w"),
+            ("🐋", "w"),
+            ("✎", "e"),
+            ("↳", ">"),
+            ("⎇", "y"),
+            ("◔", "*"),
+            ("⎘", "="),
+            ("▣", "#"),
+            ("⧉", "="),
+            ("⚑", "!"),
+            ("⏎", ";"),
+            ("⇧", "^"),
+            ("⌥", "~"),
+            ("⌘", "#"),
+            ("⇒", ">"),
+            ("◎", "*"),
+            ("↩", "<"),
+            ("ⓘ", "i"),
         ] {
             assert_eq!(ascii_fallback(rich), Some(safe));
         }
+        assert_ne!(
+            ascii_fallback(CURRENT),
+            ascii_fallback(AVAILABLE),
+            "current and available must stay distinct in ASCII"
+        );
         assert_eq!(braille_ascii_fallback('\u{2801}'), Some("."));
+        // The backend adapter replaces one cell's symbol: every single-glyph
+        // fallback must stay one ASCII cell or the rest of the row shifts.
+        for (rich, safe) in [("…", "."), ("✎", "e"), ("ⓘ", "i")] {
+            assert_eq!(ascii_fallback(rich), Some(safe));
+            assert_eq!(unicode_width::UnicodeWidthStr::width(safe), 1);
+        }
         assert_eq!(braille_ascii_fallback('A'), None);
     }
 }

@@ -58,7 +58,13 @@ jobs:
         with:
           version: '6.1'
           components: native
-          cache: true
+          # Save the ~715 MB SDK cache from main only. The action has no
+          # restore-only mode, and with `cache: true` every PR ref that missed
+          # main's entry saved its own 715 MB copy; a handful of open PRs
+          # pushed the repo past the 10 GiB Actions cache cap and evicted the
+          # Rust caches CI actually depends on. PRs download the SDK instead
+          # (checksum-verified from the GitHub mirror below).
+          cache: ${{ github.ref == 'refs/heads/main' }}
           mirror: true
       - name: Check Codewhale TUI with the real SDK/sysroot
         shell: bash

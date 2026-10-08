@@ -1,14 +1,23 @@
 "use client";
 
 import { useState } from "react";
+import { Icon } from "./icon";
+import { recordUsage } from "./usage-counting";
 
 interface Props {
   cmd: string;
   copyLabel?: string;
   copiedLabel?: string;
+  copyLocale?: string;
 }
 
-export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied ✓" }: Props) {
+/**
+ * A command in a code block with one button that copies it: the copy icon
+ * and the word, so the action reads without guessing at the glyph. The check
+ * mark, "Copied" and its announcement appear only after the clipboard write
+ * succeeds; a failed write never shows a false confirmation.
+ */
+export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied", copyLocale }: Props) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -16,6 +25,7 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
     try {
       await navigator.clipboard.writeText(cmd);
       setCopied(true);
+      recordUsage("install_copy");
       setTimeout(() => setCopied(false), 1400);
     } catch {
       // Clipboard write failed (permissions, non-secure context, or a focused
@@ -23,17 +33,25 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
     }
   };
 
+  const copiedWord = copiedLabel.replace(/\s*✓\s*$/u, "");
+
   return (
-    <div className="relative">
+    <div className="code">
+      <pre tabIndex={0} className="code-block">{cmd}</pre>
       <button
+        type="button"
+        lang={copyLocale}
         onClick={copy}
-        aria-label={copied ? copiedLabel : copyLabel}
         data-copied={copied}
-        className="copy-btn absolute top-3 right-3 z-10 px-3 py-1 bg-paper hairline-t hairline-b hairline-l hairline-r font-mono text-[0.7rem] uppercase tracking-wider hover:bg-indigo hover:text-paper transition-colors"
+        className="btn btn-sm code-copy"
       >
-        {copied ? copiedLabel : copyLabel}
+        <Icon name={copied ? "check" : "copy"} className="icon" />
+        <span className="code-copy-label">{copied ? copiedWord : copyLabel}</span>
       </button>
-      <pre className="code-block text-[0.78rem] m-0 max-w-full pr-20">{cmd}</pre>
+      <span className="sr-only" aria-live="polite" lang={copyLocale}>
+        {/* The check mark is drawn by the icon; announce only the word. */}
+        {copied ? copiedWord : ""}
+      </span>
     </div>
   );
 }

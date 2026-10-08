@@ -1,0 +1,26 @@
+{
+  "description": "Agent mode in a trusted workspace whose AGENTS.md is project authority: pins how repository instructions enter the frozen prefix.",
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "approval_mode": "suggest",
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "trusted_workspace": true,
+  "user_message": "hello",
+  "workspace_files": {
+    "README.md": "conformance fixture\n",
+    "AGENTS.md": "# Conformance project rules\n\n- Keep every change inside the fixture workspace.\n- Report checks you did not run as unrun.\n"
+  }
+}

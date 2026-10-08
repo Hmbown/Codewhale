@@ -25,6 +25,25 @@ export async function POST(req: Request) {
     });
   }
 
+  // One maintainer principal: key by that account, never by attacker-controlled
+  // headers or submitted tokens. The binding shares counters across isolates
+  // in a Cloudflare location. An unavailable limiter must not disable the gate.
+  try {
+    if (!env.ADMIN_LOGIN_LIMITER) throw new Error("Missing login limiter");
+    const { success } = await env.ADMIN_LOGIN_LIMITER.limit({ key: "codewhale-web:admin-login" });
+    if (!success) {
+      return new NextResponse("Too many login attempts", {
+        status: 429,
+        headers: { "Cache-Control": "no-store", "Retry-After": "60" },
+      });
+    }
+  } catch {
+    return new NextResponse("Login temporarily unavailable", {
+      status: 503,
+      headers: { "Cache-Control": "no-store", "Retry-After": "60" },
+    });
+  }
+
   let form: URLSearchParams;
   try {
     form = await readBoundedUrlEncodedForm(req, MAX_LOGIN_BODY_BYTES);

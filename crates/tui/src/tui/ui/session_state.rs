@@ -5,6 +5,84 @@
 
 use super::*;
 
+pub(crate) struct OfflineQueueTransition {
+    lease: Arc<crate::session_manager::OfflineQueueLease>,
+    restored: Option<OfflineQueueState>,
+}
+
+/// A session load/resume failure must survive past the next footer update.
+///
+/// The status line is replaced almost immediately, which left a failed
+/// resume looking like a silent new session — the screen even offered to
+/// resume the id it had just created (#6138). Keep both: the transcript
+/// error cell is the durable record, the status line the immediate one.
+pub(crate) fn surface_session_load_failure(app: &mut App, message: String) {
+    app.add_message(crate::tui::history::HistoryCell::Error {
+        message: message.clone(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    });
+    app.status_message = Some(message);
+}
+
+/// Complete all fallible queue work before a session switch mutates the App.
+/// A second editor must fail without touching either composer or queue file.
+pub(crate) fn prepare_offline_queue_transition(
+    app: &App,
+    session_id: &str,
+) -> Result<Option<OfflineQueueTransition>, String> {
+    if app
+        .offline_queue_lease
+        .as_ref()
+        .is_some_and(|lease| lease.session_id() == session_id)
+    {
+        return Ok(None);
+    }
+    let manager = SessionManager::default_location().map_err(|error| error.to_string())?;
+    let lease = manager
+        .acquire_offline_queue_lease(session_id)
+        .map_err(|error| error.to_string())?;
+    let restored = manager
+        .load_offline_queue_state(session_id)
+        .map_err(|error| {
+            format!("Could not restore queued input for session {session_id}: {error}")
+        })?;
+    Ok(Some(OfflineQueueTransition { lease, restored }))
+}
+
+pub(crate) fn install_offline_queue_transition(
+    app: &mut App,
+    transition: Option<OfflineQueueTransition>,
+) -> bool {
+    let Some(transition) = transition else {
+        return false;
+    };
+    // The request retains the old Arc until the actor finishes its write.
+    // Acquiring the next lease does not release the previous editor early.
+    persist_offline_queue_state(app);
+    if app.queued_draft.take().is_some() {
+        app.clear_input();
+    }
+    app.queued_messages.clear();
+    app.current_session_id = Some(transition.lease.session_id().to_string());
+    app.offline_queue_lease = Some(transition.lease);
+    transition
+        .restored
+        .is_some_and(|state| restore_matching_offline_queue_state(app, state))
+}
+
+/// The editable composer is the durable draft. Keep `queued_draft` itself as
+/// the original message so Escape can still cancel the edit in this window.
+pub(crate) fn offline_queue_projection(
+    app: &App,
+) -> (VecDeque<QueuedMessage>, Option<QueuedMessage>) {
+    let draft = app.queued_draft.as_ref().map(|original| {
+        let mut edited = original.clone();
+        edited.display.clone_from(&app.input);
+        edited
+    });
+    (app.queued_messages.clone(), draft)
+}
+
 pub(crate) async fn publish_pending_work_projection(app: &mut App) -> Result<bool, String> {
     let Some(work) = app.runtime_services.work.clone() else {
         return Ok(false);
@@ -79,11 +157,142 @@ pub(crate) fn restore_matching_offline_queue_state(
     true
 }
 
+/// A Running sub-agent older than every child's wall budget cannot still be
+/// doing bounded work: its terminal event was lost or its task is wedged
+/// (#6184 H2). The default child wall budget plus generous grace.
+pub(crate) const SUBAGENT_SUSPECT_AFTER: Duration =
+    crate::tools::subagent::DEFAULT_CHILD_WALL_TIME.saturating_add(Duration::from_secs(5 * 60));
+
+/// Running sub-agents that are past their bound: shown as suspect, and never a
+/// veto on turn recovery. A prior-session row still marked Running cannot be
+/// live in this process at all.
+pub(crate) fn suspect_running_agents(app: &App, now: Instant) -> Vec<String> {
+    app.subagent_cache
+        .iter()
+        .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
+        .filter(|agent| match agent.started_at {
+            Some(started) => now.saturating_duration_since(started) > SUBAGENT_SUSPECT_AFTER,
+            None => agent.from_prior_session,
+        })
+        .map(|agent| agent.agent_id.clone())
+        .collect()
+}
+
+/// Running sub-agents that still legitimately hold the turn open.
+pub(crate) fn live_running_agent_count(app: &App, now: Instant) -> usize {
+    let suspects = suspect_running_agents(app, now);
+    let mut ids: std::collections::HashSet<&str> =
+        app.agent_progress.keys().map(String::as_str).collect();
+    for agent in app
+        .subagent_cache
+        .iter()
+        .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
+    {
+        ids.insert(agent.agent_id.as_str());
+    }
+    ids.retain(|id| !suspects.iter().any(|suspect| suspect == id));
+    ids.len()
+}
+
+/// Queued follow-ups the stalled turn is holding back, as a sentence suffix.
+fn held_queue_note(app: &App) -> String {
+    match app.queued_messages.len() {
+        0 => String::new(),
+        1 => " 1 queued message is held until the turn ends.".to_string(),
+        n => format!(" {n} queued messages are held until the turn ends."),
+    }
+}
+
+/// Log, record under `crashes/`, and name a stall the UI watchdog saw.
+fn record_ui_stall(app: &App, phase: &str, since_progress: Duration, bound: Duration) {
+    let suspects = suspect_running_agents(app, Instant::now());
+    let detail = (!suspects.is_empty()).then(|| {
+        format!(
+            "sub-agent(s) past their bound, treated as suspect: {}",
+            suspects.join(", ")
+        )
+    });
+    crate::core::engine::turn_heartbeat::report_stall(
+        &crate::core::engine::turn_heartbeat::StallReport {
+            source: "ui",
+            phase: phase.to_string(),
+            detail,
+            turn_id: app.runtime_turn_id.clone(),
+            provider_request: app
+                .active_turn
+                .as_ref()
+                .and_then(|turn| turn.route.as_ref())
+                .map(|route| format!("{} / {}", route.provider_identity, route.model)),
+            since_progress,
+            bound: Some(bound),
+        },
+    );
+}
+
+/// The UI watchdog, supervised by the engine heartbeat (#6184). Suspect
+/// sub-agents no longer veto recovery, and an engine-reported stall is shown
+/// with the phase it stalled in.
+///
+/// Recovering a turn that had started is all-or-nothing (#6800): the engine's
+/// turn is cancelled with the UI's, through the cancellation the cancel key
+/// issues. Clearing only the UI left the engine owning the turn, so the next
+/// message was refused and no outcome was ever recorded. The engine's
+/// terminal event for that turn then arrives as it does after a local cancel.
+///
+/// Known limitation: a turn wedged somewhere that does not observe
+/// cancellation still holds the engine; this only removes the disagreement.
+pub(crate) fn reconcile_turn_liveness_supervised(
+    app: &mut App,
+    now: Instant,
+    heartbeat: &crate::core::engine::turn_heartbeat::HeartbeatSnapshot,
+    engine: &EngineHandle,
+) -> bool {
+    let turn_in_progress = matches!(app.runtime_turn_status.as_deref(), Some("in_progress"));
+    if (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
+        && let Some(stall) = heartbeat.stall.as_ref()
+    {
+        // Coalesced by text while visible, so one toast per stall episode.
+        let text = format!("{}{}", stall.status_line(), held_queue_note(app));
+        app.push_status_toast(text, StatusToastLevel::Error, None);
+    }
+    let has_live_agents = live_running_agent_count(app, now) > 0;
+    let recovered = reconcile_turn_liveness_with(app, now, has_live_agents, Some(heartbeat));
+    if recovered && turn_in_progress && app.runtime_turn_status.is_none() {
+        engine.cancel_with_reason(crate::core::engine::CancelReason::Stalled);
+        app.suppress_stream_events_until_turn_complete = true;
+    }
+    recovered
+}
+
+/// Unsupervised form (no engine heartbeat), kept for focused tests.
+#[cfg(test)]
 pub(crate) fn reconcile_turn_liveness(
     app: &mut App,
     now: Instant,
     has_running_agents: bool,
 ) -> bool {
+    reconcile_turn_liveness_with(app, now, has_running_agents, None)
+}
+
+pub(crate) fn reconcile_turn_liveness_with(
+    app: &mut App,
+    now: Instant,
+    has_running_agents: bool,
+    heartbeat: Option<&crate::core::engine::turn_heartbeat::HeartbeatSnapshot>,
+) -> bool {
+    // The engine is inside a wait it bounds itself and has not reported as
+    // overdue (a quiet model, a live stream). Its watchdog owns that bound;
+    // the UI does not second-guess it with a timer of its own.
+    let engine_owns_wait = heartbeat.is_some_and(|snapshot| snapshot.engine_owns_live_wait());
+    // #6872: human decisions can wait indefinitely. Their configured timeout,
+    // answer or withdrawal owns the wait, including buried or hidden cards.
+    let awaiting_human_decision = app.pending_user_input_prompt.is_some()
+        || app.view_stack.contains_kind(ModalKind::Approval)
+        || app.view_stack.contains_kind(ModalKind::Elevation)
+        || app
+            .pending_child_requests
+            .keys()
+            .any(|id| !crate::tui::pending_requests::is_foreign_child_request(app, id));
     if app.is_loading
         && app.runtime_turn_status.is_none()
         && !has_running_agents
@@ -93,11 +302,20 @@ pub(crate) fn reconcile_turn_liveness(
             now.saturating_duration_since(started) > DISPATCH_WATCHDOG_TIMEOUT
         })
     {
+        if let Some(started) = app.dispatch_started_at {
+            record_ui_stall(
+                app,
+                "while dispatching the message to the engine",
+                now.saturating_duration_since(started),
+                DISPATCH_WATCHDOG_TIMEOUT,
+            );
+        }
         // #2739: the user's prompt was already appended to api_messages
         // before dispatch, but the turn never reached `in_progress`. Persist
         // it before clearing turn state so `--continue` keeps the prompt
         // instead of loading the previous save.
         persist_recovery_snapshot(app);
+        settle_pending_human_requests(app);
         app.is_loading = false;
         app.dispatch_started_at = None;
         app.turn_started_at = None;
@@ -123,6 +341,7 @@ pub(crate) fn reconcile_turn_liveness(
         && !app.is_compacting
         && !app.is_purging
     {
+        settle_pending_human_requests(app);
         app.is_loading = false;
         app.dispatch_started_at = None;
         app.turn_started_at = None;
@@ -144,15 +363,19 @@ pub(crate) fn reconcile_turn_liveness(
     if app.is_loading
         && matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
         && !has_running_agents
+        && !engine_owns_wait
+        && !awaiting_human_decision
         && !app.is_compacting
         && !active_turn_has_running_tool(app)
-        && app
-            .turn_last_activity_at
-            .or(app.turn_started_at)
-            .is_some_and(|last_activity| {
-                now.saturating_duration_since(last_activity) > turn_stall_watchdog_timeout(app)
-            })
+        && let Some(last_activity) = app.turn_last_activity_at.or(app.turn_started_at)
+        && now.saturating_duration_since(last_activity) > turn_stall_watchdog_timeout(app)
     {
+        record_ui_stall(
+            app,
+            "waiting for the turn's completion signal",
+            now.saturating_duration_since(last_activity),
+            turn_stall_watchdog_timeout(app),
+        );
         recover_stalled_runtime_turn(
             app,
             "Turn stalled — no completion signal received. Please try again.",
@@ -164,16 +387,19 @@ pub(crate) fn reconcile_turn_liveness(
     if app.is_loading
         && matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
         && !has_running_agents
+        && !awaiting_human_decision
         && !app.is_compacting
         && !app.is_purging
         && active_turn_has_running_tool(app)
-        && app
-            .turn_last_activity_at
-            .or(app.turn_started_at)
-            .is_some_and(|last_activity| {
-                now.saturating_duration_since(last_activity) > TOOL_HANG_WATCHDOG_TIMEOUT
-            })
+        && let Some(last_activity) = app.turn_last_activity_at.or(app.turn_started_at)
+        && now.saturating_duration_since(last_activity) > TOOL_HANG_WATCHDOG_TIMEOUT
     {
+        record_ui_stall(
+            app,
+            "while a tool ran with no progress",
+            now.saturating_duration_since(last_activity),
+            TOOL_HANG_WATCHDOG_TIMEOUT,
+        );
         recover_stalled_runtime_turn(
             app,
             "Tool stalled with no progress for 10m — recovered; the command may still be running in the background. Use exec_shell_cancel or retry.",
@@ -248,6 +474,7 @@ pub(crate) fn maybe_throttled_recovery_snapshot(
 }
 
 pub(crate) fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: StatusToastLevel) {
+    settle_pending_human_requests(app);
     // Capture the turn identity before the reset below clears it; the
     // outbox event must name the turn that stalled.
     let stalled_turn_id = app.runtime_turn_id.clone();
@@ -268,6 +495,8 @@ pub(crate) fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: 
     persist_recovery_snapshot(app);
 
     app.is_loading = false;
+    // #6800: fail an unadmitted dispatch back now instead of after its bound.
+    app.cancel_in_flight_dispatch();
     app.turn_started_at = None;
     app.turn_last_activity_at = None;
     app.runtime_turn_status = None;
@@ -279,6 +508,24 @@ pub(crate) fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: 
     app.suppress_stream_events_until_turn_complete = false;
     // Per-turn scroll lock — clear so the next turn auto-scrolls.
     app.user_scrolled_during_stream = false;
+    // #6184: queued follow-ups drain only on a TurnComplete this recovered
+    // turn will never send. Hand the latest one back to the composer so one
+    // Enter resends it (the rest drain after that turn), and say so.
+    let held = app.queued_messages.len();
+    let message = if held > 0 && app.pop_last_queued_into_draft() {
+        let rest = held - 1;
+        let tail = if rest == 0 {
+            String::new()
+        } else {
+            format!(" {rest} more queued message(s) send after it.")
+        };
+        format!(
+            "{message} Your queued message is back in the composer — press Enter to resend it.{tail}"
+        )
+    } else {
+        format!("{message}{}", held_queue_note(app))
+    };
+    let message = message.as_str();
     app.push_status_toast(message, level, None);
     // Lifecycle outbox (`[lifecycle_outbox]`): the first scriptable stall
     // signal. Until now a wedged turn was only visible as this toast; with
@@ -307,6 +554,7 @@ pub(crate) fn recover_engine_event_disconnect(app: &mut App) -> bool {
         || app.is_purging
         || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
         || app.pending_turn_route.is_some()
+        || app.pending_user_input_prompt.is_some()
         || app.active_turn.is_some()
         || app.suppress_stream_events_until_turn_complete
         || app.streaming_message_index.is_some()
@@ -319,6 +567,8 @@ pub(crate) fn recover_engine_event_disconnect(app: &mut App) -> bool {
     if !had_live_work {
         return false;
     }
+
+    settle_pending_human_requests(app);
 
     streaming_thinking::finalize_current(app);
     app.finalize_streaming_assistant_as_interrupted();
@@ -370,6 +620,7 @@ pub(crate) fn capture_turn_started_metadata(app: &mut App, event: &EngineEvent) 
             turn_id,
             created_at,
             route,
+            submission_id: _,
         } => {
             app.ocean_completion_started_at = None;
             let auto_route_receipt = if route.as_ref().is_some_and(|route| route.auto_model) {
@@ -436,22 +687,28 @@ pub(crate) fn record_turn_activity(app: &mut App, event: &EngineEvent, now: Inst
 }
 
 pub(crate) fn persist_offline_queue_state(app: &App) {
+    let Some(lease) = app
+        .offline_queue_lease
+        .as_ref()
+        .filter(|lease| app.current_session_id.as_deref() == Some(lease.session_id()))
+    else {
+        return;
+    };
     if app.queued_messages.is_empty() && app.queued_draft.is_none() {
-        persistence_actor::persist(PersistRequest::ClearOfflineQueue);
+        persistence_actor::persist(PersistRequest::ClearOfflineQueue {
+            lease: Arc::clone(lease),
+        });
         return;
     }
+    let (messages, draft) = offline_queue_projection(app);
     let state = OfflineQueueState {
-        messages: app
-            .queued_messages
-            .iter()
-            .map(queued_ui_to_session)
-            .collect(),
-        draft: app.queued_draft.as_ref().map(queued_ui_to_session),
+        messages: messages.iter().map(queued_ui_to_session).collect(),
+        draft: draft.as_ref().map(queued_ui_to_session),
         ..OfflineQueueState::default()
     };
     persistence_actor::persist(PersistRequest::OfflineQueue {
         state,
-        session_id: app.current_session_id.clone(),
+        lease: Arc::clone(lease),
     });
 }
 
@@ -529,10 +786,7 @@ pub(crate) fn restore_message_submit_denial(
     app.dispatch_in_flight = false;
     match recovery {
         DispatchRecovery::Immediate | DispatchRecovery::Initial => {
-            app.input.clone_from(&message.display);
-            app.cursor_position = app.input.chars().count();
-            app.active_skill = message.skill_instruction;
-            app.active_skill_provenance = message.skill_provenance;
+            app.restore_unsent_message(message);
         }
         DispatchRecovery::Draft => {
             restore_queued_or_draft_message(app, recovery, message);
@@ -563,7 +817,7 @@ pub(crate) fn resume_launch_session(app: &mut App, session_id: &str) -> commands
         Ok(manager) => manager,
         Err(err) => return failed(app, &err.to_string()),
     };
-    let saved = match manager.load_session(session_id) {
+    let saved = match manager.load_session_snapshot(session_id) {
         Ok(saved) => saved,
         Err(err) => return failed(app, &err.to_string()),
     };
@@ -577,18 +831,44 @@ pub(crate) fn resume_launch_session(app: &mut App, session_id: &str) -> commands
     commands::CommandResult::action(AppAction::LoadSession(path))
 }
 
+/// `LaunchAction::McpRemedy` (#6085): type the remedy the problems row
+/// prints into the composer — `/mcp login <name>` or `/mcp`. Typing beats
+/// copying (no clipboard dependency over SSH), and the user reads the
+/// command before a second Enter sends it.
+pub(crate) fn type_launch_mcp_remedy(app: &mut App) {
+    let Some(command) = crate::tui::underwater::mcp_remedy_command(app) else {
+        return;
+    };
+    // Home can be revisited with an unsent draft. The manager exposes the
+    // same remedy without replacing user-authored composer content.
+    if !app.input.is_empty() {
+        app.launch.dissolve_card(app.ambient_clock_ms);
+        open_mcp_extensions(app);
+        return;
+    }
+    app.input = command;
+    app.cursor_position = app.input.chars().count();
+    app.launch.menu_selected = None;
+    app.launch.status = None;
+}
+
 pub(crate) fn begin_launch_session(
     app: &mut App,
     workspace: Option<PathBuf>,
 ) -> commands::CommandResult {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let transition = match prepare_offline_queue_transition(app, &session_id) {
+        Ok(transition) => transition,
+        Err(error) => return commands::CommandResult::error(error),
+    };
+    install_offline_queue_transition(app, transition);
     if let Some(workspace) = workspace {
         app.workspace = workspace;
     }
-    let session_id = uuid::Uuid::new_v4().to_string();
     app.current_session_id = Some(session_id.clone());
     app.current_session_metadata = None;
     app.session_title = Some(app.tr(MessageId::SessionsNewSessionTitle).into_owned());
-    app.launch.visible = false;
+    app.launch.dismiss();
     app.launch.status = None;
     app.status_message = None;
     commands::CommandResult::action(AppAction::SyncSession {
@@ -616,16 +896,18 @@ pub(crate) async fn switch_workspace(
     workspace: PathBuf,
 ) {
     if app.is_loading {
-        app.status_message =
-            Some("Cannot switch workspace while a request is running.".to_string());
-        app.add_message(HistoryCell::System {
-            content: "Cannot switch workspace while a request is running.".to_string(),
-        });
+        let busy = app.tr(MessageId::WorkspaceSwitchBusy).into_owned();
+        app.status_message = Some(busy.clone());
+        app.add_message(HistoryCell::System { content: busy });
         return;
     }
 
+    let shown = workspace.display().to_string();
     if app.workspace == workspace {
-        app.status_message = Some(format!("Workspace unchanged: {}", workspace.display()));
+        app.status_message = Some(
+            app.tr(MessageId::WorkspaceUnchanged)
+                .replace("{path}", &shown),
+        );
         return;
     }
 
@@ -639,7 +921,7 @@ pub(crate) async fn switch_workspace(
         let _ = engine_handle
             .send(Op::SyncSession {
                 session_id: app.current_session_id.clone(),
-                messages: app.api_messages.clone(),
+                messages: app.api_messages.as_ref().clone(),
                 system_prompt: app.system_prompt.clone(),
                 system_prompt_override: false,
                 model: app.model.clone(),
@@ -649,10 +931,89 @@ pub(crate) async fn switch_workspace(
             .await;
     }
 
-    app.add_message(HistoryCell::System {
-        content: format!("Switched workspace to {}", workspace.display()),
-    });
-    app.status_message = Some(format!("Workspace: {}", workspace.display()));
+    let switched = app
+        .tr(MessageId::WorkspaceSwitched)
+        .replace("{path}", &shown);
+    app.add_message(HistoryCell::System { content: switched });
+    app.status_message = Some(app.tr(MessageId::WorkspaceStatus).replace("{path}", &shown));
+}
+
+/// A message submitted with no usable key (#6566). Nothing reached a model:
+/// the caller has already rolled back the optimistic echo, so the text goes
+/// back into the composer — not lost, and sent once when the person presses
+/// Enter after connecting, not doubled. One transcript line says what
+/// happened and the provider picker opens.
+///
+/// A new user never chose a provider, so the line does not name the built-in
+/// default's key or print its help page. A returning user whose saved route
+/// lost its key also gets the one command that saves it.
+pub(crate) fn keep_unsent_message_for_connect(app: &mut App, message: QueuedMessage, error: &str) {
+    tracing::warn!(
+        error = %error,
+        "user message not sent: no usable credential; restored to composer"
+    );
+    app.restore_unsent_message(message);
+
+    let new_user = app.onboarding_had_provider_step;
+    let mut content = app.tr(MessageId::DispatchNotSentNoModel).into_owned();
+    if !new_user
+        && let Some(save) = error
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("codewhale auth set"))
+    {
+        content.push('\n');
+        content.push_str(
+            &app.tr(MessageId::DispatchNotSentSaveKey)
+                .replace("{command}", save),
+        );
+    }
+    app.add_message(HistoryCell::System { content });
+    app.onboarding_needs_api_key = true;
+    // From the composer, the saved route is the one missing its key: this is
+    // missing-key recovery, as after `/logout`, so Esc returns to the
+    // composer. A first-run launch with an initial prompt is still in
+    // onboarding and keeps its remaining steps (Esc walks back as before).
+    if app.onboarding == OnboardingState::None {
+        app.onboarding_missing_key_recovery = true;
+        app.onboarding_provider = app.api_provider;
+    }
+    app.onboarding = OnboardingState::Provider;
+    // The footer keeps the provider's full message for a returning user; a
+    // new user's footer says only that no model is connected.
+    let reason = if new_user {
+        app.tr(MessageId::LaunchNoModelConnected).into_owned()
+    } else {
+        error.to_string()
+    };
+    let status = app
+        .tr(MessageId::DispatchNotSentStatus)
+        .replace("{reason}", &reason);
+    app.status_message = Some(status.clone());
+    app.set_sticky_status(
+        status,
+        StatusToastLevel::Error,
+        Some(App::STICKY_ERROR_TTL_MS),
+    );
+    app.needs_redraw = true;
+}
+
+/// The engine reported this turn's message as never sent: a key rejected
+/// before any model output (#6566). Take the message back, and its bubble
+/// out of the live transcript when nothing has landed after it, so sending it
+/// again shows it once. `None` when no dispatched message is on record.
+pub(crate) fn take_back_unsent_submission(app: &mut App) -> Option<QueuedMessage> {
+    let submission = app.unanswered_submission.take()?;
+    let cell = submission.history_cell;
+    let bubble_is_last = cell + 1 == app.history.len()
+        && matches!(
+            &app.history[cell],
+            HistoryCell::User { content } if content == &submission.message.display
+        );
+    if bubble_is_last {
+        app.truncate_history_to(cell);
+    }
+    Some(submission.message)
 }
 
 pub(crate) fn restore_failed_immediate_submit(
@@ -722,7 +1083,9 @@ pub(crate) fn persist_rules_from_approval(
             None => 0,
         };
         let permissions_path = store.permissions_path();
-        config.exec_policy_engine = store.exec_policy_engine();
+        config
+            .exec_policy_engine
+            .set_ruleset(store.permissions().ruleset());
         Ok((added, permissions_path))
     }) {
         Ok((added, path)) if added > 0 => {
@@ -753,133 +1116,82 @@ pub(crate) fn persist_rules_from_approval(
 
 pub(crate) fn mirror_saved_model_in_config(
     config: &mut Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     model: String,
-) {
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+) -> Result<(), String> {
+    config.verify_provider_identity(identity)?;
+    if identity.provider == ProviderKind::Deepseek {
         config.default_text_model = Some(model);
-        return;
+        return Ok(());
     }
-    config.set_provider_model_override(provider, Some(model));
+    config
+        .set_provider_model_override(identity, Some(model))
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn mirror_saved_context_window_in_config(
     config: &mut Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     context_window: u32,
-) {
-    let providers = config
-        .providers
-        .get_or_insert_with(ProvidersConfig::default);
-    let entry = match provider {
-        ApiProvider::Moonshot => &mut providers.moonshot,
-        _ => return,
-    };
-    entry.context_window = Some(context_window);
+) -> Result<(), String> {
+    config.verify_provider_identity(identity)?;
+    if identity.provider == ProviderKind::Moonshot {
+        config
+            .provider_config_for_mut(identity)
+            .map_err(|error| error.to_string())?
+            .context_window = Some(context_window);
+    }
+    Ok(())
 }
 
 pub(crate) fn mirror_saved_api_key_in_config(
     config: &mut Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     api_key: String,
-) {
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-        config.api_key = Some(api_key);
+) -> Result<(), String> {
+    config.verify_provider_identity(identity)?;
+    let provider = identity.provider;
+    // These shared auth leaves are intrinsic released credential contracts;
+    // presentation names cannot select them.
+    if provider == ProviderKind::Deepseek {
+        let auth_owner = config.builtin_provider_identity(ProviderKind::Deepseek)?;
+        config
+            .set_provider_api_key_override(&auth_owner, Some(api_key))
+            .map_err(|error| error.to_string())?;
         config.auth_mode = Some("api_key".to_string());
-        return;
+        return Ok(());
     }
-    if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
-        config.api_key = Some(api_key);
-        config.auth_mode = Some("api_key".to_string());
-        return;
-    }
-    let pin_kimi_code_base_url = provider == ApiProvider::Moonshot
-        && config.provider_config_for(provider).is_some_and(|entry| {
+    let pin_kimi_code_base_url = provider == ProviderKind::Moonshot
+        && config.provider_config_for(identity).is_some_and(|entry| {
             crate::config::provider_config_uses_kimi_imported_token(entry)
                 && entry
                     .base_url
                     .as_deref()
                     .is_none_or(|base_url| base_url.trim().is_empty())
         });
-    let custom_key = (provider == ApiProvider::Custom).then(|| {
-        config
-            .provider
-            .clone()
-            .unwrap_or_else(|| "__custom__".to_string())
-    });
-    let providers = config
-        .providers
-        .get_or_insert_with(ProvidersConfig::default);
-    let entry: &mut ProviderConfig = match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => return,
-        ApiProvider::Custom => providers
-            .custom
-            .entry(custom_key.expect("custom key captured for custom provider"))
-            .or_default(),
-        ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
-        ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
-        ApiProvider::Openai => &mut providers.openai,
-        ApiProvider::Atlascloud => &mut providers.atlascloud,
-        ApiProvider::WanjieArk => &mut providers.wanjie_ark,
-        ApiProvider::Volcengine => &mut providers.volcengine,
-        ApiProvider::Openrouter => &mut providers.openrouter,
-        ApiProvider::Orcarouter => &mut providers.orcarouter,
-        ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
-        ApiProvider::Novita => &mut providers.novita,
-        ApiProvider::Fireworks => &mut providers.fireworks,
-        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
-        ApiProvider::Arcee => &mut providers.arcee,
-        ApiProvider::Moonshot => &mut providers.moonshot,
-        ApiProvider::Sglang => &mut providers.sglang,
-        ApiProvider::Vllm => &mut providers.vllm,
-        ApiProvider::Ollama => &mut providers.ollama,
-        ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
-        ApiProvider::Huggingface => &mut providers.huggingface,
-        ApiProvider::Deepinfra => &mut providers.deepinfra,
-        ApiProvider::Together => &mut providers.together,
-        ApiProvider::Qianfan => &mut providers.qianfan,
-        ApiProvider::OpenaiCodex => &mut providers.openai_codex,
-        ApiProvider::Anthropic => &mut providers.anthropic,
-        ApiProvider::Openmodel => &mut providers.openmodel,
-        ApiProvider::Zai => &mut providers.zai,
-        ApiProvider::Stepfun => &mut providers.stepfun,
-        ApiProvider::Minimax => &mut providers.minimax,
-        ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
-        ApiProvider::Sakana => &mut providers.sakana,
-        ApiProvider::LongCat => &mut providers.longcat,
-        ApiProvider::OpencodeGo => &mut providers.opencode_go,
-        ApiProvider::OpencodeZen => &mut providers.opencode_zen,
-        ApiProvider::Meta => &mut providers.meta,
-        ApiProvider::Xai => &mut providers.xai,
-        ApiProvider::Mistral => &mut providers.mistral,
-        ApiProvider::Google => &mut providers.google,
-        ApiProvider::Antigravity => &mut providers.antigravity,
-        ApiProvider::Telecomjs => &mut providers.telecomjs,
-        ApiProvider::Edenai => &mut providers.edenai,
-        ApiProvider::Concentrate => &mut providers.concentrate,
-        ApiProvider::ModelstudioTokenPlan => &mut providers.modelstudio_token_plan,
-        ApiProvider::ModelstudioTokenPlanAnthropic => {
-            &mut providers.modelstudio_token_plan_anthropic
-        }
-        ApiProvider::ModelstudioCodingPlan => &mut providers.modelstudio_coding_plan,
-        ApiProvider::ModelstudioCodingPlanAnthropic => {
-            &mut providers.modelstudio_coding_plan_anthropic
-        }
+    let auth_owner = if provider == ProviderKind::SiliconflowCN {
+        config.builtin_provider_identity(ProviderKind::Siliconflow)?
+    } else {
+        identity.clone()
     };
+    let entry = config
+        .provider_config_for_mut(&auth_owner)
+        .map_err(|error| error.to_string())?;
     if pin_kimi_code_base_url {
         entry.base_url = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
     }
     entry.auth_mode = Some("api_key".to_string());
     entry.api_key = Some(api_key);
     entry.external_credentials = None;
-    if provider == ApiProvider::Xai {
+    if provider == ProviderKind::Xai {
         entry.oauth_credential_generation = None;
     }
+    Ok(())
 }
 
 pub(crate) fn loaded_session_requires_engine_respawn(
     app: &App,
-    previous_provider: ApiProvider,
+    previous_provider: ProviderKind,
     previous_provider_identity: &str,
     previous_workspace: &Path,
 ) -> bool {
@@ -892,17 +1204,17 @@ pub(crate) fn restore_loaded_session_provider(
     app: &mut App,
     config: &mut Config,
     identity: ProviderIdentity,
-) {
+) -> Result<(), String> {
     let provider = identity.provider;
-    config.scope_to_provider_identity(&identity);
-    app.set_provider_identity_record(identity);
-    app.billing_presentation = crate::route_billing::for_route(config, provider);
+    config.scope_to_provider_identity(&identity)?;
+    app.set_provider_identity_record(identity.clone());
+    app.billing_presentation = crate::route_billing::for_route(config, &identity);
     app.max_subagents = config
-        .max_subagents_for_provider(provider)
+        .max_subagents_for_provider(&identity)
         .clamp(1, crate::config::MAX_SUBAGENTS);
-    app.provider_chain = provider
-        .kind()
-        .map(|kind| codewhale_config::ProviderChain::new(kind, &config.fallback_providers))
+    app.provider_chain = (identity.key.as_str() == provider.as_str()
+        && provider != ProviderKind::Antigravity)
+        .then(|| codewhale_config::ProviderChain::new(provider, &config.fallback_providers))
         .filter(|chain| chain.providers().len() > 1);
     app.last_fallback_reason = None;
     app.model_ids_passthrough = config.model_ids_pass_through();
@@ -911,64 +1223,62 @@ pub(crate) fn restore_loaded_session_provider(
             .reasoning_effort_preference
             .unwrap_or(app.reasoning_effort);
         app.reasoning_effort =
-            requested.normalize_for_route(provider, &config.deepseek_base_url(), &app.model);
+            requested.normalize_for_route(provider, &config.active_route_base_url(), &app.model);
     }
-    app.set_active_context_window_override(config.context_window_for_provider_config(provider));
+    app.set_active_context_window_override(config, &identity);
     app.active_route_limits = app.context_window_override_limits();
-    app.active_route_base_url = config.deepseek_base_url();
-    app.active_context_window_source = if app.active_context_window_override.is_some() {
-        crate::route_runtime::ContextWindowSource::Configured
-    } else {
-        crate::route_runtime::ContextWindowSource::Fallback
-    };
+    app.active_route_base_url = config.active_route_base_url();
+    app.active_context_window_source = app
+        .configured_context_window_for(&app.model)
+        .map(|resolution| resolution.source)
+        .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
+    Ok(())
 }
 
 pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
-    let context_override = config.context_window_for_provider_config(app.api_provider);
-    app.set_active_context_window_override(context_override);
+    let identity = match app
+        .admitted_provider_identity()
+        .cloned()
+        .and_then(|identity| {
+            config.verify_provider_identity(&identity)?;
+            Ok(identity)
+        }) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            return;
+        }
+    };
+    app.set_active_context_window_override(config, &identity);
     if app.auto_model {
         app.active_route_limits = app.context_window_override_limits();
-        app.active_route_base_url = config.deepseek_base_url();
-        app.active_context_window_source = if context_override.is_some() {
-            crate::route_runtime::ContextWindowSource::Configured
-        } else {
-            crate::route_runtime::ContextWindowSource::Fallback
-        };
+        app.active_route_base_url = config.active_route_base_url();
+        app.active_context_window_source = app
+            .configured_context_window_for(&app.model)
+            .map(|resolution| resolution.source)
+            .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
         return;
     }
 
-    let saved_provider_model = config
-        .provider_config_for(app.api_provider)
-        .and_then(|provider| provider.model.as_deref());
-    match crate::route_runtime::resolve_route_candidate_with_context_metadata(
-        app.api_provider,
+    match crate::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        &identity,
         Some(&app.model),
-        saved_provider_model,
-        Some(config.deepseek_base_url()),
-        context_override,
-        None,
     ) {
         Ok(resolution) => {
-            let resolved_model = resolution.candidate.wire_model_id().as_str().to_string();
             app.set_active_route_resolution(
                 resolution.candidate.endpoint().base_url.clone(),
                 resolution.candidate.limits(),
                 resolution.context_window.source,
             );
-            app.fleet_roster_stale |= crate::fleet::members::auto_enroll_fleet_model(
-                &app.workspace,
-                app.provider_identity_for_persistence(),
-                &resolved_model,
-            );
         }
         Err(_) => {
             app.active_route_limits = app.context_window_override_limits();
-            app.active_route_base_url = config.deepseek_base_url();
-            app.active_context_window_source = if context_override.is_some() {
-                crate::route_runtime::ContextWindowSource::Configured
-            } else {
-                crate::route_runtime::ContextWindowSource::Fallback
-            };
+            app.active_route_base_url = config.active_route_base_url();
+            app.active_context_window_source = app
+                .configured_context_window_for(&app.model)
+                .map(|resolution| resolution.source)
+                .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
         }
     }
 }
@@ -984,14 +1294,7 @@ pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
 ///
 /// Never leaks raw prompt text — the result is always a concise label.
 pub(crate) fn derive_session_title(messages: &[Message]) -> Option<String> {
-    let text = messages.iter().find(|m| m.role == "user").and_then(|m| {
-        m.content.iter().find_map(|block| match block {
-            ContentBlock::Text { text, .. } if !text.starts_with(TURN_META_PREFIX) => {
-                Some(text.trim().to_string())
-            }
-            _ => None,
-        })
-    })?;
+    let text = crate::session_manager::conversation_title_prompt(messages)?;
 
     let first_line =
         crate::session_manager::sanitize_session_title(text.lines().next().unwrap_or("").trim());
@@ -1019,7 +1322,7 @@ pub(crate) fn derive_session_title(messages: &[Message]) -> Option<String> {
 #[cfg(test)]
 mod derived_title_tests {
     use super::*;
-    use crate::models::Role;
+    use codewhale_models::Role;
 
     fn user(text: &str) -> Message {
         Message {
@@ -1042,6 +1345,21 @@ mod derived_title_tests {
         );
         // Controls alone leave no title to derive.
         assert_eq!(derive_session_title(&[user("\u{1b}\u{7}\u{200b}")]), None);
+    }
+
+    #[test]
+    fn live_title_uses_the_same_user_prompt_after_runtime_handoffs() {
+        let handoff = crate::runtime_handoff::operate_contract_runtime_message();
+        assert_eq!(derive_session_title(std::slice::from_ref(&handoff)), None);
+        let messages = [handoff, user("/goal Fix the diagnostic display")];
+        assert_eq!(
+            derive_session_title(&messages).as_deref(),
+            Some("/goal Fix")
+        );
+        assert_eq!(
+            crate::session_manager::conversation_title_prompt(&messages),
+            Some("/goal Fix the diagnostic display")
+        );
     }
 }
 
@@ -1176,6 +1494,82 @@ mod launch_resume_tests {
             status.contains("Resume failed"),
             "the status says why: {status}"
         );
+    }
+
+    /// U1 / #6566: a keyless first message goes back into the composer, leaves
+    /// one durable transcript line, opens the provider picker, and a later
+    /// routine acknowledgement ("Auto-compaction enabled") does not wipe the
+    /// error from the footer.
+    #[test]
+    fn keyless_submit_leaves_a_durable_recovery_that_config_acks_cannot_erase() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            crate::test_support::test_tui_options(dir.path()),
+            &Config::default(),
+        );
+        app.onboarding_had_provider_step = true;
+        let cells_before = app.history.len();
+        keep_unsent_message_for_connect(
+            &mut app,
+            crate::tui::app::QueuedMessage::new("hello".to_string(), None),
+            "DeepSeek API key not found",
+        );
+        assert_eq!(app.input, "hello", "the unsent message is not lost");
+        assert_eq!(app.history.len(), cells_before + 1);
+        let Some(HistoryCell::System { content }) = app.history.last() else {
+            panic!("keyless submit must leave a transcript line");
+        };
+        assert!(content.starts_with("No model is connected"), "{content}");
+        // A new user never chose DeepSeek; the line must not blame its key.
+        assert!(!content.contains("DeepSeek"), "{content}");
+        assert_eq!(app.onboarding, OnboardingState::Provider);
+        assert!(app.onboarding_needs_api_key);
+
+        app.status_message = Some("Make room automatically: on".to_string());
+        let shown = app
+            .active_status_toast(crate::tui::underwater::ShellPhase::Idle)
+            .expect("footer notice");
+        assert_eq!(shown.level, StatusToastLevel::Error);
+        assert!(shown.text.contains("Message not sent"), "{}", shown.text);
+        assert!(!shown.text.contains("DeepSeek"), "{}", shown.text);
+    }
+
+    /// A returning user's line names the command that saves the missing key,
+    /// and Esc from the picker it opens returns to the composer with the
+    /// message still there, not to the welcome screen.
+    #[test]
+    fn keyless_submit_names_the_key_and_esc_returns_to_the_composer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            crate::test_support::test_tui_options(dir.path()),
+            &Config::default(),
+        );
+        app.onboarding = OnboardingState::None;
+        app.onboarding_missing_key_recovery = false;
+        app.onboarding_had_provider_step = false;
+        keep_unsent_message_for_connect(
+            &mut app,
+            crate::tui::app::QueuedMessage::new("hello".to_string(), None),
+            "DeepSeek API key not found.\n\n 1. Get a key:  https://platform.deepseek.com/api_keys\n 2. Save it (works in every folder, no OS prompts):\n        codewhale auth set --provider deepseek\n\n Alternatives:\n   • export DEEPSEEK_API_KEY=<your-key>. Failed to configure provider route deepseek / deepseek-flash.",
+        );
+        let Some(HistoryCell::System { content }) = app.history.last() else {
+            panic!("keyless submit must leave a transcript line");
+        };
+        assert!(
+            content.contains("codewhale auth set --provider deepseek"),
+            "{content}"
+        );
+        assert!(content.contains("F3"), "{content}");
+        // The footer keeps the full help page; the transcript keeps two facts.
+        assert!(!content.contains("Alternatives"), "{content}");
+        assert!(!content.contains("Failed to configure"), "{content}");
+        assert!(app.onboarding_missing_key_recovery);
+        assert!(app.onboarding_recovers_configured_route());
+
+        back_from_provider_onboarding(&mut app);
+        assert_eq!(app.onboarding, OnboardingState::None);
+        assert!(app.onboarding_needs_api_key);
+        assert_eq!(app.input, "hello");
     }
 
     /// The prominent new-session entry begins a fresh session in place.

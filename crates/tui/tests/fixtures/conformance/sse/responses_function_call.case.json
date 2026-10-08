@@ -1,0 +1,23 @@
+{
+  "description": "OpenAI Responses (ChatGPT Codex route): one function_call item whose arguments stream as deltas, then response.completed.",
+  "route": "openai-codex",
+  "model": "gpt-5.5",
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "chunk_bytes": 9
+}

@@ -1,4 +1,5 @@
-//! Runtime backends: tmux durability, inline, vm/ci stubs (#4176).
+//! Runtime backends: tmux durability and inline (#4176). The never-implemented
+//! `vm` / `ci` kinds are retired and only load from historical records (#6516).
 //!
 //! Runtime owns process/session lifecycle and stream-json log capture.
 //! Fleet modules must not import this module.
@@ -21,6 +22,10 @@ use crate::worktree::{WorktreeProvision, provision_worktree, remove_worktree_if_
 pub enum RuntimeBackendKind {
     Tmux,
     Inline,
+    /// Retired (#6516): `vm` and `ci` were advertised but never implemented.
+    /// [`Self::parse`] no longer accepts them; the variants stay only so lane
+    /// records written by earlier releases (always `failed`) still load
+    /// instead of being skipped as corrupt.
     Vm,
     Ci,
 }
@@ -39,9 +44,11 @@ impl RuntimeBackendKind {
         match raw.trim().to_ascii_lowercase().as_str() {
             "tmux" => Ok(Self::Tmux),
             "inline" => Ok(Self::Inline),
-            "vm" => Ok(Self::Vm),
-            "ci" => Ok(Self::Ci),
-            other => bail!("unknown runtime backend `{other}` (use tmux|inline|vm|ci)"),
+            "vm" | "ci" => bail!(
+                "runtime backend `{}` is not available; use tmux or inline",
+                raw.trim().to_ascii_lowercase()
+            ),
+            other => bail!("unknown runtime backend `{other}` (use tmux|inline)"),
         }
     }
 }
@@ -144,10 +151,10 @@ pub fn resolve_backend(kind: RuntimeBackendKind) -> Box<dyn RuntimeBackend> {
     match kind {
         RuntimeBackendKind::Tmux => Box::new(TmuxRuntime),
         RuntimeBackendKind::Inline => Box::new(InlineRuntime),
-        RuntimeBackendKind::Vm => Box::new(StubRuntime {
+        RuntimeBackendKind::Vm => Box::new(RetiredRuntime {
             kind: RuntimeBackendKind::Vm,
         }),
-        RuntimeBackendKind::Ci => Box::new(StubRuntime {
+        RuntimeBackendKind::Ci => Box::new(RetiredRuntime {
             kind: RuntimeBackendKind::Ci,
         }),
     }
@@ -645,6 +652,15 @@ fn tmux_log_proxy_command(
     format!("exec {}", shell_join(&argv))
 }
 
+/// The tmux dry-run hook, honoured only in this crate's own unit tests.
+///
+/// It records a Running lane with no process, skips the tmux kill on stop,
+/// and blinds reconcile, so an inherited `CODEWHALE_LANE_TMUX_DRY_RUN` in a
+/// real build would fabricate lane state. Release builds ignore it.
+fn tmux_dry_run() -> bool {
+    cfg!(test) && std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some()
+}
+
 fn apply_worktree(record: &mut LaneRecord, spec: &LaneStartSpec) -> Result<Option<PathBuf>> {
     let Some(wt) = spec.worktree.as_ref() else {
         return Ok(spec.cwd.clone());
@@ -675,7 +691,7 @@ impl RuntimeBackend for TmuxRuntime {
         }
         // Dry-run is an explicit test hook only. A missing/broken tmux binary
         // must fail closed rather than persisting a fictional Running Lane.
-        let dry_run = std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some();
+        let dry_run = tmux_dry_run();
         if !dry_run && let Err(error) = ensure_tmux_available() {
             append_log_event(
                 &record.log_path,
@@ -836,7 +852,7 @@ impl RuntimeBackend for TmuxRuntime {
         record: &mut LaneRecord,
         fence: Option<u64>,
     ) -> Result<TerminalTransition> {
-        let dry_run = std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some();
+        let dry_run = tmux_dry_run();
         let transition = registry.mark_terminal_if_active_fenced(
             record,
             LaneStatus::Stopped,
@@ -895,7 +911,7 @@ impl RuntimeBackend for TmuxRuntime {
                 "process_exit_receipt",
             )
         } else {
-            if std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some() {
+            if tmux_dry_run() {
                 return Ok(false);
             }
             let (Some(socket), Some(session)) = (
@@ -956,6 +972,10 @@ impl RuntimeBackend for InlineRuntime {
             bail!("inline runtime requires a non-empty command");
         }
         let cwd = apply_worktree(record, spec)?;
+        // A concurrent stop that wins `mark_running_if_pending` replaces
+        // `record` with the stored one, which never saw the worktree; keep
+        // this copy so the worktree is still cleaned up, as tmux does.
+        let proposed_record = record.clone();
         append_log_event(
             &record.log_path,
             serde_json::json!({
@@ -966,6 +986,9 @@ impl RuntimeBackend for InlineRuntime {
             }),
         )?;
         if !registry.mark_running_if_pending(record)? {
+            let mut stopped_record = proposed_record;
+            stopped_record.stopped_at = record.stopped_at.clone();
+            self.cleanup_worktree(&stopped_record)?;
             bail!(
                 "lane `{}` was stopped before inline start completed",
                 record.id
@@ -993,6 +1016,8 @@ impl RuntimeBackend for InlineRuntime {
                     }),
                 )?;
                 let _ = registry.mark_terminal_if_active(record, LaneStatus::Failed)?;
+                // Terminal now, so no later stop will clean the worktree up.
+                self.cleanup_worktree(record)?;
                 return Err(err).with_context(|| format!("run inline command {:?}", spec.command));
             }
         };
@@ -1076,38 +1101,30 @@ impl RuntimeBackend for InlineRuntime {
     }
 }
 
-/// Placeholder for remote VM / CI backends (surface only in Phase 1).
+/// Backend for a lane record written by an earlier release under the retired
+/// `vm` / `ci` runtimes. It never starts anything: [`RuntimeBackendKind::parse`]
+/// cannot produce these kinds, so only historical records reach it, and they
+/// can still be listed, reconciled, and stopped.
 #[derive(Debug)]
-struct StubRuntime {
+struct RetiredRuntime {
     kind: RuntimeBackendKind,
 }
 
-impl RuntimeBackend for StubRuntime {
+impl RuntimeBackend for RetiredRuntime {
     fn kind(&self) -> RuntimeBackendKind {
         self.kind
     }
 
     fn start(
         &self,
-        registry: &LaneRegistry,
-        record: &mut LaneRecord,
+        _registry: &LaneRegistry,
+        _record: &mut LaneRecord,
         _spec: &LaneStartSpec,
     ) -> Result<()> {
-        let error = format!(
-            "{} runtime is not implemented; use tmux or inline",
+        bail!(
+            "{} runtime is not available; use tmux or inline",
             self.kind.as_str()
-        );
-        append_log_event(
-            &record.log_path,
-            serde_json::json!({
-                "type": "lane_failed",
-                "lane_id": record.id,
-                "runtime": self.kind.as_str(),
-                "error": &error,
-            }),
-        )?;
-        let _ = registry.mark_terminal_if_active(record, LaneStatus::Failed)?;
-        bail!("{error}")
+        )
     }
 
     fn attach_command(&self, _record: &LaneRecord) -> Option<String> {
@@ -1280,29 +1297,32 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_remote_runtimes_fail_terminally() {
+    fn retired_remote_runtimes_are_rejected_before_a_lane_is_created() {
+        for raw in ["vm", "ci", " VM "] {
+            let error = RuntimeBackendKind::parse(raw).unwrap_err().to_string();
+            assert!(error.contains("not available"), "{error}");
+            assert!(error.contains("tmux or inline"), "{error}");
+        }
+        assert_eq!(
+            RuntimeBackendKind::parse("inline").unwrap(),
+            RuntimeBackendKind::Inline
+        );
+    }
+
+    #[test]
+    fn historical_retired_runtime_records_still_load_and_stop() {
         for kind in [RuntimeBackendKind::Vm, RuntimeBackendKind::Ci] {
             let dir = tempdir().unwrap();
             let reg = LaneRegistry::open(dir.path()).unwrap();
             let mut record = reg
                 .create_pending(None, None, None, None, kind, None)
                 .unwrap();
-            let error = resolve_backend(kind)
-                .start(
-                    &reg,
-                    &mut record,
-                    &LaneStartSpec {
-                        command: vec!["/bin/true".to_string()],
-                        cwd: None,
-                        environment: Vec::new(),
-                        log_proxy: None,
-                        worktree: None,
-                    },
-                )
-                .unwrap_err();
-            assert!(error.to_string().contains("runtime is not implemented"));
-            assert_eq!(record.status, LaneStatus::Failed);
-            assert_eq!(reg.load(&record.id).unwrap().status, LaneStatus::Failed);
+            assert_eq!(reg.list().unwrap().len(), 1, "record must not be skipped");
+            assert_eq!(reg.load(&record.id).unwrap().runtime, kind);
+            resolve_backend(kind)
+                .stop(&reg, &mut record, None)
+                .expect("a retired-runtime record can still be stopped");
+            assert!(resolve_backend(kind).attach_command(&record).is_none());
         }
     }
 
@@ -1337,6 +1357,44 @@ mod tests {
         let log = std::fs::read_to_string(&record.log_path).unwrap();
         assert!(log.contains("inline-ok"), "log={log}");
         assert!(log.contains("lane_completed"));
+    }
+
+    /// Audit R06-05: an inline command that cannot spawn marks the lane
+    /// failed and cleans up the worktree it provisioned. The lane is terminal
+    /// at that point, so no later stop would.
+    #[test]
+    fn inline_spawn_failure_cleans_up_its_worktree() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::worktree::tests::init_repo(&repo);
+        let wt_path = dir.path().join("wt-inline");
+        let reg = LaneRegistry::open(dir.path().join("lanes")).unwrap();
+        let mut record = reg
+            .create_pending(None, None, None, None, RuntimeBackendKind::Inline, Some(0))
+            .unwrap();
+        let result = InlineRuntime.start(
+            &reg,
+            &mut record,
+            &LaneStartSpec {
+                command: vec!["/nonexistent/codewhale-lane-test-binary".into()],
+                cwd: None,
+                environment: Vec::new(),
+                log_proxy: None,
+                worktree: Some(WorktreeProvision {
+                    repo_root: repo,
+                    branch: "codex/lane-spawn-fail".into(),
+                    path: wt_path.clone(),
+                    base_ref: Some("main".into()),
+                }),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(record.status, LaneStatus::Failed);
+        assert!(
+            !wt_path.exists(),
+            "the failed lane's worktree was left behind"
+        );
     }
 
     #[test]

@@ -98,8 +98,8 @@ For code work:
 The checked-in `operate_best_of_n.workflow.js` recipe supports
 `strategy: "search"` for structured 2–16 candidate generation and review. It
 does **not** yet turn prompt-listed commands into hidden runtime gates. Do not
-advertise those gates until the runtime evaluator host consumes a frozen
-`WorkflowSearchSpec`.
+advertise those gates until a runtime evaluator host consumes a frozen search
+spec.
 
 Stop early when one candidate reveals a hard constraint that invalidates the
 tournament. Report the negative result rather than spending the remaining

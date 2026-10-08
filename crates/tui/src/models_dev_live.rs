@@ -46,6 +46,14 @@ pub const ENV_MODELS_DEV_PATH: &str = "CODEWHALE_MODELS_DEV_PATH";
 pub const ENV_DISABLE_FETCH: &str = "CODEWHALE_DISABLE_MODELS_DEV_FETCH";
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
+/// Largest catalog body accepted from the network, an override file, or the
+/// disk cache. The public catalog is a few MiB; anything past this is refused
+/// instead of being read whole into memory.
+const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+/// Clock skew tolerated on a cache timestamp. A `fetched_at` further in the
+/// future than this is not "age zero": it is untrustworthy, so the cache is
+/// published as stale and the next refresh fetches.
+const MAX_CACHE_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
 /// Provenance / freshness of the Models.dev live layer for UI chips (#4187).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -85,7 +93,9 @@ struct PersistedModelsDevCache {
     schema_version: u32,
     /// Unix seconds the payload was fetched (or loaded from an override path).
     fetched_at: u64,
-    /// Fingerprint of the source URL/path used for `CatalogSource::Live`.
+    /// Fingerprint of the source URL/path this body was fetched from. It scopes
+    /// the on-disk cache; it is deliberately not carried on the published rows,
+    /// which describe a model rather than an endpoint (`ModelsDevLive`).
     source_fingerprint: String,
     /// Human-readable source label (URL or `file:…`); never a secret.
     source_label: String,
@@ -163,7 +173,11 @@ pub fn cache_path() -> Option<PathBuf> {
 #[must_use]
 pub fn status() -> ModelsDevStatus {
     let current = STATUS.read().map(|guard| guard.clone()).unwrap_or_default();
-    honor_bundled_staleness(current, crate::model_catalog::bundled_catalog_is_stale())
+    honor_bundled_staleness(
+        current,
+        codewhale_config::catalog::reviewed::bundled_source_fetched_at()
+            .is_none_or(|fetched_at| !within_ttl(fetched_at, now_unix())),
+    )
 }
 
 /// A Bundled-only report whose snapshot is itself past TTL reports `Stale`:
@@ -222,15 +236,19 @@ pub fn maybe_load_persisted_cache() {
     let Some(cache) = load_cache_file(&path) else {
         return;
     };
-    let age = now_unix().saturating_sub(cache.fetched_at);
-    let freshness = if age > DEFAULT_MODELS_DEV_TTL_SECS {
-        ModelsDevFreshness::Stale
-    } else {
+    // Live only when the cache is recent by a trustworthy clock *and* came
+    // from the source this process would fetch now. A cache written for
+    // another mirror or override file still publishes (offline startups keep
+    // rows) but as stale, so the next refresh replaces it.
+    let freshness = if within_ttl(cache.fetched_at, now_unix())
+        && cache.source_fingerprint == current_source_fingerprint()
+    {
         ModelsDevFreshness::Live
+    } else {
+        ModelsDevFreshness::Stale
     };
     if let Err(err) = publish_from_body(
         &cache.body,
-        &cache.source_fingerprint,
         cache.fetched_at,
         cache.source_label.as_str(),
         freshness,
@@ -265,7 +283,7 @@ pub async fn refresh(force_network: bool) -> Result<usize, ModelsDevRefreshError
         if current.freshness == ModelsDevFreshness::Live
             && current
                 .fetched_at
-                .is_some_and(|ts| now_unix().saturating_sub(ts) < DEFAULT_MODELS_DEV_TTL_SECS)
+                .is_some_and(|ts| within_ttl(ts, now_unix()))
         {
             return Ok(current.offering_count);
         }
@@ -281,15 +299,9 @@ pub async fn refresh(force_network: bool) -> Result<usize, ModelsDevRefreshError
     };
     let fetched_at = now_unix();
     let fingerprint = base_url_fingerprint(&url);
-    let count = publish_from_body(
-        &body,
-        &fingerprint,
-        fetched_at,
-        &url,
-        ModelsDevFreshness::Live,
-    )?;
+    let count = publish_from_body(&body, fetched_at, &url, ModelsDevFreshness::Live)?;
     if let Some(path) = cache_path() {
-        let _ = save_cache_file(
+        save_cache_file(
             &path,
             &PersistedModelsDevCache {
                 schema_version: CACHE_SCHEMA_VERSION,
@@ -298,9 +310,33 @@ pub async fn refresh(force_network: bool) -> Result<usize, ModelsDevRefreshError
                 source_label: url,
                 body,
             },
-        );
+        )
+        .inspect_err(|error| mark_failed(error.clone()))?;
     }
     Ok(count)
+}
+
+/// Whether a payload fetched at `fetched_at` is still inside the TTL at
+/// `now`. A timestamp beyond the tolerated clock skew is never fresh: a
+/// saturating age would read it as zero and suppress refresh until the clock
+/// caught up.
+fn within_ttl(fetched_at: u64, now: u64) -> bool {
+    if fetched_at > now.saturating_add(MAX_CACHE_CLOCK_SKEW_SECS) {
+        return false;
+    }
+    now.saturating_sub(fetched_at) <= DEFAULT_MODELS_DEV_TTL_SECS
+}
+
+/// Fingerprint of the source a refresh would read right now: the override
+/// file when `CODEWHALE_MODELS_DEV_PATH` is set, else the catalog URL. Same
+/// derivation `refresh` stores in the cache.
+fn current_source_fingerprint() -> String {
+    match std::env::var(ENV_MODELS_DEV_PATH) {
+        Ok(path) if !path.trim().is_empty() => {
+            base_url_fingerprint(&format!("file:{}", Path::new(path.trim()).display()))
+        }
+        _ => base_url_fingerprint(&resolve_catalog_url()),
+    }
 }
 
 /// Best-effort background refresh: never panics, never blocks callers.
@@ -329,10 +365,9 @@ pub fn spawn_background_refresh() {
 }
 
 async fn refresh_from_path(path: &Path) -> Result<usize, ModelsDevRefreshError> {
-    let body = match tokio::fs::read_to_string(path).await {
+    let body = match read_catalog_file(path).await {
         Ok(body) => body,
-        Err(err) => {
-            let mapped = ModelsDevRefreshError::Io(err.to_string());
+        Err(mapped) => {
             mark_failed(mapped.clone());
             return Err(mapped);
         }
@@ -340,15 +375,9 @@ async fn refresh_from_path(path: &Path) -> Result<usize, ModelsDevRefreshError> 
     let fetched_at = now_unix();
     let label = format!("file:{}", path.display());
     let fingerprint = base_url_fingerprint(&label);
-    let count = publish_from_body(
-        &body,
-        &fingerprint,
-        fetched_at,
-        &label,
-        ModelsDevFreshness::Live,
-    )?;
+    let count = publish_from_body(&body, fetched_at, &label, ModelsDevFreshness::Live)?;
     if let Some(cache) = cache_path() {
-        let _ = save_cache_file(
+        save_cache_file(
             &cache,
             &PersistedModelsDevCache {
                 schema_version: CACHE_SCHEMA_VERSION,
@@ -357,7 +386,8 @@ async fn refresh_from_path(path: &Path) -> Result<usize, ModelsDevRefreshError> 
                 source_label: label,
                 body,
             },
-        );
+        )
+        .inspect_err(|error| mark_failed(error.clone()))?;
     }
     Ok(count)
 }
@@ -381,15 +411,60 @@ async fn fetch_catalog_body(url: &str) -> Result<String, ModelsDevRefreshError> 
         return Err(ModelsDevRefreshError::HttpStatus(status.as_u16()));
     }
 
-    response
-        .text()
+    read_catalog_response(response, MAX_CATALOG_BYTES).await
+}
+
+fn oversized_catalog(limit: usize) -> ModelsDevRefreshError {
+    ModelsDevRefreshError::InvalidResponse(format!("catalog exceeds {limit} bytes"))
+}
+
+/// Read a catalog response body without ever holding more than `limit` bytes.
+async fn read_catalog_response(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<String, ModelsDevRefreshError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(oversized_catalog(limit));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|err| ModelsDevRefreshError::Network(err.to_string()))
+        .map_err(|err| ModelsDevRefreshError::Network(err.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(oversized_catalog(limit));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| ModelsDevRefreshError::InvalidResponse("catalog is not UTF-8".into()))
+}
+
+/// Read an override catalog file, refusing one larger than the catalog limit.
+async fn read_catalog_file(path: &Path) -> Result<String, ModelsDevRefreshError> {
+    use tokio::io::AsyncReadExt as _;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| ModelsDevRefreshError::Io(err.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CATALOG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|err| ModelsDevRefreshError::Io(err.to_string()))?;
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(oversized_catalog(MAX_CATALOG_BYTES));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| ModelsDevRefreshError::InvalidResponse("catalog is not UTF-8".into()))
 }
 
 fn publish_from_body(
     body: &str,
-    fingerprint: &str,
     fetched_at: u64,
     source_label: &str,
     freshness: ModelsDevFreshness,
@@ -399,7 +474,9 @@ fn publish_from_body(
         mark_failed(mapped.clone());
         mapped
     })?;
-    let offerings = live_offerings_from_models_dev(&catalog, fingerprint, fetched_at);
+    // The source fingerprint scopes the *disk cache*, not the rows: a
+    // models.dev row describes a model, not an endpoint (`ModelsDevLive`).
+    let offerings = live_offerings_from_models_dev(&catalog, fetched_at);
     if offerings.is_empty() {
         let err = ModelsDevRefreshError::EmptyCatalog;
         mark_failed(err.clone());
@@ -435,7 +512,20 @@ fn mark_failed(err: ModelsDevRefreshError) {
 /// with an escaped body) formats. Returns metadata and the *unescaped* body
 /// without copying it in the v2 path.
 fn load_cache_file(path: &Path) -> Option<PersistedModelsDevCache> {
-    let bytes = std::fs::read(path).ok()?;
+    use std::io::Read as _;
+
+    // Header line plus body; a larger file is not ours to trust or to read
+    // whole, so the bundled rows stand instead.
+    const MAX_CACHE_FILE_BYTES: u64 = MAX_CATALOG_BYTES as u64 + 64 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_CACHE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CACHE_FILE_BYTES {
+        return None;
+    }
     // v2: single-line JSON header terminated by a newline, then the verbatim
     // catalog body. One small parse, zero body copies.
     if bytes.first() == Some(&b'{') && bytes.contains(&b'\n') {
@@ -491,18 +581,16 @@ pub(crate) fn offerings_from_json_for_test(
     body: &str,
 ) -> Result<Vec<codewhale_config::catalog::CatalogOffering>, String> {
     let catalog = ModelsDevCatalog::parse_json(body).map_err(|e| e.to_string())?;
-    Ok(live_offerings_from_models_dev(
-        &catalog,
-        "test-fp",
-        1_700_000_000,
-    ))
+    Ok(live_offerings_from_models_dev(&catalog, 1_700_000_000))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiProvider;
-    use crate::provider_lake::{all_catalog_models_for_provider, clear_live_snapshot};
+    use crate::config::ProviderKind;
+    use crate::provider_lake::{
+        all_catalog_models_for_provider, clear_live_snapshot, lock_live_snapshot,
+    };
     use crate::test_support::{EnvVarGuard, lock_test_env};
     use codewhale_config::catalog::CatalogSource;
 
@@ -600,15 +688,19 @@ mod tests {
         assert!(providers.contains(&"unknown-gateway"));
         assert!(!providers.contains(&"togetherai"));
         assert!(!providers.contains(&"moonshotai"));
+        // Layer 10, not layer 20: a refresh of a public catalog is external
+        // enrichment about a model, not a provider's answer about an endpoint,
+        // so it stays correctable by the signed layer above it.
         assert!(
             rows.iter()
-                .all(|r| matches!(r.source, CatalogSource::Live { .. }))
+                .all(|r| matches!(r.source, CatalogSource::ModelsDevLive { .. }))
         );
     }
 
     #[test]
     fn publish_from_path_updates_provider_lake() {
         let _lock = lock_test_env();
+        let _live = lock_live_snapshot();
         clear_live_snapshot();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("catalog.json");
@@ -625,12 +717,12 @@ mod tests {
         let count = rt.block_on(refresh(true)).expect("refresh from path");
         assert!(count >= 2);
 
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(
             together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"),
             "Together lake missing live Models.dev row: {together:?}"
         );
-        let moonshot = all_catalog_models_for_provider(ApiProvider::Moonshot);
+        let moonshot = all_catalog_models_for_provider(ProviderKind::Moonshot);
         assert!(
             moonshot.iter().any(|m| m == "kimi-k2.5"),
             "Moonshot lake missing live Models.dev row: {moonshot:?}"
@@ -681,6 +773,7 @@ mod tests {
     #[test]
     fn invalid_json_keeps_bundled_and_marks_failed() {
         let _lock = lock_test_env();
+        let _live = lock_live_snapshot();
         clear_live_snapshot();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bad.json");
@@ -689,7 +782,7 @@ mod tests {
         let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path().join("home"));
         let _path = EnvVarGuard::set(ENV_MODELS_DEV_PATH, &path);
 
-        let before = all_catalog_models_for_provider(ApiProvider::Together);
+        let before = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(!before.is_empty(), "bundled Together rows required");
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -699,7 +792,7 @@ mod tests {
         let err = rt.block_on(refresh(true)).expect_err("bad json");
         assert!(matches!(err, ModelsDevRefreshError::InvalidResponse(_)));
 
-        let after = all_catalog_models_for_provider(ApiProvider::Together);
+        let after = all_catalog_models_for_provider(ProviderKind::Together);
         assert_eq!(after, before, "bundled rows must survive parse failure");
         let st = status();
         assert_eq!(st.freshness, ModelsDevFreshness::Failed);
@@ -710,6 +803,7 @@ mod tests {
     #[test]
     fn stale_disk_cache_still_publishes() {
         let _lock = lock_test_env();
+        let _live = lock_live_snapshot();
         clear_live_snapshot();
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
@@ -731,14 +825,89 @@ mod tests {
         let st = status();
         assert_eq!(st.freshness, ModelsDevFreshness::Stale);
         assert!(st.offering_count >= 2);
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"));
         clear_live_snapshot();
     }
 
     #[test]
+    fn a_future_or_foreign_cache_is_never_live() {
+        let now = 2_000_000_000;
+        assert!(within_ttl(now - 60, now));
+        assert!(within_ttl(now + 30, now), "small skew is tolerated");
+        assert!(
+            !within_ttl(now + 3 * 24 * 60 * 60, now),
+            "a future timestamp is not age zero"
+        );
+        assert!(!within_ttl(now - DEFAULT_MODELS_DEV_TTL_SECS - 1, now));
+
+        let _lock = lock_test_env();
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+        let _path = EnvVarGuard::remove(ENV_MODELS_DEV_PATH);
+        let _url = EnvVarGuard::remove(ENV_MODELS_DEV_URL);
+        let cache_dir = home.join("catalog");
+        std::fs::create_dir_all(&cache_dir).expect("mkdir");
+        let cache = cache_dir.join(CACHE_FILE);
+
+        // Fresh by the clock, but fetched from another source.
+        let foreign = PersistedModelsDevCache {
+            schema_version: CACHE_SCHEMA_VERSION,
+            fetched_at: now_unix(),
+            source_fingerprint: base_url_fingerprint("https://mirror.example/catalog.json"),
+            source_label: "https://mirror.example/catalog.json".into(),
+            body: FIXTURE.into(),
+        };
+        save_cache_file(&cache, &foreign).expect("save");
+        maybe_load_persisted_cache();
+        assert_eq!(status().freshness, ModelsDevFreshness::Stale);
+
+        // From the current source, but stamped far in the future.
+        let future = PersistedModelsDevCache {
+            fetched_at: now_unix() + 30 * 24 * 60 * 60,
+            source_fingerprint: base_url_fingerprint(MODELS_DEV_CATALOG_URL),
+            source_label: MODELS_DEV_CATALOG_URL.into(),
+            ..foreign.clone()
+        };
+        save_cache_file(&cache, &future).expect("save");
+        maybe_load_persisted_cache();
+        assert_eq!(status().freshness, ModelsDevFreshness::Stale);
+
+        // The same cache stamped now is live.
+        let current = PersistedModelsDevCache {
+            fetched_at: now_unix(),
+            ..future
+        };
+        save_cache_file(&cache, &current).expect("save");
+        maybe_load_persisted_cache();
+        assert_eq!(status().freshness, ModelsDevFreshness::Live);
+        clear_live_snapshot();
+    }
+
+    #[test]
+    fn an_oversized_override_catalog_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge.json");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(MAX_CATALOG_BYTES as u64 + 1)
+            .expect("sparse size");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let error = rt
+            .block_on(read_catalog_file(&path))
+            .expect_err("oversized catalog must be refused");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
     fn network_failure_keeps_prior_rows_and_marks_failed() {
         let _lock = lock_test_env();
+        let _live = lock_live_snapshot();
         clear_live_snapshot();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("catalog.json");
@@ -762,7 +931,7 @@ mod tests {
         let err = rt.block_on(refresh(true)).expect_err("dead URL");
         assert!(matches!(err, ModelsDevRefreshError::Network(_)));
 
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(
             together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"),
             "prior live rows must survive network failure"

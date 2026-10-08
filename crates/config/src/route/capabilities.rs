@@ -65,40 +65,11 @@ pub(crate) fn documented_server_side_web_search(
 ) -> CapabilityState {
     let provider_id = provider_id.trim().to_ascii_lowercase();
     let wire_model_id = wire_model_id.trim().to_ascii_lowercase();
-    let supported = match provider_id.as_str() {
-        "openai" => matches!(
-            wire_model_id.as_str(),
-            "gpt-5.6" | "gpt-5.5" | "gpt-5.4" | "gpt-4.1" | "gpt-4.1-mini" | "o4-mini"
-        ),
-        "anthropic" => matches!(
-            wire_model_id.as_str(),
-            "claude-fable-5"
-                | "claude-opus-4-8"
-                | "claude-mythos-5"
-                | "claude-mythos-preview"
-                | "claude-opus-4-7"
-                | "claude-opus-4-6"
-                | "claude-sonnet-5"
-                | "claude-sonnet-4-6"
-        ),
-        "xai" => matches!(wire_model_id.as_str(), "grok-4.6" | "grok-4.5"),
-        "xiaomi-mimo" => matches!(wire_model_id.as_str(), "mimo-v2.5-pro" | "mimo-v2.5"),
-        "zai" => matches!(
-            wire_model_id.as_str(),
-            "glm-5.3" | "glm-5.3-flash" | "glm-5.2" | "glm-5.1" | "glm-5-turbo"
-        ),
-        "modelstudio-token-plan" => matches!(
-            wire_model_id.as_str(),
-            "qwen3.8-max" | "qwen3.7-plus" | "qwen3.7-max"
-        ),
-        "deepseek" => matches!(
-            wire_model_id.as_str(),
-            "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-v4-flash-vision-exp"
-        ),
-        "moonshot" => matches!(wire_model_id.as_str(), "kimi-k3" | "kimi-k2.6"),
-        _ => false,
-    };
-    if supported {
+    if crate::catalog::reviewed::bundled_reviewed()
+        .search_models
+        .get(&provider_id)
+        .is_some_and(|models| models.contains(&wire_model_id))
+    {
         CapabilityState::Supported
     } else {
         CapabilityState::Unknown
@@ -140,10 +111,7 @@ pub(crate) fn documented_moonshot_web_search_for_route(
     }
     let model = wire_model_id.trim().to_ascii_lowercase();
     if crate::provider::is_exact_kimi_code_route(provider, base_url)
-        && matches!(
-            model.as_str(),
-            "k3" | "k3-256k" | "kimi-for-coding" | "kimi-for-coding-highspeed"
-        )
+        && crate::catalog::reviewed::route_model_set_contains("kimi_membership_search", &model)
     {
         return CapabilityState::Supported;
     }
@@ -151,6 +119,78 @@ pub(crate) fn documented_moonshot_web_search_for_route(
         return documented_server_side_web_search("moonshot", &model);
     }
     CapabilityState::Unknown
+}
+
+/// Return the provider Files API fact for exact DeepSeek direct offerings.
+///
+/// DeepSeek stores one uploaded image per account (`purpose=user_data`) and
+/// both Codewhale DeepSeek wire dialects can reference the returned
+/// `file-api-…` id, but only on the exact official hosts: a custom
+/// DeepSeek-compatible base URL, an aggregator row, or a neighboring model id
+/// stays [`CapabilityState::Unknown`].
+///
+/// Source: <https://api-docs.deepseek.com/guides/files_api> (verified 2026-09-17)
+#[must_use]
+pub(crate) fn documented_deepseek_files_api_for_route(
+    provider: ProviderKind,
+    wire_model_id: &str,
+    base_url: &str,
+) -> CapabilityState {
+    if !is_official_deepseek_route(provider, base_url) {
+        return CapabilityState::Unknown;
+    }
+    let model = wire_model_id.trim().to_ascii_lowercase();
+    if crate::catalog::reviewed::route_model_set_contains("deepseek_files", &model) {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::Unknown
+    }
+}
+
+/// Return the image-input fact for exact DeepSeek direct Flash routes.
+///
+/// DeepSeek's Vision guide documents image input for `deepseek-flash` over
+/// Chat Completions, Responses *and* Messages; the legacy `deepseek-v4-flash`
+/// and `deepseek-v4-flash-vision-exp` ids are served by the same model
+/// (verified 2026-09-23, #6421). The curated offering rows are scoped to the
+/// canonical `deepseek` provider and its OpenAI-compatible hosts, so the
+/// Messages route — `deepseek-anthropic`, or canonical DeepSeek with
+/// `wire = "anthropic"` (the `/anthropic` base URL) — needs this route-aware
+/// projection. A custom compatible host or any other model stays `Unknown`.
+#[must_use]
+pub(crate) fn documented_deepseek_image_input_for_route(
+    provider: ProviderKind,
+    wire_model_id: &str,
+    base_url: &str,
+) -> CapabilityState {
+    if !is_official_deepseek_route(provider, base_url) {
+        return CapabilityState::Unknown;
+    }
+    let model = wire_model_id.trim().to_ascii_lowercase();
+    if crate::catalog::reviewed::route_model_set_contains("deepseek_image", &model) {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::Unknown
+    }
+}
+
+/// A DeepSeek provider kind on one of DeepSeek's own hosts, in either wire
+/// dialect.
+fn is_official_deepseek_route(provider: ProviderKind, base_url: &str) -> bool {
+    if !matches!(
+        provider,
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+    ) {
+        return false;
+    }
+    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "https://api.deepseek.com"
+            | "https://api.deepseek.com/v1"
+            | "https://api.deepseek.com/beta"
+            | "https://api.deepseek.com/anthropic"
+    )
 }
 
 /// Capability facts owned by one provider/model route offering.
@@ -165,6 +205,10 @@ pub struct RouteCapabilities {
     /// Whether the exact offering explicitly accepts image input.
     #[serde(default)]
     pub image_input: CapabilityState,
+    /// Whether the exact offering supports the provider's Files API (upload
+    /// once, reference the returned id from later turns).
+    #[serde(default)]
+    pub files_api: CapabilityState,
     #[serde(default)]
     pub reasoning: CapabilityState,
     #[serde(default)]
@@ -270,6 +314,64 @@ mod tests {
                 documented_server_side_web_search(provider, model),
                 CapabilityState::Unknown,
                 "{provider}/{model} must not inherit a capability by similarity"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_files_api_fact_is_exact_to_model_and_host() {
+        for provider in [ProviderKind::Deepseek, ProviderKind::DeepseekAnthropic] {
+            for base_url in [
+                "https://api.deepseek.com",
+                "https://api.deepseek.com/v1",
+                "https://api.deepseek.com/beta",
+                "https://api.deepseek.com/anthropic/",
+            ] {
+                for model in ["deepseek-flash", "deepseek-v4-flash"] {
+                    assert_eq!(
+                        documented_deepseek_files_api_for_route(provider, model, base_url),
+                        CapabilityState::Supported,
+                        "{provider:?}/{model}/{base_url}"
+                    );
+                }
+            }
+        }
+        for (provider, model, base_url) in [
+            (
+                ProviderKind::Deepseek,
+                "deepseek-v4-pro",
+                "https://api.deepseek.com",
+            ),
+            (
+                ProviderKind::Deepseek,
+                "deepseek-v4-flash-vision-exp",
+                "https://api.deepseek.com",
+            ),
+            (
+                ProviderKind::Deepseek,
+                "deepseek-v5-future",
+                "https://api.deepseek.com",
+            ),
+            (
+                ProviderKind::Deepseek,
+                "deepseek-flash",
+                "https://compatible.example.test/v1",
+            ),
+            (
+                ProviderKind::Deepseek,
+                "deepseek-flash",
+                "https://api.deepseek.com.example.test/v1",
+            ),
+            (
+                ProviderKind::Openrouter,
+                "deepseek/deepseek-v4-flash",
+                "https://openrouter.ai/api/v1",
+            ),
+        ] {
+            assert_eq!(
+                documented_deepseek_files_api_for_route(provider, model, base_url),
+                CapabilityState::Unknown,
+                "{provider:?}/{model}/{base_url} must not inherit the Files API fact"
             );
         }
     }

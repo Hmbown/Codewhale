@@ -1,6 +1,6 @@
 {
   "name": "@codewhale/runtime-sdk",
-  "version": "0.9.11",
+  "version": "0.10.1",
   "description": "Typed JavaScript helpers for Codewhale Runtime API Fleet endpoints.",
   "license": "MIT",
   "type": "module",
@@ -19,7 +19,11 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs && node --check index.js"
+    "test": "node --test test/*.test.mjs && node --check index.js && npm run test:types",
+    "test:types": "tsc --noEmit --strict --target ES2022 --module NodeNext test/thread-events.types.ts"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=18"

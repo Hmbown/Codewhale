@@ -25,12 +25,9 @@ export const chrome: ChromeDict = {
   navCommunity: "Comunitat",
   navContribute: "Col·laborar",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
+  navProduct: "Producte",
+  navModels: "Models",
+  navPlugins: "Plugins",
 
   skipToContent: "Salta al contingut principal",
 
@@ -40,30 +37,8 @@ export const chrome: ChromeDict = {
   installCta: "Instal·la →",
 
   authSignIn: "Inicia la sessió",
-  authRegister: "Registra't",
-  authGroupAria: "Compte",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "qualsevol model, a la teva màquina",
-
-  issueLabel: "Edició del {date}",
   dateLocale: "ca-ES",
-
-  starsAria: "Estrelles a GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "En directe",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "fusionat",
-  tickerOpened: "obert",
-  tickerClosed: "tancat",
-  tickerReleased: "publicat",
-  tickerFirstContribution: "primera contribució",
-  tickerBy: "per {handle}",
-  tickerAria: "Activitat recent del repositori",
-
-  traceLabel: "traça de raonament",
-  traceTabsAria: "Extractes de sessió",
 
   menuOpen: "Obre el menú",
   menuClose: "Tanca el menú",
@@ -71,11 +46,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "clar",
   themeDark: "fosc",
-  themeAria: "Tema de la documentació: {mode} (fes clic per canviar)",
-  themeTitle: "Tema de la documentació · auto / clar / fosc",
+  themeAria: "Tema: {mode} (fes clic per canviar)",
+  themeTitle: "Tema · auto / clar / fosc",
 
   footerTagline:
-    "Codewhale s’immergeix a les profunditats per tu — documentació, codi font i comunitat del runtime de codi obert.",
+    "Edita codi, executa proves i revisa canvis amb els models que triïs.",
   footerProduct: "Producte",
   footerProject: "Projecte",
   footerDocs: "Documentació",
@@ -87,7 +62,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "Col·laborar",
   footerLicense: "Llicència MIT",
-  footerPricing: "Preus",
   footerTerms: "Termes del servei",
   footerPrivacy: "Privadesa",
   footerChangelog: "Registre de canvis",

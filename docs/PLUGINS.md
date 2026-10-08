@@ -1,9 +1,14 @@
 # Installing plugins
 
+> 阅读简体中文版：[zh_hans/PLUGINS.md](zh_hans/PLUGINS.md)。
+
+To create a bundle, start with [Write your first Codewhale plugin](PLUGIN_AUTHORING.md)
+and its runnable Skills example.
+
 This is the walkthrough for the `/plugin install` on-ramp (v0.9.4, #5182).
 [PLUGIN_BUNDLES.md](PLUGIN_BUNDLES.md) remains the contract for the bundle
-format (`plugin.json`, compatible `kimi.plugin.json`, or legacy
-`plugin.toml`), discovery, validation, and
+format (`plugin.json`, compatible `kimi.plugin.json` or
+`.claude-plugin/plugin.json`, or legacy `plugin.toml`), discovery, validation, and
 the trust/enable lifecycle — this document covers how bits get onto disk in
 the first place.
 
@@ -13,19 +18,58 @@ hosts) and any marketplace catalogs you have added with `/plugin marketplace add
 It explains the match and gives the next review, enable, or catalog-install
 step, but never installs, trusts, or enables a bundle on its own.
 
-Sending a task also surfaces one quiet toast when the prompt strongly matches
-an installed-but-idle plugin or a catalog candidate you do not have yet — for
-example a prompt about Supabase suggesting `/plugin trust supabase` or
-`/plugin marketplace install <catalog> supabase`. Description-only matches do
-not toast. While you type, a one-line composer CTA (`Install {name} plugin?`)
-offers the same review command after a short debounce; it never auto-installs,
-hides when the plugin is already active, and stays dismissed for that name
-this session. Matching idle or catalog plugins are also appended on send as
-an `<recommended_plugins>` user-turn block (not the pinned system prefix);
-the model can call `request_plugin_install` to surface review for the human
-without changing disk. Codewhale does not invent a remote plugin URL; missing
-plugins are suggested only from catalogs you added. On-disk bundle changes
-still toast `/plugin reload` on send and between turns.
+## How Codewhale offers plugins
+
+Codewhale is helpful about plugins, not pushy. The rules:
+
+- **One proactive surface.** Sending a task can show one quiet toast when the
+  prompt matches an installed-but-idle plugin or a catalog candidate you do
+  not have yet, for example `/plugin trust supabase` or
+  `/plugin marketplace install <catalog> supabase`. Nothing appears while you
+  type, and nothing is appended to your message to advertise plugins.
+- **One switch.** With `contextual_tips` off, no plugin guidance appears
+  anywhere. Required notices and your own `/plugin` commands still work.
+- **One budget.** Plugin offers share the per-session guidance budget with
+  other tips. In the interactive TUI the model can call
+  `request_plugin_install` once per session to ask you to review a plugin the
+  task needs; a second call fails. Exec, ACP, and runtime-API sessions do not
+  get the tool.
+- **Built-ins are never advertised.** Bundled plugins such as Computer Use
+  appear only in `/plugin list` and Extensions.
+- **Specific terms only.** Generic words (accessibility, browser, chrome,
+  docs, screenshot, web, wiki, …) never trigger an offer. The matcher and the
+  marketplace's `check-marketplace.mjs` share one stoplist.
+- **Only what runs here.** Plugins whose `when.os` excludes this OS are not
+  offered.
+- **Review before acting.** A model-requested row offers Review. Its button
+  opens the existing Extensions inventory: Plugins for an installed bundle,
+  Marketplace for a suggestion that is not installed. Nothing is installed,
+  trusted, or enabled by that click. Choose the inventory's explicit action;
+  trust still reviews the exact installed content before activation.
+- **Reversible dismissal.** Esc clears a non-empty draft first, then hides the
+  row for this session only. "Don't suggest again" is the explicit,
+  persisted choice. `/plugin dismissals` lists both kinds, and
+  `/plugin dismissals reset [<name>]` lets suggestions offer a plugin again.
+- **Discovery is passive.** Find new plugins in these docs,
+  `/plugin marketplace list`, Extensions, and the browser guide below.
+
+Codewhale does not invent a remote plugin URL; missing plugins are suggested
+only from catalogs you added. On-disk bundle changes still toast
+`/plugin reload` on send and between turns.
+
+## Browser: pick one
+
+Several options can drive a browser. They differ in whose browser it is and
+what it can see.
+
+| Option | Whose browser | Good for |
+| --- | --- | --- |
+| `chrome-devtools` MCP (`/mcp recommendations`) | A Chrome it drives, which can include signed-in pages | DevTools-level inspection and performance work |
+| Playwright MCP (`/mcp recommendations`) | A fresh, isolated profile with `--isolated` | Scripted flows and testing without your identity |
+| Computer Use `browser_*` tools (bundled, off until reviewed) | One it launches, in a profile of its own | Browser steps inside a wider desktop task |
+| Chromewhale (developer preview, `codewhale-hq/codewhale-plugin-marketplace`) | Yours, already open, in your own Chrome profile; load unpacked | Reading or acting on the tab you are looking at, one granted site at a time |
+
+None of these is offered to you proactively. Add the one that fits the job.
 
 ## Sources
 
@@ -44,12 +88,31 @@ gated by the per-domain network policy: an unknown host returns a
 a denied host aborts without touching disk.
 
 The fetched tree must contain **exactly one** bundle root — a directory
-holding a `plugin.json`, compatible `kimi.plugin.json`, or legacy `plugin.toml`
-manifest. Kimi bundles are accepted when they use Codewhale-compatible Skills,
+holding a `plugin.json`, compatible `kimi.plugin.json`,
+`.claude-plugin/plugin.json`, or legacy `plugin.toml` manifest. Kimi bundles are accepted when they use Codewhale-compatible Skills,
 commands, agents, and MCP declarations; unsupported Kimi runtime fields fail
 closed instead of being silently ignored. Bundles land in
 the user plugins root at `~/.codewhale/plugins/<name>/`, where `<name>` is the
 manifest's plugin name.
+
+Claude bundles keep their metadata in `.claude-plugin/plugin.json` and their
+components at the bundle root. The importer supports skills, commands, agents,
+and MCP servers declared inline or in root `.mcp.json` (flat server map or an
+`mcpServers` wrapper). Claude `http` transport maps to Streamable HTTP. Relative
+sources in a `.claude-plugin/marketplace.json` catalog resolve from the marketplace
+repository root. The whole bundle remains subject to the same review hashes and
+path checks as native plugins.
+
+Remote MCP headers can name credentials without embedding them: exact
+`Bearer ${ENV_NAME}` authorization values become `bearer_token_env_var`, and
+exact `${ENV_NAME}` header values become `env_headers`. Import reads no credential
+values. Literal credentials and compound templates are rejected.
+
+This is a compatible subset: hooks, LSP declarations, custom MCP file paths, and
+`${CLAUDE_PLUGIN_ROOT}` expansion are rejected with an explanation; no partial
+plugin is installed. Installing a remote MCP declaration does not complete its
+authentication. Plugin-contributed remote servers retain the existing explicit
+credential requirements; this importer does not enable plugin OAuth.
 
 ## The guided flow
 
@@ -84,7 +147,9 @@ matching and the plugin goes inactive until you review again.
   changed bundle is swapped atomically and its trust receipt is automatically
   invalidated (the hash no longer matches), so re-review is forced before the
   plugin can activate again. Plugins installed from a local path cannot be
-  re-downloaded — reinstall them with `/plugin install <path>`.
+  re-downloaded. To replace their installed copy, disable and uninstall it,
+  then run `/plugin install <path>` and review the new bundle; the original
+  source directory is left intact. See the [local authoring loop](PLUGIN_AUTHORING.md#4-iterate-and-review-changes).
 - `uninstall` refuses enabled plugins (disable first), deletes the bundle
   directory, and removes its persisted trust/enablement entry.
 

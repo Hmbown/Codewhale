@@ -13,6 +13,11 @@ import {
   publicAuthRemainder,
 } from "./public-auth-routes";
 
+const SHANNON_SANS_SHA256 = "e1abb82e681b502950da1b0f25e10de3eeb329ea6549315d828dbddf53a68951";
+const SHANNON_SANS_BYTES = 531084;
+const SHANNON_OFL_SHA256 = "19c20bff3654a225895067510552ef14ce64bbcdfb90f3ae04957548e9d2cf4f";
+const SHANNON_OFL_BYTES = 4463;
+
 describe("public auth remainders and kinds", () => {
   it("recognizes the observed 404 paths with and without a locale prefix", () => {
     expect(publicAuthRemainder("/signin")).toBe("signin");
@@ -67,5 +72,16 @@ describe("canonical mark", () => {
     const bytes = readFileSync(new URL("../public/brand/codewhale-mark.png", import.meta.url));
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(CANONICAL_MARK_SHA256);
     expect(CANONICAL_MARK_SRC).toBe("/brand/codewhale-mark.png");
+  });
+});
+
+describe("website font assets", () => {
+  it("ships the pinned Shannon Sans face with the complete adjacent OFL notice", () => {
+    const font = readFileSync(new URL("../public/brand/fonts/ShannonSans-Variable.woff2", import.meta.url));
+    const license = readFileSync(new URL("../public/brand/fonts/OFL.txt", import.meta.url));
+    expect(font.length).toBe(SHANNON_SANS_BYTES);
+    expect(createHash("sha256").update(font).digest("hex")).toBe(SHANNON_SANS_SHA256);
+    expect(license.length).toBe(SHANNON_OFL_BYTES);
+    expect(createHash("sha256").update(license).digest("hex")).toBe(SHANNON_OFL_SHA256);
   });
 });

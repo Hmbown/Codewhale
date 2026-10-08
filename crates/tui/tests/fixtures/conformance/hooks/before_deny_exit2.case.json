@@ -1,0 +1,19 @@
+{
+  "description": "tool_call_before: the legacy hard deny — exit code 2 with no JSON — refuses with the generic reason.",
+  "event": "tool_call_before",
+  "model": "deepseek-v4-pro",
+  "tool": {
+    "name": "Bash",
+    "call_id": "call_hook_bash",
+    "input": {
+      "command": "rm -rf build"
+    }
+  },
+  "hooks": [
+    {
+      "event": "tool_call_before",
+      "name": "legacy",
+      "command": "{{capture}} legacy; echo 'blocked by a legacy hook' >&2; exit 2"
+    }
+  ]
+}

@@ -61,7 +61,14 @@ pub enum ToolError {
     #[error("Failed to resolve path '{}': path escapes workspace", path.display())]
     PathEscape { path: PathBuf },
     #[error("Failed to execute tool: {message}")]
-    ExecutionFailed { message: String },
+    ExecutionFailed {
+        message: String,
+        /// Structured facts about the failure, in the same shape a
+        /// `ToolResult` would carry them. A process-backed tool that reports a
+        /// nonzero exit or a timeout as an error puts its `exit_code` and
+        /// `status` here, so observers (hooks, receipts) still see them.
+        metadata: Option<Value>,
+    },
     #[error("Failed to execute tool: operation timed out after {seconds}s")]
     Timeout { seconds: u64 },
     #[error("Tool execution cancelled: {message}")]
@@ -91,6 +98,26 @@ impl ToolError {
     pub fn execution_failed(msg: impl Into<String>) -> Self {
         Self::ExecutionFailed {
             message: msg.into(),
+            metadata: None,
+        }
+    }
+
+    /// An execution failure that still carries structured result metadata,
+    /// such as a shell command's `exit_code` and `status`.
+    #[must_use]
+    pub fn execution_failed_with_metadata(msg: impl Into<String>, metadata: Value) -> Self {
+        Self::ExecutionFailed {
+            message: msg.into(),
+            metadata: Some(metadata),
+        }
+    }
+
+    /// Structured metadata the failing tool attached, if any.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&Value> {
+        match self {
+            Self::ExecutionFailed { metadata, .. } => metadata.as_ref(),
+            _ => None,
         }
     }
 
@@ -134,6 +161,11 @@ pub struct ToolResult {
 }
 
 /// Provider-neutral non-text content returned alongside a tool result.
+/// Image-producing tools return owned base64 bytes here (MCP uses its standard
+/// `content` image blocks). A path in `ToolResult.metadata` is descriptive
+/// metadata, never permission for the engine to read another host file.
+/// The runtime validates format, full decode and size, retains one image per
+/// result, and keeps omitted-image receipts with the text result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolResultContentBlock {
@@ -274,6 +306,29 @@ pub fn optional_str<'a>(
         .ok_or_else(|| type_mismatch(field, value, "a string"))
 }
 
+/// Read a JSON number as a non-negative integer, accepting whole-number
+/// floats such as `200.0`.
+///
+/// Several providers serialize every JSON number as a float, so a ranged
+/// `read` arrives as `{"offset": 200.0}`. Exact integers keep the `as_u64`
+/// fast path (so `u64::MAX` stays exact); a float is accepted only when it
+/// is finite, non-negative, has no fractional part and fits in `u64`.
+/// Negative, fractional, string and array values are still refused.
+#[must_use]
+pub fn json_nonnegative_integer(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    let float = value.as_f64()?;
+    // 2^64 is exactly representable as f64; anything at or above it overflows.
+    const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+    if float.is_finite() && float >= 0.0 && float.fract() == 0.0 && float < U64_LIMIT {
+        // The guards above make this cast exact.
+        return Some(float as u64);
+    }
+    None
+}
+
 /// Helper to extract a required u64 field from JSON input.
 ///
 /// Absence (field missing or `null`) is a `missing_field` error; a value
@@ -286,8 +341,7 @@ pub fn required_u64(input: &Value, field: &str) -> std::result::Result<u64, Tool
         return Err(ToolError::missing_field(field));
     }
     let value = value.expect("is_absent covers the None case");
-    value
-        .as_u64()
+    json_nonnegative_integer(value)
         .ok_or_else(|| type_mismatch(field, value, "a non-negative integer"))
 }
 
@@ -304,8 +358,7 @@ pub fn optional_u64(
         return Ok(default);
     }
     let value = value.expect("is_absent covers the None case");
-    value
-        .as_u64()
+    json_nonnegative_integer(value)
         .ok_or_else(|| type_mismatch(field, value, "a non-negative integer"))
 }
 
@@ -562,11 +615,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Return the configured specs for every registered tool.
-    pub fn list_specs(&self) -> Vec<ConfiguredToolDescriptor> {
-        self.specs.values().cloned().collect()
-    }
-
     /// Validate and execute a tool call.
     ///
     /// Looks up the tool by name, verifies the payload kind matches the
@@ -773,9 +821,27 @@ mod tests {
             u64::MAX
         );
 
+        // Whole-number floats are integers some providers send as `200.0`.
+        assert_eq!(
+            required_u64(&json!({"count": 200.0}), "count").unwrap(),
+            200
+        );
+        assert_eq!(required_u64(&json!({"count": 0.0}), "count").unwrap(), 0);
+        assert_eq!(
+            optional_u64(&json!({"count": 200.0}), "count", 7).unwrap(),
+            200
+        );
+
         // Present but wrongly typed is a type mismatch naming the field and
-        // the expected type — never a missing-field misdirection.
-        for value in [json!(-1), json!(2.5), json!("42")] {
+        // the expected type — never a missing-field misdirection. Floats that
+        // are negative, fractional or beyond u64 stay refused.
+        for value in [
+            json!(-1),
+            json!(-1.0),
+            json!(2.5),
+            json!(1.8446744073709552e19),
+            json!("42"),
+        ] {
             let err = required_u64(&json!({"count": value}), "count")
                 .expect_err("wrong type must not look missing")
                 .to_string();
@@ -850,7 +916,7 @@ mod tests {
         let err = ToolError::execution_failed("process crashed");
 
         assert!(
-            matches!(err, ToolError::ExecutionFailed { ref message } if message == "process crashed")
+            matches!(err, ToolError::ExecutionFailed { ref message, .. } if message == "process crashed")
         );
         assert_eq!(err.to_string(), "Failed to execute tool: process crashed");
     }

@@ -2,7 +2,7 @@ import { DocsBreadcrumb } from "@/components/docs-breadcrumb";
 import { DocsHelp } from "@/components/docs-help";
 import { DocsSidebar } from "@/components/docs-sidebar";
 import { ReleaseTruth } from "@/components/release-truth";
-import { Whale } from "@/components/whale";
+import { WhalePose } from "@/components/whale-pose";
 import { BUILD_FACTS, getFactsWithProvenance } from "@/lib/facts";
 import { getDocsShell } from "@/lib/i18n/dictionaries";
 
@@ -40,7 +40,7 @@ export default async function DocsLayout({
       <section className="hero">
         <div className="portal-container docs-portal-band">
           <div className="portal-mark">
-            <Whale size={28} />
+            <WhalePose pose="read" className="portal-mark-pose" priority />
             <span>{t.portalMark}</span>
           </div>
           <ReleaseTruth locale={locale} facts={facts} />

@@ -1,15 +1,20 @@
 //! `/statusline` multi-select picker.
 //!
 //! Mirrors codex-rs's `bottom_pane::status_line_setup` ergonomically: a
-//! checklist of footer items the user can toggle on/off with Space (or
-//! Enter), reordered by ↑/↓, applied immediately so the live footer
+//! checklist of bottom-chrome items the user can toggle on/off with Space (or
+//! Enter), moved through with ↑/↓, applied immediately so the live chrome
 //! reflects every change. Enter saves to `~/.deepseek/config.toml` under
 //! `tui.status_items`; Esc reverts to the snapshot taken on open.
 //!
-//! The picker enumerates [`StatusItem::all`] so adding a new variant in
-//! `crates/tui/src/config.rs` automatically surfaces a new row here.
+//! Every row here changes what is on screen (#5950): the metrics line's
+//! segments ([`crate::tui::ui::frame::info_segments`]) and the posture bar's
+//! mode chip. Between 0.9.12 and that fix the list was persisted and never
+//! read, so the checklist was decoration — a new variant belongs in
+//! `crates/tui/src/config.rs` only once something paints it.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -18,14 +23,14 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
 
-use crate::config::{ApiProvider, StatusItem};
-use crate::localization::{Locale, MessageId, tr};
-use crate::palette;
+use crate::config::{ProviderKind, StatusItem};
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
     render_modal_footer, render_modal_surface,
 };
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette as palette;
 use unicode_width::UnicodeWidthStr;
 
 /// Picker state. We hold both the user's working selection AND the original
@@ -42,23 +47,32 @@ pub struct StatusPickerView {
     /// Snapshot of `app.status_items` at open time so Esc reverts cleanly.
     original: Vec<StatusItem>,
     locale: Locale,
+    row_hitboxes: RefCell<Vec<(usize, Rect)>>,
 }
 
 impl StatusPickerView {
     #[must_use]
-    pub fn new(active: &[StatusItem], provider: ApiProvider, locale: Locale) -> Self {
+    pub fn new(active: &[StatusItem], provider: ProviderKind, locale: Locale) -> Self {
         let rows: Vec<StatusItem> = StatusItem::all()
             .iter()
             .filter(|item| item.is_available_for(provider))
             .copied()
             .collect();
-        let selected: Vec<bool> = rows.iter().map(|item| active.contains(item)).collect();
+        let selected: Vec<bool> = rows
+            .iter()
+            .map(|item| {
+                active.contains(item)
+                    || (active.contains(&StatusItem::SessionMetrics)
+                        && matches!(item, StatusItem::Ttft | StatusItem::OutputRate))
+            })
+            .collect();
         Self {
             rows,
             selected,
             cursor: 0,
             original: active.to_vec(),
             locale,
+            row_hitboxes: RefCell::new(Vec::new()),
         }
     }
 
@@ -73,22 +87,22 @@ impl StatusPickerView {
             .collect()
     }
 
-    fn move_up(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        if self.cursor == 0 {
-            self.cursor = self.rows.len() - 1;
-        } else {
-            self.cursor -= 1;
-        }
-    }
-
-    fn move_down(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        self.cursor = (self.cursor + 1) % self.rows.len();
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Vertical motions wrap at the ends for
+    /// Prev/Next and clamp for paging and Home/End; the horizontal axis does
+    /// not exist on this single-column checklist. The checklist fits on one
+    /// screen, so a page is the whole list.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        let Some(next) = crate::tui::list_nav::apply(
+            self.cursor,
+            self.rows.len(),
+            self.rows.len().max(1),
+            motion,
+        ) else {
+            return false;
+        };
+        self.cursor = next;
+        true
     }
 
     fn toggle_current(&mut self) {
@@ -129,6 +143,14 @@ impl ModalView for StatusPickerView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        // Movement keys come from the shared vocabulary (#6290): `j`/`k`,
+        // Home/End and the page keys mean here what they mean on every other
+        // list. This match owns only the checklist's own verbs.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Esc => {
                 // Roll the live preview back to the snapshot so Esc means
@@ -136,14 +158,6 @@ impl ModalView for StatusPickerView {
                 ViewAction::EmitAndClose(self.revert_event())
             }
             KeyCode::Enter => ViewAction::EmitAndClose(self.final_event()),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                ViewAction::None
-            }
             KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Char('X') => {
                 self.toggle_current();
                 ViewAction::Emit(self.live_preview_event())
@@ -163,6 +177,30 @@ impl ModalView for StatusPickerView {
             }
             _ => ViewAction::None,
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.apply_motion(crate::tui::list_nav::Motion::Prev);
+            }
+            MouseEventKind::ScrollDown => {
+                self.apply_motion(crate::tui::list_nav::Motion::Next);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().find_map(|(index, rect)| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        .then_some(*index)
+                });
+                if let Some(index) = clicked {
+                    self.cursor = index;
+                    self.toggle_current();
+                    return ViewAction::Emit(self.live_preview_event());
+                }
+            }
+            _ => {}
+        }
+        ViewAction::None
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -205,6 +243,7 @@ impl ModalView for StatusPickerView {
             ],
         );
 
+        self.row_hitboxes.borrow_mut().clear();
         let visible_rows = content.height.saturating_sub(2) as usize;
         let row_start = visible_row_start(self.rows.len(), self.cursor, visible_rows);
 
@@ -222,6 +261,15 @@ impl ModalView for StatusPickerView {
             .skip(row_start)
             .take(visible_rows)
         {
+            self.row_hitboxes.borrow_mut().push((
+                idx,
+                Rect::new(
+                    content.x,
+                    content.y + 2 + (idx - row_start) as u16,
+                    content.width,
+                    1,
+                ),
+            ));
             let checked = *self.selected.get(idx).unwrap_or(&false);
             let is_cursor = idx == self.cursor;
             let mark = if checked { "[✓]" } else { "[ ]" };
@@ -294,19 +342,72 @@ fn status_row_text(pointer: &str, mark: &str, item: &StatusItem, width: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::localization::Locale;
+    use codewhale_localization::Locale;
 
     #[test]
     fn opens_with_active_items_pre_selected() {
         let active = StatusItem::default_footer();
-        let view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         assert_eq!(view.current_selection(), active);
+    }
+
+    #[test]
+    fn legacy_metrics_can_be_split_and_cancel_restores_the_saved_pair() {
+        let original = vec![StatusItem::SessionMetrics];
+        let mut view = StatusPickerView::new(&original, ProviderKind::Stepfun, Locale::En);
+        assert_eq!(
+            view.current_selection(),
+            vec![StatusItem::Ttft, StatusItem::OutputRate]
+        );
+        view.cursor = view
+            .rows
+            .iter()
+            .position(|item| *item == StatusItem::OutputRate)
+            .unwrap();
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(view.current_selection(), vec![StatusItem::Ttft]);
+        match view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)) {
+            ViewAction::EmitAndClose(ViewEvent::StatusItemsUpdated { items, final_save }) => {
+                assert_eq!(items, original);
+                assert!(!final_save);
+            }
+            action => panic!("unexpected cancel: {action:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_toggles_the_painted_row_after_scrolling_a_short_picker() {
+        let mut view = StatusPickerView::new(
+            &StatusItem::default_footer(),
+            ProviderKind::Stepfun,
+            Locale::En,
+        );
+        view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 40, 12);
+        view.render(area, &mut Buffer::empty(area));
+        let (index, rect) = *view.row_hitboxes.borrow().last().expect("visible row");
+        let was_selected = view.selected[index];
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 2,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            action,
+            ViewAction::Emit(ViewEvent::StatusItemsUpdated {
+                final_save: false,
+                ..
+            })
+        ));
+        assert_eq!(view.cursor, index);
+        assert_eq!(view.selected[index], !was_selected);
     }
 
     #[test]
     fn space_toggles_current_row_and_emits_live_preview() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         match action {
             ViewAction::Emit(ViewEvent::StatusItemsUpdated { items, final_save }) => {
@@ -320,7 +421,7 @@ mod tests {
     #[test]
     fn enter_emits_final_save() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match action {
             ViewAction::EmitAndClose(ViewEvent::StatusItemsUpdated { final_save, .. }) => {
@@ -333,9 +434,10 @@ mod tests {
     #[test]
     fn esc_reverts_to_snapshot() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        view.move_down();
+        // Move through the shared vocabulary, the same path a key takes.
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         let action = view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         match action {
@@ -350,7 +452,7 @@ mod tests {
     #[test]
     fn select_all_and_select_none_keys_work() {
         let active: Vec<StatusItem> = Vec::new();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         match action {
             ViewAction::Emit(ViewEvent::StatusItemsUpdated { items, .. }) => {
@@ -370,7 +472,7 @@ mod tests {
     #[test]
     fn arrow_keys_wrap_cursor_at_edges() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         assert_eq!(view.cursor, 0);
         view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(view.cursor, StatusItem::all().len() - 1);
@@ -392,25 +494,26 @@ mod tests {
 
     #[test]
     fn selected_row_text_fills_available_width() {
-        let text = status_row_text("▸", "[ ]", &StatusItem::LastToolElapsed, 40);
+        let text = status_row_text("▸", "[ ]", &StatusItem::Cache, 40);
         assert_eq!(text.width(), 40);
-        assert!(text.starts_with(" ▸ [ ] Last tool elapsed"));
+        assert!(text.starts_with(" ▸ [ ] Prompt cache hit rate"));
     }
 
     #[test]
     fn selected_row_text_semantically_truncates_hint_at_narrow_width() {
-        let text = status_row_text("▸", "[ ]", &StatusItem::LastToolElapsed, 49);
-        assert_eq!(text.width(), 49);
-        assert!(text.contains("ms of the most…"), "{text:?}");
-        assert!(!text.contains("ms of the most r"), "{text:?}");
+        let text = status_row_text("▸", "[ ]", &StatusItem::Cache, 44);
+        assert_eq!(text.width(), 44);
+        // Cut at a word boundary, never mid-word.
+        assert!(text.contains("% of…"), "{text:?}");
+        assert!(!text.contains("% of p"), "{text:?}");
     }
 
     #[test]
     fn balance_offered_for_prepaid_providers_and_hidden_for_local() {
         let active = StatusItem::default_footer();
-        let openrouter = StatusPickerView::new(&active, ApiProvider::Openrouter, Locale::En);
+        let openrouter = StatusPickerView::new(&active, ProviderKind::Openrouter, Locale::En);
         assert!(openrouter.rows.contains(&StatusItem::Balance));
-        let ollama = StatusPickerView::new(&active, ApiProvider::Ollama, Locale::En);
+        let ollama = StatusPickerView::new(&active, ProviderKind::Ollama, Locale::En);
         assert!(!ollama.rows.contains(&StatusItem::Balance));
         assert!(ollama.rows.contains(&StatusItem::Mode));
     }
@@ -439,7 +542,7 @@ mod tests {
             let mut stack = ViewStack::new();
             stack.push(StatusPickerView::new(
                 &active,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 Locale::En,
             ));
             stack.render(area, &mut buf);

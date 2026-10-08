@@ -8,7 +8,12 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+#[cfg(test)]
 use std::fs::OpenOptions;
+use std::sync::{Mutex, OnceLock};
+
+use super::files::{WorkspaceFile, same_file};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -16,11 +21,68 @@ use anyhow::{Context, Result, bail};
 use codewhale_protocol::fleet::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 const FLEET_DIR: &str = ".codewhale";
 const FLEET_LEDGER_FILE: &str = "fleet.jsonl";
 const FLEET_LEDGER_LOCK_FILE: &str = "fleet.lock";
-const PARTIAL_SUFFIX: &str = ".tmp";
+
+/// Path of the ledger file under `workspace`, mirroring [`FleetLedger::open`].
+pub(crate) fn fleet_ledger_path(workspace: &Path) -> PathBuf {
+    workspace.join(FLEET_DIR).join(FLEET_LEDGER_FILE)
+}
+
+/// Process-wide append wakes, one [`Notify`] per ledger file (#6211 R7b).
+/// Ledger managers open per operation, so instances cannot share a channel
+/// handle; the registry joins differently-spelled opens of one file by
+/// canonicalized path. A wake means "re-poll with your cursor" — the cursor
+/// stays the source of truth, so a missed or spurious wake only costs one
+/// extra poll, never lost or duplicated events.
+static FLEET_LEDGER_WAKES: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Notify>>>> =
+    OnceLock::new();
+
+fn fleet_ledger_wake_key(ledger_path: &Path) -> PathBuf {
+    if let Ok(canonical) = ledger_path.canonicalize() {
+        return canonical;
+    }
+    // The ledger file may not exist yet at subscribe time; canonicalize the
+    // parent so both spellings still meet. A fully missing tree falls back
+    // to the raw path on both sides.
+    match ledger_path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(ledger_path.file_name())
+    {
+        Some((parent, name)) => parent.join(name),
+        None => ledger_path.to_path_buf(),
+    }
+}
+
+/// Subscribe to append wakes for the ledger at `ledger_path`. Callers must
+/// still poll on a fallback interval: the registry only sees in-process
+/// appends, and a wake can race the subscriber's last read.
+pub(crate) fn subscribe_fleet_ledger_appends(ledger_path: &Path) -> std::sync::Arc<Notify> {
+    let key = fleet_ledger_wake_key(ledger_path);
+    let mut wakes = FLEET_LEDGER_WAKES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("fleet ledger wake registry poisoned");
+    wakes
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(Notify::new()))
+        .clone()
+}
+
+fn notify_fleet_ledger_append(ledger_path: &Path) {
+    let key = fleet_ledger_wake_key(ledger_path);
+    let notify = FLEET_LEDGER_WAKES
+        .get()
+        .and_then(|wakes| wakes.lock().ok())
+        .and_then(|wakes| wakes.get(&key).cloned());
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+}
 
 fn inline_secret_assignment_pattern() -> &'static regex::Regex {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -275,6 +337,9 @@ pub enum FleetEventReplayError {
 #[derive(Debug)]
 pub struct FleetLedger {
     ledger_path: PathBuf,
+    ledger_file: WorkspaceFile,
+    lock_file: WorkspaceFile,
+    original_lock: std::fs::File,
     /// Stable advisory-lock inode shared by every manager for this workspace.
     ///
     /// The ledger itself is replaced during compaction, so locking
@@ -289,24 +354,21 @@ pub struct FleetLedger {
 impl FleetLedger {
     /// Open (or create) the ledger under `workspace/.codewhale/fleet.jsonl`.
     pub fn open(workspace: &Path) -> Result<Self> {
-        let dir = workspace.join(FLEET_DIR);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating fleet ledger dir {}", dir.display()))?;
-        let ledger_path = dir.join(FLEET_LEDGER_FILE);
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&ledger_path)
+        let relative = Path::new(FLEET_DIR).join(FLEET_LEDGER_FILE);
+        let ledger_path = workspace.join(&relative);
+        let ledger_file = WorkspaceFile::open(workspace, &relative, true)?;
+        ledger_file
+            .open_update(true, true)
             .with_context(|| format!("creating fleet ledger {}", ledger_path.display()))?;
-        let lock_path = dir.join(FLEET_LEDGER_LOCK_FILE);
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
+        let lock_path = workspace.join(FLEET_DIR).join(FLEET_LEDGER_LOCK_FILE);
+        let lock_file = ledger_file.sibling(FLEET_LEDGER_LOCK_FILE)?;
+        let original_lock = lock_file
+            .open_update(true, false)
             .with_context(|| format!("creating fleet ledger lock {}", lock_path.display()))?;
         Ok(Self {
+            ledger_file,
+            lock_file,
+            original_lock,
             ledger_path,
             lock_path,
             #[cfg(test)]
@@ -333,13 +395,14 @@ impl FleetLedger {
     }
 
     fn open_lock_file(&self) -> Result<std::fs::File> {
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&self.lock_path)
-            .with_context(|| format!("opening fleet ledger lock {}", self.lock_path.display()))
+        let file = self
+            .lock_file
+            .open_update(false, false)
+            .with_context(|| format!("opening fleet ledger lock {}", self.lock_path.display()))?;
+        if !same_file(&file, &self.original_lock)? {
+            bail!("Fleet ledger lock was replaced; reopen the workspace before continuing");
+        }
+        Ok(file)
     }
 
     fn with_read_lock<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -377,11 +440,9 @@ impl FleetLedger {
             );
             lines.push('\n');
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.ledger_path)
+        let mut file = self
+            .ledger_file
+            .open_update(true, true)
             .with_context(|| format!("opening fleet ledger {}", self.ledger_path.display()))?;
         // A process can die after writing only part of its final JSON record.
         // O_APPEND would otherwise concatenate the next valid record directly
@@ -419,6 +480,10 @@ impl FleetLedger {
             .with_context(|| format!("flushing fleet ledger {}", self.ledger_path.display()))?;
         file.sync_data()
             .with_context(|| format!("syncing fleet ledger {}", self.ledger_path.display()))?;
+        // Wake SSE subscribers after the bytes are durable (#6211 R7b). Every
+        // record kind funnels through here, so a wake only promises "something
+        // changed" — subscribers re-poll with their cursor.
+        notify_fleet_ledger_append(&self.ledger_path);
         Ok(())
     }
 
@@ -1424,11 +1489,13 @@ impl FleetLedger {
         let mut events = Vec::new();
         let mut replay_epoch = "legacy".to_string();
         let mut history_compacted = false;
-        if !self.ledger_path.exists() {
-            return Ok((false, events, history_compacted));
-        }
-        let file = std::fs::File::open(&self.ledger_path)
-            .with_context(|| format!("opening ledger {}", self.ledger_path.display()))?;
+        let file = match self.ledger_file.open_file() {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((false, events, history_compacted));
+            }
+            Err(error) => return Err(error).context("Opening Fleet ledger for replay"),
+        };
         let reader = std::io::BufReader::new(file);
         for (line_no, line) in reader.lines().enumerate() {
             let line = match line {
@@ -1478,11 +1545,11 @@ impl FleetLedger {
 
     fn rebuild_state_unlocked(&self) -> Result<FleetLedgerState> {
         let mut state = FleetLedgerState::default();
-        if !self.ledger_path.exists() {
-            return Ok(state);
-        }
-        let file = std::fs::File::open(&self.ledger_path)
-            .with_context(|| format!("opening ledger {}", self.ledger_path.display()))?;
+        let file = match self.ledger_file.open_file() {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(state),
+            Err(error) => return Err(error).context("Opening Fleet ledger for state rebuild"),
+        };
         let reader = std::io::BufReader::new(file);
         for (line_no, line) in reader.lines().enumerate() {
             let line = match line {
@@ -1561,7 +1628,6 @@ impl FleetLedger {
         self.with_write_lock(|| {
             let state = self.rebuild_state_unlocked()?;
             after_snapshot();
-            let tmp_path = self.ledger_path.with_extension(PARTIAL_SUFFIX);
             let mut lines = vec![serde_json::to_string(&FleetLedgerRecord::ReplayEpoch {
                 epoch: uuid::Uuid::new_v4().simple().to_string(),
             })?];
@@ -1704,36 +1770,14 @@ impl FleetLedger {
             if !contents.is_empty() {
                 contents.push('\n');
             }
-            let mut tmp_file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp_path)
-                .with_context(|| format!("opening Fleet compaction file {}", tmp_path.display()))?;
-            tmp_file
-                .write_all(contents.as_bytes())
-                .with_context(|| format!("writing Fleet compaction file {}", tmp_path.display()))?;
-            tmp_file.flush().with_context(|| {
-                format!("flushing Fleet compaction file {}", tmp_path.display())
-            })?;
-            tmp_file
-                .sync_all()
-                .with_context(|| format!("syncing Fleet compaction file {}", tmp_path.display()))?;
-            drop(tmp_file);
-            std::fs::rename(&tmp_path, &self.ledger_path).with_context(|| {
-                format!(
-                    "replacing Fleet ledger {} from {}",
-                    self.ledger_path.display(),
-                    tmp_path.display()
-                )
-            })?;
-            #[cfg(unix)]
-            if let Some(parent) = self.ledger_path.parent() {
-                std::fs::File::open(parent)
-                    .with_context(|| format!("opening Fleet ledger dir {}", parent.display()))?
-                    .sync_all()
-                    .with_context(|| format!("syncing Fleet ledger dir {}", parent.display()))?;
-            }
+            self.ledger_file
+                .replace(contents.as_bytes())
+                .with_context(|| {
+                    format!(
+                        "atomically compacting Fleet ledger {}",
+                        self.ledger_path.display()
+                    )
+                })?;
             Ok(())
         })
     }
@@ -2553,6 +2597,184 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn ledger_append_wakes_subscribers() {
+        let workspace = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        let appends = subscribe_fleet_ledger_appends(&fleet_ledger_path(workspace.path()));
+        let notified = appends.notified();
+        tokio::pin!(notified);
+        let appended = tokio::task::spawn_blocking(move || {
+            ledger.create_run(&sample_run("run-1")).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut notified)
+            .await
+            .expect("append should wake subscribers");
+        appended.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ledger_wake_is_scoped_to_its_file() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(first.path()).unwrap();
+        let appends = subscribe_fleet_ledger_appends(&fleet_ledger_path(second.path()));
+        ledger.create_run(&sample_run("run-1")).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), appends.notified())
+                .await
+                .is_err(),
+            "an append must not wake another ledger's subscribers"
+        );
+    }
+
+    /// The workspace lock sidecar is created through the confined, private
+    /// file helper: owner-only, never umask-widened.
+    #[cfg(unix)]
+    #[test]
+    fn ledger_lock_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let workspace = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&ledger.lock_path), 0o600);
+        assert_eq!(mode(ledger.path()), 0o600);
+    }
+
+    #[test]
+    fn ledger_rejects_replaced_lock_identity() {
+        let workspace = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        std::fs::remove_file(&ledger.lock_path).unwrap();
+        std::fs::write(&ledger.lock_path, b"").unwrap();
+        assert!(ledger.rebuild_state().is_err());
+        assert!(ledger.compact().is_err());
+    }
+
+    #[test]
+    fn ledger_rejects_hard_linked_ledger_and_lock() {
+        for name in ["fleet.jsonl", "fleet.lock"] {
+            let workspace = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            std::fs::create_dir(workspace.path().join(".codewhale")).unwrap();
+            let canary = outside.path().join("canary.txt");
+            std::fs::write(&canary, b"OUTSIDE_SYNTHETIC_HARD_LINK_CANARY").unwrap();
+            std::fs::hard_link(&canary, workspace.path().join(".codewhale").join(name)).unwrap();
+            assert!(FleetLedger::open(workspace.path()).is_err());
+            assert_eq!(
+                std::fs::read(canary).unwrap(),
+                b"OUTSIDE_SYNTHETIC_HARD_LINK_CANARY"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_rejects_parent_and_final_linked_paths() {
+        use std::os::unix::fs::symlink;
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), workspace.path().join(".codewhale")).unwrap();
+        assert!(FleetLedger::open(workspace.path()).is_err());
+        assert!(!outside.path().join("fleet.jsonl").exists());
+        assert!(!outside.path().join("fleet.lock").exists());
+        for name in ["fleet.jsonl", "fleet.lock"] {
+            for hard_link in [false, true] {
+                let workspace = TempDir::new().unwrap();
+                std::fs::create_dir(workspace.path().join(".codewhale")).unwrap();
+                let outside = TempDir::new().unwrap();
+                let canary = outside.path().join("canary.txt");
+                std::fs::write(&canary, b"OUTSIDE_SYNTHETIC_LEDGER_CANARY").unwrap();
+                let linked = workspace.path().join(".codewhale").join(name);
+                if hard_link {
+                    std::fs::hard_link(&canary, linked).unwrap();
+                } else {
+                    symlink(&canary, linked).unwrap();
+                }
+                assert!(
+                    FleetLedger::open(workspace.path()).is_err(),
+                    "accepted linked {name}"
+                );
+                assert_eq!(
+                    std::fs::read(canary).unwrap(),
+                    b"OUTSIDE_SYNTHETIC_LEDGER_CANARY"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_compaction_ignores_preexisting_temporary_links() {
+        use std::os::unix::fs::symlink;
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        let canary = outside.path().join("canary.txt");
+        std::fs::write(&canary, b"OUTSIDE_SYNTHETIC_COMPACTION_CANARY").unwrap();
+        symlink(&canary, ledger.path().with_extension(".tmp")).unwrap();
+        ledger.compact().unwrap();
+        assert_eq!(
+            std::fs::read(canary).unwrap(),
+            b"OUTSIDE_SYNTHETIC_COMPACTION_CANARY"
+        );
+        assert!(ledger.rebuild_state().unwrap().runs.is_empty());
+        assert!(
+            !std::fs::symlink_metadata(ledger.path())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_rejects_linked_ledger_and_replaced_lock_after_open() {
+        use std::os::unix::fs::symlink;
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        let canary = outside.path().join("canary.txt");
+        std::fs::write(&canary, b"OUTSIDE_SYNTHETIC_LEDGER_CANARY").unwrap();
+        std::fs::remove_file(ledger.path()).unwrap();
+        symlink(&canary, ledger.path()).unwrap();
+        assert!(ledger.compact().is_err());
+        assert!(ledger.rebuild_state().is_err());
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"OUTSIDE_SYNTHETIC_LEDGER_CANARY"
+        );
+        std::fs::remove_file(ledger.path()).unwrap();
+        std::fs::write(ledger.path(), b"").unwrap();
+        std::fs::remove_file(&ledger.lock_path).unwrap();
+        std::fs::write(&ledger.lock_path, b"").unwrap();
+        assert!(ledger.compact().is_err());
+        assert!(ledger.rebuild_state().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_uses_pinned_parent_after_workspace_path_swap() {
+        use std::os::unix::fs::symlink;
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        std::fs::rename(
+            workspace.path().join(".codewhale"),
+            workspace.path().join("retained"),
+        )
+        .unwrap();
+        symlink(outside.path(), workspace.path().join(".codewhale")).unwrap();
+        ledger.compact().unwrap();
+        assert!(
+            std::fs::read(workspace.path().join("retained/fleet.jsonl"))
+                .unwrap()
+                .starts_with(b"{\"record\":\"replay_epoch\"")
+        );
+        assert!(!outside.path().join("fleet.jsonl").exists());
+        assert!(!outside.path().join("fleet.lock").exists());
+    }
+
     fn sample_run(id: &str) -> FleetRun {
         FleetRun {
             id: FleetRunId::from(id),
@@ -2763,6 +2985,7 @@ mod tests {
                     notes: Some("verifier note contained super-secret".to_string()),
                 }),
                 resolved_route: None,
+                saved_session_id: None,
                 effective_permissions: None,
             })
             .unwrap();
@@ -3542,6 +3765,7 @@ mod tests {
             artifacts: Vec::new(),
             score: None,
             resolved_route: None,
+            saved_session_id: None,
             effective_permissions: None,
         };
         assert!(
@@ -3825,6 +4049,7 @@ mod tests {
                 artifacts: vec![],
                 score: None,
                 resolved_route: None,
+                saved_session_id: None,
                 effective_permissions: None,
             })
             .unwrap();
@@ -3940,6 +4165,7 @@ mod tests {
                     artifacts: Vec::new(),
                     score: None,
                     resolved_route: None,
+                    saved_session_id: None,
                     effective_permissions: None,
                 },
             )
@@ -4186,6 +4412,7 @@ mod tests {
             artifacts: vec![],
             score: None,
             resolved_route: None,
+            saved_session_id: None,
             effective_permissions: None,
         };
         ledger.record_receipt(receipt.clone()).unwrap();

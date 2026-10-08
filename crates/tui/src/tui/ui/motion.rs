@@ -110,16 +110,24 @@ pub(crate) fn rail_row_budget(
     terminal_height: u16,
     idle_empty: bool,
 ) -> u16 {
-    let ambient_mark_can_draw =
-        idle_empty && terminal_width >= crate::tui::underwater::AMBIENT_MIN_CHAT_WIDTH;
+    // An explicit work-bar choice takes priority over decorative empty-state
+    // space, just as real transcript content does. Otherwise Ctrl+] can be
+    // accepted while the ambient floor immediately hides its result.
+    let ambient_mark_can_draw = idle_empty
+        && !app.work_surface.explicit_view
+        && terminal_width >= crate::tui::underwater::AMBIENT_MIN_CHAT_WIDTH;
     let chat_floor = if ambient_mark_can_draw {
         crate::tui::underwater::AMBIENT_MIN_CHAT_HEIGHT
     } else {
         MIN_CHAT_HEIGHT
     };
-    let composer_floor = MIN_COMPOSER_HEIGHT.saturating_add(u16::from(
+    let composer_floor = crate::tui::composer_chrome::desired_height(
+        1,
+        0,
+        terminal_height,
+        app.composer_density,
         crate::tui::widgets::composer_enclosure_enabled(app),
-    ));
+    );
     terminal_height
         .saturating_sub(info_row_height_for(terminal_height))
         // The merged Tideline footer is one row (spec §3: slots 6+8
@@ -157,7 +165,17 @@ pub(crate) fn status_animation_interval_ms(app: &App) -> u64 {
     }
 }
 
-pub(crate) fn underwater_animation_interval_ms(app: &App) -> u64 {
+/// Tick interval for the water. `tier` is the draw cadence the frame limiter
+/// enforces this frame: while only ambience moves, the tick lands exactly on
+/// the atmosphere interval the limiter will draw at, so no wake asks for a
+/// frame the limiter then holds. While a turn streams or the user types, the
+/// limiter runs at the interactive cap and the authored ocean cadence rides
+/// inside it unchanged.
+pub(crate) fn underwater_animation_interval_ms(
+    app: &App,
+    tier: crate::tui::display_refresh::DrawCadenceTier,
+) -> u64 {
+    use crate::tui::display_refresh::DrawCadenceTier;
     if app.effective_low_motion_for_status() || app.low_motion {
         crate::tui::display_refresh::adaptive_animation_interval_ms(true)
     } else if app.constrained_frame_rate {
@@ -167,8 +185,11 @@ pub(crate) fn underwater_animation_interval_ms(app: &App) -> u64 {
     } else {
         // Measured display Hz can raise atmosphere cadence on high-Hz
         // panels; missing probe falls back to the ~8 fps floor.
-        crate::tui::display_refresh::adaptive_animation_interval_ms(false)
-            .min(UI_UNDERWATER_ANIMATION_MS)
+        let atmosphere = crate::tui::display_refresh::adaptive_animation_interval_ms(false);
+        match tier {
+            DrawCadenceTier::Atmosphere => atmosphere,
+            DrawCadenceTier::Interactive => atmosphere.min(UI_UNDERWATER_ANIMATION_MS),
+        }
     }
 }
 
@@ -201,8 +222,9 @@ pub(crate) fn animation_interval_ms(
     app: &App,
     status_motion: bool,
     underwater_motion: bool,
+    tier: crate::tui::display_refresh::DrawCadenceTier,
 ) -> u64 {
-    let underwater = underwater_animation_interval_ms(app);
+    let underwater = underwater_animation_interval_ms(app, tier);
     match (status_motion, underwater_motion) {
         (true, true) => status_animation_interval_ms(app).min(underwater),
         (true, false) => status_animation_interval_ms(app),

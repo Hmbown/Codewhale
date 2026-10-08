@@ -1,10 +1,6 @@
 //! Explicit motion modes with semantic (non-animated) fallbacks.
 
-use std::time::Duration;
-
-use crate::tui::frame_rate_limiter::{LOW_MOTION_MIN_FRAME_INTERVAL, MIN_FRAME_INTERVAL};
 use crate::tui::spinner::{BRAILLE_SPINNER_STILL_FRAME, LIVE_STATIC_MARKER};
-use crate::tui::streaming::DEFAULT_STREAM_COMMIT_INTERVAL;
 
 /// How the shell presents motion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,7 +16,6 @@ pub enum MotionMode {
 
 /// Resolved presentation for a live-work marker / spinner cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // spinner presentation enum for MotionPolicy hosts (TUI-DOG-008)
 pub enum SpinnerPresentation {
     /// Use the shared braille animation table.
     Animate,
@@ -61,7 +56,6 @@ impl MotionPolicy {
     }
 
     #[must_use]
-    #[allow(dead_code)] // mode accessor for hosts that store policy not enum (TUI-DOG-008)
     pub fn mode(self) -> MotionMode {
         self.mode
     }
@@ -76,33 +70,13 @@ impl MotionPolicy {
         matches!(self.mode, MotionMode::Full)
     }
 
-    /// Frame-cap interval for the existing render loop limiter.
-    #[must_use]
-    #[allow(dead_code)] // used by FrameRequester::clamp_to_frame_cap (TUI-DOG-008)
-    pub fn min_frame_interval(self) -> Duration {
-        if self.constrained_frame_rate || !matches!(self.mode, MotionMode::Full) {
-            LOW_MOTION_MIN_FRAME_INTERVAL
-        } else {
-            MIN_FRAME_INTERVAL
-        }
-    }
-
     /// Whether the render loop should use its 30 FPS compatibility cap.
     #[must_use]
     pub fn uses_constrained_frame_rate(self) -> bool {
         self.constrained_frame_rate || !matches!(self.mode, MotionMode::Full)
     }
 
-    /// Streaming display-clock interval. Reduced/Still keep the same cadence
-    /// so low motion never becomes an artificial typewriter.
     #[must_use]
-    #[allow(dead_code)] // stream clock; ui still uses DEFAULT_STREAM_COMMIT_INTERVAL (TUI-DOG-008)
-    pub fn stream_commit_interval(self) -> Duration {
-        DEFAULT_STREAM_COMMIT_INTERVAL
-    }
-
-    #[must_use]
-    #[allow(dead_code)] // spinner policy bridge for history/sidebar cutover (TUI-DOG-008)
     pub fn spinner_presentation(self, earned_live_marker: bool) -> SpinnerPresentation {
         match self.mode {
             MotionMode::Full if earned_live_marker => SpinnerPresentation::Animate,
@@ -114,7 +88,6 @@ impl MotionPolicy {
 
     /// Resolve the glyph a widget should paint for a running marker.
     #[must_use]
-    #[allow(dead_code)] // prefer over low_motion bool once callers pass MotionPolicy (TUI-DOG-008)
     pub fn spinner_glyph(
         self,
         animated_frame: &'static str,
@@ -145,14 +118,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reduced_is_semantic_not_slow_typewriter() {
+    fn reduced_uses_calm_markers_without_decorative_motion() {
         let reduced = MotionPolicy::from_settings(true, true, false);
         let full = MotionPolicy::from_settings(false, true, false);
-        assert_eq!(
-            reduced.stream_commit_interval(),
-            full.stream_commit_interval(),
-            "reduced motion must not slow the stream clock"
-        );
+        assert!(full.allows_decorative());
         assert!(!reduced.allows_catch_up_bursts());
         assert!(!reduced.allows_decorative());
         assert_eq!(
@@ -162,14 +131,10 @@ mod tests {
     }
 
     #[test]
-    fn still_disables_spin_but_keeps_display_clock() {
+    fn still_disables_animation_frames_and_uses_static_marker() {
         let still = MotionPolicy::from_settings(false, false, false);
         assert_eq!(still.mode, MotionMode::Still);
         assert!(!still.should_request_animation_frames());
-        assert_eq!(
-            still.stream_commit_interval(),
-            DEFAULT_STREAM_COMMIT_INTERVAL
-        );
         assert_eq!(
             still.spinner_presentation(true),
             SpinnerPresentation::StaticChevron
@@ -185,7 +150,6 @@ mod tests {
         assert!(policy.allows_catch_up_bursts());
         assert!(policy.should_request_animation_frames());
         assert!(policy.uses_constrained_frame_rate());
-        assert_eq!(policy.min_frame_interval(), LOW_MOTION_MIN_FRAME_INTERVAL);
     }
 
     #[test]

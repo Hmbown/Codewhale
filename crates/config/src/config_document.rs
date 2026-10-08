@@ -22,6 +22,54 @@ pub fn mutate_config_document<T, F>(path: &Path, mutate: F) -> Result<T>
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<T>,
 {
+    mutate_config_document_with_migration(path, |doc, _| mutate(doc))
+}
+
+/// [`mutate_config_document`], also handing `mutate` the receipt of the legacy
+/// top-level `base_url` / `api_key` move this same write made, so a caller can
+/// tell a value it just moved from one that was already in its table.
+pub fn mutate_config_document_with_migration<T, F>(path: &Path, mutate: F) -> Result<T>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,
+{
+    mutate_locked(path, mutate).map(|(result, _)| result)
+}
+
+/// [`mutate_config_document`], also returning what undoes exactly this write.
+///
+/// Both halves are taken under the lock: the bytes this call left on disk and
+/// the document as it stood just before `mutate` ran (after this writer's own
+/// one-way repairs), or the file's absence. A caller whose follow-up step is
+/// refused can then take back only its own change with
+/// [`ConfigDocumentUndo::undo`].
+pub fn mutate_config_document_undoable<T, F>(
+    path: &Path,
+    mutate: F,
+) -> Result<(T, ConfigDocumentUndo)>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<T>,
+{
+    mutate_locked(path, |doc, _| mutate(doc))
+}
+
+/// The undoable write, also retaining the migration performed under this same
+/// lock. The caller can validate a captured route against the freshly moved
+/// document before writing its delta; undo still compares the exact written bytes.
+pub fn mutate_config_document_undoable_with_migration<T, F>(
+    path: &Path,
+    mutate: F,
+) -> Result<(T, ConfigDocumentUndo)>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,
+{
+    mutate_locked(path, mutate)
+}
+
+fn mutate_locked<T, F>(path: &Path, mutate: F) -> Result<(T, ConfigDocumentUndo)>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,
+{
+    let requested = path.to_path_buf();
     with_config_write_lock(path, |path| {
         let original = read_optional_config(path)?;
         let mut document = match original.as_deref() {
@@ -36,14 +84,70 @@ where
             _ => toml_edit::DocumentMut::new(),
         };
         heal_extras_nesting(&mut document);
-        let result = mutate(&mut document)?;
+        // Move legacy top-level `base_url` / `api_key` into their provider
+        // tables as part of this write (#6394). Conflicting pairs stay put
+        // unless this very write changes the table side.
+        let moved = crate::legacy_root::apply_to_document(&mut document, None);
+        let conflicts = crate::legacy_root::conflict_snapshot(&document);
+        let restore = original.as_ref().map(|_| document.to_string());
+        let result = mutate(&mut document, &moved)?;
+        crate::legacy_root::settle_conflicts_after_write(&mut document, conflicts);
         let body = document.to_string();
         if original.as_deref() == Some(body.as_str()) || (original.is_none() && body.is_empty()) {
-            return Ok(result);
+            let undo = ConfigDocumentUndo {
+                path: requested,
+                written: original,
+                restore,
+            };
+            return Ok((result, undo));
+        }
+        if moved.changes_file()
+            && let Some(original) = original.as_deref()
+        {
+            crate::note_legacy_root_file_migration(path, original)?;
         }
         persist_locked(path, original.as_deref(), body.as_bytes())?;
-        Ok(result)
+        let undo = ConfigDocumentUndo {
+            path: requested,
+            written: Some(body),
+            restore,
+        };
+        Ok((result, undo))
     })
+}
+
+/// Takes back one [`mutate_config_document_undoable`] write, and only that.
+#[derive(Debug, Clone)]
+pub struct ConfigDocumentUndo {
+    path: PathBuf,
+    /// The bytes that write left on disk; `None` when the file stayed absent.
+    written: Option<String>,
+    /// What `undo` puts back; `None` removes the file that write created.
+    restore: Option<String>,
+}
+
+impl ConfigDocumentUndo {
+    /// Put the document back as it was before the write, but only while the
+    /// file still holds exactly the bytes that write left: any newer save
+    /// wins. Returns `false` when the file changed since and was left alone.
+    pub fn undo(&self) -> Result<bool> {
+        with_config_write_lock(&self.path, |path| {
+            let current = read_optional_config(path)?;
+            if current == self.restore {
+                return Ok(true);
+            }
+            if current != self.written {
+                return Ok(false);
+            }
+            match self.restore.as_deref() {
+                Some(body) => persist_locked(path, current.as_deref(), body.as_bytes())?,
+                None => fs::remove_file(path).with_context(|| {
+                    format!("failed to remove config at {}", crate::quote_os_path(path))
+                })?,
+            }
+            Ok(true)
+        })
+    }
 }
 
 /// Lift keys trapped under literal `[extras]` tables back to the top level.
@@ -87,6 +191,52 @@ pub fn heal_extras_nesting(document: &mut toml_edit::DocumentMut) -> bool {
         }
     }
     healed
+}
+
+/// What `codewhale config migrate` would do to the file at `path`, without
+/// writing it (#6394).
+pub fn preview_legacy_root_config(
+    path: &Path,
+    prefer: Option<crate::legacy_root::LegacyRootPrefer>,
+) -> Result<crate::legacy_root::LegacyRootMigration> {
+    let Some(raw) = read_optional_config(path)? else {
+        return Ok(crate::legacy_root::LegacyRootMigration::default());
+    };
+    let document = raw.parse::<toml_edit::DocumentMut>().map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse config at {}; file contents were omitted",
+            crate::quote_os_path(path)
+        )
+    })?;
+    Ok(crate::legacy_root::preview_document(&document, prefer))
+}
+
+/// Move legacy top-level `base_url` / `api_key` into their provider tables
+/// on disk, keeping comments. A conflicting pair changes only when `prefer`
+/// says which side to keep. Before the first write a one-time,
+/// credential-free backup is kept; its path is returned when one exists.
+pub fn migrate_legacy_root_config(
+    path: &Path,
+    prefer: Option<crate::legacy_root::LegacyRootPrefer>,
+) -> Result<(crate::legacy_root::LegacyRootMigration, Option<PathBuf>)> {
+    with_config_write_lock(path, |path| {
+        let Some(original) = read_optional_config(path)? else {
+            return Ok((crate::legacy_root::LegacyRootMigration::default(), None));
+        };
+        let mut document = original.parse::<toml_edit::DocumentMut>().map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse config at {}; file contents were omitted",
+                crate::quote_os_path(path)
+            )
+        })?;
+        let receipt = crate::legacy_root::apply_to_document(&mut document, prefer);
+        if !receipt.changes_file() {
+            return Ok((receipt, None));
+        }
+        let backup = crate::write_legacy_root_backup(path, &original)?;
+        persist_locked(path, Some(&original), document.to_string().as_bytes())?;
+        Ok((receipt, Some(backup)))
+    })
 }
 
 /// Create a config file only if it is still absent when the shared lock is
@@ -177,7 +327,9 @@ pub fn unset_config_document_value(
     Ok(removed)
 }
 
-pub(crate) fn with_config_write_lock<T>(
+/// Serialize a complete read-modify-write operation against a canonical
+/// configuration path. The callback must not acquire this same lock again.
+pub fn with_config_write_lock<T>(
     path: &Path,
     operation: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
@@ -362,7 +514,10 @@ fn persist_locked(path: &Path, original: Option<&str>, body: &[u8]) -> Result<()
         .with_context(|| format!("failed to write config at {}", crate::quote_os_path(path)))
 }
 
-fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key: &str) -> bool {
+pub(crate) fn remove_key_preserving_leading_decor(
+    table: &mut dyn toml_edit::TableLike,
+    key: &str,
+) -> bool {
     let mut found = false;
     let next_key = table.iter().find_map(|(candidate, _)| {
         if found {
@@ -454,6 +609,61 @@ fn table_like_at_path_mut<'a>(
 
 #[cfg(test)]
 mod tests {
+    fn set_model(doc: &mut toml_edit::DocumentMut, model: &str) -> anyhow::Result<()> {
+        super::set_config_document_value(doc, &["model"], model)
+    }
+
+    #[test]
+    fn undo_restores_the_document_and_removes_a_file_it_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let before = "# keep me\nmodel = \"a\"\n";
+        std::fs::write(&path, before).expect("write fixture");
+        let ((), undo) = super::mutate_config_document_undoable(&path, |doc| set_model(doc, "b"))
+            .expect("write");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("\"b\"")
+        );
+        assert!(undo.undo().expect("undo"));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+
+        // A file this write created goes away again, not left behind empty.
+        let absent = tmp.path().join("fresh.toml");
+        let ((), undo) = super::mutate_config_document_undoable(&absent, |doc| set_model(doc, "b"))
+            .expect("write");
+        assert!(absent.exists());
+        assert!(undo.undo().expect("undo"));
+        assert!(!absent.exists(), "undo must not leave an empty config file");
+    }
+
+    #[test]
+    fn undo_never_overwrites_a_newer_save() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "model = \"a\"\n").expect("write fixture");
+        let ((), undo) = super::mutate_config_document_undoable(&path, |doc| set_model(doc, "b"))
+            .expect("write");
+        super::mutate_config_document(&path, |doc| set_model(doc, "c")).expect("newer save");
+        assert!(!undo.undo().expect("undo"), "a changed file is reported");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "model = \"c\"\n"
+        );
+
+        // The same holds when the newer save removed a file the write created.
+        let absent = tmp.path().join("fresh.toml");
+        let ((), undo) = super::mutate_config_document_undoable(&absent, |doc| set_model(doc, "b"))
+            .expect("write");
+        std::fs::write(&absent, "model = \"c\"\n").expect("newer save");
+        assert!(!undo.undo().expect("undo"));
+        assert_eq!(
+            std::fs::read_to_string(&absent).expect("read"),
+            "model = \"c\"\n"
+        );
+    }
+
     #[test]
     fn healing_keeps_a_non_table_extras_key_it_cannot_lift() {
         // `extras` is where the config structs flatten unknown keys, so a

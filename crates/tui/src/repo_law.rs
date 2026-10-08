@@ -13,8 +13,11 @@
 //! - `ask` force-prompts only in Ask posture. Auto-Review, Full Access, and
 //!   Never never open tool-approval prompts, so the same law fails closed
 //!   there. `block` denies outright in every posture.
-//! - Any failure (missing file, parse error, bad glob) degrades to fewer or
-//!   zero rules — never a poisoned gate, never a hold on unprotected paths.
+//! - No constitution (or an empty one) means no holds. A constitution that
+//!   exists but cannot be read or parsed, or an enforced invariant whose glob
+//!   does not compile, holds every write (`ask`) naming the problem: the law
+//!   the file meant to state is unknown, and enforcing less than it says
+//!   would fail open. Fixing the file releases the hold.
 //! - Only the repo-local constitution participates. The user-global
 //!   constitution stays advisory prose and never reaches this module.
 
@@ -56,7 +59,14 @@ pub(crate) fn repo_law_plan_decision(
     if targets.is_empty() {
         return None;
     }
-    let rules = load_repo_law_rules(workspace);
+    let rules = match load_repo_law_rules(workspace) {
+        Ok(rules) => rules,
+        Err(problem) => {
+            return Some(RepoLawPlanDecision::ForcePrompt(format!(
+                "Repo law holds every write until .codewhale/constitution.json is fixed: {problem}"
+            )));
+        }
+    };
     if rules.is_empty() {
         return None;
     }
@@ -89,7 +99,8 @@ pub(crate) fn repo_law_plan_decision(
 }
 
 /// Extract workspace-relative write targets from a tool input. Covers the
-/// `path`/`target`/`destination`/`file_path` params, canonical
+/// `path`/`target`/`destination` params and every path alias the file tools
+/// fold onto `path` (`file_path`, `filePath`), canonical
 /// `replace[].path`, legacy `changes[].path`, and
 /// every unified-diff / codex-envelope header shape the patch tools accept —
 /// old (`--- `) and new (`+++ `) paths, with or without an `a/`/`b/` prefix,
@@ -98,7 +109,7 @@ pub(crate) fn repo_law_plan_decision(
 /// bypass, so this deliberately over-collects candidate paths.
 fn write_target_paths(workspace: &Path, input: &Value) -> Vec<String> {
     let mut targets = Vec::new();
-    for key in ["path", "target", "destination", "file_path"] {
+    for key in crate::tools::file::path_argument_keys().chain(["target", "destination"]) {
         if let Some(path) = input.get(key).and_then(Value::as_str) {
             push_normalized(&mut targets, workspace, path);
         }
@@ -305,6 +316,32 @@ mod tests {
     }
 
     #[test]
+    fn path_alias_spellings_receive_the_same_holds() {
+        let tmp = TempDir::new().unwrap();
+        write_law(tmp.path(), LAW);
+        for (tool, input) in [
+            (
+                "write_file",
+                json!({"filePath": "crates/protocol/wire.rs", "content": "x"}),
+            ),
+            (
+                "write_file",
+                json!({"file_path": "crates/protocol/wire.rs", "content": "x"}),
+            ),
+            (
+                "File",
+                json!({"action": "edit", "filePath": "crates/protocol/wire.rs", "search": "a", "replace": "b"}),
+            ),
+        ] {
+            let decision = repo_law_plan_decision(tmp.path(), tool, &input);
+            assert!(
+                matches!(decision, Some(RepoLawPlanDecision::Block(_))),
+                "{tool} {input}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unprotected_writes_and_non_write_tools_pass() {
         let tmp = TempDir::new().unwrap();
         write_law(tmp.path(), LAW);
@@ -401,29 +438,36 @@ mod tests {
     }
 
     #[test]
-    fn malformed_law_and_bad_globs_degrade_to_no_holds() {
+    fn malformed_law_and_bad_globs_hold_every_write() {
         let tmp = TempDir::new().unwrap();
+        let write = json!({"path": "src/unrelated.rs", "content": "x"});
         write_law(tmp.path(), "{ not json");
-        assert_eq!(
-            repo_law_plan_decision(
-                tmp.path(),
-                "write_file",
-                &json!({"path": "crates/protocol/wire.rs", "content": "x"}),
-            ),
-            None
-        );
+        let Some(RepoLawPlanDecision::ForcePrompt(reason)) =
+            repo_law_plan_decision(tmp.path(), "write_file", &write)
+        else {
+            panic!("an unparseable constitution must hold writes");
+        };
+        assert!(reason.contains("constitution.json"), "{reason}");
         write_law(
             tmp.path(),
             r#"{"protected_invariants": [
                 { "text": "broken glob", "paths": ["crates/[invalid"] }
             ]}"#,
         );
+        let Some(RepoLawPlanDecision::ForcePrompt(reason)) =
+            repo_law_plan_decision(tmp.path(), "write_file", &write)
+        else {
+            panic!("an invariant whose glob does not compile must hold writes");
+        };
+        assert!(reason.contains("crates/[invalid"), "{reason}");
+        // Non-write tools stay unaffected, and an empty file is no law.
         assert_eq!(
-            repo_law_plan_decision(
-                tmp.path(),
-                "write_file",
-                &json!({"path": "crates/protocol/wire.rs", "content": "x"}),
-            ),
+            repo_law_plan_decision(tmp.path(), "read_file", &json!({"path": "a.rs"})),
+            None
+        );
+        write_law(tmp.path(), "  \n");
+        assert_eq!(
+            repo_law_plan_decision(tmp.path(), "write_file", &write),
             None
         );
     }

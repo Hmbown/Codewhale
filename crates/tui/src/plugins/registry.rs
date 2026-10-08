@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::activation::{PluginActivationCapability, PluginActivationPolicy};
+use super::managed_policy::{
+    ManagedPluginPolicy, ManagedPolicyOutcome, load_managed_policy, resolve_managed_policy_path,
+};
 use super::manifest::PluginInventory;
 use super::path_identity::metadata_is_link_or_reparse;
 #[cfg(windows)]
@@ -15,6 +18,8 @@ use super::types::{
     LoadedPlugin, PluginAuthority, PluginDiagnostic, PluginDiagnosticLevel, PluginId,
     PluginTrustStatus,
 };
+
+pub(crate) mod gc;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_REVIEW_HISTORY: usize = 32;
@@ -66,15 +71,116 @@ pub struct PluginRegistry {
     state: PluginStateFile,
     state_path: Option<PathBuf>,
     state_error: Option<String>,
+    managed_policy: Option<ManagedPluginPolicy>,
+    managed_policy_path: Option<PathBuf>,
+    managed_policy_error: Option<String>,
     workspace: PathBuf,
     discovery_context: Option<std::sync::Arc<super::context::PluginDiscoveryContext>>,
     catalog_stamp: super::discovery::PluginCatalogStamp,
+    /// Ephemeral caller binding, never persisted in plugin state.
+    caller_selection: Option<crate::extension_host::composition_scope::SelectionRevision>,
+    selected_native_entries: Vec<crate::extension_host::composition_scope::NativePresetRef>,
+    /// Catalog-only Native owners with no upstream default. Ephemeral caller
+    /// selection data; an empty entry list must not broaden these owners.
+    unselected_native_catalogs: BTreeSet<String>,
 }
 
 impl PluginRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn caller_selection(
+        &self,
+    ) -> Option<crate::extension_host::composition_scope::SelectionRevision> {
+        self.caller_selection
+    }
+    pub(crate) fn bind_caller(
+        &self,
+        revision: crate::extension_host::composition_scope::SelectionRevision,
+    ) -> Self {
+        let mut view = self.clone();
+        view.caller_selection = Some(revision);
+        view
+    }
+    pub(crate) fn selected_native_entries(
+        &self,
+    ) -> &[crate::extension_host::composition_scope::NativePresetRef] {
+        &self.selected_native_entries
+    }
+    /// Keep a narrowed selector across rediscovery even when its receipt is now
+    /// invalid. Desired-owner admission then withdraws it; failure must never
+    /// widen this caller back to every Native entry.
+    pub(crate) fn retain_native_selection_from(&self, previous: &Self) -> Self {
+        let mut view = self.clone();
+        if !previous.selected_native_entries.is_empty()
+            || !previous.unselected_native_catalogs.is_empty()
+        {
+            view.selected_native_entries = previous.selected_native_entries.clone();
+            view.unselected_native_catalogs = previous.unselected_native_catalogs.clone();
+        }
+        view
+    }
+
+    pub(crate) fn native_catalog_requires_selection(&self, plugin_id: &str) -> bool {
+        self.unselected_native_catalogs.contains(plugin_id)
+    }
+
+    pub(crate) fn native_entry_selected(&self, plugin_id: &str, path: &str, sha256: &str) -> bool {
+        if self.unselected_native_catalogs.contains(plugin_id) {
+            return false;
+        }
+        if self.selected_native_entries.is_empty() {
+            return true;
+        }
+        self.selected_native_entries.iter().any(|selected| {
+            selected.plugin_id == plugin_id
+                && selected.entry.path == path
+                && selected.entry.sha256 == sha256
+                && self
+                    .get(plugin_id)
+                    .is_some_and(|plugin| plugin.content_hash == selected.content_hash)
+        })
+    }
+
+    /// Select one reviewed Native inventory entry. No additional Agent capability.
+    pub(crate) fn with_native_preset(
+        &self,
+        selected: crate::extension_host::composition_scope::NativePresetRef,
+    ) -> Result<Self, String> {
+        let (sources, _) =
+            super::runtime::active_component_sources(self, PluginActivationCapability::Native);
+        let source = sources
+            .into_iter()
+            .find(|source| {
+                source.authority.plugin_id.as_str() == selected.plugin_id
+                    && source.authority.content_hash == selected.content_hash
+                    && source.path.to_string_lossy() == selected.entry.path
+            })
+            .ok_or("Native preset is not in the current reviewed inventory")?;
+        if let Some(problem) = super::runtime::native_entry_problem(&source.path, true) {
+            return Err(problem.into());
+        }
+        let file = super::manifest::open_bundle_file(&source.path)
+            .map_err(|_| "Native preset cannot be opened")?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Native preset cannot be read")?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err("Native preset entry exceeds the bundle limit".into());
+        }
+        if crate::hashing::sha256_hex(&bytes) != selected.entry.sha256 {
+            return Err("Native preset bytes changed".into());
+        }
+        let mut view = self.clone();
+        view.caller_selection = None;
+        view.unselected_native_catalogs.remove(&selected.plugin_id);
+        view.selected_native_entries
+            .retain(|entry| entry.plugin_id != selected.plugin_id);
+        view.selected_native_entries.push(selected);
+        Ok(view)
     }
 
     /// Construct a fail-closed registry for a workspace without consulting
@@ -109,6 +215,24 @@ impl PluginRegistry {
             .as_ref()
             .map(|context| context.catalog_stamp_for_workspace(&workspace))
             .unwrap_or_default();
+        let host_environment = discovery_context
+            .as_ref()
+            .map(|context| context.host_environment());
+        let policy_path = resolve_managed_policy_path(&state_path, host_environment.as_deref());
+        let (managed_policy, managed_policy_error) = match load_managed_policy(&policy_path) {
+            ManagedPolicyOutcome::Absent => (None, None),
+            ManagedPolicyOutcome::Loaded(policy) => (Some(policy), None),
+            ManagedPolicyOutcome::Invalid(error) => {
+                diagnostics.push(PluginDiagnostic::error(
+                    "policy-invalid",
+                    format!(
+                        "Managed plugin policy is fail-closed; no plugin may stay enabled until it is repaired or removed: {error}"
+                    ),
+                    Some(policy_path.clone()),
+                ));
+                (None, Some(error))
+            }
+        };
         let mut registry = Self {
             plugins: BTreeMap::new(),
             names: BTreeMap::new(),
@@ -116,9 +240,15 @@ impl PluginRegistry {
             state,
             state_path: Some(state_path),
             state_error,
+            managed_policy,
+            managed_policy_path: Some(policy_path),
+            managed_policy_error,
             workspace,
             discovery_context,
             catalog_stamp,
+            caller_selection: None,
+            selected_native_entries: Vec::new(),
+            unselected_native_catalogs: BTreeSet::new(),
         };
         for plugin in plugins {
             registry.register_loaded(plugin);
@@ -135,6 +265,11 @@ impl PluginRegistry {
 
     fn apply_state(&mut self) {
         let state_path = self.state_path.clone();
+        // Hoisted so the loop below can borrow `self.plugins` mutably: a
+        // malformed policy fails closed (nothing stays enabled), a valid one
+        // forbids whatever it does not allow, and an absent one forbids nothing.
+        let managed_policy_invalid = self.managed_policy_error.is_some();
+        let managed_policy = self.managed_policy.clone();
         for (id, plugin) in &mut self.plugins {
             let persisted = self.state.plugins.get(id);
             plugin.state_generation = persisted.map_or(0, |state| state.generation);
@@ -152,6 +287,18 @@ impl PluginRegistry {
             if self.state_error.is_some() {
                 plugin.enabled = false;
                 plugin.trust_status = PluginTrustStatus::NeverReviewed;
+            }
+            // The managed policy is enforced here — inside the single choke
+            // point that turns persisted state into live enablement — so a
+            // plugin enabled before the policy arrived, or hand-edited to
+            // `enabled: true`, never comes back enabled. There is no window
+            // in which a forbidden plugin is observably active.
+            let policy_forbids = managed_policy_invalid
+                || managed_policy
+                    .as_ref()
+                    .is_some_and(|policy| !policy.allows(id));
+            if policy_forbids {
+                plugin.enabled = false;
             }
             plugin.staged_root = state_path.as_deref().and_then(|state_path| {
                 let staged_root = runtime_stage_path(state_path, id, &plugin.content_hash);
@@ -176,6 +323,12 @@ impl PluginRegistry {
                     }
                 }
             }
+        }
+        if self.selected_native_entries.is_empty() && self.unselected_native_catalogs.is_empty() {
+            (
+                self.selected_native_entries,
+                self.unselected_native_catalogs,
+            ) = super::native_presets::default_selection(self);
         }
     }
 
@@ -325,6 +478,21 @@ impl PluginRegistry {
         self.state_path.as_deref()
     }
 
+    /// The fail-closed load error for the managed plugin policy, if the
+    /// document exists but could not be used. `None` means no policy file was
+    /// found or the loaded policy is valid.
+    #[must_use]
+    pub fn managed_policy_error(&self) -> Option<&str> {
+        self.managed_policy_error.as_deref()
+    }
+
+    /// The resolved managed policy source: the env override when set,
+    /// otherwise `managed-policy.json` next to the plugin state file.
+    #[must_use]
+    pub fn managed_policy_path(&self) -> Option<&Path> {
+        self.managed_policy_path.as_deref()
+    }
+
     /// The pre-dotenv user plugins root, when this registry was built from a
     /// discovery context. Registries without one (tests, fail-closed ad-hoc
     /// values) return `None`, and the mutation controller refuses to write.
@@ -406,7 +574,32 @@ impl PluginRegistry {
     pub fn enable(&mut self, selector: &str) -> Result<(), String> {
         let plugin = self
             .get(selector)
-            .ok_or_else(|| format!("Plugin bundle `{selector}` was not found"))?;
+            .ok_or_else(|| format!("Plugin bundle `{selector}` was not found"))?
+            .clone();
+        // The organization policy is the outermost gate: re-read it so a
+        // document that landed after discovery still refuses, and refuse
+        // before diagnosing trust or staging the user can never act on.
+        self.refresh_managed_policy();
+        if let Some(error) = self.managed_policy_error.as_deref() {
+            let path = self.managed_policy_path.as_deref().map_or_else(
+                || "(unknown path)".to_string(),
+                |path| path.display().to_string(),
+            );
+            return Err(format!(
+                "Managed plugin policy at {path} is invalid, so no plugin may be enabled: {error}"
+            ));
+        }
+        if self
+            .managed_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.allows(&plugin.id))
+        {
+            return Err(format!(
+                "Plugin bundle `{}` is forbidden by the managed plugin policy: `{}` is not on the plugin allowlist",
+                plugin.name(),
+                plugin.id.as_str()
+            ));
+        }
         if !plugin.trusted() {
             return Err(format!(
                 "Plugin bundle `{}` requires capability review before enablement (trust: {})",
@@ -462,6 +655,107 @@ impl PluginRegistry {
         })
     }
 
+    /// Carry a built-in bundle's review across Codewhale upgrades (K4).
+    ///
+    /// Each build materializes its built-ins under a digest-named snapshot
+    /// root and a plugin id is bound to its root, so an upgrade presents the
+    /// same built-in under a new id with no persisted state. Left alone it is
+    /// `NeverReviewed` and disabled, which turns Computer Use off for every
+    /// user who had enabled it. Once per new id, the newest review of a
+    /// same-named built-in is carried forward:
+    ///
+    /// * capability hash unchanged: the review stands for the new bytes. The
+    ///   bundle is staged and re-receipted under its new id and keeps its
+    ///   prior enablement.
+    /// * capability hash changed: the prior receipt is recorded as is, so the
+    ///   bundle reports `capabilities-changed` and stays disabled until the
+    ///   user reviews the changes.
+    ///
+    /// Fail-closed: nothing is carried when the new id already has state,
+    /// when the most recently reviewed same-named predecessor has since been
+    /// revoked, or when the state file is invalid. Older ids are left
+    /// untouched, so a still-running older binary keeps its own authority.
+    /// Only the built-in scope is ever carried; user and workspace bundles
+    /// still require review of the exact bytes on disk.
+    pub(crate) fn carry_forward_builtin_trust(&mut self) {
+        if self.state_error.is_some() || self.state_path.is_none() {
+            return;
+        }
+        let candidates: Vec<LoadedPlugin> = self
+            .plugins
+            .values()
+            .filter(|plugin| plugin.scope == super::types::PluginScope::Builtin)
+            .filter(|plugin| builtin_predecessor(&self.state, &plugin.id, plugin.name()).is_some())
+            .cloned()
+            .collect();
+        for plugin in candidates {
+            if let Err(error) = self.carry_forward_one_builtin(&plugin) {
+                tracing::warn!(
+                    target: "plugins",
+                    plugin = plugin.name(),
+                    %error,
+                    "built-in plugin review could not be carried across the upgrade; it needs review again"
+                );
+            }
+        }
+    }
+
+    fn carry_forward_one_builtin(&mut self, plugin: &LoadedPlugin) -> Result<(), String> {
+        let state_path = self
+            .state_path
+            .clone()
+            .ok_or_else(|| "Plugin registry has no persistence store".to_string())?;
+        let same_capabilities = builtin_predecessor(&self.state, &plugin.id, plugin.name())
+            .and_then(|entry| entry.trust.as_ref())
+            .is_some_and(|receipt| receipt.capability_hash == plugin.capability_hash);
+        // Staging is content-addressed and idempotent, so it runs before the
+        // state lock; the decision is re-derived from the locked state below.
+        if same_capabilities {
+            stage_bundle(&state_path, plugin)?;
+        }
+        let id = plugin.id.clone();
+        let name = plugin.name().to_string();
+        let applicable = plugin.applicable;
+        let carried = TrustReceipt {
+            content_hash: plugin.content_hash.clone(),
+            capability_hash: plugin.capability_hash.clone(),
+            reviewed_capabilities: plugin.inventory.clone(),
+            reviewed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.commit_state_change(|state| {
+            let Some(predecessor) = builtin_predecessor(state, &id, &name).cloned() else {
+                return Ok(());
+            };
+            let Some(prior) = predecessor.trust else {
+                return Ok(());
+            };
+            let mut entry = PersistedPluginState {
+                generation: 1,
+                enabled: false,
+                trust: None,
+                review_history: predecessor.review_history,
+            };
+            if prior.capability_hash == carried.capability_hash {
+                if !same_capabilities {
+                    // Changed under us to a state that needs a staged copy we
+                    // did not make; the next discovery carries it.
+                    return Ok(());
+                }
+                entry.enabled = predecessor.enabled && applicable;
+                entry.trust = Some(carried.clone());
+                entry.review_history.push(carried);
+                if entry.review_history.len() > MAX_REVIEW_HISTORY {
+                    let remove = entry.review_history.len() - MAX_REVIEW_HISTORY;
+                    entry.review_history.drain(..remove);
+                }
+            } else {
+                entry.trust = Some(prior);
+            }
+            state.plugins.insert(id, entry);
+            Ok(())
+        })
+    }
+
     fn commit_state_change(
         &mut self,
         mutate: impl FnOnce(&mut PluginStateFile) -> Result<(), String>,
@@ -487,8 +781,36 @@ impl PluginRegistry {
         mutate(&mut next)?;
         save_state(path, &next)?;
         self.state = next;
+        // Runtime selection rechecks the persisted review through its own
+        // read lock. Publish the completed state transaction before deriving
+        // that view; retaining the writer here would deadlock on enable.
+        drop(_guard);
         self.apply_state();
         Ok(())
+    }
+
+    /// Re-read the policy document from its resolved path so `enable`
+    /// enforces the on-disk document even when it landed or changed after
+    /// discovery. Refreshing never touches diagnostics: the discovery-time
+    /// `policy-invalid` diagnostic and the `enable` refusal carry the error.
+    fn refresh_managed_policy(&mut self) {
+        let Some(path) = self.managed_policy_path.clone() else {
+            return;
+        };
+        match load_managed_policy(&path) {
+            ManagedPolicyOutcome::Absent => {
+                self.managed_policy = None;
+                self.managed_policy_error = None;
+            }
+            ManagedPolicyOutcome::Loaded(policy) => {
+                self.managed_policy = Some(policy);
+                self.managed_policy_error = None;
+            }
+            ManagedPolicyOutcome::Invalid(error) => {
+                self.managed_policy = None;
+                self.managed_policy_error = Some(error);
+            }
+        }
     }
 
     fn resolve_id(&self, selector: &str) -> Option<&PluginId> {
@@ -524,13 +846,23 @@ fn load_state(path: &Path) -> Result<PluginStateFile, String> {
     load_state_unlocked(path)
 }
 
+/// Maximum bytes read from the plugin state file.
+const MAX_PLUGIN_STATE_BYTES: u64 = 1024 * 1024;
+
 fn load_state_unlocked(path: &Path) -> Result<PluginStateFile, String> {
-    let Some(mut file) = open_existing_regular_file(path, false)? else {
+    let Some(file) = open_existing_regular_file(path, false)? else {
         return Ok(PluginStateFile::default());
     };
     let mut raw = String::new();
-    file.read_to_string(&mut raw)
+    file.take(MAX_PLUGIN_STATE_BYTES + 1)
+        .read_to_string(&mut raw)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if raw.len() as u64 > MAX_PLUGIN_STATE_BYTES {
+        return Err(format!(
+            "plugin state {} exceeds the 1 MiB limit",
+            path.display()
+        ));
+    }
     let state: PluginStateFile = serde_json::from_str(&raw)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
     if state.schema_version != STATE_SCHEMA_VERSION {
@@ -632,6 +964,7 @@ fn persist_plugin_state_with_directory_sync(
 #[cfg(windows)]
 fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Foundation::WIN32_ERROR;
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileAttributesW,
@@ -648,6 +981,7 @@ fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Resul
     // NamedTempFile marks the source as temporary. Clear only that temporary
     // caching hint before publication, matching tempfile's own persistence
     // contract while retaining the owner-only DACL applied above.
+    // SAFETY: `temporary_wide` is NUL-terminated and live.
     unsafe {
         SetFileAttributesW(
             PCWSTR::from_raw(temporary_wide.as_ptr()),
@@ -658,15 +992,38 @@ fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Resul
         format!("failed to prepare private plugin state temp file for publication: {error}")
     })?;
 
-    if let Err(error) = unsafe {
+    // The state lock serializes writers, but not everything that opens the
+    // stable file: another registry re-applies the state directory's
+    // inheritable ACL before it takes that lock, and Defender or the indexer
+    // can scan the file. Each holds the destination only briefly, and
+    // MoveFileExW then reports a refusal that clears on its own. Re-attempt
+    // only the rename, on the schedule the other atomic writers share; the
+    // hardened temporary and the stable file are both left untouched.
+    let mut attempt = 0;
+    // SAFETY: both paths are NUL-terminated and live.
+    while let Err(error) = unsafe {
         MoveFileExW(
             PCWSTR::from_raw(temporary_wide.as_ptr()),
             PCWSTR::from_raw(destination_wide.as_ptr()),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     } {
+        // MoveFileExW reports an HRESULT; the shared classifier reads the
+        // Win32 code it wraps.
+        let backoff = WIN32_ERROR::from_error(&error).and_then(|code| {
+            crate::utils::windows_publish_retry_delay(
+                &std::io::Error::from_raw_os_error(code.0 as i32),
+                attempt,
+            )
+        });
+        if let Some(backoff) = backoff {
+            std::thread::sleep(backoff);
+            attempt += 1;
+            continue;
+        }
         // Restore tempfile's cleanup hint on the still-private source. The
         // stable state path remains untouched when MoveFileExW fails.
+        // SAFETY: `temporary_wide` is NUL-terminated and live.
         let _ = unsafe {
             SetFileAttributesW(
                 PCWSTR::from_raw(temporary_wide.as_ptr()),
@@ -822,7 +1179,8 @@ pub(crate) fn open_existing_regular_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // A swapped FIFO must not block before the handle can be validated.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -1004,15 +1362,57 @@ pub(crate) fn harden_plugin_state_file(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+/// The newest persisted review of another built-in with this name, when it
+/// may be carried to `id`: `id` has no state yet, and the same-named built-in
+/// entry with the most recent review still holds its receipt. A revoked entry
+/// is dated by its last review, so revoking blocks carrying until the user
+/// reviews a build again; ties go to the revocation. Entries that were never
+/// reviewed (for example, disabled before any review) granted nothing and are
+/// ignored.
+fn builtin_predecessor<'a>(
+    state: &'a PluginStateFile,
+    id: &PluginId,
+    name: &str,
+) -> Option<&'a PersistedPluginState> {
+    if state.plugins.contains_key(id) {
+        return None;
+    }
+    let builtin = super::types::PluginScope::Builtin.as_str();
+    let mut newest: Option<(&PersistedPluginState, i64)> = None;
+    for (other, entry) in &state.plugins {
+        let mut parts = other.as_str().splitn(3, '/');
+        if parts.next() != Some(builtin) || parts.nth(1) != Some(name) {
+            continue;
+        }
+        let Some(last_review) = entry.trust.as_ref().or(entry.review_history.last()) else {
+            continue;
+        };
+        let reviewed = chrono::DateTime::parse_from_rfc3339(&last_review.reviewed_at)
+            .map_or(i64::MIN, |at| at.timestamp_micros());
+        let revoked = entry.trust.is_none();
+        if newest.is_none_or(|(_, at)| reviewed > at || (reviewed == at && revoked)) {
+            newest = Some((entry, reviewed));
+        }
+    }
+    newest
+        .map(|(entry, _)| entry)
+        .filter(|entry| entry.trust.is_some())
+}
+
+/// Directory name of a plugin id's runtime snapshots under `.runtime/v2`.
+fn runtime_stage_key(id: &PluginId) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codewhale-plugin-stage-v2\0");
     hasher.update(id.as_str().as_bytes());
-    let key = hasher
+    hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+        .collect::<String>()
+}
+
+fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+    let key = runtime_stage_key(id);
     let state_parent = state_path.parent().unwrap_or_else(|| Path::new("."));
     let state_parent = state_parent
         .canonicalize()
@@ -1754,6 +2154,7 @@ fn apply_windows_owner_only_acl(
     let result = (|| {
         let mut required = 0_u32;
         // The first call intentionally obtains the required byte count.
+        // SAFETY: null buffer queries size; `required` is live.
         let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut required) };
         if required < size_of::<TOKEN_USER>() as u32 {
             return Err("Windows token did not expose a current-user SID".to_string());
@@ -1896,6 +2297,7 @@ fn ensure_windows_plugin_target_owner(
             status.0
         ));
     }
+    // SAFETY: `owner` is non-null from GetSecurityInfo; `expected_owner` is the caller's SID.
     let owner_matches = !owner.0.is_null() && unsafe { EqualSid(owner, expected_owner) }.is_ok();
     if !descriptor.0.is_null() {
         // SAFETY: the successful GetSecurityInfo allocation is released only
@@ -1965,6 +2367,17 @@ pub fn verify_plugin_component_authority(
 
 /// Recheck a persisted plugin receipt, the mutable reviewed source, and the
 /// Codewhale-owned immutable runtime copy. This function performs no writes.
+///
+/// Known limitation, deliberate: this is **not** memoized on `(path, mtime,
+/// len)`, even though re-walking both trees is the dominant cost of an MCP
+/// dispatch (#6209). The reviewed source tree is user-writable, and
+/// `utimensat(2)` lets any same-uid process restore an mtime after an
+/// equal-length in-place rewrite. A stat-keyed cache would then hand back the
+/// pre-tamper digest, `content_hash` would still match, and a modified bundle
+/// would dispatch as reviewed — turning the one check that stands between a
+/// reviewed bundle and an altered one into a check of whether someone
+/// remembered to reset a timestamp. The cost is paid per dispatch on purpose.
+/// Reduce the *number* of calls instead; see `McpConnection::is_transport_ready`.
 pub fn verify_plugin_authority(authority: &PluginAuthority) -> Result<(), String> {
     verify_plugin_state_authority(authority)?;
     for (label, manifest_path) in [
@@ -2162,14 +2575,87 @@ mod windows_acl_tests {
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
     use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetFileSecurityW,
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SE_DACL_PROTECTED,
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, AdjustTokenPrivileges,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DuplicateTokenEx, EqualSid, GetAce,
+        GetAclInformation, GetFileSecurityW, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SE_DACL_PROTECTED,
+        SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
+        TOKEN_QUERY, TokenImpersonation,
     };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
     use windows::core::{BOOL, PCWSTR};
+
+    /// Pin the fixture to a thread token with privileges disabled. Hosted
+    /// runners can hold backup/restore/take-ownership privileges that bypass
+    /// the DACL, making a WRITE_OWNER denial depend on the host identity.
+    /// The process token is unchanged, and dropping the guard reverts the thread.
+    struct UnprivilegedThreadToken {
+        process_token: HANDLE,
+        restricted: HANDLE,
+    }
+
+    impl UnprivilegedThreadToken {
+        fn adopt() -> windows::core::Result<Self> {
+            let mut process_token = HANDLE::default();
+            // SAFETY: the pseudo process handle is valid for the current
+            // process and the output location is live across the call.
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &mut process_token,
+                )
+            }?;
+            let mut restricted = HANDLE::default();
+            // SAFETY: `process_token` stays open for the call and `restricted`
+            // receives a new handle ownership of which passes to the guard.
+            let duplicated = unsafe {
+                DuplicateTokenEx(
+                    process_token,
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    None,
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut restricted,
+                )
+            };
+            if let Err(error) = duplicated {
+                // SAFETY: closing the only handle opened above.
+                unsafe {
+                    let _ = CloseHandle(process_token);
+                }
+                return Err(error);
+            }
+            // Own both handles before the fallible calls below, so a failure
+            // still reverts and closes through `Drop`.
+            let guard = Self {
+                process_token,
+                restricted,
+            };
+            // DisableAllPrivileges leaves the duplicate holding none, so the
+            // DACL becomes the only thing that can grant WRITE_OWNER.
+            // SAFETY: `restricted` is owned by `guard` for the whole call.
+            unsafe { AdjustTokenPrivileges(guard.restricted, true, None, 0, None, None) }?;
+            // SAFETY: impersonation is scoped to this thread and undone in Drop.
+            unsafe { SetThreadToken(None, Some(guard.restricted)) }?;
+            Ok(guard)
+        }
+    }
+
+    impl Drop for UnprivilegedThreadToken {
+        fn drop(&mut self) {
+            // SAFETY: reverts this thread's identity and closes the two handles
+            // this guard opened, each exactly once.
+            unsafe {
+                let _ = RevertToSelf();
+                let _ = CloseHandle(self.restricted);
+                let _ = CloseHandle(self.process_token);
+            }
+        }
+    }
 
     fn create_junction(link: &std::path::Path, target: &std::path::Path) {
         let output = std::process::Command::new("cmd")
@@ -2269,6 +2755,12 @@ mod windows_acl_tests {
         .expect("current owner may restrict its DACL without changing ownership");
         drop(reduced);
 
+        // From here the DACL must be the only authority. Held to the end of the
+        // test so the fallback and the restored ACL are both observed through
+        // an identity that cannot bypass the descriptor.
+        let _unprivileged = UnprivilegedThreadToken::adopt()
+            .expect("restricted thread identity for the WRITE_OWNER denial");
+
         let denied = std::fs::OpenOptions::new()
             .access_mode(0x0002_0000 | 0x0004_0000 | 0x0008_0000)
             .share_mode(0x0000_0001)
@@ -2318,6 +2810,13 @@ mod windows_acl_tests {
         )
         .expect("current owner may remove WRITE_OWNER from an existing state lock");
         drop(reduced);
+
+        // This sibling passed on the hosted runner only because its denial open
+        // omits FILE_FLAG_BACKUP_SEMANTICS, which is what engages the
+        // descriptor-bypassing privileges. That is an accident of the flags, not
+        // a guarantee, so pin the identity here too.
+        let _unprivileged = UnprivilegedThreadToken::adopt()
+            .expect("restricted thread identity for the WRITE_OWNER denial");
 
         let denied = std::fs::OpenOptions::new()
             .access_mode(0x001e_019f) // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER
@@ -2399,6 +2898,42 @@ mod windows_acl_tests {
             b"old-authoritative-state"
         );
         drop(retained);
+    }
+
+    #[test]
+    fn transient_state_replacement_contention_is_retried() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        std::fs::write(&state_path, b"old-authoritative-state").unwrap();
+        // FILE_SHARE_READ alone omits delete sharing: the short-lived handle a
+        // concurrent ACL pass or scanner holds on the stable file.
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&state_path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(retained);
+        });
+
+        save_state_with_hardener(
+            &state_path,
+            &PluginStateFile::default(),
+            harden_plugin_state_file,
+        )
+        .expect("retry contended plugin state replacement");
+
+        release.join().unwrap();
+        let published = std::fs::read_to_string(&state_path).unwrap();
+        assert!(published.contains("\"schema_version\": 1"));
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("state.json")]);
     }
 
     #[test]

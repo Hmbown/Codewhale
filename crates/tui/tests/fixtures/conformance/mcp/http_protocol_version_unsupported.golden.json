@@ -1,0 +1,36 @@
+{
+  "requests_summary": {
+    "authorization_shapes": [
+      null
+    ],
+    "rpcs": [
+      "initialize"
+    ],
+    "statuses": [
+      200
+    ]
+  },
+  "server_received": [],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": {
+        "err": "conformance: MCP server 'conformance' negotiated unsupported protocol version '1999-12-31' (supported: 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05)"
+      }
+    },
+    {
+      "op": "catalog",
+      "tools": []
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP server 'conformance' negotiated unsupported protocol version '1999-12-31' (supported: 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05)",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    }
+  ]
+}

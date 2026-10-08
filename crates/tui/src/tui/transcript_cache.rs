@@ -14,7 +14,9 @@
 //!
 //! The cache is bounded to keep memory predictable on long sessions.
 //! Eviction is a simple insertion-order scheme — a strict LRU would be
-//! overkill for the access pattern (full sweep on every render frame).
+//! overkill for the access pattern (full sweep on every render frame) —
+//! and the owner sizes the cap to the sweep with
+//! [`TranscriptCache::ensure_capacity`] so a sweep never evicts itself.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -80,6 +82,15 @@ impl TranscriptCache {
             entries: HashMap::with_capacity(capacity.max(1)),
             insertion_order: VecDeque::with_capacity(capacity.max(1)),
         }
+    }
+
+    /// Grow the cap to at least `min_capacity`; never shrinks. The overlay
+    /// sweeps every cell each rebuild, and insertion-order eviction under a
+    /// cap smaller than that sweep evicts each entry before its next use —
+    /// every lookup misses. Sizing to the sweep keeps the scheme simple and
+    /// the hit rate whole.
+    pub fn ensure_capacity(&mut self, min_capacity: usize) {
+        self.capacity = self.capacity.max(min_capacity);
     }
 
     /// Look up wrapped lines previously rendered at this exact key. Returns

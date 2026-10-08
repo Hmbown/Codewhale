@@ -1,23 +1,23 @@
 import Link from "next/link";
-import { Seal } from "@/components/seal";
+import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
+import { PageHeader } from "@/components/page-header";
 import { FaqSearch } from "@/components/faq-search";
 import { buildFaqPageJsonLd } from "@/lib/faq-schema";
 import { FACTS } from "@/lib/facts.generated";
 import { canonicalLocaleForPath } from "@/lib/i18n/content-locales";
+import { getFaq, pickTextLocale } from "@/lib/i18n/dictionaries";
 import { serializeJsonLd } from "@/lib/json-ld";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { SITE_URL } from "@/lib/page-meta";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getFaq(locale);
   return buildPageMetadata({
     path: "/faq",
     locale,
-    title: isZh ? "常见问题 · Codewhale" : "FAQ · Codewhale",
-    description: isZh
-      ? "Codewhale 常见问题：安装、配置、提供商、模型、模式、安全与隐私。答案来自实际代码、文档和 GitHub 议题。"
-      : "Codewhale frequently asked questions: install, config, providers, models, modes, security, and privacy. Answers sourced from real code, docs, and GitHub issues.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
@@ -27,7 +27,10 @@ interface FaqItem {
   sources?: string[];
 }
 
-const faqEn: FaqItem[] = [
+/** `p` prefixes a site path with the reader's locale. */
+type SitePath = (path: string) => string;
+
+const faqEn = (p: SitePath): FaqItem[] => [
   {
     q: "What is Codewhale?",
     a: (
@@ -42,28 +45,40 @@ const faqEn: FaqItem[] = [
     a: (
       <>
         <p className="mb-2">Published channels differ in timing and platform support:</p>
-        <pre className="code-block mb-2">
-{`# npm (recommended — no Rust toolchain needed)
+        <pre tabIndex={0} className="code-block mb-2">
+{`# GitHub release binaries (recommended on macOS / Linux)
+${GETTING_STARTED_STEPS[0].commands[0]}
+
+# npm alternative — no Rust toolchain needed
 npm install -g codewhale
 
 # Cargo (needs Rust 1.88+; installs the codewhale command)
 cargo install codewhale-cli --locked
 
-# Homebrew (macOS)
-brew tap Hmbown/deepseek-tui && brew install codewhale
+# Homebrew on Linux (tap; tested on Ubuntu)
+brew install Hmbown/deepseek-tui/codewhale
 
 # Direct download
-# https://github.com/Hmbown/CodeWhale/releases`}
+# https://github.com/codewhale-hq/CodeWhale/releases`}
         </pre>
         <p>
           Run <code className="inline">codewhale</code> to start. First run creates <code className="inline">~/.codewhale/</code> automatically. Legacy <code className="inline">~/.deepseek/</code> is still read as a compatibility fallback.
           Android arm64 / Termux is preview support: npm works only when the
           selected package version has matching Android assets in its GitHub Release.
-          See the <Link href="/en/install" className="body-link">full install guide</Link> for China mirrors, Docker, and troubleshooting.
+          See the <Link href={p("/install")} className="body-link">full install guide</Link> for China mirrors, Docker, and troubleshooting.
         </p>
       </>
     ),
     sources: ["README.md", "docs/INSTALL.md", "#1860", "#1914"],
+  },
+  {
+    q: "Can I use Codewhale from VS Code?",
+    a: (
+      <>
+        Yes. CodeWhale GUI (VS Code) is the community-maintained graphical frontend for the same engine: agent chat, threads, and file changes in a VS Code sidebar, over the local Runtime you already run. Install it from the <a href="https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode" className="body-link">VS Code Marketplace</a>; the source is on <a href="https://github.com/HengQuWorld/CodeWhale-VSCode" className="body-link">GitHub</a>.
+      </>
+    ),
+    sources: ["README.md"],
   },
   {
     q: "What's the difference between codewhale and codewhale-tui?",
@@ -92,23 +107,20 @@ brew tap Hmbown/deepseek-tui && brew install codewhale
     q: "How do I set my API key?",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# Method 1: Environment variable
 export DEEPSEEK_API_KEY=sk-...
 
-# Method 2: Saved config (recommended — survives shell restarts)
-codewhale auth set --provider deepseek --api-key sk-...
-
-# Method 3: config.toml
-# Add to ~/.codewhale/config.toml:
-api_key = "sk-..."
+# Method 2: Saved key (recommended — survives shell restarts)
+codewhale auth set --provider deepseek     # prompts for the key
+# scripted: pipe it in with --api-key-stdin
 
 # Check what's active:
 codewhale auth status    # shows config, keyring, and env-var state
 codewhale doctor         # full connectivity check`}
         </pre>
         <p>
-          Saved config keys take precedence over environment variables.
+          Saved keys take precedence over environment variables. Avoid putting a key directly on the command line, where it lands in shell history.
           Use <code className="inline">codewhale auth clear --provider deepseek</code> to remove a saved key.
         </p>
       </>
@@ -123,7 +135,7 @@ codewhale doctor         # full connectivity check`}
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft mb-3">
           <li><strong>DeepSeek</strong> — bundled default with a native API route, reasoning streaming, cache metrics, and thinking effort control.</li>
           <li><strong>OpenRouter</strong> — unified API for DeepSeek models and other open-model routes.</li>
-          <li><strong>{FACTS.providers.length - 2} more routes</strong> — including OpenAI-compatible, Anthropic, Mistral AI, OpenAI Codex, xAI, Moonshot/Kimi, Z.ai, MiniMax, StepFun, Volcengine Ark, Baidu Qianfan, Model Studio, NVIDIA NIM, Fireworks AI, Together AI, DeepInfra, SiliconFlow, Novita AI, Hugging Face, Arcee AI, AtlasCloud, and the keyless local endpoints SGLang, vLLM, and Ollama. <Link href="/en/models" className="body-link">The full list is generated from the provider registry</Link>.</li>
+          <li><strong>{FACTS.providers.length - 2} more routes</strong> — including OpenAI-compatible, Anthropic, Mistral AI, OpenAI Codex, xAI, Moonshot/Kimi, Z.ai, MiniMax, StepFun, Volcengine Ark, Baidu Qianfan, Model Studio, NVIDIA NIM, Fireworks AI, Together AI, DeepInfra, SiliconFlow, Novita AI, Hugging Face, Arcee AI, AtlasCloud, and the keyless local endpoints SGLang, vLLM, and Ollama. <Link href={p("/models")} className="body-link">The full list is generated from the provider registry</Link>.</li>
         </ul>
         <p>
           Set the corresponding env var (e.g. <code className="inline">OPENROUTER_API_KEY</code>) and your provider in <code className="inline">~/.codewhale/config.toml</code>.
@@ -137,7 +149,7 @@ codewhale doctor         # full connectivity check`}
     q: "How do I use OpenRouter with Codewhale?",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# 1. Set your OpenRouter key
 export OPENROUTER_API_KEY=sk-or-v1-...
 
@@ -214,7 +226,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         App-server clients can also persist a thread-scoped goal through the
         <code className="inline">thread/goal/*</code> methods. It does not add another
         app mode; the mode switcher remains Plan, Work, and Operate, while permission posture is selected independently.
-        Track progress in <a href="https://github.com/Hmbown/CodeWhale/issues/891" className="body-link">#891</a>.
+        Track progress in <a href="https://github.com/codewhale-hq/CodeWhale/issues/891" className="body-link">#891</a>.
       </>
     ),
     sources: ["#891"],
@@ -224,31 +236,33 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         The Codewhale runtime, workspace state, and audit log stay on your machine.
-        Anonymous usage counting is on by default with a clear first-run disclosure
-        and a durable opt-out. It posts aggregate session, feature, and error counts
-        and closed enums to the first-party endpoint{" "}
-        <code className="inline">https://telemetry.codewhale.net/v1/telemetry</code>,
-        a Cloudflare Worker whose full source is in the repo under{" "}
-        <code className="inline">telemetry-ingest/</code>. Its storage has no IP,
-        country, or geo column — structurally, not as a setting — nothing is logged,
-        and retention is a fixed three months. Set{" "}
+        Codewhale counts anonymous usage by default and says so at first launch.
+        Turning it off is a saved choice that later versions keep; showing the notice
+        never records any acceptance on your behalf. While on, a
+        session posts aggregate session, feature, and error counts
+        and closed enums to a first-party endpoint at telemetry.codewhale.net,
+        a Cloudflare Worker whose full source is in the repository. Its storage has no IP,
+        country, or geo column, records no request logs,
+        and retains records for three months. Optional PostHog forwarding requires
+        separate operator configuration and verified IP-safe egress; its retention
+        is a separate project setting. Source support does not establish activation. Set{" "}
         <code className="inline">telemetry_endpoint = &quot;&quot;</code> to stay
         enabled and contact nobody. It never carries conversations, code, prompts,
         files, file/repo/branch names, model content, credentials, or a per-turn or
-        per-tool timeline (schema:{" "}
-        <code className="inline">docs/TELEMETRY.md</code>;
+        per-tool timeline (see the{" "}
+        <a href="https://github.com/codewhale-hq/CodeWhale/blob/main/docs/TELEMETRY.md" className="body-link">telemetry schema</a>;
         off with <code className="inline">codewhale config set telemetry false</code>
         or <code className="inline">CODEWHALE_TELEMETRY=0</code>). There is no
         mandatory hosted relay. The hosted
         provider you select receives the prompt, project context, tool definitions,
         and tool results required for that turn. Use a loopback local-model route to
         keep model inference local.
-        OS command sandboxing is platform-specific: Codewhale uses <strong>Seatbelt</strong> on macOS when available. On Linux it uses <strong>bubblewrap</strong> only when <code className="inline">prefer_bwrap = true</code> and <code className="inline">/usr/bin/bwrap</code> is executable; otherwise commands have no Codewhale OS wrapper. Windows currently reports no OS sandbox.
+        OS command sandboxing is platform-specific: Codewhale uses <strong>Seatbelt</strong> on macOS when available. On Linux it uses <strong>bubblewrap</strong> by default whenever <code className="inline">/usr/bin/bwrap</code> is installed and a probe shows it works; <code className="inline">prefer_bwrap = false</code> opts out. Otherwise commands have no Codewhale OS wrapper. Windows currently reports no OS sandbox.
         Workspace boundaries default to <code className="inline">--workspace</code>. <code className="inline">/trust</code> lifts them.
         Permission posture is configurable per session.
       </>
     ),
-    sources: ["SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
+    sources: [".github/SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
   },
   {
     q: "How do MCP servers work?",
@@ -256,7 +270,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         Codewhale is a bidirectional MCP client and server. Define servers in <code className="inline">~/.codewhale/mcp.json</code>.
         Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose Codewhale as an MCP server with <code className="inline">codewhale mcp</code>.
-        See the <Link href="/en/docs/mcp" className="body-link">docs page</Link> for configuration examples.
+        See the <Link href={p("/docs/mcp")} className="body-link">docs page</Link> for configuration examples.
       </>
     ),
     sources: ["docs/MCP.md"],
@@ -267,7 +281,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         No CLA required. Fork, branch with conventional commits (<code className="inline">feat:</code>, <code className="inline">fix:</code>, etc.), run the local checks, open a PR.
         The maintainer reads everything personally. Start with issues labeled <code className="inline">good first issue</code>.
-        See the <Link href="/en/contribute" className="body-link">contribute page</Link> and <a href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>.
+        See the <Link href={p("/contribute")} className="body-link">contribute page</Link> and <a href="https://github.com/codewhale-hq/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>.
       </>
     ),
     sources: ["CONTRIBUTING.md"],
@@ -277,7 +291,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         Use mirror registries:
-        <pre className="code-block my-2">
+        <pre tabIndex={0} className="code-block my-2">
 {`# npm mirror
 npm config set registry https://registry.npmmirror.com
 npm install -g codewhale
@@ -290,7 +304,7 @@ replace-with = "tuna"
 registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         </pre>
         <p>
-          Prebuilt binaries are also available from <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a>.
+          Prebuilt binaries are also available from <a href="https://github.com/codewhale-hq/CodeWhale/releases" className="body-link">GitHub Releases</a>.
           A maintained CNB mirror covers its documented targets; no Gitee mirror is advertised until one exists.
         </p>
       </>
@@ -305,17 +319,17 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
           <strong>codewhale.net</strong> and <strong>www.codewhale.net</strong> are the
           official Codewhale sites, deployed on Cloudflare. The website source is open
           and lives under <code className="inline">web/</code> in the{" "}
-          <code className="inline">Hmbown/CodeWhale</code> repository — anyone can
+          <code className="inline">codewhale-hq/CodeWhale</code> repository — anyone can
           self-deploy it as a mirror.
         </p>
         <p className="mb-2">
           All official releases and SHA-256 checksums are distributed exclusively through{" "}
-          <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a>.
+          <a href="https://github.com/codewhale-hq/CodeWhale/releases" className="body-link">GitHub Releases</a>.
           The npm package downloads verified binaries from GitHub Releases.
         </p>
         <p className="mb-2">
           A CNB mirror is maintained for users who cannot reliably reach GitHub
-          (<Link href="/en/install" className="body-link">docs/CNB_MIRROR.md</Link>).
+          (<Link href={p("/install")} className="body-link">docs/CNB_MIRROR.md</Link>).
           Cargo users can use the TUNA mirror for faster downloads in China.
         </p>
         <p>
@@ -347,7 +361,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
       <>
         The <code className="inline">huggingface</code> provider is the shipped OpenAI-compatible route for Hugging Face Inference Providers.
         Model Lab is the planned open-model infrastructure layer for Hub discovery, model cards, datasets, safetensors adapters, and Jobs.
-        Track broader progress in <a href="https://github.com/Hmbown/CodeWhale/issues/1977" className="body-link">#1977</a>.
+        Track broader progress in <a href="https://github.com/codewhale-hq/CodeWhale/issues/1977" className="body-link">#1977</a>.
       </>
     ),
     sources: ["#1977", "docs/MODEL_LAB.md"],
@@ -369,22 +383,22 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "How do I update Codewhale?",
     a: (
       <>
-        <pre className="code-block mb-2">
-{`# Release-binary updater (works for npm/release-binary installs)
+        <pre tabIndex={0} className="code-block mb-2">
+{`# Installer or release-binary installs
 codewhale update
 
-# npm
+# npm (codewhale update refuses npm installs)
 npm install -g codewhale@latest
 
 # Cargo
 cargo install codewhale-cli --locked --force
 
-# Homebrew
+# Homebrew tap
 brew update && brew upgrade codewhale`}
         </pre>
         <p>
-          If you installed via npm, <code className="inline">codewhale update</code> downloads the latest release binaries.
-          If a mirror is lagging, download directly from <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a>.
+          If you installed with npm or Homebrew, update through that package manager; <code className="inline">codewhale update</code> leaves package-managed installs unchanged.
+          If a mirror is lagging, download directly from <a href="https://github.com/codewhale-hq/CodeWhale/releases" className="body-link">GitHub Releases</a>.
         </p>
       </>
     ),
@@ -392,7 +406,7 @@ brew update && brew upgrade codewhale`}
   },
 ];
 
-const faqZh: FaqItem[] = [
+const faqZh = (p: SitePath): FaqItem[] => [
   {
     q: "Codewhale 是什么？",
     a: (
@@ -407,27 +421,39 @@ const faqZh: FaqItem[] = [
     a: (
       <>
         <p className="mb-2">已发布渠道的更新时间与平台覆盖各不相同：</p>
-        <pre className="code-block mb-2">
-{`# npm（推荐 — 无需 Rust 工具链）
+        <pre tabIndex={0} className="code-block mb-2">
+{`# GitHub Releases 二进制（macOS / Linux 推荐方式）
+${GETTING_STARTED_STEPS[0].commands[0]}
+
+# npm 其他方式 — 无需 Rust 工具链
 npm install -g codewhale
 
 # Cargo（需要 Rust 1.88+；安装 codewhale 命令）
 cargo install codewhale-cli --locked
 
-# Homebrew（macOS）
-brew tap Hmbown/deepseek-tui && brew install codewhale
+# Linux 上的 Homebrew（tap；已在 Ubuntu 上测试）
+brew install Hmbown/deepseek-tui/codewhale
 
 # 直接下载
-# https://github.com/Hmbown/CodeWhale/releases`}
+# https://github.com/codewhale-hq/CodeWhale/releases`}
         </pre>
         <p>
           输入 <code className="inline">codewhale</code> 即可启动。首次运行会自动创建 <code className="inline">~/.codewhale/</code>。旧版 <code className="inline">~/.deepseek/</code> 仍会作为兼容回退读取。
           Android arm64 / Termux 仍是预览支持：只有当所选 npm 包版本对应的 GitHub Release 发布了匹配的 Android 资产时，npm 安装才可用。
-          查看 <Link href="/zh/install" className="body-link">完整安装指南</Link> 了解国内镜像、Docker 和故障排除。
+          查看 <Link href={p("/install")} className="body-link">完整安装指南</Link> 了解国内镜像、Docker 和故障排除。
         </p>
       </>
     ),
     sources: ["README.md", "docs/INSTALL.md", "#1860", "#1914"],
+  },
+  {
+    q: "可以在 VS Code 中使用 Codewhale 吗？",
+    a: (
+      <>
+        可以。CodeWhale GUI（VS Code）是社区维护的图形前端，运行同一个引擎：在 VS Code 侧边栏中对话、管理线程并查看文件变更，连接你本机已在运行的 Runtime。可从 <a href="https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode" className="body-link">VS Code Marketplace</a> 安装；源码见 <a href="https://github.com/HengQuWorld/CodeWhale-VSCode" className="body-link">GitHub</a>。
+      </>
+    ),
+    sources: ["README.md"],
   },
   {
     q: "codewhale 和 codewhale-tui 有什么区别？",
@@ -455,23 +481,20 @@ brew tap Hmbown/deepseek-tui && brew install codewhale
     q: "如何设置 API 密钥？",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# 方法 1：环境变量
 export DEEPSEEK_API_KEY=sk-...
 
-# 方法 2：保存在配置中（推荐 — 重启 Shell 后仍然有效）
-codewhale auth set --provider deepseek --api-key sk-...
-
-# 方法 3：config.toml
-# 在 ~/.codewhale/config.toml 中添加：
-api_key = "sk-..."
+# 方法 2：保存密钥（推荐 — 重启 Shell 后仍然有效）
+codewhale auth set --provider deepseek     # 会提示输入密钥
+# 脚本中：用 --api-key-stdin 通过管道传入
 
 # 查看当前状态：
 codewhale auth status    # 显示配置、密钥环和环境变量状态
 codewhale doctor         # 完整连接检查`}
         </pre>
         <p>
-          配置中保存的密钥优先于环境变量。
+          已保存的密钥优先于环境变量。不要把密钥直接写在命令行里，否则会留在 Shell 历史中。
           使用 <code className="inline">codewhale auth clear --provider deepseek</code> 移除已保存的密钥。
         </p>
       </>
@@ -486,7 +509,7 @@ codewhale doctor         # 完整连接检查`}
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft mb-3">
           <li><strong>DeepSeek</strong> — 内置默认原生 API 路由，支持推理流、缓存指标和思考力度控制。</li>
           <li><strong>OpenRouter</strong> — 统一 API，可访问 DeepSeek 和其他开放模型路由。</li>
-          <li><strong>另外 {FACTS.providers.length - 2} 条路由</strong>——包括 OpenAI 兼容、Anthropic、Mistral AI、OpenAI Codex、xAI、Moonshot/Kimi、Z.ai、MiniMax、StepFun、Volcengine Ark、百度千帆、Model Studio、NVIDIA NIM、Fireworks、Together AI、DeepInfra、SiliconFlow、Novita、Hugging Face、Arcee AI、AtlasCloud，以及无需密钥的本地端点 SGLang、vLLM 和 Ollama。<Link href="/zh/models" className="body-link">完整列表由提供商注册表生成</Link>。</li>
+          <li><strong>另外 {FACTS.providers.length - 2} 条路由</strong>——包括 OpenAI 兼容、Anthropic、Mistral AI、OpenAI Codex、xAI、Moonshot/Kimi、Z.ai、MiniMax、StepFun、Volcengine Ark、百度千帆、Model Studio、NVIDIA NIM、Fireworks、Together AI、DeepInfra、SiliconFlow、Novita、Hugging Face、Arcee AI、AtlasCloud，以及无需密钥的本地端点 SGLang、vLLM 和 Ollama。<Link href={p("/models")} className="body-link">完整列表由提供商注册表生成</Link>。</li>
         </ul>
         <p>
           设置对应的环境变量（如 <code className="inline">OPENROUTER_API_KEY</code>）并在 <code className="inline">~/.codewhale/config.toml</code> 中配置你的提供商。
@@ -500,7 +523,7 @@ codewhale doctor         # 完整连接检查`}
     q: "如何使用 OpenRouter？",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# 1. 设置 OpenRouter 密钥
 export OPENROUTER_API_KEY=sk-or-v1-...
 
@@ -576,7 +599,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         <code className="inline">/goal</code> 为当前 TUI 会话设置目标，支持 <code className="inline">pause</code>、<code className="inline">resume</code>、<code className="inline">complete</code>、<code className="inline">blocked</code> 和 <code className="inline">clear</code> 控制。
         App-server 客户端也可以通过 <code className="inline">thread/goal/*</code> 方法持久化线程范围的目标，支持 <code className="inline">set</code>、<code className="inline">get</code> 和 <code className="inline">clear</code>。
         它不会新增一个应用模式；模式切换器仍然是 Plan、Work 和 Operate，权限姿态独立选择。
-        跟踪进展：<a href="https://github.com/Hmbown/CodeWhale/issues/891" className="body-link">#891</a>。
+        跟踪进展：<a href="https://github.com/codewhale-hq/CodeWhale/issues/891" className="body-link">#891</a>。
       </>
     ),
     sources: ["#891"],
@@ -585,22 +608,22 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     q: "我的代码安全吗？Codewhale 使用什么沙箱机制？",
     a: (
       <>
-        Codewhale 运行时、工作区状态与审计日志保留在你的机器上。匿名使用计数默认开启，首次运行会清楚说明，并可随时永久关闭。
-        它只会把聚合的会话、功能与错误计数以及封闭枚举 POST 到第一方端点{" "}
-        <code className="inline">https://telemetry.codewhale.net/v1/telemetry</code>，
-        那是一个 Cloudflare Worker，完整源码就在仓库的 <code className="inline">telemetry-ingest/</code> 目录里。
-        它的存储中没有 IP、国家或任何地理位置列——这是结构上不存在，而不是某个开关——不写任何日志，保留期固定为三个月。
+        Codewhale 运行时、工作区状态与审计日志保留在你的机器上。Codewhale 默认统计匿名使用量，并在首次启动时告知你。
+        关闭是会被后续版本保留的选择；显示告知绝不会代你记录任何同意。开启时，会话只会把聚合的会话、功能与错误计数以及封闭枚举 POST 到 telemetry.codewhale.net 上的第一方端点，
+        那是一个 Cloudflare Worker，完整源码就在仓库里。
+        它的存储中没有 IP、国家或地理位置列，不记录请求日志，保留期固定为三个月。
+        可选的 PostHog 转发需要运营方单独配置，并验证出口不会转发客户端 IP；其保留期由项目另行设置。源码支持不代表已启用。
         若想保持启用但不联系任何服务器，设置 <code className="inline">telemetry_endpoint = &quot;&quot;</code>。
-        它永远不会携带对话、代码、prompt、文件、文件/仓库/分支名、模型内容、凭据，也不发送逐轮或逐工具时间线（schema 见 <code className="inline">docs/TELEMETRY.md</code>；
+        它永远不会携带对话、代码、prompt、文件、文件/仓库/分支名、模型内容、凭据，也不发送逐轮或逐工具时间线（见<a href="https://github.com/codewhale-hq/CodeWhale/blob/main/docs/TELEMETRY.md" className="body-link">遥测 schema</a>；
         可用 <code className="inline">codewhale config set telemetry false</code> 或
         <code className="inline">CODEWHALE_TELEMETRY=0</code> 关闭）。也不要求经过托管中继。你选择的托管 provider 会收到本轮所需的
         prompt、项目上下文、工具定义与工具结果。若要让模型推理也保持本地，请使用回环地址上的本地模型路由。
-        OS 命令沙箱因平台而异：macOS 在可用时使用 <strong>Seatbelt</strong>。Linux 仅在 <code className="inline">prefer_bwrap = true</code> 且 <code className="inline">/usr/bin/bwrap</code> 可执行时使用 <strong>bubblewrap</strong>；否则命令没有 Codewhale OS 包装器。Windows 当前报告无 OS 沙箱。
+        OS 命令沙箱因平台而异：macOS 在可用时使用 <strong>Seatbelt</strong>。Linux 默认在 <code className="inline">/usr/bin/bwrap</code> 已安装且探测可用时使用 <strong>bubblewrap</strong>；<code className="inline">prefer_bwrap = false</code> 退出。否则命令没有 Codewhale OS 包装器。Windows 当前报告无 OS 沙箱。
         工作区边界默认为 <code className="inline">--workspace</code>。<code className="inline">/trust</code> 可解除边界。
         权限姿态可按会话配置。
       </>
     ),
-    sources: ["SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
+    sources: [".github/SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
   },
   {
     q: "MCP 服务器如何工作？",
@@ -608,7 +631,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         Codewhale 是双向 MCP 客户端和服务器。在 <code className="inline">~/.codewhale/mcp.json</code> 中定义服务器。
         工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale mcp</code> 将 Codewhale 暴露为 MCP 服务器。
-        查看 <Link href="/zh/docs/mcp" className="body-link">文档页面</Link> 了解配置示例。
+        查看 <Link href={p("/docs/mcp")} className="body-link">文档页面</Link> 了解配置示例。
       </>
     ),
     sources: ["docs/MCP.md"],
@@ -619,7 +642,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         无需签署 CLA。Fork、用约定式提交（<code className="inline">feat:</code>、<code className="inline">fix:</code> 等）创建分支、通过本地检查、提交 PR。
         维护者亲自阅读每一条内容。从标记为 <code className="inline">good first issue</code> 的议题开始。
-        查看 <Link href="/zh/contribute" className="body-link">贡献页面</Link> 和 <a href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>。
+        查看 <Link href={p("/contribute")} className="body-link">贡献页面</Link> 和 <a href="https://github.com/codewhale-hq/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>。
       </>
     ),
     sources: ["CONTRIBUTING.md"],
@@ -629,7 +652,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         使用镜像源：
-        <pre className="code-block my-2">
+        <pre tabIndex={0} className="code-block my-2">
 {`# npm 镜像
 npm config set registry https://registry.npmmirror.com
 npm install -g codewhale
@@ -642,7 +665,7 @@ replace-with = "tuna"
 registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         </pre>
         <p>
-          也可以从 <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a> 直接下载预编译二进制。
+          也可以从 <a href="https://github.com/codewhale-hq/CodeWhale/releases" className="body-link">GitHub Releases</a> 直接下载预编译二进制。
           维护中的 CNB 镜像覆盖其文档列出的目标；Gitee 镜像只有实际存在后才会对外展示。
         </p>
       </>
@@ -656,17 +679,17 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         <p className="mb-2">
           <strong>codewhale.net</strong> 和 <strong>www.codewhale.net</strong> 是
           Codewhale 的官方站点，部署在 Cloudflare 上。网站源码存放于{" "}
-          <code className="inline">Hmbown/CodeWhale</code> 仓库的{" "}
+          <code className="inline">codewhale-hq/CodeWhale</code> 仓库的{" "}
           <code className="inline">web/</code> 目录下，任何人都可自行部署为镜像。
         </p>
         <p className="mb-2">
           所有正式发布和 SHA-256 校验文件仅通过{" "}
-          <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a> 分发。
+          <a href="https://github.com/codewhale-hq/CodeWhale/releases" className="body-link">GitHub Releases</a> 分发。
           npm 包从 GitHub Releases 下载经校验的二进制。
         </p>
         <p className="mb-2">
           面向无法稳定访问 GitHub 的用户，提供 CNB 镜像（
-          <Link href="/zh/install" className="body-link">docs/CNB_MIRROR.md</Link>）。
+          <Link href={p("/install")} className="body-link">docs/CNB_MIRROR.md</Link>）。
           Cargo 用户可使用 TUNA 镜像在国内加速下载。
         </p>
         <p>
@@ -698,7 +721,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
       <>
         <code className="inline">huggingface</code> provider 是已经接入的 OpenAI 兼容 Hugging Face Inference Providers 路由。
         Model Lab 是规划中的开放模型基础设施层：Hub 发现、模型卡片、数据集、safetensors 适配器和 Jobs。
-        更完整的进展见 <a href="https://github.com/Hmbown/CodeWhale/issues/1977" className="body-link">#1977</a>。
+        更完整的进展见 <a href="https://github.com/codewhale-hq/CodeWhale/issues/1977" className="body-link">#1977</a>。
       </>
     ),
     sources: ["#1977", "docs/MODEL_LAB.md"],
@@ -720,22 +743,22 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "如何更新 Codewhale？",
     a: (
       <>
-        <pre className="code-block mb-2">
-{`# 发布二进制更新器（适用于 npm/二进制安装）
+        <pre tabIndex={0} className="code-block mb-2">
+{`# 安装器或发布二进制安装
 codewhale update
 
-# npm
+# npm（codewhale update 不会更新 npm 安装）
 npm install -g codewhale@latest
 
 # Cargo
 cargo install codewhale-cli --locked --force
 
-# Homebrew
+# Homebrew tap
 brew update && brew upgrade codewhale`}
         </pre>
         <p>
-          如果通过 npm 安装，<code className="inline">codewhale update</code> 会下载最新发布二进制。
-          如果镜像延迟，请从 <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a> 直接下载。
+          如果通过 npm 或 Homebrew 安装，请用对应的包管理器更新；<code className="inline">codewhale update</code> 不会改动包管理器安装的版本。
+          如果镜像延迟，请从 <a href="https://github.com/codewhale-hq/CodeWhale/releases" className="body-link">GitHub Releases</a> 直接下载。
         </p>
       </>
     ),
@@ -745,8 +768,9 @@ brew update && brew upgrade codewhale`}
 
 export default async function FaqPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
-  const items = isZh ? faqZh : faqEn;
+  const t = getFaq(locale);
+  const p = (path: string) => `/${locale}${path}`;
+  const items = { en: faqEn, zh: faqZh }[pickTextLocale(locale)](p);
   const canonicalLocale = canonicalLocaleForPath("/faq", locale);
   const jsonLd = buildFaqPageJsonLd({
     items,
@@ -760,42 +784,30 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: serializeJsonLd(jsonLd) }}
       />
-      <section className="site-container section">
-        <div className="flex items-baseline gap-4 mb-3">
-          <Seal char="问" />
-          <div className="eyebrow">{isZh ? "常见问题" : "FAQ"}</div>
-        </div>
-        <h1 className="font-display tracking-crisp">
-          {isZh ? (
-            <>常见问题 <span className="font-cjk text-indigo text-5xl ml-2">FAQ</span></>
-          ) : (
-            <>FAQ <span className="font-cjk text-indigo text-5xl ml-2">常见问题</span></>
-          )}
-        </h1>
-        <p className="mt-5 max-w-3xl text-ink-soft text-lg leading-[1.9] tracking-wide">
-          {isZh
-            ? "答案来自实际代码、文档、发布说明和 GitHub 议题。每个回答下方标注了信息来源。如有未覆盖的问题，请在 GitHub 上提交 Issue。"
-            : "Answers sourced from real code, docs, release notes, and GitHub issues. Sources are cited below each answer. If your question isn't covered, open an issue on GitHub."}
-        </p>
-      </section>
+      <PageHeader
+        seal="问"
+        kicker={t.eyebrow}
+        title={t.title}
+        titleAside={t.titleAside}
+        titleAsideLang={t.titleAsideLang}
+        lede={t.lead}
+        pose="talk"
+      />
 
-      <section className="site-container pb-20">
-        <FaqSearch items={items} locale={locale} />
+      <div className="page-body">
+        <div className="page-body-narrow">
+          <FaqSearch items={items} locale={locale} />
 
-        <div className="mt-12 text-center">
-          <p className="text-ink-soft text-sm mb-4">
-            {isZh
-              ? "没找到你的问题？"
-              : "Didn't find your question?"}
-          </p>
-          <a
-            href="https://github.com/Hmbown/CodeWhale/issues/new/choose"
-            className="inline-flex items-center gap-2 px-5 py-3 bg-indigo text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo-deep transition-colors"
-          >
-            {isZh ? "提交 Issue →" : "Open an issue →"}
-          </a>
+          <div className="empty-state empty-state-compact faq-more">
+            <p className="empty-state-title">{t.notCovered}</p>
+            <div className="empty-state-actions">
+              <a href="https://github.com/codewhale-hq/CodeWhale/issues/new/choose" className="btn btn-secondary">
+                {t.openIssue}
+              </a>
+            </div>
+          </div>
         </div>
-      </section>
+      </div>
     </>
   );
 }

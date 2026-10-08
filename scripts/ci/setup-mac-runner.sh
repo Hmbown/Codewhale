@@ -7,7 +7,7 @@
 #
 # SAFETY — read this before running it.
 #
-# Hmbown/CodeWhale is a PUBLIC repository with thousands of forks. A
+# codewhale-hq/CodeWhale is a PUBLIC repository with thousands of forks. A
 # self-hosted runner that accepts pull requests from forks lets anyone who
 # opens a PR execute arbitrary code on this machine, as this user. That is the
 # one CI configuration GitHub explicitly warns against, and on this machine it
@@ -16,7 +16,7 @@
 #
 # The companion change in .github/workflows/ci.yml therefore routes jobs to
 # this runner ONLY for same-repository events (pushes and PRs whose head repo
-# is Hmbown/CodeWhale). Fork PRs keep running on GitHub-hosted runners. Do not
+# is codewhale-hq/CodeWhale). Fork PRs keep running on GitHub-hosted runners. Do not
 # remove that guard; without it this script is a remote-code-execution hole.
 #
 # Each job gets a freshly registered --ephemeral runner: the registration is
@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-REPO="${RUNNER_REPO:-Hmbown/CodeWhale}"
+REPO="${RUNNER_REPO:-codewhale-hq/CodeWhale}"
 RUNNER_VERSION="${RUNNER_VERSION:-2.337.0}"
 RUNNER_HOME="${RUNNER_HOME:-$HOME/actions-runner}"
 LABELS="${RUNNER_LABELS:-self-hosted,macOS,ARM64,codewhale-mac}"

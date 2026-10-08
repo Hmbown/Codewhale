@@ -1,0 +1,20 @@
+{
+  "description": "tool_call_after for a non-shell tool that failed: no schema-1 document (stdin is empty); the environment carries the result, the failure flag and no exit code.",
+  "event": "tool_call_after",
+  "tool": {
+    "name": "read_file",
+    "call_id": "call_hook_read",
+    "outcome": {
+      "execution_failed": {
+        "message": "no such file: missing.md"
+      }
+    }
+  },
+  "hooks": [
+    {
+      "event": "tool_call_after",
+      "name": "observer",
+      "command": "{{capture}} observer"
+    }
+  ]
+}

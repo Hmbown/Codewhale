@@ -1,3 +1,4 @@
+import { DurableObject } from "cloudflare:workers";
 import handler from "./.open-next/worker.js";
 import {
   runCurate,
@@ -11,6 +12,18 @@ import {
 import { runFactsDrift } from "./lib/facts-drift";
 import { runLinkCheck, runSemanticDrift } from "./lib/content-watch";
 import { fetchWithStaticInstaller } from "./lib/static-installer";
+import { applyDraftLock, type DraftLockRequest } from "./lib/draft-claim-lock";
+
+/**
+ * Exclusive claim on one community-agent draft (binding DRAFT_CLAIM_LOCK, one
+ * instance per draft via idFromName). OpenNext's custom-worker entry exports
+ * extra Durable Object classes from here; see lib/draft-claim-lock.ts.
+ */
+export class DraftClaimLock extends DurableObject {
+  async act(req: DraftLockRequest) {
+    return applyDraftLock(this.ctx.storage, Date.now(), req);
+  }
+}
 
 export default {
   fetch(request, env, ctx) {

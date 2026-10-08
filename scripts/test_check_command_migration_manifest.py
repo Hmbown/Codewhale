@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -194,6 +195,61 @@ class LiveTransitionTests(unittest.TestCase):
             self.assertEqual(mod.load_pending_groups(path), ["session", "utility"])
 
 
+class GitBaselineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.git("init", "-q", "--template=", "-b", "main")
+        self.git("config", "user.name", "Manifest test")
+        self.git("config", "user.email", "manifest@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+
+    def git(self, *args: str) -> str:
+        return subprocess.check_output(
+            ["git", *args], cwd=self.root, text=True, stderr=subprocess.PIPE,
+        ).strip()
+
+    def commit(self, frontier: list[str]) -> str:
+        doc = sample_topology()
+        doc["frontier"] = frontier
+        target = self.root / mod.TOPOLOGY_REPO_PATH
+        target.parent.mkdir(exist_ok=True)
+        target.write_text(json.dumps(doc), encoding="utf-8")
+        self.git("add", mod.TOPOLOGY_REPO_PATH)
+        self.git("commit", "-qm", "Update frontier", "--allow-empty")
+        return self.git("rev-parse", "HEAD")
+
+    def test_aligned_main_uses_parent_and_still_rejects_growth(self) -> None:
+        previous = self.commit(["utility"])
+        head = self.commit(["session", "utility"])
+        self.git("update-ref", "refs/remotes/origin/main", head)
+        baseline = mod.detect_local_baseline_ref(self.root)
+        self.assertEqual(baseline, previous)
+        violations = mod.validate_baseline_transition(
+            mod.load_topology_at_ref(head, self.root),
+            mod.load_topology_at_ref(baseline, self.root),
+        )
+        self.assertTrue(any("arbitrary growth" in str(v) for v in violations))
+
+    def test_feature_branch_keeps_merge_base_across_multiple_commits(self) -> None:
+        base = self.commit(["session", "utility"])
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        self.commit(["utility"])
+        self.commit(["utility"])
+        self.assertEqual(mod.detect_local_baseline_ref(self.root), base)
+
+    def test_history_without_remote_uses_parent(self) -> None:
+        previous = self.commit(["session", "utility"])
+        self.commit(["utility"])
+        self.assertEqual(mod.detect_local_baseline_ref(self.root), previous)
+
+    def test_initial_commit_has_no_baseline(self) -> None:
+        head = self.commit(["session", "utility"])
+        self.git("update-ref", "refs/remotes/origin/main", head)
+        self.assertIsNone(mod.detect_local_baseline_ref(self.root))
+
+
 class SelectorTests(unittest.TestCase):
     def test_free_selector_passes(self) -> None:
         selector = {"kind": "free", "item": ["crate", "commands", "groups", "session", "run_save"]}
@@ -362,12 +418,58 @@ class LiveGateTests(unittest.TestCase):
         frontier = doc["frontier"]
         self.assertEqual(frontier, sorted(frontier))
         self.assertEqual(len(frontier), len(set(frontier)))
-        # FEAT-018 removed utility, FEAT-019 removed memory, FEAT-021 removed project,
-        # and FEAT-022 removed skills; the remaining five groups stay pending.
+        # FEAT-018 removed utility, FEAT-019 removed memory, FEAT-020 removed plugins,
+        # FEAT-021 removed project, FEAT-022 removed skills, FEAT-029 completed debug,
+        # and FEAT-026 completed session; config/core remain.
         self.assertEqual(
             set(frontier),
-            {"plugins", "session", "config", "debug", "core"},
+            {"config", "core"},
         )
+
+
+class DebugGroupFrontierTests(unittest.TestCase):
+    def test_complete_debug_inventory_has_no_pending_host_handlers(self) -> None:
+        doc = mod.load_topology()
+        debug = doc["topology"]["debug"]
+        actual = {p.relative_to(ROOT).as_posix() for p in
+                  (ROOT / "crates/tui/src/commands/groups/debug").rglob("*.rs")}
+        self.assertEqual(set(mod.group_source_scope("debug", debug, ROOT)), actual)
+        self.assertNotIn("debug", doc["frontier"])
+        self.assertNotIn("debug", mod.load_pending_groups())
+        self.assertEqual(mod.check_source_frontier({"debug": debug}, [], ROOT), [])
+        self.assertIn("crates/tui/src/commands/groups/debug/receipts.rs", actual)
+
+    def test_omitted_receipts_and_new_nested_commands_fail_inventory(self) -> None:
+        for filename in ["receipts.rs", "new/command.rs"]:
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                directory = root / "crates/tui/src/commands/groups/debug"
+                directory.mkdir(parents=True)
+                (directory / "mod.rs").write_text("// complete portable module\n")
+                omitted = directory / filename
+                omitted.parent.mkdir(parents=True, exist_ok=True)
+                omitted.write_text("pub fn receipt(app: &mut App) {}\n")
+                scope = [(directory / "mod.rs").relative_to(root).as_posix()]
+                topology = {"debug": {"kind": "group", "scope": scope, "slices": []}}
+                violations = mod.check_source_frontier(topology, [], root)
+                self.assertTrue(any(v.category == "stale-removal" and
+                                    v.location.endswith("::receipt")
+                                    for v in violations), violations)
+                # Adding the historical scope entry cannot declare the handler portable.
+                scope.append(omitted.relative_to(root).as_posix())
+                violations = mod.check_source_frontier(topology, [], root)
+                self.assertTrue(any(v.category == "stale-removal" for v in violations), violations)
+
+    def test_omitted_pure_file_is_automatically_included_in_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "crates/tui/src/commands/groups/debug"
+            directory.mkdir(parents=True)
+            (directory / "future.rs").write_text("pub fn future() {}\n")
+            node = {"kind": "group", "scope": [], "slices": []}
+            self.assertEqual(mod.group_source_scope("debug", node, root),
+                             ["crates/tui/src/commands/groups/debug/future.rs"])
+            self.assertEqual(mod.check_source_frontier({"debug": node}, [], root), [])
 
 
 class SourceScanTests(unittest.TestCase):

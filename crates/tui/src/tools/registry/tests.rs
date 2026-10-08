@@ -17,6 +17,97 @@ use super::{
     mcp_result_to_bounded_rich_tool_result, mcp_tool_adapter_for_test,
 };
 
+#[tokio::test]
+async fn shell_denial_reaches_registry_and_direct_delegation_sinks() {
+    use crate::tools::run_tool::RunTool;
+    use crate::tools::tasks::{TaskShellStartTool, TasksTool};
+    use crate::tools::terminal_session::{TerminalResetTool, TerminalRunTool, TerminalSendTool};
+    use crate::tools::test_runner::RunTestsTool;
+    use crate::tools::verifier::RunVerifiersTool;
+    let tmp = tempdir().unwrap();
+    let mut context = ToolContext::new(tmp.path());
+    context.auto_approve = true;
+    context.disallowed_tools = vec!["Bash".into()];
+    let command = "printf forbidden > denial-canary.txt";
+    let cases: Vec<(Arc<dyn ToolSpec>, Value)> = vec![
+        (Arc::new(BashTool::new("Bash")), json!({"command":command})),
+        (
+            Arc::new(BashTool::alias("exec_interact", "interact")),
+            json!({"task_id":"missing", "stdin":command, "action":"wait"}),
+        ),
+        (Arc::new(TaskShellStartTool), json!({"command":command})),
+        (
+            Arc::new(TasksTool::new("tasks")),
+            json!({"action":"gate_run", "gate":"custom", "command":command}),
+        ),
+        (
+            Arc::new(TasksTool::alias("task_gate_run", "gate_run")),
+            json!({"action":"list", "gate":"custom", "command":command}),
+        ),
+        (Arc::new(TerminalRunTool), json!({"command":command})),
+        (
+            Arc::new(TerminalSendTool),
+            json!({"session":"missing", "text":command}),
+        ),
+        (Arc::new(TerminalResetTool), json!({"session":"missing"})),
+        (
+            Arc::new(RunTool::new("Run")),
+            json!({"action":"verifiers", "commands":[{"program":"sh", "args":["-c", command]}]}),
+        ),
+        (
+            Arc::new(RunTestsTool),
+            json!({"args":"--config build.rustc=malicious"}),
+        ),
+        (
+            Arc::new(RunVerifiersTool),
+            json!({"commands":[{"program":"sh", "args":["-c",command]}]}),
+        ),
+    ];
+    for (tool, input) in cases {
+        let mut registry = ToolRegistry::new(context.clone());
+        registry.register(tool.clone());
+        for result in [
+            registry.execute_full(tool.name(), input.clone()).await,
+            tool.execute(input, &context).await,
+        ] {
+            let error = result.expect_err(tool.name());
+            assert!(
+                error.to_string().contains("disallowed-tools"),
+                "{}: {error}",
+                tool.name()
+            );
+            assert!(!tmp.path().join("denial-canary.txt").exists());
+        }
+    }
+}
+
+#[test]
+fn shell_denial_keeps_the_existing_bounded_child_read_only_exception() {
+    use crate::core::engine::tool_catalog::enforce_tool_denial;
+    use crate::worker_profile::ShellPolicy;
+    let tmp = tempdir().unwrap();
+    let mut context = ToolContext::new(tmp.path()).with_shell_policy(ShellPolicy::ReadOnly);
+    context.disallowed_tools = vec!["Bash".into()];
+    assert!(enforce_tool_denial(&context, "bash", &json!({"command":"pwd"})).is_err());
+    context = context.with_owner_agent("fixture-child", "fixture");
+    assert!(enforce_tool_denial(&context, "bash", &json!({"command":"pwd"})).is_ok());
+    for (name, input) in [
+        ("Bash", json!({"command":"pwd"})),
+        ("bash", json!({"command":"printf bad > denied"})),
+        ("bash", json!({"command":"pwd", "background":true})),
+        ("task_shell_start", json!({"command":"pwd"})),
+        (
+            "terminal/send",
+            json!({"session":"existing", "text":"pwd\n"}),
+        ),
+    ] {
+        assert!(
+            enforce_tool_denial(&context, name, &input).is_err(),
+            "{name}: {input}"
+        );
+    }
+}
+
 #[test]
 fn mcp_iserror_result_maps_to_tool_error_preserving_text() {
     // #5123-class: MCP servers report tool failure via isError on an
@@ -48,7 +139,7 @@ fn mcp_iserror_result_maps_to_tool_error_preserving_text() {
 
 #[test]
 fn mcp_image_result_uses_typed_block_without_base64_in_text() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let payload = json!({
         "content": [
             {"type": "text", "text": "screenshot captured"},
@@ -101,7 +192,7 @@ fn mcp_invalid_image_is_removed_with_a_visible_receipt() {
 
 #[test]
 fn mcp_malformed_images_are_removed_with_a_visible_receipt() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let payload = json!({
         "content": [
             {"type": "image", "data": image_data},
@@ -123,7 +214,7 @@ fn mcp_malformed_images_are_removed_with_a_visible_receipt() {
 
 #[test]
 fn mcp_image_limits_keep_one_valid_block_and_report_the_rest() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let oversized = "A".repeat(crate::image_attach::MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4);
     let payload = json!({
         "content": [
@@ -152,7 +243,7 @@ fn mcp_image_limits_keep_one_valid_block_and_report_the_rest() {
 
 #[test]
 fn mcp_error_text_and_typed_image_are_both_preserved() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let payload = json!({
         "content": [
             {"type": "text", "text": "capture failed after partial screenshot"},
@@ -387,7 +478,7 @@ fn rlm_is_the_only_registered_session_surface() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
     let registry = ToolRegistryBuilder::new()
-        .with_rlm_tool(None, "test-model".to_string())
+        .with_rlm_tool()
         .with_harness_tool()
         .build(ctx);
 
@@ -410,26 +501,149 @@ fn rlm_is_the_only_registered_session_surface() {
     }
 }
 
+/// The names an engine treats as built in: whatever is registered before the
+/// plugin directory loads (see `configure_plugin_tools`).
+fn builtin_names(registry: &ToolRegistry) -> std::collections::HashSet<String> {
+    registry.names().into_iter().map(str::to_string).collect()
+}
+
 #[test]
 fn apply_overrides_removes_original_when_replacement_is_missing() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
     let mut registry = ToolRegistryBuilder::new().with_file_tools().build(ctx);
-
-    assert!(registry.contains("File"));
+    let builtins = builtin_names(&registry);
+    std::fs::write(
+        tmp.path().join("reader.sh"),
+        "# name: custom-reader\n# description: drop-in reader\n",
+    )
+    .unwrap();
+    registry.load_plugins(tmp.path());
+    assert!(registry.contains("custom-reader"));
 
     let mut overrides = HashMap::new();
     overrides.insert(
-        "File".to_string(),
+        "custom-reader".to_string(),
         ToolOverride::Script {
             path: "missing-wrapper.sh".to_string(),
             args: None,
         },
     );
 
-    registry.apply_overrides(&overrides, tmp.path());
+    registry.apply_overrides(&overrides, tmp.path(), &builtins);
 
+    assert!(!registry.contains("custom-reader"));
+    assert!(registry.contains("File"));
+}
+
+/// D4 (CURRENT_DECISIONS §26): a `[tools.overrides]` script or command cannot
+/// replace a built-in. The entry is refused loudly, naming the config key and
+/// the built-in, and the built-in stays active; `disabled` and overrides under
+/// a new name keep working.
+#[test]
+fn script_and_command_overrides_cannot_replace_builtins() {
+    let tmp = tempdir().unwrap();
+    let mut registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_patch_tools()
+        .build(ToolContext::new(tmp.path()));
+    let builtins = builtin_names(&registry);
+    let file = registry.get("File").unwrap();
+    let patch = registry.get("apply_patch").unwrap();
+    std::fs::write(
+        tmp.path().join("wrapper.sh"),
+        "# name: wrapper\n# description: audit wrapper\n",
+    )
+    .unwrap();
+    let script = || ToolOverride::Script {
+        path: "wrapper.sh".to_string(),
+        args: None,
+    };
+    let command = || ToolOverride::Command {
+        command: "my-patcher".to_string(),
+        args: None,
+    };
+    let overrides = HashMap::from([
+        ("File".to_string(), script()),
+        ("apply_patch".to_string(), command()),
+        ("audited_file".to_string(), script()),
+        ("my_patcher".to_string(), command()),
+    ]);
+
+    let mut refused = Vec::new();
+    let errors = capture_registration_warnings(|| {
+        refused = registry.apply_overrides(&overrides, tmp.path(), &builtins);
+    });
+
+    assert!(Arc::ptr_eq(&registry.get("File").unwrap(), &file));
+    assert!(Arc::ptr_eq(&registry.get("apply_patch").unwrap(), &patch));
+    // The refusals are returned for the engine's status line and logged.
+    refused.sort();
+    assert_eq!(refused, ["File", "apply_patch"]);
+    for name in ["File", "apply_patch"] {
+        assert!(
+            errors.contains(&super::override_refusal_notice(name)),
+            "{errors}"
+        );
+    }
+    assert_eq!(
+        registry.get("audited_file").unwrap().description(),
+        "audit wrapper"
+    );
+    assert!(registry.contains("my_patcher"));
+
+    let disable = HashMap::from([("File".to_string(), ToolOverride::Disabled)]);
+    registry.apply_overrides(&disable, tmp.path(), &builtins);
     assert!(!registry.contains("File"));
+}
+
+/// D4 (CURRENT_DECISIONS §26): a script cannot approve itself. `approval: auto`
+/// gets the default a script without the line gets, and the loader says so.
+#[test]
+fn script_tool_auto_approval_is_ignored_and_reported() {
+    let tmp = tempdir().unwrap();
+    let mut registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .build(ToolContext::new(tmp.path()));
+    let builtins = builtin_names(&registry);
+    let plugin_dir = tmp.path().join("tools");
+    std::fs::create_dir(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("greet.sh"),
+        "# name: greet\n# description: Say hello\n# approval: auto\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("audit.sh"),
+        "# name: ignored\n# description: audit\n# approval: auto\n",
+    )
+    .unwrap();
+    let overrides = HashMap::from([(
+        "audited".to_string(),
+        ToolOverride::Script {
+            path: tmp.path().join("audit.sh").to_string_lossy().into_owned(),
+            args: None,
+        },
+    )]);
+
+    let warnings = capture_registration_warnings(|| {
+        registry.load_plugins(&plugin_dir);
+        registry.apply_overrides(&overrides, &plugin_dir, &builtins);
+    });
+
+    for name in ["greet", "audited"] {
+        assert_eq!(
+            registry.get(name).unwrap().approval_requirement(),
+            ApprovalRequirement::Suggest,
+            "{name}"
+        );
+        assert!(
+            warnings.contains(&format!(
+                "Script tool '{name}': `approval: auto` is no longer supported for script tools"
+            )),
+            "{warnings}"
+        );
+    }
 }
 
 #[test]
@@ -442,6 +656,78 @@ fn builder_registers_speech_alias_tools() {
 
     assert!(registry.contains("speech"));
     assert!(registry.contains("tts"));
+    // One capability, one catalog entry: the alias stays callable for replay
+    // but is not advertised (#5941).
+    let visible: Vec<String> = registry
+        .to_api_tools()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(visible.iter().any(|name| name == "speech"));
+    assert!(!visible.iter().any(|name| name == "tts"), "{visible:?}");
+}
+
+#[test]
+fn agent_runtime_surface_skips_speech_without_a_client() {
+    use super::AgentToolSurfaceOptions;
+    use crate::worker_profile::ShellPolicy;
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let registry = ToolRegistryBuilder::new()
+        .with_agent_runtime_surface(
+            None,
+            "test-model".to_string(),
+            AgentToolSurfaceOptions::new(ShellPolicy::Full),
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        )
+        .build(ctx);
+    assert!(!registry.contains("speech"));
+    assert!(!registry.contains("tts"));
+}
+
+#[test]
+fn model_visible_tool_descriptions_name_no_vendor() {
+    use super::AgentToolSurfaceOptions;
+    use crate::worker_profile::ShellPolicy;
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
+    options.web_search_enabled = true;
+    let registry = ToolRegistryBuilder::new()
+        .with_agent_runtime_surface(
+            None,
+            "test-model".to_string(),
+            options,
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        )
+        .with_speech_tools(None, None)
+        .build(ctx);
+    let vendors = [
+        "xiaomi",
+        "mimo",
+        "claude",
+        "anthropic",
+        "openai",
+        "gpt-",
+        "deepseek",
+        "gemini",
+        "kimi",
+        "qwen",
+        "grok",
+        "mistral",
+    ];
+    for tool in registry.to_api_tools() {
+        let description = tool.description.to_ascii_lowercase();
+        for vendor in vendors {
+            assert!(
+                !description.contains(vendor),
+                "tool {} names a vendor ({vendor}) in its model-facing description",
+                tool.name
+            );
+        }
+    }
 }
 
 #[test]
@@ -715,7 +1001,10 @@ fn readonly_verifier_context(workspace: &std::path::Path) -> ToolContext {
 fn machine_verifier_catalog_and_dispatch_add_only_bounded_run() {
     let tmp = tempdir().expect("tempdir");
     let registry = ToolRegistryBuilder::new()
-        .with_agent_tools_policy(crate::worker_profile::ShellPolicy::None)
+        .with_agent_tools_policy(
+            crate::worker_profile::ShellPolicy::None,
+            crate::tools::user_input::UserInputLimits::default(),
+        )
         .with_web_tools()
         .with_todo_tool(crate::tools::todo::new_shared_todo_list())
         .build(readonly_verifier_context(tmp.path()));
@@ -820,6 +1109,11 @@ async fn fleet_authority_allows_scoped_file_writes_and_rejects_outside_paths() {
 async fn fleet_authority_allows_only_classifier_proven_readonly_bash() {
     let tmp = tempdir().expect("tempdir");
     std::fs::create_dir(tmp.path().join("src")).expect("src");
+    std::fs::write(
+        tmp.path().join("src/evidence.txt"),
+        "first\nsecond\nthird\n",
+    )
+    .expect("inspection fixture");
     let registry = ToolRegistryBuilder::new()
         .with_shell_tools()
         .build(readonly_scout_context(tmp.path(), true));
@@ -831,6 +1125,19 @@ async fn fleet_authority_allows_only_classifier_proven_readonly_bash() {
         "rg needle src",
         "gh issue list --limit 10",
         "gh issue view 5287 --json title,state",
+        "sed -n '2,3p' src/evidence.txt",
+        // #6015: durable workers accept the same grammar as in-session
+        // agents — pipelines, chains, find, git -C and a leading cd.
+        "rg -n foo src | head -5",
+        "find . -name '*.rs'",
+        "git -C . log --oneline -3",
+        "cd src && git diff",
+        "git diff HEAD && echo '=== FILES ===' && ls -la",
+        "rg -n foo src 2>/dev/null",
+        "sed -n '2p' src/evidence.txt | head -n 1",
+        "sed -n '2p' src/evidence.txt | gh issue list",
+        "gh issue list | sed -n '2p'",
+        "find src -name '*.rs'",
     ] {
         enforce_tool_authority(
             "Bash",
@@ -847,6 +1154,24 @@ async fn fleet_authority_allows_only_classifier_proven_readonly_bash() {
         .expect("bounded read-only Bash survives machine authority");
     assert!(result.success, "{}", result.content);
 
+    #[cfg(unix)]
+    for name in ["bash", "Bash"] {
+        let result = registry
+            .execute_full(name, json!({"command": "sed -n '2,3p' src/evidence.txt"}))
+            .await
+            .expect("numeric sed inspection survives machine authority");
+        assert!(result.success, "{}", result.content);
+        assert!(
+            result.content.contains("second\nthird"),
+            "{}",
+            result.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src/evidence.txt")).expect("fixture"),
+            "first\nsecond\nthird\n"
+        );
+    }
+
     for command in [
         "touch src/no.txt",
         "git checkout -- src/lib.rs",
@@ -857,13 +1182,31 @@ async fn fleet_authority_allows_only_classifier_proven_readonly_bash() {
         "gh issue view 5287 > issue.txt",
         "gh issue view 5287 &",
         "bash -lc 'git status'",
+        "sed -i -n '2p' src/evidence.txt",
+        "sed -n '2p' src/evidence.txt -i",
+        "sed -n '2p' src/evidence.txt -e 'w src/no.txt'",
+        "sed -n '2p' src/evidence.txt -f src/evidence.txt",
+        "sed -n 'w src/no.txt' src/evidence.txt",
+        "sed -n 'e touch src/no.txt' src/evidence.txt",
+        "sed -n 's/first/changed/w src/no.txt' src/evidence.txt",
+        "sed -n '2p' $(touch src/no.txt)",
+        "sed -n '2p' src/evidence.txt > src/no.txt",
+        "sed -n '2p' src/evidence.txt && touch src/no.txt",
+        "find src -delete",
+        "awk '1' src/evidence.txt",
+        "git commit -m x",
+        "sort -o src/no.txt src/evidence.txt",
+        "cd /etc; cat passwd",
     ] {
         let error = registry
             .execute_full("Bash", json!({"action": "run", "command": command}))
             .await
             .expect_err("mutating Bash remains outside machine authority")
             .to_string();
-        assert!(error.contains("arbitrary command execution"), "{error}");
+        // The refusal names the rule, from the same classifier every
+        // read-only gate uses.
+        assert!(error.contains("[shell.readonly.command]"), "{error}");
+        assert!(error.contains("File tool"), "{error}");
     }
     assert!(!tmp.path().join("src/no.txt").exists());
 
@@ -877,6 +1220,78 @@ async fn fleet_authority_allows_only_classifier_proven_readonly_bash() {
     .expect_err("mutation authority must not imply shell authority")
     .to_string();
     assert!(error.contains("does not grant read-only shell"), "{error}");
+}
+
+#[test]
+fn fleet_authority_sed_inspection_preserves_policy_boundaries() {
+    let tmp = tempdir().expect("tempdir");
+    let context = readonly_scout_context(tmp.path(), false);
+    let registry = ToolRegistryBuilder::new().with_shell_tools().build(context);
+    for name in ["bash", "Bash"] {
+        let shell = registry.get(name).expect("shell tool");
+        let input = if name == "bash" {
+            json!({"command": "sed -n '300,400p' src/lib.rs", "timeout": 10})
+        } else {
+            json!({"action": "run", "command": "sed -n '300,400p' src/lib.rs", "timeout_ms": 10_000})
+        };
+        enforce_tool_authority(name, &input, shell.as_ref(), registry.context())
+            .expect("local numeric sed inspection needs no network grant");
+        assert!(
+            !shell.is_read_only_for(&input),
+            "parent classification stays strict"
+        );
+        assert!(
+            !shell.supports_parallel_for(&input),
+            "parallel policy stays strict"
+        );
+        assert_eq!(
+            shell.approval_requirement_for(&input),
+            ApprovalRequirement::Required
+        );
+
+        let mut denied = registry.context().clone();
+        denied.disallowed_tools = vec!["Bash".into()];
+        assert!(enforce_tool_authority(name, &input, shell.as_ref(), &denied).is_err());
+        assert!(
+            enforce_tool_authority(name, &input, shell.as_ref(), &scoped_context(tmp.path()))
+                .is_err(),
+            "write authority does not grant shell authority"
+        );
+        assert!(
+            enforce_tool_authority(
+                name,
+                &input,
+                shell.as_ref(),
+                &readonly_verifier_context(tmp.path())
+            )
+            .is_err(),
+            "shell-less evidence authority stays shell-less"
+        );
+        for field in [
+            json!({"background": true}),
+            json!({"tty": true}),
+            json!({"interactive": true}),
+            json!({"stdin": ""}),
+            json!({"action": "wait"}),
+            json!({"action": "interact"}),
+            json!({"action": "cancel"}),
+            json!({"action": 3}),
+            json!({"task_id": "shell_1"}),
+            json!({"persist": true}),
+            json!({"sandbox_permissions": "danger-full-access", "justification": "test"}),
+        ] {
+            let mut rejected = input.clone();
+            rejected
+                .as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            assert!(
+                enforce_tool_authority(name, &rejected, shell.as_ref(), registry.context())
+                    .is_err(),
+                "{name}: {rejected}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -917,6 +1332,38 @@ fn fleet_authority_intersects_readonly_github_bash_with_network_ceiling() {
         .expect_err("network denial must win")
         .to_string();
     assert!(error.contains("does not grant network access"), "{error}");
+
+    // #6015: an admitted network read cannot hide inside a pipeline or chain.
+    for command in [
+        "gh pr view 1 | head",
+        "ls && gh issue list",
+        "cd . && gh pr view 1",
+    ] {
+        let input = json!({"action": "run", "command": command});
+        enforce_tool_authority("Bash", &input, &shell, &networked)
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+        let error = enforce_tool_authority("Bash", &input, &shell, &offline)
+            .expect_err("network denial must win inside compositions")
+            .to_string();
+        assert!(
+            error.contains("does not grant network access"),
+            "{command}: {error}"
+        );
+    }
+    // Network access alone cannot authorize npm's configured destinations.
+    for command in [
+        "npm view x",
+        "npm view @scope/pkg --json",
+        "cd sub && npm view x",
+    ] {
+        let input = json!({"action": "run", "command": command});
+        for context in [&networked, &offline] {
+            let error = enforce_tool_authority("Bash", &input, &shell, context)
+                .expect_err("npm metadata reads require ordinary shell authority")
+                .to_string();
+            assert!(error.contains("configuration"), "{command}: {error}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1299,12 +1746,42 @@ fn agent_runtime_surface_gates_verify_on_option() {
 }
 
 #[test]
+fn agent_runtime_surface_gates_request_plugin_install_on_option() {
+    use super::AgentToolSurfaceOptions;
+    use crate::worker_profile::ShellPolicy;
+
+    // Policy rule 11: hosts without the TUI (exec, runtime API) and sessions
+    // with contextual tips off get no plugin-offer tool in any mode.
+    let build_surface = |enabled: bool| {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
+        options.request_plugin_install_enabled = enabled;
+        ToolRegistryBuilder::new()
+            .with_agent_runtime_surface(
+                None,
+                "test-model".to_string(),
+                options,
+                crate::tools::todo::new_shared_todo_list(),
+                crate::tools::plan::new_shared_plan_state(),
+            )
+            .build(ctx)
+    };
+
+    assert!(build_surface(true).contains("request_plugin_install"));
+    assert!(!build_surface(false).contains("request_plugin_install"));
+}
+
+#[test]
 fn test_builder_with_agent_tools_policy_includes_finance() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
 
     let registry = ToolRegistryBuilder::new()
-        .with_agent_tools_policy(crate::worker_profile::ShellPolicy::None)
+        .with_agent_tools_policy(
+            crate::worker_profile::ShellPolicy::None,
+            crate::tools::user_input::UserInputLimits::default(),
+        )
         .build(ctx);
 
     assert!(registry.contains("finance"));
@@ -1316,7 +1793,10 @@ fn agent_tools_with_shell_policy_none_excludes_shell_tools() {
     let ctx = ToolContext::new(tmp.path().to_path_buf());
 
     let registry = ToolRegistryBuilder::new()
-        .with_agent_tools_policy(crate::worker_profile::ShellPolicy::None)
+        .with_agent_tools_policy(
+            crate::worker_profile::ShellPolicy::None,
+            crate::tools::user_input::UserInputLimits::default(),
+        )
         .build(ctx);
 
     assert!(!registry.contains("bash"));
@@ -1341,7 +1821,10 @@ fn agent_tools_with_shell_policy_readonly_exposes_only_run_only_bash() {
     let ctx = ToolContext::new(tmp.path().to_path_buf());
 
     let registry = ToolRegistryBuilder::new()
-        .with_agent_tools_policy(crate::worker_profile::ShellPolicy::ReadOnly)
+        .with_agent_tools_policy(
+            crate::worker_profile::ShellPolicy::ReadOnly,
+            crate::tools::user_input::UserInputLimits::default(),
+        )
         .build(ctx);
 
     assert!(registry.contains("bash"));
@@ -1368,10 +1851,16 @@ fn agent_tools_with_shell_policy_readonly_exposes_only_run_only_bash() {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "justification", "sandbox_permissions", "timeout"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "command",
+            "justification",
+            "read_only",
+            "sandbox_permissions",
+            "timeout"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     );
     for hidden in ["action", "background", "tty", "stdin", "task_id", "wait"] {
         assert!(bash.input_schema["properties"].get(hidden).is_none());
@@ -1388,7 +1877,10 @@ fn agent_tools_with_shell_policy_readonly_exposes_only_run_only_bash() {
 fn machine_readonly_catalog_is_exactly_the_evidence_profile() {
     let tmp = tempdir().expect("tempdir");
     let registry = ToolRegistryBuilder::new()
-        .with_agent_tools_policy(crate::worker_profile::ShellPolicy::ReadOnly)
+        .with_agent_tools_policy(
+            crate::worker_profile::ShellPolicy::ReadOnly,
+            crate::tools::user_input::UserInputLimits::default(),
+        )
         .with_web_tools()
         .with_todo_tool(crate::tools::todo::new_shared_todo_list())
         .build(readonly_scout_context(tmp.path(), true));
@@ -1428,6 +1920,32 @@ fn machine_readonly_catalog_is_exactly_the_evidence_profile() {
     assert!(registry.contains("Bash"));
     assert!(tools.iter().all(|tool| tool.name != "File"));
     assert!(tools.iter().all(|tool| tool.name != "Bash"));
+    let shell = tools.iter().find(|tool| tool.name == "bash").unwrap();
+    assert!(shell.description.contains("`cd <dir> &&`"));
+    assert!(shell.description.contains("git log"));
+    assert!(shell.description.contains("cannot change its own role"));
+    let bash = registry.get("bash").unwrap();
+    enforce_tool_authority(
+        "bash",
+        &json!({"command": "cd src && git status"}),
+        bash.as_ref(),
+        registry.context(),
+    )
+    .expect("a leading cd moves into the working directory (#6015)");
+    for command in ["git branch -a", "git rev-parse HEAD"] {
+        let error = enforce_tool_authority(
+            "bash",
+            &json!({"command":command}),
+            bash.as_ref(),
+            registry.context(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("subcommand:") && error.contains("git log"),
+            "{error}"
+        );
+    }
     let web = tools.iter().find(|tool| tool.name == "Web").unwrap();
     assert_eq!(
         web.input_schema["properties"]["action"]["enum"],
@@ -1455,7 +1973,10 @@ fn agent_tools_with_shell_policy_full_includes_shell_tools() {
     let ctx = ToolContext::new(tmp.path().to_path_buf());
 
     let registry = ToolRegistryBuilder::new()
-        .with_agent_tools_policy(crate::worker_profile::ShellPolicy::Full)
+        .with_agent_tools_policy(
+            crate::worker_profile::ShellPolicy::Full,
+            crate::tools::user_input::UserInputLimits::default(),
+        )
         .build(ctx);
 
     assert!(registry.contains("bash"));
@@ -1654,9 +2175,7 @@ fn read_only_task_surface_contains_no_per_action_aliases() {
 fn rlm_family_removes_legacy_aliases() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
-    let registry = ToolRegistryBuilder::new()
-        .with_rlm_tool(None, "deepseek-v4-pro".to_string())
-        .build(ctx);
+    let registry = ToolRegistryBuilder::new().with_rlm_tool().build(ctx);
 
     for alias in [
         "rlm_session_objects",
@@ -1689,4 +2208,319 @@ fn rlm_family_removes_legacy_aliases() {
             "{retired} must not be advertised"
         );
     }
+}
+
+#[test]
+fn a_builder_upgrade_replaces_the_tool_instead_of_registering_it_twice() {
+    // `with_patch_tools` swaps the default `File` for the patch-capable one;
+    // that used to reach `register` as a second `File` and warn on every
+    // registry rebuild (#5934).
+    let builder = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_patch_tools();
+    let file_tools = builder
+        .tools
+        .iter()
+        .filter(|tool| tool.name() == "File")
+        .count();
+    assert_eq!(file_tools, 1, "one File tool after the upgrade");
+    assert!(
+        builder
+            .tools
+            .iter()
+            .any(|tool| tool.name() == "apply_patch"),
+        "the upgrade still adds apply_patch"
+    );
+    let tmp = tempdir().unwrap();
+    let warnings = capture_registration_warnings(|| {
+        let registry = builder.build(ToolContext::new(tmp.path()));
+        assert!(registry.contains("File"));
+        assert!(registry.contains("apply_patch"));
+    });
+    assert!(warnings.is_empty(), "normal File composition: {warnings}");
+}
+
+fn capture_registration_warnings(action: impl FnOnce()) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut output = tempfile::tempfile().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::sync::Mutex::new(output.try_clone().unwrap()))
+        .finish();
+    tracing::subscriber::with_default(subscriber, action);
+    output.seek(SeekFrom::Start(0)).unwrap();
+    let mut warnings = String::new();
+    output.read_to_string(&mut warnings).unwrap();
+    warnings
+}
+
+#[test]
+fn runtime_surface_hardening_plugin_collisions_preserve_registered_tools() {
+    let tmp = tempdir().unwrap();
+    let mut registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .build(ToolContext::new(tmp.path()));
+    let original = registry.get("File").unwrap();
+    let original_catalog = registry.to_api_tools();
+    std::fs::write(
+        tmp.path().join("tool.sh"),
+        "# name: File\n# description: custom file tool\n",
+    )
+    .unwrap();
+    let errors = capture_registration_warnings(|| registry.load_plugins(tmp.path()));
+    assert!(
+        errors.contains("Cannot load plugin tool 'File': name is already registered"),
+        "{errors}"
+    );
+    assert!(errors.contains(&format!(
+        "previous_origin={:?}",
+        original.registration_origin()
+    )));
+    let plugin_origin = format!(
+        "plugin script tool.sh ({})",
+        crate::safe_label::SafeLabel::identifier(&tmp.path().join("tool.sh").to_string_lossy())
+    );
+    assert!(errors.contains(&format!("plugin_origin={plugin_origin:?}")));
+    assert!(!errors.contains(tmp.path().to_string_lossy().as_ref()));
+    assert!(Arc::ptr_eq(&registry.get("File").unwrap(), &original));
+    assert_eq!(
+        serde_json::to_value(registry.to_api_tools()).unwrap(),
+        serde_json::to_value(original_catalog).unwrap()
+    );
+
+    std::fs::write(
+        tmp.path().join("other.sh"),
+        "# name: custom-reader\n# description: custom reader\n",
+    )
+    .unwrap();
+    registry.load_plugins(tmp.path());
+    assert!(registry.contains("custom-reader"));
+
+    // An explicit override still wins over a drop-in script of the same name;
+    // it never replaces a built-in (see
+    // `script_and_command_overrides_cannot_replace_builtins`).
+    let builtins = std::collections::HashSet::from(["File".to_string()]);
+    let overrides = std::collections::HashMap::from([(
+        "custom-reader".to_string(),
+        crate::config::ToolOverride::Command {
+            command: "my-reader".to_string(),
+            args: None,
+        },
+    )]);
+    registry.apply_overrides(&overrides, tmp.path(), &builtins);
+    assert!(
+        registry
+            .get("custom-reader")
+            .unwrap()
+            .description()
+            .contains("my-reader")
+    );
+    assert!(Arc::ptr_eq(&registry.get("File").unwrap(), &original));
+}
+
+#[test]
+fn registration_adapter_origins_are_bounded_and_exclude_execution_payloads() {
+    use crate::tools::dynamic::RuntimeDynamicTool;
+    use crate::tools::plugin::tool_from_override;
+    use codewhale_protocol::runtime::DynamicToolSpec;
+    let tmp = tempdir().unwrap();
+    let hostile = format!(
+        "\u{1b}[31m\nhttps://private.invalid/token?{}",
+        "x".repeat(500)
+    );
+    let command = "do-not-log-command";
+    let argument = "do-not-log-argument";
+    let schema_payload = "do-not-log-schema";
+    let cases: Vec<(Arc<dyn ToolSpec>, &str)> = vec![
+        (
+            Arc::new(RuntimeDynamicTool::new(DynamicToolSpec {
+                name: hostile.clone(),
+                namespace: Some(hostile.clone()),
+                description: command.into(),
+                input_schema: json!({"description":schema_payload}),
+                defer_loading: false,
+            })),
+            "runtime dynamic namespace sha256:",
+        ),
+        (
+            Arc::new(super::McpToolAdapter {
+                name: hostile.clone(),
+                server_name: Some("plugin-4-demo-server_with_underscores".into()),
+                tool: crate::mcp::McpTool {
+                    name: hostile.clone(),
+                    description: Some(command.into()),
+                    input_schema: json!({"description":schema_payload}),
+                    annotations: None,
+                },
+                pool: Arc::new(tokio::sync::Mutex::new(crate::mcp::McpPool::new(
+                    crate::mcp::McpConfig::default(),
+                ))),
+            }),
+            "MCP server plugin-4-demo-server_with_underscores, tool sha256:",
+        ),
+        (
+            tool_from_override(
+                &hostile,
+                &ToolOverride::Command {
+                    command: command.into(),
+                    args: Some(vec![argument.into()]),
+                },
+                tmp.path(),
+            )
+            .unwrap(),
+            "config [tools.overrides.sha256:",
+        ),
+    ];
+    for (replacement, expected_origin) in cases {
+        let mut registry = ToolRegistry::new(ToolContext::new(tmp.path()));
+        registry.register(make_test_tool(&hostile));
+        let warnings = capture_registration_warnings(|| registry.register(replacement.clone()));
+        assert_eq!(warnings.lines().count(), 1, "{warnings}");
+        assert!(
+            warnings.contains("Overwriting existing tool: sha256:"),
+            "{warnings}"
+        );
+        assert!(warnings.contains(expected_origin), "{warnings}");
+        assert!(warnings.len() < 600, "{warnings}");
+        for excluded in [
+            &hostile,
+            command,
+            argument,
+            schema_payload,
+            "https://private.invalid",
+            "\u{1b}",
+        ] {
+            assert!(
+                !warnings.contains(excluded),
+                "unexpected payload: {warnings}"
+            );
+        }
+        assert!(Arc::ptr_eq(&registry.get(&hostile).unwrap(), &replacement));
+    }
+}
+
+/// Regression probe for the fleet-52663788 class of provider 400
+/// (`Invalid schema for function 'bash': null is not of type "array"`):
+/// a read-only Fleet worker (reviewer) projects its tool schemas before the
+/// wire; no projected schema may carry a JSON null, because strict
+/// OpenAI-compatible validators reject null where arrays/objects are typed.
+#[test]
+fn fleet_readonly_reviewer_wire_catalog_carries_no_null_schema_fields() {
+    use crate::tools::spec::{
+        ToolMutationAuthority, ToolShellAuthority, ToolVerificationAuthority,
+    };
+
+    fn collect_null_paths(value: &Value, path: String, out: &mut Vec<String>) {
+        match value {
+            Value::Null => out.push(path),
+            Value::Object(map) => {
+                for (key, child) in map {
+                    collect_null_paths(child, format!("{path}.{key}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_null_paths(child, format!("{path}[{index}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let tmp = tempdir().expect("tempdir");
+    let reviewer_authority = ToolAuthorityEnvelope {
+        schema_version: 1,
+        owner: "reviewer".to_string(),
+        authority: ToolMutationAuthority::ReadOnly,
+        network_access: Some(false),
+        shell: ToolShellAuthority::ReadOnly,
+        verification: ToolVerificationAuthority::None,
+        writable_roots: Vec::new(),
+        writable_files: Vec::new(),
+        coordination_contracts: Vec::new(),
+    };
+    let context = ToolContext::new(tmp.path().to_path_buf())
+        .with_tool_authority(reviewer_authority)
+        .expect("reviewer authority");
+
+    let registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_foreground_shell_tools()
+        .with_search_tools()
+        .build(context);
+    let tools = registry.to_api_tools();
+    assert!(
+        tools.iter().any(|tool| tool.name == "bash"),
+        "reviewer keeps classifier-bounded bash"
+    );
+
+    for tool in &tools {
+        let mut nulls = Vec::new();
+        collect_null_paths(&tool.input_schema, "$".to_string(), &mut nulls);
+        assert!(
+            nulls.is_empty(),
+            "tool {} schema carries null at {nulls:?}: {}",
+            tool.name,
+            tool.input_schema
+        );
+    }
+}
+
+#[test]
+fn read_media_is_not_offered_to_a_text_only_route() {
+    use codewhale_config::route::CapabilityState;
+    let tmp = tempdir().unwrap();
+    for (state, offered) in [
+        (CapabilityState::Unsupported, false),
+        (CapabilityState::Unknown, true),
+        (CapabilityState::Supported, true),
+    ] {
+        let mut context = ToolContext::new(tmp.path());
+        context.route_capabilities.image_input = state;
+        let registry = ToolRegistryBuilder::new()
+            .with_read_media_tool()
+            .build(context);
+        assert_eq!(registry.get("read_media").is_some(), offered, "{state:?}");
+    }
+}
+
+/// #6559 D04-10: a client-supplied dynamic tool cannot take over a builtin
+/// handler (and its approval policy), and a second dynamic tool with the same
+/// model-facing name from another namespace cannot replace the first.
+#[test]
+fn dynamic_tools_never_replace_registered_tools() {
+    use codewhale_protocol::runtime::DynamicToolSpec;
+    let tmp = tempdir().unwrap();
+    let spec = |namespace: &str, name: &str, description: &str| DynamicToolSpec {
+        namespace: Some(namespace.to_string()),
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: json!({"type": "object"}),
+        defer_loading: false,
+    };
+    let registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_dynamic_tools(&[
+            spec("client", "read", "client read"),
+            spec("first", "lookup", "first lookup"),
+            spec("second", "lookup", "second lookup"),
+        ])
+        .build(ToolContext::new(tmp.path()));
+
+    let read = registry.get("read").expect("builtin read");
+    assert_ne!(read.description(), "client read");
+    assert!(
+        !read.registration_origin().contains("runtime dynamic"),
+        "{}",
+        read.registration_origin()
+    );
+    assert_eq!(
+        registry
+            .get("lookup")
+            .expect("first dynamic tool")
+            .description(),
+        "first lookup"
+    );
 }

@@ -27,7 +27,7 @@ pub(crate) fn dismiss_dock(app: &mut App) {
     // closed: the dock re-opens when *that* view grows.
     super::model::resolve_view(app);
     app.work_surface.dismissed_view = app.work_surface.panel;
-    app.work_surface.dismissed_at_rows = super::model::visible_rows_for_panel(app).len();
+    app.work_surface.dismissed_at_rows = super::model::auto_work_rows(app);
     app.work_surface.focused = false;
     app.work_surface.selected = None;
     app.needs_redraw = true;
@@ -82,6 +82,14 @@ pub fn activate_primary(
         app.work_surface.opened = Some(row_id.clone());
     }
     Some(action)
+}
+
+/// Whether the work-surface-owned detail is actually on screen. A row action
+/// that runs a command without pushing a view (the Context panel's `/compact`
+/// row) still records `opened`; with nothing stacked above the dock that owner
+/// is stale, and Esc belongs to the dock again (#6502).
+pub(crate) fn opened_detail_on_screen(app: &App) -> bool {
+    app.work_surface.opened.is_some() && !app.view_stack.is_empty()
 }
 
 /// Close the work-surface-owned detail (pager when we opened it).

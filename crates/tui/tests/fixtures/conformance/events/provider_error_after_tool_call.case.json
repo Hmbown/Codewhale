@@ -1,0 +1,137 @@
+{
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "approval_mode": "bypass",
+  "auto_approve": true,
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "workspace_files": {
+    "README.md": "conformance fixture\n",
+    "NOTES.md": "second file\n"
+  },
+  "description": "A complete file-writing tool call, then a terminal provider `error` frame in the same stream (C02-05). A failed response authorizes nothing: the collected call must not execute and no further request may be sent.",
+  "user_message": "Write c0205.txt.",
+  "provider_script": [
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_error",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 120,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "call_write",
+            "name": "File",
+            "input": {}
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"action\":\"write\",\"path\":\"c0205.txt\",\"content\":\"side effect\\n\"}"
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "error",
+          "error": {
+            "message": "Model not exist."
+          }
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_error_retry",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 200,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "text",
+            "text": ""
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "this second request must never be issued"
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "end_turn"
+          },
+          "usage": {
+            "input_tokens": 200,
+            "output_tokens": 6
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "workspace_file_absent": "c0205.txt"
+    },
+    {
+      "max_model_requests": 1
+    }
+  ]
+}

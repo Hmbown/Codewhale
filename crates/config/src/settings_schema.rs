@@ -33,10 +33,15 @@
 //! order they are first declared within a tab, and rows in declaration order
 //! within a group.
 //!
-//! Three settings take their values from a runtime registry rather than this
-//! table (`theme` from the shipped palettes, `locale` from the shipped packs,
-//! `reasoning_effort` from the active route's efforts). They are declared
-//! `String`; the surface supplies the live value list.
+//! Two settings take their values from a runtime registry rather than this
+//! table (`theme` from the shipped palettes, `locale` from the shipped packs).
+//! They are declared `String`; the surface supplies the live value list.
+//! `reasoning_effort` declares the canonical nine-spelling effort vocabulary
+//! here so `/config` and `/effort` cannot disagree; the live settings screen
+//! still narrows that list to the active route's rungs.
+
+/// Fresh terminal installs, theme resets and the settings schema share this default.
+pub const DEFAULT_TUI_THEME: &str = "underwater";
 
 /// One selectable value of a [`SettingKind::Enum`] (or a boolean override).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,8 +70,24 @@ pub enum SettingKind {
     /// on/off labels; a non-empty one overrides them per value.
     Bool(&'static [SettingOption]),
     Int,
+    /// A fractional number such as a percent threshold. Values are served and
+    /// accepted in plain decimal form; bounds live in the write validator.
+    Float,
     Enum(&'static [SettingOption]),
     String,
+}
+
+/// What a declared settings row is. `Setting` is a writable preference;
+/// `Action` opens another surface (the provider/model pickers, module
+/// links); `Diagnostic` is a read-only receipt or managed-policy fact;
+/// `Session` is editable for the running session but does not persist
+/// through the config store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingRowKind {
+    Setting,
+    Action,
+    Diagnostic,
+    Session,
 }
 
 /// Where a setting appears, and what it says. Absent ⇒ no row.
@@ -78,6 +99,11 @@ pub struct SettingUi {
     pub label: &'static str,
     /// Message key for the row's description sentence.
     pub description: &'static str,
+    /// Whether the row is a writable preference, a link to another surface,
+    /// a read-only receipt, or a session-scoped override. Surfaces that
+    /// cannot open the target or scope the write render non-`Setting` rows
+    /// read-only instead of guessing.
+    pub row: SettingRowKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +123,7 @@ impl SettingDef {
         match self.kind {
             SettingKind::Bool(_) => Some(vec!["false", "true"]),
             SettingKind::Enum(options) => Some(options.iter().map(|o| o.value).collect()),
-            SettingKind::Int | SettingKind::String => None,
+            SettingKind::Int | SettingKind::String | SettingKind::Float => None,
         }
     }
 
@@ -105,7 +131,7 @@ impl SettingDef {
     pub fn option(&self, value: &str) -> Option<&'static SettingOption> {
         let options = match self.kind {
             SettingKind::Bool(options) | SettingKind::Enum(options) => options,
-            SettingKind::Int | SettingKind::String => return None,
+            SettingKind::Int | SettingKind::String | SettingKind::Float => return None,
         };
         options.iter().find(|option| option.value == value)
     }
@@ -117,7 +143,49 @@ impl SettingDef {
     pub fn is_int(&self) -> bool {
         matches!(self.kind, SettingKind::Int)
     }
+
+    pub fn is_float(&self) -> bool {
+        matches!(self.kind, SettingKind::Float)
+    }
 }
+
+const NOTIFICATION_SOUNDS: &[SettingOption] = &[
+    SettingOption::new("legacy", "ConfigChoiceNotificationLegacy", ""),
+    SettingOption::new("off", "ConfigValueOff", ""),
+    SettingOption::new("whale", "ConfigChoiceNotificationWhale", ""),
+    SettingOption::new("bell", "ConfigChoiceNotificationBell", ""),
+    SettingOption::new("beep", "ConfigChoiceNotificationBell", ""),
+    SettingOption::new("file", "ConfigChoiceNotificationFile", ""),
+];
+
+const NOTIFICATION_COMPLETION_SOUNDS: &[SettingOption] = &[
+    SettingOption::new("off", "ConfigValueOff", ""),
+    SettingOption::new("whale", "ConfigChoiceNotificationWhale", ""),
+    SettingOption::new("bell", "ConfigChoiceNotificationBell", ""),
+    SettingOption::new("beep", "ConfigChoiceNotificationBell", ""),
+    SettingOption::new("file", "ConfigChoiceNotificationFile", ""),
+];
+
+const NOTIFICATION_CONDITIONS: &[SettingOption] = &[
+    SettingOption::new("always", "ConfigChoiceNotificationAlways", ""),
+    SettingOption::new("unfocused", "ConfigChoiceNotificationUnfocused", ""),
+    SettingOption::new("never", "ConfigChoiceNotificationNever", ""),
+];
+
+const NOTIFICATION_METHODS: &[SettingOption] = &[
+    SettingOption::new("auto", "", ""),
+    SettingOption::new("off", "", ""),
+    SettingOption::new("osc9", "", ""),
+    SettingOption::new("bel", "", ""),
+    SettingOption::new("kitty", "", ""),
+    SettingOption::new("ghostty", "", ""),
+];
+
+const NOTIFICATION_SUBAGENTS: &[SettingOption] = &[
+    SettingOption::new("off", "", ""),
+    SettingOption::new("final-only", "", ""),
+    SettingOption::new("always", "", ""),
+];
 
 const ON_OFF: &[SettingOption] = &[];
 
@@ -252,6 +320,26 @@ const COST_CURRENCY: &[SettingOption] = &[
     SettingOption::new("cny", "", ""),
 ];
 
+/// The canonical `ReasoningEffort::as_setting` spellings, in the order
+/// `auto, off, minimal, low, medium, high, xhigh, ultra, max`.
+///
+/// This is the same vocabulary `codewhale_tui::reasoning_preference::
+/// ReasoningEffort::parse_strict` accepts (`/effort`), so the settings schema
+/// and the command cannot drift. Labels stay empty: an undeclared label means
+/// "show the raw value", and a capitalized literal would also have to be
+/// localized in every shipped locale to satisfy the schema message-key check.
+const REASONING_EFFORT: &[SettingOption] = &[
+    SettingOption::new("auto", "", ""),
+    SettingOption::new("off", "", ""),
+    SettingOption::new("minimal", "", ""),
+    SettingOption::new("low", "", ""),
+    SettingOption::new("medium", "", ""),
+    SettingOption::new("high", "", ""),
+    SettingOption::new("xhigh", "", ""),
+    SettingOption::new("ultra", "", ""),
+    SettingOption::new("max", "", ""),
+];
+
 const DENSITY: &[SettingOption] = &[
     SettingOption::new("compact", "", ""),
     SettingOption::new("comfortable", "", ""),
@@ -343,6 +431,57 @@ const fn ui(
         group,
         label,
         description,
+        row: SettingRowKind::Setting,
+    })
+}
+
+/// A row that opens another surface rather than editing a value in place.
+const fn ui_action(
+    tab: &'static str,
+    group: &'static str,
+    label: &'static str,
+    description: &'static str,
+) -> Option<SettingUi> {
+    Some(SettingUi {
+        tab,
+        group,
+        label,
+        description,
+        row: SettingRowKind::Action,
+    })
+}
+
+/// A read-only receipt row — a managed-policy fact, live route value, or
+/// descriptive pointer, never a writable control.
+const fn ui_diagnostic(
+    tab: &'static str,
+    group: &'static str,
+    label: &'static str,
+    description: &'static str,
+) -> Option<SettingUi> {
+    Some(SettingUi {
+        tab,
+        group,
+        label,
+        description,
+        row: SettingRowKind::Diagnostic,
+    })
+}
+
+/// A row editable for the running session only; it does not persist through
+/// the config store.
+const fn ui_session(
+    tab: &'static str,
+    group: &'static str,
+    label: &'static str,
+    description: &'static str,
+) -> Option<SettingUi> {
+    Some(SettingUi {
+        tab,
+        group,
+        label,
+        description,
+        row: SettingRowKind::Session,
     })
 }
 
@@ -366,7 +505,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def(
         "theme",
         SettingKind::String,
-        "underwater",
+        DEFAULT_TUI_THEME,
         ui(
             TAB_APPEARANCE,
             "display",
@@ -468,6 +607,17 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         ui(TAB_APPEARANCE, "display", "", "ConfigHintHelpExpandGroups"),
     ),
     def(
+        "contextual_tips",
+        SettingKind::Bool(ON_OFF),
+        "true",
+        ui(
+            TAB_APPEARANCE,
+            "display",
+            "ConfigLabelContextualTips",
+            "ConfigHintContextualTips",
+        ),
+    ),
+    def(
         "pin_last_prompt",
         SettingKind::Bool(ON_OFF),
         "true",
@@ -551,7 +701,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "provider",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_MODELS,
             "provider",
             "ConfigLabelProvider",
@@ -559,25 +709,14 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         ),
     ),
     def(
-        "provider_templates",
-        SettingKind::String,
-        "",
-        ui(
-            TAB_MODELS,
-            "provider",
-            "ConfigLabelProviderTemplates",
-            "ConfigHintProviderTemplates",
-        ),
-    ),
-    def(
         "model",
         SettingKind::String,
         "",
-        ui(TAB_MODELS, "model", "ConfigLabelModel", "ConfigHintModel"),
+        ui_action(TAB_MODELS, "model", "ConfigLabelModel", "ConfigHintModel"),
     ),
     def(
         "reasoning_effort",
-        SettingKind::String,
+        SettingKind::Enum(REASONING_EFFORT),
         "",
         ui(
             TAB_MODELS,
@@ -593,7 +732,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "fleet.exec.max_spawn_depth",
         SettingKind::Int,
         "3",
-        ui(
+        ui_diagnostic(
             TAB_MODELS,
             "model",
             "ConfigLabelFleetSpawnDepth",
@@ -732,7 +871,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     ),
     def(
         "auto_compact_threshold_percent",
-        SettingKind::Int,
+        SettingKind::Float,
         "80",
         ui(
             TAB_WORK,
@@ -758,7 +897,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "goal_command",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_WORK,
             "session",
             "ConfigLabelGoalCommand",
@@ -769,11 +908,220 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "workflow",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_WORK,
             "workflow",
             "ConfigLabelWorkflow",
             "ConfigHintWorkflow",
+        ),
+    ),
+    def(
+        "notifications.quiet",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationQuiet",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.sound",
+        SettingKind::Enum(NOTIFICATION_SOUNDS),
+        "legacy",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationSound",
+            "ConfigHintNotificationSound",
+        ),
+    ),
+    def(
+        "notifications.condition",
+        SettingKind::Enum(NOTIFICATION_CONDITIONS),
+        "unfocused",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationCondition",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.method",
+        SettingKind::Enum(NOTIFICATION_METHODS),
+        "auto",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationMethod",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.threshold_secs",
+        SettingKind::Int,
+        "30",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationThreshold",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.include_summary",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationSummary",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.subagent_completion",
+        SettingKind::Enum(NOTIFICATION_SUBAGENTS),
+        "final-only",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationSubagents",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.events.turn-complete",
+        SettingKind::Bool(ON_OFF),
+        "true",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationTurnComplete",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.events.subagent-terminal",
+        SettingKind::Bool(ON_OFF),
+        "true",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationSubagentTerminal",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.events.approval-needed",
+        SettingKind::Bool(ON_OFF),
+        "true",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationApprovalNeeded",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.events.input-needed",
+        SettingKind::Bool(ON_OFF),
+        "true",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationInputNeeded",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.events.elevation-needed",
+        SettingKind::Bool(ON_OFF),
+        "true",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationElevationNeeded",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.events.model-notify",
+        SettingKind::Bool(ON_OFF),
+        "true",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationModelNotify",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.completion_sound",
+        SettingKind::Enum(NOTIFICATION_COMPLETION_SOUNDS),
+        "off",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationCompletionSound",
+            "ConfigHintNotificationLegacy",
+        ),
+    ),
+    def(
+        "notifications.sound_file",
+        SettingKind::String,
+        "",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationSoundFile",
+            "ConfigHintNotificationSound",
+        ),
+    ),
+    def(
+        "notifications.event_sound.enabled",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationEventSoundEnabled",
+            "ConfigHintNotificationLegacy",
+        ),
+    ),
+    def(
+        "notifications.event_sound.events",
+        SettingKind::String,
+        "[\"turn-complete\", \"approval-needed\"]",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationEventSoundEvents",
+            "ConfigHintNotificationLegacy",
+        ),
+    ),
+    def(
+        "notifications.event_sound.min_interval_ms",
+        SettingKind::Int,
+        "2000",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationEventSoundInterval",
+            "ConfigHintNotificationPolicy",
+        ),
+    ),
+    def(
+        "notifications.event_sound.quiet",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        ui(
+            TAB_WORK,
+            "workflow",
+            "ConfigLabelNotificationEventSoundQuiet",
+            "ConfigHintNotificationLegacy",
         ),
     ),
     // ── tools & MCP ─────────────────────────────────────────────────────
@@ -781,13 +1129,13 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "mcp_open",
         SettingKind::String,
         "",
-        ui(TAB_TOOLS, "mcp", "ConfigLabelMcpOpen", "ConfigHintMcpOpen"),
+        ui_action(TAB_TOOLS, "mcp", "ConfigLabelMcpOpen", "ConfigHintMcpOpen"),
     ),
     def(
         "mcp_reconnect",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_TOOLS,
             "mcp",
             "ConfigLabelMcpReconnect",
@@ -798,7 +1146,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "mcp_diagnose",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_TOOLS,
             "mcp",
             "ConfigLabelMcpDiagnose",
@@ -809,7 +1157,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "plugins_open",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_TOOLS,
             "mcp",
             "ConfigLabelPluginsOpen",
@@ -829,10 +1177,21 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     ),
     // ── trust ───────────────────────────────────────────────────────────
     def(
+        "sandbox_details",
+        SettingKind::String,
+        "",
+        ui_action(
+            TAB_TRUST,
+            "permissions",
+            "SetupStepTrustSandboxTitle",
+            "SetupStepTrustSandboxWhy",
+        ),
+    ),
+    def(
         "approval_mode",
         SettingKind::Enum(APPROVAL_MODE),
         "",
-        ui(
+        ui_session(
             TAB_TRUST,
             "permissions",
             "ConfigLabelApprovalMode",
@@ -865,7 +1224,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "managed_approval_policy",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_TRUST,
             "permissions",
             "ConfigLabelManagedApprovalPolicy",
@@ -898,7 +1257,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "managed_allow_shell",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_TRUST,
             "permissions",
             "ConfigLabelManagedAllowShell",
@@ -944,7 +1303,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "base_url",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "ConfigLabelBaseUrlDeepseek",
@@ -955,7 +1314,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "provider_url",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "ConfigLabelProviderUrl",
@@ -966,13 +1325,13 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "context_window",
         SettingKind::Int,
         "",
-        ui(TAB_ADVANCED, "provider", "", "ConfigHintContextWindow"),
+        ui_diagnostic(TAB_ADVANCED, "provider", "", "ConfigHintContextWindow"),
     ),
     def(
         "effective_context_window",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "",
@@ -985,7 +1344,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "external_credentials.openai-codex",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "",
@@ -996,7 +1355,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "external_credentials.xai",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "",
@@ -1009,6 +1368,39 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def("fast_model", SettingKind::String, "", None),
     // A transport timeout; advanced networking, available through `/set` only.
     def("stream_chunk_timeout_secs", SettingKind::Int, "900", None),
+    // Canonical transport keys. Runtime resolution stays in TUI Config.
+    def("stream.open_timeout_secs", SettingKind::Int, "45", None),
+    def("stream.chunk_timeout_secs", SettingKind::Int, "900", None),
+    def("stream.max_resumes", SettingKind::Int, "3", None),
+    def(
+        "stream.max_transparent_retries",
+        SettingKind::Int,
+        "2",
+        None,
+    ),
+    def("stream.max_stream_errors", SettingKind::Int, "5", None),
+    def("stream.max_duration_secs", SettingKind::Int, "1800", None),
+    def("stream.max_content_mb", SettingKind::Int, "10", None),
+    def("stream.connect_timeout_secs", SettingKind::Int, "30", None),
+    def("stream.tcp_keepalive_secs", SettingKind::Int, "30", None),
+    def(
+        "stream.http2_keep_alive_interval_secs",
+        SettingKind::Int,
+        "15",
+        None,
+    ),
+    def(
+        "stream.http2_keep_alive_timeout_secs",
+        SettingKind::Int,
+        "20",
+        None,
+    ),
+    def(
+        "stream.force_http1",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        None,
+    ),
     // DeepSeek-only legacy fallback: the runtime still reads it, but it is
     // not a live choice, so it stays settable through `/set` without a row.
     def("default_model", SettingKind::String, "", None),
@@ -1019,7 +1411,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.subagents",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",
@@ -1030,7 +1422,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.web_search",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",
@@ -1041,7 +1433,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.apply_patch",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",
@@ -1052,19 +1444,66 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.mcp",
         SettingKind::String,
         "",
-        ui(TAB_ADVANCED, "experimental", "", "ConfigHintFeatureMcp"),
+        ui_diagnostic(TAB_ADVANCED, "experimental", "", "ConfigHintFeatureMcp"),
     ),
     def(
         "features.exec_policy",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",
             "ConfigHintFeatureExecPolicy",
         ),
     ),
+    // ── persisted field names without a row ─────────────────────────────
+    // Every field `Settings` serializes to settings.toml has a declaration;
+    // these have `ui: None` because their value is owned elsewhere:
+    // route pickers, `/set` aliases with their own canonical row, or
+    // internal one-way flags. Declaration order is render order, and hidden
+    // entries render nothing, so they live together at the end.
+    //
+    // Canonical names behind a `/set` alias row: `set()` accepts both
+    // spellings, the row carries the alias.
+    def("tool_collapse_mode", SettingKind::String, "compact", None),
+    def("max_input_history", SettingKind::Int, "100", None),
+    // Written by the route pickers, not by a settings row (the provider /
+    // model rows persist to config.toml via `set_config_value`).
+    def("default_provider", SettingKind::String, "", None),
+    // Trust posture with a `/set` entry point but no row; surfaced where
+    // sandboxing acts, not as a settings sentence.
+    def("sandbox_mode", SettingKind::String, "", None),
+    // Route memory written by the pickers: per-provider defaults, enabled
+    // chooser sets, and pinned routes. Structured values no row could edit.
+    def("provider_models", SettingKind::String, "", None),
+    def("enabled_models", SettingKind::String, "", None),
+    def("pinned_models", SettingKind::String, "", None),
+    // One-way internal flags: shown an intro, shown a deprecation, counted
+    // tip impressions. Read back to suppress repeats, never edited.
+    def(
+        "feature_intro_shown",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        None,
+    ),
+    def(
+        "yolo_deprecation_shown",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        None,
+    ),
+    // Round 3 work-bar placement migration ran once (`top` → `bottom`).
+    def(
+        "work_surface_bottom_migrated",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        None,
+    ),
+    def("behavioral_tip_impressions", SettingKind::String, "", None),
+    // Footer key-hint use counts: a hint retires to its bare state once its
+    // binding has been used enough times. Written by the footer, never edited.
+    def("footer_hint_uses", SettingKind::String, "", None),
 ];
 
 /// The declaration for `key`, if the shell knows it.

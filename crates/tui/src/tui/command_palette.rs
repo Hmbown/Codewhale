@@ -14,11 +14,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
-use unicode_width::UnicodeWidthStr;
 
 use crate::commands;
-use crate::localization::{Locale, MessageId, tr};
-use crate::palette;
 use crate::skills;
 use crate::tools::spec::ApprovalRequirement;
 use crate::tools::spec::ToolCapability;
@@ -28,6 +25,8 @@ use crate::tui::views::{
     ActionHint, CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent,
     centered_modal_area, render_modal_footer, render_modal_surface,
 };
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette as palette;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PaletteSection {
@@ -70,10 +69,11 @@ pub struct CommandPaletteView {
     hovered: Cell<Option<usize>>,
 }
 
+#[cfg(test)]
 pub fn build_entries(
     locale: Locale,
     skills_dir: &Path,
-    skills_scan_codewhale_only: bool,
+    skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     workspace: &Path,
     mcp_config_path: &Path,
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
@@ -81,7 +81,7 @@ pub fn build_entries(
     build_entries_with_plugins(
         locale,
         skills_dir,
-        skills_scan_codewhale_only,
+        skills_discovery_mode,
         workspace,
         mcp_config_path,
         mcp_snapshot,
@@ -92,16 +92,19 @@ pub fn build_entries(
 pub fn build_entries_with_plugins(
     locale: Locale,
     skills_dir: &Path,
-    skills_scan_codewhale_only: bool,
+    skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     workspace: &Path,
     mcp_config_path: &Path,
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
     plugins: &crate::plugins::PluginRegistry,
 ) -> Vec<CommandPaletteEntry> {
     let mut entries = Vec::new();
-    commands::user_registry::with_registry_for_workspace(Some(workspace), |user_registry| {
+    commands::user_registry::with_registry_for_plugins(plugins, |user_registry| {
         let all_user_commands = user_registry.iter().collect::<Vec<_>>();
         for command in commands::command_infos() {
+            if command.is_unlisted() {
+                continue;
+            }
             if commands::discovery::user_command_shadows_builtin_canonical(
                 command,
                 &all_user_commands,
@@ -166,15 +169,19 @@ pub fn build_entries_with_plugins(
     let skills = skills::discover_for_workspace_and_dir_with_mode_and_plugins(
         workspace,
         skills_dir,
-        skills::SkillDiscoveryMode::from_codewhale_only(skills_scan_codewhale_only),
+        skills_discovery_mode,
         Some(plugins),
     )
     .into_enabled();
-    for skill in skills.list() {
+    for skill in skills
+        .list()
+        .iter()
+        .filter(|skill| skill.invocation.user_invocable())
+    {
         entries.push(CommandPaletteEntry {
             section: PaletteSection::Skill,
             label: format!("${}", skill.name),
-            description: skill.description.clone(),
+            description: skill.user_menu_description(),
             command: format!("${}", skill.name),
             action: CommandPaletteAction::ExecuteCommand {
                 command: format!("${}", skill.name),
@@ -190,7 +197,7 @@ pub fn build_entries_with_plugins(
         .with_shell_tools()
         .with_web_tools()
         .with_git_tools()
-        .with_user_input_tool()
+        .with_user_input_tool(crate::tools::user_input::UserInputLimits::default())
         .with_patch_tools()
         .with_note_tool()
         .with_diagnostics_tool()
@@ -723,10 +730,16 @@ impl CommandPaletteView {
             let entry = &self.entries[*idx];
             (section_rank(entry.section), *score, &entry.label)
         });
+        // Follow the highlighted entry across the refilter instead of leaving a
+        // raw index pointing into a freshly re-sorted list. Every keystroke
+        // refilters, so a clamp alone silently slides the highlight onto an
+        // unrelated row — and Enter runs whatever it landed on. `filtered` holds
+        // indices into the stable `entries`, so the entry is its own identity.
+        let keep = self.filtered.get(self.selected).copied();
         self.filtered = filtered.into_iter().map(|(idx, _)| idx).collect();
-        if self.selected >= self.filtered.len() {
-            self.selected = 0;
-        }
+        self.selected = keep
+            .and_then(|entry| self.filtered.iter().position(|idx| *idx == entry))
+            .unwrap_or(0);
         self.hovered.set(None);
     }
 
@@ -827,14 +840,6 @@ impl ModalView for CommandPaletteView {
                 ViewAction::None
             }
             KeyCode::Down => {
-                self.move_selection(1);
-                ViewAction::None
-            }
-            KeyCode::Char('k') if self.query.is_empty() => {
-                self.move_selection(-1);
-                ViewAction::None
-            }
-            KeyCode::Char('j') if self.query.is_empty() => {
                 self.move_selection(1);
                 ViewAction::None
             }
@@ -996,20 +1001,19 @@ impl ModalView for CommandPaletteView {
                 };
 
                 let pointer = crate::tui::glyphs::selection_marker(is_selected);
-                let mut line = format!("{pointer} {:<label_width$}", entry.label);
-                let desc_capacity = popup_width as usize - (label_width + 4);
-                let desc = if entry.description.width() > desc_capacity {
-                    let mut shortened = String::new();
-                    for ch in entry.description.chars() {
-                        if shortened.width() >= desc_capacity.saturating_sub(3) {
-                            break;
-                        }
-                        shortened.push(ch);
-                    }
-                    format!("{shortened}...")
-                } else {
-                    entry.description.clone()
-                };
+                // `{:<width$}` pads but never truncates, so a long label — every
+                // `mcp:server:tool` row — ran past the column and pushed the
+                // description off the card entirely. Truncate first, then pad, so
+                // the description column stays on one axis.
+                let label = crate::tui::ui_text::truncate_line_to_width(&entry.label, label_width);
+                let mut line = format!("{pointer} {label:<label_width$}");
+                // The rows are drawn into `content`, which is the popup less its
+                // borders and padding — measuring against `popup_width` overstated
+                // the room by four columns.
+                let content_width = (popup_width as usize).saturating_sub(4);
+                let desc_capacity = content_width.saturating_sub(label_width + 4);
+                let desc =
+                    crate::tui::ui_text::truncate_line_to_width(&entry.description, desc_capacity);
                 line.push_str("  ");
                 line.push_str(&desc);
                 entry_line_indices.push((lines.len(), absolute));
@@ -1037,6 +1041,49 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::TempDir;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn refilter_keeps_the_highlight_on_the_entry_the_user_was_looking_at() {
+        // Every keystroke refilters and re-sorts. The index used to be clamped
+        // but never re-anchored, so refining a query could slide the highlight
+        // onto an unrelated row — and Enter runs whatever is highlighted.
+        let entries = vec![
+            palette_entry(PaletteSection::Tool, "tool:one", "alpha", "one"),
+            palette_entry(PaletteSection::Tool, "tool:two", "shared", "two"),
+            palette_entry(PaletteSection::Tool, "tool:three", "shared", "three"),
+        ];
+        let mut view = CommandPaletteView::new(entries);
+
+        view.query = "tool".to_string();
+        view.refilter();
+        view.selected = view
+            .filtered
+            .iter()
+            .position(|idx| view.entries[*idx].label == "tool:three")
+            .expect("tool:three is listed");
+
+        // Narrowing to a query `tool:three` still matches. It moves to a lower
+        // index in the shorter list, which is exactly the case a clamp gets
+        // wrong: the old code reset to 0 and highlighted `tool:two`.
+        view.query = "shared".to_string();
+        view.refilter();
+        assert_eq!(
+            view.selected_entry().map(|entry| entry.label.as_str()),
+            Some("tool:three"),
+            "the highlight jumped to another row: {:?}",
+            view.selected_entry().map(|entry| entry.label.clone())
+        );
+
+        // When the highlighted entry filters out entirely, fall back to the top
+        // rather than to a stale index.
+        view.query = "alpha".to_string();
+        view.refilter();
+        assert_eq!(
+            view.selected_entry().map(|entry| entry.label.as_str()),
+            Some("tool:one")
+        );
+    }
 
     #[test]
     fn visible_window_keeps_selection_in_view_and_fits() {
@@ -1112,6 +1159,66 @@ mod tests {
             },
             show_on_empty_query: true,
         }
+    }
+
+    fn assert_palette_search_owns_text(query: &str) {
+        let entries = ["json", "key", "队列é"]
+            .map(|text| palette_entry(PaletteSection::Command, text, "", text))
+            .to_vec();
+        let mut stack = crate::tui::views::ViewStack::new();
+        stack.push(CommandPaletteView::new(entries));
+        for ch in query.chars() {
+            assert!(
+                stack
+                    .handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                    .is_empty()
+            );
+            assert_eq!(stack.top_kind(), Some(ModalKind::CommandPalette));
+        }
+        let mut modal = stack.pop().unwrap();
+        let view = modal
+            .as_any_mut()
+            .downcast_mut::<CommandPaletteView>()
+            .unwrap();
+        assert_eq!(view.query, query);
+        assert_eq!(view.filtered.len(), 1);
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            assert!(matches!(
+                view.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+                ViewAction::None
+            ));
+            assert_eq!(view.query, query);
+        }
+        assert!(matches!(
+            view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::InsertText { text }
+            }) if text == query
+        ));
+        assert!(matches!(
+            view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ViewAction::Close
+        ));
+    }
+
+    #[test]
+    fn palette_search_owns_initial_j() {
+        assert_palette_search_owns_text("json");
+    }
+
+    #[test]
+    fn palette_search_owns_initial_k() {
+        assert_palette_search_owns_text("key");
+    }
+
+    #[test]
+    fn palette_search_owns_unicode() {
+        assert_palette_search_owns_text("队列é");
     }
 
     #[test]
@@ -1222,6 +1329,7 @@ mod tests {
     fn command_palette_skills_use_workspace_and_configured_directories() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let workspace_skill_dir = workspace
             .join(".agents")
             .join("skills")
@@ -1245,7 +1353,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             configured_dir.as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             Path::new("mcp.json"),
             None,
@@ -1264,6 +1372,7 @@ mod tests {
     fn command_palette_skills_respect_codewhale_only_scan() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let claude_skill_dir = workspace
             .join(".claude")
             .join("skills")
@@ -1288,7 +1397,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             workspace.join(".codewhale").join("skills").as_path(),
-            true,
+            crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
             workspace.as_path(),
             Path::new("mcp.json"),
             None,
@@ -1333,7 +1442,7 @@ mod tests {
         let entries_before = build_entries_with_plugins(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             &workspace,
             Path::new("mcp.json"),
             None,
@@ -1350,7 +1459,7 @@ mod tests {
         let entries_after = build_entries_with_plugins(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             &workspace,
             Path::new("mcp.json"),
             None,
@@ -1371,7 +1480,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1395,6 +1504,7 @@ mod tests {
         let workspace = tmp.path().join("workspace");
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
+        crate::config::save_workspace_trust(&workspace).expect("trust workspace");
         std::fs::write(
             commands_dir.join("review.md"),
             "---\ndescription: Review with context\nargument-hint: <path>\n---\nReview $ARGUMENTS",
@@ -1404,7 +1514,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1426,6 +1536,7 @@ mod tests {
     fn command_palette_uses_frontmatter_name_usage_and_arguments() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1437,7 +1548,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1472,7 +1583,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1489,6 +1600,7 @@ mod tests {
     fn hidden_frontmatter_name_override_suppresses_shadowed_builtin() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1500,7 +1612,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1516,6 +1628,7 @@ mod tests {
     fn command_palette_filters_shadowed_builtin_aliases_from_description() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1527,7 +1640,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1560,6 +1673,7 @@ mod tests {
         // command (its metadata and action), never the built-in row.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1571,7 +1685,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1605,6 +1719,7 @@ mod tests {
         // matching the shared alias-aware contract.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1616,7 +1731,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1643,6 +1758,7 @@ mod tests {
         // still owning the token (AT-008 boundary in the palette).
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1654,7 +1770,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1675,6 +1791,7 @@ mod tests {
         // from its description.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1686,7 +1803,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1718,7 +1835,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             skills_dir.as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             tmp.path(),
             mcp_config_path.as_path(),
             None,
@@ -1737,13 +1854,19 @@ mod tests {
             .iter()
             .filter(|command| user_registry.get(command.name).is_some())
             .count();
+        // Unlisted commands run when typed but are never advertised — see
+        // `commands::traits::UNLISTED_COMMANDS`.
+        let unlisted = commands::command_infos()
+            .iter()
+            .filter(|command| command.is_unlisted() && user_registry.get(command.name).is_none())
+            .count();
         assert_eq!(
             command_entries.len(),
-            commands::command_infos().len() - shadowed_builtins + visible_user_commands
+            commands::command_infos().len() - shadowed_builtins - unlisted + visible_user_commands
         );
 
         for command in commands::command_infos() {
-            if user_registry.get(command.name).is_some() {
+            if user_registry.get(command.name).is_some() || command.is_unlisted() {
                 continue;
             }
             let label = format!("/{}", command.name);
@@ -1783,7 +1906,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1821,7 +1944,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1843,7 +1966,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1881,7 +2004,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             skills_dir.as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             tmp.path(),
             mcp_config_path.as_path(),
             None,
@@ -1889,7 +2012,7 @@ mod tests {
         let user_registry = commands::user_registry::registry_for_workspace(Some(tmp.path()));
 
         for command in commands::command_infos() {
-            if user_registry.get(command.name).is_some() {
+            if user_registry.get(command.name).is_some() || command.is_unlisted() {
                 continue;
             }
             let label = format!("/{}", command.name);
@@ -2006,7 +2129,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             Some(&snapshot),
@@ -2063,7 +2186,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             Some(&snapshot),
@@ -2181,7 +2304,7 @@ mod tests {
         view.render(area, &mut hovered_buf);
         assert_eq!(
             hovered_buf[(rect.x, rect.y)].bg,
-            crate::palette::SURFACE_ELEVATED,
+            codewhale_palette::SURFACE_ELEVATED,
             "hovered palette entry must show the shared hover band"
         );
     }

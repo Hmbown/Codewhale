@@ -1,14 +1,14 @@
 use super::{
-    CODE_EXECUTION_DESCRIPTION, DEFAULT_ACTIVE_NATIVE_TOOLS,
+    CODE_EXECUTION_DESCRIPTION, DEFAULT_ACTIVE_NATIVE_TOOLS, ToolMode,
     allowlist_is_native_file_and_shell_only, apply_mcp_tool_deferral, apply_native_tool_deferral,
-    apply_registry_first_shell_guidance, build_model_tool_catalog_with_surface,
-    default_synthetic_catalog_tool_names, ensure_advanced_tooling, execute_tool_search_with_cache,
-    initial_active_tools, is_synthetic_catalog_tool, remove_evicted_cache_activations,
+    build_model_tool_catalog_with_surface, default_synthetic_catalog_tool_names,
+    ensure_advanced_tooling, execute_tool_search_with_cache, initial_active_tools,
+    is_synthetic_catalog_tool, remove_evicted_cache_activations, requested_tool_mode,
     tool_matches_any_rule, touch_cached_tool_after_execution,
 };
 use crate::core::session::ToolActivationCache;
-use crate::models::Tool;
-use crate::tui::app::AppMode;
+use codewhale_config::AppMode;
+use codewhale_models::Tool;
 use serde_json::json;
 use std::collections::{BTreeSet, HashSet};
 
@@ -26,14 +26,41 @@ fn tool(name: &str) -> Tool {
     }
 }
 
-/// `code_execution` writes the script to a tempdir and runs it as a plain
-/// child process in the workspace — no seccomp, no jail, no container. The
-/// description is model-facing, so calling it a sandbox would tell the model
-/// it has isolation the runtime never provides.
+/// The shared launcher applies policy only where enforcement is available.
+/// The model-facing description must not promise unconditional isolation.
 #[test]
 fn code_execution_description_does_not_claim_process_sandboxing() {
     assert!(CODE_EXECUTION_DESCRIPTION.contains("local Python interpreter"));
     assert!(!CODE_EXECUTION_DESCRIPTION.contains("sandbox"));
+}
+
+/// Python output must match our UTF-8 decoder even with non-UTF-8 parent stdio.
+#[tokio::test]
+async fn code_execution_returns_utf8_stdout_and_stderr() {
+    use crate::dependencies::ExternalTool as _;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    let _env_lock = lock_test_env();
+    if !crate::dependencies::Python::available() {
+        return;
+    }
+    let _encoding = EnvVarGuard::set("PYTHONIOENCODING", "gbk");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let result = super::execute_code_execution_tool(
+        &json!({"code": r#"import sys; print("\u4e2d\u6587"); print("\u9519\u8bef", file=sys.stderr)"#}),
+        tmp.path(),
+        &crate::tools::spec::ToolContext::new(tmp.path()),
+    )
+    .await
+    .expect("code execution should run");
+    let payload = result.metadata.expect("payload");
+    assert_eq!(
+        (
+            payload["stdout"].as_str().map(str::trim_end),
+            payload["stderr"].as_str().map(str::trim_end),
+        ),
+        (Some("中文"), Some("错误")),
+    );
 }
 
 /// The published synthetic-name list and the predicate that classifies a
@@ -69,31 +96,53 @@ fn published_synthetic_names_agree_with_the_synthetic_predicate() {
 }
 
 #[test]
-fn first_turn_surface_is_stable_across_plan_work_and_full_access() {
+fn first_turn_surface_is_stable_across_plan_work_and_operate() {
     assert_eq!(
         DEFAULT_ACTIVE_NATIVE_TOOLS,
-        &["read", "write", "edit", "bash", "agent", "todo_write"]
+        &[
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "agent",
+            "workflow",
+            "todo_write",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+            "load_skill"
+        ]
     );
     let expected = [
         "agent",
         "bash",
+        "create_goal",
+        "get_goal",
+        "update_goal",
         "edit",
+        "load_skill",
         "read",
         "todo_write",
         "tool_search",
+        "workflow",
         "write",
     ]
     .into_iter()
     .map(str::to_string)
     .collect::<BTreeSet<_>>();
-    for mode in [AppMode::Plan, AppMode::Agent] {
+    let mut expected_prefix = None;
+    for mode in [AppMode::Plan, AppMode::Agent, AppMode::Operate] {
         let mut catalog = [
             "read",
             "write",
             "edit",
             "bash",
             "agent",
+            "workflow",
             "todo_write",
+            "create_goal",
+            "get_goal",
+            "update_goal",
             "Git",
             "Run",
             "tasks",
@@ -104,11 +153,59 @@ fn first_turn_surface_is_stable_across_plan_work_and_full_access() {
         .collect::<Vec<_>>();
         let always_load = HashSet::new();
         apply_native_tool_deferral(&mut catalog, &always_load);
-        ensure_advanced_tooling(&mut catalog, mode, &always_load);
-        let active = initial_active_tools(&catalog)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+        ensure_advanced_tooling(&mut catalog, mode, &always_load, ToolMode::Direct);
+        let active_names = initial_active_tools(&catalog);
+        let active = active_names.iter().cloned().collect::<BTreeSet<_>>();
         assert_eq!(active, expected, "{mode:?}");
+        let prefix = serde_json::to_string(&super::active_tools_for_step(&catalog, &active_names))
+            .expect("serialize first-turn tool prefix");
+        if let Some(expected) = &expected_prefix {
+            assert_eq!(&prefix, expected, "{mode:?} must preserve schema bytes");
+        } else {
+            expected_prefix = Some(prefix);
+        }
+    }
+}
+
+#[test]
+fn eager_workflow_still_respects_command_allow_and_deny_gates() {
+    for mode in [AppMode::Plan, AppMode::Agent, AppMode::Operate] {
+        for (allow, deny, expected) in [
+            (None, None, true),
+            (Some("read"), None, false),
+            (Some("workflow"), None, true),
+            (None, Some("workflow"), false),
+            (Some("workflow"), Some("workflow"), false),
+        ] {
+            let catalog = build_model_tool_catalog_with_surface(
+                ["read", "agent", "workflow"]
+                    .into_iter()
+                    .map(tool)
+                    .collect(),
+                Vec::new(),
+                mode,
+                &HashSet::new(),
+                crate::model_profile::ToolSurfaceBudget::Standard,
+            );
+            let policy = super::ToolSurfacePolicy::new(
+                crate::tools::ToolRegistry::new(crate::tools::ToolContext::for_empty_registry()),
+                Some(catalog),
+                mode,
+                &HashSet::new(),
+                &["workflow"], // Cached activation cannot restore a denied tool.
+                false,
+                allow.map(|name| vec![name.to_string()]),
+                deny.map(|name| vec![name.to_string()]),
+                None,
+                ToolMode::Direct,
+            );
+            assert_eq!(policy.allows_tool("workflow"), expected);
+            assert_eq!(policy.active_names.contains("workflow"), expected);
+            assert_eq!(
+                policy.catalog.iter().any(|tool| tool.name == "workflow"),
+                expected
+            );
+        }
     }
 }
 
@@ -163,13 +260,16 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
         &catalog,
         &mut active,
         &mut cache,
-        "deferred-0"
+        "deferred-7"
     ));
     let delta = cache.activate(&catalog, &["deferred-8".to_string()]);
     remove_evicted_cache_activations(&catalog, &mut active, delta.evicted);
     active.extend(delta.admitted);
+    // The batch is ranked best-first; using its oldest retained match
+    // promotes it ahead of the next batch without granting an unseen tool.
+    assert!(cache.names().any(|name| name == "deferred-7"));
     assert!(cache.names().any(|name| name == "deferred-0"));
-    assert!(!cache.names().any(|name| name == "deferred-1"));
+    assert!(!cache.names().any(|name| name == "deferred-6"));
 
     assert!(!touch_cached_tool_after_execution(
         &catalog,
@@ -251,33 +351,131 @@ fn unknown_and_wildcard_allowlists_keep_mcp_startup() {
 }
 
 #[test]
-fn compact_surface_keeps_the_exact_eager_agent_head() {
+fn compact_surface_keeps_agent_and_workflow_eager() {
     let catalog = build_model_tool_catalog_with_surface(
-        ["read", "write", "edit", "bash", "agent", "todo_write"]
-            .into_iter()
-            .map(tool)
-            .collect(),
+        [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "agent",
+            "workflow",
+            "todo_write",
+        ]
+        .into_iter()
+        .map(tool)
+        .collect(),
         Vec::new(),
         AppMode::Agent,
         &HashSet::new(),
         crate::model_profile::ToolSurfaceBudget::Compact,
     );
 
+    for name in ["agent", "workflow"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|definition| definition.name == name)
+                .and_then(|definition| definition.defer_loading),
+            Some(false),
+            "{name}"
+        );
+    }
+}
+
+/// The per-tool Registry paragraph is gone; the catalog builder must leave the
+/// shell tool's description exactly as the registry produced it, so the KV
+/// prefix stays byte-stable and there is one Registry authority (the prompt).
+#[test]
+fn catalog_build_does_not_append_registry_guidance_to_the_shell_tool() {
+    let described = tool("bash");
+    let catalog = build_model_tool_catalog_with_surface(
+        vec![described.clone()],
+        Vec::new(),
+        AppMode::Agent,
+        &HashSet::new(),
+        crate::model_profile::ToolSurfaceBudget::Standard,
+    );
+
+    let shell = catalog
+        .iter()
+        .find(|definition| definition.name == "bash")
+        .expect("shell tool");
+    assert_eq!(shell.description, described.description);
+    assert!(!shell.description.contains("registry_sync"));
+}
+
+#[test]
+fn requested_tool_mode_prefers_model_hint_then_flag_then_direct() {
+    use crate::features::{Feature, Features};
+
+    // #6562: code mode is the default; `[features] code_mode = false` is the
+    // escape hatch back to Direct.
+    let on = Features::with_defaults();
+    assert_eq!(requested_tool_mode(None, &on), ToolMode::CodeMode);
+
+    let mut off = Features::with_defaults();
+    off.disable(Feature::CodeMode);
+    assert_eq!(requested_tool_mode(None, &off), ToolMode::Direct);
+
+    // Model metadata wins over config, in both directions (Codex parity).
     assert_eq!(
-        catalog
-            .iter()
-            .find(|definition| definition.name == "agent")
-            .and_then(|definition| definition.defer_loading),
-        Some(false)
+        requested_tool_mode(Some(ToolMode::Direct), &on),
+        ToolMode::Direct
+    );
+    assert_eq!(
+        requested_tool_mode(Some(ToolMode::CodeMode), &off),
+        ToolMode::CodeMode
     );
 }
 
 #[test]
-fn registry_first_guidance_does_not_expand_contract_bash_schema_text() {
-    let mut catalog = vec![tool("bash")];
-    let description = catalog[0].description.clone();
+fn execute_tools_is_eager_in_code_mode_and_deferred_in_direct() {
+    for (mode, expected_defer) in [(ToolMode::Direct, true), (ToolMode::CodeMode, false)] {
+        let mut catalog = vec![tool("read")];
+        ensure_advanced_tooling(&mut catalog, AppMode::Agent, &HashSet::new(), mode);
+        let injected = catalog
+            .iter()
+            .find(|definition| definition.name == "execute_tools")
+            .expect("execute_tools is injected outside Plan");
+        assert_eq!(injected.defer_loading, Some(expected_defer), "{mode:?}");
+    }
 
-    apply_registry_first_shell_guidance(&mut catalog);
+    // Plan hides the surface under every tool mode.
+    let mut catalog = vec![tool("read")];
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Plan,
+        &HashSet::new(),
+        ToolMode::CodeMode,
+    );
+    assert!(
+        catalog
+            .iter()
+            .all(|definition| definition.name != "execute_tools")
+    );
+}
 
-    assert_eq!(catalog[0].description, description);
+/// A timed-out or cancelled `code_execution` kills the interpreter and what the
+/// script started; a bare `output()` left both running.
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_code_execution_kills_the_interpreter_tree() {
+    if crate::dependencies::resolve_python_interpreter().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pid_file = tmp.path().join("grandchild.pid");
+    let code = format!(
+        "import subprocess\np = subprocess.Popen(['sleep', '300'])\nopen({:?}, 'w').write(str(p.pid))\np.wait()\n",
+        pid_file.display().to_string()
+    );
+    let input = json!({ "code": code });
+    let context = crate::tools::spec::ToolContext::new(tmp.path());
+    let run = super::execute_code_execution_tool(&input, tmp.path(), &context);
+    let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+    assert!(
+        crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),
+        "a process the script started outlived the dropped code_execution call"
+    );
 }

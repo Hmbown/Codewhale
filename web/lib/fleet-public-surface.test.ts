@@ -33,8 +33,10 @@ describe("Fleet is the canonical public surface", () => {
     const fleet = getTopic("fleet");
     expect(fleet?.hasPage).toBe(true);
     expect(fleet?.slug).toBe("fleet");
-    expect(fleet?.label.en).toContain("Fleet");
-    expect(fleet?.label.en).not.toContain("Pod");
+    // The page is task-named ("Run a workflow"); the Fleet noun lives in
+    // its description, never the retired Pod noun.
+    expect(fleet?.description.en).toContain("Fleet");
+    expect(`${fleet?.label.en} ${fleet?.description.en}`).not.toContain("Pod");
     expect(docTopicHref(fleet!, "en")).toBe("/en/docs/fleet");
     expect(DOC_TOPICS.filter((t) => t.id === "fleet")).toHaveLength(1);
     expect(DOC_TOPICS.map((t) => t.id)).not.toContain("pod");
@@ -69,7 +71,7 @@ describe("Fleet is the canonical public surface", () => {
     const llms = buildLlmsTxt();
     expect(llms).toContain("/docs/fleet");
     expect(llms).not.toContain("/docs/pod");
-    expect(llms).toContain("Fleet / Workflow");
+    expect(llms).toContain(getTopic("fleet")!.label.en);
   });
 
   it("resolves docs search on both nouns to the one Fleet page", () => {
@@ -89,27 +91,25 @@ describe("Fleet is the canonical public surface", () => {
   });
 
   it("keeps durable Fleet status separate from current-session workers", () => {
-    const en = webText("lib/i18n/dictionaries/en/docs-fleet.ts");
-    const zh = webText("lib/i18n/dictionaries/zh/docs-fleet.ts");
     const page = webText("app/[locale]/docs/fleet/page.tsx");
-    expect(page).toContain('fleetWorkers: "/fleet workers"');
-    for (const source of [en, zh]) {
-      expect(source).toContain("{fleetStatusTui}");
-      expect(source).toContain("{fleetStatusShell}");
-      expect(source).toContain("{fleetWorkers}");
-      expect(source).toContain("{subagents}");
+    expect(page).toContain("getDocsFleet");
+    for (const locale of ["en", "zh"]) {
+      const source = webText(`lib/i18n/dictionaries/${locale}/docs-fleet.ts`);
+      // Durable run history (shell) and this session's workers (TUI) are
+      // named as two different surfaces in both languages.
+      expect(source, locale).toContain("codewhale fleet status");
+      expect(source, locale).toContain("/fleet workers");
+      expect(source, locale).toContain("/subagents");
     }
   });
 
   it("documents saved fleets separately from members and workers", () => {
-    const page = webText("app/[locale]/docs/fleet/page.tsx");
-    const en = webText("lib/i18n/dictionaries/en/docs-fleet.ts");
-    const zh = webText("lib/i18n/dictionaries/zh/docs-fleet.ts");
-    expect(page).toContain('fleetSaved: "/fleet saved"');
-    for (const source of [en, zh]) {
-      expect(source).toContain("{fleetSaved}");
-      expect(source).toContain("/fleet setup");
-      expect(source).toContain("/fleet");
+    for (const locale of ["en", "zh"]) {
+      const source = webText(`lib/i18n/dictionaries/${locale}/docs-fleet.ts`);
+      expect(source, locale).toContain("/fleet saved");
+      expect(source, locale).toContain("/fleet setup");
+      expect(source, locale).toContain("codewhale workflow run");
+      expect(source, locale).toContain("codewhale lane");
     }
   });
 });

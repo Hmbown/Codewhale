@@ -19,5 +19,4 @@ pub mod frame_requester;
 pub mod mode;
 
 pub use frame_requester::FrameRequester;
-#[allow(unused_imports)] // public API surface for host pickers / widgets
-pub use mode::{MotionMode, MotionPolicy, SpinnerPresentation};
+pub use mode::{MotionMode, MotionPolicy};

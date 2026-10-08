@@ -1,0 +1,144 @@
+{
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "approval_mode": "suggest",
+  "auto_approve": false,
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "workspace_files": {
+    "README.md": "conformance fixture\n",
+    "NOTES.md": "second file\n"
+  },
+  "description": "The model reads one file (arguments split across two deltas), gets the result, and answers. Read-only, so no approval.",
+  "user_message": "What does README.md say?",
+  "provider_script": [
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_tool",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 120,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "call_read_readme",
+            "name": "File",
+            "input": {}
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"action\":\"read\","
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "\"path\":\"README.md\"}"
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 150,
+            "output_tokens": 20
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_tool_answer",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 200,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "text",
+            "text": ""
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "It says: conformance fixture."
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "end_turn"
+          },
+          "usage": {
+            "input_tokens": 200,
+            "output_tokens": 6
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    }
+  ]
+}

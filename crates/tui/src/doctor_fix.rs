@@ -6,7 +6,7 @@
 //! narrowly scoped and reversible:
 //!
 //! - delete stale `.tmp*` files left behind by interrupted atomic writes in
-//!   the Codewhale home;
+//!   the Codewhale home, only when last modified more than an hour ago;
 //! - tighten secret-store file permissions to `0600` on Unix when group or
 //!   world bits are set (the secret store writes private files, but a file
 //!   restored from backup or moved from another machine may have drifted);
@@ -31,7 +31,8 @@ use crate::mcp;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DoctorFixAction {
     /// Delete an interrupted-atomic-write leftover. Only ever a regular file
-    /// whose name starts with `.tmp` directly inside the Codewhale home.
+    /// whose name starts with `.tmp` directly inside the Codewhale home and
+    /// whose last modification was more than an hour ago.
     DeleteStaleTempFile { path: PathBuf },
     /// Restrict a secret-store file to owner-only on Unix.
     #[cfg(unix)]
@@ -95,7 +96,22 @@ impl DoctorFixPlan {
     }
 }
 
+fn is_stale_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".tmp"))
+        && std::fs::symlink_metadata(path).is_ok_and(|meta| {
+            meta.is_file()
+                && meta.modified().is_ok_and(|modified| {
+                    modified
+                        .elapsed()
+                        .is_ok_and(|age| age > std::time::Duration::from_secs(60 * 60))
+                })
+        })
+}
+
 /// Stale `.tmp*` regular files directly inside the Codewhale home.
+/// Recent files and files with unknown or future modification times are kept.
 fn stale_temp_files() -> Vec<PathBuf> {
     let Ok(home) = codewhale_config::codewhale_home() else {
         return Vec::new();
@@ -105,11 +121,8 @@ fn stale_temp_files() -> Vec<PathBuf> {
     };
     let mut files = entries
         .flatten()
-        .filter(|entry| {
-            entry.file_name().to_string_lossy().starts_with(".tmp")
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
-        })
         .map(|entry| entry.path())
+        .filter(|path| is_stale_temp_file(path))
         .collect::<Vec<_>>();
     files.sort();
     files
@@ -244,14 +257,7 @@ fn apply_one(action: &DoctorFixAction) -> DoctorFixOutcome {
         DoctorFixAction::DeleteStaleTempFile { path } => {
             // Re-verify the deletion guard at apply time: the plan was
             // computed before consent, so the file may have changed.
-            let still_stale = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".tmp"))
-                && std::fs::symlink_metadata(path)
-                    .ok()
-                    .is_some_and(|meta| meta.is_file());
-            if !still_stale {
+            if !is_stale_temp_file(path) {
                 return DoctorFixOutcome::Applied;
             }
             match std::fs::remove_file(path) {
@@ -285,25 +291,21 @@ fn apply_one(action: &DoctorFixAction) -> DoctorFixOutcome {
 /// path the MCP editor uses. A missing file or missing server is a no-op
 /// (the plan may be stale after consent).
 fn disable_mcp_server(config_path: &Path, server_name: &str) -> Result<()> {
-    let Some(cfg) = mcp::load_config(config_path).ok() else {
-        return Ok(());
-    };
-    let mut cfg = cfg;
-    let Some(server) = cfg.servers.get_mut(server_name) else {
-        return Ok(());
-    };
-    if !server.enabled {
-        return Ok(());
-    }
-    server.enabled = false;
-    mcp::save_config(config_path, &cfg)
+    mcp::mutate_config(config_path, None, |cfg| {
+        if let Some(server) = cfg.servers.get_mut(server_name) {
+            server.enabled = false;
+            server.disabled = true;
+        }
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 /// Print the repair plan the way the human doctor report presents it.
 pub(crate) fn print_fix_plan(plan: &DoctorFixPlan) {
     use colored::Colorize;
 
-    let (sky_r, sky_g, sky_b) = crate::palette::WHALE_ACTION_RGB;
+    let (sky_r, sky_g, sky_b) = codewhale_palette::WHALE_ACTION_RGB;
     println!("{}", "Repair plan (--fix):".bold());
     if plan.is_empty() {
         println!("  {} nothing to repair", "✓".truecolor(sky_r, sky_g, sky_b));
@@ -336,8 +338,8 @@ pub(crate) fn confirm_fix(plan: &DoctorFixPlan) -> bool {
 pub(crate) fn print_apply_results(results: &[(DoctorFixAction, DoctorFixOutcome)]) -> bool {
     use colored::Colorize;
 
-    let (aqua_r, aqua_g, aqua_b) = crate::palette::WHALE_ACTION_RGB;
-    let (red_r, red_g, red_b) = crate::palette::WHALE_ERROR_RGB;
+    let (aqua_r, aqua_g, aqua_b) = codewhale_palette::WHALE_ACTION_RGB;
+    let (red_r, red_g, red_b) = codewhale_palette::WHALE_ERROR_RGB;
     println!("{}", "Repair results:".bold());
     let mut all_applied = true;
     for (action, outcome) in results {
@@ -406,6 +408,23 @@ mod tests {
         let (home, config) = ScratchHome::new();
         std::fs::write(home.path().join(".tmpAbC123"), b"orphaned").expect("write stale");
         std::fs::write(home.path().join(".tmpOther"), b"orphaned 2").expect("write stale 2");
+        let now = std::time::SystemTime::now();
+        for name in [".tmpAbC123", ".tmpOther"] {
+            std::fs::File::options()
+                .write(true)
+                .open(home.path().join(name))
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(2 * 60 * 60))
+                .unwrap();
+        }
+        for (name, modified) in [
+            (".tmpLive", now),
+            (".tmpRecent", now - std::time::Duration::from_secs(30 * 60)),
+            (".tmpFuture", now + std::time::Duration::from_secs(60 * 60)),
+        ] {
+            let file = std::fs::File::create(home.path().join(name)).expect("temp file");
+            file.set_modified(modified).expect("mtime");
+        }
         std::fs::write(home.path().join("keep.txt"), b"keep").expect("write keep");
         std::fs::create_dir_all(home.path().join(".tmpDir")).expect("mkdir .tmpDir");
 
@@ -422,6 +441,13 @@ mod tests {
             .count();
         assert_eq!(temp_deletions, 2, "{:?}", plan.actions);
 
+        // A stale candidate may become active while waiting for consent.
+        std::fs::File::options()
+            .write(true)
+            .open(home.path().join(".tmpOther"))
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
         let results = apply_fixes(&DoctorFixPlan {
             actions: plan
                 .actions
@@ -432,6 +458,15 @@ mod tests {
         });
         assert!(results.iter().all(|(_, o)| *o == DoctorFixOutcome::Applied));
         assert!(!home.path().join(".tmpAbC123").exists());
+        for name in [
+            ".tmpOther",
+            ".tmpLive",
+            ".tmpRecent",
+            ".tmpFuture",
+            ".tmpDir",
+        ] {
+            assert!(home.path().join(name).exists(), "must preserve {name}");
+        }
         assert!(home.path().join("keep.txt").exists());
     }
 
@@ -568,15 +603,17 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&mcp_path).expect("reread"))
                 .expect("json");
-        assert_eq!(
-            raw["servers"]["broken"]["enabled"],
-            false,
-            "file: {}",
-            std::fs::read_to_string(&mcp_path).unwrap_or_default()
+        assert!(
+            raw.get("servers").is_none(),
+            "preserve the original mcpServers spelling"
         );
+        assert_eq!(raw["mcpServers"]["broken"]["enabled"], false);
+        assert_eq!(raw["mcpServers"]["broken"]["disabled"], true);
         assert_eq!(
-            raw["servers"]["healthy"]["enabled"], true,
-            "healthy entry stays enabled"
+            raw["mcpServers"]["healthy"],
+            serde_json::json!({"command":"node", "args":["server.js"]}),
+            "healthy entry remains unchanged"
         );
+        assert!(mcp::load_config(&mcp_path).unwrap().servers["healthy"].enabled);
     }
 }

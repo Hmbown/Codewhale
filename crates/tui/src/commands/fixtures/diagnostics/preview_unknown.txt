@@ -1,0 +1,5 @@
+command: /preview-request nope
+is_error: false
+message:
+Unknown argument. Flags come before `--prompt`, which takes the rest of the line as prompt text. Usage: /preview-request [json] [--prompt <text>] | base-prompt  (flags first; --prompt takes the rest)
+action: <none>

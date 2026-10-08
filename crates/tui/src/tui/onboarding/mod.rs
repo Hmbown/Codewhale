@@ -25,10 +25,10 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::localization::MessageId;
-use crate::palette;
 use crate::tui::app::{App, OnboardingState};
 use crate::tui::views::{ActionHint, render_modal_footer, render_underwater_surface};
+use codewhale_localization::MessageId;
+use codewhale_palette as palette;
 
 const ONBOARDED_MARKER_FILE: &str = ".onboarded";
 
@@ -146,11 +146,9 @@ fn action_hints(app: &App) -> Vec<ActionHint> {
             ActionHint::new("3/N", app.tr(MessageId::OnboardTrustActionQuit).to_string()),
         ],
         OnboardingState::Ready => vec![
+            // Only keys this screen handles: a `/rc` hint here could not be
+            // typed, because the Ready screen owns the keyboard.
             ActionHint::new("Enter", app.tr(MessageId::OnboardReadyStart).to_string()),
-            ActionHint::new(
-                "/rc",
-                app.tr(MessageId::CmdRemoteControlDescription).to_string(),
-            ),
             ActionHint::new("C", app.tr(MessageId::OnboardReadyCustomize).to_string()),
         ],
         OnboardingState::None => Vec::new(),
@@ -172,6 +170,15 @@ fn provider_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     heading(&mut lines, app, MessageId::OnboardProviderTitle, width);
     lines.push(Line::from(""));
+    if let Some(notice) = app.onboarding_key_rejected.as_deref() {
+        for segment in wrap_words(notice, width) {
+            lines.push(Line::from(Span::styled(
+                segment,
+                Style::default().fg(palette::STATUS_ERROR),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
     wrap_body(&mut lines, app, MessageId::OnboardProviderBlurb, width);
     lines
 }
@@ -204,7 +211,7 @@ fn wrap_body(lines: &mut Vec<Line<'static>>, app: &App, id: MessageId, width: us
 /// Characters that may not begin a line in Japanese and Chinese typography
 /// (a small, uncontroversial kinsoku set: closing brackets, sentence-final
 /// punctuation, and the sound-extension mark). When a width break would strand
-/// one of these at the start of a line, one more cluster is pulled back.
+/// one of these at the start of a line, carry its preceding grapheme forward.
 const NO_LINE_START: &[char] = &[
     '。', '、', '．', '，', '，', '。', '」', '』', '）', '］', '｝', '〕', '〉', '》', '”', '’',
     '！', '？', '：', '；', 'ー', '々', '·', '…', '!', '?', ',', '.', ':', ';', ')', ']', '}',
@@ -232,16 +239,30 @@ fn break_by_display_width(text: &str, width: usize) -> Vec<String> {
                 .next()
                 .is_some_and(|c| NO_LINE_START.contains(&c));
             if starts_forbidden {
-                // Keep the punctuation with the text it belongs to. The line
-                // runs one column over only if that is unavoidable, which is
-                // still better than opening the next line with `。`.
-                current.push_str(cluster);
+                // Carry the preceding text with its punctuation onto the next
+                // line. Extending a full line instead silently clips it in a
+                // terminal viewport, including on the redaction consent gate.
+                if let Some((split, _)) = current.grapheme_indices(true).rev().find(|(_, part)| {
+                    !part
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| NO_LINE_START.contains(&ch))
+                }) && split > 0
+                    && UnicodeWidthStr::width(&current[split..]) + cluster_width <= width
+                {
+                    let carry = current.split_off(split);
+                    out.push(std::mem::replace(&mut current, carry));
+                    current_width = UnicodeWidthStr::width(current.as_str());
+                } else {
+                    // A punctuation-only run cannot satisfy both typography
+                    // and width; preserve every character inside the viewport.
+                    out.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+            } else {
                 out.push(std::mem::take(&mut current));
                 current_width = 0;
-                continue;
             }
-            out.push(std::mem::take(&mut current));
-            current_width = 0;
         }
         current.push_str(cluster);
         current_width += cluster_width;
@@ -392,7 +413,7 @@ pub fn mark_trusted(workspace: &Path) -> anyhow::Result<PathBuf> {
 /// confident; anything else defaults to English silently, so first run asks
 /// once. Returning users never see the language screen.
 pub fn locale_confidently_inferred(setting: &str) -> bool {
-    let normalized = crate::localization::normalize_configured_locale(setting);
+    let normalized = codewhale_localization::normalize_configured_locale(setting);
     if normalized.is_some_and(|tag| tag != "auto") {
         return true;
     }
@@ -400,7 +421,7 @@ pub fn locale_confidently_inferred(setting: &str) -> bool {
         std::env::var(key)
             .ok()
             .filter(|value| locale_var_names_a_language(value))
-            .and_then(|value| crate::localization::normalize_configured_locale(&value))
+            .and_then(|value| codewhale_localization::normalize_configured_locale(&value))
             .is_some_and(|tag| tag != "auto")
     })
 }
@@ -416,7 +437,7 @@ fn locale_var_names_a_language(value: &str) -> bool {
 
 /// The example task the ready screen seeds into the composer, chosen from
 /// what is cheaply visible in the workspace.
-pub fn first_task_seed(workspace: &Path, locale: crate::localization::Locale) -> String {
+pub fn first_task_seed(workspace: &Path, locale: codewhale_localization::Locale) -> String {
     let id = if CODE_PROJECT_MARKERS
         .iter()
         .any(|marker| workspace.join(marker).is_file())
@@ -425,7 +446,7 @@ pub fn first_task_seed(workspace: &Path, locale: crate::localization::Locale) ->
     } else {
         MessageId::OnboardSeedFolder
     };
-    crate::localization::tr(locale, id).into_owned()
+    codewhale_localization::tr(locale, id).into_owned()
 }
 
 /// Welcome → the first decision this run actually needs.
@@ -489,7 +510,7 @@ pub fn choose_offline_explore(app: &mut App) {
     // `advance_*` clears the status bar, so the label is applied after it.
     advance_onboarding_after_provider(app);
     app.status_message = Some(
-        app.tr(crate::localization::MessageId::OnboardOfflineNotice)
+        app.tr(codewhale_localization::MessageId::OnboardOfflineNotice)
             .into_owned(),
     );
     app.needs_redraw = true;
@@ -520,8 +541,8 @@ pub fn finish_ready_and_open_composer(app: &mut App) {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::localization::{Locale, MessageId, tr};
     use crate::tui::app::{App, TuiOptions};
+    use codewhale_localization::{Locale, MessageId, tr};
     use std::path::PathBuf;
 
     /// A first-run app with the onboarding decision reset to "nothing asked
@@ -939,6 +960,21 @@ mod tests {
     }
 
     #[test]
+    fn ready_screen_advertises_only_keys_it_handles() {
+        use crate::tui::views::action_footer_lines;
+
+        let mut app = test_app_with_locale(Locale::En);
+        app.onboarding = OnboardingState::Ready;
+        let rail = flattened(action_footer_lines(&action_hints(&app), 80));
+        assert!(rail.contains("Enter"), "{rail}");
+        assert!(rail.contains("change the look"), "{rail}");
+        assert!(
+            !rail.contains("/rc"),
+            "the Ready screen owns the keyboard, so /rc cannot be typed: {rail}"
+        );
+    }
+
+    #[test]
     fn provider_screen_advertises_the_offline_choice() {
         use crate::tui::views::action_footer_lines;
 
@@ -976,7 +1012,7 @@ mod tests {
         );
         for line in &lines {
             assert!(
-                UnicodeWidthStr::width(line.as_str()) <= 77,
+                UnicodeWidthStr::width(line.as_str()) <= 76,
                 "line exceeds the lane: {:?} ({} cols)",
                 line,
                 UnicodeWidthStr::width(line.as_str())

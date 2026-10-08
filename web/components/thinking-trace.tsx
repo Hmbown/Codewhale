@@ -1,14 +1,15 @@
+import { getConstitution, pickText } from "@/lib/i18n/dictionaries";
+import { Icon } from "./icon";
 /**
- * "See how it decides" — a terminal-styled pane that surfaces REAL reasoning
- * traces from a Codewhale session, paired with the decision each produced.
+ * "See how it decides" — explanatory prose that illustrates how the
+ * constitution's rank shows up in a model's reasoning, paired with the
+ * decision each line of reasoning led to.
  *
- * The point is "show, don't tell": every agent claims to be aligned/trustworthy;
- * Codewhale can prove it, because the Constitution is observable in the model's
- * reasoning (it cites "Article II", "Article V", etc. as it decides). No other
- * agent can show this because none have a hierarchy the model reasons against.
- *
- * The traces below are faithful excerpts from an actual session — not invented
- * marketing copy. Keep them honest if you edit them (see AGENTS.md Article II).
+ * These are ILLUSTRATIONS, labelled as such on the page: short paraphrases
+ * of the kind of reasoning the rank produces, not a transcript of one cited
+ * session. If a real, linkable session transcript is ever published, cite it
+ * here and change the label; until then, never present these as captured
+ * output (see AGENTS.md Article II).
  */
 
 export type Scene = {
@@ -66,55 +67,29 @@ export const SCENES: Scene[] = [
 ];
 
 export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
-  const isZh = locale === "zh";
+  const t = getConstitution(locale);
   return (
-    <div className="grid gap-6 md:grid-cols-3">
+    <div className="grid-3">
       {SCENES.map((s, i) => (
-        <div
-          key={i}
-          className="hairline-t hairline-b hairline-l hairline-r bg-paper flex flex-col overflow-hidden"
-        >
-          {/* terminal title bar */}
-          <div className="bg-paper-deep text-ink px-4 py-2.5 flex items-center justify-between">
-            <div className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-jade inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-ochre inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-indigo inline-block" />
-              <span className="ml-2.5 font-mono text-[0.66rem] uppercase tracking-widest text-ink-mute">
-                codewhale — thinking
-              </span>
-            </div>
-            <span className="font-cjk text-[0.6rem] text-ink-mute">
-              {isZh ? "推理痕迹" : "reasoning trace"}
+        <figure key={i} className="trace">
+          <figcaption className="trace-head">
+            <span className="status status-accent">
+              <span className="status-dot" aria-hidden="true" />
+              {t.illustration}
             </span>
-          </div>
-
-          {/* context */}
-          <div className="px-4 pt-4 text-[0.66rem] font-mono uppercase tracking-wider text-ink-mute">
-            {isZh ? s.context.zh : s.context.en}
-          </div>
-
-          {/* the trace */}
-          <pre className="px-4 py-3 font-mono text-[0.82rem] text-ink leading-relaxed whitespace-pre-wrap flex-1">
-            <span className="text-indigo">›</span>{" "}
-            <span className="text-ink-soft">{s.trace}</span>
-          </pre>
-
-          {/* cited authority */}
-          <div className="px-4 pb-3 flex flex-wrap gap-1.5">
+            <span className="trace-context">{pickText(s.context, locale)}</span>
+          </figcaption>
+          <p className="trace-body">{s.trace}</p>
+          <p className="trace-cites">
             {s.cites.map((c) => (
-              <span key={c} className="pill text-[0.58rem] tracking-wider">
-                {c}
-              </span>
+              <span key={c} className="pill">{c}</span>
             ))}
-          </div>
-
-          {/* the decision it produced */}
-          <div className="bg-indigo-pale px-4 py-3 hairline-t text-[0.8rem] leading-relaxed text-ink-soft">
-            <span className="font-display text-indigo font-semibold mr-1">→</span>
-            {isZh ? s.decision.zh : s.decision.en}
-          </div>
-        </div>
+          </p>
+          <p className="trace-decision">
+            <Icon name="arrow-right" className="icon icon-flip" />
+            <span>{pickText(s.decision, locale)}</span>
+          </p>
+        </figure>
       ))}
     </div>
   );

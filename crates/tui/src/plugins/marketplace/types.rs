@@ -260,6 +260,26 @@ impl MarketplaceInstallPlan {
     }
 }
 
+/// What a catalog entry is.
+///
+/// A marketplace carries more than plugins: the Codewhale marketplace lists
+/// standalone skills as their own entries, and imported third-party catalogs
+/// carry whatever their format allows. The kind is how a surface knows which
+/// pool an entry belongs to — in particular, only `Plugin` entries are plugin
+/// suggestions. (grokbuild's `MarketplaceEntry` carries the same distinction
+/// as inventory flags — `skill_count`, `has_mcp`, … — on an always-a-plugin
+/// entry; we keep the kind explicit because our catalogs list skills
+/// directly.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceEntryKind {
+    #[default]
+    Plugin,
+    /// A standalone skill (instruction pack). Installable, but never
+    /// suggested as a plugin.
+    Skill,
+}
+
 /// A normalized catalog entry. Catalog-declared component lists are kept
 /// for display; the reviewed staged-tree manifest at install time remains
 /// the only authority on what a bundle actually contains.
@@ -267,10 +287,16 @@ impl MarketplaceInstallPlan {
 pub struct MarketplaceCandidate {
     pub id: MarketplaceCandidateId,
     pub catalog_id: MarketplaceCatalogId,
+    /// What this entry is. Defaults to `Plugin` so stored snapshots and
+    /// formats that do not declare a kind keep their previous meaning.
+    #[serde(default)]
+    pub kind: MarketplaceEntryKind,
     /// Canonical (Agent Plugins standard) plugin name.
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

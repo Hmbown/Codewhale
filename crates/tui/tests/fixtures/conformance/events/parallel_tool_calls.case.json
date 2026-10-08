@@ -1,0 +1,158 @@
+{
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "approval_mode": "suggest",
+  "auto_approve": false,
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "workspace_files": {
+    "README.md": "conformance fixture\n",
+    "NOTES.md": "second file\n"
+  },
+  "description": "Two read-only tool calls in one assistant message run as one batch; their completions may race, so the golden orders adjacent completions by id.",
+  "user_message": "Read README.md and NOTES.md.",
+  "provider_script": [
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_parallel",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 120,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "call_read_a",
+            "name": "File",
+            "input": {}
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"action\":\"read\",\"path\":\"README.md\"}"
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "content_block_start",
+          "index": 1,
+          "content_block": {
+            "type": "tool_use",
+            "id": "call_read_b",
+            "name": "File",
+            "input": {}
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 1,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"action\":\"read\",\"path\":\"NOTES.md\"}"
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 1
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 160,
+            "output_tokens": 40
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_parallel_answer",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 200,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "text",
+            "text": ""
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "Both files read."
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "end_turn"
+          },
+          "usage": {
+            "input_tokens": 200,
+            "output_tokens": 6
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    }
+  ]
+}

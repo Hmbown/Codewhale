@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -14,8 +13,10 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { FACTS } from "./facts.generated";
 import { SNIPPETS, VERIFY } from "./install-binary-snippets";
+import { INSTALL_GUIDE } from "./install-guide.generated";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
+import { TERMINAL_SCREENSHOT } from "./media-manifest";
 
 const root = new URL("../../", import.meta.url);
 
@@ -189,7 +190,7 @@ describe("public surface contracts", () => {
     expect(matrix.product.license).toBe("MIT");
     expect(matrix.product.description).toBe(npmPackage.description);
     expect(license).toContain("MIT License");
-    expect(matrix.install.recommended).toBe("npm install -g codewhale");
+    expect(matrix.install.recommended).toBe("curl -fsSL https://codewhale.net/install.sh | sh");
     expect(readme).toContain(matrix.install.recommended);
     expect(Object.keys(npmPackage.bin)).toEqual(matrix.install.binaries);
     expect(matrix.install.channels).toEqual({
@@ -209,7 +210,10 @@ describe("public surface contracts", () => {
     // failure looked like a copy defect rather than a stale test.
     expect(install).toContain(`v${FACTS.version} source candidate`);
     expect(install).toContain("unpublished source candidate");
-    expect(install).toMatch(/Android \/ Termux \| arm64 \(aarch64\) \| ⚠️⁴ preview/);
+    const androidRow = install.split("\n").find((line) => line.startsWith("| Android / Termux |"));
+    expect(androidRow).toContain("arm64 (aarch64)");
+    expect(androidRow).toContain("`codewhale-android-arm64.tar.gz`");
+    expect(androidRow).toContain("⚠️⁴ preview");
     expect(install).not.toContain(`wrapper is published at\nv${FACTS.version}`);
     expect(npmReadme).toMatch(/^- Android arm64 \/ Termux \(preview;/m);
     expect(npmReadme).toContain("requires matching Android assets");
@@ -260,8 +264,8 @@ describe("public surface contracts", () => {
     expect(installDoc).toContain("One Cargo package is required");
     expect(installDoc).toContain("`codewhale-cli` installs the `codewhale` command");
     expect(installDoc).toContain("Cargo does\nnot create that alias");
-    expect(installPage).toContain("# Install the compiled runtime as codewhale");
-    expect(installPage).toContain("Cargo installs only");
+    expect(installPage).toContain('from "@/lib/install-guide.generated"');
+    expect(INSTALL_GUIDE.chunks.some((chunk) => chunk.kind === "code" && chunk.text.includes("cargo install --path crates/cli --locked"))).toBe(true);
     expect(installPage).not.toContain("codewhale-tui");
     expect(npmReadme).toContain("installs `codewhale` plus the `codew` convenience name");
     expect(npmReadme).not.toContain("codewhale-tui");
@@ -370,13 +374,8 @@ done
 
     expect(matrix.trust.audit).toContain("best-effort");
     expect(matrix.trust.audit).toContain("$CODEWHALE_HOME");
-    expect(installPage).toContain(
-      "const CONFIG_TREE = `$CODEWHALE_HOME/ (default: ~/.codewhale/)",
-    );
-    expect(installPage).toContain(
-      "best-effort credential / approval / elevation events",
-    );
-    expect(installPage).toContain("尽力写入的凭证 / 审批 / 提权事件");
+    // Install links to configuration instead of duplicating its storage map.
+    expect(installPage).toContain("/docs/configuration");
     expect(installPage).not.toContain(
       "audit.log        credential / approval / elevation audit trail",
     );
@@ -416,21 +415,19 @@ done
     expect(matrixText).not.toContain('"approvalPostures"');
   });
 
-  it("enforces the six-tool core, deferred discovery, and exact hidden compatibility", () => {
+  it("keeps public tool facts aligned with the native core and discovery boundaries", () => {
     const toolDoc = text("docs/TOOL_SURFACE.md");
-    const toolsPage = text("web/app/[locale]/docs/tools/page.tsx");
+    const toolsPage = text("web/app/[locale]/docs/tools/page.tsx") + text("web/lib/content/tools.ts");
     const registry = text("crates/tui/src/tools/registry.rs");
     const limits = text("crates/tui/src/config/subagent_limits.rs");
     const roadmap = text("web/app/[locale]/roadmap/page.tsx");
 
-    expect(matrix.toolSurface.defaultActive).toEqual([
-      "read",
-      "write",
-      "edit",
-      "bash",
-      "agent",
-      "todo_write",
-    ]);
+    const catalog = text("crates/tui/src/core/engine/tool_catalog.rs");
+    const nativeCore = catalog.match(/const DEFAULT_ACTIVE_NATIVE_TOOLS: &[\s\S]*?= &\[([\s\S]*?)\];/);
+    expect(nativeCore, "native core declaration must be found").not.toBeNull();
+    const nativeNames = [...nativeCore![1].matchAll(/"([^"\n]+)"/g)].map((match) => match[1]);
+    expect(nativeNames.length).toBeGreaterThan(0);
+    expect(matrix.toolSurface.defaultActive).toEqual(nativeNames);
     expect(matrix.toolSurface.schemas).toEqual({
       read: ["path", "offset?", "limit?"],
       write: ["path", "content"],
@@ -460,14 +457,7 @@ done
     expect(roadmap.indexOf('{ title: "Local web client"')).toBeLessThan(
       roadmap.indexOf('title: "Underway"'),
     );
-    expect(roadmap).toContain("Implemented in the v0.9.1 source candidate");
-    // docs/TOOL_SURFACE.md moved from six to seven model-facing names when
-    // the TUI promoted todo_write into DEFAULT_ACTIVE_NATIVE_TOOLS
-    // (bf6def00d). docs/public-surface-facts.json tracks the six-name
-    // DEFAULT_ACTIVE_NATIVE_TOOLS matrix (tool_search is the synthetic
-    // always-active entry outside it), and the name loop below keeps the
-    // matrix↔doc↔site alignment honest.
-    expect(toolDoc).toContain("exactly seven model-facing names");
+    expect(roadmap).toContain("In published releases: `codewhale web`");
     for (const name of matrix.toolSurface.defaultActive) {
       expect(toolDoc, name).toContain(`\`${name}\``);
       expect(toolsPage, name).toContain(name);
@@ -494,12 +484,17 @@ done
 
     expect(matrix.trust.hostedProviderBoundary).toContain("selected hosted provider");
     expect(matrix.trust.localInference).toContain("loopback local-model route");
-    // 0.9.6 makes anonymous usage counting default-on. The trust gate therefore
-    // requires both plain disclosure and a durable opt-out, plus explicit red
-    // lines around product content and agent timelines.
-    expect(matrix.trust.telemetry).toContain("on by default");
-    expect(matrix.trust.telemetry).toContain("clear first-run disclosure");
-    expect(matrix.trust.telemetry).toContain("durable opt-out");
+    // The source candidate counts by default and says so. Disclosure alone
+    // is never acceptance, every opt-out stays authoritative, and the
+    // published release's earlier opt-in behavior is named, not blurred.
+    expect(matrix.trust.telemetry).toContain(`Codewhale ${matrix.sourceCandidate.version} counts anonymous usage by default`);
+    expect(matrix.trust.telemetry).toContain("discloses it at first launch");
+    expect(matrix.trust.telemetry).toContain("policy notice version 5");
+    expect(matrix.trust.telemetry).toContain("Codewhale and PostHog");
+    expect(matrix.trust.telemetry).toContain("earlier 0.9.11 release asked first");
+    expect(matrix.trust.telemetry).toContain("never records any acceptance");
+    expect(matrix.trust.telemetry).toContain("opt-out recorded under the earlier opt-in policy stays off");
+    expect(matrix.trust.telemetry).not.toContain("requires explicit consent");
     expect(matrix.trust.telemetry).toContain("does not collect conversations");
     expect(matrix.trust.telemetry).toContain("per-turn/per-tool timelines");
     // The destination is now named, and named exactly — a trust claim that says
@@ -554,105 +549,59 @@ done
     // English and Chinese editions — same guarantee, one source.
     expect(footerProjectLinks("en", getChrome("en")).at(-1)).toEqual({
       label: "MIT license",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footerProjectLinks("zh", getChrome("zh")).at(-1)).toEqual({
       label: "MIT 许可证",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footer).toContain("href={REPO_RELEASES_URL}");
     expect(text("web/lib/i18n/links.ts")).toContain(
       'export const REPO_RELEASES_URL = `${REPO_URL}/releases`',
     );
     expect(text("web/lib/i18n/links.ts")).toContain(
-      'export const REPO_URL = "https://github.com/Hmbown/CodeWhale"',
+      'export const REPO_URL = "https://github.com/codewhale-hq/CodeWhale"',
     );
     expect(footer).toContain("GITEE_ENABLED &&");
   });
 
-  it("keeps the README and website on one optimized canonical product screenshot", () => {
+  it("keeps supplied terminal screenshots and website dimensions truthful", () => {
+    // The site and README use captures from the same exact build. The site
+    // opens on the real unsent composer; the README image preserves the home
+    // frame rasterized from its corresponding capture.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
-    const digest = (image: Buffer) => createHash("sha256").update(image).digest("hex");
 
-    expect(digest(readmeImage)).toBe(digest(websiteImage));
-    expect(imageDimensions(readmeImage)).toEqual([1562, 1256]);
+    expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
+    expect(readmeImage).toEqual(websiteImage);
     expect(statSync(new URL(matrix.screenshot.readme, root)).size).toBeLessThan(500_000);
-    expect(matrix.screenshot.terminal).toBe("unrecorded");
+    expect(statSync(new URL(matrix.screenshot.website, root)).size).toBeLessThan(500_000);
+    expect(matrix.screenshot.terminal).toContain("real PTY cell capture");
+    // A development-build capture, never a release claim.
+    expect(matrix.screenshot.capture).toContain("development build");
+    expect(matrix.screenshot.capture).toContain("not a default");
 
     const readme = text("README.md");
     const homepage = text("web/app/[locale]/page.tsx");
-    expect(readme).toContain("assets/screenshot.webp");
-    expect(homepage).toContain('src="/codewhale-tui.webp"');
-    // Alt text and figcaption are dictionary-backed (#4934); the screenshot
-    // contract now runs through the EN reference value and the page's use of
-    // it, and every routed locale must caption the same session honestly.
-    expect(homepage).toContain("alt={d.screenshotAlt}");
-    expect(homepage).toContain("<figcaption>{d.figcaption}</figcaption>");
-    expect(getHome("en").figcaption).toBe(
-      "Codewhale session · Operate mode · permissions: Ask",
-    );
-    expect(getHome("en").screenshotAlt).toContain("Operate mode");
-    for (const locale of ["zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id"]) {
+    expect(readme).toContain(matrix.screenshot.readme);
+    expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
+    expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
+    expect(homepage).toContain('<NativeTerminalGallery\n                    locale={locale}\n                    defaultFrame="composer"');
+    expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
+    expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
+    // Every locale describes the actual capture; build identity comes from
+    // the media manifest instead of a stale version embedded in translations.
+    expect(homepage).toContain("label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
+    expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
+    expect(getHome("en").shotBuild).toBe("v{version} pre-release build");
+    for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
       const home = getHome(locale);
-      expect(home.figcaption, `${locale} figcaption`).toContain("Operate");
-      expect(home.figcaption, `${locale} figcaption`).toContain("Ask");
-      expect(home.screenshotAlt.trim().length, `${locale} alt`).toBeGreaterThan(0);
+      expect(home.shotBuild, `${locale} shotBuild`).toContain("{version}");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("{version}");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("Ask");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("Work");
+      expect(home.screenshotAlt, `${locale} alt`).not.toMatch(/171acee|0\.9\.12|Full Access/);
     }
-  });
-
-  it("keeps the standalone wire strip a record of GitHub, not a summary of it", () => {
-    const ticker = text("web/components/ticker.tsx");
-    const github = text("web/lib/github.ts");
-
-    // An empty or unreachable feed removes the strip. No skeleton, no
-    // placeholder row, no invented item.
-    expect(ticker).toContain("if (!ordered.length) return null;");
-
-    // Drafts are the author's own not-ready marker, not an event.
-    expect(ticker).toContain("EVENT_STATES.includes(item.state)");
-    expect(ticker).not.toContain('"draft"');
-
-    // Every verb resolves through the caller's dictionary — the strip never
-    // hardcodes an English event word next to a translated page.
-    for (const key of [
-      "tickerMerged",
-      "tickerOpened",
-      "tickerClosed",
-      "tickerReleased",
-      "tickerFirstContribution",
-      "tickerBy",
-      "tickerAria",
-    ] as const) {
-      for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id"]) {
-        expect(getChrome(locale)[key].trim().length, `${locale} ${key}`).toBeGreaterThan(0);
-      }
-    }
-    expect(getChrome("en").tickerBy).toContain("{handle}");
-
-    // The first-contribution mark is GitHub's verdict, copied, never ours.
-    expect(github).toContain('association === "FIRST_TIME_CONTRIBUTOR"');
-    expect(ticker).toContain("item.firstTimeContributor");
-
-    // A verb is dated by its own event, so a merge is never dated by a later
-    // comment on the thread.
-    expect(github).toContain("eventAt");
-    expect(ticker).toContain("item.eventAt ?? item.updatedAt");
-
-    // Merged pull requests, issues, and releases — the whole life of the repo,
-    // within the existing three-call budget.
-    expect(github).toContain("/releases?per_page=");
-    expect(github).toContain('kind: "release"');
-  });
-
-  it("keeps reduced motion static without hiding the reasoning trace", () => {
-    const css = text("web/app/globals.css");
-
-    expect(css).toMatch(
-      /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.ticker-track\s*\{\s*animation:\s*none;\s*\}[\s\S]*?\}/,
-    );
-    // Freezing the track must not also hide the entries it stopped scrolling.
-    expect(css).toMatch(/\.ticker-viewport\s*\{\s*overflow-x:\s*auto;\s*\}/);
   });
 
   it("keeps the homepage free of fabricated demo panels", () => {

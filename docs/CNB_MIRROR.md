@@ -1,15 +1,33 @@
 # CNB Cool mirror
 
+> 阅读简体中文版：[zh_hans/CNB_MIRROR.md](zh_hans/CNB_MIRROR.md)。
+
 `cnb.cool/codewhale.net/codewhale` is a one-way mirror of this
 GitHub repository for users on networks where GitHub is slow or blocked
 (primarily mainland China). The mirror receives every push to `main`, every
 `fix/*`, `rebrand/*`, and `work/v*` branch used for first-party release work,
-and every `v*` release tag.
+and each `v*` release tag after its complete GitHub Release is published.
+
+## Source and downloads are separate checks (2026-10-06 audit)
+
+CNB `main` matched canonical GitHub `main` during this audit. GitHub, npm and
+npmmirror's latest published version was **0.10.0**; the two registry wrapper
+tarballs had identical bytes and verified integrity. CNB's latest binary
+release remained **0.9.9**. Its `v0.10.0` source tag exists, but that tag build
+failed the release-note check before compilation and upload. The CNB 0.10.0
+checksum manifest returned 404; do not recommend forcing the CNB-only installer
+for that version. 0.10.1 remains a Main source candidate until publication.
+
+Check source identity, then the actual versioned release, assets and manifest.
+A successful GitHub mirror workflow or a source tag is not binary availability.
+Re-pushing an existing tag does not create a fresh tag-push build. Maintainers
+must recover the build/publication separately and verify the result, preserving
+published tags. Refresh this dated status after publication.
 
 ## Provenance
 
 **GitHub is the sole canonical source.** All releases, tags, and source code
-originate at `github.com/Hmbown/CodeWhale`. The CNB mirror is a read-only
+originate at `github.com/codewhale-hq/CodeWhale`. The CNB mirror is a read-only
 replica maintained by the `Sync to CNB` workflow — it exists solely to serve
 users behind GFW-blocked or slow GitHub connections.
 
@@ -29,19 +47,20 @@ sha256sum -c codewhale-artifacts-sha256.txt --ignore-missing
 The mirror is maintained by the [`Sync to CNB`](../.github/workflows/sync-cnb.yml)
 GitHub Actions workflow:
 
-- **Trigger:** `push` to `main`, `push` of any `v*` tag,
+- **Trigger:** `push` to `main`, the release workflow after canonical publication,
   release work branches matching `work/v*`, first-party fix and rebrand
   branches matching `fix/*` and `rebrand/*`, or `workflow_dispatch` for manual
-  recovery.
+  recovery. A tag push alone does not mirror a release tag. Manual tag recovery
+  also verifies the complete public GitHub asset inventory and immutable source.
 - **Auth:** HTTPS basic auth as user `cnb` with the `CNB_GIT_TOKEN`
   repository secret as the password.
 - **Scope:** only the ref that triggered the run is pushed. Tag pushes
   push exactly that tag. Branch pushes mirror `main`, first-party
   `fix/*`/`rebrand/*` branches, or explicitly matched release branches. Other
   feature branches and dependabot refs are intentionally *not* mirrored.
-- **Concurrency:** runs are serialized via a `cnb-sync` concurrency
-  group so the back-to-back `main` push and tag push from
-  `auto-tag.yml` cannot race each other.
+- **Concurrency:** `cnb-sync-${{ github.ref }}` serializes each ref separately.
+  Distinct release tags cannot replace one another in a global pending slot;
+  only a newer push of the same branch supersedes its pending branch sync.
 - **Retry:** each push is retried up to three times with linear
   backoff (5s, 10s) before the workflow gives up.
 
@@ -65,6 +84,9 @@ release assets from source and publishes a CNB release with:
 This gives users who can reach CNB but not GitHub a CNB-native release path.
 GitHub remains the canonical macOS/Windows release matrix; the CNB tag pipeline
 is the China-friendly Linux x64 fallback.
+The GitHub release workflow calls the mirror only after publishing its complete,
+verified asset set. CNB cannot publish a version whose canonical release failed.
+An existing CNB tag must match; recovery never force-updates a release tag.
 
 ## CNB Linux CI and release preflight
 
@@ -76,7 +98,7 @@ Linux Rust gates run on Tencent-hosted runners instead of GitHub Actions:
 - `cargo check --workspace --all-targets --locked`
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 - `cargo test --workspace --all-features --locked`
-- `cargo build --release --locked -p codewhale-cli -p codewhale-tui`
+- `cargo build --release --locked -p codewhale-cli --bin codewhale`
 - `node scripts/release/npm-wrapper-smoke.js`
 
 Release branches matching `work/v*` also run
@@ -94,7 +116,7 @@ git ls-remote https://cnb.cool/codewhale.net/codewhale.git \
     refs/tags/vX.Y.Z
 
 # Quick check: is CNB's main at the same commit as origin/main?
-gh_main=$(git ls-remote https://github.com/Hmbown/CodeWhale.git refs/heads/main | awk '{print $1}')
+gh_main=$(git ls-remote https://github.com/codewhale-hq/CodeWhale.git refs/heads/main | awk '{print $1}')
 cnb_main=$(git ls-remote https://cnb.cool/codewhale.net/codewhale.git refs/heads/main | awk '{print $1}')
 test "$gh_main" = "$cnb_main" && echo "in sync" || echo "DIVERGED: gh=$gh_main cnb=$cnb_main"
 ```
@@ -102,7 +124,7 @@ test "$gh_main" = "$cnb_main" && echo "in sync" || echo "DIVERGED: gh=$gh_main c
 Or check the workflow run directly:
 
 ```bash
-gh run list --workflow=sync-cnb.yml --repo Hmbown/CodeWhale --limit 5
+gh run list --workflow=sync-cnb.yml --repo codewhale-hq/CodeWhale --limit 5
 ```
 
 If the most recent run for the release tag is `success`, the mirror
@@ -123,10 +145,10 @@ without pushing anything:
 
 ```bash
 # Prefer rerunning the existing failed tag run when one exists.
-gh run rerun <failed-tag-run-id> --repo Hmbown/CodeWhale
+gh run rerun <failed-tag-run-id> --repo codewhale-hq/CodeWhale
 
 # If no tag run exists, dispatch from the exact existing release tag.
-gh workflow run sync-cnb.yml --repo Hmbown/CodeWhale --ref vX.Y.Z
+gh workflow run sync-cnb.yml --repo codewhale-hq/CodeWhale --ref vX.Y.Z
 ```
 
 Do not omit `--ref` when repairing a tag: a default-branch dispatch syncs
@@ -142,11 +164,11 @@ expired:
    with `repo` (push) scope.
 2. Update the `CNB_GIT_TOKEN` repository secret:
    ```bash
-   gh secret set CNB_GIT_TOKEN --repo Hmbown/CodeWhale
+   gh secret set CNB_GIT_TOKEN --repo codewhale-hq/CodeWhale
    ```
 3. Re-trigger the workflow on a recent commit:
    ```bash
-   gh workflow run sync-cnb.yml --repo Hmbown/CodeWhale
+   gh workflow run sync-cnb.yml --repo codewhale-hq/CodeWhale
    ```
 4. Confirm the run succeeds via `gh run list --workflow=sync-cnb.yml`.
 
@@ -210,7 +232,7 @@ Users behind GitHub-blocking networks can also select a source explicitly:
   `codewhale-tui` install is not required.
   Linux build-time dependencies (`build-essential`, `pkg-config`,
   `libdbus-1-dev` on Debian/Ubuntu) are required — see
-  [INSTALL.md](INSTALL.md#4-install-via-cargo-any-tier-1-rust-target).
+  [INSTALL.md](INSTALL.md#5-cargo-and-building-from-source).
 
 - **CNB release assets** for Linux x64, when the matching CNB tag pipeline has
   completed successfully. Download `codewhale-linux-x64`, `codew-linux-x64`,
@@ -245,7 +267,10 @@ https://cnb.cool/codewhale.net/codewhale.git
 The mirror receives `main`, release tags, and matched release branches. GitHub
 is the fallback when the CNB workflow or credentials are unhealthy.
 
-CNB deploy-button examples live in `deploy/tencent-lighthouse/cnb/`. They are
+The bilingual self-hosting guide is
+[`scripts/tencent-lighthouse/README.md`](../scripts/tencent-lighthouse/README.md).
+CNB deploy-button examples live in
+[`deploy/tencent-lighthouse/cnb/`](../deploy/tencent-lighthouse/cnb/README.md). They are
 not active until copied into `.cnb.yml` and `.cnb/tag_deploy.yml`, because live
 deploy jobs require a Lighthouse deploy key, target host, and explicit CNB
 quota/billing policy.

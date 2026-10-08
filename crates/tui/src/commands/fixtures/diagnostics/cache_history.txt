@@ -1,0 +1,18 @@
+command: /cache
+is_error: false
+message:
+Cache telemetry — last 4 of 4 turn(s) (model: deepseek-v4-pro)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+turn  route                        in    out    hit   miss  write  replay    ratio        cost   age
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+   1  deepseek/deepseek-v4-pro   4000    200   3000   1000      —       —    75.0%           —   <age>
+   2  deepseek/deepseek-v4-pro   6000    250   3000   3000      —     150    50.0%           —   <age>
+   3  deepseek/deepseek-v4-pro   5000    100   2500  2500*      —       —    50.0%           —   <age>
+   4  deepseek/deepseek-v4-pro   1000     50      —      —      —       —        —           —   <age>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+sum_write: 0  sum_reasoning: 0 (already inside out)
+Σ in: 16000   Σ hit: 8500   Σ miss: 6500   avg hit ratio: 56.7%
+* miss inferred from input − hit when the provider did not report it explicitly.
+Hit/miss ratios over ~70% after the third turn indicate a stable cache prefix; 
+ lower than that on long sessions suggests prefix churn worth investigating (#263).
+action: <none>

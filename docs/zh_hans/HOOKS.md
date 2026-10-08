@@ -1,25 +1,31 @@
 # 钩子（Hooks）
 
-> 本文翻译自英文版 [HOOKS.md](../HOOKS.md)，与英文修订 `0fe366bba`（2026-08-15）同步。
+> 英文原文：[HOOKS.md](../HOOKS.md)。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 Hooks 会在 Codewhale **TUI** 到达生命周期节点时运行一条 shell 命令。它们是普通进程：通过环境变量接收上下文，其中一些会在 stdin 上收到 JSON 载荷，还有三个可以引导 Codewhale 接下来做什么。
 
-本页是当前已实现内容的权威参考。与 `config.toml` 其余部分重叠的配置语法见 [CONFIGURATION.md](CONFIGURATION.md)；本文件是逐事件约定的契约。
+本页是当前已实现内容的权威参考。与 `config.toml` 其余部分重叠的配置语法见 [CONFIGURATION.md](CONFIGURATION.md)；本文件是逐事件的约定说明。
 
 ## 适用范围
 
-Hooks 是 **TUI 运行时功能**。每个触发点都位于交互式 TUI 以及它所驱动的引擎回合循环中。
+Hooks 会在交互式 TUI 和引擎回合循环中触发；Runtime API 也把这个回合循环放在桌面应用和 web 的背后驱动。
 
 | 界面 | 是否触发 hooks |
 | --- | --- |
 | `codewhale` / `codew` 交互式 TUI | 是 |
-| `codewhale exec`（无头一次性执行） | 否 |
+| `codewhale exec`（无头一次性执行） | 需主动开启：`--hooks` 会触发 `tool_call_before` 和 `shell_env` |
+| Runtime API 线程（桌面应用、web） | 是：`tool_call_before`、`shell_env`、`tool_call_after`、`on_error`；`GET /v1/hooks` 列出这一组 |
 | `codewhale` CLI 分发器及其子命令 | 否 |
 | app-server / ACP | 否 |
-| `workflow` 工具和子代理 *内部机制* | 否——但 TUI 会在它们周围触发 `subagent_spawn` / `subagent_complete` |
+| `workflow` 工具和子智能体 *内部机制* | 否——但 TUI 会在它们周围触发 `subagent_spawn` / `subagent_complete` |
 | 公共 API | 不存在 |
 
 本仓库中的 `crates/hooks` event-sink crate 是一个无关的内部机制。它与这里描述的 hooks 不共享任何配置、事件名称或契约。
+
+### `codewhale exec --hooks`
+
+无头运行默认不触发任何 hook——CI 任务不应仅仅因为存在某份配置，就开始呼叫值班轮换。`codewhale exec --hooks` 让这次运行主动开启 hooks。引擎侧的事件是 `tool_call_before`（退出码 2 仍会拒绝该调用；`ask` 按失败即关闭（fail-closed）处理，因为无头模式下没有任何东西可以弹出提示）和 `shell_env`。由 UI 驱动的事件，例如 `session_start`、`message_submit` 和 `turn_end`，不会触发——它们属于交互式外壳，而不是回合循环。Fleet worker 子进程从不触发操作员 hooks。与这个标志无关，`permissions.toml` 中有类型的规则本来就适用于 `exec`——这次运行驱动的是同一个回合循环，而 `deny` 在每种模式下都会拦截。
 
 ## 快速开始
 
@@ -45,13 +51,13 @@ default_timeout_secs = 30      # 见下面的超时说明
 working_dir = "/path/to/dir"   # 默认：会话工作区
 
 [[hooks.hooks]]
-event = "tool_call_before"     # 必填；下面是 11 个名称之一
+event = "tool_call_before"     # 必填；下面 15 个名称之一
 command = "~/.codewhale/hooks/gate.sh"  # 必填；Unix 上是 `sh -c`，Windows 上是 `cmd /C`
 name = "gate"                  # 可选；/hooks 和日志行中的标签
 timeout_secs = 30              # 可选，默认 30
 background = false             # 可选；在 hook worker 内前台运行
 continue_on_error = true       # 可选，默认 true
-condition = { type = "tool_name", name = "exec_shell" }  # 可选
+condition = { type = "tool_name", name = "bash" }  # 可选
 ```
 
 `timeout_secs` 说明（按实现陈述）：当设置了 `[hooks].default_timeout_secs` 时，它会**覆盖**每个 hook 自己的 `timeout_secs`，而不仅仅是给省略该项的 hook 提供默认值。如果你希望各 hook 各自的超时生效，请保持不设置它。`/hooks list` 会显示运行时实际应用的超时，并在有覆盖生效时指明该覆盖。
@@ -82,7 +88,7 @@ Hooks 以工作区（或 `working_dir`）作为当前目录运行。
 
 `shell_env` 完全忽略 `background`——它的 stdout *就是*契约，所以它总是前台运行。`/hooks list` 会将其报告为配置警告，并且不把该 hook 标注为 `[bg]`。
 
-仅观察的 UI 事件通过非阻塞 `try_send` 提交到一个 32 项队列，由两个持续运行的 worker 消费。已配置的前台观察者仍会在某个 worker 内按配置顺序被等待，但终端事件循环从不等待它的进程，也从不按事件创建线程。队列饱和或分发器丢失会丢弃该观察者事件，并产生一个事件专属的错误 toast，它能挺过代理普通的进度状态更新。引导事件保留其门或变换语义：fresh/queued `message_submit` 分发通过有界结果通道报告，同回合的引导在调用引擎引导路径之前于阻塞 worker 上执行变换，而 `tool_call_before` / `shell_env` 在引擎或工具 worker 上执行，而非终端事件循环。
+仅观察的 UI 事件通过非阻塞 `try_send` 提交到一个 32 项队列，由两个持续运行的 worker 消费。已配置的前台观察者仍会在某个 worker 内按配置顺序被等待，但终端事件循环从不等待它的进程，也从不按事件创建线程。队列饱和或分发器丢失会丢弃该观察者事件，并产生一个事件专属的错误 toast，不会被智能体普通的进度状态更新覆盖。引导事件保留其门或变换语义：fresh/queued `message_submit` 分发通过有界结果通道报告，同回合的引导在调用引擎引导路径之前于阻塞 worker 上执行变换，而 `tool_call_before` / `shell_env` 在引擎或工具 worker 上执行，而非终端事件循环。
 
 ### hook 进程环境
 
@@ -95,42 +101,48 @@ hook 命令继承 Codewhale 进程的环境，外加该事件对应的 `DEEPSEEK
 | 条件 | 匹配 | 支持于 |
 | --- | --- | --- |
 | `{ type = "always" }` | 每次调用（省略时的默认值也是它） | 每个事件 |
-| `{ type = "tool_name", name = "exec_shell" }` | 精确工具名；支持 `*` 通配，例如 `mcp__*` | `tool_call_before`、`tool_call_after`、`shell_env`、`on_error` |
+| `{ type = "tool_name", name = "bash" }` | 精确工具名；支持 `*` 通配，例如 `mcp__*`。shell 工具的写法 `bash`、`Bash` 和 `exec_shell` 互为别名：条件中写其中任何一个，都会匹配这三者 | `tool_call_before`、`tool_call_after`、`shell_env`、`on_error` |
 | `{ type = "tool_category", category = "shell" }` | 工具类别 | `tool_call_before`、`tool_call_after`、`shell_env`、`on_error` |
 | `{ type = "mode", mode = "plan" }` | 上下文的模式字符串，不区分大小写 | 除 `shell_env` 外的每个事件 |
 | `{ type = "exit_code", code = 1 }` | 工具实际报告的退出码 | `tool_call_after`、`on_error` |
 | `{ type = "all", conditions = [...] }` | 每个嵌套条件 | 每个事件 |
 | `{ type = "any", conditions = [...] }` | 至少一个嵌套条件 | 每个事件 |
 
-有三条规则防止条件撒谎：
+以下三条规则避免条件给出误导性的匹配结果：
 
-- **`exit_code` 需要真实的退出码。** 它只在事件确实观察到进程退出码时匹配——`tool_call_after`，或工具失败时的 `on_error`，两种情况都针对 `exec_shell` 这类由进程支撑的工具。不报告退出码的工具永远不会匹配 `exit_code` 条件；默认值、零或成功标志都不能满足该条件。该值是 64 位整数，因此 `3221225477`（`0xC0000005`）这样的 Windows 崩溃码也可以匹配。
+- **`exit_code` 需要真实的退出码。** 它只在事件确实观察到进程退出码时匹配——`tool_call_after`，或工具失败时的 `on_error`，两种情况都针对 `bash` 这类由进程支撑的工具。以非零码退出的命令同样会报告它的退出码，尽管 `bash` 会把它作为一次失败的调用返回。超时或被杀死的命令通常没有退出码；`DEEPSEEK_TOOL_STATUS` 会说明是哪一种。不报告退出码的工具永远不会匹配 `exit_code` 条件；默认值、零或成功标志都不能满足该条件。该值是 64 位整数，因此 `3221225477`（`0xC0000005`）这样的 Windows 崩溃码也可以匹配。
 - **支持工具作用域的 `on_error` hooks。** `on_error` 会因传输和容量错误*以及*工具失败而触发；工具失败的触发会携带工具名、调用 id、结果和报告的退出码。因此，`on_error` 上的 `tool_name` / `tool_category` / `exit_code` 条件是有效的配置。背后没有工具的 `on_error` 触发只是不匹配这样的条件——它在分发时被跳过，而不是在加载时被拒绝。
-- **不支持的条件会在加载时被拒绝。** 引用其事件永远不会携带的上下文的条件永远无法匹配，佩戴这种条件的 hook 会静默失效——危险的形式是操作员以为已武装的 `deny` 门。Codewhale 会在加载时丢弃这些 hooks，在 `hooks` tracing 目标下记录原因，并在 `/hooks list` 中显示为 `rejected:`。`all` / `any` 内的嵌套谓词也会被检查。带 `timeout_secs = 0` 或空 `command` 的 hook 也会以同样的方式被拒绝。拒绝是**逐条**的：一个坏 hook 永远不会连累另一个，即使两者共享同一个 `name` 或都未命名。
+- **不支持的条件会在加载时被拒绝。** 引用其事件永远不会携带的上下文的条件永远无法匹配，带有这种条件的 hook 会静默失效——最危险的情形，是操作员以为已生效的 `deny` 拦截门实际上根本没有起作用。Codewhale 会在加载时丢弃这些 hooks，在 `hooks` tracing 目标下记录原因，并在 `/hooks list` 中显示为 `rejected:`。`all` / `any` 内的嵌套谓词也会被检查。带 `timeout_secs = 0` 或空 `command` 的 hook 也会以同样的方式被拒绝。拒绝是**逐条**的：一个坏 hook 永远不会连累另一个，即使两者共享同一个 `name` 或都未命名。
 
 ### 项目本地 hooks
 
-仓库可以附带 `<workspace>/.codewhale/hooks.toml`，使用相同的结构，但只有它的 `[[hooks]]` 条目会被合并——项目文件不能更改 `enabled`、`default_timeout_secs` 或 `working_dir`，这些始终来自你自己的配置。由于 hooks 是可执行配置，项目 hooks 只有在用户自有配置中信任该工作区**之后**才会加载；仅靠会话 `/trust on` 不会启用它们。受信任的项目 hooks 会追加在全局 hooks 之后，因此它们最后运行，并在 `updatedInput` 平局时胜出。格式错误的受信任项目文件会记录一条警告，Codewhale 只回退到全局 hooks。校验针对合并后的集合运行，因此被拒绝的项目 hook 与被拒绝的全局 hook 报告方式相同。
+仓库可以附带 `<workspace>/.codewhale/hooks.toml`，使用相同的结构，但只有它的 `[[hooks]]` 条目会被合并——项目文件不能更改 `enabled`、`default_timeout_secs` 或 `working_dir`，这些始终来自你自己的配置。由于 hooks 是可执行配置，项目 hooks **只有**在工作区受信任、并且在用户自有配置中对该 hooks 文件的确切内容另行批准之后才会加载。用 `/hooks review` 检查其中的命令和摘要（digest），再用 `/hooks approve <digest>` 让这些字节在下一个会话生效。命令所调用的脚本也请一并审阅。文件一旦改动，就需要重新批准。`/hooks revoke` 会阻止之后以及已排队的启动；它不会停止已经在运行的命令。仅靠会话内的 `/trust on` 不会启用项目 hooks。已批准的项目 hooks 会追加在全局 hooks 之后，因此它们最后运行，并在 `updatedInput` 平局时胜出。格式错误的受信任项目文件会记录一条警告，Codewhale 只回退到全局 hooks。校验针对合并后的集合运行，因此被拒绝的项目 hook 与被拒绝的全局 hook 报告方式相同。
 
-## 11 个事件
+## 15 个事件
 
 | 事件 | 触发时机 | 引导 |
 | --- | --- | --- |
 | `session_start` | 一次，引擎就绪后、首次绘制前 | observer |
 | `session_end` | 一次，优雅关闭时 | observer |
+| `turn_end` | 回合完成且回合后状态更新后 | observer |
 | `message_submit` | 在提交的消息到达历史或模型之前 | **可以替换或阻止文本** |
 | `tool_call_before` | 每次工具调用执行之前 | **可以 allow / deny / ask、改写输入、添加上下文** |
 | `tool_call_after` | 每个工具结果落定后，包括 transcript 不重绘的完成 | observer |
 | `mode_change` | 每次应用的 Plan/Work/Operate 转换（`Act` 是 Work 的兼容别名） | observer |
 | `on_error` | 传输、容量和认证错误，以及工具失败时 | observer |
-| `turn_end` | 回合完成且回合后状态更新后 | observer |
-| `subagent_spawn` | 子代理启动时 | observer |
-| `subagent_complete` | 子代理完成、失败或被取消时 | observer |
+| `subagent_spawn` | 子智能体启动时 | observer |
+| `subagent_complete` | 子智能体完成、失败或被取消时 | observer |
 | `shell_env` | 每次 `exec_shell` 调用之前 | **贡献环境变量** |
+| `session_idle` | 会话在一个回合或一次等待之后回到空闲——没有未决的提示、审批或续跑 | observer |
+| `session_error` | 一个回合以终止性失败结束时；智能体自行消化的瞬时工具失败不会触发它 | observer |
+| `waiting_for_user` | 智能体开始等你时：审批提示打开、呈现了一个 `request_user_input` 问题，或者目标续跑在两次执行之间被挂起 | observer |
+| `session_busy` | 空闲或等待中的会话开始或恢复工作时；启动时以及对同一状态的重复观察都保持静默 | observer |
+
+`waiting_for_user` 的载荷带有 `reason`：`approval`、`user_input` 或 `goal_continuation`。三个状态事件都带有 `from`/`to` 转换字段；`session_idle` 在已知时还带有 `last_turn_status`，`session_error` 带有有界的终止性 `error` 文本。busy、idle 和 waiting 对应控制套接字的 `status` 动词已经发布的会话状态（`idle` / `in_progress` / `waiting`），因此 hook 与 supervisor 永远不会对会话正在做什么产生分歧。想要 opencode 那种针对错误告警的宽限期语义的 hook 作者，应当在 hook 内部去抖动——`session_error` 已经排除了被消化的瞬时失败，而一个失败后被操作员重试的回合，只有在重试同样以失败结束时才会再次触发。
 
 ### “observer”到底意味着什么
 
-Observer 意味着 Codewhale 会忽略 hook 的**结果**：stdout 被丢弃，非零退出被记录为警告，回合、工具结果、子代理或错误都不会因它而改变。
+Observer 意味着 Codewhale 会忽略 hook 的**结果**：stdout 被丢弃，非零退出被记录为警告，回合、工具结果、子智能体或错误都不会因它而改变。
 
 Observer 并**不**意味着无副作用。observer hook 是以你的凭据运行的任意 shell 命令。它可以写文件、推送提交、呼叫值班轮换，或删除工作区。它唯一做不到的是改变 Codewhale 自己接下来要做的事。
 
@@ -138,7 +150,7 @@ Observer 并**不**意味着无副作用。observer hook 是以你的凭据运�
 
 ### 会话身份
 
-同一个 TUI 会话中的每个事件携带相同的 `DEEPSEEK_SESSION_ID`。该 id 在启动时铸造一次，形式为 `sess_xxxxxxxx`，并且能挺过工作区切换和添加项目 hooks 的信任决策——两者都会重新加载 hook 集，而不会开始新会话。引擎触发的 `tool_call_before` 与 UI 触发的事件报告相同的 id，因此工具记录可以与周围的会话记录关联。
+同一个 TUI 会话中的每个事件携带相同的 `DEEPSEEK_SESSION_ID`。该 id 在启动时生成一次，形式为 `sess_xxxxxxxx`，并且能挺过工作区切换和添加项目 hooks 的信任决策——两者都会重新加载 hook 集，而不会开始新会话。引擎触发的 `tool_call_before` 与 UI 触发的事件报告相同的 id，因此工具记录可以与周围的会话记录关联。
 
 `session_end` 在排队的启动默认写入被排空后、应用仍然存活时触发，因此它观察到的是落定的结束状态，而不是半拆除的状态。
 
@@ -161,10 +173,51 @@ Observer 并**不**意味着无副作用。observer hook 是以你的凭据运�
 | `DEEPSEEK_TOOL_ARGS` | `tool_call_before`、`shell_env` | 工具输入 JSON 预览，上限 10 000 字节 |
 | `DEEPSEEK_TOOL_RESULT` | `tool_call_after`、`on_error`（工具失败） | 截断至 10 000 字节 |
 | `DEEPSEEK_TOOL_SUCCESS` | `tool_call_after`、`on_error`（工具失败） | `true` / `false` |
-| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` 和 `on_error` **当工具报告了退出码时** | 否则不存在——绝不合成；64 位，因此 `3221225477` 这样的 Windows 崩溃码能完好保留 |
+| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` 和 `on_error` **当工具报告了退出码时** | 否则不存在——绝不合成；命令失败时同样设置；64 位，因此 `3221225477` 这样的 Windows 崩溃码能完好保留 |
+| `DEEPSEEK_TOOL_STATUS` | `tool_call_after` 和 `on_error` **当 shell 工具报告了状态时** | `completed`、`failed`、`timed_out`、`killed` 或 `running`（已转入后台）；其他工具不存在 |
+| `DEEPSEEK_TOOL_EXECUTION_RECEIPT` | `tool_call_after` 和 `on_error` **仅限已结束的本地前台 shell 运行** | 完整 JSON，最多 32 KiB，否则不存在；见下方“执行回执” |
 | `DEEPSEEK_SESSION_COST` | 提供成本时 | USD，六位小数 |
 
-**模式拼写说明。** UI 触发的事件（`session_start`、`session_end`、`message_submit`、`tool_call_after`、`mode_change`、`on_error`、`turn_end`、`subagent_*`）会将 `DEEPSEEK_MODE` 设为 UI 标签——`ACT`、`PLAN`、`OPERATE`。`tool_call_before` 在引擎内部触发，并使用引擎自己的模式拼写（`Agent`、`Plan`、`Operate`）。`mode` 条件不区分大小写比较，因此 `{ type = "mode", mode = "plan" }` 两者都能匹配，但精确字符串匹配 `$DEEPSEEK_MODE` 的 hook 应同时接受两种拼写。
+### 执行回执
+
+`DEEPSEEK_TOOL_EXECUTION_RECEIPT` 说明 shell 工具（`bash`、`Bash`、`exec_shell`）实际运行了什么。before-hook 的输入不等于实际执行的内容：`tool_call_before` hook 可以改写它。回执取自进程管理器在准入与改写之后启动进程时记录的内容。
+
+```json
+{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","state":"completed","scope":"local","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_kind":"separate"}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `command` | 交给 shell 的已准入命令源码，而不是 shell 可执行文件或其 argv 包装 |
+| `cwd` | 进程启动时所在目录的规范绝对路径：解析符号链接，因此无论调用是否传入 `cwd`，同一目录只有一种写法；在启动前解析，并将同一路径交给操作系统 |
+| `state` | 观察到退出（包括非零退出）为 `completed`；信号、kill、取消或超时为 `interrupted` |
+| `scope` | schema 1 中始终为 `local` |
+| `exit_code` | 观察到的整数，或 `null`；绝不根据 `state` 合成 |
+| `stdout`、`stderr` | 工具已保留输出的预览，其中可能已经缺少进程输出的开头；过长的预览保留自身的首尾字节，中间以 `[receipt preview truncated]` 标记 |
+| `stdout_truncated`、`stderr_truncated` | 工具自身的输出捕获或预览丢弃了字节时为 `true` |
+| `output_kind` | `Bash` / `exec_shell` 为 `separate`；小写 `bash` 的 stdout 与 stderr 共用一个管道，为 `combined`——此时 `stdout` 是合并后的预览，`stderr` 为空 |
+
+规则是保守的：
+
+- **要么精确，要么不存在。** `command` 和 `cwd` 绝不截断。任一超过 8 KiB、包含 NUL，或目录是相对路径、非 UTF-8 或在启动前无法解析时，不导出回执。shell 工具无法观察到运行如何结束（操作系统的 wait 调用本身失败）时同样不导出：其状态未知，回执不做猜测。预览会缩短直到序列化后的 JSON 不超过 32 KiB；仍然放不下时不导出回执，而不是截断。
+- **不存在不代表任何结果。** 既不意味着成功，也不意味着失败。应用当前调用的上下文前，会清除继承的 `DEEPSEEK_TOOL_EXECUTION_RECEIPT`。
+- **范围。** 只有配置了 `tool_call_after` 或 `on_error` hook 时才会生成回执，且仅限已结束、基于管道、未沙箱化的本地前台运行。后台启动、转入 `/jobs` 的前台运行、PTY（`tty` / `combined_output`）与交互会话、OS 沙箱与外部后端执行、只读 shell 的加固 argv、Windows、任何平台上的 PowerShell（它会包装源码或通过临时脚本运行），以及执行前就被拒绝的调用都没有回执。
+- **仅供 hook 使用。** 回执不写入持久化的 Runtime API 条目记录；该记录已包含工具输出。
+- 失败的运行与成功的运行同样设置，因此 shell 调用失败时的 `on_error` 也带有它。其他变量均不变。
+
+对于 `tool_call_after`，同一份执行证据还会作为带版本号的 JSON 文档通过 stdin 传递，前台和后台 hook 均会收到：
+
+```json
+{"schema_version":1,"event":"tool_call_after","tool_name":"bash","session_id":"session-id","tool_call_id":"call-id","session_id_truncated":false,"tool_call_id_truncated":false,"tool_name_truncated":false,"execution_receipt":{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","command_truncated":false,"cwd_truncated":false,"execution":"started","completion":"completed","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_mode":"combined"}}
+```
+
+stdin 载荷不会改变上述环境变量中的回执。`completion` 表示观察到的终态：`completed`、`failed`、`killed` 或 `timed_out`；非零退出对应 `failed`。`exit_code` 保持为有符号 64 位整数或 `null`。`output_mode` 沿用现有回执的 `output_kind`，值为 `separate` 或 `combined`。输出合并时，空的 `stderr` 并不表示命令没有向 stderr 写入内容。
+
+完整文档的上限为 64 KiB。关联标识符各自最多保留 1,024 个 UTF-8 字节，另加截断标记，并携带各自的截断标志；缺失的标识符为 `null`。shell 名称保持精确。执行的 `command` 和 `cwd` 仍遵守上述“要么精确，要么不存在”的规则，因此它们的截断标志始终为 `false`。输出截断标志同时反映捕获阶段与预览阶段丢弃的内容。
+
+只有带有有效且已落定回执的原生 shell 调用才会生成这份 stdin 文档。不支持或未观察到结果的路径不会生成文档；缺失仍表示未知。hook 仍然只观察结果：其 stdout 不能允许、拒绝或改写已完成的调用，后台 hook 也不会被等待。`on_error` 继续只接收环境变量中的回执。
+
+**模式拼写说明。** UI 触发的事件（`session_start`、`session_end`、`message_submit`、`tool_call_after`、`mode_change`、`on_error`、`turn_end`、`subagent_*`、`session_busy`、`session_idle`、`session_error`、`waiting_for_user`）会将 `DEEPSEEK_MODE` 设为 UI 标签——`ACT`、`PLAN`、`OPERATE`。`tool_call_before` 在引擎内部触发，并使用引擎自己的模式拼写（`Agent`、`Plan`、`Operate`）。`mode` 条件不区分大小写比较，因此 `{ type = "mode", mode = "plan" }` 两者都能匹配，但精确字符串匹配 `$DEEPSEEK_MODE` 的 hook 应同时接受两种拼写。
 
 **`shell_env` 是受限的那个。** 它只接收 `DEEPSEEK_TOOL_NAME` 和 `DEEPSEEK_TOOL_ARGS`——没有会话 id、工作区、模型或模式。因此，`shell_env` hook 上的 `{ type = "mode", … }` 条件会在加载时被拒绝；请改用 `tool_name` 或 `tool_category` 来限定作用域。
 
@@ -237,14 +290,14 @@ shell 无法承载的条目会被丢弃，而不是放任其破坏工具调用�
 
 **shell 命令最终确切得到什么——本地执行。** 当 `exec_shell` 在本地运行命令（默认情况）时，它不继承 Codewhale 的环境。它的环境按如下方式构建：
 
-1. 一份净化的固定父变量 allowlist——`PATH`、`HOME`、`USER`、`LANG` 和其他 `LC_*`/locale 条目、`TERM`、`SHELL`、`TMPDIR`、Windows 系统与 MSVC 工具链条目——仅此而已。allowlist 之外的变量，包括任何看起来像秘密的内容，都会被丢弃；
+1. 一份净化的固定父变量 allowlist——`PATH`、`HOME`、`USER`、`LANG` 和其他 `LC_*`/locale 条目、`TERM`、`SHELL`、`TMPDIR`、`proxy` 相关变量、`NO_COLOR` 这类颜色/终端条目、`CARGO_HOME`/`RUSTUP_HOME`/`RUSTUP_TOOLCHAIN`、Windows 系统与 MSVC 工具链条目，以及其他平台相关的键（完整列表在 `crates/tui/src/child_env.rs`）——仅此而已。allowlist 之外的变量，包括任何看起来像密钥的内容，都会被丢弃；
 2. 然后，你的 `shell_env` hooks 产生的 `KEY=VALUE` 对叠加应用在上面。这些是你配置的显式值，因此它们胜过 allowlist。
 
-因此，`shell_env` hook 是把凭据送进一次本地 `exec_shell` 调用的受支持方式。启动 Codewhale 的终端中导出的环境秘密**不会**自行转发给本地 `exec_shell`。
+因此，`shell_env` hook 是把凭据送进一次本地 `exec_shell` 调用的受支持方式。启动 Codewhale 的终端中导出的环境变量里的密钥**不会**自行转发给本地 `exec_shell`。
 
 **配置了外部 sandbox 后端时，上面的 allowlist 不是契约。** 如果 `exec_shell` 被路由到已配置的 sandbox/执行后端，Codewhale 根本不会构建进程环境：它把命令和你的 `shell_env` 值作为额外环境变量交给后端，**后端拥有自己的基础环境**。除了你的值之外还存在什么——镜像内置的变量、后端自己的注入、远程 runner 导出的任何内容——由该后端决定，而非由上面的列表决定。不要假定本地 allowlist 在那里适用。
 
-披露说明，因为这对发出凭据的 hook 才是关键部分：**`shell_env` 值会被传输到已配置的后端。** 对远程或容器化后端而言，这意味着这些值会离开本机，并受该后端的日志记录、保留和访问控制约束。Codewhale 自己的审计日志仍然只记录键名，但这并不能说明后端会对这些值做什么。如果 `shell_env` hook 发出秘密，请将其限定在你信任该秘密的后端上——例如给 hook 加条件，或在这些 hooks 生效的会话中不配置外部后端。
+披露说明，因为这对发出凭据的 hook 才是关键部分：**`shell_env` 值会被传输到已配置的后端。** 对远程或容器化后端而言，这意味着这些值会离开本机，并受该后端的日志记录、保留和访问控制约束。Codewhale 自己的审计日志仍然只记录键名，但这并不能说明后端会对这些值做什么。如果 `shell_env` hook 会输出密钥，请将其限定在你信任、可以托付该密钥的后端上——例如给 hook 加条件，或在这些 hooks 生效的会话中不配置外部后端。
 
 解析出的**键名——绝不是值**——会写入 `~/.codewhale/audit.log`，以便事后对会话进行核对。失败或超时的 hook 不贡献任何变量，也不会中止 shell 调用。
 
@@ -258,9 +311,24 @@ condition = { type = "tool_category", category = "shell" }
 
 ## 结构化 observer 载荷
 
-`turn_end`、`subagent_spawn` 和 `subagent_complete` 除了环境变量外，还会在 stdin 上接收 JSON。它们的 stdout 被忽略。这些事件的后台形式会在 stdin 上收到相同的载荷。
+`turn_end`、`subagent_spawn`、`subagent_complete`、`session_busy`、`session_idle`、`session_error` 和 `waiting_for_user` 除了环境变量外，还会在 stdin 上接收 JSON。它们的 stdout 被忽略。这些事件的后台形式会在 stdin 上收到相同的载荷。
 
-其余 observer 事件——`session_start`、`session_end`、`tool_call_after`、`mode_change`、`on_error`——无论前台还是后台形式，都只接收环境变量，没有 stdin 载荷。
+`tool_call_after` 在原生 shell 调用结束且具有已记录的[执行回执](#执行回执)时，也会通过 stdin 接收 JSON，前台和后台形式均如此。其他工具调用没有 stdin 文档。
+
+其余 observer 事件——`session_start`、`session_end`、`mode_change`、`on_error`——无论前台还是后台形式，都只接收环境变量，没有 stdin 载荷。
+
+### 会话状态转换
+
+第一个观察到的状态会被静默记录，无论是 idle、busy 还是 waiting。重复同一状态不会发出任何事件。对于一个中途暂停等待用户输入、然后完成的回合，转换类 hooks 会按提交顺序收到这些载荷：
+
+| 事件 | stdin JSON |
+| --- | --- |
+| `session_busy` | `{"from":"idle","to":"in_progress"}` |
+| `waiting_for_user` | `{"from":"in_progress","to":"waiting","reason":"user_input"}` |
+| `session_busy` | `{"from":"waiting","to":"in_progress"}` |
+| `session_idle` | `{"from":"in_progress","to":"idle","last_turn_status":"completed"}` |
+
+分发器有两个 worker，因此不保证命令的完成顺序。`session_error` 是一个独立的终止性失败事件，带的是 `status` 和 `error` 字段，而不是 `from` 和 `to`。
 
 ### `turn_end`
 
@@ -302,7 +370,7 @@ condition = { type = "tool_category", category = "shell" }
 }
 ```
 
-`created_at` 锚定时间窗口定价。`provider` 和 `model` 标识模型支撑回合的有效路由。`billing_surface` 是对服务该回合的端点的一种可选、非秘密的分类（已识别的 StepFun 路由会发出 `stepfun-payg` 或 `stepfun-plan`）；原始 base URL 永远不会写入 hook 记录。仅 shell、手动压缩和 purge 完成没有对应的 `TurnStarted`，因此它们报告 `model_backed: false`、`null` provider 和合成的 `lifecycle_<uuid>` 回合 id。`stop_hook_active` 目前始终为 `false`；它为防重入保护预留了空间。
+`created_at` 锚定时间窗口定价。`provider` 和 `model` 标识模型支撑回合的有效路由。`billing_surface` 是对服务该回合的端点的一种可选、不含敏感信息的分类（已识别的 StepFun 路由会发出 `stepfun-payg` 或 `stepfun-plan`）；原始 base URL 永远不会写入 hook 记录。仅 shell、手动压缩和 purge 完成没有对应的 `TurnStarted`，因此它们报告 `model_backed: false`、`null` provider 和合成的 `lifecycle_<uuid>` 回合 id。`stop_hook_active` 目前始终为 `false`；它为防重入保护预留了空间。
 
 ### `subagent_spawn` / `subagent_complete`
 
@@ -321,22 +389,22 @@ condition = { type = "tool_category", category = "shell" }
 }
 ```
 
-`subagent_spawn` 改为携带 `prompt_preview` / `prompt_truncated`，且没有 `status`。两个载荷都有意设了界：预览被截断，而不是传送完整提示或结果。这些 hooks 仅观察——失败不会影响子代理调度、提示或结果，`continue_on_error` 没有效果，因为后面匹配的 hooks 总是会运行。
+`subagent_spawn` 改为携带 `prompt_preview` / `prompt_truncated`，且没有 `status`。两个载荷都有意设了界：预览被截断，而不是传送完整提示或结果。这些 hooks 仅观察——失败不会影响子智能体调度、提示或结果，`continue_on_error` 没有效果，因为后面匹配的 hooks 总是会运行。
 
 ## 失败行为
 
 - 非零退出会在 `hooks` tracing 目标下以 `warn` 级别记录日志，包含 hook 名、事件、退出码、时长和一个通用失败类别。原始 stdout/stderr/error 文本不会持久化在日志回执中。
 - 对于 `execute` 路径的事件，`continue_on_error = false` 会停止该事件后续的 hooks；除 `tool_call_before`（见上文）外，它不会回滚触发它们的行为。
-- 结构化 observer 事件（`turn_end`、`subagent_*`）总是继续到下一个匹配的 hook。
+- 结构化 observer 事件（`turn_end`、`subagent_*`、`session_busy`、`session_idle`、`session_error`、`waiting_for_user`）总是继续到下一个匹配的 hook。
 - Observer 事件使用有界的持久分发器。队列已满和分发器不可用的提交不会静默重试；TUI 会保留一条事件专属的错误 toast，与普通状态行分开。
 - 超过超时的 hook，其整个进程组会被杀死，然后被回收，前台或后台皆然——尽力而为，回收等待有界；见[超时](#超时)。
 
 ## 安全说明
 
 - Hooks 是来自你自己配置的任意 shell 命令；请把 `~/.codewhale/config.toml` 当作可执行文件对待。
-- 项目提供的 hooks 需要在用户自有配置中作出明确的工作区信任决策。
+- 项目提供的 hooks，除了工作区信任之外，还需要在用户自有配置中对确切文件作出批准。
 - hook 命令继承 Codewhale 自己的环境。本地 `exec_shell` 不会——见 [`shell_env`](#shell_env)。
 - `shell_env` 审计记录只包含键名。这覆盖 Codewhale 自己的日志记录；配置了外部 sandbox 后端时，值本身会被传输到该后端，之后受其处理方式约束。
 - 使用外部 sandbox 后端时，本地父变量 allowlist 不适用——后端拥有自己的基础环境。
 - 载荷预览、工具参数/结果、错误消息、捕获的 stdout 和 stderr、替换消息和引导对象都有界，因此 hook 输入或输出不可能成为 transcript 的无界副本。
-- Codewhale 在拒绝信息中持久化的任何内容都不会回显 stdin 载荷、hook 环境、原始 stdout/stderr/error、命令行或解析后的文件系统路径。`/hooks list` 显示净化后的单行命令预览，上限 60 字符；它不是逐字副本。结构化拒绝原因有界，并对类似路径、参数、命令和秘密的 token 脱敏，包括带引号或 `key=value` 的形式以及 `Authorization: Bearer …`。
+- Codewhale 在拒绝信息中持久化的任何内容都不会回显 stdin 载荷、hook 环境、原始 stdout/stderr/error、命令行或解析后的文件系统路径。`/hooks list` 显示净化后的单行命令预览，上限 60 字符；它不是逐字副本。结构化拒绝原因有界，并对类似路径、参数、命令和密钥的 token 脱敏，包括带引号或 `key=value` 的形式以及 `Authorization: Bearer …`。

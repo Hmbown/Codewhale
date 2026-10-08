@@ -1,0 +1,18 @@
+# codewhale Configuration
+# Set provider credentials in this file or via environment variables.
+# See /links in the TUI for provider-specific credential pages.
+
+api_key = "sk-legacy-auth-set"
+auth_mode = "api_key"
+
+# Base URL (default: https://api.deepseek.com/beta)
+# Set https://api.deepseek.com to opt out of beta features.
+# base_url = "https://api.deepseek.com/beta"
+
+# Default model
+default_text_model = "deepseek-v4-pro"
+
+# Thinking mode (DeepSeek V4 reasoning effort):
+# "off" | "low" | "medium" | "high" | "max"
+# Shift+Tab in the TUI cycles between off / high / max.
+reasoning_effort = "max"

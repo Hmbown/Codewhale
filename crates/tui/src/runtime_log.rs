@@ -61,21 +61,6 @@ pub struct TuiLogGuard {
     #[cfg(windows)]
     redirected_stderr_handle: Option<windows::Win32::Foundation::HANDLE>,
     _file: File,
-    // Exposed via `log_path()` for diagnostics (e.g. `/doctor`,
-    // `--print-log-path`). Currently no caller — keep the accessor
-    // wired up so adding one later doesn't require revisiting the
-    // guard struct.
-    #[allow(dead_code)]
-    log_path: PathBuf,
-}
-
-impl TuiLogGuard {
-    /// Path the subscriber is writing to.
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn log_path(&self) -> &std::path::Path {
-        &self.log_path
-    }
 }
 
 #[cfg(unix)]
@@ -98,6 +83,7 @@ impl Drop for TuiLogGuard {
 impl Drop for TuiLogGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.saved_stderr_handle.take() {
+            // SAFETY: `handle` is owned here via take; Drop runs once.
             unsafe {
                 let _ = windows::Win32::System::Console::SetStdHandle(
                     windows::Win32::System::Console::STD_ERROR_HANDLE,
@@ -109,6 +95,7 @@ impl Drop for TuiLogGuard {
         // stderr target. This is safe because `SetStdHandle` above already
         // restored the original handle, so nothing references this one.
         if let Some(dup) = self.redirected_stderr_handle.take() {
+            // SAFETY: `dup` is owned here via take; nothing references it.
             unsafe {
                 let _ = windows::Win32::Foundation::CloseHandle(dup);
             }
@@ -136,10 +123,7 @@ pub fn init() -> Result<TuiLogGuard> {
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let log_path = log_dir.join(log_file_name(&date, std::process::id()));
 
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let file = open_log_file(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
 
     // The tracing-subscriber consumes a clone of the file handle for its
@@ -164,11 +148,7 @@ pub fn init() -> Result<TuiLogGuard> {
                     Ok(f) => Box::new(f),
                     Err(e) => {
                         tracing::warn!("Failed to clone log file handle: {e}, reopening");
-                        match std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&log_path_clone)
-                        {
+                        match open_log_file(&log_path_clone) {
                             Ok(f) => Box::new(f),
                             Err(_) => Box::new(std::io::stderr()),
                         }
@@ -204,8 +184,30 @@ pub fn init() -> Result<TuiLogGuard> {
         #[cfg(windows)]
         redirected_stderr_handle,
         _file: file,
-        log_path,
     })
+}
+
+/// Open (creating if needed) the per-process log for append. Logs can hold
+/// prompts and paths, so on Unix the file is owner-only: created 0600, an
+/// existing file is tightened to 0600, and a symlink at the log path is
+/// refused (`O_NOFOLLOW`) instead of followed to wherever it points.
+fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options.open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
 }
 
 pub(crate) fn log_directory() -> Option<PathBuf> {
@@ -327,8 +329,10 @@ fn redirect_stderr_to(
     // Without this, `_file` and stderr would alias the same HANDLE;
     // a rogue `CloseHandle` on stderr would silently invalidate `_file`.
     let raw = HANDLE(file.as_raw_handle());
+    // SAFETY: pseudo-handle; no preconditions.
     let process = unsafe { GetCurrentProcess() };
     let mut dup = HANDLE::default();
+    // SAFETY: `file` and `dup` are live; pseudo-handle needs no close.
     unsafe {
         DuplicateHandle(
             process,
@@ -359,6 +363,52 @@ fn redirect_stderr_to(
 mod tests {
     use super::*;
     use std::fs::FileTimes;
+
+    #[cfg(unix)]
+    #[test]
+    fn log_file_is_owner_only_and_refuses_symlinks() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let tmp = tempfile::TempDir::new().expect("temporary dir");
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        let fresh = tmp.path().join("fresh.log");
+        open_log_file(&fresh)
+            .expect("create")
+            .write_all(b"one\n")
+            .expect("write");
+        assert_eq!(mode(&fresh), 0o600);
+
+        // An existing world-readable log is tightened, and stays appended to.
+        let old = tmp.path().join("old.log");
+        std::fs::write(&old, "before\n").expect("seed");
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        open_log_file(&old)
+            .expect("reopen")
+            .write_all(b"after\n")
+            .expect("write");
+        assert_eq!(mode(&old), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&old).expect("read"),
+            "before\nafter\n"
+        );
+
+        // A symlink planted at the log path is not followed.
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, "keep").expect("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let link = tmp.path().join("link.log");
+        symlink(&target, &link).expect("symlink");
+        assert!(open_log_file(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep");
+        assert_eq!(mode(&target), 0o644);
+    }
 
     #[test]
     fn whitespace_home_override_is_consistent_across_tui_state_entry_points() {

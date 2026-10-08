@@ -1,0 +1,156 @@
+command: /context json
+is_error: false
+message:
+{
+  "entries": [
+    {
+      "source_kind": "constitution",
+      "label": "Bundled constitution, language policy, and output policy",
+      "source_path": "bundled in this codewhale-tui build (BASE_PROMPT, compiled in)",
+      "activation_reason": "always_on",
+      "estimated_tokens": 1803,
+      "counting_confidence": "high",
+      "authority_tier": 1,
+      "truncation_reason": null
+    },
+    {
+      "source_kind": "project_context",
+      "label": "Project instructions",
+      "source_path": null,
+      "activation_reason": "file_present",
+      "estimated_tokens": 160,
+      "counting_confidence": "high",
+      "authority_tier": 5,
+      "truncation_reason": null
+    },
+    {
+      "source_kind": "project_context_pack",
+      "label": "Project context pack",
+      "source_path": "<workspace>",
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 5,
+      "truncation_reason": "disabled; project_map provides this information on demand"
+    },
+    {
+      "source_kind": "skills_block",
+      "label": "Available skills",
+      "source_path": "<skills>",
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 5,
+      "truncation_reason": "no skills discovered"
+    },
+    {
+      "source_kind": "context_management",
+      "label": "ACT runtime mode",
+      "source_path": null,
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 3,
+      "truncation_reason": "mode enforced by runtime policy and the live tool catalog; no prompt doctrine"
+    },
+    {
+      "source_kind": "compaction_relay_template",
+      "label": "Session relay template",
+      "source_path": "bundled in this codewhale-tui build (COMPACT_TEMPLATE, compiled in)",
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 3,
+      "truncation_reason": "loaded only when /relay is requested; automatic compaction owns its successor brief"
+    },
+    {
+      "source_kind": "runtime_policy",
+      "label": "Core execution discipline",
+      "source_path": null,
+      "activation_reason": "always_on",
+      "estimated_tokens": 295,
+      "counting_confidence": "high",
+      "authority_tier": 3,
+      "truncation_reason": null
+    },
+    {
+      "source_kind": "authority_recap",
+      "label": "Authority recap",
+      "source_path": null,
+      "activation_reason": "always_on",
+      "estimated_tokens": 88,
+      "counting_confidence": "high",
+      "authority_tier": 1,
+      "truncation_reason": null
+    },
+    {
+      "source_kind": "environment_block",
+      "label": "Runtime environment",
+      "source_path": "<workspace>",
+      "activation_reason": "always_on",
+      "estimated_tokens": 21,
+      "counting_confidence": "high",
+      "authority_tier": 4,
+      "truncation_reason": null
+    },
+    {
+      "source_kind": "handoff_relay",
+      "label": "Previous session relay",
+      "source_path": "<workspace>/.codewhale/handoff.md",
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 6,
+      "truncation_reason": "no relay artifact found"
+    },
+    {
+      "source_kind": "user_memory",
+      "label": "User memory",
+      "source_path": "<memory>",
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 6,
+      "truncation_reason": "disabled, missing, or empty"
+    },
+    {
+      "source_kind": "session_goal",
+      "label": "Session goal",
+      "source_path": null,
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 6,
+      "truncation_reason": "no active /goal objective"
+    },
+    {
+      "source_kind": "tool_schemas",
+      "label": "Tool schemas",
+      "source_path": null,
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": 3,
+      "truncation_reason": "no tool catalog has been sent yet"
+    },
+    {
+      "source_kind": "conversation_history",
+      "label": "Conversation history",
+      "source_path": null,
+      "activation_reason": "omitted",
+      "estimated_tokens": 0,
+      "counting_confidence": "high",
+      "authority_tier": null,
+      "truncation_reason": "no API messages yet"
+    }
+  ],
+  "total_estimated_tokens": 2367,
+  "active_context_estimated_tokens": 48,
+  "overflow_guard_estimated_tokens": 48,
+  "context_window_tokens": 1000000,
+  "context_window_source": "catalog",
+  "budget_used_percent": 0.0048000000000000004,
+  "generated_at": "<timestamp>",
+  "note": "Diagnostic source map. The headline is the pressure estimate the context meter and auto-compaction gate use; per-source counts are conservative estimates. All counts may differ from provider billing."
+}
+action: <none>

@@ -7,10 +7,10 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_u64, required_str,
 };
-use super::web::extract::{DocumentKind, extract_document};
+use super::web::extract::{DocumentKind, ExtractedDocument, extract_document};
 #[cfg(test)]
-use super::web::fetch::fetch_with_initial_pin;
-use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch};
+use super::web::fetch::fetch_readable_with_initial_pin;
+use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch_readable};
 #[cfg(test)]
 use super::web::guard::DnsPin;
 use super::web::overflow::bound_text as bound_web_text;
@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -60,6 +60,10 @@ struct WebRunSessionState {
     next_turn: u64,
     refs: VecDeque<String>,
     last_access: Instant,
+    /// Hosts that refused to serve a page this session (HTTP 401/403 even
+    /// after the browser-agent fallback). Later search results from them are
+    /// ranked after sources that are likely to load.
+    refusing_hosts: HashSet<String>,
 }
 
 impl Default for WebRunSessionState {
@@ -68,6 +72,7 @@ impl Default for WebRunSessionState {
             next_turn: 0,
             refs: VecDeque::new(),
             last_access: Instant::now(),
+            refusing_hosts: HashSet::new(),
         }
     }
 }
@@ -143,6 +148,20 @@ impl WebRunState {
         let current = session.next_turn;
         session.next_turn = session.next_turn.saturating_add(1);
         current
+    }
+
+    fn note_refusing_host(&mut self, namespace: &str, host: &str) {
+        self.touch_session(namespace);
+        if let Some(session) = self.sessions.get_mut(namespace) {
+            session.refusing_hosts.insert(host.to_string());
+        }
+    }
+
+    fn refusing_hosts(&self, namespace: &str) -> HashSet<String> {
+        self.sessions
+            .get(namespace)
+            .map(|session| session.refusing_hosts.clone())
+            .unwrap_or_default()
     }
 
     fn store_page(&mut self, namespace: &str, ref_id: &str, page: WebPage) {
@@ -346,6 +365,45 @@ struct WebRunOutput {
     screenshot: Option<Vec<ScreenshotResult>>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
+    /// Every page this call tried to open or click, loaded ones first, so the
+    /// model cites what actually loaded and moves past what did not.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    sources: Vec<SourceEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceStatus {
+    Loaded,
+    /// The site answered but would not serve a readable page (403, 404,
+    /// script-only body). Not retryable as-is; use another source.
+    Unavailable,
+    /// Network or server trouble (timeout, 5xx, 429). May load on a later try.
+    Transient,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SourceEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ref_id: Option<String>,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    status: SourceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl SourceEntry {
+    fn loaded(ref_id: &str, page: &WebPage) -> Self {
+        Self {
+            ref_id: Some(ref_id.to_string()),
+            url: page.url.clone(),
+            title: page.title.clone(),
+            status: SourceStatus::Loaded,
+            reason: None,
+        }
+    }
 }
 
 pub struct WebRunTool;
@@ -450,7 +508,9 @@ impl ToolSpec for WebRunTool {
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+        // Read-only HTTP can still disclose local data through a URL or query.
+        // Host allowlisting controls reachability, not approval of this payload.
+        ApprovalRequirement::Required
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -504,12 +564,15 @@ impl ToolSpec for WebRunTool {
                         })?;
                     Some(Recency::Days(days))
                 };
-                let response = execute_search(
+                let mut response = execute_search(
                     SearchQuery::new(query, max_results, requested_recency, domains, None),
                     timeout_ms,
                     context,
                 )
                 .await?;
+                let refusing_hosts =
+                    with_state(|state| state.refusing_hosts(&context.state_namespace));
+                prefer_loading_sources(&mut response.results, &refusing_hosts);
                 let warning = response.receipt.warning();
                 search_counter += 1;
                 let ref_id = format!("{scope}turn{turn}search{search_counter}");
@@ -561,7 +624,7 @@ impl ToolSpec for WebRunTool {
                     .unwrap_or_default();
 
                 let (mut entries, warning) =
-                    run_image_search(&query, max_results, timeout_ms, &domains).await?;
+                    run_image_search(&query, max_results, timeout_ms, &domains, context).await?;
                 entries.retain_mut(|entry| {
                     let canonical_url = entry.url.as_deref().unwrap_or(&entry.image);
                     let Some(citation) = super::web::citations::register(
@@ -608,10 +671,23 @@ impl ToolSpec for WebRunTool {
                 let ref_id = required_str(open, "ref_id")?.to_string();
                 let lineno = optional_u64(open, "lineno", 1)?.max(1) as usize;
 
-                let page = resolve_or_fetch_page(&ref_id, DEFAULT_OPEN_TIMEOUT_MS, context).await?;
+                let page =
+                    match resolve_or_fetch_page(&ref_id, DEFAULT_OPEN_TIMEOUT_MS, context).await {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let target = open_target_url(&context.state_namespace, &ref_id);
+                            output.sources.push(source_failure(
+                                &context.state_namespace,
+                                target.as_deref().unwrap_or(&ref_id),
+                                error,
+                            )?);
+                            continue;
+                        }
+                    };
                 view_counter += 1;
                 let view_ref = format!("{scope}turn{turn}view{view_counter}");
                 store_page(&context.state_namespace, &view_ref, (*page).clone());
+                output.sources.push(SourceEntry::loaded(&view_ref, &page));
 
                 let view = render_view(&view_ref, &page, lineno, response_length);
                 views.push(view);
@@ -639,10 +715,23 @@ impl ToolSpec for WebRunTool {
                 })?;
                 let target = link.url.clone();
                 let fetched =
-                    resolve_or_fetch_page(&target, DEFAULT_OPEN_TIMEOUT_MS, context).await?;
+                    match resolve_or_fetch_page(&target, DEFAULT_OPEN_TIMEOUT_MS, context).await {
+                        Ok(page) => page,
+                        Err(error) => {
+                            output.sources.push(source_failure(
+                                &context.state_namespace,
+                                &target,
+                                error,
+                            )?);
+                            continue;
+                        }
+                    };
                 click_counter += 1;
                 let click_ref = format!("{scope}turn{turn}click{click_counter}");
                 store_page(&context.state_namespace, &click_ref, (*fetched).clone());
+                output
+                    .sources
+                    .push(SourceEntry::loaded(&click_ref, &fetched));
                 let view = render_view(&click_ref, &fetched, 1, response_length);
                 views.push(view);
             }
@@ -683,7 +772,22 @@ impl ToolSpec for WebRunTool {
             }
         }
 
-        if output.performed_no_op() {
+        let failed = output
+            .sources
+            .iter()
+            .filter(|source| source.status != SourceStatus::Loaded)
+            .count();
+        if failed > 0 {
+            output
+                .sources
+                .sort_by_key(|source| source.status != SourceStatus::Loaded);
+            output.warnings.push(format!(
+                "{failed} source(s) did not load. Cite only sources marked loaded; open another \
+                 search result instead of retrying an unavailable URL."
+            ));
+        }
+
+        if output.performed_no_op() && output.sources.is_empty() {
             // #5123-class: an empty success here reads as "nothing found"
             // rather than "you called the tool wrong" (e.g. the natural
             // {"query": …} shape, which matches no op key).
@@ -699,7 +803,80 @@ impl ToolSpec for WebRunTool {
             )));
         }
 
-        bounded_web_run_result(&output, context)
+        let mut result = bounded_web_run_result(&output, context)?;
+        if failed > 0 {
+            // A site refusing a page is an outcome of the browse, not a tool
+            // failure: the call still succeeds, and clients render these
+            // neutrally instead of as errors.
+            let metadata = result.metadata.get_or_insert_with(|| json!({}));
+            metadata["source_failures"] = json!(failed);
+            metadata["source_failure_severity"] = json!("neutral");
+        }
+        Ok(result)
+    }
+}
+
+/// Where an `open` ref would be fetched from, for the failure receipt.
+fn open_target_url(namespace: &str, ref_id: &str) -> Option<String> {
+    if let Some(citation) = super::web::citations::resolve(namespace, ref_id) {
+        return Some(citation.url);
+    }
+    looks_like_url(ref_id).then(|| ref_id.to_string())
+}
+
+/// Turn a failed page fetch into a source receipt, or pass the error through
+/// when it is the caller's mistake or a gate (bad ref, denied host, cancel).
+fn source_failure(namespace: &str, url: &str, error: ToolError) -> Result<SourceEntry, ToolError> {
+    let (status, reason) = match &error {
+        ToolError::Timeout { .. } => (SourceStatus::Transient, error.to_string()),
+        ToolError::ExecutionFailed { message, .. } => {
+            let status = match http_status_of(message) {
+                Some(code) if code == 429 || (500..600).contains(&code) => SourceStatus::Transient,
+                Some(_) => SourceStatus::Unavailable,
+                None if message.contains("timed out") || message.contains("after one retry") => {
+                    SourceStatus::Transient
+                }
+                None => SourceStatus::Unavailable,
+            };
+            (status, message.clone())
+        }
+        _ => return Err(error),
+    };
+    if let Some(code) = http_status_of(&reason)
+        && matches!(code, 401 | 403)
+        && let Some(host) = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    {
+        with_state(|state| state.note_refusing_host(namespace, &host));
+    }
+    Ok(SourceEntry {
+        ref_id: None,
+        url: url.to_string(),
+        title: None,
+        status,
+        reason: Some(reason),
+    })
+}
+
+/// The HTTP status carried by a `document_from_fetched` rejection.
+fn http_status_of(message: &str) -> Option<u16> {
+    let (_, tail) = message.rsplit_once(" failed: HTTP ")?;
+    tail.get(..3)?.parse().ok()
+}
+
+/// Rank results from hosts that already refused this session after the ones
+/// likely to load, keeping each group's order and renumbering `rank`.
+fn prefer_loading_sources(
+    results: &mut [NormalizedSearchResult],
+    refusing_hosts: &HashSet<String>,
+) {
+    if refusing_hosts.is_empty() {
+        return;
+    }
+    results.sort_by_key(|result| refusing_hosts.contains(&result.domain));
+    for (index, result) in results.iter_mut().enumerate() {
+        result.rank = u8::try_from(index + 1).unwrap_or(u8::MAX);
     }
 }
 
@@ -853,13 +1030,13 @@ fn looks_like_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDuckGoImageResponse {
     #[serde(default)]
     results: Vec<DuckDuckGoImageResult>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDuckGoImageResult {
     image: String,
     #[serde(default)]
@@ -918,7 +1095,9 @@ async fn run_image_search(
     max_results: usize,
     timeout_ms: u64,
     domains: &[String],
+    context: &ToolContext,
 ) -> Result<(Vec<ImageResultEntry>, Option<String>), ToolError> {
+    super::web_search::check_policy(context.network_policy.as_ref(), "duckduckgo.com")?;
     let client = crate::tls::reqwest_client_builder()
         .timeout(Duration::from_millis(timeout_ms))
         .user_agent(USER_AGENT)
@@ -942,9 +1121,15 @@ async fn run_image_search(
         })?;
 
     let seed_status = seed_resp.status();
-    let seed_body = seed_resp.text().await.map_err(|e| {
-        ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
-    })?;
+    let seed_body = if super::web::adapter::search_selected(context) {
+        super::web::adapter::read_response_with_limit(seed_resp, context, HARD_MAX_BYTES)
+            .await
+            .map_err(ToolError::from)?
+    } else {
+        seed_resp.text().await.map_err(|e| {
+            ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
+        })?
+    };
 
     if !seed_status.is_success() {
         return Err(ToolError::execution_failed(format!(
@@ -959,6 +1144,7 @@ async fn run_image_search(
 
     // Step 2: query the DuckDuckGo images JSON endpoint.
     let api_url = format!("https://duckduckgo.com/i.js?l=us-en&o=json&q={encoded}&vqd={vqd}&p=1");
+    super::web_search::check_policy(context.network_policy.as_ref(), "duckduckgo.com")?;
     let api_resp = client
         .get(&api_url)
         .header("Accept", "application/json")
@@ -968,10 +1154,15 @@ async fn run_image_search(
         .map_err(|e| ToolError::execution_failed(format!("Image search request failed: {e}")))?;
 
     let api_status = api_resp.status();
-    let api_body = api_resp
-        .text()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Failed to read image response: {e}")))?;
+    let api_body = if super::web::adapter::search_selected(context) {
+        super::web::adapter::read_response(api_resp, context)
+            .await
+            .map_err(ToolError::from)?
+    } else {
+        api_resp.text().await.map_err(|e| {
+            ToolError::execution_failed(format!("Failed to read image response: {e}"))
+        })?
+    };
 
     if !api_status.is_success() {
         return Err(ToolError::execution_failed(format!(
@@ -980,9 +1171,56 @@ async fn run_image_search(
         )));
     }
 
-    let parsed: DuckDuckGoImageResponse = serde_json::from_str(&api_body).map_err(|e| {
+    let mut parsed: DuckDuckGoImageResponse = serde_json::from_str(&api_body).map_err(|e| {
         ToolError::execution_failed(format!("Failed to parse image search JSON: {e}"))
     })?;
+
+    if super::web::adapter::search_selected(context) {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Proposal {
+            kind: String,
+            entries: Vec<DuckDuckGoImageResult>,
+            max_results: usize,
+        }
+        let mut urls = super::web_search::OpaqueUrls::default();
+        let mut captured = parsed.clone();
+        for entry in &mut captured.results {
+            entry.image = urls.capture(&entry.image);
+            if let Some(value) = entry.thumbnail.as_mut() {
+                *value = urls.capture(value);
+            }
+            if let Some(value) = entry.url.as_mut() {
+                *value = urls.capture(value);
+            }
+        }
+        let proposal: Proposal = super::web::adapter::transform(
+            crate::extension_host::StockOperation::WebImages,
+            json!({"max_results":max_results,"parsed":captured}),
+            context,
+            Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(ToolError::from)?;
+        if proposal.kind != "web_images"
+            || proposal.max_results != max_results
+            || proposal.entries.len() > parsed.results.len()
+        {
+            return Err(ToolError::execution_failed(
+                "Web Host returned inconsistent image candidates; no fallback was attempted",
+            ));
+        }
+        parsed.results = proposal.entries;
+        for entry in &mut parsed.results {
+            entry.image = urls.restore(&entry.image).map_err(ToolError::from)?;
+            if let Some(value) = entry.thumbnail.as_mut() {
+                *value = urls.restore(value).map_err(ToolError::from)?;
+            }
+            if let Some(value) = entry.url.as_mut() {
+                *value = urls.restore(value).map_err(ToolError::from)?;
+            }
+        }
+    }
 
     let mut results = parsed
         .results
@@ -1052,23 +1290,39 @@ fn page_from_search(query: &str, results: &[NormalizedSearchResult]) -> WebPage 
     }
 }
 
+fn open_fetch_options(timeout_ms: u64) -> FetchOptions {
+    FetchOptions::new(
+        Duration::from_millis(timeout_ms),
+        HARD_MAX_BYTES,
+        "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
+    )
+}
+
+/// A 401/403 earns one browser-agent retry inside [`fetch_readable`].
 async fn fetch_page(
     url: &str,
     timeout_ms: u64,
     context: &ToolContext,
 ) -> Result<WebPage, ToolError> {
-    let payload = fetch(
+    fetch_page_with(url, &open_fetch_options(timeout_ms), context).await
+}
+
+async fn fetch_page_with(
+    url: &str,
+    options: &FetchOptions,
+    context: &ToolContext,
+) -> Result<WebPage, ToolError> {
+    let readable = fetch_readable(
         url,
-        &FetchOptions::new(
-            Duration::from_millis(timeout_ms),
-            HARD_MAX_BYTES,
-            "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
-        ),
+        options,
         context,
         "web_run",
+        |payload: super::web::fetch::FetchedPayload| {
+            Box::pin(async move { document_from_fetched(&payload, context).await })
+        },
     )
     .await?;
-    page_from_fetched(payload, context).await
+    page_from_document(readable.payload, readable.document, context)
 }
 
 #[cfg(test)]
@@ -1078,38 +1332,49 @@ async fn fetch_page_with_initial_pin(
     context: &ToolContext,
     initial_pin: Option<DnsPin>,
 ) -> Result<WebPage, ToolError> {
-    let payload = fetch_with_initial_pin(
+    let readable = fetch_readable_with_initial_pin(
         url,
-        &FetchOptions::new(
-            Duration::from_millis(timeout_ms),
-            HARD_MAX_BYTES,
-            "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
-        ),
+        &open_fetch_options(timeout_ms),
         context,
         "web_run",
         initial_pin.flatten(),
+        |payload: super::web::fetch::FetchedPayload| {
+            Box::pin(async move { document_from_fetched(&payload, context).await })
+        },
     )
     .await?;
-    page_from_fetched(payload, context).await
+    page_from_document(readable.payload, readable.document, context)
 }
 
-async fn page_from_fetched(
-    payload: super::web::fetch::FetchedPayload,
+/// Reject non-2xx responses, then extract one readable document.
+///
+/// Kept separate from rendering so `fetch_readable` can re-run exactly this
+/// step against a cache-busted second response (#5904).
+async fn document_from_fetched(
+    payload: &super::web::fetch::FetchedPayload,
     context: &ToolContext,
-) -> Result<WebPage, ToolError> {
+) -> super::web::adapter::AdapterResult<ExtractedDocument> {
     if !(200..300).contains(&payload.status) {
-        return Err(ToolError::execution_failed(format!(
+        return Err((ToolError::execution_failed(format!(
             "Web request to {} failed: HTTP {}",
             payload.url, payload.status
-        )));
+        )))
+        .into());
     }
-    let document = extract_document(
+    extract_document(
         &payload.url,
         Some(&payload.content_type),
         &payload.bytes,
-        context.cancel_token.as_ref(),
+        Some(context),
     )
-    .await?;
+    .await
+}
+
+fn page_from_document(
+    payload: super::web::fetch::FetchedPayload,
+    document: ExtractedDocument,
+    context: &ToolContext,
+) -> Result<WebPage, ToolError> {
     let content_type = Some(payload.content_type);
     match document.kind {
         DocumentKind::Html => {
@@ -1211,6 +1476,10 @@ fn bounded_web_run_result(
             "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&artifact.relative_path),
             "artifact_byte_size": artifact.byte_size,
             "artifact_preview": artifact.preview,
+            // The overflow footer points at `retrieve_tool_result`; flag the
+            // evidence so the engine auto-activates that tool next turn (same
+            // contract as the shell-truncation spillover).
+            "evidence_available": true,
         })
     });
 
@@ -1653,6 +1922,12 @@ mod tests {
         assert!(result.content.contains("retrieve_tool_result"));
         assert!(result.content.chars().count() <= inline_char_budget(&context));
         assert_eq!(
+            metadata["evidence_available"],
+            json!(true),
+            "overflow footer points at retrieve_tool_result; the metadata must \
+             flag the evidence so the engine auto-activates that tool:\n{metadata}"
+        );
+        assert_eq!(
             serde_json::from_str::<Value>(&full).unwrap()["warnings"][0],
             output.warnings[0]
         );
@@ -1760,11 +2035,9 @@ mod tests {
         assert_eq!(search["results"][0]["domain"], "docs.example.com");
         assert_eq!(search["receipt"]["backend"], "searxng");
         assert_eq!(search["receipt"]["honored"]["domains"], true);
-        assert!(
-            search["warning"]
-                .as_str()
-                .expect("visible degraded warning")
-                .contains("recency")
+        assert_eq!(
+            search["receipt"]["honored"]["recency"], true,
+            "SearXNG forwards recency as time_range"
         );
     }
 
@@ -1836,7 +2109,7 @@ mod tests {
         };
         let context = ToolContext::new(PathBuf::from("."));
 
-        let error = page_from_fetched(payload, &context)
+        let error = document_from_fetched(&payload, &context)
             .await
             .expect_err("non-2xx pages must not be rendered");
         let message = error.to_string();
@@ -2245,5 +2518,164 @@ mod tests {
             .await
             .expect_err("empty input must fail fast");
         assert!(format!("{err}").contains("performed no operation"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn open_retries_as_browser_once_after_a_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+
+        #[derive(Clone)]
+        struct RefuseBots(Arc<AtomicUsize>);
+        impl Respond for RefuseBots {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let agent = request
+                    .headers
+                    .get("user-agent")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                if agent.contains("codewhale") {
+                    ResponseTemplate::new(403)
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/plain")
+                        .set_body_string("review body")
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .respond_with(RefuseBots(Arc::clone(&calls)))
+            .mount(&server)
+            .await;
+        let host = "refuses-bots.example.test";
+        let url = format!("http://{host}:{}/review", server.address().port());
+        let pin = Some((host.to_string(), "127.0.0.1".parse().unwrap()));
+        let context = ToolContext::new(PathBuf::from(".")).with_state_namespace("refuse-bots");
+
+        let page = fetch_page_with_initial_pin(&url, 5_000, &context, Some(pin))
+            .await
+            .expect("browser-agent fallback loads the page");
+        assert!(page.lines.iter().any(|line| line.contains("review body")));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one fallback request"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_does_not_retry_a_missing_page_as_browser() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+
+        #[derive(Clone)]
+        struct Missing(Arc<AtomicUsize>);
+        impl Respond for Missing {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(404)
+            }
+        }
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .respond_with(Missing(Arc::clone(&calls)))
+            .mount(&server)
+            .await;
+        let host = "missing.example.test";
+        let url = format!("http://{host}:{}/gone", server.address().port());
+        let pin = Some((host.to_string(), "127.0.0.1".parse().unwrap()));
+        let context = ToolContext::new(PathBuf::from(".")).with_state_namespace("missing-page");
+
+        let err = fetch_page_with_initial_pin(&url, 5_000, &context, Some(pin))
+            .await
+            .expect_err("404 stays a failure");
+        assert_eq!(http_status_of(&err.to_string()), Some(404));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn source_failures_are_classified_and_gates_pass_through() {
+        let _lock = lock_web_run_test_state();
+        reset_web_run_state();
+        let namespace = "source-failure-session";
+
+        let refused = source_failure(
+            namespace,
+            "https://reviews.example.com/espresso",
+            ToolError::execution_failed(
+                "Web request to https://reviews.example.com/espresso failed: HTTP 403",
+            ),
+        )
+        .expect("a refusal is a source outcome");
+        assert_eq!(refused.status, SourceStatus::Unavailable);
+        assert!(
+            with_state(|state| state.refusing_hosts(namespace)).contains("reviews.example.com"),
+            "a refusing host is remembered for this session"
+        );
+
+        let flaky = source_failure(
+            namespace,
+            "https://slow.example.com/",
+            ToolError::execution_failed(
+                "Web request to https://slow.example.com/ failed: HTTP 503",
+            ),
+        )
+        .expect("a 5xx is a source outcome");
+        assert_eq!(flaky.status, SourceStatus::Transient);
+        let timeout = source_failure(
+            namespace,
+            "https://slow.example.com/",
+            ToolError::execution_failed("request timed out before retry completed"),
+        )
+        .expect("a timeout is a source outcome");
+        assert_eq!(timeout.status, SourceStatus::Transient);
+
+        let gate = source_failure(
+            namespace,
+            "http://10.0.0.5/",
+            ToolError::permission_denied("IP 10.0.0.5 is a restricted address"),
+        );
+        assert!(
+            gate.is_err(),
+            "gates must never be softened into source outcomes"
+        );
+        let bad_ref = source_failure(
+            namespace,
+            "turn9search9",
+            ToolError::invalid_input("Unknown ref_id 'turn9search9'"),
+        );
+        assert!(bad_ref.is_err(), "caller mistakes stay errors");
+    }
+
+    #[test]
+    fn search_results_prefer_hosts_that_load() {
+        let mut results = vec![
+            NormalizedSearchResult::new(
+                1,
+                "a".into(),
+                "https://blocked.example/a".into(),
+                None,
+                None,
+            ),
+            NormalizedSearchResult::new(2, "b".into(), "https://open.example/b".into(), None, None),
+            NormalizedSearchResult::new(3, "c".into(), "https://open.example/c".into(), None, None),
+        ];
+        let refusing = HashSet::from(["blocked.example".to_string()]);
+        prefer_loading_sources(&mut results, &refusing);
+        let order: Vec<_> = results.iter().map(|r| (r.rank, r.url.as_str())).collect();
+        assert_eq!(
+            order,
+            vec![
+                (1, "https://open.example/b"),
+                (2, "https://open.example/c"),
+                (3, "https://blocked.example/a"),
+            ]
+        );
     }
 }

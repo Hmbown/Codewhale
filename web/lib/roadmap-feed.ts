@@ -1,7 +1,7 @@
 /**
  * roadmap-feed.ts — fetch the live roadmap from GitHub.
  *
- *   "Shipped"    ← last 8 published Releases on Hmbown/CodeWhale
+ *   "Shipped"    ← last 8 published Releases on codewhale-hq/CodeWhale
  *   "Underway"   ← open issues with label `roadmap:underway`
  *   "Considered" ← open issues with label `roadmap:considered`
  *   "Ruled out"  ← issues (open or closed) with label `roadmap:ruled-out`
@@ -12,9 +12,10 @@
  * Categories that come back empty fall through to the page's static items —
  * the maintainer can adopt label-driven roadmap incrementally.
  */
+import { OUTBOUND_TIMEOUT_MS } from "./bounded-body";
 import { truncateChars } from "./truncate";
 
-const REPO = process.env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+const REPO = process.env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
 const KV_KEY = "roadmap:feed";
 const KV_TTL = 60 * 30;
 
@@ -48,7 +49,7 @@ async function gh<T>(url: string, ghToken?: string): Promise<T | null> {
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
-    const r = await fetch(url, { headers });
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS) });
     if (!r.ok) return null;
     return (await r.json()) as T;
   } catch {
@@ -63,7 +64,7 @@ const FALLBACK_SHIPPED: RoadmapItem[] = [
   {
     title: "v0.8.45",
     note: "Moonshot/Kimi provider support, API-key setup guidance, provider-surface sync, and current Windows install/runtime guidance",
-    href: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.45",
+    href: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.45",
   },
 ];
 

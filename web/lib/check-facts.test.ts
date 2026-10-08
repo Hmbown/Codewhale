@@ -23,6 +23,15 @@ interface PublishedReleaseFact {
   url: string;
 }
 
+interface ModelFact {
+  id: string;
+  provider: string | null;
+  contextWindow: number | null;
+  maxOutput: number | null;
+  reasoning: boolean;
+  addedAt: string | null;
+}
+
 interface RepoFacts {
   [key: string]: unknown;
   generatedAt: string;
@@ -32,6 +41,7 @@ interface RepoFacts {
   crates: string[];
   sandboxBackends: string[];
   providers: ProviderFact[];
+  models: ModelFact[];
   defaultModel: string | null;
   nodeEngines: string | null;
   toolCount: number | null;
@@ -48,6 +58,7 @@ function diffFacts(
     "crates",
     "sandboxBackends",
     "providers",
+    "models",
     "defaultModel",
     "nodeEngines",
     "toolCount",
@@ -82,6 +93,16 @@ function freshFacts(overrides: Partial<RepoFacts> = {}): RepoFacts {
       { id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" },
       { id: "anthropic", label: "Anthropic", env: "ANTHROPIC_API_KEY" },
     ],
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        provider: "DeepSeek",
+        contextWindow: 1000000,
+        maxOutput: 128000,
+        reasoning: true,
+        addedAt: "2026-07-01",
+      },
+    ],
     defaultModel: "deepseek-v4-pro",
     nodeEngines: ">=18",
     toolCount: 78,
@@ -90,7 +111,7 @@ function freshFacts(overrides: Partial<RepoFacts> = {}): RepoFacts {
       tag: "v0.8.63",
       version: "0.8.63",
       publishedAt: "2026-06-01T00:00:00Z",
-      url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.63",
+      url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.63",
     },
     ...overrides,
   };
@@ -179,7 +200,7 @@ describe("diffFacts (check-facts parity)", () => {
         tag: "v0.8.64",
         version: "0.8.64",
         publishedAt: "2026-06-02T00:00:00Z",
-        url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.64",
+        url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.64",
       },
     });
     const diffs = diffFacts(committed, fresh);

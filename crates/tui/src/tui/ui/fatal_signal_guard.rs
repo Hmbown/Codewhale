@@ -31,13 +31,16 @@
 
 /// The restore byte string, written in a single `write(2)`.
 ///
-/// Mirrors `emergency_restore_terminal`'s mode teardown, minus raw mode
-/// (termios state lives behind a lock that may be held by the dying thread)
-/// and minus every query (a dead process cannot read replies). Modes left
+/// Mirrors `emergency_restore_terminal`'s mode teardown, minus every query
+/// (a dead process cannot read replies). Raw mode is not in these bytes:
+/// crossterm's termios state sits behind a lock the dying thread may hold, so
+/// the handler restores the job-control guard's lock-free cooked snapshot with
+/// `tcsetattr` instead (U03-02). When that guard is disabled or its snapshot
+/// failed there is no snapshot, and raw mode is left for `stty sane`. Modes left
 /// over that a shell does not self-heal are the ones that poison input:
 /// mouse capture and the kitty keyboard stack get the full reset.
 #[cfg(unix)]
-const FATAL_RESTORE_BYTES: &[u8] = concat!(
+pub(crate) const FATAL_RESTORE_BYTES: &[u8] = concat!(
     "\x1b[?2026l", // close any open DEC 2026 synchronized-update batch
     "\x1b[<1u",    // pop one kitty keyboard-enhancement stack level
     "\x1b[?1007l", // alternate scroll off
@@ -68,12 +71,13 @@ pub(crate) fn install_fatal_signal_guard() {
     #[cfg(unix)]
     {
         // Piped/embedded surfaces must never receive escape bytes.
+        // SAFETY: isatty(2) dereferences no pointers.
         if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
             tracing::debug!("Fatal-signal terminal guard skipped: stdout is not a TTY");
             return;
         }
-        if let Some(home) = crate::config::effective_home_dir() {
-            let dir = home.join(".codewhale").join("crashes");
+        if let Ok(home) = codewhale_config::codewhale_home() {
+            let dir = home.join("crashes");
             // Pre-create so the handler's open(2) cannot fail on ENOENT and
             // so a first crash needs no directory creation mid-signal.
             if std::fs::create_dir_all(&dir).is_ok() {
@@ -90,6 +94,7 @@ pub(crate) fn install_fatal_signal_guard() {
             }
         }
         for signal in [libc::SIGABRT, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+            // SAFETY: ABRT/BUS/ILL/FPE all terminate by default.
             unsafe { install_handler(signal) };
         }
         tracing::debug!("Fatal-signal terminal guard installed (ABRT/BUS/ILL/FPE)");
@@ -106,12 +111,13 @@ pub(crate) fn install_fatal_signal_guard() {
 ///
 /// # Safety
 ///
-/// Only async-signal-safe operations: `write(2)`, `open(2)`, `close(2)`,
-/// `signal(2)`, `raise(2)`, and fixed-buffer arithmetic. No allocation, no
+/// Only async-signal-safe operations: `write(2)`, `tcsetattr(3)`, `open(2)`,
+/// `close(2)`, `signal(2)`, `raise(2)`, and fixed-buffer arithmetic. No allocation, no
 /// locks (the `OnceLock`/`AtomicUsize` reads complete before any thread
 /// exists and are never written again).
 #[cfg(unix)]
 unsafe extern "C" fn fatal_signal_handler(signal: libc::c_int) {
+    // SAFETY: signal-safe syscalls only, per the contract above.
     unsafe {
         // 1. Restore the terminal: stdout first, stderr as fallback.
         let mut written: usize = 0;
@@ -132,6 +138,11 @@ unsafe extern "C" fn fatal_signal_handler(signal: libc::c_int) {
                 FATAL_RESTORE_BYTES.as_ptr() as *const libc::c_void,
                 FATAL_RESTORE_BYTES.len(),
             );
+        }
+        // Leave raw mode from the cooked snapshot taken before it was enabled.
+        // `tcsetattr` is async-signal-safe; TCSANOW never waits on output.
+        if let Some(original) = super::job_control_guard::original_termios() {
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original);
         }
 
         // 2. Append the one-line marker (mtime timestamps it).
@@ -188,6 +199,7 @@ unsafe extern "C" fn fatal_signal_handler(signal: libc::c_int) {
 /// `signal` must be a fatal signal whose default action is to terminate.
 #[cfg(unix)]
 unsafe fn install_handler(signal: libc::c_int) {
+    // SAFETY: `action` is live and zeroed; oldact is null.
     unsafe {
         // Zero the whole struct then set our two fields: the remaining
         // members (empty signal mask; any hidden per-OS plumbing like the
@@ -220,6 +232,18 @@ mod tests {
                 "fatal restore must reset {mode}; got: {bytes:?}"
             );
         }
+    }
+
+    #[test]
+    fn job_control_guard_reuses_the_fatal_restore_bytes() {
+        // #6169: the SIGTSTP/SIGTTIN stop handler must not grow a second byte
+        // table. One teardown string is written on both the death and the
+        // suspend path, so a mode cannot be reverted on one and leaked by the
+        // other.
+        assert_eq!(
+            super::super::job_control_guard::SUSPEND_RESTORE_BYTES,
+            FATAL_RESTORE_BYTES
+        );
     }
 
     #[test]

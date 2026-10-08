@@ -143,7 +143,145 @@ pub fn resolve_manifest_path(root: &Path) -> Option<PathBuf> {
     if toml.is_file() {
         return Some(toml);
     }
-    None
+    let claude = root.join(".claude-plugin").join(PLUGIN_JSON_NAME);
+    claude.is_file().then_some(claude)
+}
+
+/// The bundle root is outside Claude's manifest-only metadata directory.
+pub(crate) fn plugin_root_for_manifest(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if path.file_name()?.to_str()? == PLUGIN_JSON_NAME
+        && parent
+            .file_name()
+            .is_some_and(|name| name == ".claude-plugin")
+    {
+        parent.parent()
+    } else {
+        Some(parent)
+    }
+}
+
+/// Claude's skills/commands/agents/MCP subset uses the existing declarative
+/// adapters. Unsupported components fail validation; no hooks are silently lost.
+pub(crate) fn parse_claude_plugin_json(
+    text: &str,
+    root: &Path,
+    mcp_bytes: Option<&[u8]>,
+) -> Result<PluginManifest, String> {
+    let mut value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("invalid Claude plugin.json: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or("Claude plugin.json must be an object")?;
+    for component in ["hooks/hooks.json", ".lsp.json"] {
+        if root.join(component).exists() {
+            return Err(format!(
+                "Claude component {component} is not supported by this importer; no partial plugin will be installed"
+            ));
+        }
+    }
+
+    // Reuse the compatible, closed metadata/component schema. Claude's
+    // default component directories are additive to explicit paths.
+    for component in ["skills", "commands", "agents"] {
+        if root.join(component).is_dir() {
+            let mut paths = match object.remove(component) {
+                Some(value) => {
+                    let spec = serde_json::from_value::<KimiPathSpec>(value)
+                        .map_err(|error| format!("invalid Claude {component} paths: {error}"))?
+                        .into_plugin_path_spec()?;
+                    spec.path.into_iter().chain(spec.paths).collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
+            if !paths.iter().any(|path| {
+                path.strip_prefix("./")
+                    .unwrap_or(path)
+                    .trim_end_matches('/')
+                    == component
+            }) {
+                paths.push(component.to_string());
+            }
+            object.insert(component.to_string(), serde_json::json!(paths));
+        }
+    }
+    let mut servers = match object.remove("mcpServers") {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => return Err("Claude mcpServers must be an inline server object; custom MCP file paths are not supported".to_string()),
+        None => serde_json::Map::new(),
+    };
+    if let Some(bytes) = mcp_bytes {
+        let mut file: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|error| format!("invalid .mcp.json: {error}"))?;
+        let map = file.as_object_mut().ok_or(".mcp.json must be an object")?;
+        let entries = if let Some(wrapped) = map.remove("mcpServers") {
+            map.remove("$schema");
+            if !map.is_empty() {
+                return Err("unsupported .mcp.json wrapper fields".to_string());
+            }
+            wrapped
+                .as_object()
+                .cloned()
+                .ok_or(".mcp.json mcpServers must be an object")?
+        } else {
+            std::mem::take(map)
+        };
+        for (name, server) in entries {
+            if servers.insert(name.clone(), server).is_some() {
+                return Err(format!(
+                    "MCP server {name} is declared in both plugin.json and .mcp.json"
+                ));
+            }
+        }
+    }
+    for (name, server) in &mut servers {
+        if server.get("type").and_then(serde_json::Value::as_str) == Some("http") {
+            server["type"] = serde_json::json!("streamable-http");
+        }
+        if server.to_string().contains("${CLAUDE_PLUGIN_ROOT}") {
+            return Err(format!(
+                "MCP server {name} uses unsupported CLAUDE_PLUGIN_ROOT expansion; use bundle-relative command paths"
+            ));
+        }
+    }
+    object.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
+    let mut manifest = parse_kimi_plugin_json(&value.to_string(), root)
+        .map_err(|error| error.replace("kimi.plugin.json", "Claude plugin.json"))?;
+    // Official Claude bundles express credential sources as header templates.
+    // Translate only exact environment references into the existing reviewed
+    // credential contract. Never expand credentials while importing a bundle.
+    if let Some(servers) = &mut manifest.mcp_servers {
+        for (name, server) in servers {
+            for (header, value) in std::mem::take(&mut server.headers) {
+                let authorization = header.eq_ignore_ascii_case("authorization");
+                if server
+                    .env_headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case(&header))
+                    || (authorization && server.bearer_token_env_var.is_some())
+                {
+                    return Err(format!(
+                        "MCP server {name} has duplicate credential sources for header {header}"
+                    ));
+                }
+                if authorization
+                    && let Some(source) = value
+                        .strip_prefix("Bearer ")
+                        .and_then(super::manifest::exact_environment_placeholder)
+                {
+                    server.bearer_token_env_var = Some(source.to_string());
+                } else if let Some(source) = super::manifest::exact_environment_placeholder(&value)
+                {
+                    server.env_headers.insert(header, source.to_string());
+                } else {
+                    return Err(format!(
+                        "MCP server {name} header {header} must use an exact environment reference; literal or compound header values are not supported"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(manifest)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -414,6 +552,7 @@ pub fn parse_kimi_plugin_json(text: &str, root: &Path) -> Result<PluginManifest,
             license: kimi.license,
             keywords: kimi.keywords,
             display_name,
+            icon: None,
         },
         skills,
         commands,
@@ -421,6 +560,7 @@ pub fn parse_kimi_plugin_json(text: &str, root: &Path) -> Result<PluginManifest,
         hooks: None,
         lsp: None,
         native: None,
+        providers: BTreeMap::new(),
         mcp_servers: (!mcp_servers.is_empty()).then_some(mcp_servers),
         capabilities: PluginCapabilities {
             network_hosts,
@@ -495,6 +635,8 @@ pub struct CodewhalePluginExtension {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<PluginPathSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commands: Option<PluginPathSpec>,
@@ -506,6 +648,8 @@ pub struct CodewhalePluginExtension {
     pub lsp: Option<PluginPathSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<PluginPathSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, super::providers::PluginProviderDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<PluginCapabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -516,12 +660,14 @@ impl CodewhalePluginExtension {
     #[must_use]
     fn is_empty(&self) -> bool {
         self.display_name.is_none()
+            && self.icon.is_none()
             && self.skills.is_none()
             && self.commands.is_none()
             && self.agents.is_none()
             && self.hooks.is_none()
             && self.lsp.is_none()
             && self.native.is_none()
+            && self.providers.is_empty()
             && self.capabilities.is_none()
             && self.when.is_none()
     }
@@ -714,6 +860,8 @@ fn standard_server_to_config(
         oauth: extension.oauth,
         oauth_resource: extension.oauth_resource,
         reviewed_plugin: None,
+        runtime_added: false,
+        allow_private_network: false,
     })
 }
 
@@ -791,6 +939,7 @@ pub fn standard_to_manifest(
             license: standard.license,
             keywords: standard.keywords,
             display_name: extension.display_name,
+            icon: extension.icon,
         },
         skills,
         commands: extension.commands,
@@ -798,6 +947,7 @@ pub fn standard_to_manifest(
         hooks: extension.hooks,
         lsp: extension.lsp,
         native: extension.native,
+        providers: extension.providers,
         mcp_servers,
         capabilities: extension.capabilities.unwrap_or_default(),
         when: extension.when,
@@ -876,6 +1026,7 @@ pub fn manifest_to_standard(
 
     let extension = CodewhalePluginExtension {
         display_name: display_name.clone(),
+        icon: manifest.plugin.icon.clone(),
         skills: manifest
             .skills
             .clone()
@@ -885,6 +1036,7 @@ pub fn manifest_to_standard(
         hooks: manifest.hooks.clone(),
         lsp: manifest.lsp.clone(),
         native: manifest.native.clone(),
+        providers: manifest.providers.clone(),
         capabilities: (!capabilities_are_default(&manifest.capabilities))
             .then(|| manifest.capabilities.clone()),
         when: manifest.when.clone(),
@@ -1182,16 +1334,14 @@ fn validate_mcp_server_json(id: &str, server: &serde_json::Value) -> Result<(), 
     for key in ["command", "cwd", "url"] {
         optional_string(object, key).map_err(|error| format!("mcp.json server `{id}`: {error}"))?;
     }
-    for key in ["args"] {
-        if let Some(values) = object.get(key) {
-            let values = values.as_array().ok_or_else(|| {
-                format!("mcp.json server `{id}` {key} must be an array of strings")
-            })?;
-            if values.iter().any(|value| !value.is_string()) {
-                return Err(format!(
-                    "mcp.json server `{id}` {key} must be an array of strings"
-                ));
-            }
+    if let Some(values) = object.get("args") {
+        let values = values
+            .as_array()
+            .ok_or_else(|| format!("mcp.json server `{id}` args must be an array of strings"))?;
+        if values.iter().any(|value| !value.is_string()) {
+            return Err(format!(
+                "mcp.json server `{id}` args must be an array of strings"
+            ));
         }
     }
     for key in ["env", "headers"] {

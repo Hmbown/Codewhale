@@ -29,9 +29,9 @@
 //!   escape. Multi-skill repository archives may contain unrelated symlinks
 //!   outside that selected subtree; those entries are ignored and never
 //!   extracted.
-//! * No `+x` is granted on extracted files. The optional `/skill trust <name>`
-//!   command writes a `.trusted` marker; tool-execution gating is a separate
-//!   concern that lives next to the tool registry.
+//! * Archive executable intent is preserved for the owner only; extraction
+//!   never runs files or accepts an archive's trust/installation markers.
+//!   `/skill trust <name>` writes the local `.trusted` receipt separately.
 //! * Claude Code plugin archives that contain multiple skills are rejected with
 //!   an explicit migration message. Codewhale can install individual
 //!   `SKILL.md` bundles, including `.claude/skills/<name>/SKILL.md`, but it
@@ -50,8 +50,34 @@ use thiserror::Error;
 
 use crate::network_policy::{Decision, NetworkPolicy, host_from_url};
 
+/// Connect and total budgets for install and registry-sync HTTP requests.
+fn install_http_timeouts() -> (std::time::Duration, std::time::Duration) {
+    if cfg!(test) {
+        // Short enough that the stalled-server regression test finishes
+        // quickly, long enough that happy-path tests never approach it.
+        (
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(2),
+        )
+    } else {
+        (
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(600),
+        )
+    }
+}
+
 fn reqwest_client() -> reqwest::Client {
+    let (connect_timeout, total_timeout) = install_http_timeouts();
     codewhale_release::platform_http_client_builder()
+        // The shared platform builder sets no timeouts; without a bound, a
+        // connection that opens but stalls (dead proxy, black-holed route)
+        // hangs installs and registry sync forever. Connect is bounded
+        // tightly; the total budget is generous for 5 MiB tarballs on slow
+        // links (registry sync fans out `SYNC_REGISTRY_CONCURRENCY` of
+        // these in parallel).
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
         .build()
         .expect("build platform HTTP client")
 }
@@ -60,11 +86,10 @@ fn reqwest_client() -> reqwest::Client {
 ///
 /// Lives at `~/.codewhale/cache/skills/` so it's separate from user-installed
 /// skills and can be blown away without losing anything irreplaceable.
-pub fn default_cache_skills_dir() -> PathBuf {
-    crate::config::effective_home_dir().map_or_else(
-        || PathBuf::from("/tmp/codewhale/cache/skills"),
-        |p| p.join(".codewhale").join("cache").join("skills"),
-    )
+/// A missing home has no cache destination; callers must refuse the sync.
+pub fn default_cache_skills_dir() -> Option<PathBuf> {
+    crate::config::effective_home_dir()
+        .map(|home| home.join(".codewhale").join("cache").join("skills"))
 }
 
 /// Default registry. Falls back to a community-curated `index.json` hosted on
@@ -76,6 +101,8 @@ pub const DEFAULT_REGISTRY_URL: &str =
 /// gzip bomb can't blow up RAM.
 pub const DEFAULT_MAX_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const SYNC_REGISTRY_CONCURRENCY: usize = 8;
+/// Upper bound on a registry index document.
+const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
 
 /// File written under each installed skill so [`update`] / [`uninstall`] can
 /// recover the original [`InstallSource`] without re-parsing user input.
@@ -85,6 +112,21 @@ pub const INSTALLED_FROM_MARKER: &str = ".installed-from";
 /// never auto-runs anything) — the runtime tool-invocation gate consults this
 /// marker before executing scripts that ship with the skill.
 pub const TRUSTED_MARKER: &str = ".trusted";
+const RESERVED_ROOT_METADATA: [&str; 3] = [
+    INSTALLED_FROM_MARKER,
+    TRUSTED_MARKER,
+    ".system-installed-version",
+];
+
+/// Installer-owned root metadata must never arrive from a remote package.
+/// Descendants of a reserved root directory are excluded too.
+pub(super) fn is_reserved_root_metadata(relative: &Path) -> bool {
+    let first = relative
+        .components()
+        .find(|component| !matches!(component, Component::CurDir));
+    matches!(first, Some(Component::Normal(name)) if name.to_str().is_some_and(|name|
+        RESERVED_ROOT_METADATA.iter().any(|reserved| name.eq_ignore_ascii_case(reserved))))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Source parsing
@@ -200,7 +242,7 @@ pub struct InstalledSkill {
     /// SHA-256 over the downloaded tarball bytes. Used by [`update`] to detect
     /// upstream changes without re-extracting; also surfaced for telemetry /
     /// future signature-verification work.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub source_checksum: String,
 }
 
@@ -229,8 +271,6 @@ pub enum InstallError {
     OversizedTarball { limit: u64 },
     #[error("missing SKILL.md in archive")]
     MissingSkillMd,
-    #[error("SKILL.md frontmatter missing required field: {0}")]
-    MissingFrontmatterField(&'static str),
     #[error("symlinks are not allowed in skill tarballs")]
     SymlinkRejected,
     #[error(
@@ -270,7 +310,8 @@ pub enum InstallError {
 /// [`DEFAULT_REGISTRY_URL`]. Public for downstream consumers (tests, runtime
 /// API) even though the slash-command path always goes through
 /// [`install_with_registry`] so the user's configured registry wins.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
+#[cfg_attr(test, allow(dead_code))]
 pub async fn install(
     source: InstallSource,
     skills_dir: &Path,
@@ -326,10 +367,10 @@ pub async fn install_with_registry(
     // finalize can restore the previous install.
     let final_path = skills_dir.join(&staged.skill_name);
     let mut backup_path: Option<PathBuf> = None;
-    if final_path.exists() {
+    if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
         if !update {
             // Clean up the staging dir before returning the error.
-            let _ = fs::remove_dir_all(&staged.staged_path);
+            let _ = tokio::fs::remove_dir_all(&staged.staged_path).await;
             return Err(InstallError::AlreadyInstalled(staged.skill_name).into());
         }
         // Same ownership gate as plugins/install/place.rs: an update may only
@@ -337,31 +378,35 @@ pub async fn install_with_registry(
         // is not proof of ownership — without the marker we would delete a
         // user-authored or system skill that happened to share the name.
         if let Err(err) = reject_unmarked_update(&final_path, &staged.skill_name) {
-            let _ = fs::remove_dir_all(&staged.staged_path);
+            let _ = tokio::fs::remove_dir_all(&staged.staged_path).await;
             return Err(err.into());
         }
         let backup = skills_dir.join(format!("{}.bak", staged.skill_name));
-        if backup.exists() {
-            fs::remove_dir_all(&backup).ok();
+        if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
+            tokio::fs::remove_dir_all(&backup).await.ok();
         }
-        fs::rename(&final_path, &backup).with_context(|| {
-            format!(
-                "failed to backup existing skill at {}",
-                final_path.display()
-            )
-        })?;
-        if let Err(err) = fs::rename(&staged.staged_path, &final_path) {
-            fs::rename(&backup, &final_path).ok();
+        tokio::fs::rename(&final_path, &backup)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to backup existing skill at {}",
+                    final_path.display()
+                )
+            })?;
+        if let Err(err) = tokio::fs::rename(&staged.staged_path, &final_path).await {
+            tokio::fs::rename(&backup, &final_path).await.ok();
             return Err(err).context("failed to install staged skill");
         }
         backup_path = Some(backup);
     } else {
         if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("failed to create skills directory {}", parent.display())
             })?;
         }
-        fs::rename(&staged.staged_path, &final_path).context("failed to install staged skill")?;
+        tokio::fs::rename(&staged.staged_path, &final_path)
+            .await
+            .context("failed to install staged skill")?;
     }
 
     // Write the marker last so a partial install never leaves a stale
@@ -370,9 +415,9 @@ pub async fn install_with_registry(
     let content_digest = match super::package_digest::compute_package_digest(&final_path) {
         Ok(digest) => digest,
         Err(err) => {
-            let _ = fs::remove_dir_all(&final_path);
+            let _ = tokio::fs::remove_dir_all(&final_path).await;
             if let Some(backup) = backup_path.take() {
-                let _ = fs::rename(&backup, &final_path);
+                let _ = tokio::fs::rename(&backup, &final_path).await;
             }
             return Err(anyhow::anyhow!(
                 "installed package failed content digest validation: {err}"
@@ -387,14 +432,14 @@ pub async fn install_with_registry(
         &content_digest,
         &staged.skill_name,
     ) {
-        let _ = fs::remove_dir_all(&final_path);
+        let _ = tokio::fs::remove_dir_all(&final_path).await;
         if let Some(backup) = backup_path.take() {
-            let _ = fs::rename(&backup, &final_path);
+            let _ = tokio::fs::rename(&backup, &final_path).await;
         }
         return Err(err);
     }
     if let Some(backup) = backup_path {
-        fs::remove_dir_all(&backup).ok();
+        tokio::fs::remove_dir_all(&backup).await.ok();
     }
 
     Ok(InstallOutcome::Installed(InstalledSkill {
@@ -412,7 +457,8 @@ pub async fn install_with_registry(
 /// `/skill update bar` without the user re-typing the spec.
 ///
 /// Convenience wrapper over [`update_with_registry`].
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
+#[cfg_attr(test, allow(dead_code))]
 pub async fn update(
     name: &str,
     skills_dir: &Path,
@@ -431,14 +477,15 @@ pub async fn update_with_registry(
     registry_url: &str,
 ) -> Result<UpdateResult> {
     let target = skill_target_path(name, skills_dir)?;
-    if target.exists() {
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
         ensure_target_within_skills_dir(&target, skills_dir)?;
     }
     let marker_path = target.join(INSTALLED_FROM_MARKER);
-    if !marker_path.exists() {
+    if !tokio::fs::try_exists(&marker_path).await.unwrap_or(false) {
         return Err(InstallError::NotInstalledHere(name.to_string()).into());
     }
-    let marker_body = fs::read_to_string(&marker_path)
+    let marker_body = tokio::fs::read_to_string(&marker_path)
+        .await
         .with_context(|| format!("failed to read {}", marker_path.display()))?;
     let marker: InstalledFromMarker = serde_json::from_str(&marker_body)
         .with_context(|| format!("malformed {INSTALLED_FROM_MARKER} for {name}"))?;
@@ -472,19 +519,10 @@ pub async fn update_with_registry(
 
     // Bytes changed — fall back to the regular install path with `update = true`
     // so we get the same atomic-replace semantics. Content updates must not
-    // inherit a previous trust marker.
-    let trust_path = target.join(TRUSTED_MARKER);
-    let had_trust = trust_path.exists();
+    // inherit a previous trust marker. The shared extractor excludes archive
+    // markers on every install, including an update of an untrusted package.
     let outcome =
         install_with_registry(source, skills_dir, max_size, network, true, registry_url).await?;
-    match &outcome {
-        InstallOutcome::Installed(installed) => {
-            if had_trust {
-                let _ = fs::remove_file(installed.path.join(TRUSTED_MARKER));
-            }
-        }
-        InstallOutcome::NeedsApproval(_) | InstallOutcome::NetworkDenied(_) => {}
-    }
     match outcome {
         InstallOutcome::Installed(installed) => Ok(UpdateResult::Updated(installed)),
         InstallOutcome::NeedsApproval(host) => Ok(UpdateResult::NeedsApproval(host)),
@@ -547,17 +585,17 @@ pub async fn fetch_registry(
         Decision::Deny => return Ok(RegistryFetchResult::Denied(host)),
         Decision::Prompt => return Ok(RegistryFetchResult::NeedsApproval(host)),
     }
-    let body = reqwest_client()
+    let response = reqwest_client()
         .get(registry_url)
         .send()
         .await
         .with_context(|| format!("failed to fetch registry {registry_url}"))?
         .error_for_status()
-        .with_context(|| format!("registry {registry_url} returned an error status"))?
-        .text()
+        .with_context(|| format!("registry {registry_url} returned an error status"))?;
+    let body = crate::utils::read_response_body_capped(response, MAX_REGISTRY_BYTES)
         .await
         .with_context(|| format!("failed to read registry body from {registry_url}"))?;
-    let parsed: RegistryDocument = serde_json::from_str(&body)
+    let parsed: RegistryDocument = serde_json::from_slice(&body)
         .with_context(|| format!("failed to parse registry json from {registry_url}"))?;
     Ok(RegistryFetchResult::Loaded(parsed))
 }
@@ -649,6 +687,14 @@ async fn sync_one_skill(
     cache_dir: &Path,
     max_size: u64,
 ) -> SkillSyncOutcome {
+    // The registry key names the cache directory joined below; it gets the
+    // same single-segment check as an installed skill name.
+    if let Err(err) = validate_skill_name_segment(name) {
+        return SkillSyncOutcome::Failed {
+            name: name.to_string(),
+            reason: format!("{err:#}"),
+        };
+    }
     // Resolve the source to a concrete URL list.
     let source = match InstallSource::parse(&entry.source) {
         Ok(s) => s,
@@ -706,14 +752,10 @@ async fn sync_one_skill(
         // Perform a HEAD request (or conditional GET) for freshness. We use a
         // simple GET with If-None-Match when we have an ETag, falling back to
         // an unconditional GET for servers that don't support ETags.
-        let existing_meta: Option<CacheMeta> = meta_path
-            .exists()
-            .then(|| {
-                fs::read_to_string(&meta_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-            })
-            .flatten();
+        let existing_meta: Option<CacheMeta> = tokio::fs::read_to_string(&meta_path)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
 
         // Build the request — add If-None-Match if we have a cached ETag.
         let client = reqwest_client();
@@ -761,24 +803,18 @@ async fn sync_one_skill(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let compressed_cap = max_size.saturating_mul(4);
-        let bytes = match resp.bytes().await {
+        let compressed_cap = compressed_download_cap(max_size);
+        let bytes = match crate::utils::read_response_body_capped(resp, compressed_cap).await {
             Ok(b) => b,
             Err(err) => {
                 return SkillSyncOutcome::Failed {
                     name: name.to_string(),
-                    reason: format!("failed to read body from {url}: {err:#}"),
+                    reason: format!(
+                        "failed to read body from {url} (compressed size cap {compressed_cap} bytes): {err:#}"
+                    ),
                 };
             }
         };
-        if bytes.len() as u64 > compressed_cap {
-            return SkillSyncOutcome::Failed {
-                name: name.to_string(),
-                reason: format!(
-                    "download from {url} exceeds compressed size cap ({compressed_cap} bytes)"
-                ),
-            };
-        }
 
         // Compute SHA-256 of the downloaded bytes.
         let sha256 = sha256_hex(&bytes);
@@ -813,11 +849,11 @@ async fn sync_one_skill(
             };
             // Move staged dir into its final location, replacing any prior cache.
             let dest = cache_dir.join(name);
-            if dest.exists() {
-                let _ = fs::remove_dir_all(&dest);
+            if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+                let _ = tokio::fs::remove_dir_all(&dest).await;
             }
-            if let Err(err) = fs::rename(&staged.staged_path, &dest) {
-                let _ = fs::remove_dir_all(&staged.staged_path);
+            if let Err(err) = tokio::fs::rename(&staged.staged_path, &dest).await {
+                let _ = tokio::fs::remove_dir_all(&staged.staged_path).await;
                 return SkillSyncOutcome::Failed {
                     name: name.to_string(),
                     reason: format!("failed to move staged skill into cache: {err:#}"),
@@ -826,14 +862,14 @@ async fn sync_one_skill(
             dest
         } else {
             // Plain SKILL.md (or other companion text file). Write directly.
-            if let Err(err) = fs::create_dir_all(&skill_cache_dir) {
+            if let Err(err) = tokio::fs::create_dir_all(&skill_cache_dir).await {
                 return SkillSyncOutcome::Failed {
                     name: name.to_string(),
                     reason: format!("failed to create cache dir: {err:#}"),
                 };
             }
             let skill_md_path = skill_cache_dir.join("SKILL.md");
-            if let Err(err) = fs::write(&skill_md_path, &bytes) {
+            if let Err(err) = tokio::fs::write(&skill_md_path, &bytes).await {
                 return SkillSyncOutcome::Failed {
                     name: name.to_string(),
                     reason: format!("failed to write SKILL.md to cache: {err:#}"),
@@ -849,7 +885,7 @@ async fn sync_one_skill(
             url: url.clone(),
         };
         let meta_json = serde_json::to_string(&meta).unwrap_or_default();
-        let _ = fs::write(final_path.join(".cache-meta.json"), meta_json);
+        let _ = tokio::fs::write(final_path.join(".cache-meta.json"), meta_json).await;
 
         return SkillSyncOutcome::Downloaded {
             name: name.to_string(),
@@ -880,10 +916,10 @@ pub(crate) struct InstalledFromMarker {
     #[serde(default)]
     source_checksum: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     schema_version: Option<u32>,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     content_digest: Option<String>,
 }
 
@@ -1155,17 +1191,19 @@ async fn download_with_cap(url: &str, max_size: u64) -> Result<DownloadAttempt> 
         }
         bail!("download {url} returned {status}");
     }
-    // Soft cap on the *compressed* download — well above max_size to allow
-    // for highly compressible payloads but still bounded.
-    let compressed_cap = max_size.saturating_mul(4);
-    let bytes = resp
-        .bytes()
+    let compressed_cap = compressed_download_cap(max_size);
+    let bytes = crate::utils::read_response_body_capped(resp, compressed_cap)
         .await
-        .with_context(|| format!("failed to read body of {url}"))?;
-    if (bytes.len() as u64) > compressed_cap {
-        bail!("download {url} exceeds compressed size cap of {compressed_cap} bytes");
-    }
-    Ok(DownloadAttempt::Bytes(bytes.to_vec()))
+        .with_context(|| {
+            format!("failed to read body of {url} (compressed size cap {compressed_cap} bytes)")
+        })?;
+    Ok(DownloadAttempt::Bytes(bytes))
+}
+
+/// Soft cap on the *compressed* download — well above `max_size` to allow for
+/// highly compressible payloads but still bounded.
+fn compressed_download_cap(max_size: u64) -> usize {
+    usize::try_from(max_size.saturating_mul(4)).unwrap_or(usize::MAX)
 }
 
 struct StagedSkill {
@@ -1335,9 +1373,8 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
         }
     }
 
-    // Parse frontmatter to extract the skill name. We reuse the same parser
-    // shape as `SkillRegistry::parse_skill` but inline it here so we don't
-    // depend on the discovery module's private function.
+    // Install and discovery share the same frontmatter reader; install adds
+    // the required description and path-safe destination-name checks.
     let name = parse_frontmatter_name(&skill_md_bytes)?;
 
     Ok(TarballScan {
@@ -1460,6 +1497,9 @@ fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) ->
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(InstallError::SymlinkRejected.into());
         }
+        if is_reserved_root_metadata(stripped_path) {
+            continue;
+        }
 
         let target = dest.join(stripped_path);
         // Final paranoia check: ensure the resolved target stays under dest.
@@ -1491,13 +1531,36 @@ fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) ->
             if total_size > max_size {
                 return Err(InstallError::OversizedTarball { limit: max_size }.into());
             }
-            let mut out = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut out = options
                 .open(&target)
                 .with_context(|| format!("failed to create {}", target.display()))?;
             out.write_all(&buf)
                 .with_context(|| format!("failed to write {}", target.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let executable = header.mode().context("invalid archive file mode")? & 0o111 != 0;
+                let mode = if executable { 0o700 } else { 0o600 };
+                out.set_permissions(fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("failed to set mode for {}", target.display()))?;
+            }
+        }
+    }
+    // Let the host filesystem resolve any platform-specific aliases (for
+    // example a trailing dot on Windows) before this staged tree is published.
+    // Remote content can never supply the local install or trust receipt.
+    for marker in RESERVED_ROOT_METADATA {
+        match fs::remove_file(dest.join(marker)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to discard archive metadata"),
         }
     }
     Ok(())
@@ -1542,14 +1605,7 @@ fn skill_target_path(name: &str, skills_dir: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn validate_skill_name_segment(name: &str) -> Result<&str> {
-    if name.is_empty() || name.trim() != name || name.chars().any(char::is_whitespace) {
-        bail!("skill name must be a single path-safe segment (got '{name}')");
-    }
-    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
-        bail!("skill name must be a single path-safe segment (got '{name}')");
-    }
-    let mut components = Path::new(name).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+    if !super::frontmatter::is_path_safe_skill_name(name) {
         bail!("skill name must be a single path-safe segment (got '{name}')");
     }
     Ok(name)
@@ -1589,41 +1645,15 @@ fn strip_prefix<'a>(path: &'a str, prefix: &str) -> std::borrow::Cow<'a, str> {
 /// Also verifies the leading `---` fence so we reject malformed files early.
 fn parse_frontmatter_name(bytes: &[u8]) -> Result<String> {
     let content = std::str::from_utf8(bytes).context("SKILL.md is not valid UTF-8")?;
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        bail!("SKILL.md is missing the leading '---' frontmatter fence");
-    }
-    let after_open = &trimmed[3..];
-    let close = after_open.find("---").ok_or_else(|| {
-        anyhow::anyhow!("SKILL.md is missing the closing '---' frontmatter fence")
-    })?;
-    let frontmatter = &after_open[..close];
-
-    let mut name: Option<String> = None;
-    let mut has_description = false;
-    for raw in frontmatter.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().to_ascii_lowercase();
-            let value = value.trim().to_string();
-            match key.as_str() {
-                "name" if !value.is_empty() => name = Some(value),
-                "description" if !value.is_empty() => has_description = true,
-                _ => {}
-            }
-        }
-    }
-
-    let name = name.ok_or(InstallError::MissingFrontmatterField("name"))?;
-    if !has_description {
-        return Err(InstallError::MissingFrontmatterField("description").into());
-    }
-    if validate_skill_name_segment(&name).is_err() {
-        bail!("SKILL.md `name` must be a single path-safe segment (got '{name}')");
-    }
+    let parsed = super::frontmatter::parse_frontmatter(content).map_err(anyhow::Error::msg)?;
+    super::frontmatter::validate_skill_frontmatter(
+        parsed.as_ref().map(|(metadata, _)| metadata),
+        None,
+        super::frontmatter::SkillValidationMode::Strict,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let (metadata, _) = parsed.expect("strict validation requires frontmatter");
+    let name = metadata["name"].clone();
     Ok(name)
 }
 
@@ -1664,6 +1694,220 @@ fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn skill_tarball(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, body, mode) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(*mode);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *body).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn remote_stage_discards_forged_root_receipts_and_keeps_hidden_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join(".codewhale/skills");
+        let body = b"---\nname: demo\ndescription: test\n---\nbody";
+        let baseline = tmp.path().join("baseline");
+        fs::create_dir_all(baseline.join("nested")).unwrap();
+        fs::write(baseline.join("SKILL.md"), body).unwrap();
+        fs::write(baseline.join(".hidden"), b"payload").unwrap();
+        fs::write(baseline.join("nested/.trusted"), b"nested payload").unwrap();
+        let digest = super::super::package_digest::compute_package_digest(&baseline).unwrap();
+        let forged = serde_json::json!({"schema_version": 2, "content_digest": digest}).to_string();
+        let bytes = skill_tarball(&[
+            ("repo-main/SKILL.md", body, 0o644),
+            ("repo-main/.trusted", forged.as_bytes(), 0o644),
+            ("repo-main/.TRUSTED", forged.as_bytes(), 0o644),
+            ("repo-main/./.installed-from", b"forged provenance", 0o644),
+            ("repo-main/.system-installed-version", b"999", 0o644),
+            ("repo-main/.hidden", b"payload", 0o644),
+            ("repo-main/nested/.trusted", b"nested payload", 0o644),
+        ]);
+        let staged = stage_tarball(&bytes, &skills, DEFAULT_MAX_SIZE_BYTES).unwrap();
+        for marker in RESERVED_ROOT_METADATA {
+            assert!(!staged.staged_path.join(marker).exists(), "{marker}");
+        }
+        assert!(!staged.staged_path.join(".TRUSTED").exists());
+        assert_eq!(
+            fs::read(staged.staged_path.join(".hidden")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            super::super::package_digest::compute_package_digest(&staged.staged_path).unwrap(),
+            digest
+        );
+        fs::rename(&staged.staged_path, skills.join("demo")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_skill_stage_preserves_only_owner_executable_intent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bytes = skill_tarball(&[
+            (
+                "repo/SKILL.md",
+                b"---\nname: demo\ndescription: test\n---\nbody",
+                0o644,
+            ),
+            ("repo/scripts/run.sh", b"#!/bin/sh\nexit 0\n", 0o6755),
+            ("repo/scripts/group-only.sh", b"#!/bin/sh\nexit 0\n", 0o010),
+            ("repo/data.txt", b"data", 0o666),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = stage_tarball(&bytes, tmp.path(), DEFAULT_MAX_SIZE_BYTES).unwrap();
+        for (path, expected) in [
+            ("scripts/run.sh", 0o700),
+            ("scripts/group-only.sh", 0o700),
+            ("data.txt", 0o600),
+        ] {
+            assert_eq!(
+                fs::metadata(staged.staged_path.join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_sync_refuses_a_key_that_is_not_a_single_segment() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cache_dir = root.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        let entry = RegistryEntry {
+            source: "https://example.invalid/skill.tar.gz".to_string(),
+            description: None,
+            keywords: Vec::new(),
+            domains: Vec::new(),
+        };
+        for name in ["../escape", "..", "a/b", "/abs"] {
+            let outcome =
+                sync_one_skill(name, &entry, &NetworkPolicy::default(), &cache_dir, 1024).await;
+            assert!(
+                matches!(outcome, SkillSyncOutcome::Failed { ref reason, .. }
+                    if reason.contains("single path-safe segment")),
+                "{name}: {outcome:?}"
+            );
+        }
+        assert!(!root.path().join("escape").exists());
+    }
+
+    /// Serve one response per connection: an endless chunked body, or a
+    /// small body that declares an oversized `Content-Length`.
+    async fn oversized_body_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = socket.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if request.starts_with(b"GET /declared ") {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\nxx")
+                            .await;
+                        return;
+                    }
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await;
+                    let chunk = [b'x'; 4096];
+                    // Never terminates: only a streaming cap ends this read.
+                    loop {
+                        if socket.write_all(b"1000\r\n").await.is_err()
+                            || socket.write_all(&chunk).await.is_err()
+                            || socket.write_all(b"\r\n").await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn download_with_cap_stops_reading_at_the_cap() {
+        let addr = oversized_body_server().await;
+        for path in ["endless", "declared"] {
+            let url = format!("http://{addr}/{path}");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                download_with_cap(&url, 16 * 1024),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{path}: the size cap must end the read"));
+            let err = match result {
+                Ok(_) => panic!("{path}: an oversized body must be refused"),
+                Err(err) => format!("{err:#}"),
+            };
+            assert!(err.contains("exceeds"), "{path}: {err}");
+        }
+    }
+
+    /// A server that accepts the connection and then never reads or writes
+    /// another byte, so the request can only end through the client's own
+    /// timeouts.
+    async fn stalled_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Hold every accepted socket open without responding.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn stalled_registry_fetch_fails_through_the_client_timeouts() {
+        let addr = stalled_server().await;
+        let url = format!("http://{addr}/index.json");
+        let policy = NetworkPolicy {
+            default: Decision::Allow.into(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        // Without the install client's own timeouts this call never returns;
+        // the outer bound only converts that hang into a test failure.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fetch_registry(&policy, &url),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("install HTTP must honor its own timeouts"));
+        let err = match outcome {
+            Ok(_) => panic!("a stalled registry connection must fail, not succeed"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("timed out"), "{err}");
+    }
 
     #[test]
     fn parse_github_source() {
@@ -1766,6 +2010,17 @@ mod tests {
     fn parse_frontmatter_extracts_name() {
         let body = b"---\nname: hello\ndescription: greeter\n---\nbody\n";
         assert_eq!(parse_frontmatter_name(body).unwrap(), "hello");
+    }
+
+    #[test]
+    fn installer_uses_shared_frontmatter_without_weakening_name_checks() {
+        let body = "\u{feff}---\r\nname: 'hello'\r\ndescription: Deploy --- safely\r\n  with details: here\r\n---\r\nbody";
+        assert_eq!(parse_frontmatter_name(body.as_bytes()).unwrap(), "hello");
+        assert!(parse_frontmatter_name(body.replace("'hello'", "'../escape'").as_bytes()).is_err());
+        assert!(parse_frontmatter_name(b"---\nname: hello\ndescription: ''\n---\n").is_err());
+        assert!(
+            parse_frontmatter_name(b"---\nname: hello\ndescription: missing --- fence").is_err()
+        );
     }
 
     #[test]

@@ -1,0 +1,4 @@
+command: /context
+is_error: false
+message: <none>
+action: OpenContextInspector

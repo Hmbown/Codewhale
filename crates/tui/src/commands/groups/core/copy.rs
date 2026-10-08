@@ -1,8 +1,8 @@
 //! `/copy` command — copy the last completed assistant response.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 
@@ -38,7 +38,7 @@ fn execute_copy(app: &mut App) -> CommandResult {
     // Any native-host attempt may fall through to the asynchronous terminal
     // transport. Preserve /export's durable recovery contract before the
     // write so every optimistic receipt names (or explicitly lacks) a backup.
-    let recovery = crate::commands::groups::session::write_last_copy(&content);
+    let recovery = crate::commands::session_export_host::write_last_copy(&content);
     match app.clipboard.write_text(&content) {
         Ok(()) if terminal_client => match recovery {
             Some(path) => CommandResult::message(
@@ -72,10 +72,10 @@ fn execute_copy(app: &mut App) -> CommandResult {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::models::{ContentBlock, Message, Role};
     use crate::tui::app::TuiOptions;
     use crate::tui::clipboard::ClipboardHandler;
     use crate::tui::history::{HistoryCell, history_cells_from_message};
+    use codewhale_models::{ContentBlock, Message, Role};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -220,7 +220,7 @@ mod tests {
         let mut app = test_app();
         app.clipboard = ClipboardHandler::for_test(false, false);
         add_completed_assistant(&mut app, "visible answer before compaction");
-        app.api_messages = vec![
+        app.api_messages = std::sync::Arc::new(vec![
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
@@ -235,7 +235,7 @@ mod tests {
                     cache_control: None,
                 }],
             },
-        ];
+        ]);
 
         let result = execute_copy(&mut app);
 
@@ -274,7 +274,7 @@ mod tests {
         app.clipboard = ClipboardHandler::for_test(false, false);
         add_completed_assistant(&mut app, "older answer");
         add_completed_assistant(&mut app, "newer answer");
-        app.api_messages.clear();
+        app.api_messages_mut().clear();
         app.pop_history();
 
         let result = execute_copy(&mut app);
@@ -295,7 +295,7 @@ mod tests {
             content: "next prompt".to_string(),
         });
         add_completed_assistant(&mut app, "newer answer");
-        app.api_messages.clear();
+        app.api_messages_mut().clear();
         app.truncate_history_to(2);
 
         let result = execute_copy(&mut app);

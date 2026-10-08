@@ -16,8 +16,8 @@ generic checklist does not enumerate.
 - [ ] The live milestone and PR queue no longer contain work intended for this
       version:
       ```
-      gh issue list --repo Hmbown/CodeWhale --milestone "vX.Y.Z" --state open
-      gh pr list --repo Hmbown/CodeWhale --state open --limit 100
+      gh issue list --repo codewhale-hq/CodeWhale --milestone "vX.Y.Z" --state open
+      gh pr list --repo codewhale-hq/CodeWhale --state open --limit 100
       ```
 - [ ] Any remaining same-theme work is explicitly retargeted to a later
       version or called out as a known issue. Do not bump/tag while still
@@ -26,7 +26,7 @@ generic checklist does not enumerate.
       maintainer has deliberately chosen to publish exactly that older SHA:
       ```
       git ls-remote origin refs/heads/main refs/tags/vX.Y.Z
-      gh release view vX.Y.Z --repo Hmbown/CodeWhale
+      gh release view vX.Y.Z --repo codewhale-hq/CodeWhale
       ./scripts/release/check-published.sh X.Y.Z
       ```
 - [ ] If `vX.Y.Z` exists with no GitHub Release/packages and `main` has moved
@@ -99,7 +99,7 @@ Run, in order, from the repo root:
 
 ## 4. npm wrapper smoke
 
-- [ ] `cargo build --release --locked -p codewhale-cli -p codewhale-tui`
+- [ ] `cargo build --release --locked -p codewhale-cli --bin codewhale`
 - [ ] `node scripts/release/npm-wrapper-smoke.js`
       (Set `DEEPSEEK_TUI_KEEP_SMOKE_DIR=1` if you need to inspect the temp
       install afterwards.)
@@ -205,7 +205,7 @@ release anxiety: contributors cannot tell whether their work merged.
 - [ ] The live GitHub Release body has its own `## Contributors` or
       `## Credits` section; do not rely on "see CHANGELOG" alone. Verify with:
       ```
-      gh release view vX.Y.Z --repo Hmbown/CodeWhale --json body \
+      gh release view vX.Y.Z --repo codewhale-hq/CodeWhale --json body \
         --jq '.body | test("## (Contributors|Credits)")'
       ```
 - [ ] `npm view codewhale@X.Y.Z version codewhaleBinaryVersion --json`
@@ -219,7 +219,7 @@ release anxiety: contributors cannot tell whether their work merged.
       in `docs/REBRAND.md#homebrew`.
 - [ ] `crates.io` has the new version (or the `publish-crates.sh` job has
       pushed it).
-- [ ] `ghcr.io/hmbown/codewhale:vX.Y.Z` and `:latest` are updated.
+- [ ] `ghcr.io/codewhale-hq/codewhale:vX.Y.Z` and `:latest` are updated.
 - [ ] The final registry verification passes:
       ```
       ./scripts/release/check-published.sh X.Y.Z

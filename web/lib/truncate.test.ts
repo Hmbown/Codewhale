@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import { truncateChars } from "./truncate";
 
 const webRoot = new URL("../", import.meta.url);
-const ticker = readFileSync(new URL("components/ticker.tsx", webRoot), "utf8");
 const roadmap = readFileSync(new URL("lib/roadmap-feed.ts", webRoot), "utf8");
 
 describe("truncateChars", () => {
@@ -38,8 +37,6 @@ describe("truncateChars", () => {
   });
 
   it("is the one truncation rule the GitHub-fed surfaces use", () => {
-    expect(ticker).toContain("truncateChars(title, 70)");
-    expect(ticker).not.toContain("title.slice(");
     expect(roadmap).toContain("truncateChars(stripped, 140, 137)");
     expect(roadmap).not.toContain("stripped.slice(");
   });

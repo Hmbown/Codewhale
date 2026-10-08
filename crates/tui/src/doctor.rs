@@ -239,11 +239,7 @@ pub(crate) fn structural_url_authority(url: &str) -> String {
     let Some(host) = parsed.host_str() else {
         return "unparseable (configured value omitted)".to_string();
     };
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
+    // Url::host_str already includes the brackets around an IPv6 address.
     let mut authority = format!("{}://{host}", parsed.scheme());
     if let Some(port) = parsed.port() {
         authority.push(':');
@@ -496,7 +492,11 @@ fn doctor_safe_release_tag(raw: &str) -> Option<String> {
         .map(|version| format!("v{version}"))
 }
 
-fn doctor_update_report_lines(report: &DoctorUpdateReport) -> Vec<String> {
+/// `update_command` is the install-method-aware upgrade command
+/// ([`codewhale_release::InstallMethod::update_command`]): an npm, Homebrew,
+/// cargo or Omarchy install must be upgraded by its package manager, never by
+/// `codewhale update`, which refuses to replace a managed binary.
+fn doctor_update_report_lines(report: &DoctorUpdateReport, update_command: &str) -> Vec<String> {
     match report {
         DoctorUpdateReport::NotChecked => vec![
             "latest: unknown (not checked; offline default)".to_string(),
@@ -504,7 +504,7 @@ fn doctor_update_report_lines(report: &DoctorUpdateReport) -> Vec<String> {
         ],
         DoctorUpdateReport::UpdateAvailable { latest } => vec![
             format!("latest: {latest}"),
-            "Update available. Run `codewhale update` to install.".to_string(),
+            format!("Update available. Run `{update_command}` to install."),
         ],
         DoctorUpdateReport::UpToDate { latest } => {
             vec![
@@ -545,7 +545,11 @@ pub(crate) async fn print_update_report(probes: DoctorProbeRequest) {
     } else {
         DoctorUpdateReport::NotChecked
     };
-    for (index, line) in doctor_update_report_lines(&report).into_iter().enumerate() {
+    let method = codewhale_release::current_install_method();
+    for (index, line) in doctor_update_report_lines(&report, method.update_command())
+        .into_iter()
+        .enumerate()
+    {
         let indent = if index == 0 { "  ·" } else { "   " };
         println!("{indent} {line}");
     }
@@ -556,10 +560,12 @@ pub(crate) fn is_keyless_ds4_route(config: &crate::config::Config) -> bool {
         .provider
         .as_deref()
         .is_some_and(|provider| provider.eq_ignore_ascii_case("ds4"))
-        && crate::config::base_url_uses_local_host(&config.deepseek_base_url())
+        && crate::config::base_url_uses_local_host(&config.active_route_base_url())
         && crate::config::auth_mode_disables_api_key(
             config
-                .auth_mode_for_provider(config.api_provider())
+                .active_provider_identity()
+                .ok()
+                .and_then(|identity| config.auth_mode_for_provider(&identity))
                 .as_deref(),
         )
 }
@@ -567,11 +573,11 @@ pub(crate) fn is_keyless_ds4_route(config: &crate::config::Config) -> bool {
 /// Probe DS4 through its cheap `/v1/models` contract instead of waking the
 /// model for a completion. The selected model must be advertised.
 pub(crate) async fn probe_ds4_models(config: &crate::config::Config) -> anyhow::Result<()> {
-    use crate::client::DeepSeekClient;
+    use crate::client::CodewhaleClient;
     use crate::core::model_client::ModelClient;
 
-    let endpoint = crate::client::redact_url_for_display(&config.deepseek_base_url());
-    let client = DeepSeekClient::new(config)?;
+    let endpoint = crate::client::redact_url_for_display(&config.active_route_base_url());
+    let client = CodewhaleClient::new(config)?;
     let configured_alias = client.model().to_string();
     let models = match tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -607,7 +613,7 @@ pub(crate) async fn probe_ds4_models(config: &crate::config::Config) -> anyhow::
 }
 
 fn ds4_probe_error(config: &crate::config::Config, error: &str) -> String {
-    let endpoint = crate::client::redact_url_for_display(&config.deepseek_base_url());
+    let endpoint = crate::client::redact_url_for_display(&config.active_route_base_url());
     let status = error
         .split_whitespace()
         .collect::<Vec<_>>()

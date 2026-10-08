@@ -1,5 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -151,24 +153,55 @@ pub struct JsonlHookSink {
 impl JsonlHookSink {
     /// Create a new sink that writes to the file at `path`.
     ///
-    /// Parent directories are created lazily on the first [`HookSink::emit`]
-    /// call.
+    /// A leading `~` is expanded against the user home. Parent directories
+    /// are created lazily on the first [`HookSink::emit`] call.
     pub fn new(path: PathBuf) -> Self {
         Self {
-            path,
+            path: expand_home(path),
             write_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
 
+/// Expand a leading `~` in a configured sink path, reusing the one expansion
+/// rule global path overrides use. Documented examples write
+/// `~/.codewhale/...`; taken literally that created a directory named `~` in
+/// the working directory. A path without `~` (absolute or relative) is
+/// returned unchanged, as is `~` when no home resolves.
+pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
+    codewhale_paths::validate_absolute_path("hook sink path", path.clone()).unwrap_or(path)
+}
+
+/// Open a JSONL sink for append, creating it privately: on Unix new parent
+/// directories are 0700 and a new file 0600 (existing modes are left alone).
+/// Hook and lifecycle events carry tool payloads, prompts, and paths; under
+/// an ordinary umask the old defaults were readable by every local user.
+pub(crate) async fn open_private_append(path: &Path) -> Result<tokio::fs::File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let mut dirs = tokio::fs::DirBuilder::new();
+        dirs.recursive(true);
+        #[cfg(unix)]
+        dirs.mode(0o700);
+        dirs.create(parent)
+            .await
+            .with_context(|| format!("failed to create sink directory {}", parent.display()))?;
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .await
+        .with_context(|| format!("failed to open sink file {}", path.display()))
+}
+
 #[async_trait]
 impl HookSink for JsonlHookSink {
     async fn emit(&self, event: &HookEvent) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("failed to create hook log directory {}", parent.display())
-            })?;
-        }
         // Encode outside the lock so only I/O is serialized.
         let payload = json!({
             "at": Utc::now().to_rfc3339(),
@@ -177,12 +210,7 @@ impl HookSink for JsonlHookSink {
         let encoded = serde_json::to_string(&payload).context("failed to encode hook event")?;
 
         let _guard = self.write_lock.lock().await;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .with_context(|| format!("failed to open hook log {}", self.path.display()))?;
+        let mut file = open_private_append(&self.path).await?;
         file.write_all(encoded.as_bytes())
             .await
             .context("failed to write hook event")?;
@@ -229,7 +257,7 @@ impl WebhookHookSink {
                 .unwrap_or_else(|_| {
                     codewhale_release::platform_http_client_builder()
                         .build()
-                        .unwrap_or_else(|_| reqwest::Client::new())
+                        .unwrap_or_else(|_| codewhale_release::tls::reqwest_client())
                 }),
         }
     }
@@ -307,25 +335,42 @@ impl UnixSocketHookSink {
     }
 }
 
+/// Longest one Unix-socket delivery (connect + write) may take. The
+/// dispatcher awaits its sinks in order, so a listener that accepts and never
+/// reads would otherwise stall every later sink, and the emitting turn, as
+/// soon as the socket buffer filled.
+#[cfg(unix)]
+const UNIX_SOCKET_SINK_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[async_trait]
 impl HookSink for UnixSocketHookSink {
     #[cfg(unix)]
     async fn emit(&self, event: &HookEvent) -> Result<()> {
-        let mut stream = match tokio::net::UnixStream::connect(&self.path).await {
-            Ok(s) => s,
-            Err(_) => return Ok(()), // listener not running, skip silently
-        };
         let payload = json!({
             "at": Utc::now().to_rfc3339(),
             "event": event
         });
         let mut line = serde_json::to_string(&payload).context("failed to encode hook event")?;
         line.push('\n');
-        stream
-            .write_all(line.as_bytes())
+        let deliver = async {
+            let mut stream = match tokio::net::UnixStream::connect(&self.path).await {
+                Ok(s) => s,
+                Err(_) => return Ok(()), // listener not running, skip silently
+            };
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .context("failed to write to unix socket")
+        };
+        tokio::time::timeout(UNIX_SOCKET_SINK_TIMEOUT, deliver)
             .await
-            .context("failed to write to unix socket")?;
-        Ok(())
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "unix socket hook sink {} did not accept the event within {:?}",
+                    self.path.display(),
+                    UNIX_SOCKET_SINK_TIMEOUT
+                )
+            })?
     }
 
     #[cfg(not(unix))]
@@ -608,6 +653,75 @@ mod tests {
         assert!(parsed["at"].as_str().is_some());
 
         cleanup();
+    }
+
+    /// Audit R04-11: a listener that accepts and never reads must not stall
+    /// the sequential dispatcher past the sink's own bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_sink_gives_up_on_a_listener_that_never_reads() {
+        use tokio::net::UnixListener;
+
+        let (root, socket_path) = unique_short_socket_path("stall");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        let held = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            // Hold the connection open without ever reading from it.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let sink = UnixSocketHookSink::new(socket_path.clone());
+        // Far larger than any socket buffer, so `write_all` must block.
+        let event = HookEvent::ToolLifecycle {
+            response_id: "resp-stall".to_string(),
+            tool_name: "shell".to_string(),
+            phase: "end".to_string(),
+            payload: json!({ "output": "x".repeat(16 * 1024 * 1024) }),
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), sink.emit(&event)).await;
+        held.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&root);
+        let result = outcome.expect("emit must return within its own bound");
+        assert!(result.is_err(), "a stalled delivery is reported, not faked");
+    }
+
+    /// Audit R04-10: `~` expands against the home, and a new JSONL sink is
+    /// private (dir 0700, file 0600) on Unix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_sink_expands_home_and_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = codewhale_paths::user_home().expect("test home");
+        assert_eq!(
+            expand_home(PathBuf::from("~/.codewhale/events.jsonl")),
+            home.join(".codewhale/events.jsonl")
+        );
+        assert_eq!(
+            expand_home(PathBuf::from("relative/events.jsonl")),
+            PathBuf::from("relative/events.jsonl")
+        );
+
+        let root = unique_temp_dir("private");
+        let path = root.join("nested").join("events.jsonl");
+        let sink = JsonlHookSink::new(path.clone());
+        sink.emit(&HookEvent::ResponseStart {
+            response_id: "resp-private".to_string(),
+        })
+        .await
+        .expect("emit");
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
     }
 
     #[derive(Default)]

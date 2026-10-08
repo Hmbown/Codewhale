@@ -75,21 +75,17 @@ jobs:
             echo "version=${INPUT_VERSION}"
           } >> "${GITHUB_OUTPUT}"
           echo "Resolved ${tag} -> ${sha}"
-      - name: Require an existing published release
+      - name: Require a complete published release
         # The inverse of release.yml's immutability guard. That one refuses to
-        # run when assets exist; this one refuses to run when they do not,
-        # because there is nothing to derive a channel from.
+        # run when assets exist; this one refuses to run unless the published
+        # release carries exactly the assets its own checksum manifest lists,
+        # each fully uploaded, because a channel derived from a partial set
+        # would advertise bytes that are not there. The tag may predate the
+        # current inventory, so its manifest, not today's list, is the check.
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          count="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets | length')"
-          if [[ "${count}" -eq 0 ]]; then
-            echo "::error::${TAG} has no published assets. Run release.yml, not this recovery workflow." >&2
-            exit 1
-          fi
-          echo "${TAG} has ${count} published assets."
+        run: node scripts/release/verify-release-inventory.js --manifest "${GITHUB_REPOSITORY}" "${TAG}"
       - name: Verify the remote tag still points at this commit
         env:
           EXPECTED_SHA: ${{ steps.release.outputs.sha }}
@@ -120,9 +116,9 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           path: infra
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -143,7 +139,7 @@ jobs:
             "${TAG}" \
             "${EXPECTED_SHA}"
       - name: Build and push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         env:
           DOCKER_BUILD_RECORD_UPLOAD: false
           DOCKER_BUILD_SUMMARY: false

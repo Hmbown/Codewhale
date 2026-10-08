@@ -6,13 +6,14 @@
  *                      writes a draft per broken link (4xx/5xx). Stores a
  *                      `linkcheck:last` summary so /admin can show last status.
  *
- *   runSemanticDrift — reads recent CHANGELOG / commits, asks deepseek-v4-flash
+ *   runSemanticDrift — reads recent CHANGELOG / commits, asks deepseek-flash
  *                      whether any specific claims on the site look out of
  *                      date, writes review-required drafts.
  *
  * Both surface as drafts in CURATED_KV under `draft:linkcheck:<...>` and
  * `draft:semantic-drift:<...>`, picked up by the existing /admin listing.
  */
+import { fetchBoundedText } from "./bounded-body";
 import { agentChat, draftStorageKey, getDraft, saveDraft, type AgentDraft, type DeepSeekEnv, VOICE_CONSTRAINTS } from "./community-agent";
 
 interface KVNamespace {
@@ -68,16 +69,16 @@ function dsEnv(env: WatchEnv): DeepSeekEnv {
 // Targets to probe daily. For registries that block bot HEAD/GET (npm, crates.io)
 // we hit the public JSON API instead — same upstream, doesn't 403.
 const LINK_TARGETS: { url: string; label: string }[] = [
-  { url: "https://github.com/Hmbown/CodeWhale", label: "Main repo" },
-  { url: "https://github.com/Hmbown/CodeWhale/issues", label: "Issues" },
-  { url: "https://github.com/Hmbown/CodeWhale/pulls", label: "Pull Requests" },
-  { url: "https://github.com/Hmbown/CodeWhale/discussions", label: "Discussions" },
-  { url: "https://github.com/Hmbown/CodeWhale/releases", label: "Releases" },
-  { url: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE", label: "License file" },
-  { url: "https://github.com/Hmbown/CodeWhale/blob/main/CODE_OF_CONDUCT.md", label: "Code of Conduct" },
-  { url: "https://github.com/Hmbown/CodeWhale/blob/main/SECURITY.md", label: "Security policy" },
-  { url: "https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md", label: "Contributing guide" },
-  { url: "https://github.com/Hmbown/CodeWhale/blob/main/.github/PULL_REQUEST_TEMPLATE.md", label: "PR template" },
+  { url: "https://github.com/codewhale-hq/CodeWhale", label: "Main repo" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/issues", label: "Issues" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/pulls", label: "Pull Requests" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/discussions", label: "Discussions" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/releases", label: "Releases" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE", label: "License file" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/blob/main/.github/CODE_OF_CONDUCT.md", label: "Code of Conduct" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/blob/main/.github/SECURITY.md", label: "Security policy" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/blob/main/CONTRIBUTING.md", label: "Contributing guide" },
+  { url: "https://github.com/codewhale-hq/CodeWhale/blob/main/.github/PULL_REQUEST_TEMPLATE.md", label: "PR template" },
   { url: "https://github.com/Hmbown/homebrew-deepseek-tui", label: "Homebrew tap" },
   { url: "https://github.com/sponsors/Hmbown", label: "Support link (GitHub Sponsors)" },
   { url: "https://buymeacoffee.com/hmbown", label: "Support link (BMC)" },
@@ -95,15 +96,20 @@ export interface LinkCheckResult {
   ms: number;
 }
 
+const PROBE_TIMEOUT_MS = 10_000;
+
 async function probe(target: { url: string; label: string }): Promise<LinkCheckResult> {
   const start = Date.now();
   try {
     // Use HEAD where possible; fall back to GET on 405/403 since some hosts
     // (e.g. Cloudflare-protected) reject HEAD.
-    let r = await fetch(target.url, { method: "HEAD", redirect: "follow" });
+    // Each request has its own deadline; only the status matters, so a GET
+    // body is discarded unread.
+    let r = await fetch(target.url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
     if (r.status === 405 || r.status === 403 || r.status === 404) {
       // Some sites return 404 to HEAD but 200 to GET (e.g. NPM)
-      r = await fetch(target.url, { method: "GET", redirect: "follow" });
+      r = await fetch(target.url, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      await r.body?.cancel().catch(() => undefined);
     }
     return { url: target.url, label: target.label, status: r.status, ok: r.ok, ms: Date.now() - start };
   } catch {
@@ -291,10 +297,10 @@ export async function runSemanticDrift(env: WatchEnv): Promise<{ ok: boolean; dr
 
   // Fetch CHANGELOG (truncated), recent commits, and live homepage HTML.
   const [changelog, commits, homepageHtml, docsHtml] = await Promise.all([
-    fetch("https://raw.githubusercontent.com/Hmbown/CodeWhale/main/CHANGELOG.md", { headers: ghHeaders }).then((r) => r.ok ? r.text() : "").catch(() => ""),
-    fetch("https://api.github.com/repos/Hmbown/CodeWhale/commits?per_page=30", { headers: ghHeaders }).then((r) => r.ok ? r.json() as Promise<{ commit: { message: string }; sha: string }[]> : []).catch(() => []),
-    fetch("https://codewhale.net/en", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.ok ? r.text() : "").catch(() => ""),
-    fetch("https://codewhale.net/en/docs", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.ok ? r.text() : "").catch(() => ""),
+    fetchBoundedText("https://raw.githubusercontent.com/codewhale-hq/CodeWhale/main/CHANGELOG.md", { headers: ghHeaders }).then((r) => r.text).catch(() => ""),
+    fetchBoundedText("https://api.github.com/repos/codewhale-hq/CodeWhale/commits?per_page=30", { headers: ghHeaders }).then((r) => r.ok ? JSON.parse(r.text) as { commit: { message: string }; sha: string }[] : []).catch(() => []),
+    fetchBoundedText("https://codewhale.net/en", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.text).catch(() => ""),
+    fetchBoundedText("https://codewhale.net/en/docs", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.text).catch(() => ""),
   ]);
 
   if (!changelog && (!commits || commits.length === 0)) {
@@ -363,8 +369,8 @@ ${docsText}`;
     const existing = await getDraft(env.CURATED_KV, draftStorageKey(draft));
     if (existing) continue;
 
-    await saveDraft(env.CURATED_KV, draft);
-    drafted++;
+    // saveDraft refuses findings the maintainer already discarded.
+    if (await saveDraft(env.CURATED_KV, draft)) drafted++;
   }
 
   return { ok: true, drafted };

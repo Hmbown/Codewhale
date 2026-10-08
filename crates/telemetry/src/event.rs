@@ -33,7 +33,10 @@ use serde::{Deserialize, Serialize};
 
 /// Wire schema version. Bumped on any field add, remove, or retype; never
 /// reused. `crates/telemetry/tests/golden/v1.json` pins what v1 was.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// Default-on policy disclosure version. This is not human consent.
+pub const NOTICE_VERSION: u32 = 5;
 
 /// Which product surface produced a batch.
 ///
@@ -56,6 +59,14 @@ pub enum Surface {
     McpServer,
     /// `codewhale serve`.
     Serve,
+    /// Public website product interactions.
+    Website,
+    /// Browser application interactions.
+    WebApp,
+    /// Native desktop application interactions.
+    Desktop,
+    /// Control-plane application interactions.
+    ControlPlane,
 }
 
 impl Surface {
@@ -67,6 +78,10 @@ impl Surface {
         Self::AppServer,
         Self::McpServer,
         Self::Serve,
+        Self::Website,
+        Self::WebApp,
+        Self::Desktop,
+        Self::ControlPlane,
     ];
 
     /// The wire spelling.
@@ -79,6 +94,10 @@ impl Surface {
             Self::AppServer => "app-server",
             Self::McpServer => "mcp-server",
             Self::Serve => "serve",
+            Self::Website => "website",
+            Self::WebApp => "web-app",
+            Self::Desktop => "desktop",
+            Self::ControlPlane => "control-plane",
         }
     }
 }
@@ -449,6 +468,58 @@ impl Counters {
     ];
 }
 
+/// Closed aggregate product counters shared with browser and app clients.
+/// Runtime sessions keep their existing counters and add no second collector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductCounters {
+    /// Aggregate page view count.
+    pub page_view: u32,
+    /// Aggregate docs view count.
+    pub docs_view: u32,
+    /// Aggregate install copy count.
+    pub install_copy: u32,
+    /// Aggregate download count.
+    pub download: u32,
+    /// Aggregate signup count.
+    pub signup: u32,
+    /// Aggregate login count.
+    pub login: u32,
+    /// Aggregate session create count.
+    pub session_create: u32,
+    /// Aggregate session resume count.
+    pub session_resume: u32,
+    /// Aggregate turn submit count.
+    pub turn_submit: u32,
+    /// Aggregate turn complete count.
+    pub turn_complete: u32,
+    /// Aggregate settings open count.
+    pub settings_open: u32,
+    /// Aggregate integration connect count.
+    pub integration_connect: u32,
+    /// Aggregate error shown count.
+    pub error_shown: u32,
+}
+
+impl ProductCounters {
+    /// Closed wire field names.
+    pub const FIELDS: &'static [&'static str] = &[
+        "page_view",
+        "docs_view",
+        "install_copy",
+        "download",
+        "signup",
+        "login",
+        "session_create",
+        "session_resume",
+        "turn_submit",
+        "turn_complete",
+        "settings_open",
+        "integration_connect",
+        "error_shown",
+    ];
+}
+
 /// Error counts for one session.
 ///
 /// Every value is a count of a **variant discriminant**, never of an
@@ -565,6 +636,26 @@ pub enum Event {
         /// this tree slices user and model text in dozens of places.
         site: String,
     },
+    /// Anonymous service health aggregates under explicit operator consent.
+    OperationsSummary {
+        /// Aggregate requests.
+        requests: u32,
+        /// Aggregate errors.
+        errors: u32,
+        /// Aggregate duration ms total.
+        duration_ms_total: u32,
+        /// Aggregate duration ms max.
+        duration_ms_max: u32,
+        /// Aggregate probes.
+        probes: u32,
+        /// Aggregate probes failed.
+        probes_failed: u32,
+    },
+    /// Aggregate browser or application interactions without a timeline.
+    ProductUsage {
+        /// Closed counts; never a URL, user identity, or work content.
+        counters: ProductCounters,
+    },
 }
 
 impl Event {
@@ -576,6 +667,8 @@ impl Event {
             Self::SessionStart { .. } => "session_start",
             Self::SessionEnd { .. } => "session_end",
             Self::Panic { .. } => "panic",
+            Self::ProductUsage { .. } => "product_usage",
+            Self::OperationsSummary { .. } => "operations_summary",
         }
     }
 
@@ -597,7 +690,9 @@ impl Event {
     #[must_use]
     pub fn is_bounded(&self) -> bool {
         match self {
-            Self::SessionStart { .. } => true,
+            Self::SessionStart { .. }
+            | Self::ProductUsage { .. }
+            | Self::OperationsSummary { .. } => true,
             Self::InstallOrUpgrade {
                 previous_version, ..
             } => previous_version
@@ -663,8 +758,8 @@ pub fn is_reduced_panic_site(value: &str) -> bool {
 /// Whether `value` is a provider id this build knows.
 ///
 /// Checked against the **full** provider registry, not
-/// `ProviderKind::all()`: that constant is the 36-row *catalog* subset, and
-/// `ApiProvider::kind()` legitimately yields dialect kinds
+/// `ProviderKind::all()`: that list is the selectable catalog subset, while
+/// captured intrinsic kinds legitimately include dialect kinds
 /// (`deepseek-anthropic`, the Model Studio plan variants) that are absent from
 /// it. Narrowing to the catalog would silently drop a real user's route.
 #[must_use]
@@ -679,6 +774,8 @@ pub fn is_known_provider_id(value: &str) -> bool {
 pub struct Batch {
     /// [`SCHEMA_VERSION`].
     pub schema_version: u32,
+    /// [`NOTICE_VERSION`], policy metadata rather than proof of acceptance.
+    pub notice_version: u32,
     /// RFC3339 UTC, second precision. Per-**batch** only — events carry no
     /// timestamps at all.
     pub sent_at: String,
@@ -707,6 +804,7 @@ impl Batch {
     /// Envelope field names in declaration order, for the doc-match test.
     pub const FIELDS: &'static [&'static str] = &[
         "schema_version",
+        "notice_version",
         "sent_at",
         "install_id",
         "app_version",

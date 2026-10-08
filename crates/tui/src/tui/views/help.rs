@@ -18,6 +18,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -31,14 +32,14 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands;
-use crate::localization::{Locale, MessageId, tr};
-use crate::palette;
 use crate::tui::keybindings::KEYBINDINGS;
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, render_modal_footer, render_panel_scroll_rail,
     render_underwater_surface,
 };
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette as palette;
 
 /// Two top-level sections rendered in the overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,11 @@ struct HelpEntry {
     sub_rank: u8,
     label: String,
     description: String,
+    /// The command's argument shape, when it has one worth stating — the
+    /// registry `usage` string for built-ins, the front-matter usage for
+    /// workspace commands. `None` for rows that are already the whole shape
+    /// (`/copy`, `$skill`, a keybinding chord).
+    usage: Option<String>,
     /// Lowercased haystack used for substring matching; pre-built so each
     /// keystroke does not re-allocate per entry.
     haystack: String,
@@ -155,6 +161,7 @@ impl HelpView {
     /// Discoverability index over every user-invocable surface (#3912):
     /// built-ins, workspace commands, and discovered skills. `skills` comes
     /// from `App::cached_skills`; pass `&[]` only where none are discovered.
+    #[cfg(test)]
     pub fn new_for_workspace(
         locale: Locale,
         workspace: &Path,
@@ -165,17 +172,20 @@ impl HelpView {
         })
     }
 
-    /// Open Help as the keyboard reference promised by shell shortcut hints.
-    pub fn new_for_shortcuts(
-        locale: Locale,
-        workspace: &Path,
-        skills: &[(String, String)],
-    ) -> Self {
-        commands::user_registry::with_registry_for_workspace(Some(workspace), |registry| {
-            Self::new_with_registry(locale, HelpOrdering::KeybindingsFirst, registry, skills)
+    pub fn new_for_app(app: &crate::tui::app::App, shortcuts: bool) -> Self {
+        commands::user_registry::with_registry_for_app(app, |registry| {
+            Self::new_with_registry(
+                app.ui_locale,
+                if shortcuts {
+                    HelpOrdering::KeybindingsFirst
+                } else {
+                    HelpOrdering::CommandsFirst
+                },
+                registry,
+                &app.cached_skills,
+            )
         })
     }
-
     fn new_with_ordering(locale: Locale, ordering: HelpOrdering) -> Self {
         let registry = commands::user_registry::UserCommandRegistry::new();
         Self::new_with_registry(locale, ordering, &registry, &[])
@@ -372,14 +382,17 @@ impl HelpView {
         widths
     }
 
-    /// Description of the focused entry when the row itself could not hold
-    /// it, at the full width of the panel.
+    /// What the focused row could not say for itself: the command's argument
+    /// shape, and its description when the row had to shed one.
     ///
-    /// This slot exists to repair a shed, not to repeat one. On a wide
-    /// terminal the inline description already fits, and printing it again
-    /// two rows above would be the same duplication the footer was carrying
-    /// with `type to filter`. The row stays reserved either way so the list
-    /// does not jump as focus moves between shed and unshed rows.
+    /// `/help` used to show `label + description` and keep `usage` in the
+    /// search haystack alone, so `/workspace [path|worktrees]` read as
+    /// `/workspace` and the worktree manager behind it was invisible (#5952).
+    /// The usage line is new information, so it is printed whenever the
+    /// registry has one; the description is only repeated when the row shed
+    /// it, because printing the same sentence twice on one screen is the
+    /// duplication this slot was built to avoid. The row stays reserved
+    /// either way so the list does not jump as focus moves.
     fn focused_entry_detail(
         &self,
         inner_width: usize,
@@ -398,7 +411,20 @@ impl HelpView {
         let inline_capacity = inner_width.saturating_sub(label_width + 4);
         let inline = shed_to_width(&entry.description, inline_capacity);
         let full = shed_to_width(&entry.description, inner_width);
-        (full != inline && !full.is_empty()).then(|| full.to_string())
+        let repaired = (full != inline && !full.is_empty()).then(|| full.to_string());
+        match (entry.usage.as_deref(), repaired) {
+            (None, repaired) => repaired,
+            (Some(usage), None) => Some(shed_to_width(usage, inner_width).to_string()),
+            (Some(usage), Some(description)) => {
+                // They join at a joint `shed_to_width` already sheds on, and
+                // the description leads: repairing the shed is what this slot
+                // was built for, and a panel too narrow to hold both must not
+                // spend itself on the argument shape and drop the sentence
+                // the row could not print.
+                let joined = format!("{description} — {usage}");
+                Some(shed_to_width(&joined, inner_width).to_string())
+            }
+        }
     }
 
     fn focusable_rows(&self) -> Vec<HelpHit> {
@@ -481,7 +507,15 @@ fn build_entries(
             .iter()
             .copied()
             .filter(|alias| registry.get(alias).is_none())
+            .filter(|alias| alias_is_listed_for(locale, alias))
             .collect::<Vec<_>>();
+        // Every alias stays findable by typing it, listed or not.
+        let alias_terms = command
+            .aliases
+            .iter()
+            .map(|alias| format!("/{alias}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let description = if visible_aliases.is_empty() {
             localized.to_string()
         } else {
@@ -496,16 +530,18 @@ fn build_entries(
             )
         };
         let haystack = format!(
-            "{} {} {}",
+            "{} {} {} {}",
             label.to_ascii_lowercase(),
             description.to_ascii_lowercase(),
-            command.usage.to_ascii_lowercase()
+            command.usage.to_ascii_lowercase(),
+            alias_terms.to_lowercase()
         );
         entries.push(HelpEntry {
             section: HelpSection::Command,
-            // Commands have no inherent ordering — fall back to alphabetical
-            // by leaning on `label.clone()` in the final sort_by_key tuple.
-            sub_rank: 0,
+            // Curated commands first, then the catalog; alphabetical within
+            // each by leaning on `label.clone()` in the final sort_by_key tuple.
+            sub_rank: command_sub_rank(&label),
+            usage: stated_usage(command.usage, &label),
             label,
             description,
             haystack,
@@ -538,6 +574,7 @@ fn build_entries(
         entries.push(HelpEntry {
             section: HelpSection::UserCommand,
             sub_rank: 0,
+            usage: stated_usage(&usage, &label),
             label,
             description,
             haystack,
@@ -558,6 +595,7 @@ fn build_entries(
         entries.push(HelpEntry {
             section: HelpSection::Skill,
             sub_rank: 0,
+            usage: None,
             label,
             description,
             haystack,
@@ -567,7 +605,15 @@ fn build_entries(
     for binding in KEYBINDINGS {
         // macOS renders Alt chords with the Option glyph (`⌥V`), never
         // `Alt`/`Cmd` (TUI-DOG-002 acceptance).
-        let label = crate::tui::shell_key_routing::display_chord(binding.chord).into_owned();
+        let mut label = crate::tui::shell_key_routing::display_chord(binding.chord).into_owned();
+        // The newline row is the one chord whose availability depends on the
+        // terminal rather than the platform, so it is answered here instead
+        // of listing a key that may do nothing.
+        if label.contains("Shift+Enter")
+            && !crate::tui::composer_ui::terminal_can_report_shift_enter()
+        {
+            label = label.replace(" / Shift+Enter (enhanced terminals)", "");
+        }
         let description = tr(locale, binding.description_id).into_owned();
         let haystack = format!(
             "{} {}",
@@ -577,6 +623,7 @@ fn build_entries(
         entries.push(HelpEntry {
             section: HelpSection::Keybinding,
             sub_rank: binding.section.rank(),
+            usage: None,
             label,
             description,
             haystack,
@@ -586,9 +633,116 @@ fn build_entries(
     entries
 }
 
+/// Romanized Chinese (pinyin) command aliases. They dispatch in every locale,
+/// but only the Chinese packs list them: an English reader sees `/clear`, not
+/// `/clear (aliases: /qingping)`.
+const ROMANIZED_ALIASES: &[&str] = &[
+    "bangzhu",
+    "chongmingming",
+    "chongshi",
+    "daili",
+    "dangan",
+    "daochu",
+    "digui",
+    "fujian",
+    "gaiming",
+    "gouzi",
+    "jiazai",
+    "jihua",
+    "jineng",
+    "jinengliebiao",
+    "lianjie",
+    "maodian",
+    "moxing",
+    "moxingliebiao",
+    "qingchu",
+    "qingping",
+    "shencha",
+    "shouye",
+    "tuichu",
+    "xinren",
+    "xitong",
+    "yasuo",
+    "yuyin",
+    "yuyincontrol",
+    "yuyinsend",
+    "zhinengti",
+    "zhuye",
+    "zidong",
+    "zuoye",
+];
+
+/// Whether `/help` lists `alias` beside its command for `locale`. Chinese
+/// aliases (Han script or pinyin) are listed only in the Chinese packs.
+fn alias_is_listed_for(locale: Locale, alias: &str) -> bool {
+    if matches!(locale, Locale::ZhHans | Locale::ZhHant) {
+        return true;
+    }
+    let han = alias
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    !han && !ROMANIZED_ALIASES.contains(&alias)
+}
+
+/// The usage line worth printing beside a row, or `None` when it only
+/// restates the label.
+///
+/// `/copy`'s usage is `/copy`; showing it teaches nothing and costs the row
+/// that `/queue [list|send <n>|…]` needs. Workspace commands declare the
+/// argument shape alone (`<environment>`), so the label is prepended to make
+/// the same whole line a built-in already carries.
+fn stated_usage(usage: &str, label: &str) -> Option<String> {
+    let usage = usage.trim();
+    if usage.is_empty() || usage == label {
+        return None;
+    }
+    Some(if usage.starts_with('/') {
+        usage.to_string()
+    } else {
+        format!("{label} {usage}")
+    })
+}
+
+/// The commands Help opens on. Everything else stays one keystroke away under
+/// *All commands* — 103 rows sorted alphabetically is a catalog, not an answer,
+/// and it buried the handful of commands people actually reach for.
+///
+/// Membership is a product judgement, not a usage metric: these are the ones a
+/// session needs to steer itself. The first five agree with the composer's own
+/// curated slash menu on purpose, so the two surfaces teach the same thing.
+const COMMON_COMMANDS: [&str; 12] = [
+    "/setup",
+    "/model",
+    "/settings",
+    "/resume",
+    "/clear",
+    "/compact",
+    "/context",
+    "/cost",
+    "/diff",
+    "/mcp",
+    "/theme",
+    "/exit",
+];
+
+/// Sort rank that also selects the group: curated commands sort and group ahead
+/// of the full catalog, because `filtered` is ordered by
+/// `(section_rank, sub_rank, label)` and `group_key` reads the same field.
+const COMMAND_RANK_COMMON: u8 = 0;
+const COMMAND_RANK_ALL: u8 = 1;
+
+fn command_sub_rank(label: &str) -> u8 {
+    if COMMON_COMMANDS.contains(&label) {
+        COMMAND_RANK_COMMON
+    } else {
+        COMMAND_RANK_ALL
+    }
+}
+
 fn group_key(entry: &HelpEntry) -> String {
     match entry.section {
-        HelpSection::Command => "cmd".into(),
+        HelpSection::Command if entry.sub_rank == COMMAND_RANK_COMMON => "cmd:common".into(),
+        HelpSection::Command => "cmd:all".into(),
         HelpSection::UserCommand => "usercmd".into(),
         HelpSection::Skill => "skill".into(),
         HelpSection::Keybinding => format!("kb:{}", entry.sub_rank),
@@ -597,6 +751,10 @@ fn group_key(entry: &HelpEntry) -> String {
 
 fn group_label(entry: &HelpEntry, locale: Locale) -> String {
     match entry.section {
+        HelpSection::Command if entry.sub_rank == COMMAND_RANK_COMMON => {
+            tr(locale, MessageId::HelpGroupCommonCommands).into_owned()
+        }
+        HelpSection::Command => tr(locale, MessageId::HelpGroupAllCommands).into_owned(),
         HelpSection::Keybinding => keybinding_section_for_rank(entry.sub_rank)
             .map(|section| section.label(locale).into_owned())
             .unwrap_or_else(|| entry.section.label(locale).into_owned()),
@@ -605,46 +763,39 @@ fn group_label(entry: &HelpEntry, locale: Locale) -> String {
 }
 
 fn keybinding_section_for_rank(rank: u8) -> Option<crate::tui::keybindings::KeybindingSection> {
-    use crate::tui::keybindings::KeybindingSection;
-    [
-        KeybindingSection::Navigation,
-        KeybindingSection::Editing,
-        KeybindingSection::Submission,
-        KeybindingSection::Modes,
-        KeybindingSection::Sessions,
-        KeybindingSection::Clipboard,
-        KeybindingSection::Help,
-    ]
-    .into_iter()
-    .find(|section| section.rank() == rank)
+    crate::tui::keybindings::KeybindingSection::ALL
+        .into_iter()
+        .find(|section| section.rank() == rank)
 }
 
 fn default_collapsed(ordering: HelpOrdering) -> HashSet<String> {
     use crate::tui::keybindings::KeybindingSection;
-    let kb_keys = [
-        KeybindingSection::Navigation,
-        KeybindingSection::Editing,
-        KeybindingSection::Submission,
-        KeybindingSection::Modes,
-        KeybindingSection::Sessions,
-        KeybindingSection::Clipboard,
-        KeybindingSection::Help,
-    ]
-    .into_iter()
-    .map(|section| format!("kb:{}", section.rank()));
+    let kb_keys = KeybindingSection::ALL
+        .into_iter()
+        .map(|section| format!("kb:{}", section.rank()));
 
     match ordering {
         HelpOrdering::KeybindingsFirst => {
             // Show Navigation only — the rest is a long tail the user
             // expands or searches. Slash/skill catalogs stay folded.
-            let mut set: HashSet<String> = ["cmd", "usercmd", "skill"]
+            let mut set: HashSet<String> = ["cmd:common", "cmd:all", "usercmd", "skill"]
                 .into_iter()
                 .map(str::to_string)
                 .collect();
             set.extend(kb_keys.filter(|key| key != "kb:0"));
             set
         }
-        HelpOrdering::CommandsFirst => kb_keys.collect(),
+        HelpOrdering::CommandsFirst => {
+            // Open on the curated commands with everything else folded. The
+            // catalogs are still one keystroke — or one keystroke of typing,
+            // since a query ignores collapse entirely — away.
+            let mut set: HashSet<String> = ["cmd:all", "usercmd", "skill"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            set.extend(kb_keys);
+            set
+        }
     }
 }
 
@@ -702,11 +853,14 @@ fn shed_to_width(text: &str, max_width: usize) -> Cow<'_, str> {
             if width > best.width() {
                 best = head;
             }
-        } else if width > oversize_clause.width() {
+        } else if oversize_clause.is_empty() {
             // The main clause was one column over, so the joint itself did
             // not fire. Word-shed that clause rather than the alias list
             // hanging off it — otherwise `/automation` keeps the adjectives
-            // and loses `automations`.
+            // and loses `automations`. Heads grow left to right, so the first
+            // oversize one is the main clause; a later, wider head is that
+            // clause plus everything trailing it, which is the text this
+            // branch exists to shed.
             oversize_clause = head;
         }
     }
@@ -895,7 +1049,6 @@ impl ModalView for HelpView {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ViewAction::Close
             }
-            KeyCode::Char('q') | KeyCode::Char('Q') if self.query.is_empty() => ViewAction::Close,
             KeyCode::Up => {
                 self.move_selection_wrapping(-1);
                 ViewAction::None
@@ -1236,6 +1389,7 @@ mod tests {
         // #3912: both surfaces executed and autocompleted but were absent
         // from the surface that teaches the product.
         let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
         let commands_dir = tmp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -1438,16 +1592,46 @@ mod tests {
     }
 
     #[test]
-    fn q_closes_empty_filter_but_types_when_filtering() {
-        let mut view = HelpView::new();
-        let action = view.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(action, ViewAction::Close));
-
-        let mut view = HelpView::new();
-        type_filter(&mut view, "mod");
-        let action = view.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.query, "modq");
+    fn help_search_owns_initial_q() {
+        for query in ["queue", "Queue", "q 队列é"] {
+            let mut stack = crate::tui::views::ViewStack::new();
+            stack.push(HelpView::new());
+            for ch in query.chars() {
+                let modifiers = if ch.is_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                assert!(
+                    stack
+                        .handle_key(KeyEvent::new(KeyCode::Char(ch), modifiers))
+                        .is_empty()
+                );
+                assert_eq!(stack.top_kind(), Some(ModalKind::Help), "{query:?}");
+            }
+            let mut modal = stack.pop().unwrap();
+            let view = modal.as_any_mut().downcast_mut::<HelpView>().unwrap();
+            assert_eq!(view.query, query);
+            if query.eq_ignore_ascii_case("queue") {
+                assert!(
+                    view.filtered
+                        .iter()
+                        .any(|&i| view.entries[i].label == "/queue")
+                );
+            }
+            view.handle_key(key(KeyCode::Backspace));
+            assert_eq!(
+                view.query,
+                query
+                    .chars()
+                    .take(query.chars().count() - 1)
+                    .collect::<String>()
+            );
+            assert!(matches!(
+                view.handle_key(key(KeyCode::Esc)),
+                ViewAction::Close
+            ));
+        }
     }
 
     #[test]
@@ -1503,9 +1687,84 @@ mod tests {
         assert_eq!(view.focus, Some(HelpHit::Entry(slot)));
     }
 
+    /// `/help` used to open on all 103 slash commands sorted alphabetically —
+    /// a catalog, not an answer, and it buried the handful of commands a
+    /// session actually steers itself with. It opens on the curated group now,
+    /// with the catalog one keystroke below it.
+    #[test]
+    fn help_opens_on_the_curated_commands_with_the_catalog_folded() {
+        let view = HelpView::new();
+        assert!(
+            !view.group_is_collapsed("cmd:common"),
+            "the curated commands are the point of opening Help"
+        );
+        assert!(
+            view.group_is_collapsed("cmd:all"),
+            "the full catalog stays folded until asked for"
+        );
+
+        let rows = view.render_rows();
+        let entries = rows
+            .iter()
+            .filter(|row| matches!(row, HelpRenderRow::Entry { .. }))
+            .count();
+        assert!(
+            entries <= COMMON_COMMANDS.len(),
+            "Help opened with {entries} rows; only the curated set should be expanded: {:?}",
+            rows.iter()
+                .filter_map(|row| match row {
+                    HelpRenderRow::Entry { entry_idx, .. } =>
+                        Some(view.entries[*entry_idx].label.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+
+        // Every curated command is a real registered command, and each is on
+        // screen. A typo here would silently shrink the opening view.
+        // Distinct labels: a workspace command may share a built-in's name,
+        // and that is a naming collision, not a missing curated entry.
+        let shown: std::collections::BTreeSet<&str> = view
+            .filtered
+            .iter()
+            .map(|idx| view.entries[*idx].label.as_str())
+            .filter(|label| COMMON_COMMANDS.contains(label))
+            .collect();
+        assert_eq!(
+            shown.len(),
+            COMMON_COMMANDS.len(),
+            "curated commands missing from the registry: {:?}",
+            COMMON_COMMANDS
+                .iter()
+                .filter(|name| !shown.contains(*name))
+                .collect::<Vec<_>>()
+        );
+
+        // Typing reaches the folded catalog without expanding anything by hand.
+        let mut view = view;
+        type_filter(&mut view, "/advisor");
+        assert!(
+            view.filtered
+                .iter()
+                .any(|idx| view.entries[*idx].label == "/advisor"),
+            "a query must reach commands inside the folded catalog"
+        );
+    }
+
+    /// Help opens with the full command catalog folded. Tests about layout,
+    /// scrolling or a specific catalog command open it first — what they
+    /// exercise is the rendering of those rows, not the default fold state,
+    /// which `help_opens_on_the_curated_commands` covers on its own.
+    fn view_with_catalog_open() -> HelpView {
+        let mut view = HelpView::new();
+        view.toggle_group("cmd:all");
+        view.focus = None;
+        view
+    }
+
     #[test]
     fn visible_window_keeps_selected_entry_visible_after_scroll() {
-        let mut view = HelpView::new();
+        let mut view = view_with_catalog_open();
         let selected = view
             .filtered
             .iter()
@@ -1592,11 +1851,13 @@ mod tests {
     /// the renderer ignores proves nothing.
     #[test]
     fn label_column_is_measured_from_the_group_not_fixed() {
-        let view = HelpView::new();
+        let view = view_with_catalog_open();
         let widest = view
             .entries
             .iter()
-            .filter(|entry| entry.section == HelpSection::Command)
+            .filter(|entry| {
+                entry.section == HelpSection::Command && entry.sub_rank == COMMAND_RANK_ALL
+            })
             .map(|entry| entry.label.width())
             .max()
             .expect("commands exist");
@@ -1604,9 +1865,10 @@ mod tests {
             widest < 28,
             "slash command labels are short; the fixture assumes it"
         );
-        assert_eq!(view.label_widths(28).get("cmd").copied(), Some(widest));
+        assert_eq!(view.label_widths(28).get("cmd:all").copied(), Some(widest));
 
-        let rows = rows_at(&view, 60, 20);
+        // Tall enough to reach past the curated group into the catalog.
+        let rows = rows_at(&view, 60, 60);
         let row = rows
             .iter()
             .find(|row| row.contains("/advisor"))
@@ -1629,8 +1891,8 @@ mod tests {
     /// without the noun that says what is being managed.
     #[test]
     fn sixty_column_help_keeps_the_automation_noun() {
-        let view = HelpView::new();
-        let rows = rows_at(&view, 60, 20);
+        let view = view_with_catalog_open();
+        let rows = rows_at(&view, 60, 60);
         let row = rows
             .iter()
             .find(|row| row.contains("/automation"))
@@ -1646,13 +1908,13 @@ mod tests {
     /// — one glyph, twice, for two different facts.
     #[test]
     fn a_group_header_spends_one_glyph_on_one_meaning() {
-        let mut view = HelpView::new();
-        view.toggle_group("cmd");
-        assert_eq!(view.focus, Some(HelpHit::Group("cmd".to_string())));
-        let rows = rows_at(&view, 96, 24);
+        let mut view = view_with_catalog_open();
+        view.toggle_group("cmd:all");
+        assert_eq!(view.focus, Some(HelpHit::Group("cmd:all".to_string())));
+        let rows = rows_at(&view, 96, 60);
         let header = rows
             .iter()
-            .find(|row| row.contains("Slash commands"))
+            .find(|row| row.contains("All commands"))
             .expect("group header row");
         assert!(!header.contains("▸ ▸"), "{header:?}");
         assert!(
@@ -1662,11 +1924,11 @@ mod tests {
     }
 
     /// The detail row repairs a shed; it never repeats one. On a wide terminal
-    /// the inline description already fits, so the slot stays empty rather
-    /// than printing the same sentence twice on one screen.
+    /// the inline description already fits, so the slot carries the usage
+    /// line alone rather than printing the same sentence twice on one screen.
     #[test]
     fn the_detail_row_repairs_a_shed_and_never_repeats_one() {
-        let mut view = HelpView::new();
+        let mut view = view_with_catalog_open();
         let slot = view
             .filtered
             .iter()
@@ -1718,6 +1980,104 @@ mod tests {
             detail.len() > inline_description.len(),
             "the detail row must carry more than the row could: {inline_description:?} / {detail:?}"
         );
+    }
+
+    /// #5952: the usage string lived in the search haystack alone, so
+    /// `/workspace [path|worktrees]` rendered as `/workspace` and the
+    /// worktree manager behind it had no way of being seen.
+    #[test]
+    fn the_focused_command_states_its_usage() {
+        let mut view = HelpView::new();
+        let slot = view
+            .filtered
+            .iter()
+            .position(|idx| view.entries[*idx].label == "/workspace")
+            .expect("/workspace is a registered command");
+        view.set_focus(HelpHit::Entry(slot));
+
+        let rows = rows_at(&view, 140, 24);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("/workspace [path|worktrees]")),
+            "the usage line must be on screen: {rows:#?}"
+        );
+    }
+
+    /// A row whose usage only restates its label spends no columns saying so.
+    #[test]
+    fn a_command_without_arguments_states_no_usage() {
+        let view = HelpView::new();
+        let entry = view
+            .entries
+            .iter()
+            .find(|entry| entry.label == "/copy")
+            .expect("/copy is a registered command");
+        assert_eq!(entry.usage, None);
+
+        let workspace = view
+            .entries
+            .iter()
+            .find(|entry| entry.label == "/workspace")
+            .expect("/workspace is a registered command");
+        assert_eq!(
+            workspace.usage.as_deref(),
+            Some("/workspace [path|worktrees]")
+        );
+    }
+
+    /// At 60 columns the detail slot cannot hold both, and the description it
+    /// exists to repair wins — the usage sheds at its own joint rather than
+    /// pushing the sentence off the panel.
+    #[test]
+    fn a_narrow_panel_keeps_the_repaired_description_over_the_usage() {
+        let mut view = HelpView::new();
+        let slot = view
+            .filtered
+            .iter()
+            .position(|idx| view.entries[*idx].label == "/advisor")
+            .expect("/advisor is a registered command");
+        view.set_focus(HelpHit::Entry(slot));
+        let description = view.entries[view.filtered[slot]].description.clone();
+
+        let narrow = rows_at(&view, 60, 20);
+        let detail_row = narrow
+            .iter()
+            .position(|row| row.contains("Type to filter"))
+            .expect("filter row")
+            + 1;
+        let detail = narrow
+            .get(detail_row)
+            .expect("detail row")
+            .trim_end_matches(['█', '│', '┃', ' '])
+            .trim()
+            .to_string();
+        assert!(
+            description.starts_with(&detail) && !detail.is_empty(),
+            "the narrow detail row must still be the description: {detail:?}"
+        );
+    }
+
+    /// Workspace commands declare their own usage in front matter; the row
+    /// reads it from the same place the built-ins read theirs.
+    #[test]
+    fn a_workspace_command_states_its_declared_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("shipit.md"),
+            "---\ndescription: Ship the branch\nargument-hint: <environment>\n---\nbody",
+        )
+        .unwrap();
+
+        let view = HelpView::new_for_workspace(Locale::En, tmp.path(), &[]);
+        let entry = view
+            .entries
+            .iter()
+            .find(|entry| entry.label == "/shipit")
+            .expect("workspace command row");
+        assert_eq!(entry.usage.as_deref(), Some("/shipit <environment>"));
     }
 
     #[test]
@@ -1790,7 +2150,7 @@ mod tests {
 
     #[test]
     fn render_includes_help_chrome_for_empty_filter() {
-        let view = HelpView::new();
+        let view = view_with_catalog_open();
         let area = Rect::new(0, 0, 96, 32);
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
@@ -1802,9 +2162,15 @@ mod tests {
             dump.contains("Type to filter"),
             "missing filter prompt:\n{dump}"
         );
+        // Help opens on the curated set with the catalog folded beneath it,
+        // so both group headings are part of the chrome a user always sees.
         assert!(
-            dump.contains("Slash commands"),
-            "missing slash-command section heading:\n{dump}"
+            dump.contains("Common commands"),
+            "missing curated-command heading:\n{dump}"
+        );
+        assert!(
+            dump.contains("All commands"),
+            "missing command-catalog heading:\n{dump}"
         );
         // Footer hint should advertise close key on the bottom border.
         assert!(
@@ -2081,7 +2447,7 @@ mod tests {
     #[test]
     fn right_expands_and_left_collapses_a_focused_header() {
         let mut view = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst);
-        let group_key = "cmd".to_string();
+        let group_key = "cmd:all".to_string();
         assert!(view.group_is_collapsed(&group_key));
         view.focus = Some(HelpHit::Group(group_key.clone()));
 
@@ -2125,12 +2491,12 @@ mod tests {
     fn search_unfolds_collapsed_groups() {
         let mut view = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst);
         assert!(
-            view.group_is_collapsed("cmd"),
+            view.group_is_collapsed("cmd:all"),
             "slash commands start collapsed on the shortcuts surface"
         );
         type_filter(&mut view, "/mode");
         assert!(
-            !view.group_is_collapsed("cmd"),
+            !view.group_is_collapsed("cmd:all"),
             "a search query must reveal matching groups"
         );
         assert!(
@@ -2145,7 +2511,7 @@ mod tests {
         let view = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst)
             .with_groups_expanded(true);
         assert!(
-            !view.group_is_collapsed("cmd"),
+            !view.group_is_collapsed("cmd:all"),
             "help_expand_groups must start with slash commands visible"
         );
         assert!(

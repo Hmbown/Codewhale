@@ -21,7 +21,13 @@ import {
   stripGroupPrefix,
   ThreadStore
 } from "./lib.mjs";
-import { createRuntimeClient, readJsonSafe, readSse } from "../../bridge-core/src/lib.mjs";
+import {
+  ApprovalOwnershipError,
+  createRuntimeClient,
+  decideApproval as decideRuntimeApproval,
+  readJsonSafe,
+  readSse
+} from "../../bridge-core/src/lib.mjs";
 
 /** Map of chatId -> latest pending approval info for natural-language approval. */
 const pendingApprovals = new Map();
@@ -185,19 +191,19 @@ async function handleCommand(chatId, command, frame) {
       return;
     case "prompt":
       // Check if this is a natural-language approval/deny response
+      // This map supplies an approval id for convenience only. Runtime's
+      // pending turn and its durable initiating human still decide authority.
       if (pendingApprovals.has(chatId)) {
         const pending = pendingApprovals.get(chatId);
         if (Date.now() - pending.timestamp < config.approvalTimeoutMs) {
           if (isApprovalResponse(action.prompt)) {
             const action2 = { kind: "approval", decision: "allow", approvalId: pending.approvalId };
-            await decideApproval(chatId, action2, frame);
-            pendingApprovals.delete(chatId);
+            if (await decideApproval(chatId, action2, frame)) pendingApprovals.delete(chatId);
             return;
           }
           if (isDenyResponse(action.prompt)) {
             const action2 = { kind: "approval", decision: "deny", approvalId: pending.approvalId };
-            await decideApproval(chatId, action2, frame);
-            pendingApprovals.delete(chatId);
+            if (await decideApproval(chatId, action2, frame)) pendingApprovals.delete(chatId);
             return;
           }
         }
@@ -241,11 +247,17 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   return state;
 }
 
+function turnActor(identity) {
+  return identity?.userId ? `wecom-user:${identity.userId}` : "";
+}
+
 async function runPrompt(chatId, prompt, frame) {
   if (!prompt.trim()) {
     await replyText(frame, helpText());
     return;
   }
+  const actorId = turnActor(incomingIdentity(frame.body));
+  if (!actorId) throw new ApprovalOwnershipError("turn needs its initiating human");
   const state = await ensureThread(chatId);
   const effectiveModel = state?.model || config.model;
   const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(state.threadId)}`);
@@ -280,6 +292,11 @@ async function runPrompt(chatId, prompt, frame) {
   );
 
   const turnId = turnResponse.turn?.id;
+  // A turn the Runtime accepted keeps streaming even when its origin cannot be
+  // recorded; its approvals then fail closed and are decided from the TUI.
+  if (turnId && actorId) {
+    await threadStore.recordTurnOrigin(chatId, state.threadId, turnId, actorId);
+  }
   await threadStore.patchChat(chatId, {
     activeTurnId: turnId || null,
     lastSeq: sinceSeq,
@@ -488,16 +505,22 @@ async function compactThread(chatId, frame) {
 
 async function decideApproval(chatId, action, frame) {
   const decision = action.decision;
-  const { approvalId, remember } =
+  // WeCom approvals are text: a session-wide "remember" is never taken from
+  // a chat message.
+  const { approvalId } =
     action.approvalId != null ? action : parseApprovalDecisionArgs(action.args);
+  const remember = false;
   if (!approvalId) {
-    await replyText(frame, `Usage: /${decision} <approval_id>${decision === "allow" ? " [remember]" : ""}`);
-    return;
+    await replyText(frame, `Usage: /${decision} <approval_id>`);
+    return false;
   }
-  await runtimeJson(`/v1/approvals/${encodeURIComponent(approvalId)}`, {
-    method: "POST",
-    body: { decision, remember }
-  });
+  try {
+    await decideRuntimeApproval(runtimeJson, { store: threadStore, chatId, actorId: turnActor(incomingIdentity(frame.body)), approvalId, decision, remember });
+  } catch (error) {
+    if (!(error instanceof ApprovalOwnershipError)) throw error;
+    await replyText(frame, `Approval ${approvalId} is not waiting in this chat.`);
+    return false;
+  }
 
   // Clear activeTurnId so the user can send follow-up messages
   // immediately instead of being blocked by activeTurnBlock
@@ -508,6 +531,7 @@ async function decideApproval(chatId, action, frame) {
   });
 
   await replyText(frame, `Approval ${approvalId}: ${decision}${remember ? " and remember" : ""}`);
+  return true;
 }
 
 async function setChatModel(chatId, modelName, frame) {

@@ -1,0 +1,32 @@
+{
+  "hooks": [
+    {
+      "env": {
+        "CODEWHALE_SESSION_ID": "<HOOK_SESSION>",
+        "CODEWHALE_TOOL_CALL_ID": "call_hook_read",
+        "DEEPSEEK_SESSION_ID": "<HOOK_SESSION>",
+        "DEEPSEEK_TOOL_CALL_ID": "call_hook_read",
+        "DEEPSEEK_TOOL_NAME": "read_file",
+        "DEEPSEEK_TOOL_RESULT": "Failed to execute tool: no such file: missing.md",
+        "DEEPSEEK_TOOL_SUCCESS": "false",
+        "DEEPSEEK_WORKSPACE": "<WORKSPACE>"
+      },
+      "name": "observer",
+      "ran": true,
+      "stdin": ""
+    }
+  ],
+  "outcome": {
+    "observers": [
+      {
+        "background": false,
+        "error": null,
+        "exit_code": 0,
+        "name": "observer",
+        "stderr": "",
+        "stdout": "",
+        "success": true
+      }
+    ]
+  }
+}

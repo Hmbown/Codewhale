@@ -100,6 +100,24 @@ fn tool_context_keeps_execution_state_grouped_and_value_cloned() {
 }
 
 #[test]
+fn legacy_auto_approve_bit_folds_into_the_context_posture() {
+    let plain = ToolContext::new(".");
+    assert_eq!(
+        plain.approval_mode,
+        codewhale_execpolicy::ApprovalMode::Suggest,
+        "a context with no authority runs under Ask"
+    );
+
+    let yolo = ToolContext::with_auto_approve(".", false, "notes.md", "mcp.json", true);
+    assert!(yolo.auto_approve);
+    assert_eq!(
+        yolo.approval_mode,
+        codewhale_execpolicy::ApprovalMode::Bypass,
+        "a set auto-approve bit is the Full Access posture"
+    );
+}
+
+#[test]
 fn tool_context_top_level_stays_slim_as_services_grow() {
     assert!(
         std::mem::size_of::<ToolContext>()
@@ -525,4 +543,230 @@ fn test_tool_error_display() {
 fn test_approval_requirement_default() {
     let level = ApprovalRequirement::default();
     assert_eq!(level, ApprovalRequirement::Auto);
+}
+
+#[test]
+fn test_resolve_home_path_exact_prefixes() {
+    let fake_home = PathBuf::from("/fake/user/home");
+
+    // Exact ~ and ~/ prefixes resolve
+    assert_eq!(
+        resolve_home_path_with("~", || Some(fake_home.clone())).unwrap(),
+        Some(fake_home.clone())
+    );
+    assert_eq!(
+        resolve_home_path_with("~/", || Some(fake_home.clone())).unwrap(),
+        Some(fake_home.clone())
+    );
+    assert_eq!(
+        resolve_home_path_with("~//", || Some(fake_home.clone())).unwrap(),
+        Some(fake_home.clone())
+    );
+    assert_eq!(
+        resolve_home_path_with("~/file.txt", || Some(fake_home.clone())).unwrap(),
+        Some(fake_home.join("file.txt"))
+    );
+    assert_eq!(
+        resolve_home_path_with("~/a/b/c.md", || Some(fake_home.clone())).unwrap(),
+        Some(fake_home.join("a/b/c.md"))
+    );
+
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            resolve_home_path_with(r"~\", || Some(fake_home.clone())).unwrap(),
+            Some(fake_home.clone())
+        );
+        assert_eq!(
+            resolve_home_path_with(r"~\file.txt", || Some(fake_home.clone())).unwrap(),
+            Some(fake_home.join("file.txt"))
+        );
+    }
+
+    // Must NOT expand ~otheruser, shell variables, command substitutions, globs, or literals
+    assert_eq!(
+        resolve_home_path_with("~otheruser", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_home_path_with("~otheruser/file", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_home_path_with("./~/file", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_home_path_with("$HOME/file", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_home_path_with("`whoami`/file", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_home_path_with("~*", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_home_path_with("regular/path", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_home_path_with("/absolute/path", || Some(fake_home.clone())).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_resolve_home_path_unknown_home_fails_explicitly_without_cwd_guessing() {
+    let err = resolve_home_path_with("~", || None).expect_err("unknown home must fail explicitly");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("user home directory could not be determined"),
+        "error message must be explicit: {msg}"
+    );
+
+    let err = resolve_home_path_with("~/nested/file.txt", || None)
+        .expect_err("unknown home must fail explicitly");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("user home directory could not be determined"),
+        "error message must be explicit: {msg}"
+    );
+}
+
+#[test]
+fn test_tool_context_resolve_path_home_prefix_inside_workspace() {
+    // The fixture lives inside the home, so the home must be the test's own.
+    let _sealed = crate::test_support::SealedHome::new();
+    let real_home = crate::config::effective_home_dir().expect("test home must be available");
+    let home_temp = tempfile::Builder::new()
+        .prefix("cw_spec_test_home_")
+        .tempdir_in(&real_home)
+        .expect("create fixture inside test home");
+
+    let test_file = home_temp.path().join("inside.txt");
+    std::fs::write(&test_file, "inside workspace").expect("write test file");
+
+    let rel = test_file
+        .strip_prefix(&real_home)
+        .expect("fixture is below test home");
+    let tilde_path = format!("~/{}", rel.to_string_lossy());
+
+    let ctx = ToolContext::new(home_temp.path().to_path_buf());
+    let resolved = ctx
+        .resolve_path(&tilde_path)
+        .expect("home path inside workspace should resolve");
+
+    let expected = test_file
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path(&test_file));
+    assert_eq!(resolved, expected);
+}
+
+#[test]
+fn test_tool_context_resolve_path_home_prefix_restricted_refusal() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let ctx = ToolContext::new(workspace.path().to_path_buf());
+
+    // A home path outside workspace without trusted external path or trust mode must be refused
+    let err = ctx
+        .resolve_path("~/some_untrusted_file_never_present_12345.txt")
+        .expect_err("home path outside workspace must error");
+    assert!(matches!(err, ToolError::PathEscape { .. }));
+}
+
+#[test]
+fn test_tool_context_resolve_path_home_prefix_trusted_external_path() {
+    // The fixture lives inside the home, so the home must be the test's own.
+    let _sealed = crate::test_support::SealedHome::new();
+    let real_home = crate::config::effective_home_dir().expect("test home must be available");
+    let trusted_dir = tempfile::Builder::new()
+        .prefix("cw_spec_trusted_home_")
+        .tempdir_in(&real_home)
+        .expect("create fixture inside test home");
+    let trusted_file = trusted_dir.path().join("shared.md");
+    std::fs::write(&trusted_file, "shared content").expect("write trusted file");
+
+    let rel = trusted_file
+        .strip_prefix(&real_home)
+        .expect("fixture is below test home");
+    let tilde_path = format!("~/{}", rel.to_string_lossy());
+
+    let workspace = tempdir().expect("workspace tempdir");
+    let canonical_trusted = trusted_dir
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| trusted_dir.path().to_path_buf());
+    let ctx = ToolContext::new(workspace.path().to_path_buf())
+        .with_trusted_external_paths(vec![canonical_trusted]);
+
+    let resolved = ctx
+        .resolve_path(&tilde_path)
+        .expect("trusted external home path should resolve");
+    assert_eq!(resolved, trusted_file.canonicalize().unwrap());
+}
+
+#[test]
+fn test_tool_context_resolve_path_literal_tilde_in_workspace() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let literal_tilde = workspace.path().join("~");
+    std::fs::create_dir_all(&literal_tilde).expect("create literal ~ dir");
+    let literal_file = literal_tilde.join("nested.txt");
+    std::fs::write(&literal_file, "literal tilde data").expect("write literal");
+
+    let ctx = ToolContext::new(workspace.path().to_path_buf());
+    let resolved = ctx
+        .resolve_path("./~/nested.txt")
+        .expect("literal ./~/ path must resolve inside workspace");
+    assert_eq!(resolved, literal_file.canonicalize().unwrap());
+}
+
+#[test]
+fn test_tool_context_resolve_path_no_shell_expansion() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let ctx = ToolContext::new(workspace.path().to_path_buf());
+
+    // $HOME/file should NOT expand shell env var, but be treated relative to workspace
+    let resolved = ctx
+        .resolve_path("$HOME/file.txt")
+        .expect("should treat as workspace child");
+    assert!(
+        resolved.starts_with(
+            workspace
+                .path()
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.path().to_path_buf())
+        )
+    );
+    assert!(resolved.to_string_lossy().contains("$HOME"));
+
+    // ~otheruser should NOT expand other user home, but be treated relative to workspace
+    let resolved_other = ctx
+        .resolve_path("~otheruser/file.txt")
+        .expect("should treat as workspace child");
+    assert!(resolved_other.to_string_lossy().contains("~otheruser"));
+}
+
+#[test]
+fn delegated_shell_is_refused_outright_when_the_session_lacks_it() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut ctx = ToolContext::new(workspace.path());
+
+    // Leaving the flag out would fall back to the host default, which may
+    // allow shell: a session without full shell must store an explicit "no".
+    ctx.shell_policy = crate::worker_profile::ShellPolicy::None;
+    assert_eq!(ctx.cap_delegated_authority(None, None, None).0, Some(false));
+    assert_eq!(
+        ctx.cap_delegated_authority(Some(true), None, None).0,
+        Some(false)
+    );
+
+    ctx.shell_policy = crate::worker_profile::ShellPolicy::Full;
+    assert_eq!(ctx.cap_delegated_authority(None, None, None).0, None);
+    assert_eq!(
+        ctx.cap_delegated_authority(Some(true), None, None).0,
+        Some(true)
+    );
 }

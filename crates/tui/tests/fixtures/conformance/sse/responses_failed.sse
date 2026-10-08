@@ -1,0 +1,12 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_conf_err","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_conf_err","role":"assistant","content":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_conf_err","output_index":0,"content_index":0,"delta":"Part"}
+
+event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_conf_err","status":"failed","error":{"code":"server_error","message":"The server had an error while processing your request."}}}
+

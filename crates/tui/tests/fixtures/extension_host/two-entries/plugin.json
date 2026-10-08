@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "two-entries",
+  "version": "0.1.0",
+  "description": "Test fixture: one plugin whose manifest declares two native entries, a tool in the first and a command and a second tool in the second.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "paths": ["tools.mjs", "commands.mjs"]
+      }
+    }
+  }
+}

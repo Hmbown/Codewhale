@@ -1,0 +1,57 @@
+{
+  "server_received": [
+    {
+      "arguments": {
+        "target": "fixture"
+      },
+      "method": "tools/call",
+      "name": "act"
+    }
+  ],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Do the one thing.",
+          "input_schema": {
+            "properties": {
+              "target": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "mcp_conformance_act"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "acted",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_act"
+    }
+  ]
+}

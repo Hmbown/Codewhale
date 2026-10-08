@@ -4,37 +4,48 @@ members = [
     "crates/app-server",
     "crates/build-support",
     "crates/cli",
+    "crates/cloud-facts",
     "crates/command-contract",
     "crates/config",
     "crates/core",
     "crates/execpolicy",
     "crates/hooks",
     "crates/lane",
+    "crates/localization",
     "crates/mcp",
+    "crates/memory",
+    "crates/models",
+    "crates/palette",
     "crates/paths",
     "crates/protocol",
     "crates/release",
+    "crates/runtime",
     "crates/secrets",
+    "crates/sanitize",
     "crates/state",
     "crates/telemetry",
     "crates/tools",
     "crates/tui",
     "crates/workflow",
     "crates/workflow-js",
+    "tests/portable-debug-diagnostics",
+    "tests/portable-session",
+    "tests/portable-config-policy",
 ]
+exclude = ["vendor/codewhale-ratatui"]
 default-members = ["crates/cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.11"
+version = "0.10.1"
 edition = "2024"
-# Rust 1.88 stabilized `let_chains` in `if`/`while` conditions, which the
-# codebase relies on extensively. Cargo enforces this so users on older
-# toolchains get a clear "package requires rustc 1.88+" error instead of a
-# confusing E0658 from rustc.
-rust-version = "1.88"
+# The floor is what CI's MSRV job builds (1.89): Rust 1.88 stabilized the
+# `let_chains` the codebase relies on, but a locked dependency
+# (serde-saphyr) needs 1.89. Cargo enforces this so users on older toolchains
+# get a clear "package requires rustc 1.89+" error.
+rust-version = "1.89"
 license = "MIT"
-repository = "https://github.com/Hmbown/CodeWhale"
+repository = "https://github.com/codewhale-hq/CodeWhale"
 
 # Record the policy CI already applies via `RUSTFLAGS: -Dwarnings`.
 # Member crates opt in with `[lints] workspace = true`. This does not add
@@ -46,24 +57,27 @@ warnings = "deny"
 [workspace.dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"
-axum = { version = "0.8.5", features = ["json"] }
+axum = { version = "0.8.5", features = ["json", "ws"] }
 chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
 clap_complete = "4.5"
-dirs = "6.0.0"
+dirs = "7.0.0"
 encoding_rs = "0.8.35"
-# Pinned to the jsonschema line schemaui 0.12 requires (^0.46) so the graph
-# carries one jsonschema/jsonschema-regex/referencing/fancy-regex stack.
-# Move both together when schemaui catches up (dependabot: keep in step).
-jsonschema = { version = "0.46", default-features = false }
+# Users: crates/workflow-js and the extension host in crates/tui (schemaui is
+# gone); keep the graph on one jsonschema/jsonschema-regex/referencing/
+# fancy-regex stack.
+jsonschema = { version = "0.57", default-features = false }
+libc = "0.2"
 reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls-no-provider", "socks"] }
 # NOT "parallel": the Workflow VM stays single-threaded and bridges to the
 # multi-thread engine over channels (see crates/workflow-js).
-rquickjs = { version = "0.12", features = ["futures"] }
+rquickjs = { version = "0.14", features = ["futures"] }
 rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+# DSH bundle import: event-level parsing so aliases and explicit tags can be refused.
+yaml-rust2 = { version = "0.13.0", default-features = false }
 semver = "1.0.28"
 thiserror = "2.0"
 tempfile = "3.27"
@@ -77,6 +91,12 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.11", features = ["v4"] }
 mimalloc = { version = "0.1", default-features = false }
+# Off-by-default alternative to mimalloc behind the `rusty-alloc` feature in
+# codewhale-tui / codewhale-cli (#5872): the pure-Rust mimalloc v2.4.5
+# remake — no C compiler, no build script on that path. `rusty_alloc-api` is
+# the crate's documented surface; it pulls the `rusty_alloc` core transitively
+# at the same version.
+rusty_alloc-api = "1.1.6"
 
 # The everyday `--release` gate (AGENTS.md pre-push build): optimized but
 # fast to produce. Shipping artifacts use `--profile dist` below — fat LTO on
@@ -116,3 +136,9 @@ codegen-units = 1
 # them as 2 columns, causing cell-offset rendering glitches. (#4479)
 [patch.crates-io]
 unicode-width = { path = "patches/unicode-width-0.2.2" }
+# Windows Terminal paste dropped every non-BMP character (emoji): upstream pairs a
+# surrogate half with its own key-up record. See patches/crossterm-0.29.0 parse.rs.
+# Same change as crossterm-rs/crossterm#1073 (open); drop this once a release carries it.
+# Also drops one redundant pair of parentheses and allows upstream warnings, because a
+# path crate is built under our `-D warnings`.
+crossterm = { path = "patches/crossterm-0.29.0" }

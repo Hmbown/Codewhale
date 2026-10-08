@@ -1,0 +1,31 @@
+.body { padding-block-end: var(--section-gap); }
+.local { color: var(--muted); margin-block-end: 2rem; }
+.grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: clamp(2rem, 5vw, 5rem); align-items: start; }
+.form { display: grid; gap: .7rem; }
+.form > label:not(:first-child) { margin-block-start: .9rem; }
+.form label { display: block; font-weight: 600; }
+.form input, .form select { width: 100%; min-width: 0; min-height: 48px; font: inherit; font-size: 1rem; padding: .7rem .8rem; border: 1px solid var(--line-strong); border-radius: var(--radius-control); color: var(--text); background: var(--surface); }
+.form input:focus-visible, .form select:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.form input[aria-invalid="true"] { border-color: var(--danger); }
+.form button { margin-block-start: 1rem; justify-self: start; }
+.pair { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 1rem; margin-block-start: .9rem; }
+.pair label { margin-block-end: .7rem; }
+.aside { min-width: 0; }
+.print { display: flex; flex-direction: column; align-items: center; gap: .8rem; padding: 2rem 1.5rem; background: var(--ocean-floor); color: white; border: 1px solid var(--ocean-line); border-radius: var(--radius-sheet); text-align: center; }
+.caption { font-size: var(--text-ui); color: #b3c5e8; }
+.print img { filter: brightness(0) invert(1); }
+.printPhrase { margin: .5rem 0; font-size: clamp(1.35rem, 2.8vw, 2rem); font-weight: 650; line-height: 1.4; overflow-wrap: anywhere; }
+.brand { font-weight: 600; }
+.site { font-size: var(--text-caption); color: #b3c5e8; }
+.cost { margin-block-start: 2rem; }
+.cost h2, .draft h2 { font-size: var(--text-title); margin-block-end: .5rem; }
+.cost p, .draft p { color: var(--muted); line-height: 1.6; }
+.cost dl, .draft dl { margin: 1.3rem 0; }
+.cost dl > div, .draft dl > div { display: flex; justify-content: space-between; gap: 1rem; padding-block: .7rem; border-bottom: 1px solid var(--line); }
+.cost dd { margin: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.cost .total { border-top: 1px solid var(--line-strong); border-bottom: 0; margin-block-start: .5rem; font-weight: 700; font-size: var(--text-title); }
+.note { font-size: var(--text-ui); }
+.error { color: var(--danger); font-weight: 600; }
+.draft { margin-block-start: 3rem; padding: 2rem; border: 1px solid var(--line-strong); border-radius: var(--radius-sheet); background: var(--panel); }
+.draft dd { margin: 0; max-width: 70%; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } .draft { padding: 1.25rem; } .cost dl > div { flex-wrap: wrap; } .cost dd { white-space: normal; } }

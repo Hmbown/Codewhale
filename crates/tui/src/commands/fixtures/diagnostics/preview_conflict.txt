@@ -1,0 +1,5 @@
+command: /preview-request json base-prompt
+is_error: false
+message:
+`base-prompt` cannot be combined with JSON. Usage: /preview-request [json] [--prompt <text>] | base-prompt  (flags first; --prompt takes the rest)
+action: <none>

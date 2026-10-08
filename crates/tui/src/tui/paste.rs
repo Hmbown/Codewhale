@@ -12,6 +12,56 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::app::{App, looks_like_slash_command_input};
 use super::paste_burst::CharDecision;
 
+/// Terminals known to deliver `Event::Paste` for a real paste.
+///
+/// `bracketed_paste_seen` alone waits for proof: it only flips after the
+/// person has pasted once, so every session ran the rapid-keystroke
+/// heuristic until then. That heuristic re-arms a ~120 ms Enter-suppression
+/// window on each character, and the composer's send cue honestly reports it
+/// — so the `[↵]` control strobed dim-to-bold once per keystroke while
+/// someone typed at an ordinary pace. Reported from a live session.
+///
+/// Naming the terminals we have verified is deliberately narrower than
+/// trusting `EnableBracketedPaste` to have succeeded: `execute!` returning
+/// `Ok` only means the escape was written, not that the terminal honors it,
+/// and a terminal that ignores it would submit on a pasted newline. That is
+/// data loss, so the fallback stays for everything not on this list.
+/// Windows input keeps the fallback until an actual `Event::Paste`: Windows
+/// Terminal can advertise bracketed paste while the input path still delivers
+/// individual key events (#6427). Its session marker is not delivery proof.
+///
+/// Known limitation: a non-Windows terminal that sets one of the remaining
+/// identifiers while not honoring bracketed paste would still lose the guard.
+pub(crate) fn terminal_delivers_bracketed_paste() -> bool {
+    use std::io::IsTerminal;
+
+    // Only a real interactive terminal gets the trust. Under `cargo test`
+    // stdout is captured, so every unit test keeps the heuristic and stays
+    // hermetic regardless of the `TERM_PROGRAM` the developer happens to be
+    // running in — the first version of this read the ambient environment
+    // and broke five paste tests on a Mac running Terminal.app.
+    terminal_identity_allows_paste_bypass(
+        std::io::stdout().is_terminal(),
+        cfg!(windows) || std::env::var_os("WT_SESSION").is_some(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    )
+}
+
+fn terminal_identity_allows_paste_bypass(
+    interactive: bool,
+    windows_input: bool,
+    program: Option<&str>,
+) -> bool {
+    interactive
+        && !windows_input
+        && program.is_some_and(|program| {
+            matches!(
+                program.trim(),
+                "ghostty" | "Ghostty" | "iTerm.app" | "WezTerm" | "Apple_Terminal"
+            )
+        })
+}
+
 /// Process a key in the context of paste-burst detection. Returns `true`
 /// when the key was fully handled by the paste machinery (caller skips
 /// further input handling); `false` when the key still needs the normal
@@ -26,7 +76,7 @@ pub fn handle_paste_burst_key(app: &mut App, key: &KeyEvent, now: Instant) -> bo
     // IME commits / autocomplete on terminals with reliable bracketed
     // paste (the dominant case on iTerm2 / Ghostty / WezTerm / Windows
     // Terminal).
-    if app.bracketed_paste_seen {
+    if app.bracketed_paste_seen || app.bracketed_paste_trusted {
         return false;
     }
 
@@ -136,6 +186,69 @@ fn in_command_context(app: &App) -> bool {
 }
 
 #[cfg(test)]
+mod bracketed_paste_trust_tests {
+    use super::{terminal_delivers_bracketed_paste, terminal_identity_allows_paste_bypass};
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    /// Under `cargo test` stdout is captured, so the probe refuses to trust
+    /// anything — the heuristic stays on and every existing paste test keeps
+    /// the behaviour it was written against, whatever terminal the developer
+    /// is in. This is the hermeticity the first version of this check broke.
+    #[test]
+    fn a_captured_stdout_is_never_trusted() {
+        let _env = lock_test_env();
+        for program in ["ghostty", "iTerm.app", "WezTerm", "some-new-terminal"] {
+            let _guard = EnvVarGuard::set("TERM_PROGRAM", program);
+            assert!(
+                !terminal_delivers_bracketed_paste(),
+                "{program} must not be trusted without a real terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_input_requires_observed_paste_even_with_a_known_terminal_identity() {
+        for program in [
+            None,
+            Some("Windows Terminal"),
+            Some("iTerm.app"),
+            Some("ghostty"),
+        ] {
+            assert!(
+                !terminal_identity_allows_paste_bypass(true, true, program),
+                "Windows input must retain the fallback before Event::Paste: {program:?}"
+            );
+        }
+        assert!(terminal_identity_allows_paste_bypass(
+            true,
+            false,
+            Some("iTerm.app")
+        ));
+        assert!(!terminal_identity_allows_paste_bypass(
+            false,
+            false,
+            Some("iTerm.app")
+        ));
+        assert!(!terminal_identity_allows_paste_bypass(
+            true,
+            false,
+            Some("unknown")
+        ));
+    }
+
+    #[test]
+    fn windows_terminal_is_trusted_through_its_session_marker() {
+        let _env = lock_test_env();
+        let _program = EnvVarGuard::remove("TERM_PROGRAM");
+        let _wt = EnvVarGuard::set("WT_SESSION", "abc-123");
+        assert!(
+            !terminal_delivers_bracketed_paste(),
+            "still gated on a real terminal, which a test never has"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -148,13 +261,88 @@ mod tests {
         let options = TuiOptions {
             ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
-        let mut app = App::new(options, &Config::default());
-        app.use_paste_burst_detection = true;
-        app
+        App::new(options, &Config::default())
     }
 
     fn plain(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn requested_bracketed_paste_keeps_raw_multiline_fallback_until_verified() {
+        for pasted in [
+            "first line\nsecond line\nthird line",
+            "多行粘贴测试\n行1\n行2\n行3",
+        ] {
+            let mut app = test_app();
+            assert!(app.use_bracketed_paste);
+            assert!(!app.bracketed_paste_seen);
+            let t0 = Instant::now();
+            for (i, ch) in pasted.chars().enumerate() {
+                let key = if ch == '\n' {
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                } else {
+                    plain(ch)
+                };
+                assert!(
+                    handle_paste_burst_key(&mut app, &key, t0 + Duration::from_millis(i as u64)),
+                    "raw paste {ch:?} must not reach the submit path"
+                );
+            }
+            app.flush_paste_burst_if_due(t0 + Duration::from_secs(1));
+            assert_eq!(app.input, pasted);
+            assert!(
+                !handle_paste_burst_key(
+                    &mut app,
+                    &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    t0 + Duration::from_secs(2),
+                ),
+                "a deliberate Enter after the paste must reach the submit path"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_terminal_raw_five_line_paste_never_reaches_submit() {
+        // #6427: test the interactive startup decision, not captured stdout,
+        // then send the raw keys that the Windows input backend can produce.
+        for pasted in [
+            "first line\nsecond line\nthird line\nfourth line\nfifth line",
+            "第一行\n第二行\n第三行\n第四行\n第五行",
+        ] {
+            let mut app = test_app();
+            app.bracketed_paste_trusted =
+                terminal_identity_allows_paste_bypass(true, true, Some("iTerm.app"));
+            let start = Instant::now();
+            for (index, ch) in pasted.chars().enumerate() {
+                let key = if ch == '\n' {
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                } else {
+                    plain(ch)
+                };
+                assert!(
+                    handle_paste_burst_key(
+                        &mut app,
+                        &key,
+                        start + Duration::from_millis(index as u64),
+                    ),
+                    "raw pasted {ch:?} must not reach submit"
+                );
+            }
+            app.flush_paste_burst_if_due(start + Duration::from_secs(1));
+            assert_eq!(app.input, pasted);
+            assert!(!handle_paste_burst_key(
+                &mut app,
+                &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                start + Duration::from_secs(2),
+            ));
+            app.bracketed_paste_seen = true;
+            assert!(!handle_paste_burst_key(
+                &mut app,
+                &plain('x'),
+                start + Duration::from_secs(3),
+            ));
+        }
     }
 
     /// Y-7 regression (2026-08-31 QA, `tui-swarm-head`): a scripted driver

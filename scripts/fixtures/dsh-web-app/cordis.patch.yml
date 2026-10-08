@@ -1,0 +1,544 @@
+# The dsh-web-app bundle patch: the browser surface over the dsh-base layer.
+# Applied after dsh-base's insert; rows here override base rows by id, with
+# the profile's own cordis.patch.yml and any --patch overlays still to come.
+#
+# A patch replaces the targeted row's whole `config`, so each row below
+# restates every key it owns.
+#
+# The web-startup plugin injects `cmdlineArgs` and provides `webStartup` as an
+# ordinary Cordis service. Rows configured from flags inject that service, so
+# Loader resolves their expressions only after it exists. The web runtime then
+# provides bind-dependent `webRuntime` values to the trust fence.
+# `dsh --profile web --help` provides neither service, so no server binds.
+
+# ── surface-specific values the base deliberately omits ─────────────────────
+
+- id: system-prompt
+  config:
+    personaSuffix: Your working directory is {{cwd}}.
+    personaPrefix: >-
+      You are a coding agent powered by the {{model}} model.
+
+# Full-text session search is opt-in (the base row's `openAt: never`). This
+# restatement keeps the Web values on one ephemeral in-memory index; a
+# deployment enabling content search overrides `openAt` to `first-search` in a
+# later patch layer, which defers the node:sqlite import and in-memory handle
+# to the first search so Node 22 startup stays quiet.
+- id: session-query-sqlite
+  config:
+    path: ':memory:'
+    openAt: never
+
+- id: tools
+  config:
+    # TEMPORARY workaround: DSH_TOOLS_MODE (native|ptc|both) opts a whole dsh
+    # process into PTC mode while per-session tool-presentation selection is being
+    # designed; unset keeps the schema default (native). Remove the env seam
+    # once the web UI owns the choice per session.
+    mode: !!js process.env.DSH_TOOLS_MODE
+
+# ── web-only host rows, the transport layer, and the browser roster ─────────
+
+# `dsh.client` rows are the browser roster the modules node half scans into
+# window.__DSH_BOOT__; the modules row is simultaneously a host row.
+- insert:
+    # Host-owned opt-in sampled when a new Web session receives its preset
+    # delegation tools. The Plugins page edits this settings namespace.
+    - id: subagent-model-selection-settings
+      name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+
+    - id: message-feedback
+      name: '@deepseek-ai/dsh-message-feedback'
+      config:
+        maxNoteBytes: 8192
+
+    # Browser Session export: `/export` command plus the shared download dialog.
+    - id: session-log-download
+      name: '@deepseek-ai/dsh-session-log-export'
+
+    # Session-header "Open In..." split button over the host application
+    # resolution (macOS/Windows/Linux; a host with no resolved application
+    # renders no button). Two halves: the host routes and the browser surface.
+    - id: open-in-app
+      name: '@deepseek-ai/dsh-host-open-in-app'
+      config:
+        probeTimeoutMs: 10000
+        iconTimeoutMs: 10000
+        launchWatchMs: 1000
+
+    - id: ui-open-in-app
+      name: '@deepseek-ai/dsh-client-ui-open-in-app'
+
+    - id: workspace
+      name: '@deepseek-ai/dsh-workspace'
+
+    - id: session-reference
+      name: '@deepseek-ai/dsh-session-reference'
+
+    - id: file-reference-local
+      name: '@deepseek-ai/dsh-file-reference-local'
+
+    # Whole-log turn/step counts for the chat stats strip (the sessionStats
+    # projection key); the projection registry itself is a base-layer row.
+    - id: session-stats
+      name: '@deepseek-ai/dsh-session-stats'
+
+    # Whole-log turn outline for the chat turn rail (the turnOutline
+    # projection key): every turn stays navigable before its events page in.
+    - id: session-turn-outline
+      name: '@deepseek-ai/dsh-session-turn-outline'
+
+    # Resolve bind host, SSH launch, and display once at boot, then mount the
+    # matching dual-face directory picker. Mount -native or -browse directly in
+    # an overlay to pin the interaction.
+    - id: directory-picker
+      name: '@deepseek-ai/dsh-host-directory-picker-auto'
+
+    # Read-only projection of current Loader entries for trusted client RPCs.
+    - id: plugin-inventory
+      name: '@deepseek-ai/dsh-host-plugin-inventory'
+
+    # Session commands, cold reads, and live control over Typert Remote.
+    - id: session-controller
+      name: '@deepseek-ai/dsh-api-session-controller'
+
+    # One background job's observation record streamed over Typert Remote;
+    # the roster rides the session control stream above.
+    - id: job-controller
+      name: '@deepseek-ai/dsh-api-job-controller'
+    # Workspace file service: bounded read, directory listing, and the
+    # agent-write change feed inside the session workspace root.
+    - id: terminal-controller
+      name: '@deepseek-ai/dsh-api-terminal-controller'
+    - id: workspace-files
+      name: '@deepseek-ai/dsh-api-workspace-files'
+
+    # Configuration-surface reads and writes over Typert Remote. Each method
+    # reports an actionable error when its settings-domain provider is absent.
+    - id: ui-settings-account
+      name: '@deepseek-ai/dsh-client-ui-settings-account'
+
+    - id: account-controller
+      name: '@deepseek-ai/dsh-api-account-controller'
+
+    - id: settings-controller
+      name: '@deepseek-ai/dsh-api-settings-controller'
+
+    # Workspace commands and reconnect-safe projection over Typert Remote.
+    - id: workspace-controller
+      name: '@deepseek-ai/dsh-api-workspace-controller'
+
+    - id: cordis-host-runner
+      name: '@deepseek-ai/dsh-cordis-host-runner'
+
+    # The Host inspect providers are process-global: the registry rejects a
+    # duplicate id, so they register here once and every preset's `tool-cordis`
+    # row reads them.
+    - id: cordis-inspect-providers
+      name: '@deepseek-ai/dsh-tool-cordis/host'
+
+    # Ordinary provider for the parsed Web flags. Its plugin-level injection
+    # waits for cmdlineArgs; no launcher metadata or special row kind is needed.
+    - id: web-startup
+      name: '@deepseek-ai/dsh-web-app/startup'
+
+    # ── layer 2: transport/service ──────────────────────────────────────────────
+
+    # Plain route-registration carrier; host and port come from the app's
+    # webStartup provider, with these deployment fallbacks. The dist is served by
+    # the web-runtime row below through the fallback seat.
+    - id: webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      inject: [webStartup]
+      config:
+        host: !!js ctx.webStartup.host ?? '127.0.0.1'
+        port: !!js ctx.webStartup.port ?? 3080
+        compression: gzip
+        compressionLevel: 1
+        compressionThresholdBytes: 1024
+
+    # Web glue owned by this bundle: resolves the built frontend dist (an
+    # assembly fact of dsh-web-app, never user config), mounts the
+    # frontend-static fallback owner, registers the web-surface prompt
+    # section and the bash runtime variable, prints the URL line, and opens the
+    # canonical local URL after the full Loader tree settles and the required-
+    # entry audit passes. The
+    # webStartup provider supplies invocation-only values; after the server binds, this row samples
+    # LAN trust once and provides `webRuntime`. A complete agent-preset persona
+    # suppresses the prompt section for that agent while retaining the host-owned
+    # shell variable.
+    - id: web-runtime
+      name: '@deepseek-ai/dsh-web-app'
+      inject: [webStartup]
+      config:
+        openBrowser: !!js ctx.webStartup.openBrowser
+        printUrl: true
+        surfaceContext: true
+        trustedHosts: !!js ctx.webStartup.trustedHosts
+
+    # The client-plugin reload chain, always mounted: it is idle until a
+    # rebuild watcher (pnpm run dev:web) actually rewrites client bundles. It
+    # is a row rather than a child of web-runtime because its node half is a
+    # client-side package, which a host-side bundle cannot import.
+    - id: client-hmr
+      name: '@deepseek-ai/dsh-client-hmr'
+
+    # ── browser plugin roster (dsh.client rows; node halves are layer-2 hosts) ──
+
+    # Dual-face: the node half scans this tree, composes window.__DSH_BOOT__,
+    # and serves /plugins/<id>/client.js; the browser half is the module table
+    # the shell kernel constructs before cordis exists (adopted as a plugin
+    # entry by the kernel, never fetched).
+    - id: modules
+      name: '@deepseek-ai/dsh-client-modules'
+
+    # Owns both ends of the web transport: node half binds the gateway to the
+    # webserver under /api; browser half is the fetch/SSE client.
+    - id: connection
+      name: '@deepseek-ai/dsh-client-connection'
+      inject: [webRuntime]
+      config:
+        # LAN literals derived from the active bind plus --trusted-host extras.
+        # A deployment adding authorities keeps this expression and concatenates
+        # its literals, for example: ['app.internal', ...ctx.webRuntime.trustedHosts].
+        trustedHosts: !!js ctx.webRuntime.trustedHosts
+
+    # Raw Blob and ReadableStream uploads run independently of Connection's
+    # RPC and generation service.
+    - id: file-upload
+      name: '@deepseek-ai/dsh-client-file-upload'
+
+    - id: api-remotes
+      name: '@deepseek-ai/dsh-api-remotes'
+
+    - id: cordis-client-runner
+      name: '@deepseek-ai/dsh-cordis-client-runner'
+
+    - id: ui-theme
+      name: '@deepseek-ai/dsh-client-ui-theme'
+
+    - id: locale
+      name: '@deepseek-ai/dsh-client-locale'
+
+    - id: ui-layout
+      name: '@deepseek-ai/dsh-client-ui-layout'
+
+    - id: ui-renderer
+      name: '@deepseek-ai/dsh-client-ui-renderer'
+
+    - id: ui-session
+      name: '@deepseek-ai/dsh-client-ui-session'
+
+    # Unified resource model: protocol providers behind the useResource hook.
+    - id: resources
+      name: '@deepseek-ai/dsh-client-resources'
+
+    - id: ui-sidebar
+      name: '@deepseek-ai/dsh-client-ui-sidebar'
+
+    # The right Sidebar: one docking surface per session over ui-dockkit.
+    - id: ui-sidebar-right
+      name: '@deepseek-ai/dsh-client-ui-sidebar-right'
+
+
+    - id: office-to-pdf
+      name: '@deepseek-ai/dsh-office-to-pdf'
+
+    # The right Sidebar's document tab: bounded file reads with selectable
+    # Markdown, code, HTML, PDF, Office, and plain-text renderers.
+    - id: ui-sidebar-documentpreview
+      name: '@deepseek-ai/dsh-client-ui-sidebar-documentpreview'
+
+    # Web profiles opt in; Desktop retains sandboxed HTTP(S) Browser tabs.
+    - id: ui-sidebar-browser
+      name: '@deepseek-ai/dsh-client-ui-sidebar-browser'
+      disabled: !!js "ctx.get('profileContext')?.name !== 'desktop'"
+
+    - id: ui-sidebar-terminal
+      name: '@deepseek-ai/dsh-client-ui-sidebar-terminal'
+    # The right Sidebar's workspace file tree tab type.
+    - id: ui-sidebar-files
+      name: '@deepseek-ai/dsh-client-ui-sidebar-files'
+
+    - id: ui-settings
+      name: '@deepseek-ai/dsh-client-ui-settings'
+
+    - id: ui-settings-general
+      name: '@deepseek-ai/dsh-client-ui-settings-general'
+
+    - id: ui-settings-models
+      name: '@deepseek-ai/dsh-client-ui-settings-models'
+
+    # Plugin management: the sidebar Plugins page installs, enables, disables,
+    # and removes the profile's bundles through the `pluginManager` Remote.
+    # Without a profile-backed Host it reports itself unavailable.
+    - id: ui-plugin-manager
+      name: '@deepseek-ai/dsh-client-ui-plugin-manager'
+
+    # Read-only Plugin list tab in the Settings Plugins section; the built-in
+    # bundles the sidebar page leaves out are inspected here.
+    - id: ui-settings-plugin-inventory
+      name: '@deepseek-ai/dsh-client-ui-settings-plugin-inventory'
+
+    - id: ui-conversation
+      name: '@deepseek-ai/dsh-client-ui-conversation'
+
+    - id: ui-approval
+      name: '@deepseek-ai/dsh-client-ui-approval'
+
+    - id: ui-chat
+      name: '@deepseek-ai/dsh-client-ui-chat'
+
+    # Official occupants for the generic sidebar and conversation brand slots.
+    - id: ui-brand-official
+      name: '@deepseek-ai/dsh-client-ui-brand-official'
+
+    - id: ui-attachment
+      name: '@deepseek-ai/dsh-client-ui-attachment'
+
+    # Tool call tree, generic fallback, and keyed business Tool views.
+    - id: ui-tool
+      name: '@deepseek-ai/dsh-client-ui-tool'
+
+    - id: ui-cordis
+      name: '@deepseek-ai/dsh-client-ui-cordis'
+
+    # Turn tail: the changed-files card and delivery cards under each closing
+    # assistant message. Remove this entry to turn the surface off; the tail
+    # hole renders empty.
+    - id: ui-deliverables
+      name: '@deepseek-ai/dsh-client-ui-deliverables'
+
+    # Records each top-level turn's changed files from git working-tree
+    # snapshots; the changed-files card above renders its events.
+    - id: workspace-changes
+      name: '@deepseek-ai/dsh-workspace-changes'
+
+
+    - id: ui-workspace
+      name: '@deepseek-ai/dsh-client-ui-workspace'
+
+    # Durable workflow lifecycle as an independent Chat node after the
+    # existing generic workflow tool row.
+    - id: ui-workflow-run
+      name: '@deepseek-ai/dsh-client-ui-workflow-run'
+
+    # Input triggers: the '/' | '@' pipeline (ui-input-trigger), the command surface over
+    # it (ui-commands), and the reference sources (ui-skill / ui-reference).
+    - id: ui-input-trigger
+      name: '@deepseek-ai/dsh-client-ui-input-trigger'
+
+    - id: ui-commands
+      name: '@deepseek-ai/dsh-client-ui-commands'
+
+    - id: ui-skill
+      name: '@deepseek-ai/dsh-client-ui-skill'
+
+    - id: ui-subagent
+      name: '@deepseek-ai/dsh-client-ui-subagent'
+
+    - id: ui-reference
+      name: '@deepseek-ai/dsh-client-ui-reference'
+
+
+    # Background jobs: the session-header roster with on-demand streaming
+    # record panels over the session job-output service.
+    - id: ui-jobs
+      name: '@deepseek-ai/dsh-client-ui-jobs'
+
+    # Read-only active Schedule catalog. The shipped Web graph resolves the
+    # client package but leaves it disabled; the explicit Schedule overlay
+    # enables this same row together with the host Schedule services.
+    - id: ui-schedule
+      name: '@deepseek-ai/dsh-client-ui-schedule'
+      disabled: true
+
+    # Goal surface: GoalBar in the input dock over the goal session projection.
+    - id: ui-goal
+      name: '@deepseek-ai/dsh-client-ui-goal'
+
+    # The feedback surface: Like/Dislike in the assistant-message action
+    # strip, the feedback dialog behind Dislike and /feedback with its
+    # acknowledgement toast, over the messageFeedback and sessionFeedback Remotes.
+    - id: ui-message-feedback
+      name: '@deepseek-ai/dsh-client-ui-message-feedback'
+
+    # Model selection: the /model popupSelect + composer seat over session.models.
+    - id: ui-model-selection
+      name: '@deepseek-ai/dsh-client-ui-model-selection'
+
+    - id: ui-permission
+      name: '@deepseek-ai/dsh-client-ui-permission-presets'
+
+    # The agent-preset row in General settings: the default preset for
+    # sessions created later. Absent a roster it renders nothing.
+    - id: ui-agent-preset
+      name: '@deepseek-ai/dsh-client-ui-agent-preset'
+
+    # The Built-in plugins settings section: the navigation entry and the tab
+    # row the inventory tab registers into. The official configuration pages
+    # are the companion rows below.
+    - id: ui-settings-plugins
+      name: '@deepseek-ai/dsh-client-ui-settings-plugins'
+
+    # The official settings pages: one companion package per host-plane
+    # namespace, each registering its page into the Plugins page while the
+    # Host serves the namespace.
+    - id: ui-settings-shell
+      name: '@deepseek-ai/dsh-client-ui-settings-shell'
+
+    - id: ui-settings-agent-loop
+      name: '@deepseek-ai/dsh-client-ui-settings-agent-loop'
+
+    - id: ui-settings-subagent
+      name: '@deepseek-ai/dsh-client-ui-settings-subagent'
+
+    - id: ui-settings-web-search
+      name: '@deepseek-ai/dsh-client-ui-settings-web-search'
+
+    # Plan control: the composer plan seat over the plan projection + /plan channel.
+    - id: ui-plan
+      name: '@deepseek-ai/dsh-client-ui-plan'
+
+    - id: ui-user-questions
+      name: '@deepseek-ai/dsh-client-ui-user-questions'
+
+    - id: ui-trajectory
+      name: '@deepseek-ai/dsh-client-ui-trajectory'
+
+# ── the agent plane moves behind agent presets ─────────────────────────────
+#
+# Every row below composes what ONE agent contributes to the host registries:
+# its tools, its prompt sections, its delegation backends. The base keeps them
+# for the TUI, which is single-session and composes its agent process-wide; the
+# Web surface disables them here and lets each session mount a preset instead.
+#
+# Disabling rather than deleting is deliberate: the base is shared, and a row
+# absent from a surface overlay would silently reappear the day someone reorders
+# the composition.
+
+# `shell-env` STAYS in the host plane: `apps/cli/src/web.ts` injects it to
+# publish `DSH_WEB_URL`/`DSH_WEB_MODE`, and a host row that injects a service is
+# the criterion for host-plane ownership — injection resolves before any session
+# exists, so there is no agent to key by. Behind a preset realm those variables
+# would never reach the model's shell at all.
+
+- id: tool-plugin-manager
+  disabled: true
+
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+# The background-job REGISTRY stays on the host plane; only the model-facing
+# `job_*` controls move. Its producers — `tool-bash` here, `tool-terminal` and a
+# non-continuable `tool-subagent` elsewhere — are preset rows that resolve it
+# with `ctx.get`, and an entry-local realm around the registry is invisible to
+# every sibling row outside that realm, so `run_in_background` answered
+# "background jobs unavailable" while the controls sat in the catalog. That is
+# the `goals` criterion read from inside the preset: a Service a row outside its
+# realm READS belongs to the plane both can see. The registry is keyed by owning
+# agent, so one host instance serves every session exactly as before presets.
+
+- id: tool-jobs
+  disabled: true
+
+- id: tool-fs
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+# The `skill` REGISTRY stays in the host plane. It is host+per-scope layered
+# (the tools-registry shape): deployment-level providers — repository plugins,
+# a host skill-filesystem row — register into its global layer, while a preset's
+# `skill-filesystem` registers into that preset's layer, and each agent reads the
+# merged catalog its scope chain selects. Only the per-agent rows move behind
+# presets: the base host `skill-filesystem` row is disabled here (presets own local
+# discovery), and `tool-skill` is what a preset mounts to give its agent the
+# catalog and loader at all.
+
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-skill
+  disabled: true
+
+# The goal service and session driver stay on the host plane, where Gateway
+# remotes resolve them. Presets own the human command and model-facing tool.
+
+- id: command-goal
+  disabled: true
+
+- id: tool-goal
+  disabled: true
+
+- id: plan-mode
+  disabled: true
+
+# The token METER stays on the host plane; only the compaction backend that
+# reads it moves. It owns the context-meter projection units, and that table is
+# process-wide, so preset ownership would make the meter a function of which
+# presets happen to be mounted rather than a per-session fact. Same criterion as
+# `tasks` and `goals`; the reasoning has one home in
+# `.agents/notes/implemented/architecture/2026-08-10-host-plane-ownership-after-presets.md`.
+
+- id: compaction-basic
+  disabled: true
+
+- id: command-compact
+  disabled: true
+
+- id: tool-result-pruner
+  disabled: true
+
+# The subagent registry and its backends STAY in the host plane. `subagents` is
+# a process singleton with a cross-session query surface (`listChildren`,
+# `followup`) that the host api-proxy serves to the browser, and a provider
+# registers under a globally unique name, so a per-session copy would both
+# starve that host row and collide on the second session. What a preset
+# chooses is which delegation TOOLS its agent sees, below.
+
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- id: workflow-ptc
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+# `base` ships this row disabled; the preset-plane gate reads declared row ids
+# without regard to `disabled`, so this row must stay to keep `tool-ralph` off
+# the host plane and out of collision with every preset's row.
+- id: tool-ralph
+  disabled: true
+
+- id: agent-instructions
+  disabled: true
+
+- id: tool-todo
+  disabled: true
+
+- id: tool-web
+  disabled: true
+
+# The preset selection registry. The shipped preset declarations follow as
+# separate patch files under `presets/`, listed after this file in
+# `package.json` `dsh.bundle.patch`.
+- insert:
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: standard

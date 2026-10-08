@@ -45,26 +45,25 @@ runtime model.
 
 ## 2. First Launch
 
-Install Codewhale with the path that fits your machine. Release installers
-provide the same runtime under the `codewhale` and `codew` command names, and
-every supported install path ships the `codewhale` dispatcher with the
-`codewhale-tui` runtime built in.
+For a new macOS or Linux installation, use the official GitHub release.
+The installer verifies the release checksums and provides the same runtime
+under the `codewhale` and `codew` command names:
 
 ```bash
-# npm
-npm install -g codewhale
-
-# Cargo
-cargo install codewhale-cli --locked
-# Optional short name after Cargo install:
-ln -s "$(command -v codewhale)" "$(dirname "$(command -v codewhale)")/codew"
-
-# Homebrew
-brew tap Hmbown/deepseek-tui
-brew install codewhale
+curl -fsSL https://codewhale.net/install.sh | sh
 ```
 
-Docker is also available when you want an isolated runtime:
+Windows users should choose the matching installer or archive from
+[GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest).
+For an existing direct install, use `codewhale update --check`, then
+`codewhale update`. npm and Cargo remain secondary packaging routes; Cargo
+also supports source builds where a compatible prebuilt is unavailable.
+For occupied directories, package-managed installs, and PATH setup, follow
+[the installation and migration guide](INSTALL.md#recommended-official-github-releases).
+Android/Termux uses its own [preview archive or source-build path](INSTALL.md#android--termux-arm64).
+
+Docker is also available when you want an isolated runtime. The published
+image is currently 0.10.0; to test current `main`, [build it from source](DOCKER.md#building-locally).
 
 ```bash
 docker volume create codewhale-home
@@ -76,11 +75,15 @@ docker run --rm -it \
   ghcr.io/hmbown/codewhale:latest
 ```
 
-Launch Codewhale from the repository or directory you want it to work in:
+Once the install directory is on PATH, launch Codewhale from the repository or
+directory you want it to work in:
 
 ```bash
 codewhale
 ```
+
+For the default GitHub installer destination, you can use
+`"$HOME/.local/bin/codewhale"` until that directory is on PATH.
 
 On first launch, Codewhale asks only for decisions this installation still
 needs: language when it cannot infer one, a provider when no usable route is
@@ -201,7 +204,7 @@ Codewhale works best when you let investigation and implementation happen in
 separate steps for unfamiliar code. For small, well-understood changes, a
 single implementation request is fine.
 
-Next: [MODES.md](MODES.md) explains when to use Plan, Act, and Operate.
+Next: [MODES.md](MODES.md) explains when to use Plan, Work, and Operate.
 
 ## 4. Understanding the Interface
 
@@ -218,30 +221,77 @@ The interactive TUI has a few stable regions:
 - Status and footer areas: live activity, queued follow-ups, and short command
   hints.
 
-The footer status line is configurable. Run `/statusline` to choose which
-footer chips are visible, or set `[tui].status_items` in `config.toml` to
-control both selection and order. Supported keys currently include `mode`,
-`model`, `cost`, `balance` (DeepSeek / DeepSeekCN only), `status`, `agents`,
-`reasoning_replay`, `prefix_stability`, `cache`, `context_percent`,
-`git_branch`, `last_tool_elapsed` (reserved), `rate_limit` (reserved),
-`tokens`, and `session_metrics`. Omit `status_items` to keep the built-in
-default order; set it to `[]` to hide configurable chips.
+When the model asks a question (`request_user_input`), a bottom sheet opens
+over the transcript rather than a centered overlay. The conversation stays
+visible above it. Use `PageUp`/`PageDown`, `Home`/`End`, or modified `↑`/`↓`
+(`Ctrl`, `Alt`, or `Shift`) to review the transcript while the sheet stays open.
+The mouse wheel scrolls the transcript above the sheet and the question content
+over the sheet itself. Moving the highlight or typing brings that content back
+into view after wheel browsing. Use `↑`/`↓` to move, `Enter` to confirm, `←`/`h`
+to go back to a previous question, and `Esc` to cancel the whole request.
+Every question offers an "Other" row for a custom response; that text stays on
+screen while you type. Keys for the sheet are in [KEYBINDINGS.md](KEYBINDINGS.md).
 
-`session_metrics` (on by default) paints the session metrics strip on the
-phase row: `4 turns · 108 steps │ LLM 11m46s · Tool call 1m52s │ TTFT avg
-1.5s · 120 tok/s │ Cache hit 99% │ Input 9.3M`. Turns are user turns; steps
-are model calls plus tool calls; `LLM` is the summed wall time of model
-calls and `Tool call` the summed wall time of tools; `TTFT avg` is the mean
-time to first streamed token; `tok/s` is provider-reported output tokens over
-streamed seconds; `Cache hit` and `Input` are provider-reported token
-classes. A cell whose provider or runtime evidence has not arrived is
-omitted rather than estimated, and on narrow rows the strip drops its
-lowest-value groups (steps and tool time first, then latency, turns, LLM
-time) instead of truncating a number. `/status` prints the untrimmed line.
+The bottom chrome is configurable. Run `/statusline` to choose what is
+visible, or set `[tui].status_items` in `config.toml`. Each key owns exactly
+one thing on screen: `mode` is the posture bar's plan/act/operate chip, and
+`model`, `context_percent`, `cost`, `balance` (prepaid providers only:
+DeepSeek, DeepSeekCN, OpenRouter, SiliconFlow), `cache`, `tokens` and
+`ttft`, `output_rate`, `workspace` and `git_branch` are segments of the metrics line below it. Omit
+`status_items` to keep the built-in default; set it to `[]` to strip the
+metrics line down to the help hint.
 
-The transcript is the audit trail. When Codewhale reads files, runs commands,
-or edits code, the action appears there. If a command fails, use the visible
-failure output as part of your next instruction instead of starting over.
+`workspace` and `git_branch` are opt-in. The workspace chip shows the folder
+name; linked worktrees include its parent to distinguish repeated names. The
+branch chip shows the current branch or a short detached HEAD SHA, with `(wt)`
+for linked worktrees. Both keep the last 24 display columns when long. Git
+metadata refreshes in the background on the existing 15-second cadence and
+when a refresh is requested; unavailable Git data removes the branch chip.
+These identify the active session workspace. The full path remains in `/status`.
+
+`context_percent` is on by default and shows `ctx NN%` at every fullness —
+0.9.12 went silent below 50% and left most of a session with no context
+signal at all. The reading keeps its warning colour from 80% up.
+
+The keys `status`, `agents`, `reasoning_replay`, `prefix_stability`,
+`last_tool_elapsed` and `rate_limit` were retired in 0.9.13:
+they drove nothing. Old configuration files still load — the retired keys are
+ignored with a warning in the log.
+
+`status_items` composes the rows; two size presets decide how much of each
+row paints. `[tui].posture_bar` and `[tui].metrics_line` each take `full`,
+`compact`, or `hidden`. The posture bar defaults to `full` so active controls
+stay visible; the metrics line defaults to `compact` to keep selected performance
+readings while removing secondary counts and help. These are also settable at runtime with
+`/config posture_bar compact`. TOML values must be lowercase; `/config`
+accepts either case. `compact` is the row after its first shed
+rungs: the posture bar keeps its permission and mode chips — and the cap
+warning, which is advice, not decoration — and drops the clocks, counts and
+hint; the metrics line keeps the route, the context reading, the cost and
+the balance, plus selected TTFT and output rate when space allows, and drops
+secondary counts and the help hint. `hidden` gives the
+row back to the transcript. A small tmux pane can hide both rows without
+touching what `/statusline` composes.
+
+Both `ttft` and `output_rate` are on by default and work in full or compact
+rows. `/statusline` lets you toggle them separately; Space previews, Enter saves,
+and Esc restores your previous settings. Legacy `session_metrics` still enables
+both readings. The pair shows: `ttft 1.5s` — the mean time to first streamed token — and `120 avg tok/s`,
+the session's provider-reported output tokens divided by the measured request
+seconds for those same calls. The rate includes connection setup, time to first
+token and pauses within a response, and excludes tools and idle time between
+calls. It measures effective request throughput, not decoder speed. Streaming
+and non-streaming calls follow the same rule; receipts without individual
+request timing are excluded from both tokens and time. While a request runs,
+the last measured average stays visible. Both readings use the same
+accumulators `/status` prints in full. Missing evidence is omitted rather than
+estimated. On narrow rows the pair sheds before cost and context.
+
+Every file read, command, and edit appears in the transcript as it happens.
+`/receipts` lists what the session did, one line per action; see
+[What Codewhale records](#what-codewhale-records). If a command fails, use the
+visible failure output as part of your next instruction instead of starting
+over.
 
 The composer accepts normal prompts and slash commands. Type `/` to discover
 available commands. Use file mentions when you want the model to focus on a
@@ -263,7 +313,7 @@ Codewhale has three visible TUI modes:
 | Mode | Use it for | Default posture |
 | --- | --- | --- |
 | Plan | Exploration, design, and review before changes | Read-only investigation |
-| Act | Normal multi-step coding work | Tool use with approval gates |
+| Work | Normal multi-step coding work | Tool use with approval gates |
 | Operate | Direct work plus parallel or background coordination | Tools follow the active posture; delegate when useful |
 
 Switch modes from the TUI with the mode picker:
@@ -276,7 +326,7 @@ Or switch directly:
 
 ```text
 /mode plan
-/mode act
+/mode work
 /mode operate
 ```
 
@@ -288,13 +338,15 @@ approach, verification plan, risks, and handoff notes. Empty sections are
 visible when the agent uses the rich artifact shape, so you can ask for a
 revision instead of accepting an under-specified plan.
 
-Act mode is the default for most contribution work. It lets Codewhale read,
+Work mode is the default for most contribution work. It lets Codewhale read,
 run checks, and edit files while keeping risky actions behind approval gates.
 
 Operate keeps that direct tool surface and its approval, sandbox, shell,
-ask-rule, and repository protections. Its difference is orchestration emphasis:
-Codewhale prefers fleet workers for independent, parallel, background, or
-long-running work, while small or tightly coupled work can remain in the parent.
+ask-rule, and repository protections. Small or tightly coupled work stays
+direct. Multi-step delegation uses a compact Workflow plan with dependencies,
+bounded scopes, and completion evidence passed between steps. Fleet configures
+and manages those same sub-agents and their roles. One bounded, independent
+task can use a direct agent; continued work reuses it through `followup`.
 Heavy work can also be proposed to a Daytona cloud agent with `codewhale
 dispatch` or `/dispatch` (explicit confirmation; remotes are `github` / `cnb` /
 `gitee`). See [DAYTONA_CLOUD_DISPATCH.md](DAYTONA_CLOUD_DISPATCH.md).
@@ -333,6 +385,7 @@ Common commands for first-time users:
 | `/workflows` | Open the live Workflow run dashboard: every run this workspace's journal keeps, with phases, children, progress, and host-side cancel |
 | `/config` | Edit runtime and provider settings |
 | `/statusline` | Choose which footer status chips are visible |
+| `/receipts` | List what this session did: files changed, commands run, web and MCP calls, agents, approvals and who gave them, failures |
 | `/compact` | Summarize long context to recover token budget |
 | `/copy` | Copy the last completed assistant response to the clipboard |
 | `/review` | Ask for a structured review workflow |
@@ -361,8 +414,8 @@ walks through fleet task specs, monitoring, and Workflow authoring.
 Fleet is the public noun for the durable roster. `codewhale fleet …` is
 the command and `/fleet` the slash command. The Fleet name is
 shared by what has to stay stable across versions: the durable ledger
-`.codewhale/fleet.jsonl`, saved rosters `fleets/<name>.toml`, the `[fleet]` and
-`[fleets.*]` config tables, and the `codewhale workflow run --fleet` flag.
+`.codewhale/fleet.jsonl`, saved rosters `fleets/<name>.toml`, the `[fleet]`
+config table, and the `codewhale workflow run --fleet` flag.
 
 Use `/model auto` when you want Codewhale to choose the model and thinking
 level per turn. When the DeepSeek routing model is available, Auto may select
@@ -411,7 +464,7 @@ Examples of tool-backed work include:
 
 Tool use is governed by mode, approvals, and sandbox policy. The exact behavior
 depends on the current mode and config, but the basic rule is simple: start in
-Plan for read-only exploration, use Act for normal changes, and reserve Full
+Plan for read-only exploration, use Work for normal changes, and reserve Full
 Access for trusted automation.
 
 The workspace boundary matters. Codewhale is expected to work in the directory
@@ -439,6 +492,40 @@ the transcript easier to review and the final diff easier to merge.
 
 Next: [TOOL_SURFACE.md](TOOL_SURFACE.md) lists the tool surface and
 [SANDBOX.md](SANDBOX.md) explains sandbox behavior.
+
+### What Codewhale records
+
+Codewhale keeps these records on your machine, under `~/.codewhale/`:
+
+- **The session.** `sessions/<id>.json` holds the full conversation,
+  including every tool call and its result text. App and `codewhale serve`
+  threads keep each call as a turn item under `tasks/runtime/`, with its
+  input, status, start and end time, and structured result.
+- **Approvals.** `sessions/<id>/approval_receipts.jsonl` records every
+  approval Codewhale asked for, the decision, and who made it: you, a
+  session rule, or the active posture. App threads also record each decision
+  in their event log. A call that ran without asking (Full Access, an allow
+  rule, a remembered grant) has no approval record; the posture each turn
+  ran under is saved with the turn.
+- **Undo points.** Workspace snapshots let `/undo` and `/restore` roll files
+  back.
+- **Security events.** `audit.log` records credential changes, hook
+  environment key names, compaction passes, the terminal's approval
+  routing, and Auto-Review verdicts. It is not a list of what a session did.
+
+To see what a session did, run `/receipts`, or from a shell:
+
+```bash
+codewhale receipts --last
+codewhale receipts <session-id> --format json
+```
+
+A receipt says what it cannot show. A terminal session's receipt lists the
+files a command changed from each turn's workspace snapshots; a Runtime
+thread's lists only file tools. Terminal sessions do not save a passing
+command's exit code or how long each call took. A call Codewhale blocked
+before it started (Auto-Review, a policy, invalid input) is listed as
+blocked, with the reason, and is not counted as run. [RECEIPTS.md](RECEIPTS.md) has the full contract.
 
 ## 8. Sub-agents and Parallel Work
 
@@ -591,7 +678,7 @@ open when configuring a non-default route.
 
 ### Which mode should I use first?
 
-Use Plan for unfamiliar code, Act for normal implementation, and Full Access
+Use Plan for unfamiliar code, Work for normal implementation, and Full Access
 only for trusted repositories where automatic execution is acceptable.
 
 ### Why does Codewhale ask before running commands?
@@ -649,6 +736,29 @@ attached to the project you opened. Press `a` in the picker to show sessions
 from every workspace, or run `codewhale sessions` to list all saved sessions
 with last-updated timestamps before resuming a specific id.
 
+To archive the durable record and its artifacts, run:
+
+```sh
+codewhale sessions export <id-or-unique-prefix> --output session.tar.xz
+```
+
+The archive contains `session.json`, a portable `container.json`, a manifest,
+and regular files under `artifacts/`. Use `--skip-artifacts` for the record
+only, `--compression 0` through `9` to choose the xz preset (default `6`),
+and `--force` to replace an existing output. Store the archive outside the
+session store. Symlinks are skipped; linked artifact roots, hard links,
+nonportable filenames, and trees exceeding 64 directory levels or 100,000
+entries fail the export without replacing the destination.
+
+Unlike the sanitized Markdown `/export`, these archives retain unredacted
+session content, including system prompts, thinking, tool calls and results,
+journal branches, and approval receipts. Extract `session.json` and open it
+with `/load` in the TUI; `/resume` imports the conversation only. Extracted
+artifacts remain separate files and are not installed into the artifact store
+by `/load`. Pause writes before archiving if every artifact must reflect the
+same instant; growing files are bounded to their recorded size and shrinking
+files abort the export.
+
 To continue the exact running session from the web app, type `/rc` or launch
 with `codewhale rc`. Approve the one-time code in the system browser. While the
 lease is active, the browser owns new prompts and approvals and the terminal is
@@ -660,6 +770,12 @@ available. A dropped connection keeps local input locked until the last web
 lease expires so two controllers never race. Every folder you enroll from one
 terminal shares a single stable device id, so the web app lists one computer
 per machine rather than one per session.
+
+> Note (2026-09-14): the hosted web app at app.codewhale.net sunsets in phases
+> under the 2026-09-14 product-client decision; the native GPUI desktop app
+> (private `codehwhale-gpui` repo, phase map in `docs/TRANSITION.md`) is the
+> successor surface. `/rc` keeps working against the web app while it remains
+> live.
 
 ### What should I do when the model gets confused?
 

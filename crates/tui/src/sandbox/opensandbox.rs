@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::backend::{SandboxBackend, SandboxOutput};
+use super::backend::{SandboxBackend, SandboxKind, SandboxOutput};
 
 /// Request body sent to the OpenSandbox `/v1/sandbox/run` endpoint.
 #[derive(Debug, Serialize)]
@@ -75,6 +75,10 @@ impl OpenSandboxBackend {
 
 #[async_trait]
 impl SandboxBackend for OpenSandboxBackend {
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::OpenSandbox
+    }
+
     async fn exec(&self, cmd: &str, env: &HashMap<String, String>) -> Result<SandboxOutput> {
         let request_body = SandboxRunRequest {
             cmd: cmd.to_string(),

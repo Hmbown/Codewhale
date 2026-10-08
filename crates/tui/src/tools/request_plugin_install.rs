@@ -1,4 +1,11 @@
 //! Model-callable plugin review request. Never installs, trusts, or enables.
+//!
+//! 0.10.1 plugin offering policy: the tool is registered only in the
+//! interactive TUI with contextual tips on (it returns a TUI slash command),
+//! and a session gets one review request. A second call errors.
+
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -12,6 +19,26 @@ pub const REQUEST_PLUGIN_INSTALL_TOOL_NAME: &str = "request_plugin_install";
 
 pub struct RequestPluginInstallTool;
 
+/// Sessions (by `ToolContext::state_namespace`, the session id) that already
+/// surfaced a review request. The registry is rebuilt every turn, so the
+/// once-per-session budget cannot live on the tool value.
+static REQUESTED_SESSIONS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn session_already_requested(namespace: &str) -> bool {
+    REQUESTED_SESSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(namespace)
+}
+
+fn record_session_request(namespace: &str) {
+    REQUESTED_SESSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(namespace.to_string());
+}
+
 #[async_trait]
 impl ToolSpec for RequestPluginInstallTool {
     fn name(&self) -> &'static str {
@@ -19,10 +46,10 @@ impl ToolSpec for RequestPluginInstallTool {
     }
 
     fn description(&self) -> &'static str {
-        "Ask the human to review installing or trusting a plugin that is \
-         already installed-but-idle or listed in a marketplace catalog they \
-         added. Does not install, trust, or enable anything. Fails if the \
-         plugin name is unknown. Pass `name` and a short `reason`."
+        "Ask the human to review a plugin the current task clearly needs \
+         (installed-but-idle, or in a catalog they added). Never to advertise. \
+         Once per session; a second call fails. Installs, trusts, and enables \
+         nothing. Pass `name` and a short `reason`."
     }
 
     fn input_schema(&self) -> Value {
@@ -31,7 +58,7 @@ impl ToolSpec for RequestPluginInstallTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Plugin name as shown in <recommended_plugins> or /plugin suggest."
+                    "description": "Plugin name as shown by /plugin list or /plugin suggest."
                 },
                 "reason": {
                     "type": "string",
@@ -63,6 +90,11 @@ impl ToolSpec for RequestPluginInstallTool {
                 "request_plugin_install: reason must not be empty",
             ));
         }
+        if session_already_requested(&ctx.state_namespace) {
+            return Err(ToolError::not_available(
+                "request_plugin_install: already used this session; a plugin review may be requested once per session",
+            ));
+        }
         let Some(registry) = ctx.plugin_registry.as_ref() else {
             return Err(ToolError::not_available(
                 "request_plugin_install: plugin registry is not available",
@@ -74,6 +106,7 @@ impl ToolSpec for RequestPluginInstallTool {
                 "request_plugin_install: unknown plugin `{name}`"
             )));
         };
+        record_session_request(&ctx.state_namespace);
         let command = matched.command();
         let payload = json!({
             "completed": false,
@@ -122,7 +155,19 @@ mod tests {
             .registry_for_workspace(root.path());
         let bundle = root.path().join(".codewhale/plugins/supabase/plugin.toml");
         let before = fs::read(&bundle).unwrap();
-        let ctx = ToolContext::new(root.path()).with_plugin_registry(Arc::clone(&registry));
+        let ctx = ToolContext::new(root.path())
+            .with_plugin_registry(Arc::clone(&registry))
+            .with_state_namespace("request-plugin-install-disk-test");
+
+        let err = RequestPluginInstallTool
+            .execute(
+                json!({"name": "not-a-real-plugin", "reason": "guess"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unknown"), "{err}");
+        assert_eq!(fs::read(&bundle).unwrap(), before);
 
         let result = RequestPluginInstallTool
             .execute(
@@ -137,15 +182,43 @@ mod tests {
         assert_eq!(meta["installed"], json!(false));
         assert_eq!(meta["command"], json!("/plugin trust supabase"));
         assert_eq!(fs::read(&bundle).unwrap(), before);
+    }
 
+    /// Policy rule 4: one review request per session; a second call errors,
+    /// and another session keeps its own budget.
+    #[tokio::test]
+    async fn request_plugin_install_is_once_per_session() {
+        let _lock = lock_test_env();
+        let root = TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+        write_keyword_bundle(root.path(), "supabase");
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(root.path());
+        let ctx = ToolContext::new(root.path())
+            .with_plugin_registry(Arc::clone(&registry))
+            .with_state_namespace("request-plugin-install-once-a");
+        let input = json!({"name": "supabase", "reason": "needs hosted auth"});
+
+        assert!(
+            RequestPluginInstallTool
+                .execute(input.clone(), &ctx)
+                .await
+                .is_ok()
+        );
         let err = RequestPluginInstallTool
-            .execute(
-                json!({"name": "not-a-real-plugin", "reason": "guess"}),
-                &ctx,
-            )
+            .execute(input.clone(), &ctx)
             .await
             .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("unknown"), "{err}");
-        assert_eq!(fs::read(&bundle).unwrap(), before);
+        assert!(err.to_string().contains("once per session"), "{err}");
+
+        let other = ToolContext::new(root.path())
+            .with_plugin_registry(Arc::clone(&registry))
+            .with_state_namespace("request-plugin-install-once-b");
+        assert!(
+            RequestPluginInstallTool
+                .execute(input, &other)
+                .await
+                .is_ok()
+        );
     }
 }

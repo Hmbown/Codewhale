@@ -4,24 +4,23 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::config::{
-    ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+    DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL, ProviderKind,
     normalize_custom_model_id, normalize_model_name_for_provider,
 };
-use crate::localization::{Locale, MessageId, tr};
 #[cfg(test)]
-use crate::tui::app::ReasoningEffort;
-use crate::tui::app::{App, AppAction, AppMode};
+use crate::reasoning_preference::ReasoningEffort;
+use crate::tui::app::{App, AppAction};
 use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
+use codewhale_config::AppMode;
+use codewhale_localization::{Locale, MessageId, tr};
 
 use super::CommandResult;
 
 /// Show help information
 pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
     if let Some(topic) = topic {
-        let user_commands = crate::commands::user_registry::with_registry_for_workspace(
-            Some(&app.workspace),
-            Clone::clone,
-        );
+        let user_commands =
+            crate::commands::user_registry::with_registry_for_app(app, Clone::clone);
         if let Some(command) = user_commands.get(topic) {
             return CommandResult::message(user_command_help(app.ui_locale, command));
         }
@@ -73,8 +72,7 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
     // Show help overlay
     if app.view_stack.top_kind() != Some(ModalKind::Help) {
-        let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace, &app.cached_skills)
-            .with_groups_expanded(app.help_expand_groups);
+        let help = HelpView::new_for_app(app, false).with_groups_expanded(app.help_expand_groups);
         app.view_stack.push(help);
     }
     CommandResult::ok()
@@ -156,6 +154,11 @@ pub fn clear(app: &mut App) -> CommandResult {
             tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
         );
     }
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let queue_transition = match crate::tui::ui::prepare_offline_queue_transition(app, &new_id) {
+        Ok(transition) => transition,
+        Err(error) => return CommandResult::error(error),
+    };
     if !reset_conversation_state(app) {
         return CommandResult::error(
             tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
@@ -165,7 +168,7 @@ pub fn clear(app: &mut App) -> CommandResult {
     // and every autosave, so mint the next id here (as `/new` does) rather
     // than letting the engine generate one the App only learns about from
     // `SessionUpdated`. Two ids for one conversation orphan the checkpoint.
-    let new_id = uuid::Uuid::new_v4().to_string();
+    crate::tui::ui::install_offline_queue_transition(app, queue_transition);
     app.current_session_id = Some(new_id.clone());
     app.current_session_metadata = None;
     app.session_title = None;
@@ -193,13 +196,20 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     if !app.clear_todos() {
         return false;
     }
+    // Explicit reset discards the queue it was invoked on. Capture its owner
+    // before `/clear` or `/new` installs the next session id.
+    if let Some(lease) = app.offline_queue_lease.clone() {
+        crate::tui::persistence_actor::persist(
+            crate::tui::persistence_actor::PersistRequest::ClearOfflineQueue { lease },
+        );
+    }
     // Atomically retire background accounting before zeroing the session.
     // Late reports retain the old scope token and are discarded instead of
     // appearing in the new conversation.
     let _settled_old_cost_scope = crate::cost_status::close_current_scope();
     app.clear_history();
     app.mark_history_updated();
-    app.api_messages.clear();
+    app.clear_api_messages();
     app.system_prompt = None;
     app.viewport.transcript_selection.clear();
     app.queued_messages.clear();
@@ -225,7 +235,6 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.last_exec_wait_command = None;
     app.session.last_prompt_tokens = None;
     app.session.last_completion_tokens = None;
-    app.session.last_output_throughput = None;
     app.session.last_prompt_cache_hit_tokens = None;
     app.session.last_prompt_cache_miss_tokens = None;
     app.session.last_reasoning_replay_tokens = None;
@@ -234,6 +243,13 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.last_warmup_key = None;
     app.session.last_tool_catalog = None;
     app.session.last_base_url = None;
+    // A fresh conversation inherits neither this one's denials nor its
+    // "approve for session" grants (UX-8).
+    app.approval_session_denied.clear();
+    app.approval_session_approved.clear();
+    // Nor this one's child-agent approval cards, footer rows, or web-mirror
+    // copies: the reset finalizes those children engine-side.
+    crate::tui::pending_requests::clear_all(app);
     true
 }
 
@@ -246,6 +262,13 @@ pub fn exit() -> CommandResult {
 /// picker (Pro/Flash + thinking effort) per #39 — gives users a discoverable
 /// way to flip both knobs without memorising the docs.
 pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
+    // `/model router …` is `/router …` (#6525): one Router setup view.
+    if let Some(name) = model_name.map(str::trim) {
+        let (head, rest) = name.split_once(char::is_whitespace).unwrap_or((name, ""));
+        if head.eq_ignore_ascii_case("router") {
+            return super::router::router_command(Some(rest));
+        }
+    }
     if model_name.is_some_and(|name| name.eq_ignore_ascii_case("save-default")) {
         // Explicit persistence of the pending session route as the startup
         // default — only an explicit command can write settings after an
@@ -272,7 +295,6 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             } else {
                 app.session.last_prompt_tokens = None;
                 app.session.last_completion_tokens = None;
-                app.session.last_output_throughput = None;
             }
             let provider_identity = app.provider_identity_for_persistence().to_string();
             app.provider_models
@@ -282,15 +304,27 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             let mut message = tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
                 .replace("{new}", "auto");
-            message.push_str(
-                " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-            );
+            message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
             return CommandResult::with_message_and_action(
                 message,
                 AppAction::UpdateCompaction(app.compaction_config()),
             );
         }
-        let model_id = if app.accepts_custom_model_ids() {
+        let declared = app.api_provider != ProviderKind::OpenaiCodex
+            && codewhale_config::catalog::configured::validate_configured_models(
+                &app.configured_models,
+            )
+            .is_ok()
+            && app.configured_models.iter().any(|model| {
+                model.id == name
+                    && model.matches_route(
+                        app.provider_identity_for_persistence(),
+                        &app.active_route_base_url,
+                    )
+            });
+        let model_id = if declared {
+            name.to_string()
+        } else if app.accepts_custom_model_ids() {
             let Some(model_id) = normalize_custom_model_id(name) else {
                 return CommandResult::error(format!(
                     "Invalid model '{name}'. Expected a non-empty model ID."
@@ -307,11 +341,21 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             model_id
         };
         let strict_direct_custom_endpoint = app.accepts_custom_model_ids()
-            && matches!(
+            && matches!(app.api_provider, ProviderKind::Deepseek | ProviderKind::Zai);
+        let route_resolution = if declared {
+            match crate::route_runtime::resolve_declared_model_candidate(
                 app.api_provider,
-                ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Zai
-            );
-        let route_resolution = if strict_direct_custom_endpoint {
+                app.provider_identity_for_persistence(),
+                &model_id,
+                &app.active_route_base_url,
+                app.active_context_window_override,
+                app.active_model_context_windows.as_ref(),
+                &app.configured_models,
+            ) {
+                Ok(resolution) => Some(resolution),
+                Err(reason) => return CommandResult::error(reason),
+            }
+        } else if strict_direct_custom_endpoint {
             None
         } else {
             // `/model` normally resolves against the active provider's
@@ -334,6 +378,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 None,
                 route_base_url,
                 app.active_context_window_override,
+                app.active_model_context_windows.as_ref(),
                 None,
             ) {
                 Ok(resolution) => Some(resolution),
@@ -351,11 +396,10 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             );
         } else {
             app.active_route_limits = app.context_window_override_limits();
-            app.active_context_window_source = if app.active_context_window_override.is_some() {
-                crate::route_runtime::ContextWindowSource::Configured
-            } else {
-                crate::route_runtime::ContextWindowSource::Fallback
-            };
+            app.active_context_window_source = app
+                .configured_context_window_for(&app.model)
+                .map(|resolution| resolution.source)
+                .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
         }
         app.update_model_compaction_budget();
         if model_changed {
@@ -363,26 +407,18 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         } else {
             app.session.last_prompt_tokens = None;
             app.session.last_completion_tokens = None;
-            app.session.last_output_throughput = None;
         }
         let provider_identity = app.provider_identity_for_persistence().to_string();
         app.provider_models
             .insert(provider_identity.clone(), model_id.clone());
-        app.enable_provider_model(&provider_identity, &model_id);
-        app.fleet_roster_stale |= crate::fleet::members::auto_enroll_fleet_model(
-            &app.workspace,
-            &provider_identity,
-            &model_id,
-        );
+        app.note_route_used(&provider_identity, &model_id);
         // Route changes are temporary by default: nothing is written here.
         // The route-save prompt offers the explicit persistence choices.
         app.note_session_route_change(&provider_identity, &model_id);
         let mut message = tr(app.ui_locale, MessageId::ModelChanged)
             .replace("{old}", &old_model)
             .replace("{new}", &model_id);
-        message.push_str(
-            " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-        );
+        message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
         CommandResult::with_message_and_action(
             message,
             AppAction::UpdateCompaction(app.compaction_config()),
@@ -435,11 +471,15 @@ pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
 }
 
 pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let locale = app.ui_locale;
     let Some(raw_path) = arg.map(str::trim).filter(|path| !path.is_empty()) else {
-        return CommandResult::message(format!("Current workspace: {}", app.workspace.display()));
+        return CommandResult::message(
+            tr(locale, MessageId::WorkspaceCurrent)
+                .replace("{path}", &app.workspace.display().to_string()),
+        );
     };
 
-    let expanded = match expand_workspace_path(raw_path) {
+    let expanded = match expand_workspace_path(locale, raw_path) {
         Ok(path) => path,
         Err(message) => return CommandResult::error(message),
     };
@@ -450,30 +490,33 @@ pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
     };
 
     if !candidate.exists() {
-        return CommandResult::error(format!("Workspace does not exist: {}", candidate.display()));
+        return CommandResult::error(
+            tr(locale, MessageId::WorkspaceNotFound)
+                .replace("{path}", &candidate.display().to_string()),
+        );
     }
     if !candidate.is_dir() {
-        return CommandResult::error(format!(
-            "Workspace is not a directory: {}",
-            candidate.display()
-        ));
+        return CommandResult::error(
+            tr(locale, MessageId::WorkspaceNotDirectory)
+                .replace("{path}", &candidate.display().to_string()),
+        );
     }
 
     let workspace = candidate.canonicalize().unwrap_or(candidate);
     CommandResult::with_message_and_action(
-        format!("Switching workspace to {}...", workspace.display()),
+        tr(locale, MessageId::WorkspaceSwitching)
+            .replace("{path}", &workspace.display().to_string()),
         AppAction::SwitchWorkspace { workspace },
     )
 }
 
-fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
+fn expand_workspace_path(locale: Locale, path: &str) -> Result<PathBuf, String> {
+    let unresolved = || tr(locale, MessageId::WorkspaceHomeUnresolved).into_owned();
     if path == "~" {
-        return crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string());
+        return crate::config::effective_home_dir().ok_or_else(unresolved);
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        let home = crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string())?;
+        let home = crate::config::effective_home_dir().ok_or_else(unresolved)?;
         return Ok(home.join(rest));
     }
     Ok(PathBuf::from(path))
@@ -516,7 +559,7 @@ pub fn codewhale_links(app: &mut App) -> CommandResult {
     );
     let _ = writeln!(
         message,
-        "{} `https://github.com/Hmbown/CodeWhale`",
+        "{} `https://github.com/codewhale-hq/CodeWhale`",
         tr(locale, MessageId::LinksGitHub)
     );
     let _ = writeln!(
@@ -722,10 +765,11 @@ mod tests {
     use super::*;
     use crate::client::PromptInspection;
     use crate::config::Config;
-    use crate::models::Message;
-    use crate::models::Role;
-    use crate::tui::app::{App, AppMode, TuiOptions, TurnCacheRecord};
+    use crate::tui::app::{App, TuiOptions, TurnCacheRecord};
     use crate::tui::history::HistoryCell;
+    use codewhale_config::AppMode;
+    use codewhale_models::Message;
+    use codewhale_models::Role;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -819,8 +863,8 @@ mod tests {
             ..crate::test_support::test_tui_options(PathBuf::from("/tmp/test-workspace"))
         };
         let mut app = App::new(options, &Config::default());
-        app.ui_locale = crate::localization::Locale::En;
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.model = "deepseek-v4-pro".to_string();
         app.auto_model = false;
         app.model_ids_passthrough = false;
@@ -879,8 +923,10 @@ mod tests {
         let result = help(&mut app, Some("memory"));
         let msg = result.message.expect("help topic should return message");
         assert!(msg.contains("memory"));
-        assert!(msg.contains("persistent user-memory file"));
-        assert!(msg.contains("Usage: /memory [show|path|clear|edit|help]"));
+        assert!(msg.contains("persistent structured user memory"));
+        assert!(msg.contains(
+            "Usage: /memory [status|path|search|get|remember|import|export|reindex|clear|help]"
+        ));
     }
 
     #[test]
@@ -909,7 +955,7 @@ mod tests {
         app.history.push(HistoryCell::User {
             content: "test".to_string(),
         });
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![],
         });
@@ -965,7 +1011,7 @@ mod tests {
         app.history.push(HistoryCell::User {
             content: "keep me".to_string(),
         });
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![],
         });
@@ -991,7 +1037,7 @@ mod tests {
         app.history.push(HistoryCell::User {
             content: "keep active turn".to_string(),
         });
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![],
         });
@@ -1161,7 +1207,7 @@ mod tests {
     fn model_command_preserves_active_kimi_code_endpoint_for_bare_k3() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.set_provider_identity(crate::config::ApiProvider::Moonshot, "moonshot");
+        app.set_provider_identity(crate::config::ProviderKind::Moonshot, "moonshot");
         app.model_ids_passthrough = true;
         app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
         app.active_context_window_override = None;
@@ -1249,6 +1295,8 @@ mod tests {
         // model either — the change is session-local until the user explicitly
         // saves it via the route-save prompt.
         let _settings = SettingsPathGuard::new();
+        let startup_config = crate::config::home_config_path().expect("isolated startup config");
+        let startup_before = std::fs::read(&startup_config).ok();
         {
             let seed = crate::settings::Settings {
                 default_provider: Some("deepseek".to_string()),
@@ -1257,7 +1305,11 @@ mod tests {
             seed.save().expect("seed settings");
         }
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app.auto_model = false;
@@ -1267,7 +1319,8 @@ mod tests {
         assert!(!result.is_error, "GLM-5.2 is valid on Z.ai");
 
         let settings = crate::settings::Settings::load().expect("load settings");
-        // The shared default provider is untouched.
+        // Neither canonical startup config nor the legacy archive changes.
+        assert_eq!(std::fs::read(startup_config).ok(), startup_before);
         assert_eq!(settings.default_provider.as_deref(), Some("deepseek"));
         // No scoped entry was written either — session-local.
         assert_eq!(
@@ -1287,7 +1340,11 @@ mod tests {
     fn model_command_keeps_glm_53_as_its_own_wire_id() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
         app.auto_model = false;
@@ -1319,18 +1376,18 @@ mod tests {
 
         // Terminal A: Z.ai / GLM.
         let mut app_a = create_test_app();
-        app_a.api_provider = crate::config::ApiProvider::Zai;
+        app_a.api_provider = crate::config::ProviderKind::Zai;
         app_a.model_ids_passthrough = false;
         app_a.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app_a.auto_model = false;
         let result_a = model(&mut app_a, Some("GLM-5.2"));
         assert!(!result_a.is_error, "GLM-5.2 is valid on Z.ai");
-        assert_eq!(app_a.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app_a.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app_a.model, "GLM-5.2");
 
         // Terminal B: DeepSeek / deepseek-v4-flash.
         let mut app_b = create_test_app();
-        app_b.api_provider = crate::config::ApiProvider::Deepseek;
+        app_b.api_provider = crate::config::ProviderKind::Deepseek;
         app_b.model_ids_passthrough = false;
         app_b.model = "deepseek-v4-pro".to_string();
         app_b.auto_model = false;
@@ -1338,11 +1395,11 @@ mod tests {
         assert!(!result_b.is_error, "deepseek-v4-flash is valid on DeepSeek");
 
         // B's route is a coherent DeepSeek route — never Z.ai + a DeepSeek model.
-        assert_eq!(app_b.api_provider, crate::config::ApiProvider::Deepseek);
+        assert_eq!(app_b.api_provider, crate::config::ProviderKind::Deepseek);
         assert_eq!(app_b.model, "deepseek-v4-flash");
 
         // A is untouched by B's selection — still Z.ai / GLM.
-        assert_eq!(app_a.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app_a.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app_a.model, "GLM-5.2");
 
         // Shared settings: NOTHING was written by either `/model` — both
@@ -1368,7 +1425,7 @@ mod tests {
         // rejected locally with a precise diagnostic, before any network call.
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.api_provider = crate::config::ProviderKind::Zai;
         app.model_ids_passthrough = false;
         app.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app.auto_model = false;
@@ -1381,7 +1438,7 @@ mod tests {
         assert!(msg.contains("deepseek-v4-pro"), "names the model: {msg}");
         assert!(msg.contains("zai"), "names the provider: {msg}");
         // The session route is unchanged — still Z.ai / GLM.
-        assert_eq!(app.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app.model, crate::config::DEFAULT_ZAI_MODEL);
     }
 
@@ -1463,7 +1520,7 @@ mod tests {
     fn test_model_auto_preserves_raw_explicit_thinking() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::OpenaiCodex;
+        app.api_provider = ProviderKind::OpenaiCodex;
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
         app.reasoning_effort_preference = Some(ReasoningEffort::Off);
@@ -1496,7 +1553,7 @@ mod tests {
     fn test_model_change_accepts_custom_id_for_openai_compatible_provider() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Openai;
+        app.api_provider = crate::config::ProviderKind::Openai;
         app.model_ids_passthrough = true;
 
         let result = model(&mut app, Some("opencode-go/glm-5.1"));
@@ -1542,7 +1599,7 @@ mod tests {
     #[test]
     fn model_command_rejects_saved_model_from_other_provider() {
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.provider_models
             .insert("moonshot".to_string(), "kimi-k2.6".to_string());
 
@@ -1552,7 +1609,7 @@ mod tests {
         assert!(message.contains("Invalid model"));
         assert!(message.contains("active provider"));
         assert!(result.action.is_none());
-        assert_eq!(app.api_provider, crate::config::ApiProvider::Deepseek);
+        assert_eq!(app.api_provider, crate::config::ProviderKind::Deepseek);
         assert_eq!(app.model, "deepseek-v4-pro");
     }
 
@@ -1592,7 +1649,7 @@ mod tests {
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::SubAgents));
         assert_eq!(
             app.status_message,
-            Some("Fetching current-session sub-agents...".to_string())
+            Some("Finding this session's agents...".to_string())
         );
     }
 
@@ -1605,7 +1662,7 @@ mod tests {
         assert!(msg.contains("Codewhale & community"));
         assert!(msg.contains("https://codewhale.net/en/docs"));
         assert!(msg.contains("https://codewhale.net/en/community"));
-        assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+        assert!(msg.contains("https://github.com/codewhale-hq/CodeWhale"));
         assert!(msg.contains("https://app.codewhale.net"));
         assert!(msg.contains("separate sign-in"));
         assert!(msg.contains("not connected to the current local session"));
@@ -1628,7 +1685,10 @@ mod tests {
         assert!(msg.contains("https://cloud.baidu.com/doc/qianfan/index.html"));
         assert!(msg.contains("Local Ollama is keyless by default"));
         assert!(msg.contains("codewhale auth chatgpt"));
-        assert!(msg.contains("codex login"));
+        assert!(
+            !msg.contains("codex login"),
+            "official sign-in must not direct users to external CLI credentials"
+        );
         assert!(msg.contains("no canonical vendor credential page exists"));
         assert!(msg.contains("OPENAI_API_KEY"));
         assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));
@@ -1753,7 +1813,7 @@ mod tests {
 
     #[test]
     fn home_dashboard_localizes_in_zh_hans() {
-        use crate::localization::Locale;
+        use codewhale_localization::Locale;
         let mut app = create_test_app();
         app.ui_locale = Locale::ZhHans;
         let result = home_dashboard(&mut app);

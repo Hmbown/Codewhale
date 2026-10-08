@@ -1,0 +1,25 @@
+{
+  "server_received": [],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": {
+        "err": "conformance: MCP server 'conformance' discovery failed: tools/list exceeded the 4096-item catalogue limit"
+      }
+    },
+    {
+      "op": "catalog",
+      "tools": []
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP server 'conformance' discovery failed",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_bulk-00000"
+    }
+  ]
+}

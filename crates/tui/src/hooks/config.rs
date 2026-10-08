@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// a very large file.
 const PROJECT_HOOKS_FILE_MAX_BYTES: usize = 1024 * 1024;
 
-fn read_project_hooks_file(path: &Path) -> std::io::Result<String> {
+pub(super) fn read_project_hooks_file(path: &Path) -> std::io::Result<String> {
     let file = std::fs::File::open(path)?;
     let mut contents = String::new();
     file.take((PROJECT_HOOKS_FILE_MAX_BYTES + 1) as u64)
@@ -52,13 +52,31 @@ pub enum HookEvent {
     /// fail or time out are logged but do *not* abort the shell call; they
     /// simply contribute no env vars.
     ShellEnv,
+    /// Triggered when the session becomes idle after real work: a turn
+    /// finished (or a wait ended) and no prompt, approval, or continuation
+    /// is outstanding (#6004). Transient tool errors never fire this by
+    /// themselves; it marks "agent done, waiting for the next instruction".
+    SessionIdle,
+    /// Triggered when a turn ends in a terminal failure (#6004). Transient
+    /// tool failures that the agent absorbs never fire this; only a turn
+    /// whose final status is failed does. Hook authors that want opencode's
+    /// grace-period semantics should debounce inside the hook.
+    SessionError,
+    /// Triggered when the agent starts waiting on the person: an approval
+    /// prompt opens, a `request_user_input` question is presented, or a goal
+    /// continuation is parked between passes (#6004). The payload's `reason`
+    /// field is `approval`, `user_input`, or `goal_continuation`.
+    WaitingForUser,
+    /// Triggered when idle or waiting transitions to active work (#6004).
+    /// Startup and repeated observations of the same state stay silent.
+    SessionBusy,
 }
 
 /// Every event name the runtime actually fires, in the order `/hooks events`
 /// and `docs/HOOKS.md` list them. Tests assert this is exhaustive so a new
 /// variant cannot ship without a documented firing point.
 #[cfg(test)]
-pub const ALL_HOOK_EVENTS: [HookEvent; 11] = [
+pub const ALL_HOOK_EVENTS: [HookEvent; 15] = [
     HookEvent::SessionStart,
     HookEvent::SessionEnd,
     HookEvent::TurnEnd,
@@ -70,6 +88,10 @@ pub const ALL_HOOK_EVENTS: [HookEvent; 11] = [
     HookEvent::SubagentSpawn,
     HookEvent::SubagentComplete,
     HookEvent::ShellEnv,
+    HookEvent::SessionIdle,
+    HookEvent::SessionError,
+    HookEvent::WaitingForUser,
+    HookEvent::SessionBusy,
 ];
 
 /// How much a hook's result can change what Codewhale does next.
@@ -91,7 +113,7 @@ pub enum HookSteering {
 
 impl HookEvent {
     /// Get string representation for environment variable
-    #[allow(dead_code)] // Used in tests and future hook dispatch
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             HookEvent::SessionStart => "session_start",
@@ -105,6 +127,10 @@ impl HookEvent {
             HookEvent::SubagentSpawn => "subagent_spawn",
             HookEvent::SubagentComplete => "subagent_complete",
             HookEvent::ShellEnv => "shell_env",
+            HookEvent::SessionIdle => "session_idle",
+            HookEvent::SessionError => "session_error",
+            HookEvent::WaitingForUser => "waiting_for_user",
+            HookEvent::SessionBusy => "session_busy",
         }
     }
 
@@ -122,7 +148,11 @@ impl HookEvent {
             | HookEvent::OnError
             | HookEvent::TurnEnd
             | HookEvent::SubagentSpawn
-            | HookEvent::SubagentComplete => HookSteering::Observer,
+            | HookEvent::SubagentComplete
+            | HookEvent::SessionIdle
+            | HookEvent::SessionError
+            | HookEvent::SessionBusy
+            | HookEvent::WaitingForUser => HookSteering::Observer,
         }
     }
 
@@ -219,9 +249,21 @@ pub enum HookCondition {
     Any { conditions: Vec<HookCondition> },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NativeShellHook {
+    pub owner: crate::extension_host::protocol::OwnerRef,
+    pub scope: Option<crate::extension_host::protocol::EntryRef>,
+    pub handle: u64,
+    pub dialect: String,
+    pub point: String,
+    pub matcher: Option<String>,
+}
+
 /// A single hook definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hook {
+    #[serde(skip)]
+    pub(crate) native_shell: Option<NativeShellHook>,
     /// The event that triggers this hook
     pub event: HookEvent,
 
@@ -253,6 +295,10 @@ pub struct Hook {
     /// it after parsing immutable bytes.
     #[serde(skip)]
     pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
+
+    /// Exact-byte project approval attached by the loader; never read from TOML.
+    #[serde(skip)]
+    pub project_authority: Option<super::authority::ProjectHookAuthority>,
 }
 
 fn default_timeout() -> u64 {
@@ -265,7 +311,6 @@ fn default_continue_on_error() -> bool {
 
 impl Hook {
     /// Create a new hook with minimal configuration
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn new(event: HookEvent, command: &str) -> Self {
         Self {
             event,
@@ -276,32 +321,30 @@ impl Hook {
             continue_on_error: true,
             name: None,
             plugin_authority: None,
+            project_authority: None,
+            native_shell: None,
         }
     }
 
     /// Builder: set condition
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_condition(mut self, condition: HookCondition) -> Self {
         self.condition = Some(condition);
         self
     }
 
     /// Builder: set timeout
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
         self
     }
 
     /// Builder: run in background
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn background(mut self) -> Self {
         self.background = true;
         self
     }
 
     /// Builder: set name
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
         self
@@ -377,6 +420,31 @@ pub struct HooksConfig {
     pub problems: Vec<HookConfigProblem>,
 }
 
+/// Seed for a workspace's `.codewhale/hooks.toml` when it does not exist yet.
+///
+/// Entirely commented out: creating the file must never change behaviour, and
+/// an empty file that teaches the schema beats an empty file that does not.
+/// The event list here is the one `/hooks events` prints.
+pub const PROJECT_HOOKS_TEMPLATE: &str = r#"# Codewhale project hooks.
+#
+# Hooks are executable repository configuration: they run only after this
+# workspace is trusted and these exact bytes approved (`/hooks review`, then
+# `/hooks approve <digest>`). Global hooks live in the `[hooks]`
+# table of your own config.toml; the entries here are appended after those.
+#
+# Run `/hooks events` in Codewhale for the full event list with descriptions.
+#
+# Uncomment to try one:
+#
+# [[hooks]]
+# name = "format on write"
+# event = "post_tool_use"
+# command = "cargo fmt --all"
+# timeout_secs = 30
+# background = true
+# continue_on_error = true
+"#;
+
 fn default_enabled() -> bool {
     true
 }
@@ -385,7 +453,7 @@ impl HooksConfig {
     /// Load global hooks merged with project-local `.codewhale/hooks.toml` (#3026).
     ///
     /// Project hooks are executable repository configuration, so they are only
-    /// honored after the workspace has been trusted in user-owned config.
+    /// honored after workspace trust and exact-byte hook approval in user config.
     /// Trusted project hooks are appended after global hooks.  A malformed
     /// trusted project file logs a warning and falls back to global-only.
     pub fn load_with_project(global: HooksConfig, workspace: &Path) -> HooksConfig {
@@ -433,19 +501,28 @@ impl HooksConfig {
             }
         }
         let project_path = workspace.join(".codewhale").join("hooks.toml");
-        if project_path.exists() && workspace_allows_project_hooks(workspace) {
-            match read_project_hooks_file(&project_path) {
-                Ok(contents) => match toml::from_str::<HooksConfig>(&contents) {
-                    Ok(project) => merged.hooks.extend(project.hooks),
-                    Err(e) => tracing::warn!(
-                        "Failed to parse project hooks at {}: {e}; falling back to global hooks only",
-                        project_path.display()
-                    ),
+        if project_path.symlink_metadata().is_ok() {
+            match super::authority::approved_project_hooks(workspace) {
+                Ok((authority, contents)) => match toml::from_str::<HooksConfig>(&contents) {
+                    Ok(mut project) => {
+                        for hook in &mut project.hooks {
+                            hook.project_authority = Some(authority.clone());
+                        }
+                        merged.hooks.extend(project.hooks);
+                    }
+                    Err(_) => merged.problems.push(HookConfigProblem {
+                        name: None,
+                        event: None,
+                        detail: "Invalid project hooks TOML; project hooks were not loaded".into(),
+                        rejected: true,
+                    }),
                 },
-                Err(e) => tracing::warn!(
-                    "Failed to read project hooks at {}: {e}; falling back to global hooks only",
-                    project_path.display()
-                ),
+                Err(detail) => merged.problems.push(HookConfigProblem {
+                    name: None,
+                    event: None,
+                    detail,
+                    rejected: true,
+                }),
             }
         }
         // Validation runs on every path, not just the project-hooks path, so a
@@ -689,8 +766,8 @@ fn load_plugin_hook_component(
     Ok(merged)
 }
 
-fn workspace_allows_project_hooks(workspace: &Path) -> bool {
-    crate::config::is_workspace_trusted(workspace)
+pub fn workspace_allows_project_hooks(workspace: &Path) -> bool {
+    super::authority::approved_project_hooks(workspace).is_ok()
 }
 
 /// Walk a condition tree and report every predicate the event can never
@@ -749,11 +826,11 @@ fn collect_condition_problems(
 mod contract_tests {
     use super::*;
 
-    /// The eleven event names are a public contract: they appear in
+    /// The fifteen event names are a public contract: they appear in
     /// `config.toml`, in `/hooks events`, and in `docs/HOOKS.md`. A rename is
     /// a breaking change, and a new variant must be added deliberately.
     #[test]
-    fn all_eleven_event_names_are_stable_and_exhaustive() {
+    fn all_fifteen_event_names_are_stable_and_exhaustive() {
         let names: Vec<&str> = ALL_HOOK_EVENTS.iter().map(|e| e.as_str()).collect();
         assert_eq!(
             names,
@@ -769,6 +846,10 @@ mod contract_tests {
                 "subagent_spawn",
                 "subagent_complete",
                 "shell_env",
+                "session_idle",
+                "session_error",
+                "waiting_for_user",
+                "session_busy",
             ]
         );
 
@@ -786,12 +867,31 @@ mod contract_tests {
                 | HookEvent::OnError
                 | HookEvent::SubagentSpawn
                 | HookEvent::SubagentComplete
-                | HookEvent::ShellEnv => true,
+                | HookEvent::ShellEnv
+                | HookEvent::SessionIdle
+                | HookEvent::SessionError
+                | HookEvent::WaitingForUser
+                | HookEvent::SessionBusy => true,
             };
             assert!(covered);
         }
         let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 11);
+        assert_eq!(unique.len(), 15);
+    }
+
+    #[test]
+    fn documented_event_table_matches_the_runtime_registry() {
+        let docs = include_str!("../../../../docs/HOOKS.md");
+        let names: Vec<&str> = docs
+            .lines()
+            .skip_while(|line| *line != "| Event | Fires | Steering |")
+            .skip(2)
+            .take_while(|line| line.starts_with('|'))
+            .map(|line| line.split('`').nth(1).expect("event name in table row"))
+            .collect();
+        assert_eq!(names, ALL_HOOK_EVENTS.map(HookEvent::as_str));
+        let heading = format!("## The {} events", names.len());
+        assert!(docs.lines().any(|line| line == heading));
     }
 
     /// Serde round-trip for every event name, in the exact `event = "..."`
@@ -1397,5 +1497,22 @@ condition = { type = "exit_code", code = 1 }
             .expect_err("oversized project hook config must be rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("1 MiB"));
+    }
+
+    /// The seeded project hooks file must be inert: creating it can never
+    /// change behaviour, only teach the schema.
+    #[test]
+    fn project_hooks_template_parses_and_configures_nothing() {
+        let parsed: HooksConfig =
+            toml::from_str(PROJECT_HOOKS_TEMPLATE).expect("the seeded template must be valid TOML");
+        assert!(
+            parsed.hooks.is_empty(),
+            "a freshly created hooks file must define no hooks"
+        );
+        assert!(parsed.problems.is_empty());
+        assert!(
+            PROJECT_HOOKS_TEMPLATE.contains("/hooks events"),
+            "the template must point at the event list rather than restate it"
+        );
     }
 }

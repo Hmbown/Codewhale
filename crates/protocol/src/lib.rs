@@ -11,6 +11,7 @@ use serde_json::Value;
 
 pub mod agent_mail;
 pub mod agent_run;
+pub mod engine_owner;
 pub mod event_msg;
 pub mod fleet;
 pub mod ids;
@@ -36,6 +37,221 @@ pub trait Status {
     /// Returns `true` when the item has been explicitly paused by the user
     /// or system (e.g. Paused).
     fn is_paused(&self) -> bool;
+}
+
+/// A single message entry in a conversation thread.
+///
+/// Messages form a tree structure via [`parent_entry_id`](Self::parent_entry_id),
+/// enabling conversation branching and forking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRecord {
+    /// Auto-incremented unique identifier for this message.
+    pub id: i64,
+    /// ID of the thread this message belongs to.
+    pub thread_id: String,
+    /// Role of the message sender (e.g. `"user"`, `"assistant"`, `"system"`).
+    pub role: String,
+    /// Text content of the message.
+    pub content: String,
+    /// Optional structured item payload (tool calls, tool results, etc.).
+    pub item: Option<Value>,
+    /// Unix timestamp (seconds) when the message was created.
+    pub created_at: i64,
+    /// ID of the parent message, forming a tree structure. `None` for root messages.
+    pub parent_entry_id: Option<i64>,
+}
+
+/// A complete immutable legacy SQLite graph, not a limit or active-branch projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyThreadHistory {
+    pub version: u32,
+    pub state_store_id: String,
+    pub thread_id: String,
+    pub current_leaf_id: Option<i64>,
+    pub messages: Vec<MessageRecord>,
+    /// Captured in the same SQLite snapshot; imported Active goals stay paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<ThreadGoal>,
+}
+
+pub const MAX_CANONICAL_HISTORY_ENTRIES: usize = 16_384;
+pub const MAX_CANONICAL_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+
+/// An authenticated import proposal carries conversation data only. Routing and
+/// permissions remain the current owner's create-thread policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalHistoryImportRequest {
+    pub version: u32,
+    pub operation_key: String,
+    pub expected_data_dir: PathBuf,
+    pub expected_execution_scope: String,
+    /// Existing bare compatibility links attach their full source graph here;
+    /// the owner verifies the actual bound canonical document, never remints it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_runtime_thread_id: Option<String>,
+    pub workspace: PathBuf,
+    pub model: Option<String>,
+    pub history: LegacyThreadHistory,
+}
+
+/// Durable result of the actual canonical owner operation. Its scope fields are
+/// captured from RuntimeStoreBinding; historical receipts never authenticate a
+/// current process or convey credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadReceipt {
+    pub version: u32,
+    pub data_dir: PathBuf,
+    pub execution_scope: String,
+    pub operation_key: String,
+    pub request_digest: String,
+    pub history_digest: String,
+    pub runtime_thread_id: String,
+    pub session_id: String,
+}
+
+/// A complete read projection from the actual Engine and its existing saved
+/// journal. `session` retains the established SavedSession wire shape, including
+/// every branch; it is data, never a policy or operation-commit receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadSnapshot {
+    pub version: u32,
+    pub data_dir: PathBuf,
+    pub execution_scope: String,
+    pub runtime_thread_id: String,
+    pub saved_session_id: Option<String>,
+    pub saved_document_digest: Option<String>,
+    pub document_digest: String,
+    pub session_goal_digest: String,
+    pub session: Value,
+}
+
+/// One client-captured intent. The key is retained after an uncertain reply;
+/// retrying it never allocates another canonical identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadMutationRequest {
+    pub version: u32,
+    pub operation_key: String,
+    pub expected_data_dir: PathBuf,
+    pub expected_execution_scope: String,
+    pub workspace: PathBuf,
+    pub mutation: CanonicalThreadMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalThreadMutation {
+    /// The existing CreateThreadRequest shape, checked by the owner. Conversation
+    /// data and an imported document never supply a routing or permission ceiling.
+    Create { config: Value },
+    Resume {
+        source: CanonicalHistorySource,
+        #[serde(default)]
+        options: CanonicalHistoryOptions,
+    },
+    Fork {
+        source: CanonicalHistorySource,
+        #[serde(default)]
+        options: CanonicalHistoryOptions,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_entry_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalHistoryOptions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_history: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub overrides: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_session_goal_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalHistorySource {
+    Thread {
+        runtime_thread_id: String,
+        expected_document_digest: String,
+    },
+    /// Local mounted handoff supplies the already protected complete document;
+    /// the actual owner reopens it and compares the same whole-document digest.
+    SavedSession {
+        session: Value,
+        expected_document_digest: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalThreadOperationKind {
+    Create,
+    Resume,
+    Fork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadOperationAssociation {
+    pub kind: CanonicalThreadOperationKind,
+    pub source_runtime_thread_id: Option<String>,
+    pub source_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadOperationLookup {
+    pub version: u32,
+    pub operation_key: String,
+    pub expected_data_dir: PathBuf,
+    pub expected_execution_scope: String,
+    pub workspace: PathBuf,
+}
+
+/// Explicit completion of an already-prepared retained intent, with no source proposal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadOperationRecovery {
+    pub operation: CanonicalThreadOperationLookup,
+    pub association: CanonicalThreadOperationAssociation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalThreadOperationStatus {
+    Absent,
+    Pending {
+        receipt: CanonicalThreadReceipt,
+        association: CanonicalThreadOperationAssociation,
+    },
+    Committed {
+        receipt: CanonicalThreadReceipt,
+        association: CanonicalThreadOperationAssociation,
+    },
+}
+
+/// Closed routing receipt captured from the held Runtime owner, never a bearer.
+/// Authentication also requires the actual connected kernel peer identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeOwnerReceipt {
+    pub version: u32,
+    pub data_dir: PathBuf,
+    pub execution_scope: String,
+    pub lease_generation: String,
+    pub pid: u32,
+    pub process_start: String,
+    pub principal: String,
+    pub socket_path: PathBuf,
+    pub config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,10 +349,97 @@ pub struct ThreadGoal {
     pub continuation_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_gap_fingerprint: Option<String>,
+    #[serde(default)]
+    pub repeated_gap_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_gap_pass: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<GoalPauseReason>,
+}
+
+/// Why an unfinished goal is paused. Shared by every durable host projection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPauseReason {
+    User,
+    Backoff,
+    NoProgress,
+    UsageLimit,
+    BudgetLimit,
+}
+
+impl GoalPauseReason {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Backoff => "run limit",
+            Self::NoProgress => "no progress",
+            Self::UsageLimit => "usage limit",
+            Self::BudgetLimit => "budget limit",
+        }
+    }
+}
+
+/// Validate the compact stall history without retaining verifier prose.
+/// Legacy records with the entire history absent start with an empty window.
+pub const MAX_REPEATED_GAP_COUNT: u32 = 3;
+
+pub fn validate_goal_stall_state(
+    fingerprint: Option<&str>,
+    count: u32,
+    pass: Option<u32>,
+    continuation_count: u32,
+) -> Result<(), &'static str> {
+    match (fingerprint, count, pass) {
+        (None, 0, None) => Ok(()),
+        (Some(digest), 1..=MAX_REPEATED_GAP_COUNT, Some(pass))
+            if digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && pass <= continuation_count
+                && count <= pass.saturating_add(1) =>
+        {
+            Ok(())
+        }
+        _ => Err("invalid persisted goal stall history"),
+    }
+}
+
+impl ThreadGoal {
+    pub fn validate_stall_state(&self) -> Result<(), &'static str> {
+        validate_goal_stall_state(
+            self.last_gap_fingerprint.as_deref(),
+            self.repeated_gap_count,
+            self.last_gap_pass,
+            u32::try_from(self.continuation_count.max(0)).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Restore a durably impossible record as paused. The engine pauses
+    /// NoProgress in the same locked mutation that fills the stall window, so
+    /// a persisted record that is still Active at the ceiling is corrupt
+    /// (e.g. a crash between the counter write and the pause). Returns true
+    /// when the record was healed.
+    pub fn normalize_restored_stall_state(&mut self) -> bool {
+        if matches!(self.status, ThreadGoalStatus::Active)
+            && self.repeated_gap_count >= MAX_REPEATED_GAP_COUNT
+        {
+            self.status = ThreadGoalStatus::Paused;
+            self.pause_reason = Some(GoalPauseReason::NoProgress);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadStartParams {
+    /// Captured once for this user intent and retained for an uncertain reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +452,9 @@ pub struct ThreadStartParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadResumeParams {
+    /// Captured once for this user intent and retained for an uncertain reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_key: Option<String>,
     pub thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<Vec<Value>>,
@@ -178,6 +484,9 @@ pub struct ThreadResumeParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadForkParams {
+    /// Captured once for this user intent and retained for an uncertain reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_key: Option<String>,
     pub thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -275,6 +584,15 @@ pub enum ThreadRequest {
     Message {
         thread_id: String,
         input: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<runtime::RuntimeImageInput>,
+        #[serde(
+            default,
+            rename = "maxOutputTokens",
+            alias = "max_output_tokens",
+            skip_serializing_if = "Option::is_none"
+        )]
+        max_output_tokens: Option<std::num::NonZeroU32>,
     },
 }
 
@@ -373,11 +691,20 @@ pub struct AppResponse {
 /// A simple prompt request that sends text to the model and returns output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptRequest {
+    #[serde(
+        default,
+        rename = "maxOutputTokens",
+        alias = "max_output_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_tokens: Option<std::num::NonZeroU32>,
     /// Optional thread context for the prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// The prompt text.
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<runtime::RuntimeImageInput>,
     /// Model override, or the default if omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -795,3 +1122,11 @@ pub enum EventFrame {
         message: String,
     },
 }
+
+pub mod request;
+pub mod role;
+
+/// Pure provenance data shared by hosts and portable status reports.
+pub mod cloud_facts;
+
+pub mod display;

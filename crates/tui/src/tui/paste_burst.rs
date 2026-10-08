@@ -30,6 +30,8 @@ pub(crate) enum CharDecision {
 pub(crate) enum FlushResult {
     Paste(String),
     Typed(char),
+    /// Enter can submit again even though the composer text has not changed.
+    SuppressionExpired,
     None,
 }
 
@@ -83,6 +85,15 @@ impl PasteBurst {
     }
 
     pub fn flush_if_due(&mut self, now: Instant) -> FlushResult {
+        let suppression_expired = self.burst_window_until.is_some_and(|until| now > until);
+        if suppression_expired {
+            self.burst_window_until = None;
+        }
+        let unchanged = if suppression_expired {
+            FlushResult::SuppressionExpired
+        } else {
+            FlushResult::None
+        };
         let timeout = if self.is_active_internal() {
             PASTE_BURST_ACTIVE_IDLE_TIMEOUT
         } else {
@@ -108,29 +119,39 @@ impl PasteBurst {
             if let Some((ch, _)) = self.pending_first_char.take() {
                 FlushResult::Typed(ch)
             } else {
-                FlushResult::None
+                unchanged
             }
         } else {
-            FlushResult::None
+            unchanged
         }
     }
 
-    /// Return the remaining delay before a pending char/paste buffer must flush.
-    ///
-    /// This lets the UI event loop avoid sleeping past the flush deadline.
+    /// Wake for pending input or the one redraw that re-enables submission.
+    /// Once both are settled, typing must not leave a zero-delay poll loop.
     #[must_use]
     pub fn next_flush_delay(&self, now: Instant) -> Option<Duration> {
-        let last = self.last_plain_char_time?;
-        let timeout = if self.is_active_internal() {
-            PASTE_BURST_ACTIVE_IDLE_TIMEOUT
-        } else {
-            PASTE_BURST_CHAR_INTERVAL
-        };
-        Some(timeout.saturating_sub(now.duration_since(last)))
+        if self.is_active() {
+            let last = self.last_plain_char_time?;
+            let timeout = if self.is_active_internal() {
+                PASTE_BURST_ACTIVE_IDLE_TIMEOUT
+            } else {
+                PASTE_BURST_CHAR_INTERVAL
+            };
+            return Some(timeout.saturating_sub(now.duration_since(last)));
+        }
+        self.burst_window_until
+            .map(|until| (until + Duration::from_millis(1)).saturating_duration_since(now))
     }
 
     pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
         if self.is_active() {
+            // A held first char precedes this newline in arrival order; move
+            // it into the burst first or it would land after the newline
+            // ("a\nb" became "\nab").
+            if let Some((held, _)) = self.pending_first_char.take() {
+                self.buffer.push(held);
+                self.active = true;
+            }
             self.buffer.push('\n');
             self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
             true
@@ -294,6 +315,30 @@ mod tests {
     }
 
     #[test]
+    fn newline_after_held_first_char_keeps_arrival_order() {
+        let mut burst = PasteBurst::default();
+        let t0 = Instant::now();
+        assert!(matches!(
+            burst.on_plain_char('1', t0),
+            CharDecision::RetainFirstChar
+        ));
+        let t1 = t0 + Duration::from_millis(1);
+        assert!(burst.append_newline_if_active(t1));
+        let t2 = t1 + Duration::from_millis(1);
+        let decision = burst.on_plain_char('2', t2);
+        assert!(matches!(
+            decision,
+            CharDecision::BufferAppend | CharDecision::BeginBufferFromPending
+        ));
+        burst.append_char_to_buffer('2', t2);
+        let t3 = t2 + PasteBurst::recommended_active_flush_delay() + Duration::from_millis(1);
+        assert!(matches!(
+            burst.flush_if_due(t3),
+            FlushResult::Paste(ref s) if s == "1\n2"
+        ));
+    }
+
+    #[test]
     fn flush_before_modified_input_includes_pending_first_char() {
         let mut burst = PasteBurst::default();
         let t0 = Instant::now();
@@ -304,6 +349,37 @@ mod tests {
 
         assert_eq!(burst.flush_before_modified_input(), Some("a".to_string()));
         assert!(!burst.is_active());
+    }
+
+    #[test]
+    fn settled_input_stops_polling_and_expiry_requests_one_redraw() {
+        let mut burst = PasteBurst::default();
+        let now = Instant::now();
+        let _ = burst.on_plain_char('a', now);
+        assert!(matches!(
+            burst.flush_if_due(now + Duration::from_millis(20)),
+            FlushResult::Typed('a')
+        ));
+        assert_eq!(
+            burst.next_flush_delay(now + Duration::from_millis(20)),
+            None
+        );
+
+        burst.extend_window(now);
+        let inside = now + Duration::from_millis(100);
+        assert!(burst.newline_should_insert_instead_of_submit(inside));
+        assert_eq!(
+            burst.next_flush_delay(inside),
+            Some(Duration::from_millis(21))
+        );
+        let expired = now + Duration::from_millis(121);
+        assert!(matches!(
+            burst.flush_if_due(expired),
+            FlushResult::SuppressionExpired
+        ));
+        assert!(!burst.newline_should_insert_instead_of_submit(expired));
+        assert_eq!(burst.next_flush_delay(expired), None);
+        assert!(matches!(burst.flush_if_due(expired), FlushResult::None));
     }
 
     #[test]

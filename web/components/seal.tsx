@@ -1,16 +1,14 @@
-export function Seal({
-  char = "深",
-  size = "md",
-  variant = "ink",
-}: {
-  char?: string;
-  size?: "sm" | "md" | "lg";
-  variant?: "ink" | "indigo";
-}) {
-  const dim = size === "sm" ? "w-7 h-7 text-sm" : size === "lg" ? "w-12 h-12 text-2xl" : "w-10 h-10 text-lg";
-  const cls = variant === "indigo" ? "seal seal-indigo" : "seal";
+/**
+ * <Seal> — one Han glyph in a small square stamp, inked in the logo's ombre.
+ *
+ * A seal names the subject of a page or section at a glance (问 questions,
+ * 接 integrations, 数 facts, 信 trust, 集 surfaces, 法 law, 序 rank, 证 evidence,
+ * 动 activity, 深 depth). It is a mark, not a word: the heading beside it
+ * says the same thing, so the seal is hidden from assistive technology.
+ */
+export function Seal({ char = "深", size = "md" }: { char?: string; size?: "sm" | "md" | "lg" }) {
   return (
-    <span className={`${cls} ${dim}`} aria-hidden>
+    <span className={`seal seal-${size}`} aria-hidden="true" lang="zh">
       {char}
     </span>
   );

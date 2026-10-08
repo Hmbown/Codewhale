@@ -1,51 +1,56 @@
 # 按键绑定
 
-> 本文翻译自英文版 [KEYBINDINGS.md](../KEYBINDINGS.md)，与英文修订 `1a9600e7c`（2026-08-19）同步。
+> 英文原文：[KEYBINDINGS.md](../KEYBINDINGS.md)。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 这里是 TUI 所识别的每一个键盘快捷键的权威目录。
-快捷键绑定按**上下文**分组——即它们生效时所处的焦点或模态状态。列在“编辑器”下的快捷键仅在编辑器获得焦点时生效；“对话记录”下的快捷键仅在对话记录获得焦点时生效；依此类推。
+快捷键绑定按**上下文**分组——即它们生效时所处的焦点或模态状态。列在“输入框（Composer）”下的快捷键仅在输入框获得焦点时生效；“对话记录（Transcript）”下的快捷键仅在对话记录获得焦点时生效；依此类推。
 
-全局快捷键目前尚不支持用户自定义——此功能计划在未来的版本中实现（#436, #437）。热键栏位操作可通过 `[[hotbar]]` 和 `/hotbar` 进行配置；热键栏激活快捷键仍为 `Alt-1` 至 `Alt-8`。
+全局快捷键目前尚不支持用户自定义——此功能计划在未来的版本中实现（#436, #437）。Hotbar 槽位操作可通过 `[[hotbar]]` 和 `/hotbar` 进行配置；Hotbar 的触发键仍为 `Alt-1` 至 `Alt-8`。
+
 ## 全局（任意上下文）
 
 | 按键 | 操作 |
 |------|------|
-| `F1` 或 `Ctrl-/` | 切换帮助浮层 |
-| `F2` | 切换键入式设置编辑器 |
+| `/help`、`F1` 或 `Ctrl-/` | 切换帮助浮层。界面上显示的是 `/help`：它是所有终端都能送达的唯一途径，而 `F1` 会被 tmux 和部分终端模拟器吞掉，`Ctrl-/` 的编码也因终端而异 |
+| `F2` | 切换类型化的设置编辑器 |
+| `F3` | 打开提供商/模型选择器（等同于 `/provider`） |
 | `Ctrl-K` | 打开命令面板（斜杠命令查找器） |
-| `Ctrl-C` | 取消当前回合 / 关闭模态框 / 先武装再确认退出 |
-| `Ctrl-B` | 将受支持的前台 shell 等待移入 `/jobs`，使对话回合得以继续；可用 `/jobs` 或 `action: "wait"` 的 `Bash` 来查看它 |
+| `Ctrl-C` | 取消当前回合 / 关闭模态框 / 先预备再确认退出 |
+| `Ctrl-B` | 将受支持的前台 shell 等待移入 `/jobs`，使当前回合得以继续；可用 `/jobs` 或 `action: "wait"` 的 `Bash` 来查看它 |
 | `Ctrl-D` | 退出（仅当输入框为空时） |
 | `Tab` | 当输入框为空时，循环切换 TUI 模式：Plan → Work → Operate → Plan |
-| `Shift+Tab` | 循环切换权限姿态：Ask → Auto-Review → Full Access。无论输入框内容如何或回合是否在运行都即时生效（仅在打开 Config 以外的模态框时被抑制） |
-| `Ctrl-T` | 循环切换当前模型的推理力度。走与 `/model` 和 `/effort` 相同的阶梯（catalog 或已文档化的路由方言）。始终思考的模型省略 `off`;Grok 4.6 包含 `xhigh`。 |
-| `Ctrl-Shift-T` | 切换实时 transcript 浮层（粘性尾部自动滚动） |
+| `Shift+Tab` | 循环切换权限级别：Ask → Auto-Review → Full Access（完全访问）。无论输入框内容如何、回合是否在运行都即时生效（仅在打开设置以外的模态框时被抑制） |
+| `Ctrl-T` | 循环切换当前模型的思考强度。走与 `/model` 和 `/effort` 相同的阶梯（模型目录，或已文档化的路由方言）。始终思考的模型省略 `off`；Grok 4.6 包含 `xhigh`。 |
+| `Ctrl-Shift-T` | 切换实时对话记录浮层（粘性尾部自动滚动） |
 | `Ctrl-R` | 打开恢复会话选择器 |
-| `Ctrl-L` | 压缩对话上下文（状态行显示进度；压缩已在运行时为无操作） |
-| `Ctrl-O` | 打开所选或当前回合的推理详情，与输入框内容无关 |
-| `Ctrl-Alt-O` | 打开整回合的 Turn Inspector，与输入框内容无关 |
-| `Alt-V` / `Option-V`（macOS） | 为所选、可见或最近的工具/子代理卡片打开详情分页器；发出传统 Option-V 字符的终端也会被处理 |
-| `Ctrl-Shift-E` / `Cmd-Shift-E` | 切换文件树侧边栏 |
-| `Alt-G` / `Alt-Shift-G` |输入框为空时将 transcript 滚动到顶部 / 底部 |
+| `Ctrl-L` | 压缩对话上下文（状态行显示进度；压缩已在运行时不执行任何操作） |
+| `Ctrl-O` | 打开所选或当前回合的思考详情，与输入框内容无关 |
+| `Ctrl-Alt-O` | 打开整个回合的 Turn Inspector，与输入框内容无关 |
+| `Alt-V` / `Option-V`（macOS） | 为所选、可见或最近的工具/智能体卡片打开详情分页器；发出传统 Option-V 字符的终端也会被处理 |
+| `Ctrl-Shift-E` / `Cmd-Shift-E` | 在任务面板（workbar）中切换文件树 |
+| `Ctrl-]` 或 `Ctrl-Tab` | 循环切换 work dock：TODO → Agents → Jobs → Background。`Ctrl-]` 是可移植的组合键——`Ctrl-Tab` 只有在 kitty 键盘协议下才能送达 |
+| `Ctrl-Shift-Tab` | 反向循环切换 work dock |
+| `Alt-G` / `Alt-Shift-G` | 输入框为空时将对话记录滚动到顶部 / 底部 |
 | `Alt-1`-`Alt-8` | 当没有模态框或内联选择器打开时分发 Hotbar 槽位 1-8 |
-| `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` | 选择工作栏面板：Tasks / Agents / Context / Pinned |
-| `Ctrl-Alt-0` | 关闭工作栏 / 恢复到顶部位置 |
+| `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` | 选择任务面板（workbar）的面板：Tasks / Agents / Context / Files |
+| `Ctrl-Alt-0` | 关闭任务面板（workbar）/ 恢复到底部位置 |
 | `Alt-L` | 为最后一条消息打开分页器（输入框为空） |
 | `Alt-P` / `Alt-A` / `Alt-Y` | 跳到 Plan / Work，或请求 Full Access（`Alt-Y` 是旧的权限通道——Work + Full Access——不是独立模式；它遵循锁定的审批策略） |
-| `Ctrl-X`（活动侧边栏） | 取消所有正在运行的后台 shell 任务 |
-| `Esc` | 关闭最上层模态框 · 取消斜杠菜单 · 关闭 toast |
+| `Ctrl-X`（Activity 任务面板） | 取消所有正在运行的后台 shell 任务 |
+| `Esc` | 关闭最上层模态框 · 取消斜杠菜单 · 关闭 toast。当压缩正在为一个进行中的回合服务时，`Esc` 会停止该回合（压缩随之中断） |
 
-## Composer（消息输入区）
+## 输入框（Composer）
 
 正在编辑你即将发送的消息。
 
 | 按键 | 操作 |
 |------|------|
-| `Enter` | 空闲时发送；忙碌时排队;composer 为空时，立即发送下一条已排队的后续消息 |
+| `Enter` | 空闲时发送；忙碌时排队；输入框为空时，立即发送下一条已排队的后续消息 |
 | `Shift-Enter` / `Alt-Enter` / `Ctrl-J` | 插入换行而不发送（空闲或忙碌均可） |
 | `Ctrl-Enter` / `Cmd-Enter` | 把内容发进当前回合；空闲时正常发送（终端能区分时） |
 | `Ctrl-U` | 清空整个草稿（可恢复——参见 `Ctrl-Z`） |
-| `Ctrl-Z` | 恢复已清空的草稿（仅当 composer 为空时） |
+| `Ctrl-Z` | 恢复已清空的草稿（仅当输入框为空时） |
 | `Ctrl-W` / `Ctrl-Backspace` / `Alt-Backspace` | 删除前一个单词 |
 | `Ctrl-A` / `Home` | 移到输入开头 / 行首（readline 约定） |
 | `Ctrl-E` / `End` | 移到输入结尾 / 行尾 |
@@ -56,37 +61,40 @@
 | `Shift-Home` / `Shift-End` | 把选区扩展到行首 / 行尾 |
 | `Ctrl-Shift-Home` / `Ctrl-Shift-End` | 把选区扩展到草稿开头 / 结尾 |
 | `Ctrl-Shift-A` / `Cmd-A` | 选择整个草稿（参见下方说明） |
-| `Ctrl-Shift-U` | 从键盘运行 `/update install`：无需离开 TUI 即可检查并安装最新的 Codewhale 版本。托管安装（Homebrew/npm/cargo）保留其包管理器门槛；已是最新版本时显示更新器的 "Already up to date." 结果，不做任何更改 |
-| 鼠标拖动 | 选择 composer 文本；点击移动光标 |
+| `Ctrl-Shift-U` | 从键盘运行 `/update install`：无需离开 TUI 即可检查并安装最新的 Codewhale 版本。托管安装（Homebrew/npm/cargo）仍受其包管理器的限制；已是最新版本时显示更新器的 "Already up to date." 结果，不做任何更改 |
+| 鼠标拖动 | 选择输入框文本；点击移动光标 |
 | `Cmd-V` / `Ctrl-Shift-V` | 终端本地粘贴（在支持时以括号粘贴形式到达） |
-| `Ctrl-V` | 在本地或转发的图形会话中直接粘贴剪贴板 |
+| `Ctrl-V` | 直接从图形剪贴板粘贴；富文本内容会变成 Markdown |
 | `Ctrl-Y` | 从 kill buffer 拉取（粘贴） |
-| `↑` / `↓` | 循环 composer 历史（也用于选择弹窗/附件条目） |
+| `Ctrl-X` | 剪切选区。只有在原生剪贴板确认复制成功后才会删除文本；通过 SSH 或 tmux 时，只有终端剪贴板（OSC 52）接收数据且从不确认，此时文本会被复制并保留 |
+| `↑` / `↓` | 循环输入框历史（也用于选择弹窗/附件条目） |
 | `Shift-↑` / `Shift-↓` | 浏览对话历史 |
 | `Ctrl-P` / `Ctrl-N` | 在斜杠命令菜单条目间导航；菜单为空时 `Ctrl-P` 打开文件选择器 |
 | `Ctrl-G` / `Ctrl-S` | 暂存当前草稿（`/stash pop` 恢复它）；从不发送或排队 |
-| `Alt-R` | 搜索提示历史（Alt-R 退出） |
+| `Alt-R` | 搜索提示历史（再按 `Alt-R` 退出） |
 | `Tab` | 斜杠命令 / `@` 提及补全（感知弹窗） |
-| `Ctrl-Shift-O` / `F4` | 在 `$VISUAL` / `$EDITOR` 中打开 composer 草稿；当终端无法区分 Ctrl-Shift-O 与 Ctrl-O 时，F4 可用 |
-| `! command` | 通过常规的审批、sandbox 和输出界面运行 shell 命令 |
+| `Ctrl-Shift-O` / `F4` | 在 `$VISUAL` / `$EDITOR` 中打开输入框草稿；当终端无法区分 Ctrl-Shift-O 与 Ctrl-O 时，F4 可用 |
+| `! command` | 通过常规的审批、沙箱和输出界面运行 shell 命令 |
+
+直接在输入框中粘贴时，HTML 剪贴板内容里的标题、列表、链接、表格和代码会被保留。纯文本保持原样，配置字段则始终粘贴为纯文本。没有转发图形显示的 SSH 会话使用终端的文本粘贴。复制整条回答时会保留其原始 Markdown，不含终端折行或装饰性边线；如何渲染由目标应用决定。默认情况下，对话记录中拖选的内容也以同样方式复制：Markdown 源码，整个单元之间用空行连接（见下文“对话记录”一节）；设置 `tui.selection_copy_markdown = false` 则恢复为复制渲染后的文本。HTML 为空或过大时会退回纯文本。
 
 设置 `composer_multiline_mode = true` 即可交换可移植的 `Enter` 与 `Shift-Enter` 行为：`Enter` 插入换行，`Shift-Enter` 发送。`Alt-Enter`、`Ctrl-J` 以及受支持的 `Ctrl-Enter` / `Cmd-Enter` 行为保持不变。
 
 ### 选择语义
 
-输入、粘贴、`Backspace` 或 `Delete` 在存在活动选区时会替换或删除所选文本，与任何 GUI 编辑器一致。纯移动键（方向键、`Home`/`End`、单词移动）会折叠选区。当选区覆盖整个草稿时，删除或在上面输入会像 `Ctrl-U` 一样暂存即将离开的文本，因此 `Ctrl-Z`（在空 composer 上）或 `Alt-R` 草稿恢复可以把它找回来。
+在存在活动选区时，输入、粘贴、`Backspace` 或 `Delete` 会替换或删除所选文本，与任何 GUI 编辑器一致。纯移动键（方向键、`Home`/`End`、单词移动）会折叠选区。当选区覆盖整个草稿时，删除或在其上输入会像 `Ctrl-U` 一样暂存被移出的文本，因此 `Ctrl-Z`（在空输入框上）或 `Alt-R` 的草稿恢复可以把它找回来。
 
-光标移动和删除是字素感知的：一次 `←`/`→` 步进或一次 `Backspace` 覆盖完整的 emoji ZWJ 序列、旗帜对或组合标记簇——绝不会只删一半。CJK 文本按预期逐字符移动和删除。
+光标移动和删除以字素为单位：一次 `←`/`→` 步进或一次 `Backspace` 会覆盖完整的 emoji ZWJ 序列、旗帜对或组合标记簇——绝不会只处理一半。CJK 文本按预期逐字符移动和删除。
 
-**为什么全选不是 `Ctrl-A`：** composer 遵循 readline 约定，其中 `Ctrl-A` 跳到输入开头（与 `Ctrl-E` 配对）。全选在每个平台上都是 `Ctrl-Shift-A`（与 `Ctrl-Shift-O` / `Ctrl-Shift-E` 一样，需要支持增强键盘协议的终端）。在转发 Command 键的 macOS 终端上（kitty、WezTerm、带 Command 重映射的 iTerm2），原生的 `Cmd-A` 也会全选;`Cmd-Shift-A` 在 macOS 上随处可用，因为 Cmd 会归一化为 Ctrl。
+**为什么全选不是 `Ctrl-A`：** 输入框遵循 readline 约定，其中 `Ctrl-A` 跳到输入开头（与 `Ctrl-E` 配对）。全选在每个平台上都是 `Ctrl-Shift-A`（与 `Ctrl-Shift-O` / `Ctrl-Shift-E` 一样，需要支持增强键盘协议的终端）。在转发 Command 键的 macOS 终端上（kitty、WezTerm、带 Command 重映射的 iTerm2），原生的 `Cmd-A` 也会全选；`Cmd-Shift-A` 在 macOS 上随处可用，因为 Cmd 会归一化为 Ctrl。
 
 ### Hotbar
 
-Hotbar 触发语义刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这是 Option/Alt 键加数字行。裸 `1`-`8` 是 composer 中的正常文本输入，并仍归选择器、引导、审批提示和模态视图所有。
+Hotbar 的触发键刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这是 Option/Alt 键加数字行。裸 `1`-`8` 是输入框中的正常文本输入，并仍归选择器、引导流程、审批提示和模态视图所有。
 
-功能键和 `Cmd-1` 到 `Cmd-8` 不是 Hotbar 的主要组合。许多终端为标签页、窗口或操作系统快捷键保留了这些键，有些从不把它们转发给终端应用。如果终端配置为把 `Alt-1` 发送给某个自定义快捷键，Hotbar 也会收到同样可靠的组合。
+功能键和 `Cmd-1` 到 `Cmd-8` 不是 Hotbar 的主要组合键。许多终端把这些键留给标签页、窗口或操作系统快捷键，有些从不把它们转发给终端应用。如果终端被配置为为某个自定义快捷键发送 `Alt-1`，Hotbar 同样能可靠地收到这个组合键。
 
-自 #3807 起，缺少 `hotbar` 键会渲染**无栏**——全新配置在配置 `[[hotbar]]` 槽位之前不显示 Hotbar（显式的 `hotbar = []` 也会禁用它）。配置后，栏看起来像：
+自 #3807 起，缺少 `hotbar` 键时**不渲染任何栏**——全新配置在你配置 `[[hotbar]]` 槽位之前不显示 Hotbar（显式的 `hotbar = []` 也会禁用它）。配置后，栏看起来像：
 
 | 槽位 | 按键 | 默认操作 | 标签 |
 |------|------|----------|------|
@@ -101,60 +109,80 @@ Hotbar 触发语义刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 
 | 焦点状态 | Hotbar 行为 |
 |----------|-------------|
-| Composer 为空、有文本或空白 | `Alt-1`-`Alt-8` 分发配置的槽位 |
-| 侧边栏聚焦、隐藏或自动 | `Alt-1`-`Alt-8` 仍然分发配置的槽位 |
+| 输入框为空、有文本或仅有空白 | `Alt-1`-`Alt-8` 分发已配置的槽位 |
+| 任务面板（workbar）处于聚焦、隐藏或自动状态 | `Alt-1`-`Alt-8` 仍然分发已配置的槽位 |
 | 斜杠菜单或历史搜索打开 | 被阻止；内联选择器拥有该按键事件 |
 | 命令面板、帮助、审批、文件选择器、会话选择器、Fleet 设置或任何模态栈 | 被阻止；模态框拥有该按键事件 |
-| Onboarding | 被阻止;Onboarding 拥有数字选择 |
+| 引导流程 | 被阻止；引导流程拥有数字选择 |
 
 ### `@` 提及
 
 输入 `@<partial>` 打开文件提及弹窗。`↑`/`↓` 循环条目，`Tab` 或 `Enter` 接受。`Esc` 隐藏弹窗。自 v0.8.10（#441）起，补全按提及频率重新排序——你经常且最近提到的文件会浮到顶部。
 
-两种提及解析为精选的 git 上下文而不是路径（v0.9.2，#4067）：
+有两种提及会解析为精选的 git 上下文，而不是路径（v0.9.2，#4067）：
 
 | 提及 | 内联内容 | 字节预算 |
 |------|----------|----------|
 | `@git` | 工作区的 `git status --short --branch` | 8 KB |
-| `@diff` | 工作树 diff，已暂存和未暂存（`git diff HEAD`） | 32 KB |
+| `@diff` | 工作树 diff，含已暂存和未暂存（`git diff HEAD`） | 32 KB |
 
-两者都出现在补全弹窗中路径的旁边，并且都显示在上下文检查器中，带有其解析后的大小；当 diff 超过其预算时，还会显示截断标记。当 git 缺失、工作区不是仓库或没有可显示的内容时，回合会携带显式的 `<git-unavailable>` 说明，而不是静默地什么都不贡献。仅以该 token 开头的路径（`@diff.txt`、`@git/config`）仍是文件提及。
+两者都会与路径一起出现在补全弹窗中，也都会显示在上下文检查器中，并带有其解析后的大小；当 diff 超过预算时，还会显示截断标记。当 git 缺失、工作区不是仓库或没有可显示的内容时，回合会携带显式的 `<git-unavailable>` 说明，而不是静默地什么都不提供。仅以该字符串开头的路径（`@diff.txt`、`@git/config`）仍是文件提及。
 
 ### `#` 快速添加（记忆）
 
-当 `[memory] enabled = true` 时，输入 `# foo` 并按 `Enter` 会把 `foo` 作为带时间戳的条目追加到你的记忆文件中，*而不会*发送回合。参见 `docs/MEMORY.md`。
+当 `[memory] enabled = true` 时，输入 `# foo` 并按 `Enter`，会把 `foo` 作为带时间戳的条目追加到你的记忆文件中，*而不会*发送回合。参见 `docs/MEMORY.md`。
 
-## Transcript（transcript 获得焦点时）
+## 对话记录（对话记录获得焦点时）
 
 | 按键 | 操作 |
 |------|------|
-| `↑` / `↓` / `j` / `k` | 滚动一行（v0.8.13+：composer 为空时裸方向键也可滚动） |
-| `Alt-↑` / `Alt-↓` | 滚动 transcript（替代方式） |
+| `↑` / `↓` | 滚动一行（输入框为空时，裸方向键也可滚动） |
+| `Alt-↑` / `Alt-↓` | 滚动对话记录（输入框中有草稿时也可用） |
 | `PgUp` / `PgDn` | 滚动一页 |
-| `Home` / `g` | 跳到顶部 |
-| `End` / `G` | 跳到底部 |
-| `Ctrl-Home` / `Ctrl-End` | 跳到顶部 / 底部（也可从 composer 中工作） |
+| `Alt-G` / `Alt-Shift-G` | 跳到顶部 / 底部 |
+| `Ctrl-Home` / `Ctrl-End` | 跳到顶部 / 底部（在输入框中也可用） |
 | `Alt-[` / `Alt-]` | 在工具输出块之间跳转 |
 | `Esc Esc` | 回溯到上一条用户消息（`←`/`→` 步进，`Enter` 回退） |
-| `Esc` | 将焦点返回 composer |
-| 鼠标拖动 | 在 Codewhale 中选择 transcript 文本 |
-| `Ctrl-C` | 复制活动的 Codewhale 选区 |
-| `Cmd-click`（macOS）/ `Ctrl-click`（Linux/Windows） | 在支持的终端中打开 OSC 8 链接（归终端处理） |
+| `Esc` | 将焦点返回输入框 |
+| `Ctrl-Y` | 输入框为空时，复制获得焦点的对话记录单元 |
+| `Alt-V` | 为获得焦点的工具或消息打开原始详情 |
+| `Ctrl-O` | 为获得焦点的回合打开思考详情 |
+| `Enter` | 全屏打开获得焦点的对话记录块 |
+| 鼠标拖动 | 在 Codewhale 中选择对话记录文本 |
+| `Ctrl-C` | 复制当前 Codewhale 选区 |
+| `Cmd-click`（macOS）/ `Ctrl-click`（Linux/Windows） | 在支持的终端中打开 OSC 8 链接（由终端处理） |
 
-对于终端原生选择，按住 `Shift` 拖动（终端支持程度不一），然后使用终端自己的复制命令：通常是 macOS 上的 `Cmd-C` 或 Linux/Windows 上的 `Ctrl-Shift-C`。这些命令由本地终端处理，并刻意与 Codewhale 的 `Ctrl-C` 选择绑定分开。在 SSH 上，Codewhale 通过 OSC 52 发回复制请求，或在 tmux 内运行时通过 tmux 的 `load-buffer -w` 路径。
+裸的可打印键从来不是对话记录快捷键。根据 TUI-DOG-002，可打印字符始终属于输入框——`j`、`k`、`g`、`G`、`y`、`Y`、`r`、`v` 和 `l` 在每种焦点状态下都是直接输入，包括选中对话记录时。早期版本的这张表曾把它们记为导航键；它们从未真正接线，帮助目录里有一个测试（`transcript_navigation_catalog_does_not_advertise_bare_typing_keys`）来防止它们再次出现。
 
-## Work bar（`Alt-W` 获得焦点后）
+松开拖选，或在有活动选区时按 `Ctrl-C`，默认会把相交的单元作为 Markdown 源码复制：每个被选中的单元的序列化方式与 `Ctrl-Y` 和 `/copy` 相同，部分相交的单元会扩展为整个单元，单元之间用空行连接，提示条会显示所复制的单元数。设置 `[tui] selection_copy_markdown = false` 则改为按显示的样子复制渲染后的文本。
+
+如需使用终端原生选择，拖动时按住 `Shift`（支持程度因终端而异），然后使用终端自己的复制命令：通常是 macOS 上的 `Cmd-C` 或 Linux/Windows 上的 `Ctrl-Shift-C`。这些命令由本地终端处理，并刻意与 Codewhale 的 `Ctrl-C` 选择绑定分开。在 SSH 上，Codewhale 通过 OSC 52 把复制请求发回；在 tmux 内运行时，则通过 tmux 的 `load-buffer -w` 路径。
+
+## 指针（鼠标）
+
+鼠标是一等输入方式。这里的每一行都接线在 `crates/tui/src/tui/mouse_ui.rs` 中。
+
+| 手势 | 操作 |
+|------|------|
+| 滚轮上 / 下 | 滚动对话记录；在输入框上时，一次移动光标一行 |
+| 单击 | 激活指针下的行、标签（chip）或工具块 |
+| 拖动 | 选择对话记录文本，或拖动滚动条 |
+| 右键单击 | 对指针下的对象执行操作：复制、粘贴、打开详情或在编辑器中打开 `file:line`、聚焦或停止某个智能体。菜单中显示的字母和数字可直接执行对应行。停止操作会就地确认：第一次按 `Enter` 或点击只是预备，超过双击时间窗口之后再按 `Enter` 或点击才会执行。按字母只会预备，而双击中的第二次点击会被忽略 |
+
+悬停反馈遵循同一规则：任何会响应点击的对象都会在指针下高亮。如果某一行会高亮却什么都不做，或者没有先高亮就执行操作，都是值得报告的 bug。
+
+## 任务面板（workbar）（`Alt-W` 获得焦点后）
 
 | 按键 | 操作 |
 |------|------|
 | `↑` / `↓` | 移动选择 |
 | `Home` / `End` | 跳到第一行 / 最后一行 |
-| `PageUp` / `PageDown` | 每次按视口移动选择 |
-| `Enter` | 打开所选行的 world（work inspector / agent details）；在已打开的行上则关闭它 |
-| `Esc` | 关闭已打开的详情，否则将焦点返回 composer |
-| 任意可打印键 | 将焦点返回 composer（输入总是胜出） |
+| `PageUp` / `PageDown` | 每次按一个视口移动选择 |
+| `Enter` | 打开所选行对应的详情（work inspector / 智能体详情）；在已打开的行上则关闭它 |
+| `Esc` | 关闭已打开的详情，否则将焦点返回输入框 |
+| 任意可打印键 | 将焦点返回输入框（输入总是优先） |
 
-鼠标对等：点击任意工作栏行都执行 `Enter` 的操作，适用于每个面板和位置。`Alt-!`/`Alt-@`/`Alt-#`/`Alt-$` 切换面板。
+鼠标等效：在每个面板和每种位置下，点击任意任务面板行都等同于按 `Enter`。`Alt-!`/`Alt-@`/`Alt-#`/`Alt-$` 切换面板。
 
 ## 斜杠命令面板（按 `Ctrl-K` 或输入 `/` 后）
 
@@ -164,7 +192,7 @@ Hotbar 触发语义刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 | `Enter` / `Tab` | 运行 / 补全高亮的命令 |
 | `Esc` | 关闭面板 |
 
-## Session Picker（`Ctrl-R` 或 `/sessions`）
+## 会话选择器（`Ctrl-R` 或 `/sessions`）
 
 | 按键 | 操作 |
 |------|------|
@@ -182,6 +210,30 @@ Hotbar 触发语义刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 
 归档（`e`）非破坏性且无需确认：会话仍留在磁盘上且仍可加载，它只是离开默认列表并停止作为自动恢复候选。再按一次 `e` 把它带回来。删除（`d`）是破坏性的，并保留其确认。
 
+## 问题面板（`request_user_input`）
+
+当模型提出问题时，会在对话记录上方打开一个**固定在底部的面板**。对话仍然显示在它上方。面板会随问题和选项增高；如果仍然放不下，它会滚动，使高亮的选项和已输入的自定义回答始终留在屏幕上。无需调整窗口大小就能看到全部内容。
+
+| 按键 | 操作 |
+|------|------|
+| `↑` / `↓` / `k` / `j` | 移动高亮 |
+| `1`–`9` | 快速选择该选项 |
+| `Enter` | 确认高亮项（或进入自定义回答输入） |
+| `Space` | 切换多选选项 |
+| `←` / `h` | 上一个问题——修改该问题的答案。`Esc` 不是返回；它会取消整个请求。 |
+| `Esc` | 取消整个提问请求 |
+| `PageUp` / `PageDown` | 在保持面板打开的同时滚动对话记录 |
+| `Home` / `End` | 跳到对话记录的开头 / 最新部分 |
+| `Alt+↑` / `Alt+↓` | 将对话记录滚动三行 |
+| 面板上方的鼠标滚轮 | 滚动对话记录；侧边工作界面保留各自的输入 |
+| 面板上的鼠标滚轮 | 浏览问题内容，而不改变答案或高亮 |
+
+问题面板打开时，`Ctrl+↑` / `Ctrl+↓` 和 `Shift+↑` / `Shift+↓` 同样会将对话记录滚动三行。普通方向键仍然用于移动选项高亮。
+
+用滚轮浏览之后，选项导航或输入会把高亮的选项或自定义回答文本带回视野。对话记录的滚动键在选项选择和自定义回答输入两种状态下都可用。
+
+**自定义回答。** 每个问题都包含一个“Other”行。进入该行，输入内容，然后按 `Enter` 提交，或按 `Esc` 返回选项而不发送。
+
 ## 审批模态框（当工具请求审批时）
 
 | 按键 | 操作 |
@@ -191,25 +243,26 @@ Hotbar 触发语义刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 | `n` / `N` / `Esc` | 拒绝 |
 | `e` | 在运行前编辑已批准的输入 |
 
-## Onboarding（首次运行流程）
+## 引导流程（首次运行）
 
 | 按键 | 操作 |
 |------|------|
-| `Enter` | 前进到下一步（欢迎 → 语言 → API/信任门 → 设置检查点） |
+| `Enter` | 前进到下一步（欢迎 → 语言 → API/信任检查 → 设置检查点） |
 | `Esc` | 后退一屏 |
 | `1`–`9` | 选择语言（语言步骤） |
-| `0`–`9` | 选择 provider（Provider 步骤;SGLang、vLLM 和 Ollama 默认无密钥） |
+| `0`–`9` | 选择提供商（提供商步骤；SGLang、vLLM 和 Ollama 默认无需密钥） |
 | `y` / `Y` | 信任工作区（信任步骤） |
 | `n` / `N` | 跳过信任提示 |
 
 ## v0.8.29 审计说明
 
-- **`Shift+Enter` / `Alt+Enter` 换行现在在 Windows 上的 VSCode 中可用（#1359）。** crossterm 的 `PushKeyboardEnhancementFlags` 命令在 Windows 上无条件返回 `Unsupported`（`is_ansi_code_supported() == false`），因此 Kitty 键盘协议转义从未写入终端。没有它，VSCode 的 xterm.js 停留在传统模式，其中 `Shift+Enter` 与普通 `Enter` 无法区分，导致 composer 发送消息而不是插入换行。修复方案直接在 Windows 上写入 push/pop 转义（`\x1b[>1u` / `\x1b[<1u`），绕过 crossterm 的能力门。VSCode 集成终端和 Windows Terminal ≥1.17 都遵循 Kitty 键盘协议；不理解这些序列的终端会静默丢弃它们。
+- **`Shift+Enter` / `Alt+Enter` 换行现在在 Windows 上的 VSCode 中可用（#1359）。** crossterm 的 `PushKeyboardEnhancementFlags` 命令在 Windows 上无条件返回 `Unsupported`（`is_ansi_code_supported() == false`），因此 Kitty 键盘协议转义从未写入终端。没有它，VSCode 的 xterm.js 停留在传统模式，其中 `Shift+Enter` 与普通 `Enter` 无法区分，导致输入框直接发送消息而不是插入换行。修复方案直接在 Windows 上写入 push/pop 转义（`\x1b[>1u` / `\x1b[<1u`），绕过 crossterm 的能力检查。VSCode 集成终端和 Windows Terminal ≥1.17 都遵循 Kitty 键盘协议；不理解这些序列的终端会静默丢弃它们。
 
 ## v0.8.13 审计说明
 
 - **Ctrl-S 是暂存，不是历史搜索。** 在此修订中修复——`Alt-R` 才是历史搜索。
-- **移除了幽灵 `Alt+Up`。** "Edit last queued message" 绑定曾列在 README 中，但从未存在于按键分发代码中。
-- **composer 为空时裸 Up/Down 方向键滚动 transcript（v0.8.13）。** 以前 `should_scroll_with_arrows` 门被硬编码为 false，意味着即使 composer 为空，裸方向键也总是导航 composer 历史。虚拟终端（Ghostty、Codex、Kitty 协议）中的用户尤其受影响，因为他们无法使用 Cmd+Up / Alt+Up 快捷键。
+- **移除了幽灵 `Alt+Up`。** “Edit last queued message”绑定曾列在 README 中，但从未存在于按键分发代码中。
+- **输入框为空时，裸 Up/Down 方向键滚动对话记录（v0.8.13）。** 以前 `should_scroll_with_arrows` 开关被硬编码为 false，意味着即使输入框为空，裸方向键也总是在输入框历史中导航。虚拟终端（Ghostty、Codex、Kitty 协议）中的用户尤其受影响，因为他们无法使用 Cmd+Up / Alt+Up 快捷键。
 - **可配置键位（#436）和 `tui.toml`（#437）仍然延期。** `TuiPrefs` 结构体和加载器存在于 `settings.rs` 中，但未在启动时接线。允许 `~/.codewhale/tui.toml` 覆盖单个条目的命名绑定注册表仍然待办。
 - **未发现其他损坏的绑定。** 上面列出的每个其他组合都解析为 `crates/tui/src/tui/ui.rs`（按键事件分发）或 `crates/tui/src/tui/app.rs`（模式 + 状态转换）中的实时处理器。
+

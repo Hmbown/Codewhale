@@ -1,12 +1,14 @@
 //! Embedded, loopback-only browser client for the Runtime API.
 
+use codewhale_core::secret_eq::constant_time_eq;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use uuid::Uuid;
 
@@ -23,6 +25,8 @@ pub(super) const BOOTSTRAP_TTL: Duration = Duration::from_secs(10 * 60);
 const WEB_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const BOOTSTRAP_PREFIX: &str = "cwwb_";
 const WEB_SESSION_PREFIX: &str = "cwws_";
+pub(super) const WEB_REQUEST_HEADER: &str = "x-codewhale-web-request";
+pub(super) const WEB_STREAM_TICKET_QUERY: &str = "web_stream_ticket";
 const WEB_SESSION_COOKIE_NAME: &str = "codewhale_web_session";
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'";
 
@@ -30,6 +34,8 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; st
 pub(super) struct RuntimeWebState {
     bootstrap: Arc<Mutex<Option<BootstrapCapability>>>,
     session_token: Arc<str>,
+    request_proof: Arc<Mutex<Option<String>>>,
+    stream_tickets: Arc<Mutex<Vec<BootstrapCapability>>>,
     session_expires_at: Instant,
 }
 
@@ -39,7 +45,7 @@ struct BootstrapCapability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BootstrapError {
+pub(super) enum BootstrapError {
     Invalid,
     Expired,
     NonLoopback,
@@ -63,12 +69,18 @@ impl RuntimeWebState {
                 expires_at: Instant::now() + bootstrap_ttl,
             }))),
             session_token: session_token.into(),
+            request_proof: Arc::new(Mutex::new(None)),
+            stream_tickets: Arc::new(Mutex::new(Vec::new())),
             session_expires_at: Instant::now() + session_ttl,
         };
         (state, nonce)
     }
 
-    fn consume(&self, nonce: &str, peer_ip: IpAddr) -> Result<String, BootstrapError> {
+    pub(super) fn consume(
+        &self,
+        nonce: &str,
+        peer_ip: IpAddr,
+    ) -> Result<(String, String), BootstrapError> {
         if !peer_ip.is_loopback() {
             return Err(BootstrapError::NonLoopback);
         }
@@ -92,7 +104,80 @@ impl RuntimeWebState {
         }
 
         let _capability = slot.take().expect("bootstrap capability checked above");
-        Ok(self.session_token.to_string())
+        let proof = format!(
+            "cwwr_{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
+        *self.request_proof.lock().unwrap_or_else(|p| p.into_inner()) = Some(proof.clone());
+        Ok((self.session_token.to_string(), proof))
+    }
+
+    pub(super) fn matches_request(&self, cookie_header: Option<&str>, proof: Option<&str>) -> bool {
+        self.matches_session_cookie(cookie_header)
+            && proof.is_some_and(|proof| {
+                self.request_proof
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .is_some_and(|expected| constant_time_eq(proof.as_bytes(), expected.as_bytes()))
+            })
+    }
+
+    // Reconnects consume short-lived, single-use tickets. Retain up to 32
+    // pending tickets so independent tabs do not replace each other's ticket;
+    // excess requests evict the oldest pending ticket.
+    pub(super) fn refresh_stream_ticket(
+        &self,
+        cookie_header: Option<&str>,
+        proof: Option<&str>,
+    ) -> Option<String> {
+        if !self.matches_request(cookie_header, proof) {
+            return None;
+        }
+        let ticket = format!(
+            "cwwt_{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
+        let mut tickets = self
+            .stream_tickets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        tickets.retain(|issued| now < issued.expires_at);
+        if tickets.len() == 32 {
+            tickets.remove(0);
+        }
+        tickets.push(BootstrapCapability {
+            nonce: ticket.clone(),
+            expires_at: now + super::mobile::STREAM_TICKET_TTL,
+        });
+        Some(ticket)
+    }
+
+    pub(super) fn consume_stream_ticket(
+        &self,
+        cookie_header: Option<&str>,
+        ticket: Option<&str>,
+    ) -> bool {
+        if !self.matches_session_cookie(cookie_header) {
+            return false;
+        }
+        let mut tickets = self
+            .stream_tickets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        tickets.retain(|issued| now < issued.expires_at);
+        let Some(index) = tickets.iter().position(|issued| {
+            ticket
+                .is_some_and(|ticket| constant_time_eq(ticket.as_bytes(), issued.nonce.as_bytes()))
+        }) else {
+            return false;
+        };
+        tickets.remove(index);
+        true
     }
 
     pub(super) fn matches_session_cookie(&self, cookie_header: Option<&str>) -> bool {
@@ -114,7 +199,7 @@ pub(super) async fn exchange_bootstrap(
     let Some(web) = state.web.as_ref() else {
         return not_found();
     };
-    let session_token = match web.consume(&nonce, peer.ip()) {
+    let (session_token, request_proof) = match web.consume(&nonce, peer.ip()) {
         Ok(token) => token,
         Err(BootstrapError::NonLoopback) => {
             return secured_text(StatusCode::FORBIDDEN, "bootstrap unavailable");
@@ -126,9 +211,10 @@ pub(super) async fn exchange_bootstrap(
 
     let cookie = web_session_cookie(&session_token);
     let mut response = (StatusCode::SEE_OTHER, "").into_response();
-    response
-        .headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_static("/"));
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&format!("/#p={request_proof}")).expect("hex request proof"),
+    );
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("percent-encoded Runtime cookie is a valid header"),
@@ -137,11 +223,61 @@ pub(super) async fn exchange_bootstrap(
     response
 }
 
-pub(super) async fn web_page(State(state): State<RuntimeApiState>) -> Response {
-    if state.web.is_none() {
+pub(super) async fn refresh_stream_ticket(
+    State(state): State<RuntimeApiState>,
+    req: Request,
+) -> Response {
+    let Some(web) = state.web.as_ref() else {
         return not_found();
+    };
+    if !super::auth::web_session_request_is_authorized(&req, &state, web) {
+        return super::auth::runtime_token_required_response();
     }
-    secured_asset("text/html; charset=utf-8", WEB_HTML)
+    let ticket = web.refresh_stream_ticket(
+        req.headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+        req.headers()
+            .get(WEB_REQUEST_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let Some(ticket) = ticket else {
+        return super::auth::runtime_token_required_response();
+    };
+    let mut response = Json(serde_json::json!({"stream_ticket": ticket})).into_response();
+    secure_headers(&mut response, "application/json");
+    response
+}
+
+pub(super) async fn web_page(State(state): State<RuntimeApiState>, headers: HeaderMap) -> Response {
+    let Some(web) = state.web.as_ref() else {
+        return not_found();
+    };
+    web_page_response(web, &headers)
+}
+
+fn web_page_response(web: &RuntimeWebState, headers: &HeaderMap) -> Response {
+    let mut html = WEB_HTML.to_owned();
+    // Recover the origin-scoped proof for reloads and independent tabs. A
+    // cookie alone is insufficient: require same-origin or direct navigation
+    // Fetch Metadata. Older clients without it still use the bootstrap proof.
+    // Proofs are generated hex strings, so no HTML escaping is needed here.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site == "same-origin" || site == "none")
+        && web.matches_session_cookie(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()))
+        && let Some(proof) = web
+            .request_proof
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+    {
+        html = html.replace(
+            "name=\"codewhale-web-request\" content=\"\"",
+            &format!("name=\"codewhale-web-request\" content=\"{proof}\""),
+        );
+    }
+    secured_asset("text/html; charset=utf-8", html)
 }
 
 pub(super) async fn web_styles(State(state): State<RuntimeApiState>) -> Response {
@@ -186,19 +322,7 @@ fn valid_bootstrap_nonce(value: &str) -> bool {
     })
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
-fn secured_asset(content_type: &'static str, body: &'static str) -> Response {
+fn secured_asset(content_type: &'static str, body: impl IntoResponse) -> Response {
     let mut response = body.into_response();
     secure_headers(&mut response, content_type);
     response
@@ -241,6 +365,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_surface_hardening_web_proof_and_ticket_expiry() {
+        let (web, nonce) = RuntimeWebState::new();
+        let (token, proof) = web.consume(&nonce, "127.0.0.1".parse().unwrap()).unwrap();
+        let cookie = web_session_cookie(&token);
+        assert!(!cookie.contains(&proof));
+        assert!(!web.matches_request(None, Some(&proof)));
+        assert!(!web.matches_request(Some(&cookie), Some(&token)));
+        assert!(web.matches_request(Some(&cookie), Some(&proof)));
+        let ticket = web
+            .refresh_stream_ticket(Some(&cookie), Some(&proof))
+            .unwrap();
+        assert!(!web.consume_stream_ticket(None, Some(&ticket)));
+        assert!(!web.consume_stream_ticket(Some(&cookie), Some("wrong-ticket")));
+        web.stream_tickets.lock().unwrap()[0].expires_at = Instant::now();
+        assert!(!web.consume_stream_ticket(Some(&cookie), Some(&ticket)));
+        let ticket = web
+            .refresh_stream_ticket(Some(&cookie), Some(&proof))
+            .unwrap();
+        let mut expired = web.clone();
+        expired.session_expires_at = Instant::now();
+        assert!(!expired.matches_request(Some(&cookie), Some(&proof)));
+        assert!(!expired.consume_stream_ticket(Some(&cookie), Some(&ticket)));
+    }
+
+    #[tokio::test]
+    async fn runtime_surface_review_web_page_recovers_proof_for_reload_and_second_tab() {
+        let (web, nonce) = RuntimeWebState::new();
+        let (token, proof) = web.consume(&nonce, "127.0.0.1".parse().unwrap()).unwrap();
+        let cookie = web_session_cookie(&token);
+        for site in [
+            None,
+            Some("same-origin"),
+            Some("none"),
+            Some("same-site"),
+            Some("cross-site"),
+        ] {
+            for valid_cookie in [false, true] {
+                for expired in [false, true] {
+                    let mut session = web.clone();
+                    if expired {
+                        session.session_expires_at = Instant::now();
+                    }
+                    let mut headers = HeaderMap::new();
+                    if valid_cookie {
+                        headers.insert(header::COOKIE, cookie.parse().unwrap());
+                    }
+                    if let Some(site) = site {
+                        headers.insert("sec-fetch-site", site.parse().unwrap());
+                    }
+                    let response = web_page_response(&session, &headers);
+                    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                    assert!(
+                        response.headers()[header::CONTENT_SECURITY_POLICY]
+                            .to_str()
+                            .unwrap()
+                            .contains("frame-ancestors 'none'")
+                    );
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let html = std::str::from_utf8(&body).unwrap();
+                    let recovered = html.contains(&format!(
+                        "name=\"codewhale-web-request\" content=\"{proof}\""
+                    ));
+                    assert_eq!(
+                        recovered,
+                        valid_cookie && !expired && matches!(site, Some("same-origin" | "none")),
+                        "site={site:?}, valid_cookie={valid_cookie}, expired={expired}"
+                    );
+                    assert!(!html.contains(&token));
+                    if recovered {
+                        assert!(session.matches_request(Some(&cookie), Some(&proof)));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            web.consume(&nonce, "127.0.0.1".parse().unwrap()),
+            Err(BootstrapError::Invalid)
+        );
+    }
+
+    #[test]
+    fn runtime_surface_review_web_tabs_keep_independent_bounded_tickets() {
+        let (web, nonce) = RuntimeWebState::new();
+        let (token, proof) = web.consume(&nonce, "127.0.0.1".parse().unwrap()).unwrap();
+        let cookie = web_session_cookie(&token);
+        let first = web
+            .refresh_stream_ticket(Some(&cookie), Some(&proof))
+            .unwrap();
+        let second = web
+            .refresh_stream_ticket(Some(&cookie), Some(&proof))
+            .unwrap();
+        assert!(web.consume_stream_ticket(Some(&cookie), Some(&first)));
+        assert!(web.consume_stream_ticket(Some(&cookie), Some(&second)));
+        assert!(!web.consume_stream_ticket(Some(&cookie), Some(&first)));
+        assert!(!web.consume_stream_ticket(Some(&cookie), Some(&second)));
+        let oldest = web
+            .refresh_stream_ticket(Some(&cookie), Some(&proof))
+            .unwrap();
+        for _ in 0..32 {
+            web.refresh_stream_ticket(Some(&cookie), Some(&proof))
+                .unwrap();
+        }
+        assert_eq!(web.stream_tickets.lock().unwrap().len(), 32);
+        assert!(!web.consume_stream_ticket(Some(&cookie), Some(&oldest)));
+    }
+
+    #[test]
     fn bootstrap_is_loopback_only_one_time_and_expires() {
         let (state, nonce) =
             RuntimeWebState::new_with_ttls(Duration::from_secs(60), Duration::from_secs(60));
@@ -248,7 +481,7 @@ mod tests {
             state.consume(&nonce, "192.0.2.4".parse().unwrap()),
             Err(BootstrapError::NonLoopback)
         );
-        let session_token = state
+        let (session_token, _) = state
             .consume(&nonce, "127.0.0.1".parse().unwrap())
             .expect("valid loopback bootstrap");
         assert!(session_token.starts_with(WEB_SESSION_PREFIX));
@@ -272,7 +505,7 @@ mod tests {
     fn web_session_survives_reload_then_expires_and_rejects_wrong_tokens() {
         let (state, nonce) =
             RuntimeWebState::new_with_ttls(Duration::from_secs(60), Duration::from_secs(60));
-        let session_token = state
+        let (session_token, _) = state
             .consume(&nonce, "127.0.0.1".parse().unwrap())
             .expect("valid loopback bootstrap");
         let cookie = format!("{WEB_SESSION_COOKIE_NAME}={session_token}");
@@ -316,6 +549,7 @@ mod tests {
             state
                 .consume(&nonce, "127.0.0.1".parse().unwrap())
                 .expect("valid bootstrap remains available")
+                .0
                 .starts_with(WEB_SESSION_PREFIX)
         );
     }
@@ -345,10 +579,9 @@ mod tests {
     }
 
     #[test]
-    fn embedded_client_has_no_secret_storage_or_unsafe_dynamic_html_sink() {
+    fn embedded_client_keeps_runtime_bearer_private_and_has_no_unsafe_html_sink() {
         for asset in [WEB_HTML, WEB_JS] {
             assert!(!asset.contains("localStorage"));
-            assert!(!asset.contains("sessionStorage"));
             assert!(!asset.contains("codewhale_runtime_token"));
             assert!(!asset.contains("innerHTML"));
             assert!(!asset.contains("http://"));

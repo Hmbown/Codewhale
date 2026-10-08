@@ -1,8 +1,8 @@
 /**
  * getting-started.ts — the canonical new-user path for codewhale.net.
  *
- * Four steps, in order: install → first offline session → provider connection
- * → fleet setup. Both the homepage band and the /docs/guide page
+ * Four steps, in order: install → provider connection → first task
+ * → optional fleet setup. Both the homepage band and the /docs/guide page
  * render from this module, so the path reads identically everywhere.
  *
  * TRUTH CONTRACT:
@@ -34,52 +34,52 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
     id: "install",
     title: { en: "Install Codewhale", zh: "安装 Codewhale" },
     body: {
-      en: "One npm command installs the terminal runtime. Cargo, prebuilt archives, Docker, Nix, and China mirrors also work. All of them install published releases.",
-      zh: "一条 npm 命令即可安装终端运行时。Cargo、预编译包、Docker、Nix 和中国镜像也可以。它们安装的都是已发布版本。",
+      en: "This command installs the latest release into ~/.local/bin on macOS or Linux. If that folder is not on your PATH, the installer prints the line to add for your shell; run it before the next step. For Windows, package managers, or source builds, use the install guide.",
+      zh: "这条命令会在 macOS 或 Linux 上把最新发布版本安装到 ~/.local/bin。如果该目录不在 PATH 中，安装程序会打印需要为你的 shell 添加的那一行；请先运行它，再进行下一步。Windows、包管理器或源码构建，请参阅安装指南。",
     },
-    commands: ["npm install -g codewhale", "codewhale doctor"],
+    commands: ["curl -fsSL https://codewhale.net/install.sh | sh"],
     link: {
       href: "/install",
       label: { en: "Full install guide", zh: "完整安装指南" },
     },
   },
   {
-    id: "first-session",
-    title: { en: "Open a first session — no key needed", zh: "打开第一个会话——无需密钥" },
-    body: {
-      en: "Starts without any API key. A short setup, then the full interface. Look around in Plan mode, which is read-only. Model replies need a provider — that's the next step.",
-      zh: "无需任何 API 密钥即可启动。简短设置后进入完整界面。先在只读的 Plan 模式里看看。模型回复需要提供商——那是下一步。",
-    },
-    commands: ["codewhale"],
-    link: {
-      href: "/docs/vocabulary",
-      label: { en: "Learn the product nouns first", zh: "先了解产品名词" },
-    },
-  },
-  {
     id: "connect-provider",
-    title: { en: "Connect a provider", zh: "连接提供商" },
+    title: { en: "Connect your model", zh: "连接你的模型" },
     body: {
-      en: "Use a hosted API key, a gateway, or a local runtime with no key (Ollama, vLLM, SGLang). You pick the provider and the model. A model name never switches the provider for you.",
-      zh: "用托管 API 密钥、网关，或不需要密钥的本地运行时（Ollama、vLLM、SGLang）。提供商和模型都由你来选。模型名不会替你切换提供商。",
+      en: "Codewhale needs a model to reply. Save your own provider key, as in the DeepSeek example below, or run a local model such as Ollama with no key. You pay the provider directly.",
+      zh: "Codewhale 需要一个模型来回复。你可以像下方的 DeepSeek 示例那样保存自己的提供商密钥，也可以运行 Ollama 等本地模型，无需密钥。费用由你直接付给提供商。",
     },
     commands: ["codewhale auth set --provider deepseek"],
     link: {
-      href: "/models",
-      label: { en: "Providers and models", zh: "提供商与模型" },
+      href: "/docs/auth",
+      label: { en: "Connect a provider", zh: "连接模型提供商" },
+    },
+  },
+  {
+    id: "first-session",
+    title: { en: "Run your first task", zh: "运行第一项任务" },
+    body: {
+      en: "Run codewhale in your project folder and ask for something concrete. (If the command is not found, finish the PATH line from step 1.) Start in /mode plan to have it explain the project without changing anything, then switch to /mode work for edits and commands. It shows each edit as a diff and asks before running a shell command.",
+      zh: "在项目文件夹中运行 codewhale，交给它一件具体的事。（如果找不到该命令，请先完成第 1 步中的 PATH 设置。）可以先用 /mode plan 让它在不改动任何东西的前提下讲解项目，需要修改文件或运行命令时再切换到 /mode work。它会以 diff 展示每一处修改，并在运行 shell 命令前先征求你的同意。",
+    },
+    commands: ["codewhale"],
+    link: {
+      href: "/docs/modes",
+      label: { en: "Set modes and approvals", zh: "设置模式与审批" },
     },
   },
   {
     id: "fleet-workflow",
-    title: { en: "Set up your ideal fleet", zh: "配置你的理想 fleet" },
+    title: { en: "Add a Fleet when the work splits", zh: "任务可以拆分时添加 Fleet" },
     body: {
-      en: "Add each provider you use with one auth set (local runtimes need none). Then run /fleet setup. It goes one member at a time — a semantic role, a model from any configured provider, a thinking tier, then an exact identity/route review — and saves the roster profile for this repo or for every repo on this machine. Runtime permissions stay separate. A single task needs none of this.",
-      zh: "每个要用的提供商执行一次 auth set（本地运行时不需要）。然后运行 /fleet setup。它一次配置一个成员——语义角色、任意已配置提供商的模型、思考档位，再核对准确的身份与路由——并保存为花名册档案，可只用于本仓库或本机所有仓库。Runtime 权限始终独立。单个任务不需要这些。",
+      en: "When a task needs several models and roles, run /fleet setup inside Codewhale to save each role and its model. From your shell, codewhale fleet status counts queued, running, and finished Fleet runs.",
+      zh: "当任务需要多个模型和角色时，在 Codewhale 中运行 /fleet setup，保存每个角色及其使用的模型。在 shell 中，codewhale fleet status 会统计排队中、运行中和已结束的 Fleet 运行。",
     },
     commands: ["/fleet setup", "codewhale fleet status"],
     link: {
       href: "/docs/fleet",
-      label: { en: "Fleet and Workflow docs", zh: "Fleet 与 Workflow 文档" },
+      label: { en: "Set up a Fleet", zh: "配置 Fleet" },
     },
   },
 ];
@@ -91,27 +91,27 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
  */
 export const GUIDE_NEXT_LINKS: { href: string; label: LocalizedText; note: LocalizedText }[] = [
   {
-    href: "/docs/hooks",
-    label: { en: "Hooks", zh: "钩子" },
+    href: "/docs/review",
+    label: { en: "Review what changed", zh: "查看改动" },
     note: {
-      en: "Run your own commands before and after tool calls, at turn end, and on session events, with per-project trust rules.",
-      zh: "借助项目级信任规则，响应生命周期事件——工具调用前后、回合结束、会话事件。",
+      en: "See every edit in a session, roll files back to an earlier turn, and get a code review before you push.",
+      zh: "查看一次会话中的每处修改，把文件回滚到之前的回合，并在推送前做一次代码审查。",
     },
   },
   {
     href: "/docs/modes",
-    label: { en: "Modes and permissions", zh: "模式与权限" },
+    label: { en: "Set modes and approvals", zh: "设置模式与审批" },
     note: {
-      en: "Plan / Work / Operate and Ask / Auto-Review / Full Access: what each one allows.",
-      zh: "Plan / Work / Operate 与 Ask / Auto-Review / Full Access：各自允许做什么。",
+      en: "Plan, Work, or Operate for the kind of work; Ask, Auto-Review, or Full Access for when it stops to ask you.",
+      zh: "用 Plan、Work、Operate 选择工作类型，用 Ask、Auto-Review、Full Access 决定它什么时候停下来问你。",
     },
   },
   {
-    href: "/docs",
-    label: { en: "Documentation hub", zh: "文档中心" },
+    href: "/docs/hooks",
+    label: { en: "Run commands on events", zh: "在事件发生时运行命令" },
     note: {
-      en: "Every topic, searchable. Each page links to its source document in the repository.",
-      zh: "所有主题均可搜索。每页都链接到仓库中的源文档。",
+      en: "Run your own scripts when a session starts, before a tool call, or when a turn ends. Use them to add context, enforce a rule, or send a notification.",
+      zh: "在会话开始、工具调用之前或回合结束时运行你自己的脚本。可以用它们补充上下文、执行规则或发送通知。",
     },
   },
 ];

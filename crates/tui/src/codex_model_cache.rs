@@ -1,26 +1,26 @@
-//! Secret-free OpenAI Codex / ChatGPT OAuth model roster discovery.
+//! Account-scoped roster for official Sign in with ChatGPT plan use.
 //!
-//! The Codex CLI keeps its account-scoped roster in `models_cache.json`.
-//! CodeWhale reads only the cache timestamp and model identifiers; it never
-//! opens the adjacent OAuth credential file and never logs cache contents.
+//! This replaces external Codex CLI cache/app-server discovery. Network access
+//! uses the existing Codewhale provider client; only secret-free model metadata
+//! is cached, keyed by the verified issuer, issued client ID, and subject.
+//! A missing account roster offers no models. Public catalog rows and legacy
+//! Codex credentials never prove permission to use a ChatGPT plan.
 
-use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::config::DEFAULT_OPENAI_CODEX_MODEL;
+use crate::config::{Config, ProviderKind};
 
-const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MAX_MODEL_CACHE_BYTES: u64 = 4 * 1024 * 1024;
-/// Codex refreshes its own cache much more frequently. CodeWhale is an offline
-/// consumer, so it accepts a last-known account roster for one day before
-/// falling back to the single conservative compatibility model.
 const MODEL_CACHE_MAX_AGE: Duration = Duration::hours(24);
 const MAX_FUTURE_CLOCK_SKEW: Duration = Duration::minutes(5);
 
@@ -37,9 +37,9 @@ impl CodexModelCacheFreshness {
     pub(crate) const fn picker_label(self) -> &'static str {
         match self {
             Self::Fresh => "ChatGPT OAuth",
-            Self::Missing => "OAuth roster missing · fallback",
-            Self::Stale => "OAuth roster stale · fallback",
-            Self::Invalid => "OAuth roster invalid · fallback",
+            Self::Missing => "OAuth roster missing",
+            Self::Stale => "OAuth roster stale",
+            Self::Invalid => "OAuth roster invalid",
         }
     }
 }
@@ -49,25 +49,30 @@ pub(crate) struct CodexModelRoster {
     pub(crate) models: Vec<CodexModelMetadata>,
     pub(crate) freshness: CodexModelCacheFreshness,
     pub(crate) fetched_at: Option<DateTime<Utc>>,
+    pub(crate) observed_at: Option<DateTime<Utc>>,
+    pub(crate) source: &'static str,
+    pub(crate) observation_persisted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CodexModelMetadata {
     pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
     pub(crate) context_window: Option<u32>,
     pub(crate) reasoning: Option<bool>,
+    pub(crate) efforts: Vec<String>,
 }
 
 impl CodexModelRoster {
     fn fallback(freshness: CodexModelCacheFreshness, fetched_at: Option<DateTime<Utc>>) -> Self {
         Self {
-            models: vec![CodexModelMetadata {
-                id: DEFAULT_OPENAI_CODEX_MODEL.to_string(),
-                context_window: None,
-                reasoning: None,
-            }],
+            models: Vec::new(),
             freshness,
             fetched_at,
+            observed_at: None,
+            source: "chatgpt_plan_api",
+            observation_persisted: false,
         }
     }
 
@@ -83,83 +88,235 @@ impl CodexModelRoster {
             .find(|model| model.id.eq_ignore_ascii_case(id.trim()))
     }
 
-    /// The roster's preferred model: the highest-priority entry of a fresh
-    /// roster. Missing/stale/invalid rosters yield `None` so callers keep
-    /// the static seed default (#5034).
     #[must_use]
     pub(crate) fn preferred_model_id(&self) -> Option<&str> {
-        if self.freshness != CodexModelCacheFreshness::Fresh {
-            return None;
-        }
-        self.models.first().map(|model| model.id.as_str())
+        (self.freshness == CodexModelCacheFreshness::Fresh)
+            .then(|| self.models.first().map(|model| model.id.as_str()))
+            .flatten()
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct CacheFile {
+#[derive(Serialize, Deserialize)]
+struct CatalogSnapshot {
     fetched_at: DateTime<Utc>,
-    #[serde(default)]
-    models: Vec<CacheModel>,
+    models: Vec<CodexModelMetadata>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CacheModel {
-    slug: String,
-    #[serde(default)]
-    priority: Option<i64>,
-    #[serde(default)]
-    context_window: Option<u32>,
-    #[serde(default)]
-    supported_reasoning_levels: Option<Vec<CacheReasoningLevel>>,
-}
+type RosterCacheKey = (PathBuf, Option<SystemTime>, u64);
+static ROSTER_MEMO: Mutex<Option<(RosterCacheKey, CodexModelRoster)>> = Mutex::new(None);
 
-#[derive(Debug, Deserialize)]
-struct CacheReasoningLevel {}
-
-/// Resolve the Codex home without consulting OAuth-file overrides.
-///
-/// `OPENAI_CODEX_AUTH_FILE` intentionally does not participate: it may point
-/// at a standalone test/credential file while the model roster still belongs
-/// to `$CODEX_HOME` (or the default `~/.codex`).
-#[must_use]
-pub(crate) fn codex_home_path() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            crate::config::effective_home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".codex")
-        })
-}
-
+/// An unscoped completion/catalog cannot borrow another account's roster.
 #[must_use]
 pub(crate) fn model_roster() -> CodexModelRoster {
-    load_model_roster_from_home_at(&codex_home_path(), Utc::now())
+    CodexModelRoster::fallback(CodexModelCacheFreshness::Missing, None)
 }
 
-fn load_model_roster_from_home_at(home: &Path, now: DateTime<Utc>) -> CodexModelRoster {
-    let path = home.join(MODEL_CACHE_FILE);
-    let path_metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return CodexModelRoster::fallback(CodexModelCacheFreshness::Missing, None);
+#[must_use]
+pub(crate) fn model_roster_for(config: &Config) -> CodexModelRoster {
+    let Some(path) = snapshot_path(config) else {
+        return model_roster();
+    };
+    let key = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None);
         }
+        Ok(metadata) => (path.clone(), metadata.modified().ok(), metadata.len()),
+        Err(_) => (path.clone(), None, 0),
+    };
+    let now = Utc::now();
+    if let Ok(memo) = ROSTER_MEMO.lock()
+        && let Some((cached_key, roster)) = memo.as_ref()
+        && *cached_key == key
+        && roster.freshness == CodexModelCacheFreshness::Fresh
+        && roster
+            .fetched_at
+            .is_some_and(|fetched| now.signed_duration_since(fetched) <= MODEL_CACHE_MAX_AGE)
+    {
+        return roster.clone();
+    }
+    let roster = load_snapshot(&path, now);
+    if let Ok(mut memo) = ROSTER_MEMO.lock() {
+        *memo = Some((key, roster.clone()));
+    }
+    roster
+}
+
+fn registration_key(issuer: &str, client_id: &str, subject: &str) -> String {
+    let mut identity = Sha256::new();
+    identity.update(b"codewhale-chatgpt-plan-roster-v1\0");
+    for value in [issuer, client_id, subject] {
+        identity.update((value.len() as u64).to_le_bytes());
+        identity.update(value.as_bytes());
+    }
+    identity
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn snapshot_path(config: &Config) -> Option<PathBuf> {
+    let identity = config
+        .builtin_provider_identity(ProviderKind::OpenaiCodex)
+        .ok()?;
+    if config.provider_uses_custom_endpoint(&identity) {
+        return None;
+    }
+    let registration = crate::oauth::official_chatgpt_registration(config).ok()?;
+    let catalog_path = crate::models_dev_live::cache_path()?;
+    Some(catalog_path.parent()?.join(format!(
+        "chatgpt-plan-{}.json",
+        registration_key(
+            &registration.issuer,
+            &registration.client_id,
+            &registration.subject
+        )
+    )))
+}
+
+fn load_snapshot(path: &Path, now: DateTime<Utc>) -> CodexModelRoster {
+    let bytes = match read_cache_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(freshness) => return CodexModelRoster::fallback(freshness, None),
+    };
+    let snapshot: CatalogSnapshot = match serde_json::from_slice(&bytes) {
+        Ok(snapshot) => snapshot,
         Err(_) => return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None),
     };
-    if !path_metadata.file_type().is_file() || path_metadata.len() > MAX_MODEL_CACHE_BYTES {
-        return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None);
+    let age = now.signed_duration_since(snapshot.fetched_at);
+    if age < -MAX_FUTURE_CLOCK_SKEW
+        || snapshot.models.iter().any(|model| {
+            !crate::provider_lake::valid_catalog_model_id(&model.id)
+                || model
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|name| name.len() > 512 || name.chars().any(char::is_control))
+                || model.efforts.len() > 16
+                || model.efforts.iter().any(|effort| !valid_effort(effort))
+                || model
+                    .context_window
+                    .is_some_and(|window| !(1..=16_000_000).contains(&window))
+        })
+    {
+        return CodexModelRoster::fallback(
+            CodexModelCacheFreshness::Invalid,
+            Some(snapshot.fetched_at),
+        );
     }
-    let mut file = match open_cache_file(&path) {
+    if age > MODEL_CACHE_MAX_AGE {
+        return CodexModelRoster::fallback(
+            CodexModelCacheFreshness::Stale,
+            Some(snapshot.fetched_at),
+        );
+    }
+    CodexModelRoster {
+        models: snapshot.models,
+        freshness: CodexModelCacheFreshness::Fresh,
+        fetched_at: Some(snapshot.fetched_at),
+        observed_at: None,
+        source: "chatgpt_plan_api",
+        observation_persisted: true,
+    }
+}
+
+fn valid_effort(effort: &str) -> bool {
+    !effort.is_empty()
+        && effort.len() <= 32
+        && effort
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Fetch through the existing provider client. A registration change during
+/// the request cannot publish an old account's models under a new account.
+pub(crate) async fn update_from_chatgpt(config: &Config) -> Result<CodexModelRoster, &'static str> {
+    let config = config.clone();
+    let prepared = config.clone();
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    let (path, client) = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        let path = snapshot_path(&prepared).ok_or("chatgpt_plan_permission_required")?;
+        let client = crate::client::CodewhaleClient::for_catalog_refresh(&prepared)
+            .map_err(|_| "chatgpt_plan_credentials_unavailable")?;
+        Ok::<_, &'static str>((path, client))
+    })
+    .await
+    .map_err(|_| "chatgpt_plan_credentials_unavailable")??;
+    let available = tokio::time::timeout(std::time::Duration::from_secs(20), client.list_models())
+        .await
+        .map_err(|_| "chatgpt_models_timeout")?
+        .map_err(|_| "chatgpt_models_unavailable")?;
+    // Catalog ordering and labels are provider facts. The basic official
+    // listing does not establish context limits or reasoning effort tiers.
+    if available.iter().any(|model| {
+        !crate::provider_lake::valid_catalog_model_id(&model.id)
+            || model
+                .display_name
+                .as_ref()
+                .is_some_and(|name| name.len() > 512 || name.chars().any(char::is_control))
+    }) {
+        return Err("chatgpt_models_invalid_response");
+    }
+    let models = available
+        .into_iter()
+        .map(|model| CodexModelMetadata {
+            id: model.id,
+            display_name: model.display_name,
+            context_window: None,
+            reasoning: None,
+            efforts: Vec::new(),
+        })
+        .collect();
+    let snapshot = CatalogSnapshot {
+        fetched_at: Utc::now(),
+        models,
+    };
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        if snapshot_path(&config).as_ref() != Some(&path) {
+            return Err("refresh_credentials_changed");
+        }
+        let encoded = serde_json::to_vec(&snapshot).map_err(|_| "cache_write_failed")?;
+        if encoded.len() as u64 > MAX_MODEL_CACHE_BYTES {
+            return Err("chatgpt_models_response_too_large");
+        }
+        codewhale_config::persistence::atomic_write(&path, &encoded)
+            .map_err(|_| "cache_write_failed")?;
+        if let Ok(mut memo) = ROSTER_MEMO.lock() {
+            *memo = None;
+        }
+        Ok(load_snapshot(&path, Utc::now()))
+    })
+    .await
+    .map_err(|_| "cache_write_failed")?
+}
+
+fn read_cache_bytes(path: &Path) -> Result<Vec<u8>, CodexModelCacheFreshness> {
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CodexModelCacheFreshness::Missing);
+        }
+        Err(_) => return Err(CodexModelCacheFreshness::Invalid),
+    };
+    if !path_metadata.file_type().is_file() || path_metadata.len() > MAX_MODEL_CACHE_BYTES {
+        return Err(CodexModelCacheFreshness::Invalid);
+    }
+    let mut file = match open_cache_file(path) {
         Ok(file) => file,
-        Err(_) => return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None),
+        Err(_) => return Err(CodexModelCacheFreshness::Invalid),
     };
     let metadata = match file.metadata() {
         Ok(metadata) => metadata,
-        Err(_) => return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None),
+        Err(_) => return Err(CodexModelCacheFreshness::Invalid),
     };
     if !metadata.file_type().is_file() || metadata.len() > MAX_MODEL_CACHE_BYTES {
-        return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None);
+        return Err(CodexModelCacheFreshness::Invalid);
     }
 
     let mut bytes = Vec::with_capacity(metadata.len().min(MAX_MODEL_CACHE_BYTES) as usize);
@@ -170,59 +327,43 @@ fn load_model_roster_from_home_at(home: &Path, now: DateTime<Utc>) -> CodexModel
         .is_err()
         || bytes.len() as u64 > MAX_MODEL_CACHE_BYTES
     {
-        return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None);
+        return Err(CodexModelCacheFreshness::Invalid);
     }
-    let cache: CacheFile = match serde_json::from_slice(&bytes) {
-        Ok(cache) => cache,
-        Err(_) => return CodexModelRoster::fallback(CodexModelCacheFreshness::Invalid, None),
-    };
+    Ok(bytes)
+}
 
-    let age = now.signed_duration_since(cache.fetched_at);
-    if age < -MAX_FUTURE_CLOCK_SKEW {
-        return CodexModelRoster::fallback(
-            CodexModelCacheFreshness::Invalid,
-            Some(cache.fetched_at),
-        );
-    }
-    if age > MODEL_CACHE_MAX_AGE {
-        return CodexModelRoster::fallback(CodexModelCacheFreshness::Stale, Some(cache.fetched_at));
-    }
+#[cfg(test)]
+pub(crate) fn install_test_chatgpt_roster(config: &Config, ids: &[&str]) -> anyhow::Result<()> {
+    install_test_chatgpt_roster_with_metadata(
+        config,
+        ids.iter()
+            .map(|id| CodexModelMetadata {
+                id: (*id).to_string(),
+                display_name: None,
+                context_window: None,
+                reasoning: None,
+                efforts: Vec::new(),
+            })
+            .collect(),
+    )
+}
 
-    let mut indexed: Vec<_> = cache.models.into_iter().enumerate().collect();
-    indexed.sort_by_key(|(index, model)| (model.priority.unwrap_or(i64::MAX), *index));
-
-    let mut seen = HashSet::new();
-    let mut models = Vec::new();
-    for (_, model) in indexed {
-        let slug = model.slug.trim();
-        if !valid_model_id(slug) {
-            continue;
-        }
-        let identity = slug.to_ascii_lowercase();
-        if seen.insert(identity) {
-            models.push(CodexModelMetadata {
-                id: slug.to_string(),
-                context_window: model
-                    .context_window
-                    .filter(|window| (1..=16_000_000).contains(window)),
-                reasoning: model
-                    .supported_reasoning_levels
-                    .map(|levels| !levels.is_empty()),
-            });
-        }
-    }
-    if models.is_empty() {
-        return CodexModelRoster::fallback(
-            CodexModelCacheFreshness::Invalid,
-            Some(cache.fetched_at),
-        );
-    }
-
-    CodexModelRoster {
+#[cfg(test)]
+pub(crate) fn install_test_chatgpt_roster_with_metadata(
+    config: &Config,
+    models: Vec<CodexModelMetadata>,
+) -> anyhow::Result<()> {
+    let path = snapshot_path(config)
+        .ok_or_else(|| anyhow::anyhow!("test needs an owned ChatGPT registration"))?;
+    let snapshot = CatalogSnapshot {
+        fetched_at: Utc::now(),
         models,
-        freshness: CodexModelCacheFreshness::Fresh,
-        fetched_at: Some(cache.fetched_at),
+    };
+    codewhale_config::persistence::atomic_write(&path, &serde_json::to_vec(&snapshot)?)?;
+    if let Ok(mut memo) = ROSTER_MEMO.lock() {
+        *memo = None;
     }
+    Ok(())
 }
 
 fn open_cache_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -233,171 +374,166 @@ fn open_cache_file(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn valid_model_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value.bytes().any(|byte| byte.is_ascii_alphanumeric())
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const FIXTURE: &str = include_str!("../tests/fixtures/codex_models_cache.json");
-    const FIXTURE_TIME: &str = "2030-01-02T03:04:05Z";
-
-    fn fixture_time() -> DateTime<Utc> {
-        FIXTURE_TIME.parse().expect("fixture timestamp")
+    fn model(id: &str) -> CodexModelMetadata {
+        CodexModelMetadata {
+            id: id.to_string(),
+            display_name: Some(format!("Label for {id}")),
+            context_window: None,
+            reasoning: None,
+            efforts: Vec::new(),
+        }
     }
 
-    fn write_fixture(home: &Path) {
-        std::fs::write(home.join(MODEL_CACHE_FILE), FIXTURE).expect("write fixture");
+    fn save(path: &Path, fetched_at: DateTime<Utc>, models: Vec<CodexModelMetadata>) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&CatalogSnapshot { fetched_at, models }).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
-    fn valid_cache_uses_priority_order_and_keeps_route_available_rows() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        write_fixture(home.path());
+    fn registration_scope_separates_accounts_workspaces_and_issuers() {
+        let key = registration_key("https://auth.openai.com", "oaiapp_workspace_a", "account_a");
+        for other in [
+            registration_key("https://auth.openai.com", "oaiapp_workspace_a", "account_b"),
+            registration_key("https://auth.openai.com", "oaiapp_workspace_b", "account_a"),
+            registration_key("https://other.example", "oaiapp_workspace_a", "account_a"),
+        ] {
+            assert_ne!(key, other);
+        }
+        assert!(!key.contains("account_a"));
+        assert!(!key.contains("workspace_a"));
+    }
 
-        let roster =
-            load_model_roster_from_home_at(home.path(), fixture_time() + Duration::minutes(30));
-
-        assert_eq!(roster.freshness, CodexModelCacheFreshness::Fresh);
-        assert_eq!(roster.fetched_at, Some(fixture_time()));
+    #[test]
+    fn own_roster_follows_selected_registration_and_disappears_after_sign_out() {
+        let _env = crate::test_support::lock_test_env();
+        let directory = tempfile::tempdir().unwrap();
+        let directory_path = directory.path().canonicalize().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &directory_path);
+        let mut account_a = Config::default();
+        crate::oauth::install_test_chatgpt_registration_for(
+            &mut account_a,
+            "account-a",
+            "oaiapp_workspace_a",
+        )
+        .unwrap();
+        install_test_chatgpt_roster(&account_a, &["z-first", "a-second"]).unwrap();
+        let path_a = snapshot_path(&account_a).unwrap();
         assert_eq!(
-            roster.model_ids(),
-            [
-                "gpt-test-primary",
-                "gpt-test-secondary",
-                "codex-test-review"
-            ]
+            model_roster_for(&account_a).model_ids(),
+            ["z-first", "a-second"]
         );
-        let primary = roster
-            .metadata_for("gpt-test-primary")
-            .expect("primary metadata");
-        assert_eq!(primary.context_window, Some(372_000));
-        assert_eq!(primary.reasoning, Some(true));
-        let secondary = roster
-            .metadata_for("gpt-test-secondary")
-            .expect("secondary metadata");
-        assert_eq!(secondary.context_window, Some(128_000));
-    }
 
-    #[test]
-    fn missing_cache_falls_back_conservatively() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        let roster = load_model_roster_from_home_at(home.path(), fixture_time());
-
-        assert_eq!(roster.freshness, CodexModelCacheFreshness::Missing);
-        assert_eq!(roster.model_ids(), [DEFAULT_OPENAI_CODEX_MODEL]);
-    }
-
-    #[test]
-    fn preferred_model_is_the_fresh_roster_head_only() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        write_fixture(home.path());
-
-        let fresh =
-            load_model_roster_from_home_at(home.path(), fixture_time() + Duration::minutes(30));
-        assert_eq!(fresh.preferred_model_id(), Some("gpt-test-primary"));
-
-        // Stale and missing rosters must keep the static seed default so a
-        // provider switch never trusts outdated route knowledge (#5034).
-        let stale =
-            load_model_roster_from_home_at(home.path(), fixture_time() + Duration::days(365));
-        assert_eq!(stale.preferred_model_id(), None);
-        let missing = load_model_roster_from_home_at(
-            tempfile::tempdir().expect("empty home").path(),
-            fixture_time(),
+        let mut account_b = Config::default();
+        crate::oauth::install_test_chatgpt_registration_for(
+            &mut account_b,
+            "account-b",
+            "oaiapp_workspace_a",
+        )
+        .unwrap();
+        assert_ne!(snapshot_path(&account_b).unwrap(), path_a);
+        assert_eq!(
+            model_roster_for(&account_b).freshness,
+            CodexModelCacheFreshness::Missing
         );
-        assert_eq!(missing.preferred_model_id(), None);
+        install_test_chatgpt_roster(&account_b, &["b-only"]).unwrap();
+        assert_eq!(model_roster_for(&account_b).model_ids(), ["b-only"]);
+        assert_eq!(
+            model_roster_for(&account_a).model_ids(),
+            ["z-first", "a-second"]
+        );
+
+        let mut workspace_b = Config::default();
+        crate::oauth::install_test_chatgpt_registration_for(
+            &mut workspace_b,
+            "account-a",
+            "oaiapp_workspace_b",
+        )
+        .unwrap();
+        assert!(model_roster_for(&workspace_b).models.is_empty());
+        let generation = account_a
+            .provider_config_for(&account_a.test_identity_for_kind(ProviderKind::OpenaiCodex))
+            .unwrap()
+            .oauth_credential_generation
+            .as_ref()
+            .unwrap()
+            .clone();
+        let path = codewhale_config::chatgpt_oauth_generation_path(&generation).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(model_roster_for(&account_a).models.is_empty());
+        assert!(path_a.exists());
+        assert_eq!(model_roster_for(&account_b).model_ids(), ["b-only"]);
     }
 
     #[test]
-    fn malformed_cache_falls_back_conservatively() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        std::fs::write(home.path().join(MODEL_CACHE_FILE), b"{not-json")
-            .expect("write malformed cache");
-
-        let roster = load_model_roster_from_home_at(home.path(), fixture_time());
-
-        assert_eq!(roster.freshness, CodexModelCacheFreshness::Invalid);
-        assert_eq!(roster.model_ids(), [DEFAULT_OPENAI_CODEX_MODEL]);
+    fn own_snapshot_preserves_provider_order_and_labels_without_inventing_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roster.json");
+        let now = Utc::now();
+        save(&path, now, vec![model("z-first"), model("a-second")]);
+        let roster = load_snapshot(&path, now);
+        assert_eq!(roster.model_ids(), ["z-first", "a-second"]);
+        assert_eq!(roster.preferred_model_id(), Some("z-first"));
+        let metadata = roster.metadata_for("a-second").unwrap();
+        assert_eq!(metadata.display_name.as_deref(), Some("Label for a-second"));
+        assert_eq!(metadata.context_window, None);
+        assert_eq!(metadata.reasoning, None);
+        assert!(metadata.efforts.is_empty());
+        assert_eq!(roster.source, "chatgpt_plan_api");
+        assert!(roster.observation_persisted);
     }
 
     #[test]
-    fn oversized_cache_is_rejected_without_unbounded_read() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        let file = std::fs::File::create(home.path().join(MODEL_CACHE_FILE)).expect("cache file");
-        file.set_len(MAX_MODEL_CACHE_BYTES + 1)
-            .expect("sparse oversized cache");
-
-        let roster = load_model_roster_from_home_at(home.path(), fixture_time());
-
-        assert_eq!(roster.freshness, CodexModelCacheFreshness::Invalid);
+    fn missing_stale_future_and_unsafe_snapshots_offer_no_entitlements() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roster.json");
+        let now = Utc::now();
+        assert!(load_snapshot(&path, now).model_ids().is_empty());
+        save(
+            &path,
+            now - MODEL_CACHE_MAX_AGE - Duration::seconds(1),
+            vec![model("old")],
+        );
+        let stale = load_snapshot(&path, now);
+        assert_eq!(stale.freshness, CodexModelCacheFreshness::Stale);
+        assert!(stale.models.is_empty());
+        save(
+            &path,
+            now + MAX_FUTURE_CLOCK_SKEW + Duration::seconds(1),
+            vec![model("future")],
+        );
+        assert_eq!(
+            load_snapshot(&path, now).freshness,
+            CodexModelCacheFreshness::Invalid
+        );
+        let mut unsafe_label = model("safe-id");
+        unsafe_label.display_name = Some("Unsafe\u{1b}[31m".to_string());
+        save(&path, now, vec![unsafe_label]);
+        assert_eq!(
+            load_snapshot(&path, now).freshness,
+            CodexModelCacheFreshness::Invalid
+        );
+        assert!(model_roster().models.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlink_cache_is_rejected_as_non_regular_input() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        let target = home.path().join("target.json");
-        std::fs::write(&target, FIXTURE).expect("target fixture");
-        std::os::unix::fs::symlink(&target, home.path().join(MODEL_CACHE_FILE))
-            .expect("cache symlink");
-
-        let roster = load_model_roster_from_home_at(home.path(), fixture_time());
-
-        assert_eq!(roster.freshness, CodexModelCacheFreshness::Invalid);
-    }
-
-    #[test]
-    fn stale_cache_falls_back_conservatively() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        write_fixture(home.path());
-
-        let roster =
-            load_model_roster_from_home_at(home.path(), fixture_time() + Duration::hours(25));
-
-        assert_eq!(roster.freshness, CodexModelCacheFreshness::Stale);
-        assert_eq!(roster.model_ids(), [DEFAULT_OPENAI_CODEX_MODEL]);
-        assert_eq!(roster.fetched_at, Some(fixture_time()));
-    }
-
-    #[test]
-    fn invalid_and_duplicate_model_ids_are_filtered() {
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        let cache = format!(
-            r#"{{
-  "fetched_at": "{FIXTURE_TIME}",
-  "models": [
-    {{"slug": "gpt-good", "priority": 3}},
-    {{"slug": "GPT-GOOD", "priority": 4}},
-    {{"slug": "bad model", "priority": 1}},
-    {{"slug": "../bad\\path", "priority": 2}}
-  ]
-}}"#
+    fn cache_symlinks_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.json");
+        let path = directory.path().join("roster.json");
+        let now = Utc::now();
+        save(&target, now, vec![model("safe")]);
+        std::os::unix::fs::symlink(target, &path).unwrap();
+        assert_eq!(
+            load_snapshot(&path, now).freshness,
+            CodexModelCacheFreshness::Invalid
         );
-        std::fs::write(home.path().join(MODEL_CACHE_FILE), cache).expect("write cache");
-
-        let roster = load_model_roster_from_home_at(home.path(), fixture_time());
-
-        assert_eq!(roster.freshness, CodexModelCacheFreshness::Fresh);
-        assert_eq!(roster.model_ids(), ["gpt-good"]);
-    }
-
-    #[test]
-    fn codex_home_respects_environment_override() {
-        let lock = crate::test_support::lock_test_env();
-        let home = tempfile::tempdir().expect("temp CODEX_HOME");
-        let guard = crate::test_support::EnvVarGuard::set("CODEX_HOME", home.path());
-
-        assert_eq!(codex_home_path(), home.path());
-
-        drop(guard);
-        drop(lock);
     }
 }

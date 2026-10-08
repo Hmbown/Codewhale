@@ -1,110 +1,93 @@
-//! Session command area: saving, forking, resuming, exporting, and the
-//! `/relay` session-handoff artifact.
+//! Portable session command group. Host observations, registration and action
+//! execution live outside this complete source closure.
 
-#[cfg(all(test, feature = "long-running-tests"))]
-mod acceptance;
-mod branch;
-mod compact;
-mod export;
-pub(crate) use export::write_last_copy;
-mod fork;
-mod load;
-mod new;
-mod purge;
-mod relay;
-mod remote_control;
-mod remote_env;
-mod rename;
-#[cfg(test)]
-pub(crate) use rename::rename_with_manager;
-mod resume;
-mod save;
-mod sessions;
-mod structcopy;
-mod title;
-mod tree;
-// This group dir intentionally has a `session.rs` child module with the same
-// name. The module_inception allow is a permanent structure rationale, not
-// migration scaffolding; see docs/architecture/command-dispatch.md.
+use codewhale_command_contract::handler::CommandHandler;
+use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
+use codewhale_command_contract::outcome::SessionCommandResult as CommandResult;
+
+pub(in crate::commands) mod branch;
+pub(in crate::commands) mod compact;
+pub(in crate::commands) mod export;
+pub(in crate::commands) mod fork;
+pub(in crate::commands) mod load;
+pub(in crate::commands) mod new;
+pub(in crate::commands) mod purge;
+pub(in crate::commands) mod relay;
+pub(in crate::commands) mod remote_control;
+pub(in crate::commands) mod remote_env;
+pub(in crate::commands) mod rename;
+pub(in crate::commands) mod resume;
+pub(in crate::commands) mod save;
+pub(in crate::commands) mod sessions;
+pub(in crate::commands) mod structcopy;
+pub(in crate::commands) mod title;
+pub(in crate::commands) mod tree;
+// Documentation-only child, retained with the established source topology.
 #[allow(clippy::module_inception)]
 mod session;
 
-use crate::commands::CommandResult;
-use crate::commands::traits::{Command, CommandGroup, FunctionCommand, RegisterCommand};
+pub(in crate::commands) const MAX_TITLE_LEN: usize = 100;
 
-pub struct SessionCommands;
-
-impl CommandGroup for SessionCommands {
-    fn commands(&self) -> &'static [Box<dyn Command>] {
-        cached_command_list!(vec![
-            Box::new(FunctionCommand::new(
-                rename::RenameCmd::info(),
-                rename::RenameCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                title::TitleCmd::info(),
-                title::TitleCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                save::SaveCmd::info(),
-                save::SaveCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                fork::ForkCmd::info(),
-                fork::ForkCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                new::NewCmd::info(),
-                new::NewCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                sessions::SessionsCmd::info(),
-                sessions::SessionsCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                load::LoadCmd::info(),
-                load::LoadCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                resume::ResumeCmd::info(),
-                resume::ResumeCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                tree::TreeCmd::info(),
-                tree::TreeCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                branch::BranchCmd::info(),
-                branch::BranchCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                compact::CompactCmd::info(),
-                compact::CompactCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                purge::PurgeCmd::info(),
-                purge::PurgeCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                relay::RelayCmd::info(),
-                relay::RelayCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                remote_control::RemoteControlCmd::info(),
-                remote_control::RemoteControlCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                remote_env::RemoteEnvCmd::info(),
-                remote_env::RemoteEnvCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                export::ExportCmd::info(),
-                export::ExportCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                structcopy::StructcopyCmd::info(),
-                structcopy::StructcopyCmd::execute,
-            )),
-        ])
+/// Promote the no-action structcopy result to the group's action vocabulary.
+/// The leaf itself retains its narrower, impossible-action return type.
+pub(in crate::commands) struct StructcopyRegistration;
+impl RegisterCommand<CommandResult> for StructcopyRegistration {
+    fn info() -> &'static CommandInfo {
+        structcopy::StructcopyCmd::info()
+    }
+    fn handler() -> CommandHandler<CommandResult> {
+        CommandHandler::Contextual {
+            capabilities: structcopy::CAPABILITIES,
+            handler: |contexts, args| {
+                let result = structcopy::execute_structcopy(contexts, args);
+                CommandResult {
+                    message: result.message,
+                    action: result.action.map(|impossible| match impossible {}),
+                    is_error: result.is_error,
+                }
+            },
+        }
     }
 }
+
+/// Complete group inventory, used by the host and independent compilation proof.
+pub fn portable_handlers() -> [(&'static CommandInfo, CommandHandler<CommandResult>); 17] {
+    [
+        (rename::RenameCmd::info(), rename::RenameCmd::handler()),
+        (title::TitleCmd::info(), title::TitleCmd::handler()),
+        (save::SaveCmd::info(), save::SaveCmd::handler()),
+        (fork::ForkCmd::info(), fork::ForkCmd::handler()),
+        (new::NewCmd::info(), new::NewCmd::handler()),
+        (
+            sessions::SessionsCmd::info(),
+            sessions::SessionsCmd::handler(),
+        ),
+        (load::LoadCmd::info(), load::LoadCmd::handler()),
+        (resume::ResumeCmd::info(), resume::ResumeCmd::handler()),
+        (tree::TreeCmd::info(), tree::TreeCmd::handler()),
+        (branch::BranchCmd::info(), branch::BranchCmd::handler()),
+        (compact::CompactCmd::info(), compact::CompactCmd::handler()),
+        (purge::PurgeCmd::info(), purge::PurgeCmd::handler()),
+        (relay::RelayCmd::info(), relay::RelayCmd::handler()),
+        (
+            remote_control::RemoteControlCmd::info(),
+            remote_control::RemoteControlCmd::handler(),
+        ),
+        (
+            remote_env::RemoteEnvCmd::info(),
+            remote_env::RemoteEnvCmd::handler(),
+        ),
+        (export::ExportCmd::info(), export::ExportCmd::handler()),
+        (
+            StructcopyRegistration::info(),
+            StructcopyRegistration::handler(),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod control_test_support;
+#[cfg(test)]
+mod lifecycle_portable_tests;
+#[cfg(test)]
+mod lifecycle_test_support;

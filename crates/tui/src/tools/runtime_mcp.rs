@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::mcp::{McpPool, McpServerConfig, McpTool};
+use crate::mcp::{McpPool, McpServerConfig};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
@@ -60,6 +60,8 @@ pub fn parse_mcp_command(input: &str) -> Result<ParsedMcpServer> {
                 oauth: None,
                 oauth_resource: None,
                 reviewed_plugin: None,
+                runtime_added: false,
+                allow_private_network: false,
             },
         });
     }
@@ -97,6 +99,8 @@ pub fn parse_mcp_command(input: &str) -> Result<ParsedMcpServer> {
             oauth: None,
             oauth_resource: None,
             reviewed_plugin: None,
+            runtime_added: false,
+            allow_private_network: false,
         },
     })
 }
@@ -218,6 +222,8 @@ impl ToolSpec for StartRuntimeMcpServer {
          (like 'https://...'), call this tool immediately to start the server \
          and register its tools. Do NOT suggest editing config files. \
          Accepts a local command (stdio) or a remote URL (HTTP/SSE). \
+         To reconnect an existing configured server after login, pass only its exact name \
+         and omit server; this keeps its saved credentials and configuration. \
          After the server starts, the response lists each tool's callable name. \
          You MUST copy those exact names when calling the tools. \
          Do NOT construct or guess tool names yourself."
@@ -229,14 +235,14 @@ impl ToolSpec for StartRuntimeMcpServer {
             "properties": {
                 "server": {
                     "type": "string",
-                    "description": "MCP server command or URL"
+                    "description": "New MCP server command or URL; omit to reconnect a configured server by name"
                 },
                 "name": {
                     "type": "string",
-                    "description": "Optional server name (auto-inferred if omitted)"
+                    "description": "Exact configured name for reconnect; optional name for a new server"
                 }
             },
-            "required": ["server"]
+            "anyOf": [{"required": ["server"]}, {"required": ["name"]}]
         })
     }
 
@@ -248,13 +254,36 @@ impl ToolSpec for StartRuntimeMcpServer {
         ApprovalRequirement::Required
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let custom_name = input.get("name").and_then(|v| v.as_str());
+        if input.get("server").is_none() {
+            let name = custom_name
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    ToolError::invalid_input("Provide server or an existing configured name")
+                })?;
+            // The exact configured key owns its credentials and trust. Do not
+            // sanitize it into an alias, replace its config, or reconnect siblings.
+            if McpPool::server_denied_by(&context.disallowed_tools, name) {
+                return Err(ToolError::not_available(format!(
+                    "Failed to find MCP server: {name}"
+                )));
+            }
+            let mut pool = self.pool.lock().await;
+            let conn = pool.retry_connection(name).await.map_err(|error| {
+                ToolError::execution_failed(connect_failure_message(name, &error))
+            })?;
+            let transport = if conn.config().url.is_some() {
+                "http"
+            } else {
+                "stdio"
+            };
+            return Ok(connected_result(&pool, name, transport, context));
+        }
         let server = input
             .get("server")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::invalid_input("Missing required field: server"))?;
-
-        let custom_name = input.get("name").and_then(|v| v.as_str());
+            .ok_or_else(|| ToolError::invalid_input("server must be a command or URL string"))?;
         let mut parsed =
             parse_mcp_command(server).map_err(|e| ToolError::invalid_input(e.to_string()))?;
         // Host-supplied override (used by the Registry launcher, whose
@@ -264,21 +293,9 @@ impl ToolSpec for StartRuntimeMcpServer {
             parsed.config.connect_timeout = Some(timeout);
         }
 
-        // Reject shell-wrapped commands that could execute arbitrary code
+        // Refuse shell wrappers and anything outside the runtime allowlist.
         if let Some(ref cmd) = parsed.config.command {
-            let cmd_lower = cmd.to_lowercase();
-            if cmd_lower == "bash"
-                || cmd_lower == "sh"
-                || cmd_lower == "zsh"
-                || cmd_lower == "cmd"
-                || cmd_lower == "powershell"
-            {
-                return Err(ToolError::invalid_input(format!(
-                    "Shell wrapper commands ({cmd}) are not allowed. \
-                     Provide the actual MCP server command directly, \
-                     e.g. 'npx @modelcontextprotocol/server-filesystem /tmp'"
-                )));
-            }
+            validate_runtime_command(cmd)?;
         }
 
         // Reject shell metacharacters in arguments to prevent injection.
@@ -288,27 +305,6 @@ impl ToolSpec for StartRuntimeMcpServer {
         // guard refused it, so deleting the guard left them green
         // (2026-08-04 audit).
         reject_shell_metacharacters(&parsed.config.args)?;
-
-        // Allowlist of known MCP server runtimes and package managers.
-        // Commands not in this list are rejected to prevent arbitrary execution.
-        if let Some(ref cmd) = parsed.config.command {
-            let cmd_base = std::path::Path::new(cmd)
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-            const ALLOWED_COMMANDS: &[&str] = &[
-                "npx", "npm", "pnpm", "yarn", "bunx", "bun", "node", "python", "python3", "uvx",
-                "uv", "deno", "ruby", "cargo",
-            ];
-            if !ALLOWED_COMMANDS.contains(&cmd_base.as_ref()) {
-                return Err(ToolError::invalid_input(format!(
-                    "Command '{cmd}' is not in the allowed list. \
-                     Permitted commands: {}",
-                    ALLOWED_COMMANDS.join(", ")
-                )));
-            }
-        }
 
         let server_name = custom_name
             .map(sanitize_name)
@@ -328,6 +324,12 @@ impl ToolSpec for StartRuntimeMcpServer {
             "stdio"
         };
 
+        // Ancestor restrictions stay request-local because children share the pool.
+        if McpPool::server_denied_by(&context.disallowed_tools, &server_name) {
+            return Err(ToolError::not_available(format!(
+                "Failed to find MCP server: {server_name}"
+            )));
+        }
         // Register server config, connect, and collect tool info
         let mut pool = self.pool.lock().await;
         pool.add_runtime_server_config(server_name.clone(), parsed.config)
@@ -341,40 +343,89 @@ impl ToolSpec for StartRuntimeMcpServer {
             }
         };
 
-        let mcp_tools: Vec<McpTool> = conn.tools().to_vec();
-
-        // Build tool list with fully qualified names (mcp_{server}_{tool})
-        // so the LLM can call them directly without guessing the naming convention.
-        let tools_list: Vec<String> = mcp_tools
-            .iter()
-            .map(|t| {
-                let qualified = format!("mcp_{}_{}", server_name, t.name);
-                format!(
-                    "- {} → {}",
-                    qualified,
-                    t.description.as_deref().unwrap_or("no description")
-                )
-            })
-            .collect();
-
-        let result = serde_json::to_string(&json!({
-            "status": "connected",
-            "transport": transport,
-            "server": server_name,
-            "new_tools": mcp_tools.len(),
-            "total_mcp_tools": pool.all_tools().len(),
-            "message": format!(
-                "MCP server '{}' connected via {}. {} tools discovered.\n\n\
-                 Callable tools (use these exact names):\n{}",
-                server_name, transport, mcp_tools.len(), tools_list.join("\n")
-            )
-        }))
-        .unwrap_or_else(|_| "{}".to_string());
-
-        let mut output = ToolResult::success(result);
-        output.metadata = Some(json!({ "mcp_catalog_changed": true }));
-        Ok(output)
+        let _ = conn;
+        Ok(connected_result(&pool, &server_name, transport, context))
     }
+}
+
+/// Shared receipt for both new servers and configured-name reconnects.
+fn connected_result(
+    pool: &McpPool,
+    server_name: &str,
+    transport: &str,
+    context: &ToolContext,
+) -> ToolResult {
+    let owners = pool.resolved_tool_servers();
+    let tools_list: Vec<String> = pool
+        .all_tools()
+        .into_iter()
+        .filter(|(name, _)| {
+            owners.get(name).map(String::as_str) == Some(server_name)
+                && !crate::core::engine::tool_catalog::tool_matches_any_rule(
+                    &context.disallowed_tools,
+                    name,
+                )
+        })
+        .map(|(name, tool)| {
+            format!(
+                "- {} → {}",
+                name,
+                tool.description.as_deref().unwrap_or("no description")
+            )
+        })
+        .collect();
+    let result = serde_json::to_string(&json!({
+        "status": "connected",
+        "transport": transport,
+        "server": server_name,
+        "new_tools": tools_list.len(),
+        "total_mcp_tools": pool.all_tools().iter().filter(|(name, _)| !crate::core::engine::tool_catalog::tool_matches_any_rule(&context.disallowed_tools, name)).count(),
+        "message": format!(
+            "MCP server '{}' connected via {}. {} tools discovered.\n\nCallable tools (use these exact names):\n{}",
+            server_name, transport, tools_list.len(), tools_list.join("\n")
+        )
+    })).unwrap_or_else(|_| "{}".to_string());
+    let mut output = ToolResult::success(result);
+    output.metadata = Some(json!({ "mcp_catalog_changed": true }));
+    output
+}
+
+/// Shell interpreters that would run an arbitrary script as the "server".
+const SHELL_WRAPPERS: &[&str] = &["bash", "sh", "zsh", "cmd", "powershell"];
+
+/// Known MCP server runtimes and package managers. Anything else is refused
+/// to prevent arbitrary execution.
+const ALLOWED_COMMANDS: &[&str] = &[
+    "npx", "npm", "pnpm", "yarn", "bunx", "bun", "node", "python", "python3", "uvx", "uv", "deno",
+    "ruby", "cargo",
+];
+
+/// Refuse a runtime MCP command that is a shell wrapper or is not a known
+/// server runtime. Both checks read the command's lowercased file stem, so
+/// `/bin/zsh` and `powershell.exe` are named for what they are. Kept out of
+/// `execute` (as [`reject_shell_metacharacters`] is) so tests exercise the
+/// real guard rather than a copy of its list.
+fn validate_runtime_command(cmd: &str) -> Result<(), ToolError> {
+    let cmd_base = std::path::Path::new(cmd)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if SHELL_WRAPPERS.contains(&cmd_base.as_str()) {
+        return Err(ToolError::invalid_input(format!(
+            "Shell wrapper commands ({cmd}) are not allowed. \
+             Provide the actual MCP server command directly, \
+             e.g. 'npx @modelcontextprotocol/server-filesystem /tmp'"
+        )));
+    }
+    if !ALLOWED_COMMANDS.contains(&cmd_base.as_str()) {
+        return Err(ToolError::invalid_input(format!(
+            "Command '{cmd}' is not in the allowed list. \
+             Permitted commands: {}",
+            ALLOWED_COMMANDS.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse MCP server arguments carrying shell metacharacters.
@@ -433,6 +484,32 @@ fn connect_failure_message(server_name: &str, err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_ceiling_runtime_registration_respects_child_policy_before_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Arc::new(AsyncMutex::new(McpPool::new(
+            crate::mcp::McpConfig::default(),
+        )));
+        let tool = StartRuntimeMcpServer::new(Arc::clone(&pool));
+        let mut context = ToolContext::new(directory.path());
+        context.disallowed_tools = vec!["mcp_private-*".to_string()];
+        // The command would execute if the child ceiling were ignored.
+        let error = tool
+            .execute(
+                json!({"server":"node nonexistent-mcp.js", "name":"private_a"}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to find MCP server: private-a")
+        );
+        assert!(pool.lock().await.server_names().is_empty());
+        assert!(pool.lock().await.connected_servers().is_empty());
+    }
 
     #[test]
     fn parse_command_stdio() {
@@ -714,10 +791,30 @@ mod tests {
     // === command validation tests ===
 
     #[test]
-    fn reject_shell_wrapper_bash() {
-        let result = parse_mcp_command("bash -c 'npx server'");
-        assert!(result.is_ok()); // parsing succeeds
-        // but execute would reject — tested via parse_mcp_command structure
+    fn shell_wrappers_and_unlisted_commands_are_refused() {
+        for (cmd, reason) in [
+            ("bash", "Shell wrapper"),
+            ("sh", "Shell wrapper"),
+            ("/bin/zsh", "Shell wrapper"),
+            ("powershell", "Shell wrapper"),
+            ("PowerShell.exe", "Shell wrapper"),
+            ("curl", "not in the allowed list"),
+        ] {
+            let err =
+                super::validate_runtime_command(cmd).expect_err(&format!("{cmd} must be refused"));
+            assert!(err.to_string().contains(reason), "{cmd}: {err}");
+        }
+        // The parsed command, not the raw string, is what gets checked.
+        let parsed = parse_mcp_command("bash -c 'npx server'").expect("parses");
+        let cmd = parsed.config.command.expect("stdio command");
+        assert!(super::validate_runtime_command(&cmd).is_err());
+    }
+
+    #[test]
+    fn known_runtimes_pass_the_command_guard() {
+        for cmd in ["npx", "/usr/local/bin/node", "python3", "uvx", "cargo"] {
+            assert!(super::validate_runtime_command(cmd).is_ok(), "{cmd}");
+        }
     }
 
     /// These used to assert only that their own input string contained the
@@ -752,20 +849,6 @@ mod tests {
             "--read-only".to_string(),
         ];
         assert!(super::reject_shell_metacharacters(&args).is_ok());
-    }
-
-    #[test]
-    fn allowlist_includes_common_runtimes() {
-        // Verify the allowlist covers the expected commands
-        const ALLOWED: &[&str] = &[
-            "npx", "npm", "pnpm", "yarn", "bunx", "bun", "node", "python", "python3", "uvx", "uv",
-            "deno", "ruby", "cargo",
-        ];
-        // All standard MCP server launchers should be present
-        assert!(ALLOWED.contains(&"npx"));
-        assert!(ALLOWED.contains(&"node"));
-        assert!(ALLOWED.contains(&"python3"));
-        assert!(ALLOWED.contains(&"uvx"));
     }
 
     // === approval-gate contract ===

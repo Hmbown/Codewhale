@@ -1,9 +1,9 @@
 //! `/hf` - Hugging Face MCP and provider concept helpers.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::mcp::{McpConfig, McpServerConfig};
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 

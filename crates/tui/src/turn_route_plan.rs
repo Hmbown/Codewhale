@@ -18,11 +18,10 @@
 //! later routing.
 
 use crate::compaction::CompactionConfig;
-use crate::config::{ApiProvider, Config, ProviderIdentity};
-use crate::route_runtime::{
-    ResolvedRuntimeRoute, resolve_runtime_route, resolve_runtime_route_for_identity,
-};
-use crate::tui::app::{AppMode, ReasoningEffort};
+use crate::config::{Config, ProviderIdentity, ProviderKind};
+use crate::reasoning_preference::ReasoningEffort;
+use crate::route_runtime::{ResolvedRuntimeRoute, resolve_runtime_route_for_identity};
+use codewhale_config::AppMode;
 
 /// Everything the shared turn-route planner needs.
 ///
@@ -32,7 +31,7 @@ use crate::tui::app::{AppMode, ReasoningEffort};
 pub(crate) struct TurnRoutePlanRequest<'a> {
     pub(crate) route_config: &'a Config,
     pub(crate) app_route_identity: &'a ProviderIdentity,
-    pub(crate) api_provider: ApiProvider,
+    pub(crate) api_provider: ProviderKind,
     pub(crate) app_model: &'a str,
     pub(crate) auto_model: bool,
     pub(crate) reasoning_effort: ReasoningEffort,
@@ -40,9 +39,6 @@ pub(crate) struct TurnRoutePlanRequest<'a> {
     /// Model-facing content of the next user message (file mentions and skill
     /// wrapping already resolved). This is what the auto router classifies.
     pub(crate) content: &'a str,
-    /// The user's display text, used by the heuristic and auto-reasoning
-    /// fallbacks exactly as production does.
-    pub(crate) display_text: &'a str,
     pub(crate) auto_router_context: &'a str,
     pub(crate) should_auto_resolve: bool,
     /// Production dispatch may use the deterministic response cache for the
@@ -59,7 +55,7 @@ pub(crate) struct TurnRoutePlanRequest<'a> {
 pub(crate) struct PlannedTurnRoute {
     pub(crate) route: ResolvedRuntimeRoute,
     pub(crate) compaction: CompactionConfig,
-    pub(crate) effective_provider: ApiProvider,
+    pub(crate) effective_provider: ProviderKind,
     pub(crate) effective_model: String,
     pub(crate) effective_provider_identity: String,
     pub(crate) effective_provider_label: String,
@@ -69,6 +65,11 @@ pub(crate) struct PlannedTurnRoute {
     pub(crate) effective_reasoning_effort: Option<String>,
     pub(crate) auto_controls_reasoning: bool,
     pub(crate) auto_selection: Option<crate::model_routing::AutoRouteSelection>,
+    /// Bounded auxiliary classifier usage that must enter the accepted turn
+    /// under its own frozen routes. It is moved out of `auto_selection` so a
+    /// UI-only receipt consumer cannot accidentally become the accounting
+    /// owner or price it under the parent route.
+    pub(crate) initial_routed_usage: crate::cost_status::RuntimeUsageBatch,
     /// Why this concrete route was selected. This is captured by the planner,
     /// not inferred later from the resulting provider/model pair.
     pub(crate) routing_source: TurnRoutingSource,
@@ -82,8 +83,9 @@ pub(crate) enum TurnRoutingSource {
     ActiveFixedRoute,
     /// Auto model routing used its provider-backed classifier.
     AutoProviderClassifier,
-    /// Auto model routing used the local deterministic fallback heuristic.
-    AutoLocalHeuristic,
+    /// Auto model routing fell back to the local declared default (no
+    /// classifier signal; request wording never inspected).
+    AutoLocalFallback,
 }
 
 impl TurnRoutingSource {
@@ -91,14 +93,14 @@ impl TurnRoutingSource {
         match self {
             Self::ActiveFixedRoute => "active-fixed-route",
             Self::AutoProviderClassifier => "auto-provider-classifier",
-            Self::AutoLocalHeuristic => "auto-local-heuristic",
+            Self::AutoLocalFallback => "auto-local-fallback",
         }
     }
 }
 
 fn reasoning_effort_for_route_selection(
     auto_model: bool,
-    provider: ApiProvider,
+    provider: ProviderKind,
     effort: ReasoningEffort,
 ) -> &'static str {
     if auto_model {
@@ -106,6 +108,19 @@ fn reasoning_effort_for_route_selection(
     } else {
         effort.as_setting_for_provider(provider)
     }
+}
+
+/// Settle the classifier usage of a turn whose route then failed, into the
+/// cost scope that was current when the classifier call was made. A fresh
+/// token taken here would bill it to whatever session is current by now:
+/// after a `/new` or session load during the call, a different one.
+fn settle_failed_parent_route(
+    cost_scope: crate::cost_status::CostScopeToken,
+    error: String,
+    initial_routed_usage: &crate::cost_status::RuntimeUsageBatch,
+) -> String {
+    crate::cost_status::report_runtime_usage_batch(cost_scope, None, initial_routed_usage);
+    error
 }
 
 /// Resolve the route for one turn.
@@ -125,7 +140,10 @@ fn reasoning_effort_for_route_selection(
 pub(crate) async fn plan_turn_route(
     request: TurnRoutePlanRequest<'_>,
 ) -> Result<PlannedTurnRoute, String> {
-    let auto_selection = if request.should_auto_resolve {
+    // Taken before the classifier call so its usage settles into the scope
+    // it was spent in, not the one current when a failure is noticed.
+    let cost_scope = crate::cost_status::scope_token();
+    let mut auto_selection = if request.should_auto_resolve {
         Some(
             crate::model_routing::resolve_auto_route_with_inventory_for_session_and_cache_policy(
                 request.route_config,
@@ -147,49 +165,77 @@ pub(crate) async fn plan_turn_route(
         None
     };
 
-    let effective_provider = auto_selection
-        .as_ref()
-        .map(|selection| selection.provider)
-        .unwrap_or(request.api_provider);
+    // Move classifier accounting out immediately. Every later parent-route
+    // failure must settle this already-incurred auxiliary call instead of
+    // returning an error that silently drops its exact quote/usage.
+    let initial_routed_usage = auto_selection
+        .as_mut()
+        .map(|selection| crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
+            records: std::mem::take(&mut selection.routed_usage),
+            drop_records: std::mem::take(&mut selection.routed_usage_drop_records),
+            dropped_records: std::mem::take(&mut selection.routed_usage_dropped_records),
+        })
+        .unwrap_or_default();
 
+    let selected_identity = auto_selection
+        .as_ref()
+        .map_or(request.app_route_identity, |selection| &selection.provider);
+    let effective_provider = selected_identity.provider;
+
+    // Without an Auto selection there is no per-request signal, so the
+    // route is the configured model — the same declared default the local
+    // fallback uses. Request wording is never inspected (#6290 rework).
     let effective_model = if request.auto_model {
         auto_selection
             .as_ref()
             .map(|selection| selection.model.clone())
-            .unwrap_or_else(|| {
-                crate::model_routing::auto_model_heuristic(request.display_text, request.app_model)
-            })
+            .unwrap_or_else(|| request.app_model.to_string())
     } else {
         request.app_model.to_string()
     };
 
-    let turn_route = if effective_provider == request.app_route_identity.provider {
-        resolve_runtime_route_for_identity(
-            request.route_config,
-            request.app_route_identity,
-            Some(&effective_model),
-        )
-    } else {
-        resolve_runtime_route(
-            request.route_config,
-            effective_provider,
-            Some(&effective_model),
-        )
-    };
+    let turn_route = resolve_runtime_route_for_identity(
+        request.route_config,
+        selected_identity,
+        Some(&effective_model),
+    );
 
-    let turn_route = turn_route.map_err(|err| err.to_string())?;
+    let turn_route = match turn_route {
+        Ok(route) => route,
+        Err(err) => {
+            return Err(settle_failed_parent_route(
+                cost_scope,
+                err.to_string(),
+                &initial_routed_usage,
+            ));
+        }
+    };
     let turn_route = if request.preflight_required {
-        turn_route.preflight()?
+        match turn_route.preflight() {
+            Ok(route) => route,
+            Err(err) => {
+                return Err(settle_failed_parent_route(
+                    cost_scope,
+                    err,
+                    &initial_routed_usage,
+                ));
+            }
+        }
     } else {
         turn_route
     };
 
     let turn_route_limits = crate::route_budget::known_route_limits(turn_route.candidate.limits());
-    let effective_provider_identity = turn_route.identity.key.clone();
-    let effective_provider_label = if effective_provider == ApiProvider::Custom {
+    let effective_provider_identity = turn_route.identity.key.to_string();
+    let effective_provider_label = if effective_provider == ProviderKind::Custom {
         effective_provider_identity.clone()
     } else {
-        effective_provider.display_name().to_string()
+        turn_route
+            .identity
+            .compatibility()
+            .map_or(effective_provider.as_str(), |row| row.label)
+            .to_string()
     };
 
     let turn_compaction = CompactionConfig {
@@ -215,20 +261,24 @@ pub(crate) async fn plan_turn_route(
             &turn_route.model,
             turn_route_limits,
         )),
+        summary_instructions: request.route_config.compaction_summary_instructions(),
+        retained_user_message_tokens: request
+            .route_config
+            .compaction_retained_user_message_tokens(),
         ..Default::default()
     };
 
     // Model selection and reasoning selection are independent. A fixed
     // reasoning preference survives auto model routing and is normalized
     // against the concrete route below; only an explicit `auto` delegates the
-    // tier to the classifier/heuristic.
+    // tier to the classifier/declared fallback.
     let auto_controls_reasoning = request.reasoning_effort == ReasoningEffort::Auto;
     let selected_reasoning_effort = if auto_controls_reasoning {
         Some(
             auto_selection
                 .as_ref()
                 .and_then(|selection| selection.reasoning_effort)
-                .unwrap_or_else(|| crate::auto_reasoning::select(false, request.display_text)),
+                .unwrap_or_else(crate::auto_reasoning::select),
         )
     } else {
         None
@@ -248,7 +298,7 @@ pub(crate) async fn plan_turn_route(
     } else if auto_selection.is_some() {
         TurnRoutingSource::AutoProviderClassifier
     } else {
-        TurnRoutingSource::AutoLocalHeuristic
+        TurnRoutingSource::AutoLocalFallback
     };
 
     Ok(PlannedTurnRoute {
@@ -262,6 +312,7 @@ pub(crate) async fn plan_turn_route(
         effective_reasoning_effort,
         auto_controls_reasoning,
         auto_selection,
+        initial_routed_usage,
         routing_source,
     })
 }
@@ -272,12 +323,81 @@ mod tests {
     use crate::config::DEFAULT_TEXT_MODEL;
 
     fn deepseek_identity() -> ProviderIdentity {
-        ProviderIdentity {
-            provider: ApiProvider::Deepseek,
-            key: ApiProvider::Deepseek.as_str().to_string(),
-            exact_id: None,
-            migrated_legacy_ollama_cloud_route: false,
-        }
+        crate::config::Config::default()
+            .builtin_provider_identity(ProviderKind::Deepseek)
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_parent_route_settles_classifier_batch_once() {
+        let _cost_scope = crate::cost_status::test_scope();
+        let route = crate::cost_status::EffectiveRouteEnvelope::capture(
+            None,
+            ProviderKind::Deepseek,
+            "deepseek",
+            "classifier-model",
+            Some(ProviderKind::Deepseek.provider().default_base_url()),
+            chrono::Utc::now(),
+        );
+        let batch = crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
+            records: vec![crate::cost_status::RuntimeUsageRecord {
+                source_id: "auto-router:plan-usage".to_string(),
+                usage: crate::cost_status::EffectiveRouteUsage {
+                    route: route.clone(),
+                    usage: codewhale_models::Usage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                        ..Default::default()
+                    },
+                },
+            }],
+            drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::default(),
+                source_id: "auto-router:plan-drop".to_string(),
+                route,
+            }],
+            dropped_records: 1,
+        };
+
+        let scope = crate::cost_status::scope_token();
+        assert_eq!(
+            settle_failed_parent_route(scope, "route failed".to_string(), &batch),
+            "route failed"
+        );
+        settle_failed_parent_route(scope, "route failed".to_string(), &batch);
+        let pending = crate::cost_status::drain();
+        assert_eq!(
+            pending.usage_source_fingerprints.len(),
+            2,
+            "both exact classifier outcomes persist, and replay is idempotent"
+        );
+
+        // The classifier ran in one session; `/new` closed it before the
+        // route failed. Its cost belongs to the closed session, never the new.
+        let spent_in = crate::cost_status::scope_token();
+        let _closed = crate::cost_status::close_current_scope();
+        let batch = crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
+            records: batch
+                .records
+                .iter()
+                .cloned()
+                .map(|mut record| {
+                    record.source_id = "auto-router:plan-usage-after-new".to_string();
+                    record
+                })
+                .collect(),
+            drop_records: Vec::new(),
+            dropped_records: 0,
+        };
+        settle_failed_parent_route(spent_in, "route failed".to_string(), &batch);
+        assert!(
+            crate::cost_status::drain()
+                .usage_source_fingerprints
+                .is_empty(),
+            "classifier cost leaked into the session opened after it was spent"
+        );
     }
 
     #[test]
@@ -285,7 +405,7 @@ mod tests {
         assert_eq!(
             reasoning_effort_for_route_selection(
                 true,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 ReasoningEffort::Off,
             ),
             "off"
@@ -293,7 +413,7 @@ mod tests {
         assert_eq!(
             reasoning_effort_for_route_selection(
                 false,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 ReasoningEffort::Off,
             ),
             "low"
@@ -308,13 +428,12 @@ mod tests {
         let planned = plan_turn_route(TurnRoutePlanRequest {
             route_config: &config,
             app_route_identity: &identity,
-            api_provider: ApiProvider::Deepseek,
+            api_provider: ProviderKind::Deepseek,
             app_model: DEFAULT_TEXT_MODEL,
             auto_model: true,
             reasoning_effort: ReasoningEffort::Low,
             mode: AppMode::Agent,
             content: "explain this function",
-            display_text: "explain this function",
             auto_router_context: "",
             should_auto_resolve: false,
             allow_auto_router_response_cache: false,
@@ -326,10 +445,7 @@ mod tests {
         .await
         .expect("plan auto-model turn");
 
-        assert_eq!(
-            planned.routing_source,
-            TurnRoutingSource::AutoLocalHeuristic
-        );
+        assert_eq!(planned.routing_source, TurnRoutingSource::AutoLocalFallback);
         assert!(!planned.auto_controls_reasoning);
         assert_eq!(planned.selected_reasoning_effort, None);
         // First-party DeepSeek routes carry low as the real wire tier

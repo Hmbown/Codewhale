@@ -1,4 +1,4 @@
-const REPOSITORY = "https://github.com/Hmbown/CodeWhale";
+const REPOSITORY = "https://github.com/codewhale-hq/CodeWhale";
 
 export function faqSourceHref(source: string): string | null {
   const issue = source.match(/^#(\d+)$/);

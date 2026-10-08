@@ -1,0 +1,395 @@
+# Offline Models.dev seed spec (#6396).
+#
+# This file says WHICH upstream rows the offline seed carries and how they map
+# onto Codewhale provider ids. It never states a value that contradicts
+# upstream: policy (a withheld price, a clamped limit) belongs in
+# crates/config/assets/catalog_corrections.json, which applies online too.
+#
+#   python3 scripts/catalog_models_dev.py seed lock --dry-run   # review report
+#   python3 scripts/catalog_models_dev.py seed lock             # pin upstream
+#   python3 scripts/catalog_models_dev.py seed render           # write the seed
+#
+# Model entries: a bare id, or a table with
+#   id           Codewhale wire id (the seed key, sent on the wire)
+#   upstream_id  upstream id when it differs by more than letter case
+#   from         a sibling upstream provider to take the row from
+#   base_model   Codewhale's canonical join (upstream provider rows have none)
+#   curated      true for a row upstream does not list; data in [[curated]]
+# Exactly one model per provider is its `default`, matching the provider's
+# built-in DEFAULT_*_MODEL.
+
+[source]
+url = "https://models.dev/catalog.json"
+
+[meta]
+about = "Offline fallback Models.dev-shaped catalog snapshot for Codewhale (#3385, demoted by #4188, generated since #6396)."
+schema = "Matches crates/config/src/models_dev.rs ModelsDevCatalog ({ models, providers })."
+role = "NOT a competing source of truth. Preferred metadata is the live Models.dev catalog published into ProviderLake (#4187). This asset is used only when live/cache rows are unavailable (offline startup, failed refresh, or empty cache)."
+source = "Rows are projected unedited from Models.dev onto the fields models_dev.rs reads; provider headers, id mapping, defaults and canonical joins come from scripts/catalog/models_dev_seed.toml."
+corrections = "Deliberate holds (withheld prices, clamped limits) are not in this file. They live in crates/config/assets/catalog_corrections.json and apply to this seed and to live refresh alike."
+default_rows = "Each provider's `default: true` wire id equals that provider's built-in DEFAULT_*_MODEL so RouteResolver::new() and the descriptor stay in agreement when offline."
+pending_release_metadata = "GLM-5.3 is live on the Z.ai Coding Plan (docs.z.ai/devpack/overview and docs.z.ai/devpack/latest-model, recorded 2026-08-13) and is the default direct Z.ai model (DEFAULT_ZAI_MODEL); explicit GLM-5.2 selections keep their own id. First-party wire id is GLM-5.3; OpenRouter mirror is z-ai/glm-5.3. Capability/limit/dialect values still inherit from GLM-5.2 until Z.ai publishes distinct 5.3 numbers. Pricing stays absent: Coding Plan publishes credit multipliers, not a USD PAYG row we can stand behind. Z.ai may auto-route GLM-5.2/GLM-5.1 requests to GLM-5.3 on their side; Codewhale still sends the selected picker id. Do not send a [1m] suffix. Scope stays first-party Z.ai plus the OpenRouter mirror; add third-party gateway rows only against that gateway's own published roster."
+
+# Canonical `models` entries. The two bare DeepSeek keys are the canonical ids
+# every hosted DeepSeek `base_model`, the route layer and pricing name;
+# renaming them is a canonical-identity migration, not a seed refresh.
+
+[[canonical]]
+key = "deepseek-v4-pro"
+upstream = "deepseek/deepseek-v4-pro"
+
+[[canonical]]
+key = "deepseek-v4-flash"
+upstream = "deepseek/deepseek-v4-flash"
+
+[[canonical]]
+key = "xiaomi/mimo-v2.6-pro"
+
+[[canonical]]
+key = "xiaomi/mimo-v2.6-flash"
+
+[[providers]]
+id = "deepseek"
+name = "DeepSeek"
+api = "https://api.deepseek.com"
+npm = "@ai-sdk/openai-compatible"
+env = ["DEEPSEEK_API_KEY"]
+default = "deepseek-flash"
+models = [
+  { id = "deepseek-v4-pro", base_model = "deepseek-v4-pro" },
+  { id = "deepseek-v4-flash", base_model = "deepseek-v4-flash" },
+  { id = "deepseek-v4-flash-vision-exp", base_model = "deepseek-v4-flash" },
+  { id = "deepseek-flash", base_model = "deepseek-flash" },
+]
+
+[[providers]]
+id = "zai"
+name = "Zhipu AI / Z.ai"
+api = "https://api.z.ai/api/paas/v4"
+npm = "@ai-sdk/openai-compatible"
+env = ["ZAI_API_KEY", "ZHIPU_API_KEY", "GLM_API_KEY"]
+default = "GLM-5.3"
+models = [
+  "GLM-5.2",
+  "GLM-5.3",
+  "GLM-5.3-Flash",
+  "glm-5.1",
+  "GLM-5-Turbo",
+]
+
+[[providers]]
+id = "moonshot"
+upstream = "moonshotai"
+name = "Moonshot / Kimi"
+api = "https://api.moonshot.ai/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["MOONSHOT_API_KEY", "KIMI_API_KEY"]
+default = "kimi-k2.7-code"
+models = [
+  "kimi-k3",
+  "kimi-k2.7-code",
+  "kimi-k2.7-code-highspeed",
+  "kimi-k2.6",
+]
+
+[[providers]]
+id = "minimax"
+name = "MiniMax"
+api = "https://api.minimax.io/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["MINIMAX_API_KEY"]
+default = "MiniMax-M3"
+models = [
+  "MiniMax-M3",
+  "MiniMax-M2.7",
+  "MiniMax-M2.7-highspeed",
+]
+
+[[providers]]
+id = "minimax-anthropic"
+upstream = "minimax"
+name = "MiniMax (Anthropic-compatible)"
+api = "https://api.minimax.io/anthropic"
+npm = "@ai-sdk/anthropic"
+env = ["MINIMAX_API_KEY"]
+default = "MiniMax-M3"
+models = [
+  "MiniMax-M3",
+  "MiniMax-M2.7",
+  "MiniMax-M2.7-highspeed",
+]
+
+[[providers]]
+id = "modelstudio-token-plan"
+upstream = "alibaba-token-plan"
+name = "Alibaba Cloud Model Studio (Token Plan)"
+api = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
+default = "qwen3.8-max"
+models = [
+  "qwen3.8-max",
+  "qwen3.8-max-preview",
+  "qwen3.7-plus",
+  "qwen3.7-max",
+  "qwen3.6-flash",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash-0731",
+  "glm-5.2",
+]
+
+[[providers]]
+id = "modelstudio-token-plan-anthropic"
+upstream = "alibaba-token-plan"
+name = "Alibaba Cloud Model Studio (Token Plan, Anthropic-compatible)"
+api = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
+npm = "@ai-sdk/anthropic"
+env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
+default = "qwen3.8-max"
+models = [
+  "qwen3.8-max",
+  "qwen3.8-max-preview",
+  "qwen3.7-plus",
+  "qwen3.7-max",
+  "qwen3.6-flash",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash-0731",
+  "glm-5.2",
+]
+
+[[providers]]
+id = "modelstudio-coding-plan"
+upstream = "alibaba-coding-plan"
+name = "Alibaba Cloud Model Studio (Coding Plan)"
+api = "https://coding-intl.dashscope.aliyuncs.com/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
+default = "qwen3.8-max"
+models = [
+  { id = "qwen3.8-max", from = "alibaba-token-plan" },
+  { id = "qwen3.8-max-preview", from = "alibaba-token-plan" },
+  "qwen3.7-plus",
+  "qwen3.7-max",
+  "qwen3.6-flash",
+  { id = "deepseek-v4-pro", from = "alibaba-token-plan" },
+  { id = "deepseek-v4-flash-0731", from = "alibaba-token-plan" },
+  { id = "glm-5.2", from = "alibaba-token-plan" },
+]
+
+[[providers]]
+id = "modelstudio-coding-plan-anthropic"
+upstream = "alibaba-coding-plan"
+name = "Alibaba Cloud Model Studio (Coding Plan, Anthropic-compatible)"
+api = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic"
+npm = "@ai-sdk/anthropic"
+env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
+default = "qwen3.8-max"
+models = [
+  { id = "qwen3.8-max", from = "alibaba-token-plan" },
+  { id = "qwen3.8-max-preview", from = "alibaba-token-plan" },
+  "qwen3.7-plus",
+  "qwen3.7-max",
+  "qwen3.6-flash",
+  { id = "deepseek-v4-pro", from = "alibaba-token-plan" },
+  { id = "deepseek-v4-flash-0731", from = "alibaba-token-plan" },
+  { id = "glm-5.2", from = "alibaba-token-plan" },
+]
+
+[[providers]]
+id = "meta"
+name = "Meta Model API"
+api = "https://api.meta.ai/v1"
+npm = "@ai-sdk/openai"
+env = ["META_MODEL_API_KEY", "MODEL_API_KEY"]
+default = "muse-spark-1.2"
+models = [
+  "muse-spark-1.1",
+  "muse-spark-1.2",
+  "muse-spark-1.2-contributor",
+]
+
+[[providers]]
+id = "openai"
+name = "OpenAI-compatible"
+api = "https://api.openai.com/v1"
+npm = "@ai-sdk/openai"
+env = ["OPENAI_API_KEY"]
+default = "gpt-5.6"
+models = [
+  "gpt-5.5",
+  "gpt-5.5-pro",
+  "gpt-5.6",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.3-codex",
+]
+
+[[providers]]
+id = "anthropic"
+name = "Anthropic"
+api = "https://api.anthropic.com"
+npm = "@ai-sdk/anthropic"
+env = ["ANTHROPIC_API_KEY"]
+default = "claude-sonnet-4-6"
+models = [
+  "claude-sonnet-4-6",
+  "claude-opus-4-8",
+  "claude-haiku-4-5",
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "claude-fable-5",
+]
+
+[[providers]]
+id = "openrouter"
+name = "OpenRouter"
+api = "https://openrouter.ai/api/v1"
+npm = "@openrouter/ai-sdk-provider"
+env = ["OPENROUTER_API_KEY"]
+default = "deepseek/deepseek-v4-pro"
+models = [
+  { id = "deepseek/deepseek-v4-pro", base_model = "deepseek-v4-pro" },
+  { id = "deepseek/deepseek-v4-flash", base_model = "deepseek-v4-flash" },
+  "qwen/qwen3.8-flash",
+  "qwen/qwen3.6-flash",
+  "qwen/qwen3.6-plus",
+  "qwen/qwen3.6-35b-a3b",
+  "qwen/qwen3.7-plus",
+  "minimax/minimax-m3",
+  "z-ai/glm-5.2",
+  "z-ai/glm-5.3",
+  "z-ai/glm-5.3-flash",
+  "dots-studio/dots-3-note-preview:free",
+]
+
+[[providers]]
+id = "together"
+upstream = "togetherai"
+name = "Together AI"
+api = "https://api.together.xyz/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["TOGETHER_API_KEY"]
+default = "deepseek-ai/DeepSeek-V4-Pro"
+models = [
+  { id = "deepseek-ai/DeepSeek-V4-Pro", base_model = "deepseek-v4-pro" },
+  { id = "deepseek-ai/DeepSeek-V4-Flash", base_model = "deepseek-v4-flash", curated = true },
+]
+
+[[providers]]
+id = "fireworks"
+upstream = "fireworks-ai"
+name = "Fireworks AI"
+api = "https://api.fireworks.ai/inference/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["FIREWORKS_API_KEY"]
+default = "accounts/fireworks/models/deepseek-v4-pro"
+models = [
+  { id = "accounts/fireworks/models/deepseek-v4-pro", base_model = "deepseek-v4-pro" },
+]
+
+[[providers]]
+id = "novita"
+upstream = "novita-ai"
+name = "Novita AI"
+api = "https://api.novita.ai/openai/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["NOVITA_API_KEY"]
+default = "deepseek/deepseek-v4-pro"
+models = [
+  { id = "deepseek/deepseek-v4-pro", base_model = "deepseek-v4-pro" },
+  { id = "deepseek/deepseek-v4-flash", base_model = "deepseek-v4-flash" },
+]
+
+[[providers]]
+id = "siliconflow"
+name = "SiliconFlow"
+api = "https://api.siliconflow.com/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["SILICONFLOW_API_KEY"]
+default = "deepseek-ai/DeepSeek-V4-Pro"
+models = [
+  { id = "deepseek-ai/DeepSeek-V4-Pro", base_model = "deepseek-v4-pro" },
+  { id = "deepseek-ai/DeepSeek-V4-Flash", base_model = "deepseek-v4-flash" },
+]
+
+[[providers]]
+id = "arcee"
+name = "Arcee AI"
+api = "https://api.arcee.ai/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["ARCEE_API_KEY"]
+default = "trinity-large-thinking"
+models = [
+  "trinity-large-thinking",
+  { id = "trinity-mini", curated = true },
+]
+
+[[providers]]
+id = "xai"
+name = "xAI"
+api = "https://api.x.ai/v1"
+npm = "@ai-sdk/xai"
+env = ["XAI_API_KEY"]
+default = "grok-4.6"
+models = [
+  "grok-4.7",
+  "grok-4.6",
+  "grok-4.5",
+  "grok-4.3",
+]
+
+[[providers]]
+id = "xiaomi-mimo"
+upstream = "xiaomi"
+name = "Xiaomi MiMo"
+api = "https://api-mimo.xiaomi.com/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["XIAOMI_MIMO_API_KEY", "MIMO_API_KEY"]
+default = "mimo-v2.5-pro"
+models = [
+  "mimo-v2.5-pro",
+  "mimo-v2.5",
+  "mimo-v2.6-pro",
+  "mimo-v2.6-flash",
+]
+
+[[providers]]
+id = "stepfun"
+name = "StepFun / StepFlash"
+api = "https://api.stepfun.ai/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["STEPFUN_API_KEY", "STEP_API_KEY"]
+default = "step-3.7-flash"
+models = [
+  "step-3.5-flash",
+  "step-3.5-flash-2603",
+  "step-3.7-flash",
+  "step-5-preview",
+]
+
+[[curated]]
+provider = "together"
+id = "deepseek-ai/DeepSeek-V4-Flash"
+reason = "Carried since #3385. Models.dev togetherai lists DeepSeek-V4-Flash-0731 and DeepSeek-V4.1-Flash but not this id (checked 2026-09-26); confirm Together still serves it or remove the row."
+
+[curated.row]
+name = "DeepSeek V4 Flash (Together)"
+family = "deepseek"
+reasoning = true
+tool_call = true
+modalities = { input = ["text"], output = ["text"] }
+limit = { context = 1000000, output = 384000 }
+
+[[curated]]
+provider = "arcee"
+id = "trinity-mini"
+reason = "Carried since 0.8.68. Models.dev arcee lists only trinity-large-thinking among Arcee's own models (checked 2026-09-26); confirm Arcee still serves it or remove the row."
+
+[curated.row]
+name = "Trinity Mini"
+family = "trinity"
+reasoning = true
+tool_call = true
+modalities = { input = ["text"], output = ["text"] }
+limit = { context = 128000 }

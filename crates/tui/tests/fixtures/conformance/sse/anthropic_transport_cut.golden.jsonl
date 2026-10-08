@@ -1,0 +1,5 @@
+{"request":[{"method":"POST","path":"/v1/messages"}]}
+{"type":"message_start","message":{"id":"msg_conf_04","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":50,"output_tokens":1,"prompt_cache_hit_tokens":8,"prompt_cache_miss_tokens":42,"prompt_cache_write_tokens":0}}}
+{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Cut"}}
+{"type":"stream_failure","detail":"Stream read error: error decoding response body"}

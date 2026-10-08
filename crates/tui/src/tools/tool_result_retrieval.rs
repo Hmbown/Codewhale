@@ -5,7 +5,6 @@
 //! only when a digest-bound ownership sidecar proves they belong to the active
 //! session.
 
-use std::fs;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -135,7 +134,7 @@ impl ToolSpec for RetrieveToolResultTool {
         } else {
             None
         };
-        let bytes = fs::read(&resolved.path).map_err(|_| {
+        let bytes = tokio::fs::read(&resolved.path).await.map_err(|_| {
             ToolError::execution_failed("evidence is missing or no longer retained")
         })?;
         if let Some(ownership) = legacy_ownership {
@@ -793,6 +792,7 @@ fn clamp_u64(value: u64, min: usize, max: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::MutexGuard;
     use tempfile::tempdir;
 

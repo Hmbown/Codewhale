@@ -8,15 +8,15 @@ import type { DocsGuideDict } from "../types";
 export const docsGuide: DocsGuideDict = {
   metaTitle: "البداية · توثيق Codewhale",
   metaDescription:
-    "المسار الكامل من التثبيت إلى أسطولك المثالي: التثبيت، وأول جلسة بلا مفاتيح، وربط مزوّد، وإعداد الأسطول.",
+    "ثبّت Codewhale، واربط نموذجًا، وابدأ مهمتك الأولى. أضف Fleet عندما تريد قائمة من النماذج والأدوار.",
   bodyClassName: "text-ink-soft leading-loose",
   overviewTitle: "البداية",
   overviewLead:
-    "أربع خطوات من أمر تثبيت واحد إلى أسطول جاهز لعملك.",
+    "ثبّت Codewhale، واربط نموذجك، وأعطه مهمة. إعداد Fleet اختياري.",
   sessionTitle: "شاهد جلسة حقيقية",
   sessionLead:
-    "سيوضع هنا تسجيل لجلسة حقيقية. لا يوجد تسجيل بعد، لذا لا يُعرض شيء.",
+    "تابع مهمة من الطلب الأول إلى النتيجة النهائية.",
   nextTitle: "إلى أين بعد ذلك",
   sourceNote:
-    "المستندات المصدر: docs/GUIDE.md، docs/KEYBINDINGS.md · نصوص الخطوات في web/lib/content/getting-started.ts؛ حدّث docs-map.ts عند أي تغيير.",
+    "للمزيد من التفاصيل، راجع دليل المستخدم واختصارات لوحة المفاتيح في التوثيق.",
 };

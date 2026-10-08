@@ -4,6 +4,7 @@
 //! approval policy as the other code-executing tools.
 
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,6 @@ use super::spec::{
 
 use crate::dependencies::ExternalTool;
 
-const MAX_OUTPUT_CHARS: usize = 40_000;
-
 /// Tool for running `cargo test` in the workspace root.
 pub struct RunTestsTool;
 
@@ -29,6 +28,10 @@ struct RunTestsOutput {
     stdout: String,
     stderr: String,
     command: String,
+    /// The run hit [`RUN_TESTS_TIMEOUT`] and was killed; stdout/stderr are
+    /// what it wrote until then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    timed_out: bool,
 }
 
 #[async_trait]
@@ -56,6 +59,10 @@ impl ToolSpec for RunTestsTool {
                 "all_features": {
                     "type": "boolean",
                     "description": "When true, include `--all-features`."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory, relative to the workspace, to run `cargo test` in. Must exist inside the workspace."
                 }
             },
             "additionalProperties": false
@@ -73,10 +80,18 @@ impl ToolSpec for RunTestsTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        crate::core::engine::tool_catalog::enforce_tool_denial(context, self.name(), &input)?;
         let all_features = optional_bool(&input, "all_features", false)?;
         let extra_args = optional_str(&input, "args")?
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let workdir = match optional_str(&input, "cwd")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => context.workspace.clone(),
+            Some(raw) => context.resolve_existing_dir(raw, "cwd")?,
+        };
 
         let mut args = vec!["test".to_string()];
         if all_features {
@@ -89,50 +104,92 @@ impl ToolSpec for RunTestsTool {
             args.extend(split);
         }
 
-        let command_str = format_command(&context.workspace, &args);
-        let output = run_cargo(&context.workspace, &args)?;
+        let command_str = format_command(&workdir, &args);
+        let run = run_cargo(&workdir, &args, context, RUN_TESTS_TIMEOUT).await?;
+        let output = run.output;
+        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if run.stopped {
+            stderr.push_str(&format!(
+                "\n[run_tests: stopped after {} s; the output above is everything cargo wrote before it was killed]",
+                RUN_TESTS_TIMEOUT.as_secs()
+            ));
+        }
 
-        let exit_code = output.status.code().unwrap_or(-1);
-        let stdout_raw = String::from_utf8_lossy(&output.stdout);
-        let stderr_raw = String::from_utf8_lossy(&output.stderr);
-        let stdout = truncate_with_note(&stdout_raw, MAX_OUTPUT_CHARS);
-        let stderr = truncate_with_note(&stderr_raw, MAX_OUTPUT_CHARS);
-
-        let result = RunTestsOutput {
-            success: output.status.success(),
-            exit_code,
-            stdout,
+        // The whole output: the end of a cargo run is where the failures and
+        // the `test result:` line are. Size is the engine's one recoverable
+        // budget (#6508), so the failure summary sees everything.
+        run_tests_result(RunTestsOutput {
+            success: !run.stopped && output.status.success(),
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr,
             command: command_str,
-        };
-
-        let mut tool_result =
-            ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        if let Some(summary) = summarize_cargo_failure(
-            &result.command,
-            &result.stdout,
-            &result.stderr,
-            Some(result.exit_code),
-        ) {
-            tool_result = tool_result.with_metadata(json!({
-                "summary": summary.summary,
-                "cargo_failure_summary": summary.to_metadata_value(),
-            }));
-        }
-        Ok(tool_result)
+            timed_out: run.stopped,
+        })
     }
+}
+
+fn run_tests_result(result: RunTestsOutput) -> Result<ToolResult, ToolError> {
+    let mut tool_result =
+        ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
+    if let Some(summary) = summarize_cargo_failure(
+        &result.command,
+        &result.stdout,
+        &result.stderr,
+        Some(result.exit_code),
+    ) {
+        tool_result = tool_result.with_metadata(json!({
+            "summary": summary.summary,
+            "cargo_failure_summary": summary.to_metadata_value(),
+        }));
+    }
+    Ok(tool_result)
 }
 
 // === Helpers ===
 
-fn run_cargo(workspace: &Path, args: &[String]) -> Result<std::process::Output, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Cargo::command() else {
+/// Ceiling for one `cargo test` run. Long suites fit; a hung test does not
+/// hold the turn forever.
+const RUN_TESTS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Run cargo without blocking a runtime worker. Stop and the timeout both end
+/// the whole process tree (cargo and the test binaries it started). A timeout
+/// still returns the output written so far (`stopped`): it is the only
+/// evidence of which test hung.
+async fn run_cargo(
+    workspace: &Path,
+    args: &[String],
+    context: &ToolContext,
+    timeout: Duration,
+) -> Result<crate::process_tree::ContainedOutput, ToolError> {
+    let Some(cargo) = crate::dependencies::Cargo::resolve() else {
         return Err(ToolError::not_available(
             "cargo is not installed or not in PATH",
         ));
     };
-    cmd.args(args).current_dir(workspace);
-    cmd.output().map_err(|e| {
+    // `cargo test` builds and runs workspace code: it starts like an
+    // `exec_shell` command, inside this session's sandbox and without parent
+    // credentials.
+    let mut cmd = crate::tools::shell::sandboxed_runner_command(
+        context,
+        &cargo,
+        args.to_vec(),
+        workspace,
+        timeout,
+    )?;
+    let run = crate::process_tree::contained_output_until(&mut cmd, tokio::time::sleep(timeout));
+    let cancelled = async {
+        match context.cancel_token.as_ref() {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    // Dropping `run` on cancel kills the tree.
+    let output = tokio::select! {
+        output = run => output,
+        () = cancelled => return Err(ToolError::cancelled("cargo test cancelled")),
+    };
+    output.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ToolError::not_available("cargo is not installed or not in PATH")
         } else {
@@ -150,34 +207,6 @@ fn format_command(workspace: &Path, args: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    format!("{truncated}{note}")
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 #[cfg(test)]
@@ -227,6 +256,24 @@ mod tests {
             tool.approval_requirement(),
             ApprovalRequirement::Required,
             "run_tests must gate cargo test behind user approval"
+        );
+    }
+
+    /// Stop must reach `cargo test`: the call returns as cancelled instead of
+    /// blocking a runtime worker until cargo exits on its own.
+    #[tokio::test]
+    async fn run_tests_honors_cancellation() {
+        if !cargo_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let ctx = ToolContext::new(tmp.path()).with_cancel_token(token);
+        let result = RunTestsTool.execute(json!({}), &ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Cancelled { .. })),
+            "cancelled run_tests must not run to completion: {result:?}"
         );
     }
 
@@ -306,9 +353,190 @@ mod tests {
     }
 
     #[test]
-    fn truncation_adds_note() {
-        let long = "x".repeat(MAX_OUTPUT_CHARS + 128);
-        let truncated = truncate_with_note(&long, MAX_OUTPUT_CHARS);
-        assert!(truncated.contains("output truncated"));
+    fn long_failing_output_comes_back_whole_and_the_summary_sees_its_end() {
+        // #6508: stdout used to be cut at 40,000 characters, so the model
+        // read passing tests and never saw which one failed, and the failure
+        // summary ran on the truncated text.
+        let stdout = format!(
+            "{}test tools::git::tests::diff_keeps_the_last_file ... FAILED\n\ntest result: FAILED. 3000 passed; 1 failed; 0 ignored",
+            "test tools::ok ... ok\n".repeat(3_000)
+        );
+        assert!(stdout.chars().count() > 40_000);
+        let result = run_tests_result(RunTestsOutput {
+            success: false,
+            exit_code: 101,
+            stdout: stdout.clone(),
+            stderr: String::new(),
+            command: "(cd /repo && cargo test)".to_string(),
+            timed_out: false,
+        })
+        .expect("result");
+
+        let parsed: Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(parsed["stdout"], json!(stdout));
+        let summary = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("summary"))
+            .and_then(Value::as_str)
+            .expect("failure summary");
+        assert!(
+            summary.contains("diff_keeps_the_last_file"),
+            "summary: {summary}"
+        );
+    }
+
+    /// A child parked at a workspace root that is not the project root (the
+    /// #6296 verifier) runs the suite where the manifest lives instead of
+    /// failing on cwd.
+    #[tokio::test]
+    async fn run_tests_cwd_scopes_cargo_to_subdir() {
+        if !cargo_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let project_dir = init_cargo_project(tmp.path());
+
+        let ctx = ToolContext::new(tmp.path());
+        let result = RunTestsTool
+            .execute(json!({"cwd": "project"}), &ctx)
+            .await
+            .expect("cwd-scoped execute");
+        assert!(result.success);
+
+        let parsed: RunTestsOutput =
+            serde_json::from_str(&result.content).expect("tool result should be json");
+        assert!(
+            parsed.success,
+            "nested cargo test unexpectedly failed:\\n{}",
+            parsed.stderr
+        );
+        // `resolve_existing_dir` returns the canonical path, which on Windows
+        // carries the `\\?\` verbatim prefix the raw tempdir lacks (#6346).
+        let scoped_dir = project_dir.canonicalize().expect("canonical project dir");
+        assert!(
+            parsed.command.contains(&scoped_dir.display().to_string()),
+            "cargo must run in the scoped dir, ran: {}",
+            parsed.command
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tests_cwd_fails_closed_with_a_named_fallback() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+
+        let escape = RunTestsTool
+            .execute(json!({"cwd": "../escape"}), &ctx)
+            .await
+            .expect_err("workspace escape must be refused");
+        assert!(escape.to_string().contains("escapes workspace"), "{escape}");
+
+        let missing = RunTestsTool
+            .execute(json!({"cwd": "no-such-dir"}), &ctx)
+            .await
+            .expect_err("missing dir must be refused");
+        let message = missing.to_string();
+        assert!(message.contains("not an existing directory"), "{message}");
+        assert!(message.contains("drop `cwd`"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_cargo_does_not_inherit_parent_secret_env() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::os::unix::fs::PermissionsExt;
+        if !cargo_available() {
+            return;
+        }
+        let _env_lock = lock_test_env();
+        let bin = tempdir().expect("bin dir");
+        // cargo resolves `cargo envprobe` to a `cargo-envprobe` on PATH, which
+        // lets the test observe the environment cargo hands its children.
+        let probe = bin.path().join("cargo-envprobe");
+        fs::write(
+            &probe,
+            "#!/bin/sh\nprintf 'secret=%s target=%s' \"${CODEWHALE_TEST_CARGO_SECRET-unset}\" \"${CARGO_TARGET_DIR-unset}\"\n",
+        )
+        .expect("write probe");
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).expect("chmod probe");
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        let _path = EnvVarGuard::set("PATH", std::env::join_paths(paths).expect("join PATH"));
+        let _secret = EnvVarGuard::set("CODEWHALE_TEST_CARGO_SECRET", "cargo-secret-value");
+        // Non-secret build configuration still reaches cargo.
+        let _target = EnvVarGuard::set("CARGO_TARGET_DIR", "/tmp/codewhale-fixture-target");
+        let workspace = tempdir().expect("workspace");
+
+        let ctx = ToolContext::new(workspace.path());
+        let run = run_cargo(
+            workspace.path(),
+            &["envprobe".to_string()],
+            &ctx,
+            RUN_TESTS_TIMEOUT,
+        )
+        .await
+        .expect("cargo runs");
+        assert!(!run.stopped);
+        let output = run.output;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.trim(),
+            "secret=unset target=/tmp/codewhale-fixture-target"
+        );
+    }
+
+    /// A run that hits the timeout is killed, tree and all, and still returns
+    /// what it wrote: the only evidence of which test hung.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_run_cargo_keeps_partial_output_and_kills_the_tree() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::os::unix::fs::PermissionsExt;
+        if !cargo_available() {
+            return;
+        }
+        let _env_lock = lock_test_env();
+        let bin = tempdir().expect("bin dir");
+        let probe = bin.path().join("cargo-hangprobe");
+        fs::write(
+            &probe,
+            "#!/bin/sh\necho 'test slow_case ... started'\nsleep 300 &\necho $! > hang.pid\nwait\n",
+        )
+        .expect("write probe");
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).expect("chmod probe");
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        let _path = EnvVarGuard::set("PATH", std::env::join_paths(paths).expect("join PATH"));
+        let workspace = tempdir().expect("workspace");
+        let pid_file = workspace.path().join("hang.pid");
+
+        let ctx = ToolContext::new(workspace.path());
+        let run = run_cargo(
+            workspace.path(),
+            &["hangprobe".to_string()],
+            &ctx,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("a timed-out run still returns its output");
+        assert!(run.stopped);
+        assert!(
+            String::from_utf8_lossy(&run.output.stdout).contains("test slow_case ... started"),
+            "{:?}",
+            run.output
+        );
+        let hung = crate::process_tree::read_pid_file(&pid_file, Duration::from_secs(5));
+        assert!(
+            crate::process_tree::wait_for_pid_exit(hung, Duration::from_secs(5)),
+            "the timed-out run's process is still running"
+        );
     }
 }

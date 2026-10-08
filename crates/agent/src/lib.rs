@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use codewhale_config::{ProviderKind, opencode_go_chat_model_id};
+use codewhale_config::{ProviderKind, opencode_go_model_id};
 use serde::{Deserialize, Serialize};
 
 /// High-level model family used for shared identity affordances across clients.
@@ -149,1295 +149,20 @@ pub struct ModelRegistry {
 /// Creates a registry pre-populated with all built-in models and their aliases.
 impl Default for ModelRegistry {
     fn default() -> Self {
-        let models = vec![
-            ModelInfo {
-                id: "deepseek-v4-pro".to_string(),
-                provider: ProviderKind::Deepseek,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Deepseek,
-                aliases: vec![
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                    "deepseek-r1".to_string(),
-                    "deepseek-v3".to_string(),
-                    "deepseek-v3.2".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-v4-flash-vision-exp".to_string(),
-                provider: ProviderKind::Deepseek,
-                aliases: vec![
-                    "flash-vision".to_string(),
-                    "deepseek-v4flashvisionexp".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/deepseek-v4-pro".to_string(),
-                provider: ProviderKind::NvidiaNim,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "nvidia-deepseek-v4-pro".to_string(),
-                    "nim-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/deepseek-v4-flash".to_string(),
-                provider: ProviderKind::NvidiaNim,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                    "nvidia-deepseek-v4-flash".to_string(),
-                    "nim-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-v4-pro".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["openai-compatible-deepseek-v4-pro".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["openai-compatible-deepseek-v4-flash".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // OpenAI public API models carried by the bundled catalog.
-            ModelInfo {
-                id: "gpt-5.3-codex".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["gpt53-codex".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gpt-5.5".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["openai-gpt-5.5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gpt-5.5-pro".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["openai-gpt-5.5-pro".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // OpenAI public API GPT-5.6 family.
-            ModelInfo {
-                id: "gpt-5.6".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["gpt56".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gpt-5.6-sol".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["gpt56-sol".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gpt-5.6-terra".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["gpt56-terra".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gpt-5.6-luna".to_string(),
-                provider: ProviderKind::Openai,
-                aliases: vec!["gpt56-luna".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Atlascloud,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "atlascloud-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/deepseek-v4-pro".to_string(),
-                provider: ProviderKind::Atlascloud,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "atlascloud-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-reasoner".to_string(),
-                provider: ProviderKind::WanjieArk,
-                aliases: vec![
-                    "wanjie-deepseek-reasoner".to_string(),
-                    "ark-wanjie-deepseek-reasoner".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "DeepSeek-V4-Pro".to_string(),
-                provider: ProviderKind::Volcengine,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "volcengine-deepseek-v4-pro".to_string(),
-                    "ark-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "DeepSeek-V4-Flash".to_string(),
-                provider: ProviderKind::Volcengine,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "volcengine-deepseek-v4-flash".to_string(),
-                    "ark-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "trinity-large-thinking".to_string(),
-                provider: ProviderKind::Arcee,
-                aliases: vec![
-                    "trinity".to_string(),
-                    "arcee-trinity".to_string(),
-                    "arcee-trinity-large-thinking".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "trinity-mini".to_string(),
-                provider: ProviderKind::Arcee,
-                aliases: vec!["arcee-trinity-mini".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-v4-pro".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "openrouter-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                    "openrouter-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-v4-pro".to_string(),
-                provider: ProviderKind::Orcarouter,
-                aliases: vec!["orcarouter-deepseek-v4-pro".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Orcarouter,
-                aliases: vec!["orcarouter-deepseek-v4-flash".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "orcarouter/auto".to_string(),
-                provider: ProviderKind::Orcarouter,
-                aliases: vec!["orcarouter-auto".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "arcee-ai/trinity-large-thinking".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "trinity".to_string(),
-                    "trinity-large-thinking".to_string(),
-                    "arcee-trinity-large-thinking".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "xiaomi/mimo-v2.5-pro".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "openrouter-mimo-v2.5-pro".to_string(),
-                    "openrouter-xiaomi-mimo-v2.5-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "xiaomi/mimo-v2.5".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "openrouter-mimo-v2.5".to_string(),
-                    "openrouter-xiaomi-mimo-v2.5".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "qwen/qwen3.6-flash".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["qwen3.6-flash".to_string(), "qwen-3.6-flash".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "qwen/qwen3.6-35b-a3b".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "qwen3.6-35b-a3b".to_string(),
-                    "qwen-3.6-35b-a3b".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "qwen/qwen3.6-max-preview".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "qwen3.6-max-preview".to_string(),
-                    "qwen-3.6-max-preview".to_string(),
-                    "qwen-max-preview".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "qwen/qwen3.6-27b".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["qwen3.6-27b".to_string(), "qwen-3.6-27b".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "qwen/qwen3.6-plus".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["qwen3.6-plus".to_string(), "qwen-3.6-plus".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "qwen/qwen3.7-plus".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["qwen3.7-plus".to_string(), "qwen-3.7-plus".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "moonshotai/kimi-k2.7-code".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "kimi-k2.7-code".to_string(),
-                    "openrouter-kimi-k2.7-code".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "moonshotai/kimi-k2.6".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["openrouter-kimi-k2.6".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "minimax/minimax-m3".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "minimax-m3".to_string(),
-                    "minimax-m-3".to_string(),
-                    "openrouter-minimax-m3".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "z-ai/glm-5.1".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["glm-5.1".to_string(), "zai-glm-5.1".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "z-ai/glm-5.2".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["glm-5.2".to_string(), "zai-glm-5.2".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // GLM-5.3 is live; capabilities still inherit from glm-5.2 until
-            // Z.ai publishes distinct 5.3 numbers. See
-            // crates/config/assets/models_dev.bundled.json
-            // `_meta.pending_release_metadata`.
-            ModelInfo {
-                id: "z-ai/glm-5.3".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["glm-5.3".to_string(), "zai-glm-5.3".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "z-ai/glm-5.3-flash".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["glm-5.3-flash".to_string(), "zai-glm-5.3-flash".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "z-ai/glm-5-turbo".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["glm-5-turbo".to_string(), "zai-glm-5-turbo".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "GLM-5.3".to_string(),
-                provider: ProviderKind::Zai,
-                aliases: vec![
-                    "glm-5.3".to_string(),
-                    "glm-5-3".to_string(),
-                    "zai-glm-5.3".to_string(),
-                    "zai-glm-5-3".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "GLM-5.3-Flash".to_string(),
-                provider: ProviderKind::Zai,
-                aliases: vec![
-                    "glm-5.3-flash".to_string(),
-                    "glm-5-3-flash".to_string(),
-                    "zai-glm-5.3-flash".to_string(),
-                    "zai-glm-5-3-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // The first Z.ai row is the provider default. Keep this ordering
-            // aligned with `DEFAULT_ZAI_MODEL` in codewhale-config.
-            ModelInfo {
-                id: "GLM-5.2".to_string(),
-                provider: ProviderKind::Zai,
-                aliases: vec![
-                    "glm-5.2".to_string(),
-                    "glm-5-2".to_string(),
-                    "zai-glm-5.2".to_string(),
-                    "zai-glm-5-2".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "GLM-5.1".to_string(),
-                provider: ProviderKind::Zai,
-                aliases: vec![
-                    "glm-5.1".to_string(),
-                    "glm-5-1".to_string(),
-                    "zai-glm-5.1".to_string(),
-                    "zai-glm-5-1".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "GLM-5-Turbo".to_string(),
-                provider: ProviderKind::Zai,
-                aliases: vec![
-                    "glm-5-turbo".to_string(),
-                    "glm-5turbo".to_string(),
-                    "zai-glm-5-turbo".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "tencent/hy3-preview".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "hy3-preview".to_string(),
-                    "tencent-hy3-preview".to_string(),
-                    "hy3".to_string(),
-                    "hunyuan".to_string(),
-                    "tencent-hunyuan".to_string(),
-                    "hunyuan-hy3".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "google/gemma-4-31b-it".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["gemma-4-31b".to_string(), "gemma-4-31b-it".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "google/gemma-4-26b-a4b-it".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "gemma-4-26b-a4b".to_string(),
-                    "gemma-4-26b-a4b-it".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "nemotron-3-nano-omni".to_string(),
-                    "nemotron-3-nano-omni-reasoning".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mimo-v2.5-pro".to_string(),
-                provider: ProviderKind::XiaomiMimo,
-                aliases: vec![
-                    "mimo".to_string(),
-                    "pro".to_string(),
-                    "xiaomi-mimo-v2.5-pro".to_string(),
-                    "xiaomi-mimo-v2-5-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mimo-v2.5".to_string(),
-                provider: ProviderKind::XiaomiMimo,
-                aliases: vec![
-                    "omni".to_string(),
-                    "mimo-omni".to_string(),
-                    "v2.5-omni".to_string(),
-                    "mimo-v2.5-omni".to_string(),
-                    "xiaomi-mimo-v2.5".to_string(),
-                    "xiaomi-mimo-v2.5-omni".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mimo-v2.5-asr".to_string(),
-                provider: ProviderKind::XiaomiMimo,
-                aliases: vec![
-                    "asr".to_string(),
-                    "speech-to-text".to_string(),
-                    "transcribe".to_string(),
-                ],
-                supports_tools: false,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "mimo-v2.5-tts".to_string(),
-                provider: ProviderKind::XiaomiMimo,
-                aliases: vec![
-                    "tts".to_string(),
-                    "speech".to_string(),
-                    "mimo-tts".to_string(),
-                ],
-                supports_tools: false,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "mimo-v2.5-tts-voicedesign".to_string(),
-                provider: ProviderKind::XiaomiMimo,
-                aliases: vec![
-                    "voicedesign".to_string(),
-                    "voice-design".to_string(),
-                    "mimo-voice-design".to_string(),
-                ],
-                supports_tools: false,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "mimo-v2.5-tts-voiceclone".to_string(),
-                provider: ProviderKind::XiaomiMimo,
-                aliases: vec![
-                    "voiceclone".to_string(),
-                    "voice-clone".to_string(),
-                    "mimo-voice-clone".to_string(),
-                ],
-                supports_tools: false,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "mimo-v2-tts".to_string(),
-                provider: ProviderKind::XiaomiMimo,
-                aliases: vec!["mimo-v2-speech".to_string()],
-                supports_tools: false,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-v4-pro".to_string(),
-                provider: ProviderKind::Novita,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "novita-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Novita,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                    "novita-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "accounts/fireworks/models/deepseek-v4-pro".to_string(),
-                provider: ProviderKind::Fireworks,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "fireworks-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
-                provider: ProviderKind::Siliconflow,
-                // `deepseek-reasoner` and `deepseek-r1` deliberately do NOT
-                // appear here. Every other provider maps both to V4-Flash, so
-                // listing them on a Pro row made one alias mean two tiers —
-                // and Pro costs ~3x Flash per input token. An alias must name
-                // one model everywhere or it is a silent substitution.
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "siliconflow-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
-                provider: ProviderKind::Siliconflow,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "deepseek-v3".to_string(),
-                    "siliconflow-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "trinity-large-preview".to_string(),
-                provider: ProviderKind::Arcee,
-                aliases: vec!["arcee-trinity-large-preview".to_string()],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "kimi-k2.7-code".to_string(),
-                provider: ProviderKind::Moonshot,
-                aliases: vec![
-                    "kimi".to_string(),
-                    "kimi-k2".to_string(),
-                    "kimi-k2.7".to_string(),
-                    "kimi-code".to_string(),
-                    "moonshot-kimi-k2.7-code".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "kimi-k2.6".to_string(),
-                provider: ProviderKind::Moonshot,
-                aliases: vec!["kimi-k2.6".to_string(), "moonshot-kimi-k2.6".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Moonshot ships K3 as two distinct products under one provider
-            // id, separated by endpoint (v0.9.1 kimi-k3 dogfood report):
-            //   * `kimi-k3` on the direct platform API (api.moonshot.ai/v1)
-            //   * `k3` on the Kimi Code coding-plan API (api.kimi.com/coding/v1)
-            // Both must be resolvable here or `--model kimi-k3` silently
-            // reports the provider default instead. The endpoint pairing is
-            // enforced separately by `validate_kimi_code_api_model_id`; keep
-            // the two ids in separate entries so neither one's alias set can
-            // launder a request onto the other product's route.
-            ModelInfo {
-                id: "kimi-k3".to_string(),
-                provider: ProviderKind::Moonshot,
-                aliases: vec!["moonshot-kimi-k3".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "k3".to_string(),
-                provider: ProviderKind::Moonshot,
-                aliases: vec!["kimi-code-k3".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
-                provider: ProviderKind::Sglang,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "sglang-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
-                provider: ProviderKind::Sglang,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                    "sglang-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
-                provider: ProviderKind::Vllm,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "vllm-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
-                provider: ProviderKind::Vllm,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                    "vllm-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Ollama,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gpt-oss:120b".to_string(),
-                provider: ProviderKind::OllamaCloud,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
-                provider: ProviderKind::Huggingface,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "hf-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
-                provider: ProviderKind::Huggingface,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                    "hf-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Together AI provider models
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
-                provider: ProviderKind::Together,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "together-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
-                provider: ProviderKind::Together,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "deepseek-chat".to_string(),
-                    "together-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                // Together's published hosted endpoint is lowercase even though
-                // the open-weight Hugging Face repository uses `Inkling`.
-                id: "thinkingmachines/inkling".to_string(),
-                provider: ProviderKind::Together,
-                aliases: vec!["inkling".to_string(), "together-inkling".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Qwen 3.7 Max (OpenRouter)
-            ModelInfo {
-                id: "qwen/qwen3.7-max".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec!["qwen3.7-max".to_string(), "qwen-3.7-max".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // OpenAI Codex (ChatGPT OAuth) models
-            ModelInfo {
-                id: "gpt-5.5".to_string(),
-                provider: ProviderKind::OpenaiCodex,
-                aliases: vec!["codex-gpt-5.5".to_string(), "chatgpt-gpt-5.5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Anthropic native Messages API models (#3014)
-            ModelInfo {
-                id: "claude-opus-4-8".to_string(),
-                provider: ProviderKind::Anthropic,
-                aliases: vec!["opus".to_string(), "claude-opus".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Claude Opus 5 (GA 2026-07-24; API id/alias `claude-opus-5`, 1M
-            // context / 128K output per
-            // https://platform.claude.com/docs/en/about-claude/models/overview).
-            ModelInfo {
-                id: "claude-opus-5".to_string(),
-                provider: ProviderKind::Anthropic,
-                aliases: vec!["opus-5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "claude-sonnet-4-6".to_string(),
-                provider: ProviderKind::Anthropic,
-                aliases: vec!["sonnet".to_string(), "claude-sonnet".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "claude-haiku-4-5".to_string(),
-                provider: ProviderKind::Anthropic,
-                aliases: vec!["haiku".to_string(), "claude-haiku".to_string()],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "claude-sonnet-5".to_string(),
-                provider: ProviderKind::Anthropic,
-                aliases: vec!["sonnet-5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "claude-fable-5".to_string(),
-                provider: ProviderKind::Anthropic,
-                aliases: vec!["fable".to_string(), "fable-5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // OpenModel Anthropic-compatible Messages route
-            ModelInfo {
-                id: "deepseek-v4-flash".to_string(),
-                provider: ProviderKind::Openmodel,
-                aliases: vec!["openmodel".to_string(), "openmodel-deepseek".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // MiniMax 2.7 (OpenRouter)
-            ModelInfo {
-                id: "minimax/minimax-m2.7".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "minimax-2.7".to_string(),
-                    "minimax-2-7".to_string(),
-                    "openrouter-minimax-2.7".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "step-3.7-flash".to_string(),
-                provider: ProviderKind::Stepfun,
-                aliases: vec!["stepfun".to_string(), "stepflash".to_string()],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "MiniMax-M3".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec![
-                    "minimax".to_string(),
-                    "minimax-m3".to_string(),
-                    "minimax-m-3".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2.7".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec![
-                    "minimax-m2.7".to_string(),
-                    "minimax-m2-7".to_string(),
-                    "minimax-m-2.7".to_string(),
-                    "minimax-m-2-7".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M3".to_string(),
-                provider: ProviderKind::MinimaxAnthropic,
-                aliases: vec![
-                    "minimax-anthropic".to_string(),
-                    "minimax-anthropic-m3".to_string(),
-                    "minimax-m3".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2.7".to_string(),
-                provider: ProviderKind::MinimaxAnthropic,
-                aliases: vec![
-                    "minimax-anthropic-m2.7".to_string(),
-                    "minimax-anthropic-m2-7".to_string(),
-                    "minimax-m2.7".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2.7-highspeed".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec![
-                    "minimax-m2.7-highspeed".to_string(),
-                    "minimax-m2-7-highspeed".to_string(),
-                    "minimax-m-2.7-highspeed".to_string(),
-                    "minimax-m-2-7-highspeed".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2.5".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec![
-                    "minimax-m2.5".to_string(),
-                    "minimax-m2-5".to_string(),
-                    "minimax-m-2.5".to_string(),
-                    "minimax-m-2-5".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2.5-highspeed".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec![
-                    "minimax-m2.5-highspeed".to_string(),
-                    "minimax-m2-5-highspeed".to_string(),
-                    "minimax-m-2.5-highspeed".to_string(),
-                    "minimax-m-2-5-highspeed".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2.1".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec![
-                    "minimax-m2.1".to_string(),
-                    "minimax-m2-1".to_string(),
-                    "minimax-m-2.1".to_string(),
-                    "minimax-m-2-1".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2.1-highspeed".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec![
-                    "minimax-m2.1-highspeed".to_string(),
-                    "minimax-m2-1-highspeed".to_string(),
-                    "minimax-m-2.1-highspeed".to_string(),
-                    "minimax-m-2-1-highspeed".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "MiniMax-M2".to_string(),
-                provider: ProviderKind::Minimax,
-                aliases: vec!["minimax-m2".to_string(), "minimax-m-2".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // NVIDIA Nemotron 3 Ultra (OpenRouter)
-            ModelInfo {
-                id: "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
-                provider: ProviderKind::Openrouter,
-                aliases: vec![
-                    "nvidia/nemotron-3-ultra".to_string(),
-                    "nemotron-3-ultra".to_string(),
-                    "nemotron-3-ultra-550b-a55b".to_string(),
-                    "nvidia-nemotron-3-ultra".to_string(),
-                    "nvidia-nemotron-3-ultra-550b-a55b".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // DeepInfra (https://deepinfra.com)
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
-                provider: ProviderKind::Deepinfra,
-                aliases: vec![
-                    "deepseek-v4-pro".to_string(),
-                    "di-deepseek-v4-pro".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
-                provider: ProviderKind::Deepinfra,
-                aliases: vec![
-                    "deepseek-v4-flash".to_string(),
-                    "di-deepseek-v4-flash".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Sakana AI Fugu (https://api.sakana.ai)
-            ModelInfo {
-                id: "fugu".to_string(),
-                provider: ProviderKind::Sakana,
-                aliases: vec!["sakana-fugu".to_string(), "sakana/fugu".to_string()],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "fugu-ultra-20260615".to_string(),
-                provider: ProviderKind::Sakana,
-                aliases: vec!["fugu-ultra".to_string(), "sakana-fugu-ultra".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Meituan LongCat (https://longcat.chat/platform)
-            ModelInfo {
-                id: "LongCat-2.0".to_string(),
-                provider: ProviderKind::LongCat,
-                aliases: vec!["longcat".to_string(), "longcat-2.0".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // OpenCode Go Chat Completions models (https://opencode.ai/docs/go/).
-            // Go models documented only on `/messages` are intentionally not
-            // advertised by this OpenAI-compatible provider slice.
-            ModelInfo {
-                id: "deepseek-v4-pro".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/deepseek-v4-pro".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "grok-4.5".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/grok-4.5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // No glm-5.3 row (2026-08-03): OpenCode Go publishes no glm-5.3
-            // model. The Z.ai/OpenRouter glm-5.3 rows inherit glm-5.2 metadata;
-            // that inheritance is not evidence this gateway serves it.
-            ModelInfo {
-                id: "glm-5.2".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/glm-5.2".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "glm-5.1".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/glm-5.1".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "kimi-k3".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/kimi-k3".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "kimi-k2.7-code".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/kimi-k2.7-code".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "kimi-k2.6".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/kimi-k2.6".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "deepseek-v4-flash".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/deepseek-v4-flash".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mimo-v2.5".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/mimo-v2.5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mimo-v2.5-pro".to_string(),
-                provider: ProviderKind::OpencodeGo,
-                aliases: vec!["opencode-go/mimo-v2.5-pro".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Meta Model API / Muse Spark. Keep these in step with
-            // `DEFAULT_META_MODEL` in config's provider_defaults and with the
-            // bundled models.dev catalog: this registry resolves the `muse`
-            // aliases for the CLI and app-server, so a stale id here silently
-            // routes them somewhere the configured default never points.
-            ModelInfo {
-                id: "muse-spark-1.2".to_string(),
-                provider: ProviderKind::Meta,
-                aliases: vec!["muse-spark".to_string(), "muse".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "muse-spark-1.2-contributor".to_string(),
-                provider: ProviderKind::Meta,
-                aliases: vec!["muse-spark-contributor".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // xAI / Grok (https://api.x.ai/v1)
-            ModelInfo {
-                id: "grok-4.6".to_string(),
-                provider: ProviderKind::Xai,
-                aliases: vec!["grok".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "grok-4.5".to_string(),
-                provider: ProviderKind::Xai,
-                aliases: vec!["xai-grok-4.5".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "grok-4.3".to_string(),
-                provider: ProviderKind::Xai,
-                aliases: vec!["xai-grok-4.3".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "grok-build".to_string(),
-                provider: ProviderKind::Xai,
-                aliases: vec!["xai-grok-build".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "grok-composer-2.5-fast".to_string(),
-                provider: ProviderKind::Xai,
-                aliases: vec!["xai-grok-composer".to_string()],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "grok-4.20-0309-reasoning".to_string(),
-                provider: ProviderKind::Xai,
-                aliases: vec!["xai-grok-reasoning".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "grok-4.20-0309-non-reasoning".to_string(),
-                provider: ProviderKind::Xai,
-                aliases: vec!["xai-grok-fast".to_string()],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "gemini-3.1-pro-preview".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec!["gemini-3.1-pro".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gemini-3-pro-preview".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec!["gemini-3-pro".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            // Gemini 3.7 Flash (2026-08 latest Flash; 1,048,576 in / 65,536 out,
-            // https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash).
-            ModelInfo {
-                id: "gemini-3.7-flash".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gemini-3.6-flash".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gemini-3.5-flash".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gemini-3.5-flash-lite".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "gemini-2.5-pro".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "gemini-2.5-flash".to_string(),
-                provider: ProviderKind::Google,
-                aliases: vec![],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mistral-code-latest".to_string(),
-                provider: ProviderKind::Mistral,
-                aliases: vec![
-                    "codestral".to_string(),
-                    "codestral-latest".to_string(),
-                    "mistral-code".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-            ModelInfo {
-                id: "mistral-medium-latest".to_string(),
-                provider: ProviderKind::Mistral,
-                aliases: vec![
-                    "mistral-medium".to_string(),
-                    "mistral-medium-3-5".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mistral-small-latest".to_string(),
-                provider: ProviderKind::Mistral,
-                aliases: vec![
-                    "mistral-small".to_string(),
-                    "mistral-small-2603".to_string(),
-                ],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "magistral-small-latest".to_string(),
-                provider: ProviderKind::Mistral,
-                aliases: vec!["magistral".to_string(), "magistral-small".to_string()],
-                supports_tools: true,
-                supports_reasoning: true,
-            },
-            ModelInfo {
-                id: "mistral-large-latest".to_string(),
-                provider: ProviderKind::Mistral,
-                aliases: vec!["mistral-large".to_string()],
-                supports_tools: true,
-                supports_reasoning: false,
-            },
-        ];
-        Self::new(models)
+        Self::new(
+            codewhale_config::catalog::reviewed::bundled_reviewed()
+                .selections
+                .iter()
+                .map(|row| ModelInfo {
+                    id: row.id.clone(),
+                    provider: ProviderKind::parse_config_identity(&row.provider)
+                        .expect("validated bundled provider selector"),
+                    aliases: row.aliases.clone(),
+                    supports_tools: row.supports_tools,
+                    supports_reasoning: row.supports_reasoning,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -1522,13 +247,10 @@ impl ModelRegistry {
                     fallback_chain,
                 });
             }
-            // OpenCode Go's catalog spans Chat Completions and Anthropic
-            // Messages, while Codewhale's provider slice intentionally speaks
-            // Chat only. Resolve a hinted Go model through the shared Chat
-            // allowlist and never fall through to a same-named global alias on
-            // OpenRouter or MiniMax.
+            // Resolve within Go's roster without falling through to a same-named
+            // model on another provider.
             if provider_hint == Some(ProviderKind::OpencodeGo)
-                && let Some(canonical) = opencode_go_chat_model_id(name)
+                && let Some(canonical) = opencode_go_model_id(name)
                 && let Some(model) = self
                     .models
                     .iter()
@@ -1590,6 +312,22 @@ impl ModelRegistry {
                     fallback_chain,
                 });
             }
+            // A provider's own declared default is available from that
+            // provider by definition — the descriptor owns that fact (#6443:
+            // `deepseek-flash` is the Deepseek default and resolved nowhere).
+            // Registry rows canonicalize aliases and carry capability
+            // metadata; they must not gate the name the provider declares.
+            let declared_default = provider.provider().default_model();
+            if !declared_default.trim().is_empty()
+                && name.trim().eq_ignore_ascii_case(declared_default.trim())
+            {
+                return Ok(ModelResolution {
+                    requested: Some(name.to_string()),
+                    resolved: Self::descriptor_default_model(provider, declared_default),
+                    used_fallback: false,
+                    fallback_chain,
+                });
+            }
             if !self.models.iter().any(|model| model.provider == provider) {
                 return Err(ModelResolutionError::ProviderHasNoModels {
                     provider,
@@ -1603,12 +341,6 @@ impl ModelRegistry {
         }
 
         fallback_chain.push(format!("provider_default:{}", provider.as_str()));
-        if !self.models.iter().any(|model| model.provider == provider) {
-            return Err(ModelResolutionError::ProviderHasNoModels {
-                provider,
-                requested: None,
-            });
-        }
         let default_model = provider.provider().default_model();
         if let Some(model) = self
             .models
@@ -1623,11 +355,44 @@ impl ModelRegistry {
                 fallback_chain,
             });
         }
+        // Same rule as the explicit branch: the descriptor's declared default
+        // resolves for its own provider even without a registry row (#6443).
+        // Ollama is the exception: its descriptor default is the placeholder
+        // `unknown`, and the real default comes from the live local catalog
+        // (Y-2), so a placeholder must never resolve as a model.
+        if !default_model.trim().is_empty() && provider != ProviderKind::Ollama {
+            return Ok(ModelResolution {
+                requested: None,
+                resolved: Self::descriptor_default_model(provider, default_model),
+                used_fallback: true,
+                fallback_chain,
+            });
+        }
+        if !self.models.iter().any(|model| model.provider == provider) {
+            return Err(ModelResolutionError::ProviderHasNoModels {
+                provider,
+                requested: None,
+            });
+        }
 
         Err(ModelResolutionError::ProviderDefaultUnavailable {
             provider,
             default_model: default_model.to_string(),
         })
+    }
+
+    /// The [`ModelInfo`] a provider's declared default resolves to when the
+    /// registry carries no explicit row for it. The descriptor owns the
+    /// identity; capability metadata stays conservative rather than
+    /// fabricating a capability the registry never recorded.
+    fn descriptor_default_model(provider: ProviderKind, id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.trim().to_string(),
+            provider,
+            aliases: Vec::new(),
+            supports_tools: true,
+            supports_reasoning: false,
+        }
     }
 }
 
@@ -1874,7 +639,10 @@ mod tests {
         let resolved = registry.resolve_ok(None, Some(ProviderKind::Deepseek));
 
         assert_eq!(resolved.resolved.provider, ProviderKind::Deepseek);
-        assert_eq!(resolved.resolved.id, "deepseek-v4-pro");
+        // The descriptor's declared default, not the first cloud row: the
+        // registry's Deepseek rows start at v4-pro, and borrowing that here is
+        // exactly the mismatch #6443 fixed.
+        assert_eq!(resolved.resolved.id, "deepseek-flash");
         assert!(resolved.used_fallback);
         assert_eq!(resolved.fallback_chain, ["provider_default:deepseek"]);
     }
@@ -1894,7 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_provider_default_row_fails_instead_of_borrowing_another_model() {
+    fn provider_default_without_a_registry_row_resolves_to_its_own_id() {
+        // SHA-6443: the descriptor owns its declared default. A registry that
+        // carries unrelated rows must still resolve the provider's own
+        // default — and must never borrow another provider's model.
         let registry = ModelRegistry::new(vec![ModelInfo {
             id: "not-the-openai-default".to_string(),
             provider: ProviderKind::Openai,
@@ -1903,16 +674,12 @@ mod tests {
             supports_reasoning: true,
         }]);
 
-        let error = registry
+        let resolved = registry
             .resolve(None, Some(ProviderKind::Openai))
-            .expect_err("a missing provider default must fail closed");
-        assert_eq!(
-            error,
-            ModelResolutionError::ProviderDefaultUnavailable {
-                provider: ProviderKind::Openai,
-                default_model: "gpt-5.6".to_string(),
-            }
-        );
+            .expect("the provider's declared default resolves for that provider");
+        assert_eq!(resolved.resolved.id, "gpt-5.6");
+        assert_eq!(resolved.resolved.provider, ProviderKind::Openai);
+        assert!(resolved.used_fallback);
     }
 
     #[test]
@@ -2382,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_lists_only_current_chat_completions_models() {
+    fn opencode_go_lists_documented_models_without_inventing_capabilities() {
         let registry = ModelRegistry::default();
         let listed = registry.list();
         let models: Vec<&str> = listed
@@ -2391,51 +1158,77 @@ mod tests {
             .map(|model| model.id.as_str())
             .collect();
 
+        // Literal expectations independently catch an incomplete shared roster
+        // and prevent new compatibility entries from claiming capabilities.
+        let expected = [
+            ("deepseek-v4-pro", true),
+            ("grok-4.5", true),
+            ("glm-5.2", true),
+            ("glm-5.1", true),
+            ("kimi-k3", true),
+            ("kimi-k2.7-code", true),
+            ("kimi-k2.6", true),
+            ("deepseek-v4-flash", true),
+            ("mimo-v2.5", true),
+            ("mimo-v2.5-pro", true),
+            ("glm-5.3-flash", false),
+            ("glm-5.3", false),
+            ("longcat-2.0", false),
+            ("deepseek-v4-flash-vision-exp", false),
+            ("hy4-preview", false),
+            ("hy3", false),
+            ("omen-alpha", false),
+            ("deepseek-v4.1-flash", false),
+            ("grok-4.6", false),
+            ("gpt-5.6-luna", false),
+            ("muse-spark-1.3-contributor", false),
+            ("muse-spark-1.2-contributor", false),
+            ("minimax-m3", false),
+            ("minimax-m2.7", false),
+            ("minimax-m2.5", false),
+            ("qwen3.8-max", false),
+            ("qwen3.8-flash", false),
+            ("qwen3.7-max", false),
+            ("qwen3.7-plus", false),
+            ("qwen3.6-plus", false),
+        ];
         assert_eq!(
             models,
-            vec![
-                "deepseek-v4-pro",
-                "grok-4.5",
-                "glm-5.2",
-                "glm-5.1",
-                "kimi-k3",
-                "kimi-k2.7-code",
-                "kimi-k2.6",
-                "deepseek-v4-flash",
-                "mimo-v2.5",
-                "mimo-v2.5-pro",
-            ]
+            expected.iter().map(|(id, _)| *id).collect::<Vec<_>>()
         );
 
         let default = registry.resolve_ok(None, Some(ProviderKind::OpencodeGo));
         assert_eq!(default.resolved.provider, ProviderKind::OpencodeGo);
         assert_eq!(default.resolved.id, "deepseek-v4-pro");
 
-        for model in ["grok-4.5", "kimi-k3"] {
+        for (model, expected_capabilities) in expected {
             for requested in [model.to_string(), format!("opencode-go/{model}")] {
                 let resolved =
                     registry.resolve_ok(Some(&requested), Some(ProviderKind::OpencodeGo));
                 assert_eq!(resolved.resolved.provider, ProviderKind::OpencodeGo);
                 assert_eq!(resolved.resolved.id, model);
                 assert!(!resolved.used_fallback);
+                assert_eq!(
+                    resolved.resolved.aliases,
+                    vec![format!("opencode-go/{model}")],
+                    "{requested}"
+                );
+                assert_eq!(
+                    resolved.resolved.supports_tools, expected_capabilities,
+                    "{requested} tool support"
+                );
+                assert_eq!(
+                    resolved.resolved.supports_reasoning, expected_capabilities,
+                    "{requested} reasoning support"
+                );
             }
         }
 
-        for messages_only in [
-            "minimax-m3",
-            "minimax-m2.7",
-            "minimax-m2.5",
-            "qwen3.7-max",
-            "qwen3.7-plus",
-            "qwen3.6-plus",
-        ] {
-            for requested in [
-                messages_only.to_string(),
-                format!("opencode-go/{messages_only}"),
-            ] {
+        for non_chat in ["claude-unproven", "unknown-model", "gpt-unlisted"] {
+            for requested in [non_chat.to_string(), format!("opencode-go/{non_chat}")] {
                 let rejected = registry
                     .resolve(Some(&requested), Some(ProviderKind::OpencodeGo))
-                    .expect_err("Messages-only id must not fall back on the Chat-only route");
+                    .expect_err("unknown Go id must not fall back to another provider");
                 assert_eq!(
                     rejected,
                     ModelResolutionError::ModelNotAvailableForProvider {
@@ -2823,5 +1616,28 @@ mod tests {
             ModelFamily::Inferencer
         );
         assert_eq!(model_family(""), ModelFamily::Inferencer);
+    }
+
+    /// SHA-6443: a provider's declared default must be a model its own
+    /// registry can resolve. A default the registry rejects fails a test
+    /// here, not a founder's `model resolve`.
+    #[test]
+    fn every_provider_default_resolves_for_its_own_provider() {
+        let registry = ModelRegistry::default();
+        let mut failures = Vec::new();
+        for kind in ProviderKind::all() {
+            let default = kind.provider().default_model();
+            if default.trim().is_empty() {
+                continue;
+            }
+            if let Err(error) = registry.resolve(Some(default), Some(*kind)) {
+                failures.push(format!("{} ({kind:?}): {error}", default));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "provider defaults must resolve for their own provider:\n{}",
+            failures.join("\n")
+        );
     }
 }

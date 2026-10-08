@@ -4,7 +4,7 @@
 //! like a to-do or a sub-agent — a view is a subset of one row grammar, not
 //! a second widget system.
 
-use crate::tui::agent_roster::format_tokens;
+use crate::agent_roster::format_tokens;
 use crate::tui::app::{App, SidebarRowAction};
 
 use super::model::{RailPanel, WorkRow, WorkRowId, WorkTone};
@@ -18,20 +18,138 @@ pub(super) const fn view_always_has_content(panel: RailPanel) -> bool {
     )
 }
 
-pub(super) fn files_touched_count(_app: &mut App) -> usize {
-    0
+/// Files this session edited or read, even before TASKS has been projected.
+pub(super) fn files_touched_count(app: &mut App) -> usize {
+    app.work_surface.file_activity = super::model::settled_file_activity(app);
+    let activity = &app.work_surface.file_activity;
+    edited_files(activity).len() + activity.read.len()
 }
 
-pub(super) fn notepad_has_text(_app: &App) -> bool {
-    false
+pub(super) fn notepad_has_text(app: &App) -> bool {
+    !app.workspace_notes.is_empty()
 }
 
-pub(super) fn files_rows(_app: &mut App) -> Vec<WorkRow> {
-    Vec::new()
+/// Each edited file once, newest receipt last. Direct writes without a
+/// mutation receipt have no diff to inspect.
+fn edited_files(
+    activity: &super::model::SettledFileActivity,
+) -> Vec<(String, Option<&crate::tui::history::FileMutationReceipt>)> {
+    let mut files = Vec::new();
+    for path in &activity.write {
+        if !files.iter().any(|(existing, _)| existing == path) {
+            files.push((path.clone(), None));
+        }
+    }
+    for receipt in &activity.mutations {
+        for file in &receipt.files {
+            files.retain(|(path, _)| path != &file.path);
+            files.push((file.path.clone(), Some(receipt)));
+        }
+    }
+    files
 }
 
-pub(super) fn notepad_rows(_app: &mut App) -> Vec<WorkRow> {
-    Vec::new()
+/// The FILES view: what this session changed (with each change's size and
+/// its evidence one Enter away), then what it read (#6565).
+pub(super) fn files_rows(app: &mut App) -> Vec<WorkRow> {
+    app.work_surface.file_activity = super::model::settled_file_activity(app);
+    let activity = app.work_surface.file_activity.clone();
+    let mut out = Vec::new();
+    let edited = edited_files(&activity);
+    if !edited.is_empty() {
+        out.push(heading("files:edited", format!("Edited {}", edited.len())));
+        for (path, receipt) in &edited {
+            let Some(receipt) = receipt else {
+                out.push(WorkRow {
+                    mark: "✎",
+                    tone: WorkTone::Success,
+                    ..note_row(&format!("files:edit:{path}"), path)
+                });
+                continue;
+            };
+            let across = if receipt.files.len() > 1 {
+                format!(" across {} files", receipt.files.len())
+            } else {
+                String::new()
+            };
+            out.push(WorkRow {
+                id: WorkRowId(format!("files:edit:{path}")),
+                mark: "✎",
+                label: path.clone(),
+                detail: format!("+{} −{}{across}", receipt.added, receipt.deleted),
+                tone: WorkTone::Success,
+                selectable: true,
+                primary_action: Some(SidebarRowAction::InspectWork {
+                    title: format!("File · {path}"),
+                    body: super::model::settled_mutation_body(
+                        std::slice::from_ref(*receipt),
+                        activity.inline_diff_mode,
+                    ),
+                    stop_action: None,
+                }),
+                agent: None,
+            });
+        }
+    }
+    if !activity.read.is_empty() {
+        out.push(heading(
+            "files:read",
+            format!("Read {}", activity.read.len()),
+        ));
+        for path in &activity.read {
+            out.push(WorkRow {
+                id: WorkRowId(format!("files:read:{path}")),
+                mark: "·",
+                label: path.clone(),
+                detail: String::new(),
+                tone: WorkTone::Muted,
+                selectable: false,
+                primary_action: None,
+                agent: None,
+            });
+        }
+    }
+    app.work_surface.latest_rows = out.clone();
+    out
+}
+
+/// The NOTES view: the workspace notes `/note` keeps, one row each; Enter
+/// shows the whole note.
+pub(super) fn notepad_rows(app: &mut App) -> Vec<WorkRow> {
+    let out = app
+        .workspace_notes
+        .iter()
+        .enumerate()
+        .map(|(index, note)| {
+            let number = index + 1;
+            let first_line = note.lines().map(str::trim).find(|line| !line.is_empty());
+            WorkRow {
+                id: WorkRowId(format!("notes:{number}")),
+                mark: "▪",
+                label: crate::agent_roster::one_line(first_line.unwrap_or_default()),
+                detail: format!("/note show {number}"),
+                tone: WorkTone::Live,
+                selectable: true,
+                primary_action: Some(SidebarRowAction::Command(format!("/note show {number}"))),
+                agent: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    app.work_surface.latest_rows = out.clone();
+    out
+}
+
+fn heading(id: &str, label: String) -> WorkRow {
+    WorkRow {
+        id: WorkRowId(id.to_string()),
+        mark: "▾",
+        label,
+        detail: String::new(),
+        tone: WorkTone::Heading,
+        selectable: false,
+        primary_action: None,
+        agent: None,
+    }
 }
 
 /// The context view: the budget, not a fact list. Used/limit and the
@@ -165,9 +283,9 @@ fn message_split(app: &App) -> (u64, u64, usize) {
             && message.content.iter().all(|block| {
                 matches!(
                     block,
-                    crate::models::ContentBlock::ToolResult { .. }
-                        | crate::models::ContentBlock::ToolSearchToolResult { .. }
-                        | crate::models::ContentBlock::CodeExecutionToolResult { .. }
+                    codewhale_models::ContentBlock::ToolResult { .. }
+                        | codewhale_models::ContentBlock::ToolSearchToolResult { .. }
+                        | codewhale_models::ContentBlock::CodeExecutionToolResult { .. }
                 )
             });
         if all_tool_results {
@@ -179,8 +297,162 @@ fn message_split(app: &App) -> (u64, u64, usize) {
     (conversation, tool_output, app.api_messages.len())
 }
 
-pub(super) fn git_rows(_app: &mut App) -> Vec<WorkRow> {
-    Vec::new()
+/// The GIT view, from the cached repository probe (never git on the render
+/// path): the branch and where it stands against its upstream, the changes
+/// with their paths one Enter away, linked worktrees, and the last commits.
+/// Before the first probe it says so; "not a git repository" only when the
+/// probe found none, and a git failure is named (#6565).
+pub(super) fn git_rows(app: &mut App) -> Vec<WorkRow> {
+    let out = git_rows_for(&crate::tui::git_status::cached_status(), &app.workspace);
+    app.work_surface.latest_rows = out.clone();
+    out
+}
+
+fn git_rows_for(
+    snap: &crate::tui::git_status::GitStatusSnapshot,
+    workspace: &std::path::Path,
+) -> Vec<WorkRow> {
+    let probed_here = snap.probed_workspace.as_deref() == Some(workspace);
+    if !probed_here || snap.fetched_at.is_none() {
+        vec![note_row("git:state", "reading git status…")]
+    } else if let Some(error) = snap.error.as_deref() {
+        vec![note_row("git:state", error)]
+    } else {
+        git_state_rows(snap)
+    }
+}
+
+fn note_row(id: &str, text: &str) -> WorkRow {
+    WorkRow {
+        id: WorkRowId(id.to_string()),
+        mark: "·",
+        label: text.to_string(),
+        detail: String::new(),
+        tone: WorkTone::Muted,
+        selectable: false,
+        primary_action: None,
+        agent: None,
+    }
+}
+
+fn git_state_rows(snap: &crate::tui::git_status::GitStatusSnapshot) -> Vec<WorkRow> {
+    let mut out = Vec::new();
+    let branch = match (snap.branch.as_deref(), snap.detached) {
+        (Some(id), true) => format!("detached at {id}"),
+        (Some(branch), false) => branch.to_string(),
+        (None, _) => "no commits yet".to_string(),
+    };
+    let upstream = if snap.detached {
+        String::new()
+    } else if !snap.has_upstream {
+        " · no upstream".to_string()
+    } else if snap.ahead == 0 && snap.behind == 0 {
+        " · up to date".to_string()
+    } else {
+        format!(" · ↑{} ↓{}", snap.ahead, snap.behind)
+    };
+    let location = snap
+        .remote_slug
+        .clone()
+        .or_else(|| snap.repository_name.clone())
+        .unwrap_or_default();
+    out.push(WorkRow {
+        id: WorkRowId("git:branch".to_string()),
+        mark: "⎇",
+        label: format!("{branch}{upstream}"),
+        detail: location,
+        tone: WorkTone::Live,
+        selectable: true,
+        primary_action: Some(SidebarRowAction::Command("/diff".to_string())),
+        agent: None,
+    });
+    let changes = snap.changes.summary();
+    let body = if snap.changed_paths.is_empty() {
+        "Working tree clean.".to_string()
+    } else {
+        let listed = snap
+            .changed_paths
+            .iter()
+            .map(|path| format!("{} {}", path.code, path.path))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = if snap.changed_path_count > snap.changed_paths.len() {
+            "\n… and more; /diff for everything".to_string()
+        } else {
+            String::new()
+        };
+        format!("{listed}{tail}")
+    };
+    out.push(WorkRow {
+        id: WorkRowId("git:changes".to_string()),
+        mark: if snap.changes.conflicts > 0 {
+            "!"
+        } else {
+            "±"
+        },
+        label: changes,
+        detail: String::new(),
+        tone: if snap.changes.conflicts > 0 {
+            WorkTone::Attention
+        } else if snap.dirty {
+            WorkTone::Live
+        } else {
+            WorkTone::Muted
+        },
+        selectable: true,
+        primary_action: Some(SidebarRowAction::InspectWork {
+            title: "Git · changes".to_string(),
+            body,
+            stop_action: None,
+        }),
+        agent: None,
+    });
+    let linked: Vec<_> = snap
+        .worktrees
+        .iter()
+        .filter(|worktree| !worktree.bare && Some(&worktree.path) != snap.root.as_ref())
+        .collect();
+    if !linked.is_empty() {
+        out.push(heading(
+            "git:worktrees",
+            format!("Worktrees {}", linked.len()),
+        ));
+        for worktree in linked {
+            out.push(WorkRow {
+                id: WorkRowId(format!("git:worktree:{}", worktree.path.display())),
+                mark: "·",
+                label: worktree
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "detached".to_string()),
+                detail: format!(
+                    "{}{}",
+                    worktree.path.display(),
+                    if worktree.locked { " · locked" } else { "" }
+                ),
+                tone: WorkTone::Muted,
+                selectable: false,
+                primary_action: None,
+                agent: None,
+            });
+        }
+    }
+    if !snap.recent_commits.is_empty() {
+        out.push(heading("git:commits", "Recent commits".to_string()));
+        for commit in &snap.recent_commits {
+            out.push(WorkRow {
+                id: WorkRowId(format!("git:commit:{}", commit.hash)),
+                mark: "·",
+                label: format!("{} {}", commit.hash, commit.subject),
+                detail: commit.when.clone(),
+                tone: WorkTone::Muted,
+                selectable: false,
+                primary_action: None,
+                agent: None,
+            });
+        }
+    }
+    out
 }
 
 /// The price view. One number everywhere: the session total is the same
@@ -200,7 +472,7 @@ pub(super) fn price_rows(app: &mut App) -> Vec<WorkRow> {
         primary_action: Some(SidebarRowAction::Command("/cost".to_string())),
         agent: None,
     });
-    let roster = app.agent_roster.clone();
+    let roster = app.current_agent_roster().to_vec();
     let priced: Vec<_> = roster
         .iter()
         .filter(|row| row.cost_microusd.is_some())
@@ -239,12 +511,12 @@ pub(super) fn price_rows(app: &mut App) -> Vec<WorkRow> {
             });
         }
     }
-    let metrics = crate::tui::session_metrics::snapshot_from_app(app);
-    if let Some(pct) = metrics.cache_hit_percent {
+    let rates = crate::tui::session_metrics::cache_rates(app);
+    if let Some(rates) = rates.labelled("parent", "agents", "combined") {
         out.push(WorkRow {
             id: WorkRowId("price:cache".to_string()),
             mark: "·",
-            label: format!("cache hit · {pct}%"),
+            label: format!("cache hit · {rates}"),
             detail: "/cache for per-turn cache telemetry".to_string(),
             tone: WorkTone::Muted,
             selectable: true,
@@ -270,4 +542,353 @@ pub(super) fn price_rows(app: &mut App) -> Vec<WorkRow> {
     }
     app.work_surface.latest_rows = out.clone();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::git_status::{
+        ChangeCounts, ChangedPath, GitStatusSnapshot, RecentCommit, WorktreeEntry,
+    };
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    fn app() -> App {
+        crate::tui::app::App::new(
+            crate::test_support::test_tui_options(PathBuf::from("/repo")),
+            &crate::config::Config::default(),
+        )
+    }
+
+    #[test]
+    fn the_git_view_names_its_state_honestly() {
+        let workspace = Path::new("/repo");
+        // Before the first probe for this workspace.
+        let rows = git_rows_for(&GitStatusSnapshot::default(), workspace);
+        assert_eq!(rows[0].label, "reading git status…");
+        let other = GitStatusSnapshot {
+            probed_workspace: Some(PathBuf::from("/elsewhere")),
+            fetched_at: Some(Instant::now()),
+            ..GitStatusSnapshot::default()
+        };
+        assert_eq!(
+            git_rows_for(&other, workspace)[0].label,
+            "reading git status…"
+        );
+        // Only a probe that found no repository says so.
+        let outside = GitStatusSnapshot {
+            probed_workspace: Some(workspace.to_path_buf()),
+            fetched_at: Some(Instant::now()),
+            error: Some("not a git repository".to_string()),
+            ..GitStatusSnapshot::default()
+        };
+        assert_eq!(
+            git_rows_for(&outside, workspace)[0].label,
+            "not a git repository"
+        );
+        let broken = GitStatusSnapshot {
+            error: Some("git unavailable: No such file".to_string()),
+            ..outside
+        };
+        assert_eq!(
+            git_rows_for(&broken, workspace)[0].label,
+            "git unavailable: No such file"
+        );
+    }
+
+    #[test]
+    fn the_git_view_shows_branch_changes_worktrees_and_commits() {
+        let workspace = Path::new("/repo");
+        let snap = GitStatusSnapshot {
+            probed_workspace: Some(workspace.to_path_buf()),
+            fetched_at: Some(Instant::now()),
+            root: Some(PathBuf::from("/repo")),
+            repository_name: Some("repo".to_string()),
+            remote_slug: Some("owner/repo".to_string()),
+            branch: Some("main".to_string()),
+            has_upstream: true,
+            ahead: 2,
+            behind: 1,
+            dirty: true,
+            changes: ChangeCounts {
+                staged: 1,
+                modified: 1,
+                untracked: 0,
+                conflicts: 0,
+            },
+            changed_path_count: 2,
+            changed_paths: vec![
+                ChangedPath {
+                    code: "M ".to_string(),
+                    path: "src/lib.rs".to_string(),
+                },
+                ChangedPath {
+                    code: " M".to_string(),
+                    path: "README.md".to_string(),
+                },
+            ],
+            worktrees: vec![
+                WorktreeEntry {
+                    path: PathBuf::from("/repo"),
+                    branch: Some("main".to_string()),
+                    bare: false,
+                    locked: false,
+                },
+                WorktreeEntry {
+                    path: PathBuf::from("/repo/.cw-worktrees/agent-a"),
+                    branch: Some("agent-a".to_string()),
+                    bare: false,
+                    locked: true,
+                },
+            ],
+            recent_commits: vec![RecentCommit {
+                hash: "abc1234".to_string(),
+                subject: "fix: a thing".to_string(),
+                when: "3 hours ago".to_string(),
+            }],
+            ..GitStatusSnapshot::default()
+        };
+        let rows = git_rows_for(&snap, workspace);
+        let labels = rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "main · ↑2 ↓1",
+                "1 staged, 1 modified",
+                "Worktrees 1",
+                "agent-a",
+                "Recent commits",
+                "abc1234 fix: a thing",
+            ]
+        );
+        assert_eq!(rows[0].detail, "owner/repo");
+        let Some(SidebarRowAction::InspectWork { body, .. }) = rows[1].primary_action.as_ref()
+        else {
+            panic!("changes row opens its paths");
+        };
+        assert_eq!(body, "M  src/lib.rs\n M README.md");
+        assert!(
+            rows[3].detail.ends_with("agent-a · locked"),
+            "{}",
+            rows[3].detail
+        );
+
+        let no_upstream = GitStatusSnapshot {
+            has_upstream: false,
+            ..snap.clone()
+        };
+        assert_eq!(
+            git_rows_for(&no_upstream, workspace)[0].label,
+            "main · no upstream"
+        );
+        let detached = GitStatusSnapshot {
+            branch: Some("abc1234".to_string()),
+            detached: true,
+            ..snap
+        };
+        assert_eq!(
+            git_rows_for(&detached, workspace)[0].label,
+            "detached at abc1234"
+        );
+    }
+
+    #[test]
+    fn git_more_means_unlisted_paths() {
+        use crate::tui::git_status::{MAX_CHANGED_PATHS, parse_porcelain_v2};
+        for count in [1, MAX_CHANGED_PATHS, MAX_CHANGED_PATHS + 1] {
+            let mut raw = "# branch.head main\0".to_string();
+            for index in 0..count {
+                raw.push_str(&format!(
+                    "1 MM N... 100644 100644 100644 aaa bbb file-{index}\0"
+                ));
+            }
+            let status = parse_porcelain_v2(&raw).unwrap();
+            let rows = git_state_rows(&GitStatusSnapshot {
+                changes: status.changes,
+                changed_paths: status.changed_paths,
+                changed_path_count: status.changed_path_count,
+                ..GitStatusSnapshot::default()
+            });
+            let Some(SidebarRowAction::InspectWork { body, .. }) = &rows[1].primary_action else {
+                panic!("changes opens path details");
+            };
+            assert_eq!(
+                body.contains("and more"),
+                count > MAX_CHANGED_PATHS,
+                "{count}"
+            );
+        }
+    }
+
+    fn record_file(app: &mut App, id: &str, action: &str, path: &str, diff: Option<String>) {
+        use crate::tools::spec::ToolResult;
+        use crate::tui::tool_routing::{handle_tool_call_complete, handle_tool_call_started};
+        let input = serde_json::json!({"action": action, "path": path, "content": "new"});
+        handle_tool_call_started(app, id, "File", &input);
+        let mut result = ToolResult::success("ok");
+        if let Some(diff) = diff {
+            result = result.with_metadata(serde_json::json!({"mutation": {
+                "diff": diff, "files": [{"path": path, "outcome": "updated"}],
+            }}));
+        }
+        handle_tool_call_complete(app, id, "File", &Ok(result));
+        app.flush_active_cell();
+    }
+
+    #[test]
+    fn files_and_badge_follow_current_history_without_opening_tasks() {
+        for badge_first in [false, true] {
+            let mut app = app();
+            app.current_session_id = Some("session-a".into());
+            record_file(&mut app, "first", "write", "first.rs", None);
+            if badge_first {
+                assert_eq!(files_touched_count(&mut app), 1);
+            } else {
+                assert!(
+                    files_rows(&mut app)
+                        .iter()
+                        .any(|row| row.label == "first.rs")
+                );
+            }
+            record_file(&mut app, "second", "read", "second.rs", None);
+            if badge_first {
+                assert_eq!(files_touched_count(&mut app), 2);
+            } else {
+                assert!(
+                    files_rows(&mut app)
+                        .iter()
+                        .any(|row| row.label == "second.rs")
+                );
+            }
+            // Keep the old projection, as a session switch can, but replace
+            // the transcript that owns the next session's activity.
+            app.history.clear();
+            app.current_session_id = Some("session-b".into());
+            if badge_first {
+                assert_eq!(files_touched_count(&mut app), 0);
+                assert!(files_rows(&mut app).is_empty());
+            } else {
+                assert!(files_rows(&mut app).is_empty());
+                assert_eq!(files_touched_count(&mut app), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_git_status_reports_the_error_in_the_view_and_composer() {
+        use crate::tui::git_status::{context_line, probe_status};
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(workspace)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let clean = probe_status(workspace);
+        assert!(clean.error.is_none(), "{clean:?}");
+        assert!(context_line(&clean).unwrap().contains("clean"));
+        std::fs::write(workspace.join(".git/index"), b"broken index").unwrap();
+        let failed = probe_status(workspace);
+        assert!(failed.root.is_some(), "root discovery still succeeds");
+        let error = failed
+            .error
+            .as_deref()
+            .expect("status failure must be recorded");
+        assert!(error.contains("git status failed"), "{error}");
+        assert!(error.contains("index"), "{error}");
+        assert_eq!(context_line(&failed).as_deref(), Some(error));
+        let rows = git_rows_for(&failed, workspace);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, error);
+        assert!(!rows[0].label.contains("clean"));
+    }
+
+    #[test]
+    fn files_include_successful_writes_without_receipts() {
+        use crate::tools::spec::ToolResult;
+        use crate::tui::tool_routing::{handle_tool_call_complete, handle_tool_call_started};
+        let mut app = app();
+        for (id, action, path) in [("write", "write", "new.rs"), ("edit", "edit", "edited.rs")] {
+            let input = serde_json::json!({"action": action, "path": path, "content": "new"});
+            handle_tool_call_started(&mut app, id, "File", &input);
+            handle_tool_call_complete(&mut app, id, "File", &Ok(ToolResult::success("ok")));
+            app.flush_active_cell();
+        }
+        assert_eq!(files_touched_count(&mut app), 2);
+        let rows = files_rows(&mut app);
+        for path in ["new.rs", "edited.rs"] {
+            let row = rows
+                .iter()
+                .find(|row| row.label == path)
+                .expect("write row");
+            assert!(!row.selectable);
+            assert!(row.primary_action.is_none());
+            assert!(row.detail.is_empty());
+        }
+        // A receipt for an already-listed write adds its diff, not a second row.
+        record_file(
+            &mut app,
+            "receipt",
+            "edit",
+            "edited.rs",
+            Some("--- a/edited.rs\n+++ b/edited.rs\n@@ -0,0 +1 @@\n+new\n".into()),
+        );
+        let rows = files_rows(&mut app);
+        assert_eq!(files_touched_count(&mut app), 2);
+        assert_eq!(
+            rows.iter().filter(|row| row.label == "edited.rs").count(),
+            1
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.label == "edited.rs")
+                .unwrap()
+                .selectable
+        );
+    }
+
+    #[test]
+    fn the_files_view_lists_edits_with_their_size_then_reads() {
+        let mut app = app();
+        assert!(files_rows(&mut app).is_empty());
+        assert_eq!(files_touched_count(&mut app), 0);
+        let diff = format!(
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,12 @@\n{}{}",
+            "-old\n".repeat(3),
+            "+new\n".repeat(12),
+        );
+        record_file(&mut app, "edit", "edit", "src/lib.rs", Some(diff));
+        record_file(&mut app, "read", "read", "Cargo.toml", None);
+        let rows = files_rows(&mut app);
+        let labels = rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Edited 1", "src/lib.rs", "Read 1", "Cargo.toml"]);
+        assert_eq!(rows[1].detail, "+12 −3");
+        assert!(rows[1].selectable);
+        assert_eq!(files_touched_count(&mut app), 2);
+    }
+
+    #[test]
+    fn the_notes_view_lists_each_note_and_opens_it() {
+        let mut app = app();
+        assert!(!notepad_has_text(&app));
+        assert!(notepad_rows(&mut app).is_empty());
+        app.workspace_notes = vec![
+            "Ship the docs fix\nwith the link audit".to_string(),
+            "Ask about the flaky test".to_string(),
+        ];
+        assert!(notepad_has_text(&app));
+        let rows = notepad_rows(&mut app);
+        assert_eq!(rows[0].label, "Ship the docs fix");
+        assert!(matches!(
+            rows[1].primary_action.as_ref(),
+            Some(SidebarRowAction::Command(command)) if command == "/note show 2"
+        ));
+    }
 }

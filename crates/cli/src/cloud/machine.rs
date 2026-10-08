@@ -49,7 +49,11 @@ const TOKEN_HEAD_LEN: usize = 32;
 const KEY_ID_LEN: usize = 24;
 
 /// The closed scope set. Widening it is a control-plane change, not a CLI one.
-const SCOPES: [&str; 2] = ["account:read", "agent:run"];
+///
+/// `models:infer` is what lets a key reach the Codewhale API's model routes
+/// (`/v1/models`, `/v1/chat/completions`, `/v1/messages`); the other two stay
+/// the account and agent read/run scopes.
+const SCOPES: [&str; 3] = ["account:read", "agent:run", "models:infer"];
 
 /// Per-account ceiling quoted by `api_key_limit_reached`.
 const MAX_LIVE_KEYS: usize = 25;
@@ -770,9 +774,16 @@ pub(crate) struct ApiKeyCreateArgs {
     /// Optional lifetime in days. Omit for a key that never expires.
     #[arg(long = "expires-in-days", value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_EXPIRY_DAYS)))]
     expires_in_days: Option<u32>,
-    /// Repeatable. Omit for both `account:read` and `agent:run`.
+    /// Repeatable. Omit for all of `account:read`, `agent:run`, `models:infer`.
     #[arg(long = "scope", value_name = "SCOPE")]
     scopes: Vec<String>,
+    /// Also save the new secret as this machine's local `codewhale` provider
+    /// credential, so the CLI can immediately use Codewhale API models.
+    ///
+    /// The key never leaves this machine: it goes to the same secret store
+    /// `codewhale auth` writes, and nothing is uploaded anywhere.
+    #[arg(long = "use", default_value_t = false)]
+    use_locally: bool,
 }
 
 /// `/^[A-Za-z0-9][A-Za-z0-9 ._:@\/-]{0,63}$/`, checked locally so a bad name
@@ -800,10 +811,17 @@ digit, and contain only letters, digits, spaces, and `. _ : @ / -`."
     Ok(name)
 }
 
-/// Normalize `--scope` into the closed set, or `None` to mean "both".
+/// Normalize `--scope` into the closed set.
+///
+/// An omitted `--scope` means every scope, and is sent explicitly rather than
+/// left to a server default: a key minted by this CLI should carry exactly the
+/// scopes the CLI's own help promised, whatever the control plane's default is
+/// this week.
 pub(crate) fn validate_scopes(scopes: &[String]) -> Result<Option<Vec<String>>> {
     if scopes.is_empty() {
-        return Ok(None);
+        return Ok(Some(
+            SCOPES.iter().map(|scope| (*scope).to_string()).collect(),
+        ));
     }
     let mut normalized = Vec::new();
     for scope in scopes {
@@ -812,7 +830,7 @@ pub(crate) fn validate_scopes(scopes: &[String]) -> Result<Option<Vec<String>>> 
             bail!(
                 "unknown scope `{}`; Codewhale API keys accept only {}",
                 printable(scope),
-                SCOPES.join(" and ")
+                SCOPES.join(", ")
             );
         }
         if !normalized.iter().any(|existing| existing == scope) {
@@ -868,6 +886,7 @@ pub(crate) fn run_api_keys<T: CloudTransport, W: Write>(
     args: ApiKeysArgs,
     client: &CloudClient<'_, T>,
     machine: &MachineKeyEnv,
+    provider_secrets: &codewhale_secrets::Secrets,
     out: &mut W,
     sleeper: &mut dyn FnMut(Duration),
 ) -> Result<()> {
@@ -897,7 +916,11 @@ pub(crate) fn run_api_keys<T: CloudTransport, W: Write>(
                 return Err(anyhow::Error::new(classify(&response)));
             }
             let created: ApiKeyCreateResponse = decode_json(response)?;
-            write_created_key(out, &created)
+            write_created_key(out, &created)?;
+            if create.use_locally {
+                save_key_as_local_codewhale_credential(provider_secrets, &created.secret, out)?;
+            }
+            Ok(())
         }
         ApiKeysCommand::List => {
             let response = client.execute_authenticated_with_retry(
@@ -952,8 +975,24 @@ pub(crate) fn run_api_keys<T: CloudTransport, W: Write>(
 /// The secret goes to stdout exactly once, whether or not stdout is a TTY: CI
 /// captures stdout, and a secret written to stderr would land in a diagnostics
 /// stream that is far more likely to be archived and shared.
+///
+/// A 2xx whose secret is missing or malformed is not a created key the caller
+/// can use: it fails before anything reads "Created", naming the id (when the
+/// server sent one) so the half-minted key can be revoked.
 fn write_created_key<W: Write>(out: &mut W, created: &ApiKeyCreateResponse) -> Result<()> {
     let metadata = &created.api_key;
+    if !token_is_well_formed(&created.secret) {
+        let id = if metadata.id.trim().is_empty() {
+            "(no id returned)".to_string()
+        } else {
+            printable(&metadata.id)
+        };
+        bail!(
+            "Codewhale answered the API key request without a well-formed secret, so no usable \
+key was created. The server may still have recorded key {id}: run `codewhale account api-keys \
+list` and revoke it with `codewhale account api-keys revoke <id>`, then create another."
+        );
+    }
     writeln!(
         out,
         "Created Codewhale API key {}.",
@@ -983,6 +1022,39 @@ fn write_created_key<W: Write>(out: &mut W, created: &ApiKeyCreateResponse) -> R
         out,
         "Codewhale stores only a hash of it and cannot show it again. Copy it now into \
 {MACHINE_KEY_ENV}. If you lose it, revoke this key and create another."
+    )?;
+    Ok(())
+}
+
+/// Save a freshly minted key as this machine's local `codewhale` credential.
+///
+/// `--use` is the one place a Codewhale API key is written to disk by this
+/// surface, and it writes only locally: the same secret store `codewhale auth`
+/// uses, under the `codewhale` provider's own slot. Nothing is uploaded, and
+/// no other provider's credential is touched.
+fn save_key_as_local_codewhale_credential<W: Write>(
+    secrets: &codewhale_secrets::Secrets,
+    secret: &str,
+    out: &mut W,
+) -> Result<()> {
+    // Refuse to store a value this CLI would not accept as a key: a truncated
+    // response is better caught here than as a 401 on the next model call.
+    let key = MachineKey::parse(secret)?;
+    let slot = ProviderKind::Codewhale.secret_store_slot();
+    secrets.set(slot, secret).map_err(|error| {
+        anyhow!(
+            "The key was created, but saving it to the local secret store ({slot}) failed: {error}. Copy the secret above into {MACHINE_KEY_ENV} instead."
+        )
+    })?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Saved {} as this machine's local `codewhale` provider credential.",
+        key.head()
+    )?;
+    writeln!(
+        out,
+        "Select it with `codewhale config set provider codewhale`; models come from the account's own connected providers."
     )?;
     Ok(())
 }

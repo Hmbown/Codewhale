@@ -41,8 +41,8 @@ export default async function () {
   const summary = await task({
     description: "Synthesize from surviving parallel slots",
     label: "synthesizer",
-    // Read-only synthesizer — "general" is write-capable and fails closed without
-    // write scope (same class as operate_read_audit; dogfood 2026-07-24).
+    // Read-only synthesizer: "general" is write-capable and, without declared
+    // write scope, would claim the workspace root (same as operate_read_audit).
     type: "review",
     prompt: [
       "Build one operator-facing summary from the surviving scout results.",

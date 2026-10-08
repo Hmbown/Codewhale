@@ -1,6 +1,178 @@
 use super::*;
 use ratatui::text::Span;
 
+fn dot_cameo(area: Rect, age: u128, activity: AmbientActivity) -> (Buffer, AmbientFrameStats) {
+    let mut buf = Buffer::empty(area);
+    let mut stats = AmbientFrameStats::default();
+    pet_cameo::paint(
+        area,
+        &mut buf,
+        Color::Cyan,
+        &[],
+        1.0,
+        WhaleCameo {
+            elapsed_ms: Some(age),
+            anchor_x: area.x + area.width / 2,
+            anchor_y: area.y + area.height / 2,
+        },
+        activity,
+        &mut stats,
+    );
+    (buf, stats)
+}
+
+#[test]
+fn dot_cameo_is_bounded_and_independent_of_draw_history() {
+    let area = Rect::new(7, 11, 80, 24);
+    let (first, stats) = dot_cameo(area, 500, AmbientActivity::Baseline);
+    assert!(stats.marks_painted > 0);
+    dot_cameo(area, 1_900, AmbientActivity::Subagents);
+    dot_cameo(Rect::new(0, 0, 140, 40), 100, AmbientActivity::Baseline);
+    assert_eq!(first, dot_cameo(area, 500, AmbientActivity::Baseline).0);
+    assert_ne!(first, dot_cameo(area, 900, AmbientActivity::Baseline).0);
+    assert_eq!(
+        dot_cameo(area, 2_400, AmbientActivity::Baseline).1,
+        AmbientFrameStats::default()
+    );
+    assert_eq!(
+        dot_cameo(area, u128::MAX, AmbientActivity::Subagents).1,
+        AmbientFrameStats::default()
+    );
+}
+
+#[test]
+fn dot_cameo_withholds_whole_body_when_label_touches_wide_text() {
+    let area = Rect::new(7, 11, 80, 24);
+    let (clear, clear_stats) = dot_cameo(area, 500, AmbientActivity::Baseline);
+    let label_cell = clear
+        .content
+        .iter()
+        .position(|cell| cell.symbol() == "o")
+        .unwrap();
+    let (x, y) = (
+        label_cell % area.width as usize,
+        label_cell / area.width as usize,
+    );
+    let mut lines = vec![Line::from(""); area.height as usize];
+    lines[y] = Line::from(format!("{}鲸", " ".repeat(x)));
+    let mut buf = Buffer::empty(area);
+    buf.set_line(area.x, area.y + y as u16, &lines[y], area.width);
+    let before = buf.clone();
+    let mut stats = AmbientFrameStats::default();
+    pet_cameo::paint(
+        area,
+        &mut buf,
+        Color::Cyan,
+        &lines,
+        1.0,
+        WhaleCameo {
+            elapsed_ms: Some(500),
+            anchor_x: area.x + 40,
+            anchor_y: area.y + 12,
+        },
+        AmbientActivity::Baseline,
+        &mut stats,
+    );
+    assert_eq!(
+        before, buf,
+        "a label collision must withhold every particle too"
+    );
+    assert_eq!(stats.marks_skipped_text, clear_stats.marks_built);
+    assert_eq!(stats.marks_painted, 0);
+}
+
+#[test]
+fn narrow_pod_members_are_withheld_instead_of_stacked() {
+    let area = Rect::new(0, 0, 40, 12);
+    let (buf, stats) = dot_cameo(area, 500, AmbientActivity::Subagents);
+    let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+    assert_eq!(text.matches("agent · pod").count(), 1);
+    assert!(stats.marks_clipped > 0);
+    assert_eq!(stats.marks_built, stats.marks_painted + stats.marks_clipped);
+}
+
+#[test]
+fn reduced_motion_builds_and_paints_no_ambient_creatures() {
+    let area = Rect::new(0, 0, 80, 24);
+    let mut buf = Buffer::empty(area);
+    let before = buf.clone();
+    let stats = render_ambient_life(
+        area,
+        &mut buf,
+        (Color::Cyan, Color::Blue),
+        &[],
+        900,
+        0.0,
+        AmbientCursor::default(),
+        WhaleCameo {
+            elapsed_ms: Some(500),
+            anchor_x: 40,
+            anchor_y: 16,
+        },
+        AmbientActivity::Subagents,
+    );
+    assert_eq!(buf, before);
+    assert_eq!(stats, AmbientFrameStats::default());
+}
+
+#[test]
+fn pet_settle_clock_does_not_extend_the_ocean_light_pulse() {
+    let area = Rect::new(0, 0, 80, 24);
+    let ramp = ocean::OceanRamp::for_theme(&codewhale_palette::UNDERWATER_UI_THEME).unwrap();
+    let column = |age| {
+        OceanColumn::new(
+            ramp,
+            area,
+            900,
+            age,
+            crate::tui::underwater::ShellPhase::Done,
+            false,
+            500,
+            40,
+        )
+    };
+    let settled = column(None);
+    let pet_tail = column(Some(900));
+    assert_eq!(pet_tail.completion_elapsed_ms(), Some(900));
+    assert_eq!(pet_tail.ramp_fingerprint(), settled.ramp_fingerprint());
+    for y in 0..area.height {
+        assert_eq!(pet_tail.color_at_y(y), settled.color_at_y(y));
+    }
+}
+
+#[test]
+fn pet_widget_keeps_unknown_distinct_from_sleep_and_keeps_its_label() {
+    use pet_sim::{ChannelId, PetSim, PetState};
+    use ratatui::widgets::Widget;
+    let mut sim = PetSim::whale();
+    let mut state = PetState {
+        channel: ChannelId::Other,
+        lit: 0.3,
+        ..PetState::rest()
+    };
+    sim.step(1.0 / 30.0, &state, false, 1.0);
+    assert!(!sim.frame.hollow, "sleep is still observed");
+    state.observed = 0.15;
+    sim.step(1.0 / 30.0, &state, false, 1.0);
+    assert!(sim.frame.hollow);
+    let mut buf = Buffer::empty(Rect::new(0, 0, 40, 8));
+    pet_widget::PetWidget {
+        sim: &sim,
+        state: &state,
+    }
+    .render(buf.area, &mut buf);
+    let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+    assert!(text.contains("other · drift · resting"));
+    let mut narrow = Buffer::empty(Rect::new(0, 0, 18, 6));
+    let before = narrow.clone();
+    pet_widget::PetWidget {
+        sim: &sim,
+        state: &state,
+    }
+    .render(narrow.area, &mut narrow);
+    assert_eq!(narrow, before, "never truncate away the uncertainty cue");
+}
+
 #[test]
 fn ambient_min_dimensions_allow_small_windows() {
     const {
@@ -15,15 +187,6 @@ fn occupied_text_bounds_skips_string_join() {
     let (start, end) = occupied_text_bounds(&line).expect("bounds");
     assert_eq!(start, 2);
     assert!(end > start);
-}
-
-#[test]
-fn whale_cameo_is_brief() {
-    assert_eq!(whale_cameo_phase(0), WhaleCameoPhase::Breach);
-    assert_eq!(whale_cameo_phase(500), WhaleCameoPhase::Spout);
-    assert_eq!(whale_cameo_phase(1_200), WhaleCameoPhase::Fluke);
-    assert_eq!(whale_cameo_phase(2_000), WhaleCameoPhase::Submerge);
-    assert_eq!(whale_cameo_phase(3_000), WhaleCameoPhase::Hidden);
 }
 
 #[test]
@@ -57,8 +220,7 @@ fn frame_at(t: u128) -> FrameMarks {
         LifeDensity::from_area(area),
         &[],
         AmbientCursor::default(),
-        WhaleCameo::default(),
-        AmbientActivity::Baseline,
+        true,
         &mut stats,
     )
 }
@@ -85,7 +247,11 @@ fn subagent_activity_surfaces_a_whale_pod() {
         );
         buf.content
             .iter()
-            .filter(|cell| cell.symbol().contains('≈'))
+            .filter(|cell| {
+                cell.symbol()
+                    .chars()
+                    .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
+            })
             .map(|cell| cell.symbol().to_string())
             .collect()
     };
@@ -100,15 +266,41 @@ fn subagent_activity_surfaces_a_whale_pod() {
 }
 
 #[test]
-fn reasoning_activity_slows_the_ocean_clock() {
-    // Same scene, twice the elapsed time: the reasoning clock must read like
-    // the deep (0.6x), so position at t under Reasoning equals position at
-    // 0.6t under Baseline.
-    let scaled = AmbientActivity::Reasoning.scaled_time_ms(10_000);
-    assert_eq!(scaled, 6_000);
-    let tools = AmbientActivity::Tools.scaled_time_ms(10_000);
-    assert_eq!(tools, 12_500);
-    assert_eq!(AmbientActivity::Baseline.scaled_time_ms(10_000), 10_000);
+fn activity_changes_never_resample_creature_geometry() {
+    // Regression: scaling absolute clock age moved the school by tens of
+    // columns at a Reasoning → Tools transition. Same clock means same pose;
+    // activity still owns ink and the explicitly triggered completion cameo.
+    for elapsed in [0, 60_000, 600_000, 3_600_000] {
+        let render = |activity| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+            render_ambient_life(
+                buf.area,
+                &mut buf,
+                (Color::Cyan, Color::Blue),
+                &[],
+                elapsed,
+                1.0,
+                AmbientCursor::default(),
+                WhaleCameo::default(),
+                activity,
+            );
+            buf
+        };
+        let baseline = render(AmbientActivity::Baseline);
+        for activity in [
+            AmbientActivity::Reasoning,
+            AmbientActivity::Reading,
+            AmbientActivity::Tools,
+            AmbientActivity::Subagents,
+            AmbientActivity::Verifying,
+        ] {
+            assert_eq!(
+                baseline,
+                render(activity),
+                "geometry changed at {elapsed}ms: {activity:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -310,16 +502,24 @@ fn short_transcript_rows_leave_a_safe_ocean_corridor() {
         buf.set_line(area.x, area.y + row as u16, line, area.width);
     }
 
-    let stats = render_ambient_life(
+    let mut stats = AmbientFrameStats::default();
+    let frame = build_frame_marks(
+        area,
+        0,
+        LifeDensity::from_area(area),
+        &lines,
+        AmbientCursor::default(),
+        true,
+        &mut stats,
+    );
+    paint_marks(
         area,
         &mut buf,
         (Color::Cyan, Color::Blue),
         &lines,
-        0,
+        &frame,
         1.0,
-        AmbientCursor::default(),
-        WhaleCameo::default(),
-        AmbientActivity::Baseline,
+        &mut stats,
     );
     let rendered: String = (0..area.height)
         .map(|row| {
@@ -371,8 +571,7 @@ fn a_jellyfish_needs_water_deep_enough_to_hold_it_and_the_school() {
             LifeDensity::from_area(area),
             &lines,
             AmbientCursor::default(),
-            WhaleCameo::default(),
-            AmbientActivity::Baseline,
+            true,
             &mut stats,
         );
         for mark in &frame.marks {
@@ -418,8 +617,7 @@ fn sparse_water_gets_a_compact_jellyfish() {
             LifeDensity::from_area(area),
             &[],
             AmbientCursor::default(),
-            WhaleCameo::default(),
-            AmbientActivity::Baseline,
+            true,
             &mut stats,
         );
         for mark in &frame.marks {
@@ -473,8 +671,7 @@ fn motion_is_a_deterministic_function_of_elapsed_time() {
             LifeDensity::from_area(area),
             &[],
             AmbientCursor::default(),
-            WhaleCameo::default(),
-            AmbientActivity::Baseline,
+            true,
             &mut stats,
         )
     };
@@ -562,9 +759,8 @@ fn frame_stats_account_for_every_mark() {
 
 #[test]
 fn frame_stats_stay_within_the_render_budget() {
-    // Worst case on the largest Rich field with the whale cameo active:
-    // 7 fish + 2 jellies x 5 parts + 2 bubbles + 2 cameo cells. Anything
-    // more is a leak in the O(1)-per-frame budget.
+    // Largest Rich field with three bounded dot-whale widgets. Every
+    // visible dot cell and label character participates in the same budget.
     let area = Rect::new(0, 0, 160, 40);
     let mut buf = Buffer::empty(area);
     let whale = WhaleCameo {
@@ -581,7 +777,7 @@ fn frame_stats_stay_within_the_render_budget() {
         1.0,
         AmbientCursor::default(),
         whale,
-        AmbientActivity::Baseline,
+        AmbientActivity::Subagents,
     );
     assert!(
         stats.marks_built <= MAX_FRAME_MARKS,
@@ -882,5 +1078,182 @@ fn caustic_brightness_cross_fades_without_80ms_steps() {
             1.0,
             "a fully faded caustic must leave the water untouched"
         );
+    }
+}
+
+fn native_frame_at(area: Rect, elapsed_ms: u128) -> FrameMarks {
+    build_frame_marks(
+        area,
+        elapsed_ms,
+        LifeDensity::from_area(area),
+        &[],
+        AmbientCursor::default(),
+        false,
+        &mut AmbientFrameStats::default(),
+    )
+}
+
+#[test]
+fn native_pose_tables_have_fixed_cell_bounds_and_safe_glyphs() {
+    for right in [false, true] {
+        for pose in 0..4 {
+            for dx in 0..2 {
+                for dy in 0..2 {
+                    let row = native_poses::fish(right, pose, dx, dy);
+                    assert_eq!(row.width(), 4);
+                    assert!(row.chars().all(
+                        |c| c == ' ' || crate::tui::glyphs::braille_ascii_fallback(c).is_some()
+                    ));
+                }
+            }
+        }
+    }
+    for pose in 0..16 {
+        for dx in 0..2 {
+            for dy in 0..4 {
+                let rows = native_poses::jelly(pose, dx, dy);
+                assert_eq!(rows.len(), 3);
+                for row in rows {
+                    assert_eq!(row.width(), 5);
+                    assert!(row.chars().all(
+                        |c| c == ' ' || crate::tui::glyphs::braille_ascii_fallback(c).is_some()
+                    ));
+                }
+                assert!(rows.iter().all(|r| r.chars().count() == 5));
+            }
+        }
+    }
+}
+
+#[test]
+fn native_fish_move_within_the_old_whole_cell_dwell() {
+    let area = Rect::new(0, 0, 100, 30);
+    let a = native_frame_at(area, 190);
+    let b = native_frame_at(area, 380);
+    let (a, b) = (&a.marks[0], &b.marks[0]);
+    assert_eq!(
+        (a.x, a.y),
+        (b.x, b.y),
+        "both samples share the same cell anchor"
+    );
+    assert_ne!(
+        a.glyph, b.glyph,
+        "half-cell travel must change the raster within a cell"
+    );
+}
+
+#[test]
+fn native_motion_sampling_is_independent_of_cadence_and_history() {
+    let area = Rect::new(0, 0, 100, 30);
+    let pose = |t| {
+        native_frame_at(area, t)
+            .marks
+            .iter()
+            .map(|mark| (mark.x, mark.y, mark.glyph))
+            .collect::<Vec<_>>()
+    };
+    // Deliberately skip, reverse and change the draw cadence before landing
+    // on shared timestamps. A per-paint simulation would make these differ.
+    for target in [500, 1_000, 5_200, 9_400, 56_400, 300_800] {
+        let expected = pose(target);
+        for step in [16, 33, 117] {
+            for t in (0..target as usize).step_by(step) {
+                let _ = pose(t as u128);
+            }
+            assert_eq!(expected, pose(target));
+        }
+        let _ = pose(target + 10_000);
+        assert_eq!(expected, pose(target));
+    }
+}
+
+#[test]
+fn native_temporal_sweep_retains_population_and_paint_bounds() {
+    for area in [
+        Rect::new(0, 0, 40, 12),
+        Rect::new(0, 0, 80, 24),
+        Rect::new(0, 0, 140, 40),
+    ] {
+        // Cover rise, departure, long absence and next arrival, not just t=0.
+        let mut saw_jelly = false;
+        let mut saw_absence = false;
+        for t in (0..310_000).step_by(250) {
+            let frame = native_frame_at(area, t);
+            let count = frame.marks.iter().filter(|m| m.jellyfish.is_some()).count();
+            assert!(
+                count == 0 || count == 3,
+                "native jelly must be one complete group at {t}"
+            );
+            saw_jelly |= count == 3;
+            saw_absence |= count == 0;
+            // Bound from the one constant, not a second copy of the
+            // number: a hardcoded 13 here outlived the budget it was meant
+            // to mirror when the bubble streams grew.
+            assert!(
+                frame.marks.len() as u32 <= super::MAX_FRAME_MARKS,
+                "frame built {} marks, budget is {}",
+                frame.marks.len(),
+                super::MAX_FRAME_MARKS
+            );
+            let mut buf = Buffer::empty(area);
+            let mut stats = AmbientFrameStats {
+                marks_built: frame.marks.len() as u32,
+                ..Default::default()
+            };
+            paint_marks(
+                area,
+                &mut buf,
+                (Color::Cyan, Color::Blue),
+                &[],
+                &frame,
+                1.0,
+                &mut stats,
+            );
+            assert_eq!(
+                stats.marks_built,
+                stats.marks_painted + stats.marks_skipped_text + stats.marks_clipped
+            );
+            assert!(stats.cells_written <= stats.marks_painted * 5);
+        }
+        assert!(
+            saw_jelly && saw_absence,
+            "visit lifecycle missing at {area:?}"
+        );
+    }
+}
+
+#[test]
+fn native_jelly_stays_whole_as_wide_text_streams_through_its_lane() {
+    let area = Rect::new(0, 0, 80, 24);
+    let mut frame = native_frame_at(area, 0);
+    frame.marks.retain(|mark| mark.jellyfish.is_some());
+    assert_eq!(frame.marks.len(), 3);
+    let y = frame.marks[0].y;
+    for width in 0..=40 {
+        let mut lines = vec![Line::default(); area.height as usize];
+        lines[y as usize] = Line::from("鲸".repeat(width));
+        let mut buf = Buffer::empty(area);
+        buf.set_line(0, y, &lines[y as usize], area.width);
+        let before = buf.clone();
+        let mut stats = AmbientFrameStats {
+            marks_built: 3,
+            ..Default::default()
+        };
+        paint_marks(
+            area,
+            &mut buf,
+            (Color::Cyan, Color::Blue),
+            &lines,
+            &frame,
+            1.0,
+            &mut stats,
+        );
+        assert!(
+            stats.marks_painted == 0 || stats.marks_painted == 3,
+            "partial jelly at width {width}"
+        );
+        for x in 0..(width as u16 * 2).min(area.width) {
+            assert_eq!(buf[(x, y)], before[(x, y)], "painted over wide text at {x}");
+        }
     }
 }

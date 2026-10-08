@@ -1,18 +1,18 @@
 {
   "name": "codewhale",
   "private": true,
+  "scripts": {
+    "test": "npm test --workspaces --if-present && npm --prefix crates/tui/extension-host test && npm --prefix web test",
+    "check:web": "npm --prefix web run check"
+  },
   "workspaces": [
     "npm/codewhale",
     "npm/deepseek-tui",
     "npm/runtime-sdk"
   ],
-  "devDependencies": {
-    "wrangler": "^4.103.0"
-  },
   "overrides": {
     "esbuild": "0.28.1",
-    "sharp": "0.35.3",
     "ws": "8.21.0",
-    "undici": "7.29.0"
+    "undici": "7.29.1"
   }
 }

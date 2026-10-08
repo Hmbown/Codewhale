@@ -1,11 +1,20 @@
 # Codewhale Architecture
 
-This document provides an overview of the codewhale architecture for developers and contributors.
+> 阅读简体中文版：[zh_hans/ARCHITECTURE.md](zh_hans/ARCHITECTURE.md)。
+
+Codewhale Engine is the existing Rust execution runtime. The
+[Runtime API](RUNTIME_API.md) is its client interface, and
+[TypeScript mods](EXTENSIONS.md) contribute reviewed extensions.
 
 Current boundary note (read the workspace version from `Cargo.toml`; this
 boundary has held since v0.9.1):
 - `crates/tui` is still the live end-user runtime for the TUI, runtime API, task manager, and tool execution loop.
 - Other workspace crates are being split out incrementally, but they are not yet the sole runtime source of truth.
+- The runtime is moving into `crates/runtime` (`codewhale-runtime`) in the
+  order `docs/design/TUI_DECONSTRUCTION.md` records: engine, tools, config,
+  client and stores move there together, never into `crates/core`, and the
+  TUI stays the only crate that writes to the terminal. Until a module has
+  moved, its path under `crates/tui/src` is still where it lives.
 - The LSP subsystem (`crates/tui/src/lsp/`) is fully wired into the engine's
   post-tool-execution path (`core/engine/lsp_hooks.rs`), providing inline
   diagnostics after `File` write, edit, and patch actions.
@@ -71,13 +80,21 @@ boundary has held since v0.9.1):
 
 ### Entry Point
 
-- **`main.rs`** - CLI argument parsing (clap), configuration loading, entry point routing
+- **`crates/cli/src/main.rs`** - The canonical executable entry point. `crates/cli/src/lib.rs` owns its command interface; terminal and headless runtime startup runs in process through the `codewhale_tui` library in `crates/tui/src/lib.rs`.
 
 ### Core Components
 
 - **`core/`** - Main engine components
   - `engine.rs` - Engine state, operation handling, message processing
-  - `engine/turn_loop.rs` - Streaming turn loop and tool execution orchestration
+  - `engine/turn_loop.rs` - The existing Engine outer turn loop, shared tool
+    planner/executor/result handling, and stream decoder. Its private
+    `turn_loop/` phases contain request preparation (`preparation.rs`), model
+    dispatch and admission (`model_step.rs`), the ordered continuation ladder
+    (`continuation.rs`), inline REPL orchestration (`inline_repl.rs`), and the
+    direct model tool batch (`tool_batch.rs`). They borrow the same Engine and
+    TurnContext; they introduce no runtime, session, prompt, approval, event,
+    or persistence authority. Retry, loop termination, and immediate return
+    stay distinct, and only the existing productive paths advance the step.
   - `session.rs` - Session state management
   - `turn.rs` - Turn-based conversation handling
   - `events.rs` - Event system for UI updates
@@ -90,12 +107,24 @@ boundary has held since v0.9.1):
 
 ### Workspace Crates
 
+- **`crates/cli`** - The canonical `codewhale` executable and command interface.
+  It owns commands such as `auth`, `metrics` and `update`, and invokes terminal
+  and headless modes (`run`, `exec`, `doctor`, `sessions`, ...) in process via
+  `codewhale_tui::run(RuntimeOptions, args)`. `crates/tui` is a library; the
+  `codew` and legacy release filename aliases contain the same executable.
 - **`crates/tools`** - Shared tool invocation primitives, including tool result/error/capability types used by the TUI runtime.
 - **`crates/agent`** - Model/provider registry (ModelRegistry) for resolving model IDs to provider endpoints.
 - **`crates/app-server`** - HTTP/SSE + JSON-RPC app server transport for
-  headless agent workflows. Note that `app-server --http`/`--mobile` delegate
-  to the TUI binary, which is where the runtime API actually lives.
+  headless agent workflows. The canonical executable dispatches
+  `app-server --http`/`--mobile` in process to the runtime API hosted by the
+  `codewhale_tui` library.
 - **`crates/config`** - Config loading, profiles, environment variable precedence, CLI runtime overrides.
+- **`crates/cloud-facts`** - Fetches the signed Codewhale cloud facts channel
+  (`facts/v1`), verifies its Ed25519 envelope, and keeps a verified disk cache;
+  never a startup dependency.
+- **`crates/command-contract`** - Prototype command capability and dispatch
+  shapes for the staged extraction of TUI commands; shapes only, not yet the
+  production dispatch path.
 - **`crates/core`** - Provider-neutral request construction (`request.rs`),
   bounded context fragments, the tool-call parser, and thread/session types.
   It does **not** own the agent loop: the live turn loop is
@@ -103,13 +132,52 @@ boundary has held since v0.9.1):
   `crates/tui/src/core/` is a module inside the TUI crate, not this crate. A
   placeholder `engine/` tree here once suggested otherwise — it had no callers
   and emitted `TurnComplete` without contacting a model — and was removed in
-  v0.9.11 so there is exactly one turn loop in the workspace.
+  v0.9.11. The source guard follows resolved local phase calls and still
+  rejects unlisted loop owners. ACP stdio now projects the existing Runtime
+  manager and Engine; it keeps no provider/tool round loop or separate history.
+  Recursive RLM and mounted Python RPCs now project captured caller authority
+  onto the same Engine producer and Session; no RLM loop exception remains.
+  Python retains its context and variables, while each round borrows the
+  captured route, Native selection, original code gate, cancellation and
+  deadline. Task guidance is bounded and additive to Core policy. Recursive
+  history is retained whole; overflow refuses rather than compacting it.
+  Persistent `rlm` contexts remain caller-session scoped and `share_session=true`
+  explicitly refuses. Child workers also use their captured admission in the
+  same Engine; neither nested host retains a turn-loop exception.
 - **`crates/execpolicy`** - Approval/sandbox policy engine for tool execution decisions.
-- **`crates/hooks`** - Lifecycle hooks (stdout, jsonl, webhook) for pre/post tool events.
+- **`crates/hooks`** - Event sinks (stdout, JSONL file, webhook, Unix socket)
+  for response, tool, job and approval lifecycle events, plus the opt-in
+  lifecycle outbox. User-configured shell hooks that run commands around tool
+  calls are a separate system in `crates/tui/src/hooks.rs`.
+- **`crates/localization`** - Locale registry for user-facing UI chrome strings
+  (`crates/localization/locales/*.json`); it never changes prompts or model
+  output language.
 - **`crates/mcp`** - MCP client + stdio server for Model Context Protocol tool servers.
+- **`crates/memory`** - Local, scoped, provenance-bearing memory and
+  resumable state (a library, not a second agent loop).
+- **`crates/models`** - Provider request/response models and the offline model
+  metadata catalog.
+- **`crates/palette`** - Colour tokens, themes, and contrast math for the
+  terminal UI. Its `ratatui` feature (on by default) gates everything that
+  renders; theme ids, setting normalizers and hex parsing compile without it,
+  which is how the runtime links it.
+- **`crates/paths`** - User-scoped runtime path authority (`CODEWHALE_HOME`
+  and platform home resolution).
 - **`crates/protocol`** - Request/response framing and protocol types.
-- **`crates/secrets`** - OS keyring integration for API key storage.
+- **`crates/runtime`** - `codewhale-runtime`, the headless runtime being
+  split out of `crates/tui` (`docs/design/TUI_DECONSTRUCTION.md`). Today it
+  holds the leaf modules that moved first (retry status, safe labels, sleep
+  guard, session tree, ...) and `host_terminal`, the one port through which
+  runtime code asks the terminal UI for a terminal effect. It never depends on
+  the TUI, `ratatui` or `crossterm`; `scripts/check-command-crate-boundaries.py`
+  enforces that and ratchets the runtime -> UI references still in `crates/tui`.
+- **`crates/secrets`** - OS keyring integration for API key storage, plus the
+  shared output sanitizer (`sanitize`) and redaction (`redact`) that UI and
+  runtime code both call.
 - **`crates/state`** - SQLite thread/session persistence layer.
+- **`crates/telemetry`** - Anonymous, user-disableable aggregate usage
+  counting; the only crate allowed to build or send a telemetry payload
+  (`docs/TELEMETRY.md`).
 - **`crates/workflow`** / **`crates/workflow-js`** - Workflow engine and its
   QuickJS scripting layer (renamed from the whaleflow crates).
 - **`crates/lane`** - Lane runtime: durable, attachable running instances of
@@ -126,7 +194,8 @@ boundary has held since v0.9.1):
 - **`llm_client/`** - LLM client trait, retry logic, and error classification
   (`LlmClient`, `RetryConfig`, `with_retry`) consumed by `client.rs`; `mock.rs`
   is test-only (`#[cfg(test)]`).
-- **`models.rs`** - Data structures for API requests/responses
+- **`crates/models`** (`codewhale_models`) - Data structures for API
+  requests/responses; the TUI crate has no local `models.rs`.
 
 #### DeepSeek API Endpoints
 
@@ -156,16 +225,19 @@ drives turns through Chat Completions.
     discoverable through `tool_search`
   - `automation.rs` - Model-visible scheduling tools over `AutomationManager`
   - `plan.rs` - Planning tools
-  - `subagent/` - Sub-agent launch and supervision. The one model-facing tool
-    is `agent`; the `agent_open`/`agent_eval`/`agent_close` lifecycle surface
-    was retired (see `subagent/coord.rs:5`)
+  - `subagent/` - Sub-agent launch and supervision. `agent` is the one
+    creation surface; `subagent/coord.rs` adds narrow coordination tools
+    (`agents/list`, `agents/message`, `agents/followup`, `agents/interrupt`,
+    `agents/wait`, `agents/coordinate`) over the existing manager. The
+    `agent_open`/`agent_eval`/`agent_close` lifecycle surface was retired
+    (see the `subagent/coord.rs` module doc)
   - `spec.rs` - Tool specifications
-  - `rlm.rs` - Persistent Recursive Language Model (RLM) sessions — sandboxed Python REPLs with semantic helper calls and `var_handle` output support
+  - `rlm.rs` - Persistent Recursive Language Model (RLM) sessions — persistent local Python REPL subprocesses (environment-scrubbed, not OS-sandboxed) with semantic helper calls and `var_handle` output support
 
 ### Extension Systems
 
 - **`mcp.rs`** - Model Context Protocol client for external tool servers
-- **`skills.rs`** - Plugin/skill loading and execution
+- **`skills/`** - Skill discovery and registry for local `SKILL.md` files, plus install and audit
 - **`hooks.rs`** - Pre/post execution hooks with conditions
 
 ### User Interface
@@ -334,6 +406,11 @@ command = "echo 'Running tool: $TOOL_NAME'"
    are not wired into command execution.
 5. **Minimal dependencies**: Careful dependency selection for build speed
 6. **Local-first runtime API**: HTTP/SSE endpoints are intended for trusted localhost access and are served by the `crates/tui` runtime today
+7. **Lock poison**: fail-stop by default. A poisoned lock means a holder
+   panicked mid-mutation, so `.expect()` with a message naming the lock is
+   the standard posture — never serve half-updated state. Recover with
+   `into_inner()` only where stale state is safe (caches, idempotent
+   rebuilds), with a comment saying why.
 
 ## Configuration Files
 
@@ -346,4 +423,5 @@ command = "echo 'Running tool: $TOOL_NAME'"
 - `~/.codewhale/sessions/checkpoints/` - Crash checkpoint + offline queue persistence
 - `~/.codewhale/snapshots/` - Side-git pre/post-turn workspace snapshots for `/restore` and `revert_turn`
 - `~/.codewhale/tasks/` - Background task records, queue, timelines, artifacts
-- `~/.codewhale/audit.log` - Append-only audit events for credential + approval/elevation actions
+- `~/.codewhale/audit.log` - Append-only security events: credential saves and clears, hook environment key names, compaction passes, goal completions, the terminal's approval routing, Auto-Review verdicts, and outbound network decisions when `[network]` auditing is on. Not an action record: it holds no commands or file changes, and app or `serve` turns write no approvals there. See `docs/RECEIPTS.md` for what a session did
+- `~/.codewhale/sessions/<id>/approval_receipts.jsonl` - Every approval ask and decision for a session, including who decided

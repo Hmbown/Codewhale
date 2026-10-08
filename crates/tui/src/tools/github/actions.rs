@@ -94,6 +94,17 @@ impl GithubTool {
     ) -> Result<ToolResult, ToolError> {
         validate_evidence(input, false)?;
         let target = required_str(input, "target")?;
+        // Exactly the schema's enum. Any other spelling ("PR",
+        // "pull_request") used to fall through to an issue comment.
+        let subcmd = match target {
+            "issue" => "issue",
+            "pr" => "pr",
+            other => {
+                return Err(ToolError::invalid_input(format!(
+                    "github comment: target must be \"issue\" or \"pr\", got {other:?}; nothing was posted"
+                )));
+            }
+        };
         let number = required_u64(input, "number")?;
         let body = required_str(input, "body")?;
         if optional_bool(input, "dry_run", false)? {
@@ -101,7 +112,6 @@ impl GithubTool {
                 "Dry run: would comment on {target} #{number}."
             )));
         }
-        let subcmd = if target == "pr" { "pr" } else { "issue" };
         let number_s = number.to_string();
         run_gh_text(context, &[subcmd, "comment", &number_s, "--body", body])?;
         let metadata = github_event_metadata(

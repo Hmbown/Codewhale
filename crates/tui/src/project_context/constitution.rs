@@ -93,20 +93,23 @@ pub(crate) struct RepoLawRule {
 }
 
 /// Load and compile the enforceable rules from the workspace's repo
-/// constitution. Any failure — missing file, parse error, invalid glob —
-/// degrades to fewer (or zero) rules: enforcement can silently do less,
-/// never more, and never poisons the tool gate. Parse warnings still reach
+/// constitution. No constitution (or an empty file) is no law: `Ok` with no
+/// rules. A constitution that exists but cannot be read or parsed, or an
+/// enforced invariant whose path glob does not compile, is `Err` naming the
+/// problem: the caller holds every write instead of silently enforcing less
+/// than the law says (misconfiguration fails loud). Parse warnings also reach
 /// the user through the prompt-side load path, which reads the same file.
-pub(crate) fn load_repo_law_rules(workspace: &Path) -> Vec<RepoLawRule> {
-    let Some((_, constitution)) = discover_repo_constitution(workspace) else {
-        return Vec::new();
+pub(crate) fn load_repo_law_rules(workspace: &Path) -> Result<Vec<RepoLawRule>, String> {
+    let Some((path, constitution)) = discover_repo_constitution(workspace)? else {
+        return Ok(Vec::new());
     };
     let mut rules = Vec::new();
     for invariant in constitution.protected_invariants.into_iter().flatten() {
         let ProtectedInvariant::Enforced(enforced) = invariant else {
             continue;
         };
-        if enforced.text.trim().is_empty() {
+        let text = enforced.text.trim();
+        if text.is_empty() {
             continue;
         }
         let mut builder = globset::GlobSetBuilder::new();
@@ -116,31 +119,41 @@ pub(crate) fn load_repo_law_rules(workspace: &Path) -> Vec<RepoLawRule> {
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(glob) = globset::Glob::new(trimmed) {
-                builder.add(glob);
-                patterns.push(trimmed.to_string());
-            }
+            let glob = globset::Glob::new(trimmed).map_err(|error| {
+                format!(
+                    "{}: invariant \"{text}\" has an invalid path glob `{trimmed}`: {error}",
+                    path.display()
+                )
+            })?;
+            builder.add(glob);
+            patterns.push(trimmed.to_string());
         }
         if patterns.is_empty() {
             continue;
         }
-        let Ok(globs) = builder.build() else {
-            continue;
-        };
+        let globs = builder.build().map_err(|error| {
+            format!(
+                "{}: invariant \"{text}\" globs do not compile: {error}",
+                path.display()
+            )
+        })?;
         rules.push(RepoLawRule {
-            text: enforced.text.trim().to_string(),
+            text: text.to_string(),
             patterns,
             globs,
             action: enforced.action,
         });
     }
-    rules
+    Ok(rules)
 }
 
 /// Walk from `workspace` toward the git root looking for the repo
-/// constitution; parse best-effort. Shared by the enforcement loader; the
-/// prompt-side loader keeps its richer warning handling.
-fn discover_repo_constitution(workspace: &Path) -> Option<(PathBuf, RepoConstitution)> {
+/// constitution. `Ok(None)` when there is none (or it is empty); `Err` when
+/// one exists but cannot be read or parsed. Used by the enforcement loader;
+/// the prompt-side loader keeps its richer warning handling.
+fn discover_repo_constitution(
+    workspace: &Path,
+) -> Result<Option<(PathBuf, RepoConstitution)>, String> {
     let git_root = find_git_root(workspace);
     let mut current = workspace.to_path_buf();
     loop {
@@ -149,10 +162,14 @@ fn discover_repo_constitution(workspace: &Path) -> Option<(PathBuf, RepoConstitu
             path.push(component);
         }
         if context_candidate_exists(&path) {
-            let constitution = load_context_file(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<RepoConstitution>(&raw).ok())?;
-            return Some((path, constitution));
+            let raw = match load_context_file(&current, &path) {
+                Ok(raw) => raw,
+                Err(super::ProjectContextError::Empty { .. }) => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            let constitution = serde_json::from_str::<RepoConstitution>(&raw)
+                .map_err(|error| format!("{} is not valid: {error}", path.display()))?;
+            return Ok(Some((path, constitution)));
         }
         if let Some(ref root) = git_root
             && current == *root
@@ -164,7 +181,7 @@ fn discover_repo_constitution(workspace: &Path) -> Option<(PathBuf, RepoConstitu
             _ => break,
         }
     }
-    None
+    Ok(None)
 }
 
 impl RepoConstitution {
@@ -246,7 +263,15 @@ impl RepoConstitution {
         }
         format!(
             "<codewhale_repo_constitution source=\"{}\">\nCodewhale-specific repo authority policy (local law: subordinate to the global Constitution and the current user request, but above memory and old handoffs; WHALE.md is ignored and should be migrated, not treated as law).\n\n{}</codewhale_repo_constitution>",
-            source.display(),
+            // Same origin-label convention as `<project_instructions>`: file
+            // name only. The rendered `source` here is a runtime-canonicalized
+            // absolute path (workspace-relative traversal from the
+            // constitution's fixed relative path), but its final segment is a
+            // compile-time constant, so the base name is stable across
+            // directory moves and recasings. This keeps absolute paths out of
+            // provider-bound prompt labels. Operators still get the locator
+            // via `constitution_source_path` in the report and /constitution.
+            super::project_instructions_source_label(Some(source)),
             body.trim_end()
         )
     }
@@ -304,7 +329,7 @@ pub(crate) fn load_repo_constitution_block(
             path.push(component);
         }
         if context_candidate_exists(&path) {
-            match load_context_file(&path) {
+            match load_context_file(&current, &path) {
                 Ok(raw) => match serde_json::from_str::<RepoConstitution>(&raw) {
                     Ok(constitution) if !constitution.is_empty() => {
                         if let Some(version) = constitution.schema_version
@@ -406,7 +431,7 @@ mod tests {
         );
 
         // The enforcement loader compiles only the enforced entry.
-        let rules = load_repo_law_rules(tmp.path());
+        let rules = load_repo_law_rules(tmp.path()).expect("valid law");
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].text, "The wire format is frozen");
         assert_eq!(rules[0].action, RepoLawAction::Block);
@@ -432,7 +457,11 @@ mod tests {
             "{block}"
         );
         assert!(!block.contains("mechanically enforced"), "{block}");
-        assert!(load_repo_law_rules(tmp.path()).is_empty());
+        assert!(
+            load_repo_law_rules(tmp.path())
+                .expect("valid law")
+                .is_empty()
+        );
     }
 
     #[test]

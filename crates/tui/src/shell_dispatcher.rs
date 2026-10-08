@@ -13,7 +13,22 @@
 //! 2. **Quoting correctness** — each shell's argument-passing convention is
 //!    respected so quoted strings survive the spawn boundary intact.
 //! 3. **PowerShell safety** — non-interactive flags, temporary `.ps1` files
-//!    for multiline scripts, and explicit native `$LASTEXITCODE` capture.
+//!    for multiline scripts, explicit native `$LASTEXITCODE` capture, and a
+//!    process-scoped execution-policy bypass so a machine whose local policy
+//!    is `Restricted`/`AllSigned` does not refuse the tool's own temp script
+//!    (issue #6745).
+//!
+//! ## Known limitations
+//!
+//! - A Group Policy execution policy (`Get-ExecutionPolicy -List` rows
+//!   `MachinePolicy`/`UserPolicy`) outranks the process scope, so on such a
+//!   machine multiline commands (the temp `-File` form) are still refused and
+//!   PowerShell's own refusal is returned as the command's error. This is
+//!   deliberate: the dispatcher does not re-send the script through
+//!   `-EncodedCommand` to get around an administrator-enforced policy.
+//! - The process scope covers the whole child: scripts that a command itself
+//!   invokes run under the same bypass. The shell tool's approval and sandbox
+//!   policy, not the execution policy, is what gates what may run.
 //! 4. **Terminal state** — foreground shell execution saves and restores
 //!    crossterm raw-mode so the TUI input pipeline is not broken after a
 //!    child process exits (issue #1690).
@@ -38,20 +53,30 @@ pub(crate) mod test_env_lock;
 // ---------------------------------------------------------------------------
 
 /// The concrete shell that the dispatcher will use.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellKind {
+    // Which variants are live is exactly a platform split: `detect` builds the
+    // four Windows shells under `cfg(windows)` and `Sh`/`Custom` under
+    // `cfg(not(windows))`. So each `expect(dead_code)` has to name the platform
+    // it is dead on, or it fires as unfulfilled on the other one — which is how
+    // the Windows build broke while unix stayed green.
     /// PowerShell 7+ (`pwsh.exe`).
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     Pwsh,
     /// Windows PowerShell 5.1 (`powershell.exe`).
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     WindowsPowerShell,
     /// Command Prompt (`cmd.exe`).
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     Cmd,
     /// Unix `/bin/sh` fallback.
+    #[cfg_attr(all(not(test), windows), expect(dead_code))]
     Sh,
     /// Bash — detected via `$SHELL` on WSL/Git Bash, or constructed explicitly.
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     Bash,
     /// The exact shell executable selected by Unix `$SHELL`.
+    #[cfg_attr(all(not(test), windows), expect(dead_code))]
     Custom { binary: String, flag: String },
 }
 
@@ -129,6 +154,47 @@ fn powershell_prefers_script_file(shell_command: &str) -> bool {
         || shell_command.contains("@\"")
 }
 
+/// Flags shared by every PowerShell invocation this dispatcher builds.
+///
+/// `-ExecutionPolicy Bypass` matters for the temp `.ps1` form: script files are
+/// subject to the execution policy (the Windows client default is
+/// `Restricted`), so without it a stock or hardened machine refuses a script
+/// this tool wrote itself before a single statement runs. The parameter only
+/// sets the *process* scope — no administrator rights, no persisted change, the
+/// user's own shells are untouched — and it is applied to both forms so a
+/// command behaves the same whether it travels as `-Command` or `-File`.
+/// Group Policy scopes still take precedence; see the module's known
+/// limitations.
+///
+/// `CODEWHALE_POWERSHELL_EXECUTION_POLICY=inherit` omits the flag so the
+/// machine/user policy applies instead (#6745). Unset, `bypass`, or any other
+/// value keeps the default.
+fn powershell_base_args() -> Vec<String> {
+    powershell_base_args_for_policy(
+        std::env::var(POWERSHELL_EXECUTION_POLICY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Environment variable that opts out of the process-scope policy bypass.
+const POWERSHELL_EXECUTION_POLICY_ENV: &str = "CODEWHALE_POWERSHELL_EXECUTION_POLICY";
+
+/// [`powershell_base_args`] with the opt-out value passed in, so the decision
+/// is testable without touching the process environment.
+fn powershell_base_args_for_policy(setting: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+    ];
+    if !setting.is_some_and(|value| value.trim().eq_ignore_ascii_case("inherit")) {
+        args.push("-ExecutionPolicy".to_string());
+        args.push("Bypass".to_string());
+    }
+    args
+}
+
 /// Wrap a model/user PowerShell command so native program failures surface
 /// through `$LASTEXITCODE` without using `Invoke-Expression`.
 fn powershell_exit_aware_command(shell_command: &str) -> String {
@@ -157,19 +223,31 @@ const TEMP_PS1_TAIL: &str = concat!(
 );
 
 fn write_temp_ps1(shell_command: &str) -> std::io::Result<String> {
-    use std::io::Write;
     let dir = std::env::temp_dir();
     sweep_stale_temp_ps1(&dir);
+    // Unguessable name: another user of the shared temporary directory cannot
+    // predict it, and `write_temp_ps1_at` still refuses anything already there.
     let name = format!(
         "codewhale-shell-{}-{}.ps1",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+        uuid::Uuid::new_v4().simple()
     );
-    let path = dir.join(name);
-    let mut file = std::fs::File::create(&path)?;
+    write_temp_ps1_at(&dir.join(name), shell_command)
+}
+
+/// Create `path` exclusively, owner-only on Unix, and write the script into it.
+fn write_temp_ps1_at(path: &std::path::Path, shell_command: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    // Create-new: never write the script through a file or link that someone
+    // else placed at this name in the shared temporary directory.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     // UTF-8 with BOM helps Windows PowerShell 5.1 decode non-ASCII scripts.
     file.write_all(&[0xEF, 0xBB, 0xBF])?;
     file.write_all(shell_command.as_bytes())?;
@@ -222,7 +300,6 @@ pub struct ShellDispatcher {
     kind: ShellKind,
 }
 
-#[allow(dead_code)]
 impl ShellDispatcher {
     /// Detect the user's shell from the environment.
     ///
@@ -245,6 +322,7 @@ impl ShellDispatcher {
     }
 
     /// Log a shell execution line when `SHELL_DISPATCHER_LOG` is set.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn log_exec(command: &str) {
         if let Ok(path) = std::env::var("SHELL_DISPATCHER_LOG") {
             let _ = Self::append_log_static(&path, command);
@@ -273,6 +351,7 @@ impl ShellDispatcher {
         file.flush()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     fn append_log_static(path: &str, command: &str) -> std::io::Result<()> {
         // Resolve kind outside the lock — `global_dispatcher()` may trigger
         // `detect()` which calls `log_startup()` which also acquires the mutex.
@@ -313,11 +392,7 @@ impl ShellDispatcher {
     pub fn build_command_parts(&self, shell_command: &str) -> (String, Vec<String>) {
         let program = self.kind.binary().to_string();
         if self.kind.is_powershell() {
-            let mut args = vec![
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-            ];
+            let mut args = powershell_base_args();
             if powershell_prefers_script_file(shell_command) {
                 // Complex multiline / heavily quoted scripts: write a temp
                 // .ps1 and invoke with -File so quoting stays structured.
@@ -379,24 +454,8 @@ impl ShellDispatcher {
             }
         }
 
-        // Disable raw mode; guard restores it only if it was already enabled.
-        let raw_mode_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-        if raw_mode_was_enabled {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-        struct FgRawModeGuard {
-            restore: bool,
-        }
-        impl Drop for FgRawModeGuard {
-            fn drop(&mut self) {
-                if self.restore {
-                    let _ = crossterm::terminal::enable_raw_mode();
-                }
-            }
-        }
-        let _guard = FgRawModeGuard {
-            restore: raw_mode_was_enabled,
-        };
+        // Leave raw mode; the guard restores it only if it was already enabled.
+        let _raw_mode = crate::host_terminal::suspend_raw_mode();
 
         let mut cmd = self.build_command(shell_command);
         cmd.current_dir(cwd);
@@ -662,6 +721,60 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// #6745: both PowerShell forms carry a process-scoped policy bypass, and
+    /// it precedes `-File`/`-Command` — PowerShell hands every argument after
+    /// `-File` to the script, so a later `-ExecutionPolicy` would be ignored.
+    #[test]
+    fn powershell_forms_bypass_execution_policy_at_process_scope() {
+        let dispatcher = ShellDispatcher {
+            kind: ShellKind::WindowsPowerShell,
+        };
+        for script in ["Write-Output 'one'", "Write-Output 'a'\nWrite-Output 'b'"] {
+            let (_, args) = dispatcher.build_command_parts(script);
+            let policy = args
+                .iter()
+                .position(|a| a == "-ExecutionPolicy")
+                .unwrap_or_else(|| panic!("process-scope policy missing: {args:?}"));
+            assert_eq!(args[policy + 1], "Bypass", "{args:?}");
+            let payload_flag = args
+                .iter()
+                .position(|a| a == "-File" || a == "-Command")
+                .expect("payload flag");
+            assert!(policy < payload_flag, "{args:?}");
+            if args[payload_flag] == "-File" {
+                let _ = std::fs::remove_file(&args[payload_flag + 1]);
+            }
+        }
+    }
+
+    /// #6745: `inherit` is the only value that drops the process-scope bypass;
+    /// unset, `bypass`, and anything unrecognised keep it. Tested on the pure
+    /// decision so no test mutates the process environment.
+    #[test]
+    fn powershell_execution_policy_opt_out_only_honours_inherit() {
+        let bypass = |args: &[String]| {
+            args.iter()
+                .position(|a| a == "-ExecutionPolicy")
+                .map(|index| args[index + 1].clone())
+        };
+        for setting in [
+            None,
+            Some("bypass"),
+            Some("Bypass"),
+            Some(""),
+            Some("restricted"),
+        ] {
+            let args = powershell_base_args_for_policy(setting);
+            assert_eq!(bypass(&args).as_deref(), Some("Bypass"), "{setting:?}");
+            assert!(args.contains(&"-NonInteractive".to_string()), "{setting:?}");
+        }
+        for setting in ["inherit", "INHERIT", " inherit "] {
+            let args = powershell_base_args_for_policy(Some(setting));
+            assert_eq!(bypass(&args), None, "{setting:?}: {args:?}");
+            assert_eq!(args, ["-NoLogo", "-NoProfile", "-NonInteractive"]);
+        }
+    }
+
     #[test]
     fn powershell_trailing_comment_cannot_swallow_exit_capture() {
         // An unquoted `#` in a single-line payload comments to end-of-line;
@@ -677,6 +790,55 @@ mod tests {
             payload.contains("\nif ($null -ne $LASTEXITCODE"),
             "exit-code capture must start on a fresh line: {payload}"
         );
+    }
+
+    /// The temporary script is created exclusively: a file or link already at
+    /// the name is refused and left exactly as it was, and a fresh script is
+    /// owner-only.
+    #[test]
+    fn temp_ps1_script_is_created_exclusively_and_privately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let taken = dir.path().join("codewhale-shell-taken.ps1");
+        std::fs::write(&taken, "original").expect("pre-existing file");
+        let error = write_temp_ps1_at(&taken, "Write-Output 'x'")
+            .expect_err("an existing file must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "original");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let victim = dir.path().join("victim.txt");
+            let linked = dir.path().join("codewhale-shell-linked.ps1");
+            symlink(&victim, &linked).expect("plant dangling link");
+            assert!(write_temp_ps1_at(&linked, "Write-Output 'x'").is_err());
+            assert!(
+                !victim.exists(),
+                "a planted link must not be written through"
+            );
+
+            let fresh = dir.path().join("codewhale-shell-fresh.ps1");
+            write_temp_ps1_at(&fresh, "Write-Output 'x'").expect("fresh script");
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let fresh = dir.path().join("codewhale-shell-content.ps1");
+        let written = write_temp_ps1_at(&fresh, "Write-Output 'x'").expect("script");
+        assert_eq!(written, fresh.to_string_lossy());
+        let bytes = std::fs::read(&fresh).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
+        assert!(text.starts_with("Write-Output 'x'\n"), "{text}");
+        assert!(text.ends_with(TEMP_PS1_TAIL), "{text}");
+
+        // Two scripts from the public entry point never collide.
+        let first = write_temp_ps1("1").expect("first");
+        let second = write_temp_ps1("2").expect("second");
+        assert_ne!(first, second);
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     #[test]

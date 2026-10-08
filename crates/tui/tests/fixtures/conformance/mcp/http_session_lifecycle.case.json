@@ -1,0 +1,171 @@
+{
+  "description": "Streamable HTTP session handling. Pins Rust StreamableHttpTransport::send / HttpTransport::send / McpPool::call_tool_with_decision: initialize issues a session id that every later request carries, the negotiated (older) protocol revision rides on every request after initialize as MCP-Protocol-Version, a notifications/tools/list_changed arriving inside a call's SSE reply does NOT refresh the catalog (the Rust pool never reads it), a 404 stale-session refusal is replayed exactly once on a fresh session (the server never ran it) and the reconnect re-lists tools, while a JSON-RPC error that merely mentions an invalid session is NOT replayed.",
+  "server_name": "conformance",
+  "server_options": {
+    "numbered_sessions": true
+  },
+  "record_requests": "full",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-03-26",
+        "serverInfo": {
+          "name": "session-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": [
+      {
+        "once": true,
+        "result": {
+          "tools": [
+            {
+              "name": "echo",
+              "description": "Echo.",
+              "inputSchema": {
+                "type": "object"
+              }
+            },
+            {
+              "name": "notify_tool",
+              "description": "Answers with a tools/list_changed notification.",
+              "inputSchema": {
+                "type": "object"
+              }
+            },
+            {
+              "name": "session_error",
+              "description": "Answers with a JSON-RPC error that mentions the session.",
+              "inputSchema": {
+                "type": "object"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "result": {
+          "tools": [
+            {
+              "name": "echo",
+              "description": "Echo.",
+              "inputSchema": {
+                "type": "object"
+              }
+            },
+            {
+              "name": "notify_tool",
+              "description": "Answers with a tools/list_changed notification.",
+              "inputSchema": {
+                "type": "object"
+              }
+            },
+            {
+              "name": "session_error",
+              "description": "Answers with a JSON-RPC error that mentions the session.",
+              "inputSchema": {
+                "type": "object"
+              }
+            },
+            {
+              "name": "added_later",
+              "description": "Only advertised after a reconnect.",
+              "inputSchema": {
+                "type": "object"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "tools/call": [
+      {
+        "match": {
+          "name": "notify_tool"
+        },
+        "notifications": [
+          {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+          }
+        ],
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "notified"
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "echo"
+        },
+        "once": true,
+        "expire_session": true
+      },
+      {
+        "match": {
+          "name": "echo"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "echo"
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "session_error"
+        },
+        "error": {
+          "code": -32000,
+          "message": "session invalid"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_notify_tool",
+      "input": {}
+    },
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {
+        "text": "first"
+      }
+    },
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_session_error",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {
+        "text": "after session error"
+      }
+    }
+  ]
+}

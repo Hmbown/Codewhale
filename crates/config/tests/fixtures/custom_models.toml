@@ -1,0 +1,20 @@
+provider = "deepseek"
+default_text_model = "deepseek-v4.1-flash-expires-on-0910"
+telemetry = false
+
+[[custom_models]]
+provider = "deepseek"
+base_url = "https://models.example.test/v1"
+id = "deepseek-v4.1-flash-expires-on-0910"
+display_name = "Temporary preview"
+reasoning = false
+tool_call = true
+attachment = true
+structured_output = false
+future_note = "preserve this metadata"
+limit = { context = 96000, input = 88000, output = 8000 }
+cost = { input = 0.4, output = 1.6, cache_read = 0.1 }
+modalities = { input = ["text", "image"], output = ["text"] }
+
+[providers.deepseek]
+base_url = "https://models.example.test/v1"

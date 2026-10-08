@@ -1,0 +1,24 @@
+{
+  "description": "Plan mode: pins the advertised catalog and frozen prefix. The current catalog still advertises bash/edit/write; read-only admission and appended Plan instructions are not proved by a prefix fixture.",
+  "model": "deepseek-v4-pro",
+  "mode": "plan",
+  "approval_mode": "suggest",
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "user_message": "make a plan",
+  "workspace_files": {
+    "README.md": "conformance fixture\n"
+  }
+}

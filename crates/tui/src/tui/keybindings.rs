@@ -31,12 +31,28 @@ pub enum KeybindingSection {
     Modes,
     Sessions,
     Clipboard,
+    Pointer,
     Help,
 }
 
 impl KeybindingSection {
-    pub fn label(self, locale: crate::localization::Locale) -> Cow<'static, str> {
-        use crate::localization::{MessageId, tr};
+    /// Every section, in declaration order. Callers that need to walk the set —
+    /// the help overlay's fold defaults, its rank lookup — read this instead of
+    /// restating the list, which is how `Pointer` came to be missing from one
+    /// of them and not the other.
+    pub const ALL: [Self; 8] = [
+        Self::Navigation,
+        Self::Editing,
+        Self::Submission,
+        Self::Modes,
+        Self::Sessions,
+        Self::Clipboard,
+        Self::Pointer,
+        Self::Help,
+    ];
+
+    pub fn label(self, locale: codewhale_localization::Locale) -> Cow<'static, str> {
+        use codewhale_localization::{MessageId, tr};
         let id = match self {
             Self::Navigation => MessageId::HelpSectionNavigation,
             Self::Editing => MessageId::HelpSectionEditing,
@@ -44,6 +60,7 @@ impl KeybindingSection {
             Self::Modes => MessageId::HelpSectionModes,
             Self::Sessions => MessageId::HelpSectionSessions,
             Self::Clipboard => MessageId::HelpSectionClipboard,
+            Self::Pointer => MessageId::HelpSectionPointer,
             Self::Help => MessageId::HelpSectionHelp,
         };
         tr(locale, id)
@@ -59,7 +76,8 @@ impl KeybindingSection {
             Self::Modes => 3,
             Self::Sessions => 4,
             Self::Clipboard => 5,
-            Self::Help => 6,
+            Self::Pointer => 6,
+            Self::Help => 7,
         }
     }
 }
@@ -67,7 +85,7 @@ impl KeybindingSection {
 #[derive(Debug, Clone, Copy)]
 pub struct KeybindingEntry {
     pub chord: &'static str,
-    pub description_id: crate::localization::MessageId,
+    pub description_id: codewhale_localization::MessageId,
     pub section: KeybindingSection,
 }
 
@@ -82,257 +100,261 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     // --- Navigation ---
     KeybindingEntry {
         chord: "↑ / ↓",
-        description_id: crate::localization::MessageId::KbScrollTranscript,
+        description_id: codewhale_localization::MessageId::KbScrollTranscript,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
         chord: "Alt+↑ / Alt+↓",
-        description_id: crate::localization::MessageId::KbScrollTranscriptAlt,
+        description_id: codewhale_localization::MessageId::KbScrollTranscriptAlt,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
         chord: "Shift+↑ / Shift+↓",
-        description_id: crate::localization::MessageId::KbBrowseHistory,
+        description_id: codewhale_localization::MessageId::KbBrowseHistory,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
         chord: "PgUp / PgDn",
-        description_id: crate::localization::MessageId::KbScrollPage,
+        description_id: codewhale_localization::MessageId::KbScrollPage,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
         chord: "Ctrl+Home / Ctrl+End",
-        description_id: crate::localization::MessageId::KbJumpTopBottom,
+        description_id: codewhale_localization::MessageId::KbJumpTopBottom,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
         chord: "Alt+G / Alt+Shift+G",
-        description_id: crate::localization::MessageId::KbJumpTopBottomEmpty,
+        description_id: codewhale_localization::MessageId::KbJumpTopBottomEmpty,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
         chord: "Alt+[ / Alt+]",
-        description_id: crate::localization::MessageId::KbJumpToolBlocks,
+        description_id: codewhale_localization::MessageId::KbJumpToolBlocks,
         section: KeybindingSection::Navigation,
     },
     // --- Editing ---
     KeybindingEntry {
         chord: "← / → / Ctrl+←/→ / Alt+←/→",
-        description_id: crate::localization::MessageId::KbMoveCursor,
+        description_id: codewhale_localization::MessageId::KbMoveCursor,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Home / End",
-        description_id: crate::localization::MessageId::KbJumpLineStartEnd,
+        description_id: codewhale_localization::MessageId::KbJumpLineStartEnd,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Ctrl+A / Ctrl+E",
-        description_id: crate::localization::MessageId::KbJumpLineStartEnd,
+        description_id: codewhale_localization::MessageId::KbJumpLineStartEnd,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Backspace / Delete",
-        description_id: crate::localization::MessageId::KbDeleteChar,
+        description_id: codewhale_localization::MessageId::KbDeleteChar,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Ctrl+W / Ctrl+Backspace / Alt+Backspace",
-        description_id: crate::localization::MessageId::KbDeleteWord,
+        description_id: codewhale_localization::MessageId::KbDeleteWord,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Ctrl+Y",
-        description_id: crate::localization::MessageId::KbYank,
+        description_id: codewhale_localization::MessageId::KbYank,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Ctrl+Shift+E / Cmd+Shift+E",
-        description_id: crate::localization::MessageId::KbToggleFileTree,
+        description_id: codewhale_localization::MessageId::KbToggleFileTree,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
         chord: "Shift+←/→ / Shift+Home/End / Ctrl+Shift+←/→ / Alt+Shift+←/→ / Ctrl+Shift+Home/End",
-        description_id: crate::localization::MessageId::KbSelectText,
+        description_id: codewhale_localization::MessageId::KbSelectText,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         // Ctrl+A keeps its readline meaning (start of input); select-all is
         // the shifted chord, plus native Cmd+A on terminals that forward Cmd.
         chord: "Ctrl+Shift+A / Cmd+A",
-        description_id: crate::localization::MessageId::KbSelectAllDraft,
+        description_id: codewhale_localization::MessageId::KbSelectAllDraft,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Ctrl+U",
-        description_id: crate::localization::MessageId::KbClearDraft,
+        description_id: codewhale_localization::MessageId::KbClearDraft,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Ctrl+Z",
-        description_id: crate::localization::MessageId::KbRestoreClearedDraft,
+        description_id: codewhale_localization::MessageId::KbRestoreClearedDraft,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Ctrl+G / Ctrl+S",
-        description_id: crate::localization::MessageId::KbStashDraft,
+        description_id: codewhale_localization::MessageId::KbStashDraft,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         chord: "Alt+R",
-        description_id: crate::localization::MessageId::KbSearchHistory,
+        description_id: codewhale_localization::MessageId::KbSearchHistory,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
-        chord: "Ctrl+J / Alt+Enter / Shift+Enter",
-        description_id: crate::localization::MessageId::KbInsertNewline,
+        // Ctrl+J leads because it is a plain control byte every terminal
+        // sends. Shift+Enter only arrives where the kitty keyboard protocol
+        // is live — see `composer_ui::terminal_can_report_shift_enter` — so
+        // it is listed last rather than taught first.
+        chord: "Ctrl+J / Alt+Enter / Shift+Enter (enhanced terminals)",
+        description_id: codewhale_localization::MessageId::KbInsertNewline,
         section: KeybindingSection::Editing,
     },
     // --- Submission / actions ---
     KeybindingEntry {
         chord: "Enter",
-        description_id: crate::localization::MessageId::KbSendDraft,
+        description_id: codewhale_localization::MessageId::KbSendDraft,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Esc",
-        description_id: crate::localization::MessageId::KbCloseMenu,
+        description_id: codewhale_localization::MessageId::KbCloseMenu,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+C",
-        description_id: crate::localization::MessageId::KbCancelOrExit,
+        description_id: codewhale_localization::MessageId::KbCancelOrExit,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+B",
-        description_id: crate::localization::MessageId::KbShellControls,
+        description_id: codewhale_localization::MessageId::KbShellControls,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+D",
-        description_id: crate::localization::MessageId::KbExitEmpty,
+        description_id: codewhale_localization::MessageId::KbExitEmpty,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+K",
-        description_id: crate::localization::MessageId::KbCommandPalette,
+        description_id: codewhale_localization::MessageId::KbCommandPalette,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "F2",
-        description_id: crate::localization::MessageId::KbSettings,
+        description_id: codewhale_localization::MessageId::KbSettings,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+X (Activity workbar)",
-        description_id: crate::localization::MessageId::KbCancelBackgroundShellJobs,
+        description_id: codewhale_localization::MessageId::KbCancelBackgroundShellJobs,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+P",
-        description_id: crate::localization::MessageId::KbFuzzyFilePicker,
+        description_id: codewhale_localization::MessageId::KbFuzzyFilePicker,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         // `/context` is the guaranteed path; Alt+C is an unadvertised
         // handler until proven in real terminals (TUI-DOG-003).
         chord: "/context",
-        description_id: crate::localization::MessageId::KbCompactInspector,
+        description_id: codewhale_localization::MessageId::KbCompactInspector,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         // `/provider` remains the portable command route; F3 mirrors the
         // clickable topbar route segment without consuming composer text.
         chord: "F3 / /provider",
-        description_id: crate::localization::MessageId::CmdProviderDescription,
+        description_id: codewhale_localization::MessageId::CmdProviderDescription,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Alt+L",
-        description_id: crate::localization::MessageId::KbLastMessagePager,
+        description_id: codewhale_localization::MessageId::KbLastMessagePager,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         // Bare `v` always types `v`; details is Alt+V only (⌥V on macOS).
         chord: "Alt+V",
-        description_id: crate::localization::MessageId::KbSelectedDetails,
+        description_id: codewhale_localization::MessageId::KbSelectedDetails,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+O",
-        description_id: crate::localization::MessageId::KbReasoningDetail,
+        description_id: codewhale_localization::MessageId::KbReasoningDetail,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+Alt+O",
-        description_id: crate::localization::MessageId::KbTurnInspector,
+        description_id: codewhale_localization::MessageId::KbTurnInspector,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+Shift+O / F4",
-        description_id: crate::localization::MessageId::KbExternalEditor,
+        description_id: codewhale_localization::MessageId::KbExternalEditor,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
         // `/transcript` is the reliable fallback when a terminal cannot
         // distinguish Ctrl+Shift+T from Ctrl+T.
         chord: "/transcript / Ctrl+Shift+T",
-        description_id: crate::localization::MessageId::KbLiveTranscript,
+        description_id: codewhale_localization::MessageId::KbLiveTranscript,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
         chord: "Ctrl+T",
-        description_id: crate::localization::MessageId::KbCycleThinking,
+        description_id: codewhale_localization::MessageId::KbCycleThinking,
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
         chord: "Esc Esc",
-        description_id: crate::localization::MessageId::KbBacktrackMessage,
+        description_id: codewhale_localization::MessageId::KbBacktrackMessage,
         section: KeybindingSection::Submission,
     },
     // --- Modes ---
     KeybindingEntry {
         chord: "Tab",
-        description_id: crate::localization::MessageId::KbCompleteCycleModes,
+        description_id: codewhale_localization::MessageId::KbCompleteCycleModes,
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
         chord: "Shift+Tab",
-        description_id: crate::localization::MessageId::KbCyclePermissions,
+        description_id: codewhale_localization::MessageId::KbCyclePermissions,
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
         chord: "Alt+1-8",
-        description_id: crate::localization::MessageId::KbJumpPlanAgentYolo,
+        description_id: codewhale_localization::MessageId::KbJumpPlanAgentYolo,
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
         chord: "Alt+P / Alt+A / Alt+Y",
-        description_id: crate::localization::MessageId::KbAltJumpPlanAgentYolo,
+        description_id: codewhale_localization::MessageId::KbAltJumpPlanAgentYolo,
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
         chord: "Alt+! / Alt+@ / Alt+# / Alt+$ / Alt+0 / Ctrl+Alt+0",
-        description_id: crate::localization::MessageId::KbFocusSidebar,
+        description_id: codewhale_localization::MessageId::KbFocusSidebar,
         section: KeybindingSection::Modes,
     },
     // --- Sessions ---
     KeybindingEntry {
         chord: "Ctrl+R",
-        description_id: crate::localization::MessageId::KbSessionPicker,
+        description_id: codewhale_localization::MessageId::KbSessionPicker,
         section: KeybindingSection::Sessions,
     },
     KeybindingEntry {
         chord: "Ctrl+L",
-        description_id: crate::localization::MessageId::KbCompactContext,
+        description_id: codewhale_localization::MessageId::KbCompactContext,
         section: KeybindingSection::Sessions,
     },
     KeybindingEntry {
         // Same shifted-Ctrl family as Ctrl+Shift+A/E/O; routes through the
         // `/update install` command, so managed installs keep their gate.
         chord: "Ctrl+Shift+U",
-        description_id: crate::localization::MessageId::KbUpdateInstall,
+        description_id: codewhale_localization::MessageId::KbUpdateInstall,
         section: KeybindingSection::Sessions,
     },
     // --- Clipboard ---
@@ -340,12 +362,12 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         // Keep both terminal-client families visible: the TUI may be running
         // on Linux while the user's SSH terminal is on macOS (or vice versa).
         chord: "Cmd+V / Ctrl+Shift+V",
-        description_id: crate::localization::MessageId::KbTerminalPaste,
+        description_id: codewhale_localization::MessageId::KbTerminalPaste,
         section: KeybindingSection::Clipboard,
     },
     KeybindingEntry {
         chord: "Ctrl+V",
-        description_id: crate::localization::MessageId::KbPasteAttach,
+        description_id: codewhale_localization::MessageId::KbPasteAttach,
         section: KeybindingSection::Clipboard,
     },
     KeybindingEntry {
@@ -353,26 +375,59 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         // terminal and never become Codewhale key events. Ctrl+C is the
         // reliable in-app copy path when a Codewhale selection is active.
         chord: "Ctrl+C (selection)",
-        description_id: crate::localization::MessageId::KbCopySelection,
-        section: KeybindingSection::Clipboard,
-    },
-    KeybindingEntry {
-        chord: "Right click",
-        description_id: crate::localization::MessageId::KbContextMenu,
+        description_id: codewhale_localization::MessageId::KbCopySelection,
         section: KeybindingSection::Clipboard,
     },
     KeybindingEntry {
         chord: "@path",
-        description_id: crate::localization::MessageId::KbAttachPath,
+        description_id: codewhale_localization::MessageId::KbAttachPath,
         section: KeybindingSection::Clipboard,
+    },
+    // --- Pointer ---
+    // The mouse is a first-class input here: every one of these is wired in
+    // `tui/mouse_ui.rs`. A pointer that does nothing where a user expects it
+    // to act reads as a broken app, so what responds is documented.
+    KeybindingEntry {
+        chord: "Wheel up / down",
+        description_id: codewhale_localization::MessageId::KbPointerScroll,
+        section: KeybindingSection::Pointer,
+    },
+    KeybindingEntry {
+        chord: "Click",
+        description_id: codewhale_localization::MessageId::KbPointerClick,
+        section: KeybindingSection::Pointer,
+    },
+    KeybindingEntry {
+        chord: "Drag",
+        description_id: codewhale_localization::MessageId::KbPointerDrag,
+        section: KeybindingSection::Pointer,
+    },
+    KeybindingEntry {
+        chord: "Right click",
+        description_id: codewhale_localization::MessageId::KbContextMenu,
+        section: KeybindingSection::Pointer,
     },
     // --- Help ---
     KeybindingEntry {
-        // F1 is primary (with /help); Ctrl+/ is the secondary fallback.
-        // Alt+? stays an unadvertised handler (TUI-DOG-003).
-        chord: "F1 / Ctrl+/",
-        description_id: crate::localization::MessageId::KbHelpOverlay,
+        // `/help` leads because it is the one route that works in every
+        // terminal. F1 is eaten by tmux and several emulators, and how a
+        // terminal encodes Ctrl+/ varies; both still open help where they
+        // arrive. Alt+? stays an unadvertised handler (TUI-DOG-003).
+        chord: "/help / F1 / Ctrl+/",
+        description_id: codewhale_localization::MessageId::KbHelpOverlay,
         section: KeybindingSection::Help,
+    },
+    KeybindingEntry {
+        // The work dock was reachable but never listed here, so the only way
+        // to learn the chord was the footer's one-time hint.
+        chord: "Ctrl+Tab / Ctrl+]",
+        description_id: codewhale_localization::MessageId::KbCycleWorkDock,
+        section: KeybindingSection::Navigation,
+    },
+    KeybindingEntry {
+        chord: "Ctrl+Shift+Tab",
+        description_id: codewhale_localization::MessageId::KbCycleWorkDockBack,
+        section: KeybindingSection::Navigation,
     },
 ];
 
@@ -433,8 +488,8 @@ mod tests {
         };
 
         assert_eq!(
-            chord_for(crate::localization::MessageId::KbInsertNewline),
-            "Ctrl+J / Alt+Enter / Shift+Enter"
+            chord_for(codewhale_localization::MessageId::KbInsertNewline),
+            "Ctrl+J / Alt+Enter / Shift+Enter (enhanced terminals)"
         );
         assert!(
             KEYBINDINGS
@@ -443,22 +498,22 @@ mod tests {
                     && !entry.chord.contains("Cmd+Enter"))
         );
         assert_eq!(
-            chord_for(crate::localization::MessageId::KbStashDraft),
+            chord_for(codewhale_localization::MessageId::KbStashDraft),
             "Ctrl+G / Ctrl+S"
         );
         assert_eq!(
-            chord_for(crate::localization::MessageId::KbSendDraft),
+            chord_for(codewhale_localization::MessageId::KbSendDraft),
             "Enter"
         );
 
-        let tab_copy = crate::localization::tr(
-            crate::localization::Locale::En,
-            crate::localization::MessageId::KbCompleteCycleModes,
+        let tab_copy = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::KbCompleteCycleModes,
         );
         assert!(!tab_copy.to_ascii_lowercase().contains("queue"));
-        let stash_copy = crate::localization::tr(
-            crate::localization::Locale::En,
-            crate::localization::MessageId::KbStashDraft,
+        let stash_copy = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::KbStashDraft,
         );
         assert!(!stash_copy.to_ascii_lowercase().contains("send"));
     }
@@ -467,27 +522,31 @@ mod tests {
     fn clipboard_help_distinguishes_terminal_text_graphical_image_and_in_app_copy() {
         let terminal_paste = KEYBINDINGS
             .iter()
-            .find(|entry| entry.description_id == crate::localization::MessageId::KbTerminalPaste)
+            .find(|entry| {
+                entry.description_id == codewhale_localization::MessageId::KbTerminalPaste
+            })
             .expect("terminal paste binding should be documented");
         let graphical_paste = KEYBINDINGS
             .iter()
-            .find(|entry| entry.description_id == crate::localization::MessageId::KbPasteAttach)
+            .find(|entry| entry.description_id == codewhale_localization::MessageId::KbPasteAttach)
             .expect("graphical paste binding should be documented");
         let copy = KEYBINDINGS
             .iter()
-            .find(|entry| entry.description_id == crate::localization::MessageId::KbCopySelection)
+            .find(|entry| {
+                entry.description_id == codewhale_localization::MessageId::KbCopySelection
+            })
             .expect("copy binding should be documented");
 
         assert!(terminal_paste.chord.contains("Cmd+V"));
         assert!(terminal_paste.chord.contains("Ctrl+Shift+V"));
         assert_eq!(graphical_paste.chord, "Ctrl+V");
-        let terminal_description = crate::localization::tr(
-            crate::localization::Locale::En,
-            crate::localization::MessageId::KbTerminalPaste,
+        let terminal_description = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::KbTerminalPaste,
         );
-        let graphical_description = crate::localization::tr(
-            crate::localization::Locale::En,
-            crate::localization::MessageId::KbPasteAttach,
+        let graphical_description = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::KbPasteAttach,
         );
         assert!(!terminal_description.to_ascii_lowercase().contains("image"));
         assert!(graphical_description.to_ascii_lowercase().contains("image"));
@@ -524,7 +583,9 @@ mod tests {
     fn live_transcript_documents_command_before_shaky_chord() {
         let transcript = KEYBINDINGS
             .iter()
-            .find(|entry| entry.description_id == crate::localization::MessageId::KbLiveTranscript)
+            .find(|entry| {
+                entry.description_id == codewhale_localization::MessageId::KbLiveTranscript
+            })
             .expect("live transcript entry should be documented");
 
         assert_eq!(transcript.chord, "/transcript / Ctrl+Shift+T");
@@ -543,11 +604,22 @@ mod tests {
             "F3 / /provider"
         );
         assert_eq!(binding(ShellBindingId::Help).catalog_chord, "F1 / Ctrl+/");
+        // Every ordinary shell binding: exclusive redaction choices are
+        // advertised only by their consent screen, never as global shortcuts.
+        // The two that were
+        // not covered had already drifted (the view-cycle chord read
+        // "Ctrl+] / Ctrl+Tab" here and "Ctrl+Tab / Ctrl+]" at the source),
+        // which is exactly the rot this module's doc comment warns about.
         for id in [
             ShellBindingId::ToolDetails,
             ShellBindingId::ContextInspector,
             ShellBindingId::ProviderRoute,
             ShellBindingId::Help,
+            ShellBindingId::Settings,
+            ShellBindingId::ModeCycle,
+            ShellBindingId::PermissionCycle,
+            ShellBindingId::ViewCycle,
+            ShellBindingId::ViewCycleBack,
         ] {
             let chord = binding(id).catalog_chord;
             assert!(
@@ -570,10 +642,10 @@ mod tests {
         // Turn Inspector moved to Ctrl+Alt+O.
         assert_eq!(
             ctrl_o.description_id,
-            crate::localization::MessageId::KbReasoningDetail
+            codewhale_localization::MessageId::KbReasoningDetail
         );
         assert_eq!(
-            crate::localization::tr(crate::localization::Locale::En, ctrl_o.description_id,),
+            codewhale_localization::tr(codewhale_localization::Locale::En, ctrl_o.description_id,),
             "Open reasoning detail for the selected or current turn"
         );
 
@@ -583,10 +655,13 @@ mod tests {
             .expect("Ctrl+Alt+O keybinding should be documented");
         assert_eq!(
             ctrl_alt_o.description_id,
-            crate::localization::MessageId::KbTurnInspector
+            codewhale_localization::MessageId::KbTurnInspector
         );
         assert_eq!(
-            crate::localization::tr(crate::localization::Locale::En, ctrl_alt_o.description_id,),
+            codewhale_localization::tr(
+                codewhale_localization::Locale::En,
+                ctrl_alt_o.description_id,
+            ),
             "Open Turn Inspector"
         );
 
@@ -595,8 +670,8 @@ mod tests {
             .find(|entry| entry.chord == "Ctrl+Shift+O / F4")
             .expect("external-editor keybinding should be documented");
         assert_eq!(
-            crate::localization::tr(crate::localization::Locale::En, editor.description_id,),
-            "Open composer draft in external editor"
+            codewhale_localization::tr(codewhale_localization::Locale::En, editor.description_id,),
+            "Edit the draft externally"
         );
     }
 
@@ -608,11 +683,11 @@ mod tests {
             .expect("Ctrl+Shift+U keybinding should be documented");
         assert_eq!(
             entry.description_id,
-            crate::localization::MessageId::KbUpdateInstall
+            codewhale_localization::MessageId::KbUpdateInstall
         );
         assert_eq!(entry.section, KeybindingSection::Sessions);
         assert_eq!(
-            crate::localization::tr(crate::localization::Locale::En, entry.description_id),
+            codewhale_localization::tr(codewhale_localization::Locale::En, entry.description_id),
             "Check for and install the latest Codewhale update (`/update install`)"
         );
     }
@@ -626,7 +701,7 @@ mod tests {
 
         assert_eq!(
             ctrl_x_activity.description_id,
-            crate::localization::MessageId::KbCancelBackgroundShellJobs
+            codewhale_localization::MessageId::KbCancelBackgroundShellJobs
         );
     }
 
@@ -635,7 +710,7 @@ mod tests {
         let selected_details = KEYBINDINGS
             .iter()
             .filter(|entry| {
-                entry.description_id == crate::localization::MessageId::KbSelectedDetails
+                entry.description_id == codewhale_localization::MessageId::KbSelectedDetails
             })
             .map(|entry| entry.chord)
             .collect::<Vec<_>>();
@@ -661,7 +736,7 @@ mod tests {
         struct Use {
             chord: &'static str,
             alternative: String,
-            description_id: crate::localization::MessageId,
+            description_id: codewhale_localization::MessageId,
         }
 
         let mut uses_by_key: std::collections::BTreeMap<String, Vec<Use>> =
@@ -734,12 +809,12 @@ mod tests {
         assert_eq!(stash_entries[0].chord, "Ctrl+G / Ctrl+S");
         assert_eq!(
             stash_entries[0].description_id,
-            crate::localization::MessageId::KbStashDraft
+            codewhale_localization::MessageId::KbStashDraft
         );
 
-        let copy = crate::localization::tr(
-            crate::localization::Locale::En,
-            crate::localization::MessageId::KbStashDraft,
+        let copy = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::KbStashDraft,
         )
         .to_ascii_lowercase();
         for forbidden in ["send", "queue", "steer", "submit", "save"] {
@@ -767,7 +842,7 @@ mod tests {
         };
 
         assert_eq!(
-            entry_for(crate::localization::MessageId::KbSendDraft).chord,
+            entry_for(codewhale_localization::MessageId::KbSendDraft).chord,
             "Enter"
         );
         assert!(
@@ -777,13 +852,13 @@ mod tests {
                     && !entry.chord.contains("Cmd+Enter"))
         );
         assert_eq!(
-            entry_for(crate::localization::MessageId::KbInsertNewline).chord,
-            "Ctrl+J / Alt+Enter / Shift+Enter"
+            entry_for(codewhale_localization::MessageId::KbInsertNewline).chord,
+            "Ctrl+J / Alt+Enter / Shift+Enter (enhanced terminals)"
         );
 
-        let newline_copy = crate::localization::tr(
-            crate::localization::Locale::En,
-            crate::localization::MessageId::KbInsertNewline,
+        let newline_copy = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::KbInsertNewline,
         )
         .to_ascii_lowercase();
         for forbidden in ["send", "steer", "queue"] {

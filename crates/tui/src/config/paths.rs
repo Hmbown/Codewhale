@@ -85,6 +85,21 @@ pub(crate) fn home_config_path() -> Option<PathBuf> {
     home_config_path_from_environment()
 }
 
+/// Compare the physical user-global document using the same parent path
+/// normalization and file-symlink rejection as ConfigStore.
+pub(crate) fn is_home_config_path(path: &Path) -> bool {
+    let Some(home) = home_config_path() else {
+        return false;
+    };
+    match (
+        codewhale_config::resolve_config_path(Some(home)),
+        codewhale_config::resolve_config_path(Some(path.to_path_buf())),
+    ) {
+        (Ok(home), Ok(path)) => home == path,
+        _ => false,
+    }
+}
+
 fn home_config_path_from_environment() -> Option<PathBuf> {
     match codewhale_home_dir() {
         Ok(Some(home)) => return Some(home.join(codewhale_config::CONFIG_FILE_NAME)),

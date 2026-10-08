@@ -1,0 +1,144 @@
+/* ------------------------------------------------------------------ */
+/*  Docs overrides (owned with the docs pages; kept last in cascade)   */
+/* ------------------------------------------------------------------ */
+
+/* ---------- docs: the reading sheet ---------- */
+/* Read mode: comprehension first. The article gets a book measure, the
+   Shannon Sans heading voice, generous leading, and a contents rail that
+   stays put while the sheet scrolls. */
+.docs-content {
+  max-width: 46rem;
+}
+
+.docs-content h1 {
+  font-size: clamp(2.2rem, 3.6vw, 3rem);
+  line-height: 1.05;
+  margin-bottom: 0.35rem;
+}
+
+.docs-content h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: clamp(1.5rem, 2.2vw, 1.9rem);
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  margin-bottom: 0.25rem;
+}
+
+.docs-content h3 {
+  font-size: 1.05rem;
+}
+
+.docs-content p,
+.docs-content li {
+  max-width: 66ch;
+  font-size: var(--text-prose);
+  line-height: var(--leading-prose);
+}
+
+/* A step card is a panel, not a line of prose: its rows span the card so
+   the dividers meet both edges. */
+.docs-content .gs-steps li { max-width: none; }
+
+.docs-content > section + section {
+  padding-top: 0.5rem;
+}
+
+.docs-content code.inline {
+  background: var(--paper-card);
+  border-color: var(--hairline);
+}
+
+.docs-content pre.code-block {
+  margin-block: 1rem;
+}
+
+/* The contents rail: a running index in the margin, sticky on tall screens. */
+@media (min-width: 901px) {
+  .docs-sidebar {
+    position: sticky;
+    top: 5.25rem;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    padding-right: 0.5rem;
+  }
+}
+
+.docs-sidebar-heading {
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.docs-sidebar-category {
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+}
+
+.docs-sidebar-link {
+  font-size: 0.86rem;
+  padding-block: 0.36rem;
+}
+
+.docs-sidebar-link-current {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* The link is a flex row (label, then an optional external arrow); the
+   current-page tick is its first item, and the label grows so the tick stays
+   beside it instead of being pushed to the far edge. */
+.docs-sidebar-link-current::before {
+  content: "";
+  flex: none;
+  width: 0.4rem;
+  height: 1px;
+  margin-inline-end: -0.35rem;
+  background: var(--indigo);
+}
+.docs-sidebar-link > span:first-child { flex: 1 1 auto; min-width: 0; }
+
+/* Topic rows on the hub: a title with room to breathe. */
+.docs-topic-title {
+  font-size: 0.98rem;
+}
+
+.docs-topic-main p {
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+
+.docs-result-heading h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.6rem;
+}
+
+/* The docs hero band: the mark and the release line as one running head. */
+.docs-portal .hero {
+  padding-block: 1rem;
+  background: var(--paper-deep);
+}
+
+.docs-portal .portal-mark {
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.release-truth {
+  margin-top: 0;
+}
+
+/* Contextual help plate at the foot of every page, on the sheet's own card. */
+.docs-help {
+  background: var(--paper-card);
+  border-color: var(--hairline);
+}
+
+.docs-help-copy h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.4rem;
+}

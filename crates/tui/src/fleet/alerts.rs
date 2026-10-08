@@ -715,6 +715,7 @@ mod tests {
                 notes: Some("regex scorer could not be compiled".to_string()),
             }),
             resolved_route: None,
+            saved_session_id: None,
             effective_permissions: None,
         };
 

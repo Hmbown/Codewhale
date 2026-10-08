@@ -48,8 +48,6 @@ pub(crate) enum CredentialSource {
     /// `--api-key` on the command line (or the dispatcher's source-marked
     /// forward of it).
     CliOverride,
-    /// The root `api_key` compatibility slot in the config file.
-    RootConfigApiKey,
     /// `[providers.<table>] api_key`.
     ProviderConfigApiKey { table: String },
     /// `[providers.<table>] api_key_env = "<var>"`, resolved from `<var>`.
@@ -60,11 +58,19 @@ pub(crate) enum CredentialSource {
     SecretStore { slot: String },
     /// A read-only, explicitly consented credential file owned by another CLI.
     ExternalGrant { cli: String, path: String },
-    /// CodeWhale-owned OAuth device-login storage (xAI today).
-    OAuth { flow: String },
+    /// A subscription OAuth sign-in: Codewhale-owned storage, or (xAI) a
+    /// consented Grok CLI import. `account` is the display label (email,
+    /// plan) of the account it signs in as, taken from the same read that
+    /// proved the sign-in usable; never token material.
+    OAuth {
+        flow: String,
+        account: Option<String>,
+    },
     /// The user-global `~/.codewhale/config.toml`, consulted last so a key
     /// saved there survives loading a workspace config.
     UserGlobalConfig,
+    /// An expiring, process-only Codewhale account auth transform.
+    AccountSession,
     /// Nothing had a credential. `probed` is in precedence order.
     Missing { probed: Vec<CredentialProbe> },
 }
@@ -79,9 +85,11 @@ impl CredentialSource {
     pub(crate) fn label(&self) -> Cow<'static, str> {
         match self {
             Self::AuthModeNone => Cow::Borrowed("auth_mode = \"none\""),
-            Self::KeylessRoute { base_url } => Cow::Owned(format!("keyless route {base_url}")),
+            Self::KeylessRoute { base_url } => Cow::Owned(format!(
+                "keyless route {}",
+                crate::doctor::structural_url_authority(base_url)
+            )),
             Self::CliOverride => Cow::Borrowed("--api-key"),
-            Self::RootConfigApiKey => Cow::Borrowed("config api_key"),
             Self::ProviderConfigApiKey { table } => Cow::Owned(format!("[{table}] api_key")),
             Self::ProviderConfigEnv { var } => Cow::Owned(format!("api_key_env {var}")),
             Self::AmbientEnv { var } => Cow::Owned(var.clone()),
@@ -89,7 +97,8 @@ impl CredentialSource {
             Self::ExternalGrant { cli, path } => {
                 Cow::Owned(format!("{cli} credentials (read-only) {path}"))
             }
-            Self::OAuth { flow } => Cow::Owned(format!("{flow} OAuth")),
+            Self::OAuth { flow, .. } => Cow::Owned(format!("{flow} OAuth")),
+            Self::AccountSession => Cow::Borrowed("Codewhale account"),
             Self::UserGlobalConfig => Cow::Borrowed("~/.codewhale/config.toml api_key"),
             Self::Missing { .. } => Cow::Borrowed("not found"),
         }
@@ -145,5 +154,42 @@ impl CredentialResolution {
             .probed()
             .iter()
             .find_map(|probe| probe.fix.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod private_label_tests {
+    use super::CredentialSource;
+    #[test]
+    fn keyless_label_omits_credentials_and_still_names_the_endpoint() {
+        for url in [
+            "https://user:label-s10-synthetic@gateway.invalid/v1",
+            "https://label-s10-synthetic@gateway.invalid/v1",
+            "https://gateway.invalid/key/label-s10-synthetic/v1",
+            "https://gateway.invalid/v1?token=label-s10-synthetic",
+            "https://gateway.invalid/v1#label-s10-synthetic",
+        ] {
+            let label = CredentialSource::KeylessRoute {
+                base_url: url.into(),
+            }
+            .label()
+            .into_owned();
+            assert_eq!(label, "keyless route https://gateway.invalid");
+        }
+        let label = CredentialSource::KeylessRoute {
+            base_url: "http://localhost:11434/v1".into(),
+        }
+        .label()
+        .into_owned();
+        assert_eq!(label, "keyless route http://localhost:11434");
+        for url in ["not a url", "file:///etc/passwd", ""] {
+            let label = CredentialSource::KeylessRoute {
+                base_url: url.into(),
+            }
+            .label()
+            .into_owned();
+            assert!(label.contains("configured value omitted"));
+            assert!(!label.contains("passwd"));
+        }
     }
 }

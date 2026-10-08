@@ -203,7 +203,7 @@ pub(crate) fn version_hint_from_custom_release_json(
 
 pub(crate) fn version_hint_from_latest_tag(tag: &str, current: &str) -> Option<UpdateNotice> {
     let latest = tag.trim_start_matches('v');
-    if !is_newer_version(latest, current) {
+    if !codewhale_release::compare_release_versions(current, tag).is_ok_and(|order| order.is_lt()) {
         return None;
     }
 
@@ -244,21 +244,38 @@ pub(crate) fn release_has_uploaded_asset(json: &serde_json::Value, required: &st
     })
 }
 
-pub(crate) fn is_newer_version(latest: &str, current: &str) -> bool {
-    // Compare semver so dev builds (e.g. "0.8.46-pre") don't trigger false
-    // hints. Falls back to string compare on unparseable versions.
-    match (parse_semver(latest), parse_semver(current)) {
-        (Some(l), Some(c)) => l > c,
-        _ => latest != current,
-    }
-}
+#[cfg(test)]
+mod version_tests {
+    use super::version_hint_from_latest_tag;
 
-/// Parse a `major.minor.patch` version string into a comparable tuple.
-/// Returns `None` on any parse failure (non-semver, dev suffixes, etc.).
-pub(crate) fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = v.splitn(3, '.');
-    let major = parts.next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.parse::<u32>().ok()?;
-    let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
-    Some((major, minor, patch))
+    #[test]
+    fn version_hint_keeps_a_newer_development_or_stamped_build() {
+        for current in ["0.9.12-pre", "0.9.12-beta.2", "0.9.12 (abc123)", "0.9.12"] {
+            assert!(
+                version_hint_from_latest_tag("v0.9.11", current).is_none(),
+                "{current}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_hint_offers_stable_after_its_prerelease() {
+        let notice = version_hint_from_latest_tag("v0.9.12", "0.9.12-beta.2")
+            .expect("the stable release is newer than its beta");
+        assert_eq!(notice.latest, "0.9.12");
+        assert_eq!(notice.current, "0.9.12-beta.2");
+    }
+
+    #[test]
+    fn version_hint_does_not_replace_stable_with_a_prerelease() {
+        assert!(version_hint_from_latest_tag("v0.9.12-beta.2", "0.9.12").is_none());
+        assert!(version_hint_from_latest_tag("v0.9.12", "0.9.12 (abc123)").is_none());
+    }
+
+    #[test]
+    fn version_hint_does_not_guess_when_a_version_is_invalid() {
+        for (latest, current) in [("nightly", "0.9.12"), ("0.9.12", "unknown")] {
+            assert!(version_hint_from_latest_tag(latest, current).is_none());
+        }
+    }
 }

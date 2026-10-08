@@ -1,0 +1,19 @@
+{
+  "description": "tool_call_before: a hook answers a JSON deny with a reason; the call is refused with that (sanitized) reason.",
+  "event": "tool_call_before",
+  "model": "deepseek-v4-pro",
+  "tool": {
+    "name": "Bash",
+    "call_id": "call_hook_bash",
+    "input": {
+      "command": "rm -rf build"
+    }
+  },
+  "hooks": [
+    {
+      "event": "tool_call_before",
+      "name": "policy",
+      "command": "{{capture}} policy; printf '%s' '{\"decision\":\"deny\",\"reason\":\"conformance policy blocks rm -rf\"}'"
+    }
+  ]
+}

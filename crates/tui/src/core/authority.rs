@@ -8,12 +8,32 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::sandbox::SandboxPolicy;
+use crate::tools::canonical_action::canonical_action_alias;
 use crate::tools::spec::{ApprovalRequirement, normalize_path};
-use crate::tui::app::AppMode;
-use crate::tui::approval::ApprovalMode;
 use crate::worker_profile::ShellPolicy;
+use codewhale_config::AppMode;
+use codewhale_execpolicy::ApprovalMode;
+use serde_json::Value;
 
 use super::ops::UserInputProvenance;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOrigin {
+    Interactive,
+    Headless,
+    Background,
+}
+
+impl RunOrigin {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Headless => "headless",
+            Self::Background => "background",
+        }
+    }
+}
 
 /// Durable Agent-era permission baseline that Plan/YOLO restore to (#3386).
 ///
@@ -31,7 +51,7 @@ pub(crate) struct ModeSessionPrefs {
 /// The permission policy a given [`AppMode`] resolves to (#3386).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EffectiveModePolicy {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) mode: AppMode,
     pub(crate) allow_shell: bool,
     pub(crate) trust_mode: bool,
@@ -193,11 +213,7 @@ impl TurnAuthority {
             true,
             false,
             auto_approve,
-            if auto_approve {
-                ApprovalMode::Bypass
-            } else {
-                ApprovalMode::Suggest
-            },
+            posture_from_auto_approve(auto_approve),
         )
     }
 
@@ -220,6 +236,21 @@ impl TurnAuthority {
             workspace,
             network_access,
         )
+    }
+}
+
+/// The posture a legacy `auto_approve` bit stands for: a set bit is Full
+/// Access, a cleared bit is Ask.
+///
+/// Every surface that carries the bit without a session posture folds it here —
+/// the per-tool approval gate, a tool context built with only the bit, a
+/// scheduled automation — so none of them can disagree about what it means.
+#[must_use]
+pub(crate) fn posture_from_auto_approve(auto_approve: bool) -> ApprovalMode {
+    if auto_approve {
+        ApprovalMode::Bypass
+    } else {
+        ApprovalMode::Suggest
     }
 }
 
@@ -291,15 +322,6 @@ pub(crate) fn provenance_can_inherit_standing_auto_authority(
             | UserInputProvenance::Runtime
             | UserInputProvenance::SubAgentHandoff
     )
-}
-
-/// Whether the active permission posture may pause the turn for a user
-/// decision. Auto-Review is the fully autonomous posture: it must decide from
-/// available context and keep moving. Tool approval and user-question policy
-/// stay deliberately separate in every other posture.
-#[must_use]
-pub(crate) fn permission_posture_allows_questions(approval_mode: ApprovalMode) -> bool {
-    approval_mode != ApprovalMode::Auto
 }
 
 #[must_use]
@@ -585,7 +607,9 @@ fn carve_out_relative_path_allowed(relative: &Path) -> bool {
 /// `.git` internals, runtime/project state, credential-bearing directories
 /// and files, and key material.
 fn is_carve_out_excluded_name(name: &str) -> bool {
-    if name == ".git" {
+    // The shared `.git` rule, so a Windows alias (`.git.`, `GIT~1`) is
+    // excluded here exactly as the workspace file routes exclude it.
+    if crate::snapshot::is_git_metadata_name(OsStr::new(name)) {
         return true;
     }
     // Runtime/project state and credential-bearing directories. `.codewhale`
@@ -650,15 +674,20 @@ pub(crate) enum ApprovalRequestDisposition {
 ///
 /// `session_approved` / `session_denied` are the caller's lookups into the
 /// session approval caches (grouping key or tool name / exact approval key).
-/// The branch order is the legacy handler's order: session denial, then the
-/// full-access forced-hold denial, then auto-approval (full access or a
-/// session grant), then the `Never` denial, and only finally a modal.
+/// The branch order: session denial, then the Auto-Review hold, then the
+/// full-access policy-hold denial, then the `Never` denial — the live posture
+/// wins over any remembered grant (approvals J) — then auto-approval (full
+/// access or a session grant), and only finally a modal. Extension-origin
+/// forced calls reach that modal even under Full Access; no remembered grant
+/// can satisfy them. `extension_origin` comes from Rust-minted approval keys,
+/// never an extension label or a claim supplied by the host.
 #[must_use]
 pub(crate) fn resolve_approval_request_disposition(
     authority: &TurnAuthority,
     session_approved: bool,
     session_denied: bool,
     approval_force_prompt: bool,
+    extension_origin: bool,
 ) -> ApprovalRequestDisposition {
     if session_denied {
         return ApprovalRequestDisposition::AutoDenySessionDenied;
@@ -670,16 +699,120 @@ pub(crate) fn resolve_approval_request_disposition(
     // itself. What remains is the posture question: how does this authority
     // treat an ordinary promptable tool?
     let posture = resolve_tool_permission(authority, ApprovalRequirement::Suggest, false);
-    if approval_force_prompt && posture == ToolPermission::Allow {
+    if approval_force_prompt && !extension_origin && posture == ToolPermission::Allow {
         return ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold;
+    }
+    // The live posture wins over any remembered grant: a conversation grant
+    // given under Ask never outlives a later switch to Never (approvals J).
+    if posture == ToolPermission::Deny {
+        return ApprovalRequestDisposition::AutoDenyNeverPosture;
     }
     if !approval_force_prompt && (posture == ToolPermission::Allow || session_approved) {
         return ApprovalRequestDisposition::AutoApprove;
     }
-    if posture == ToolPermission::Deny {
-        return ApprovalRequestDisposition::AutoDenyNeverPosture;
-    }
     ApprovalRequestDisposition::Prompt
+}
+
+/// Categorizes tools by cost/risk level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCategory {
+    /// Free, read-only operations (`list_dir`, `read_file`, todo_*)
+    Safe,
+    /// File modifications (`write_file`, `edit_file`)
+    FileWrite,
+    /// Shell execution (`exec_shell`)
+    Shell,
+    /// Network-oriented built-in tools
+    Network,
+    /// Read-only MCP discovery and resource access
+    McpRead,
+    /// MCP actions that may change remote state
+    McpAction,
+    /// Sub-agent lifecycle (`agent` start/status/peek/cancel); the child's
+    /// own tool gates govern what it may actually do.
+    Agent,
+    /// Unknown or unclassified tool surface
+    Unknown,
+}
+
+/// Get the category for a tool by name.
+pub fn get_tool_category(name: &str) -> ToolCategory {
+    if name == "agent" || name == "workflow" {
+        // Workflow is multi-agent orchestration; reuse Agent stakes/routing
+        // and specialize the impact card via build_impact_summary (#4126).
+        ToolCategory::Agent
+    } else if matches!(
+        name,
+        "write" | "edit" | "write_file" | "edit_file" | "apply_patch"
+    ) {
+        ToolCategory::FileWrite
+    } else if matches!(
+        name,
+        "web_run" | "web_search" | "fetch_url" | "wait_for_dev_server" | "registry_sync"
+    ) {
+        ToolCategory::Network
+    } else if matches!(
+        name,
+        "bash"
+            | "Bash"
+            | "exec_shell"
+            | "task_shell_start"
+            | "task_shell_wait"
+            | "exec_shell_wait"
+            | "exec_shell_interact"
+            | "exec_shell_cancel"
+            | "exec_wait"
+            | "exec_interact"
+    ) {
+        ToolCategory::Shell
+    } else if name.starts_with("list_mcp_")
+        || name.starts_with("read_mcp_")
+        || name.starts_with("get_mcp_")
+    {
+        ToolCategory::McpRead
+    } else if name.starts_with("mcp_") {
+        ToolCategory::McpAction
+    } else if matches!(
+        name,
+        "read"
+            | "read_file"
+            | "list_dir"
+            | "work_update"
+            | "todo_write"
+            | "todo_read"
+            | "checklist_write"
+            | "note"
+            | "update_plan"
+            | "search"
+            | "file_search"
+            | "grep_files"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
+            | "git_blame"
+            | "git_commit_plan"
+            | "project"
+            | "diagnostics"
+    ) || name.starts_with("read_")
+        || name.starts_with("list_")
+        || name.starts_with("get_")
+    {
+        ToolCategory::Safe
+    } else if matches!(name, "start_mcp_server" | "start_registry_mcp_server") {
+        // Starting an MCP server spawns child processes or opens network
+        // connections — classify as McpAction to trigger appropriate
+        // approval prompts.
+        ToolCategory::McpAction
+    } else {
+        ToolCategory::Unknown
+    }
+}
+
+/// Categorize a concrete call after resolving an action-based canonical tool.
+#[must_use]
+pub fn get_tool_category_for_call(name: &str, params: &Value) -> ToolCategory {
+    get_tool_category(canonical_action_alias(name, params))
 }
 
 #[cfg(test)]
@@ -780,6 +913,26 @@ mod tests {
                 "{paths:?} must keep the modal"
             );
         }
+    }
+
+    #[test]
+    fn carve_out_excludes_git_metadata_by_the_shared_rule() {
+        let tmp = carve_out_workspace();
+        let workspace = tmp.path();
+        let mut refused = vec![".GIT/config", "nested/.Git/hooks/pre-commit"];
+        if cfg!(windows) {
+            refused.extend([".git./config", ".git /config", "GIT~1/config"]);
+        }
+        for path in refused {
+            assert!(
+                !paths_within_workspace_write_carve_out(workspace, &[path.to_string()]),
+                "{path} must keep the modal"
+            );
+        }
+        assert!(paths_within_workspace_write_carve_out(
+            workspace,
+            &[".github/workflows/ci.yml".to_string()]
+        ));
     }
 
     #[test]
@@ -957,6 +1110,48 @@ mod tests {
     }
 
     #[test]
+    fn outbound_web_payloads_require_a_session_decision_even_for_allowed_hosts() {
+        use crate::tools::{
+            fetch_url::FetchUrlTool, spec::ToolSpec, web_run::WebRunTool,
+            web_search::WebSearchTool, web_tool::WebTool,
+        };
+        let request = serde_json::json!({"action": "fetch", "url": "https://example.com/collect?data=synthetic-secret"});
+        for requirement in [
+            FetchUrlTool.approval_requirement_for(&request),
+            WebTool::new("Web").approval_requirement_for(&request),
+            WebSearchTool.approval_requirement(),
+            WebRunTool.approval_requirement(),
+        ] {
+            for approval in [ApprovalMode::Suggest, ApprovalMode::Auto] {
+                let ask = authority(AppMode::Agent, false, approval);
+                assert_eq!(
+                    resolve_tool_permission(&ask, requirement, false),
+                    ToolPermission::Prompt
+                );
+            }
+            let never = authority(AppMode::Agent, false, ApprovalMode::Never);
+            assert_eq!(
+                resolve_tool_permission(&never, requirement, false),
+                ToolPermission::Deny
+            );
+            let granted = authority(AppMode::Agent, true, ApprovalMode::Bypass);
+            assert_eq!(
+                resolve_tool_permission(&granted, requirement, false),
+                ToolPermission::Allow
+            );
+        }
+        let local_read = crate::tools::file::ReadFileTool.approval_requirement();
+        assert_eq!(
+            resolve_tool_permission(
+                &authority(AppMode::Agent, false, ApprovalMode::Suggest),
+                local_read,
+                false
+            ),
+            ToolPermission::Allow
+        );
+    }
+
+    #[test]
     fn auto_requirement_always_allows() {
         for (mode, auto_approve, approval_mode) in [
             (AppMode::Agent, false, ApprovalMode::Suggest),
@@ -1059,42 +1254,43 @@ mod tests {
 
         // Session denial wins over everything, including full access.
         assert_eq!(
-            resolve_approval_request_disposition(&full_access, true, true, false),
+            resolve_approval_request_disposition(&full_access, true, true, false, false),
             ApprovalRequestDisposition::AutoDenySessionDenied
         );
         // Forced hold under full access fails closed instead of auto-approving.
         assert_eq!(
-            resolve_approval_request_disposition(&full_access, true, false, true),
+            resolve_approval_request_disposition(&full_access, true, false, true, false),
             ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold
         );
         // Full access and session grants auto-approve ordinary requests.
         assert_eq!(
-            resolve_approval_request_disposition(&full_access, false, false, false),
+            resolve_approval_request_disposition(&full_access, false, false, false, false),
             ApprovalRequestDisposition::AutoApprove
         );
         assert_eq!(
-            resolve_approval_request_disposition(&ask, true, false, false),
+            resolve_approval_request_disposition(&ask, true, false, false, false),
             ApprovalRequestDisposition::AutoApprove
         );
-        // A session grant still auto-approves under Never (legacy order), and
-        // Never denies everything else promptable.
+        // The live Never posture wins over a remembered session grant
+        // (approvals J, CURRENT_DECISIONS §21), and denies everything else
+        // promptable.
         assert_eq!(
-            resolve_approval_request_disposition(&never, true, false, false),
-            ApprovalRequestDisposition::AutoApprove
+            resolve_approval_request_disposition(&never, true, false, false, false),
+            ApprovalRequestDisposition::AutoDenyNeverPosture
         );
         assert_eq!(
-            resolve_approval_request_disposition(&never, false, false, false),
+            resolve_approval_request_disposition(&never, false, false, false, false),
             ApprovalRequestDisposition::AutoDenyNeverPosture
         );
         for force_prompt in [false, true] {
             assert_eq!(
-                resolve_approval_request_disposition(&auto, false, false, force_prompt),
+                resolve_approval_request_disposition(&auto, false, false, force_prompt, false),
                 ApprovalRequestDisposition::AutoDenyAutoReview
             );
         }
         // Ask posture with no grant opens the modal.
         assert_eq!(
-            resolve_approval_request_disposition(&ask, false, false, false),
+            resolve_approval_request_disposition(&ask, false, false, false, false),
             ApprovalRequestDisposition::Prompt
         );
     }

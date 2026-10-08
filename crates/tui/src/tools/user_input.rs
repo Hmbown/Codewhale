@@ -7,6 +7,85 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Default ceiling on `request_user_input.questions` (#5949). Raised from the
+/// former hard-coded 3 so research/planning turns that need four or more
+/// clarifications are not rejected outright.
+pub const DEFAULT_MAX_QUESTIONS: usize = 6;
+/// Default ceiling on options per question.
+pub const DEFAULT_MAX_OPTIONS: usize = 4;
+/// Inclusive bounds a configured `user_input_max_questions` is clamped into.
+pub const MIN_CONFIGURABLE_QUESTIONS: usize = 1;
+pub const MAX_CONFIGURABLE_QUESTIONS: usize = 10;
+/// Inclusive bounds a configured `user_input_max_options` is clamped into.
+/// The floor is 2 because a one-option question is not a choice.
+pub const MIN_CONFIGURABLE_OPTIONS: usize = 2;
+pub const MAX_CONFIGURABLE_OPTIONS: usize = 10;
+
+/// Config key naming used in both the clamp WARN and the rejection message, so
+/// a model that hits the ceiling is told exactly where to raise it.
+pub const MAX_QUESTIONS_KEY: &str = "[tools] user_input_max_questions";
+pub const MAX_OPTIONS_KEY: &str = "[tools] user_input_max_options";
+
+/// Effective `request_user_input` payload ceilings for one session.
+///
+/// Resolved once from `[tools]` in config.toml (see
+/// [`crate::config::Config::user_input_limits`]) and carried to the three
+/// places that must agree: the validator, the tool's JSON schema, and its
+/// model-visible description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserInputLimits {
+    pub max_questions: usize,
+    pub max_options: usize,
+}
+
+impl Default for UserInputLimits {
+    fn default() -> Self {
+        Self {
+            max_questions: DEFAULT_MAX_QUESTIONS,
+            max_options: DEFAULT_MAX_OPTIONS,
+        }
+    }
+}
+
+impl UserInputLimits {
+    /// Resolve raw `[tools]` values, clamping each into its supported range.
+    /// An out-of-range value is honoured as far as it can be rather than
+    /// failing the load, and says so once with the key and the value used.
+    #[must_use]
+    pub fn from_config_values(max_questions: Option<u32>, max_options: Option<u32>) -> Self {
+        Self {
+            max_questions: clamp_with_warn(
+                max_questions,
+                DEFAULT_MAX_QUESTIONS,
+                MIN_CONFIGURABLE_QUESTIONS,
+                MAX_CONFIGURABLE_QUESTIONS,
+                MAX_QUESTIONS_KEY,
+            ),
+            max_options: clamp_with_warn(
+                max_options,
+                DEFAULT_MAX_OPTIONS,
+                MIN_CONFIGURABLE_OPTIONS,
+                MAX_CONFIGURABLE_OPTIONS,
+                MAX_OPTIONS_KEY,
+            ),
+        }
+    }
+}
+
+fn clamp_with_warn(raw: Option<u32>, default: usize, min: usize, max: usize, key: &str) -> usize {
+    let Some(raw) = raw else {
+        return default;
+    };
+    let raw = raw as usize;
+    let clamped = raw.clamp(min, max);
+    if clamped != raw {
+        tracing::warn!(
+            "`{key}` = {raw} is outside the supported range {min}..={max}; using {clamped}"
+        );
+    }
+    clamped
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInputOption {
     pub label: String,
@@ -35,24 +114,45 @@ pub struct UserInputRequest {
 }
 
 impl UserInputRequest {
+    /// Parse and validate against the built-in default limits. Call sites that
+    /// hold a session's resolved config use [`Self::from_value_with_limits`].
+    #[cfg(test)]
     pub fn from_value(value: &Value) -> Result<Self, ToolError> {
+        Self::from_value_with_limits(value, UserInputLimits::default())
+    }
+
+    pub fn from_value_with_limits(
+        value: &Value,
+        limits: UserInputLimits,
+    ) -> Result<Self, ToolError> {
         let request: UserInputRequest = serde_json::from_value(value.clone()).map_err(|e| {
             ToolError::invalid_input(format!("Invalid request_user_input payload: {e}"))
         })?;
-        request.validate()?;
+        request.validate_with_limits(limits)?;
         Ok(request)
     }
 
+    #[cfg(test)]
     pub fn validate(&self) -> Result<(), ToolError> {
+        self.validate_with_limits(UserInputLimits::default())
+    }
+
+    pub fn validate_with_limits(&self, limits: UserInputLimits) -> Result<(), ToolError> {
         if self.questions.is_empty() {
             return Err(ToolError::invalid_input(
                 "request_user_input.questions must be non-empty",
             ));
         }
-        if self.questions.len() > 3 {
-            return Err(ToolError::invalid_input(
-                "request_user_input.questions must contain 1 to 3 items",
-            ));
+        if self.questions.len() > limits.max_questions {
+            // Name the ceiling *and* where to raise it: a rejection the model
+            // cannot act on just burns another turn (#5949).
+            return Err(ToolError::invalid_input(format!(
+                "request_user_input.questions must contain 1 to {max} items (got {got}); \
+                 raise the ceiling with `{MAX_QUESTIONS_KEY}` in config.toml \
+                 (supported range {MIN_CONFIGURABLE_QUESTIONS}..={MAX_CONFIGURABLE_QUESTIONS})",
+                max = limits.max_questions,
+                got = self.questions.len(),
+            )));
         }
         for q in &self.questions {
             if q.header.trim().is_empty() {
@@ -70,10 +170,15 @@ impl UserInputRequest {
                     "request_user_input.questions.question cannot be empty",
                 ));
             }
-            if q.options.len() < 2 || q.options.len() > 4 {
-                return Err(ToolError::invalid_input(
-                    "request_user_input.questions.options must contain 2 to 4 items",
-                ));
+            if q.options.len() < MIN_CONFIGURABLE_OPTIONS || q.options.len() > limits.max_options {
+                return Err(ToolError::invalid_input(format!(
+                    "request_user_input.questions.options must contain \
+                     {MIN_CONFIGURABLE_OPTIONS} to {max} items (got {got}); \
+                     raise the ceiling with `{MAX_OPTIONS_KEY}` in config.toml \
+                     (supported range {MIN_CONFIGURABLE_OPTIONS}..={MAX_CONFIGURABLE_OPTIONS})",
+                    max = limits.max_options,
+                    got = q.options.len(),
+                )));
             }
             for opt in &q.options {
                 if opt.label.trim().is_empty() {
@@ -104,7 +209,35 @@ pub struct UserInputResponse {
     pub answers: Vec<UserInputAnswer>,
 }
 
-pub struct RequestUserInputTool;
+pub struct RequestUserInputTool {
+    limits: UserInputLimits,
+    /// Rendered once at construction: `description` hands out a borrow, and the
+    /// effective ceiling only changes when the registry is rebuilt.
+    description: String,
+}
+
+impl Default for RequestUserInputTool {
+    fn default() -> Self {
+        Self::new(UserInputLimits::default())
+    }
+}
+
+impl RequestUserInputTool {
+    #[must_use]
+    pub fn new(limits: UserInputLimits) -> Self {
+        Self {
+            description: format!(
+                "Ask the user 1-{} short questions with selectable options and return their \
+selections. It is for decisions that are the user's to make, where a guess would be costly \
+or wrong: ambiguous scope, an irreversible or expensive choice, a missing preference, or a \
+fork the user should own. It returns the user's choices, not facts about the workspace. The \
+call blocks until the user answers.",
+                limits.max_questions
+            ),
+            limits,
+        }
+    }
+}
 
 #[async_trait]
 impl ToolSpec for RequestUserInputTool {
@@ -112,8 +245,8 @@ impl ToolSpec for RequestUserInputTool {
         "request_user_input"
     }
 
-    fn description(&self) -> &'static str {
-        "Ask the user 1-3 short questions and return their selections."
+    fn description(&self) -> &str {
+        &self.description
     }
 
     fn input_schema(&self) -> Value {
@@ -138,8 +271,8 @@ impl ToolSpec for RequestUserInputTool {
                                     },
                                     "required": ["label", "description"]
                                 },
-                                "minItems": 2,
-                                "maxItems": 4
+                                "minItems": MIN_CONFIGURABLE_OPTIONS,
+                                "maxItems": self.limits.max_options
                             },
                             "allow_free_text": {
                                 "type": "boolean",
@@ -155,7 +288,7 @@ impl ToolSpec for RequestUserInputTool {
                         "required": ["header", "id", "question", "options"]
                     },
                     "minItems": 1,
-                    "maxItems": 3
+                    "maxItems": self.limits.max_questions
                 }
             },
             "required": ["questions"]
@@ -296,16 +429,122 @@ mod tests {
         }
     }
 
+    fn questions(count: usize) -> UserInputRequest {
+        UserInputRequest {
+            questions: (1..=count)
+                .map(|i| yes_no_question(&format!("Q{i}"), &format!("q{i}")))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn default_limits_are_six_questions_and_four_options() {
+        let limits = UserInputLimits::default();
+        assert_eq!(limits.max_questions, 6);
+        assert_eq!(limits.max_options, 4);
+        // An empty `[tools]` table resolves to the same ceilings.
+        assert_eq!(UserInputLimits::from_config_values(None, None), limits);
+        let tool = RequestUserInputTool::default();
+        let description = tool.description();
+        assert!(description.contains("Ask the user 1-6 short questions"));
+        assert!(description.contains("blocks until the user answers"));
+    }
+
+    #[test]
+    fn accepts_six_questions_by_default() {
+        assert!(questions(6).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_seven_questions_and_names_the_config_key() {
+        let err = questions(7)
+            .validate()
+            .expect_err("7 questions exceeds the default ceiling of 6");
+        let msg = err.to_string();
+        assert!(msg.contains("1 to 6 items"), "{msg}");
+        assert!(msg.contains("got 7"), "{msg}");
+        assert!(msg.contains("[tools] user_input_max_questions"), "{msg}");
+        assert!(msg.contains("config.toml"), "{msg}");
+    }
+
+    #[test]
+    fn rejected_option_count_names_the_config_key() {
+        let input = json!({
+            "questions": [{
+                "header": "Pick",
+                "id": "choice",
+                "question": "Which?",
+                "options": [
+                    { "label": "A", "description": "a" },
+                    { "label": "B", "description": "b" },
+                    { "label": "C", "description": "c" },
+                    { "label": "D", "description": "d" },
+                    { "label": "E", "description": "e" }
+                ]
+            }]
+        });
+        let msg = UserInputRequest::from_value(&input)
+            .expect_err("5 options must fail")
+            .to_string();
+        assert!(msg.contains("[tools] user_input_max_options"), "{msg}");
+    }
+
+    #[test]
+    fn configured_limits_widen_and_narrow_the_validator() {
+        let wide = UserInputLimits::from_config_values(Some(9), Some(6));
+        assert!(questions(9).validate_with_limits(wide).is_ok());
+
+        let narrow = UserInputLimits::from_config_values(Some(2), None);
+        let msg = questions(3)
+            .validate_with_limits(narrow)
+            .expect_err("3 questions exceeds a configured ceiling of 2")
+            .to_string();
+        assert!(msg.contains("1 to 2 items"), "{msg}");
+    }
+
+    #[test]
+    fn out_of_range_config_values_clamp() {
+        // Below the floor and far above the ceiling both clamp instead of
+        // failing the config load.
+        let low = UserInputLimits::from_config_values(Some(0), Some(0));
+        assert_eq!(low.max_questions, MIN_CONFIGURABLE_QUESTIONS);
+        assert_eq!(low.max_options, MIN_CONFIGURABLE_OPTIONS);
+
+        let high = UserInputLimits::from_config_values(Some(50), Some(50));
+        assert_eq!(high.max_questions, MAX_CONFIGURABLE_QUESTIONS);
+        assert_eq!(high.max_options, MAX_CONFIGURABLE_OPTIONS);
+    }
+
+    #[test]
+    fn schema_and_description_reflect_configured_limits() {
+        let tool = RequestUserInputTool::new(UserInputLimits::from_config_values(Some(8), Some(5)));
+        let description = tool.description();
+        assert!(description.contains("Ask the user 1-8 short questions"));
+        assert!(description.contains("blocks until the user answers"));
+        let schema = tool.input_schema();
+        let questions = &schema["properties"]["questions"];
+        assert_eq!(questions["minItems"], json!(1));
+        assert_eq!(questions["maxItems"], json!(8));
+        let options = &questions["items"]["properties"]["options"];
+        assert_eq!(options["minItems"], json!(2));
+        assert_eq!(options["maxItems"], json!(5));
+
+        // Defaults land on the documented 6 / 4 pair.
+        let default_schema = RequestUserInputTool::default().input_schema();
+        assert_eq!(
+            default_schema["properties"]["questions"]["maxItems"],
+            json!(6)
+        );
+        assert_eq!(
+            default_schema["properties"]["questions"]["items"]["properties"]["options"]["maxItems"],
+            json!(4)
+        );
+    }
+
     #[test]
     fn rejects_too_many_questions() {
-        let request = UserInputRequest {
-            questions: vec![
-                yes_no_question("Q1", "q1"),
-                yes_no_question("Q2", "q2"),
-                yes_no_question("Q3", "q3"),
-                yes_no_question("Q4", "q4"),
-            ],
-        };
-        assert!(request.validate().is_err());
+        // Seven is one past the default ceiling; four now parses (#5949).
+        assert!(questions(4).validate().is_ok());
+        assert!(questions(7).validate().is_err());
     }
 }

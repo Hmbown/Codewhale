@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::palette;
+use codewhale_palette as palette;
 
 use super::{
     RenderMode, TRANSCRIPT_RAIL, ToolStatus, render_card_detail_line_single, render_compact_kv,

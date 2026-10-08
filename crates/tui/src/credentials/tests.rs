@@ -153,7 +153,7 @@ fn concurrent_modify_on_one_provider_refreshes_once() {
 
 /// The store module used to claim `xai_oauth` refresh was unlocked. That is
 /// false: refresh holds `with_xai_oauth_lifecycle_lock` (see
-/// `xai_oauth::concurrent_refreshes_share_one_rotated_epoch`). A doc comment
+/// `oauth::concurrent_refreshes_share_one_rotated_epoch`). A doc comment
 /// that misdescribes neighbouring code is how the next person gets misled.
 #[test]
 fn store_docs_name_the_xai_lifecycle_lock_instead_of_an_unlocked_refresh() {

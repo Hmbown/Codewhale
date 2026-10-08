@@ -3,9 +3,10 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::palette;
+use codewhale_palette as palette;
 
 use super::constants::{TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_TAIL_LINES, TOOL_TEXT_LIMIT};
 use super::{
@@ -338,13 +339,21 @@ pub fn summarize_mcp_output(output: &str) -> McpOutputSummary {
 
 #[must_use]
 pub fn output_is_image(output: &str) -> bool {
-    let lower = output.to_lowercase();
-
-    [
+    // Sniff the extensions case-insensitively over the raw bytes. Lowercasing
+    // the whole output first copied every byte of a payload that can run to
+    // hundreds of kilobytes, once per MCP completion, to answer a question
+    // about eight ASCII suffixes.
+    const IMAGE_EXTENSIONS: [&str; 8] = [
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ppm",
-    ]
-    .iter()
-    .any(|ext| lower.contains(ext))
+    ];
+
+    let bytes = output.as_bytes();
+    IMAGE_EXTENSIONS.iter().any(|ext| {
+        let needle = ext.as_bytes();
+        bytes
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    })
 }
 
 fn render_preserved_output_mode(
@@ -554,7 +563,11 @@ fn selected_output_indices(rows: &[OutputRow], line_limit: usize) -> Vec<usize> 
         return (0..total).collect();
     }
 
-    let head = TOOL_OUTPUT_HEAD_LINES.min(line_limit).min(total);
+    // Small previews must retain the result/error at the tail as well as
+    // the opening context. The usual 20-row budget still keeps 10 + 6.
+    let head = TOOL_OUTPUT_HEAD_LINES
+        .min(line_limit.div_ceil(2))
+        .min(total);
     let tail = TOOL_OUTPUT_TAIL_LINES
         .min(line_limit.saturating_sub(head))
         .min(total.saturating_sub(head));
@@ -636,7 +649,7 @@ fn is_path_or_url_like(line: &str) -> bool {
 }
 
 /// Detect whether a line contains a `path:line` pattern that could be
-/// opened by `try_open_file_at_line`. Returns a distinctive style
+/// opened by `first_file_line_reference`. Returns a distinctive style
 /// (underline + blue) when the pattern matches, or `None` otherwise.
 /// The style is applied over the existing value style so the line
 /// remains readable.
@@ -741,12 +754,12 @@ pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
 
-    for ch in text.chars() {
+    for grapheme in text.graphemes(true) {
         let tentative = if current.is_empty() {
-            ch.to_string()
+            grapheme.to_string()
         } else {
             let mut t = current.clone();
-            t.push(ch);
+            t.push_str(grapheme);
             t
         };
 
@@ -754,7 +767,7 @@ pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
             lines.push(std::mem::take(&mut current));
         }
 
-        current.push(ch);
+        current.push_str(grapheme);
     }
 
     lines.push(current);
@@ -902,5 +915,40 @@ mod ansi_colour_tests {
         let rows = output_rows("done\x1b[0m", 80);
         assert_eq!(rows[0].text, "done");
         assert!(rows[0].styled.is_none());
+    }
+
+    #[test]
+    fn image_sniffing_is_case_insensitive_over_the_raw_bytes() {
+        assert!(output_is_image("saved to /tmp/Chart.PNG"));
+        assert!(output_is_image("shot.jpeg"));
+        assert!(output_is_image(".WEBP"));
+        assert!(!output_is_image("no image here"));
+        // The historical `contains` contract is preserved: a name that merely
+        // embeds an extension still counts.
+        assert!(output_is_image("weird.pngx"));
+        // A byte-window scan must not panic on multi-byte text.
+        assert!(!output_is_image("日本語のテキストのみ"));
+        assert!(!output_is_image(""));
+    }
+
+    #[test]
+    fn wrap_text_breaks_between_graphemes() {
+        // An emoji-presentation heart and a keycap are one two-column
+        // grapheme each, the way Ratatui counts cells.
+        for text in ["ab\u{2764}\u{fe0f}cd", "ab1\u{fe0f}\u{20e3}cd"] {
+            for width in 2..=6 {
+                let lines = wrap_text(text, width);
+                let rejoined: Vec<&str> =
+                    lines.iter().flat_map(|line| line.graphemes(true)).collect();
+                assert_eq!(
+                    rejoined,
+                    text.graphemes(true).collect::<Vec<_>>(),
+                    "width {width} split a grapheme: {lines:?}"
+                );
+                for line in &lines {
+                    assert!(line.width() <= width, "line {line:?} exceeds width {width}");
+                }
+            }
+        }
     }
 }

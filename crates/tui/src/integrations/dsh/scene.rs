@@ -15,7 +15,7 @@ use ratatui::style::Color;
 
 use super::identity::sha256_hex;
 use super::skin::SkinTokens;
-use crate::palette::UiTheme;
+use codewhale_palette::UiTheme;
 
 /// `localStorage` key that turns the scene off in the browser (`"off"`).
 pub(crate) const OCEAN_STORAGE_KEY: &str = "codewhale.ocean";
@@ -51,7 +51,7 @@ fn rgb(color: Color) -> Option<(u8, u8, u8)> {
 }
 
 fn hex(color: Color) -> String {
-    crate::palette::hex_rgb_string(color).unwrap_or_else(|| "#808080".to_string())
+    codewhale_palette::hex_rgb_string(color).unwrap_or_else(|| "#808080".to_string())
 }
 
 fn rgba(color: Color, alpha: &str) -> String {

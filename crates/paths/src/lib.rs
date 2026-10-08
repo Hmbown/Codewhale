@@ -83,12 +83,23 @@ pub fn legacy_deepseek_home_override() -> Option<PathBuf> {
 /// deterministic in hermetic shells. On Windows, `HOMEDRIVE` plus `HOMEPATH`
 /// remains a compatibility fallback before the platform resolver. The platform
 /// resolver remains last for ordinary desktop launches without those variables.
+///
+/// Only an absolute candidate is a home. A relative `HOME` (`HOME=.`,
+/// `HOME=build`) would otherwise resolve against the process's working
+/// directory and move config, state, and secrets into whatever repository the
+/// process runs in. [`codewhale_home`] names that case as an error.
 #[must_use]
 pub fn user_home() -> Option<PathBuf> {
-    path_env("HOME")
-        .or_else(|| path_env("USERPROFILE"))
+    // An explicit invalid home is an error, not permission to fall back to
+    // the ambient Windows profile and escape a caller's isolation boundary.
+    if let Some(home) = path_env("HOME") {
+        return home.is_absolute().then_some(home);
+    }
+    path_env("USERPROFILE")
+        .filter(|path| path.is_absolute())
         .or_else(windows_home_from_environment)
         .or_else(dirs::home_dir)
+        .filter(|path| path.is_absolute())
 }
 
 #[cfg(windows)]
@@ -108,7 +119,22 @@ fn windows_home_from_environment() -> Option<PathBuf> {
 /// A valid explicit `CODEWHALE_HOME` is returned after `~` expansion. Otherwise
 /// this is `<user home>/.codewhale`.
 pub fn codewhale_home() -> Result<Option<PathBuf>, PathOverrideError> {
-    Ok(codewhale_home_override()?.or_else(|| user_home().map(|home| home.join(CODEWHALE_APP_DIR))))
+    if let Some(home) = codewhale_home_override()? {
+        return Ok(Some(home));
+    }
+    if let Some(home) = user_home() {
+        return Ok(Some(home.join(CODEWHALE_APP_DIR)));
+    }
+    // No absolute home anywhere: when that is because `HOME` is relative, say
+    // so rather than reporting a missing home.
+    match path_env("HOME").filter(|path| !path.is_absolute()) {
+        Some(path) => Err(PathOverrideError {
+            variable: "HOME",
+            path,
+            kind: PathOverrideErrorKind::Relative,
+        }),
+        None => Ok(None),
+    }
 }
 
 /// Return the explicit config-file override, preferring the Codewhale name.

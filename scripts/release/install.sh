@@ -51,10 +51,11 @@ required_glibc_for_binary() {
 
 preflight_glibc() {
     local bin="$1"
+    local role="${2:-CLI}"
     if [[ "$(uname -s)" != "Linux" ]]; then
         return 0
     fi
-    if [[ "${CODEWHALE_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_TUI_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_SKIP_GLIBC_CHECK:-}" == "1" ]]; then
+    if [[ "${role}" != "compiled host" && ( "${CODEWHALE_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_TUI_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_SKIP_GLIBC_CHECK:-}" == "1" ) ]]; then
         return 0
     fi
 
@@ -66,74 +67,166 @@ preflight_glibc() {
     local host
     if ! host="$(detect_host_glibc)" || [[ -z "$host" ]]; then
         echo "ERROR: $(basename "$bin") requires GLIBC_$required, but no GNU libc was detected." >&2
+        if [[ "$(basename "$bin")" == codewhale-extension-host ]]; then
+            echo "The optional compiled Bun image has a separate libc floor; use Node on this installation. The Codewhale CLI remains static musl." >&2
+        else
+            echo "Official Codewhale Linux release assets (x64 and arm64) are static musl builds" >&2
+            echo "with no glibc dependency, so this binary is not an official release asset." >&2
+        fi
+        echo "Check where it came from, or build from source on this host." >&2
         echo "Build from source instead: cargo install codewhale-cli --locked" >&2
-        echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2
+        if [[ "$role" != "compiled host" ]]; then echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2; fi
         return 1
     fi
 
     if [[ "$(version_code "$host")" -lt "$(version_code "$required")" ]]; then
         echo "ERROR: $(basename "$bin") requires GLIBC_$required, but this system has glibc $host." >&2
-        echo "Ubuntu 22.04 ships glibc 2.35 and cannot run assets built against Ubuntu 24.04/glibc 2.39." >&2
+        if [[ "$(basename "$bin")" == codewhale-extension-host ]]; then
+            echo "The optional compiled Bun image has a separate libc floor; use Node on this installation. The Codewhale CLI remains static musl." >&2
+        else
+            echo "Official Codewhale Linux release assets (x64 and arm64) are static musl builds" >&2
+            echo "with no glibc dependency, so this binary is not an official release asset." >&2
+        fi
+        echo "Check where it came from, or build from source on this host." >&2
         echo "Build from source instead: cargo install codewhale-cli --locked" >&2
-        echo "Release follow-up: build Linux GNU assets against an older glibc baseline or add a musl/static asset." >&2
-        echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2
+        if [[ "$role" != "compiled host" ]]; then echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2; fi
         return 1
     fi
 }
 
+# This script installs an already checksum-verified archive. Existing different
+# binaries go through `codewhale update`, the sole version-aware updater.
+case "$BIN_DIR" in
+    /*) ;;
+    *) echo "ERROR: PREFIX must be an absolute user path" >&2; exit 1 ;;
+esac
+[[ ! -L "$BIN_DIR" ]] || { echo "ERROR: $BIN_DIR is a symlink; choose a fresh PREFIX" >&2; exit 1; }
 mkdir -p "$BIN_DIR"
+BIN_DIR="$(cd -P "$BIN_DIR" && pwd)"
+case "$BIN_DIR/" in
+    /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/nix/store/*|/gnu/store/*|*/node_modules/*|*/Cellar/*|*/.linuxbrew/*|*/linuxbrew/*|*/.cargo/bin/*)
+        echo "ERROR: refusing managed/system directory $BIN_DIR; choose a fresh user PREFIX" >&2
+        exit 1
+        ;;
+esac
+[[ -w "$BIN_DIR" ]] || { echo "ERROR: $BIN_DIR is not writable; choose a user PREFIX (no sudo)" >&2; exit 1; }
 
-echo "Installing codewhale to $BIN_DIR ..."
-
-install_binary() {
-    local src="$1"
-    local dst="$2"
-    local tmp="${dst}.tmp.$$"
-    rm -f "$tmp"
-    cp "$src" "$tmp"
-    chmod 0755 "$tmp"
-    mv -f "$tmp" "$dst"
+check_destination() {
+    local src="$1" dst="$2" mode="${3:-0755}"
+    destination_exists=0
+    if [[ -e "$dst" || -L "$dst" ]]; then
+        if [[ ! -L "$dst" && -f "$dst" ]] && [[ "$mode" != 0755 || -x "$dst" ]] && cmp -s "$src" "$dst"; then
+            destination_exists=1
+            return 0
+        fi
+        echo "ERROR: refusing to replace existing $dst; no existing file was changed." >&2
+        echo "For an existing direct Codewhale install, run its full path with 'update'." >&2
+        echo "To migrate, install this verified archive into a fresh user prefix:" >&2
+        echo '  mkdir -p "$HOME/.local"' >&2
+        echo '  codewhale_prefix="$(mktemp -d "$HOME/.local/codewhale-release.XXXXXX")"' >&2
+        echo '  PREFIX="$codewhale_prefix" ./install.sh' >&2
+        echo '  "$codewhale_prefix/bin/codewhale" --version' >&2
+        echo "Put the selected prefix/bin first on PATH after verifying it; see docs/INSTALL.md." >&2
+        return 1
+    fi
 }
 
-for bin in codewhale codew; do
-    src="$SCRIPT_DIR/$bin"
-    dst="$BIN_DIR/$bin"
-    if [[ ! -f "$src" ]]; then
-        echo "ERROR: $src not found in archive"
-        exit 1
-    fi
-    preflight_glibc "$src"
-    install_binary "$src" "$dst"
-    echo "  $dst"
-done
-
-# v0.9.4 installed a third, separate runtime at this path. Keep clean v0.9.5
-# installs to the two documented commands, while ensuring an upgrade cannot
-# leave the installer-owned legacy command running stale code.
-legacy_tui="$BIN_DIR/codewhale-tui"
-if [[ -f "$legacy_tui" && ! -L "$legacy_tui" ]]; then
-    install_binary "$SCRIPT_DIR/codewhale" "$legacy_tui"
-    echo "  $legacy_tui (refreshed legacy compatibility command)"
+# The image is an explicit installer choice; presence never changes Core's
+# Node default. Archives carry notices/source beside any qualified image.
+payloads=(codewhale codew)
+if [[ "${CODEWHALE_INSTALL_COMPILED_HOST:-}" == 1 ]]; then
+    for file in codewhale-extension-host codewhale-extension-host.LICENSES.txt codewhale-extension-host.relink-source.tar.gz codewhale-extension-host.release.json; do
+        [[ -f "$SCRIPT_DIR/$file" && ! -L "$SCRIPT_DIR/$file" ]] || { echo "ERROR: compiled host requested but archive has no complete qualified payload ($file); use Node" >&2; exit 1; }
+        payloads+=("$file")
+    done
 fi
+# Validate every source and destination before the first write.
+for bin in "${payloads[@]}"; do
+    src="$SCRIPT_DIR/$bin"
+    [[ -f "$src" ]] || { echo "ERROR: $src not found in archive" >&2; exit 1; }
+    mode=0644
+    case "$bin" in codewhale|codew|codewhale-extension-host) mode=0755; preflight_glibc "$src" "${bin/codewhale-extension-host/compiled host}" ;; esac
+    check_destination "$src" "$BIN_DIR/$bin" "$mode"
+done
+legacy_tui="$BIN_DIR/codewhale-tui"
+if [[ -e "$legacy_tui" || -L "$legacy_tui" ]]; then
+    check_destination "$SCRIPT_DIR/codewhale" "$legacy_tui"
+fi
+
+stage=""
+stage_dir=""
+# Commands this run published, as "source<TAB>destination" lines. If a later
+# publication fails, they are removed again (only while each is still the
+# exact file this run wrote), so a failed install leaves no half-installed
+# pair; files that were already installed are never touched.
+published=""
+rollback_published() {
+    local src dst
+    while IFS=$'\t' read -r src dst; do
+        [[ -n "$dst" ]] || continue
+        if [[ ! -L "$dst" && -f "$dst" ]] && cmp -s "$src" "$dst"; then
+            rm -f "$dst"
+            echo "Removed $dst: this install did not complete." >&2
+        fi
+    done <<< "$published"
+}
+on_exit() {
+    local status=$?
+    if [[ -n "$stage" ]]; then rm -f "$stage"; fi
+    if [[ -n "$stage_dir" ]]; then rmdir "$stage_dir"; fi
+    if [[ "$status" -ne 0 && -n "$published" ]]; then rollback_published; fi
+}
+trap on_exit EXIT
+install_binary() {
+    local src="$1" dst="$2" mode="${3:-0755}"
+    check_destination "$src" "$dst" "$mode"
+    if [[ "$destination_exists" == 1 ]]; then
+        echo "  $dst (already installed)"
+        return
+    fi
+    stage_dir="$(mktemp -d "$BIN_DIR/.codewhale-install.XXXXXX")"
+    stage="$stage_dir/$(basename "$dst")"
+    cp "$src" "$stage"
+    chmod "$mode" "$stage"
+    # Same-directory hard-link publication is atomic and never overwrites a
+    # destination created between preflight and this operation.
+    # The explicit parent operand avoids treating a raced-in destination
+    # directory (or directory symlink) as an alternate publication location.
+    ln "$stage" "$BIN_DIR/"
+    [[ ! -L "$dst" && -f "$dst" ]] && cmp -s "$stage" "$dst" || {
+        echo "ERROR: installed path changed during publication: $dst" >&2
+        return 1
+    }
+    published+="$src"$'\t'"$dst"$'\n'
+    rm -f "$stage"
+    rmdir "$stage_dir"
+    stage=""
+    stage_dir=""
+    echo "  $dst"
+}
+
+echo "Installing codewhale to $BIN_DIR ..."
+for bin in "${payloads[@]}"; do
+    mode=0644
+    case "$bin" in codewhale|codew|codewhale-extension-host) mode=0755 ;; esac
+    install_binary "$SCRIPT_DIR/$bin" "$BIN_DIR/$bin" "$mode"
+done
 
 echo ""
 echo "Done. Commands installed to $BIN_DIR."
-
-# Check if BIN_DIR is on PATH
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-    echo ""
-    echo "Add $BIN_DIR to your PATH:"
-    echo ""
-    SHELL_NAME="$(basename "${SHELL:-$SHELL}")"
-    case "$SHELL_NAME" in
-        zsh)  RC="$HOME/.zshrc" ;;
-        bash) RC="$HOME/.bashrc" ;;
-        fish) RC="$HOME/.config/fish/config.fish" ;;
-        *)    RC="your shell profile" ;;
-    esac
-    echo "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> $RC"
-    echo "  source $RC"
+echo "Future updates: \"$BIN_DIR/codewhale\" update"
+for bin in codewhale codew; do
+    resolved="$(command -v "$bin" || true)"
+    if [[ "$resolved" != "$BIN_DIR/$bin" ]]; then
+        echo "PATH selects ${resolved:-no $bin command}; this install is $BIN_DIR/$bin"
+    fi
+done
+echo "To select this installation in the current shell:"
+echo "  export PATH=\"$BIN_DIR:\$PATH\""
+echo "  hash -r"
+echo "  command -v codewhale codew"
+echo "Keep the directory first in your shell profile after verifying it."
+if ! command -v node >/dev/null 2>&1; then
+    echo "Computer Use is included and needs Node.js 20 or newer on PATH."
+    echo "Install Node.js from https://nodejs.org/, then restart Codewhale to enable Computer Use."
 fi
-
-echo ""
-echo "Then run: codewhale"

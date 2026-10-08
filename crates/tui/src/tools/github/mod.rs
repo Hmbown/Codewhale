@@ -19,6 +19,8 @@ use crate::tools::spec::{
 
 mod actions;
 mod cli;
+pub(crate) mod host;
+pub(crate) mod report;
 mod schema;
 mod shape;
 
@@ -36,13 +38,15 @@ use serde_json::json;
 use std::path::PathBuf;
 
 /// Actions the Plan-mode read-only surface exposes.
-const READ_ACTIONS: &[&str] = &["issue_context", "pr_context"];
+const READ_ACTIONS: &[&str] = &["issue_context", "pr_context", "report_read"];
 const ALL_ACTIONS: &[&str] = &[
     "issue_context",
     "pr_context",
     "comment",
     "close_issue",
     "close_pr",
+    "report_draft",
+    "report_read",
 ];
 
 /// Unified GitHub tool.
@@ -138,16 +142,16 @@ impl ToolSpec for GithubTool {
                 "Post an evidence-backed GitHub issue/PR comment with gh. Requires approval. Use blocker comments for partial work; do not claim closure without evidence."
             }
             Some("close_issue") => {
-                "Close a GitHub issue only when structured acceptance evidence is present and approved. For pull requests use github_close_pr; do not call PRs issues in user-facing output. Never close merely because the agent is stopping."
+                "Close a GitHub issue only when structured acceptance evidence is present and approved. Rejected when the worktree is dirty unless allow_dirty=true. For pull requests use github_close_pr; do not call PRs issues in user-facing output. Never close merely because the agent is stopping."
             }
             Some("close_pr") => {
-                "Close a GitHub pull request only when structured acceptance evidence is present and approved. Use this for PRs instead of github_close_issue so the UI, audit trail, and comments keep PR wording clear."
+                "Close a GitHub pull request only when structured acceptance evidence is present and approved. Rejected when the worktree is dirty unless allow_dirty=true. Use this for PRs instead of github_close_issue so the UI, audit trail, and comments keep PR wording clear."
             }
             _ if self.read_only => {
-                "Read GitHub issue/PR context using gh. Actions: \"issue_context\" and \"pr_context\"; bodies/comments/labels/state are summarized and large bodies become task artifacts when a durable task is active."
+                "Read GitHub issue/PR context using gh (issue_context, pr_context), or read a local current-session Codewhale issue draft with report_read. Local report publication is unavailable."
             }
             _ => {
-                "Read and guardedly mutate GitHub issues/PRs using gh. Actions: \"issue_context\", \"pr_context\" (read-only; large bodies become task artifacts when a durable task is active), \"comment\" (approval; evidence-backed), \"close_issue\", \"close_pr\" (approval; only with structured acceptance evidence — never close merely because the agent is stopping). No push/merge."
+                "GitHub context (issue_context, pr_context) and guarded comment/close_issue/close_pr actions. Closes are rejected when the worktree is dirty unless allow_dirty=true. Also report_draft and report_read: save/revise/read a LOCAL structured Codewhale issue draft in this session, without network or publication. When you observe evidence of a likely Codewhale/runtime/tool defect, you may draft it yourself, separate observations from inferences, offer /feedback review, and continue the original task. Ordinary user-code failures alone are not Codewhale defects; avoid repeated reports. Include only bounded narrative evidence, never prompts, logs, private code, credentials or paths. report_draft revises an existing draft when revises is supplied; exact repeats converge. Draft publication and duplicate search are unavailable: do not use other tools to post the draft without separate explicit user authorization. No push/merge."
             }
         }
     }
@@ -181,6 +185,7 @@ impl ToolSpec for GithubTool {
 
     fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
         match self.resolve_action(input) {
+            Ok("report_draft") => ApprovalRequirement::Auto,
             Ok(action) if Self::action_is_read(action) => ApprovalRequirement::Auto,
             _ => ApprovalRequirement::Required,
         }
@@ -194,7 +199,19 @@ impl ToolSpec for GithubTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        match self.resolve_action(&input)? {
+        let action = self.resolve_action(&input)?;
+        if context
+            .features
+            .enabled(crate::features::Feature::GithubHost)
+        {
+            let request = host::Request::capture(action, &input, context)?;
+            return crate::extension_host::manager()
+                .execute_github(request, context)
+                .await;
+        }
+        match action {
+            "report_draft" => report::draft(input, context),
+            "report_read" => report::read(input, context),
             "issue_context" => self.execute_issue_context(&input, context).await,
             "pr_context" => self.execute_pr_context(&input, context).await,
             "comment" => self.execute_comment(&input, context).await,
@@ -243,6 +260,48 @@ mod tests {
     use crate::tools::spec::ToolSpec;
 
     #[test]
+    fn close_refuses_when_git_cannot_determine_worktree_status() {
+        use crate::dependencies::{ExternalTool, Git};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            Git::output(&["init", "-q"], tmp.path())
+                .unwrap()
+                .status
+                .success()
+        );
+        let context = ToolContext::new(tmp.path());
+        assert!(
+            super::cli::git_status_porcelain(&context)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(tmp.path().join("work.txt"), "uncommitted work").unwrap();
+        assert!(
+            !super::cli::git_status_porcelain(&context)
+                .unwrap()
+                .is_empty()
+        );
+        // A real Git failure can have empty stdout; that is not a clean tree.
+        std::fs::write(tmp.path().join(".git/index"), "invalid index").unwrap();
+        let input = json!({
+            "number": 424_242,
+            "dry_run": true,
+            "acceptance_criteria": ["done"],
+            "evidence": {
+                "files_changed": ["work.txt"],
+                "tests_run": ["local fixture"],
+                "final_status": "green"
+            }
+        });
+        let error = close_github_thread(input, &context, GithubCloseTarget::Issue)
+            .expect_err("unknown worktree state must not authorize closure")
+            .to_string();
+        assert!(error.contains("git status failed"), "{error}");
+        assert!(error.contains("cannot verify"), "{error}");
+    }
+
+    #[test]
     fn close_schema_requires_structured_evidence() {
         let schema = GithubTool::alias("github_close_issue", "close_issue").input_schema();
         assert!(
@@ -278,6 +337,74 @@ mod tests {
                 .description()
                 .contains("pull request")
         );
+    }
+
+    // The dirty-worktree refusal is easy to hit on a real close; the
+    // model-facing text must disclose it and the flag that overrides it.
+    #[test]
+    fn close_disclosure_names_the_dirty_worktree_refusal() {
+        for description in [
+            GithubTool::alias("github_close_issue", "close_issue").description(),
+            GithubTool::alias("github_close_pr", "close_pr").description(),
+            GithubTool::new("github").description(),
+        ] {
+            assert!(
+                description.contains("dirty") && description.contains("allow_dirty"),
+                "close descriptions must disclose the dirty-worktree refusal: {description}"
+            );
+        }
+        let schema = GithubTool::new("github").input_schema();
+        let allow_dirty = schema["properties"]["allow_dirty"]["description"]
+            .as_str()
+            .expect("allow_dirty must carry a description");
+        assert!(
+            allow_dirty.contains("rejected when the worktree is dirty"),
+            "allow_dirty must disclose the refusal it overrides: {allow_dirty}"
+        );
+    }
+
+    /// D03-03: only the schema's `issue`/`pr` select a thread kind. Any other
+    /// spelling is refused before `gh` runs instead of commenting on an issue.
+    #[tokio::test]
+    async fn comment_refuses_a_target_outside_the_schema_enum() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let context = ToolContext::new(tmp.path());
+        let tool = GithubTool::new("github");
+        for target in ["PR", "pull_request", "pull"] {
+            let error = tool
+                .execute(
+                    json!({
+                        "action": "comment",
+                        "target": target,
+                        "number": 7,
+                        "body": "evidence",
+                        "evidence": {},
+                        "dry_run": true
+                    }),
+                    &context,
+                )
+                .await
+                .expect_err("an unknown target must not resolve to an issue")
+                .to_string();
+            assert!(error.contains("target must be"), "{target}: {error}");
+        }
+        for target in ["issue", "pr"] {
+            let result = tool
+                .execute(
+                    json!({
+                        "action": "comment",
+                        "target": target,
+                        "number": 7,
+                        "body": "evidence",
+                        "evidence": {},
+                        "dry_run": true
+                    }),
+                    &context,
+                )
+                .await
+                .expect("schema targets stay valid");
+            assert!(result.content.contains(&format!("{target} #7")));
+        }
     }
 
     #[test]
@@ -330,7 +457,7 @@ mod tests {
         let schema = tool.input_schema();
         assert_eq!(
             schema["properties"]["action"]["enum"],
-            json!(["issue_context", "pr_context"])
+            json!(["issue_context", "pr_context", "report_read"])
         );
         assert!(!schema["properties"]["body"].is_object());
         assert_eq!(tool.approval_requirement(), ApprovalRequirement::Auto);

@@ -1,28 +1,47 @@
 //! Diagnostic prompt source map for context pressure reports.
 //!
-//! The report is intentionally approximate for v0.8.59. It uses the same
-//! conservative token heuristic as compaction and describes the runtime sources
-//! CodeWhale already tracks, without claiming provider-tokenizer parity.
+//! The report is approximate and describes the runtime sources CodeWhale
+//! already tracks, without claiming provider-tokenizer parity. Its headline
+//! (`active_context_estimated_tokens`) is the pressure estimate the context
+//! meter and the auto-compaction gate read
+//! (`compaction::estimate_input_tokens_for_pressure`, lifted to the last
+//! provider-billed prompt). The 1.5x-inflated conservative estimate that
+//! request-overflow protection uses is reported separately as the overflow
+//! guard, never as the headline. Per-source entries keep the conservative
+//! per-text heuristic.
 
-use std::fmt::Write as _;
+mod portable_projection;
+pub(crate) use portable_projection::source_map as project_source_map;
+
 use std::path::Path;
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 
-use crate::compaction::{estimate_input_tokens_conservative, estimate_text_tokens_conservative};
+use crate::compaction::{
+    estimate_input_tokens_conservative, estimate_input_tokens_for_pressure,
+    estimate_text_tokens_conservative,
+};
 use crate::config::Config;
+#[cfg(test)]
 use crate::context_budget::PressureLevel;
-use crate::models::{CacheControl, ContentBlock, Message, SystemPrompt, Tool};
-use crate::prompts::{CORE_EXECUTION_PROFILE_PROMPT, Personality};
+use crate::prompts::CORE_EXECUTION_PROFILE_PROMPT;
 use crate::route_budget::route_context_window_tokens;
 use crate::tui::app::App;
+use codewhale_config::AppMode;
+use codewhale_models::{CacheControl, ContentBlock, Message, SystemPrompt, Tool};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptSourceMap {
     pub entries: Vec<SourceEntry>,
     pub total_estimated_tokens: usize,
+    /// Headline: the same pressure estimate the context meter and the
+    /// auto-compaction gate read, so `/context` never disagrees with them.
     pub active_context_estimated_tokens: usize,
+    /// Secondary: the 1.5x-inflated conservative estimate request-overflow
+    /// protection guards with. `None` when there is no live conversation to
+    /// measure (headless doctor reports).
+    pub overflow_guard_estimated_tokens: Option<usize>,
     pub context_window_tokens: Option<u32>,
     /// Non-secret receipt for the effective context-window value.
     pub context_window_source: Option<String>,
@@ -217,6 +236,7 @@ impl ReportBuilder {
         self,
         context_window: crate::route_runtime::ContextWindowResolution,
         active_context_estimated_tokens: usize,
+        overflow_guard_estimated_tokens: Option<usize>,
         note: impl Into<String>,
     ) -> PromptSourceMap {
         let total_estimated_tokens = self
@@ -231,6 +251,7 @@ impl ReportBuilder {
             entries: self.entries,
             total_estimated_tokens,
             active_context_estimated_tokens,
+            overflow_guard_estimated_tokens,
             context_window_tokens: Some(context_window.tokens),
             context_window_source: Some(context_window.source.label().to_string()),
             budget_used_percent: Some(budget_used_percent),
@@ -244,7 +265,11 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
     // The host still stores the rung apart from the number; pair them against
     // the same route limits the pressure meter reads.
     let context_window = crate::route_runtime::ContextWindowResolution {
-        tokens: route_context_window_tokens(app.api_provider, &app.model, app.active_route_limits),
+        tokens: route_context_window_tokens(
+            app.api_provider,
+            app.effective_model_for_budget(),
+            app.active_route_limits,
+        ),
         source: app.active_context_window_source,
     };
     let mut builder = base_source_entries(
@@ -252,20 +277,35 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
         &app.workspace,
         Some(&app.skills_dir),
         app.project_context_pack_enabled,
-        app.skills_scan_codewhale_only,
+        app.skills_discovery_mode,
         app.ui_locale.tag(),
         app.mode,
         Some(app.plugin_registry.as_ref()),
         Some(context_window.tokens),
     );
     add_app_runtime_entries(&mut builder, app);
-    let active_context_estimated_tokens =
-        estimate_input_tokens_conservative(&app.api_messages, app.system_prompt.as_ref());
     builder.finish(
         context_window,
-        active_context_estimated_tokens,
-        "Diagnostic source map. Token counts are conservative estimates and may differ from provider billing.",
+        pressure_estimated_tokens(app),
+        Some(estimate_input_tokens_conservative(
+            &app.api_messages,
+            app.system_prompt.as_ref(),
+        )),
+        "Diagnostic source map. The headline is the pressure estimate the context meter and auto-compaction gate use; per-source counts are conservative estimates. All counts may differ from provider billing.",
     )
+}
+
+/// The one pressure number the context meter and the auto-compaction gate
+/// decide on: the un-inflated estimate over the live request, lifted to the
+/// provider's last billed prompt when that is higher (#5577).
+fn pressure_estimated_tokens(app: &App) -> usize {
+    let estimated =
+        estimate_input_tokens_for_pressure(&app.api_messages, app.system_prompt.as_ref());
+    let billed = app
+        .last_billed_input_tokens
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .unwrap_or(0);
+    estimated.max(billed)
 }
 
 #[must_use]
@@ -310,9 +350,20 @@ pub fn build_prompt_context(app: &App) -> PromptContext {
 
 pub fn build_headless_context_report(config: &Config, workspace: &Path) -> PromptSourceMap {
     let model = config.default_model();
-    let provider = config.api_provider();
-    let provider_identity = config.provider_identity_for(provider);
-    let route = crate::route_runtime::resolve_runtime_route(config, provider, Some(&model)).ok();
+    let identity = config.active_provider_identity().ok();
+    let provider = identity
+        .as_ref()
+        .map_or(crate::config::ProviderKind::Custom, |identity| {
+            identity.provider
+        });
+    let provider_identity = identity
+        .as_ref()
+        .map(|identity| identity.key.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let route = identity.as_ref().and_then(|identity| {
+        crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(&model))
+            .ok()
+    });
     // A route we could not resolve does not erase an operator-configured
     // window: doctor must report the same number the session would use.
     let context_window = route.as_ref().map_or_else(
@@ -321,7 +372,12 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
                 provider,
                 &model,
                 None,
-                config.context_window_for_provider_config(provider),
+                identity
+                    .as_ref()
+                    .and_then(|identity| config.context_window_for_provider_config(identity)),
+                identity
+                    .as_ref()
+                    .and_then(|identity| config.model_context_windows_for(identity)),
             )
         },
         |route| route.context_window,
@@ -334,9 +390,9 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         workspace,
         Some(&selected_skills_dir),
         config.project_context_pack_enabled(),
-        config.skills_config().scan_codewhale_only(),
+        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config()),
         "en",
-        crate::tui::app::AppMode::Agent,
+        AppMode::Agent,
         None,
         Some(context_window.tokens),
     );
@@ -389,6 +445,7 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
     builder.finish(
         context_window,
         active_context_estimated_tokens,
+        None,
         "Headless diagnostic source map. Conversation, tool results, and live TUI state are unavailable in doctor mode.",
     )
 }
@@ -399,15 +456,15 @@ fn base_source_entries(
     workspace: &Path,
     skills_dir: Option<&Path>,
     project_pack_enabled: bool,
-    skills_scan_codewhale_only: bool,
+    skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     locale_tag: &str,
-    mode: crate::tui::app::AppMode,
+    mode: AppMode,
     plugin_registry: Option<&crate::plugins::PluginRegistry>,
     context_window_tokens: Option<u32>,
 ) -> ReportBuilder {
     let mut builder = ReportBuilder::new();
 
-    let constitution = crate::prompts::compose_default_static_layers(Personality::Calm, model);
+    let constitution = crate::prompts::compose_default_static_layers(model);
     builder.push(SourceEntry::text(
         SourceKind::Constitution,
         "Bundled constitution, language policy, and output policy",
@@ -449,10 +506,13 @@ fn base_source_entries(
     }
 
     if let Some(content) = project_context.instructions.as_deref() {
-        let source = project_context
-            .source_path
-            .as_ref()
-            .map_or_else(|| "project".to_string(), |p| p.display().to_string());
+        // Same helper as ProjectContext::as_system_block, so the report's
+        // source token derives from the same label the prompt shows. (The
+        // entry below still displays the absolute source path for operators;
+        // only the prompt label is relativized.)
+        let source = crate::project_context::project_instructions_source_label(
+            project_context.source_path.as_deref(),
+        );
         let mut block = format!(
             "<project_instructions source=\"{source}\">\n{content}\n</project_instructions>"
         );
@@ -531,8 +591,7 @@ fn base_source_entries(
         ));
     }
 
-    let skill_discovery_mode =
-        crate::skills::SkillDiscoveryMode::from_codewhale_only(skills_scan_codewhale_only);
+    let skill_discovery_mode = skills_discovery_mode;
     let skills_budget = crate::skills::skills_prompt_budget_chars(context_window_tokens);
     let skills_block = match skills_dir {
         Some(dir) => crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(
@@ -810,6 +869,7 @@ fn content_block_text(block: &ContentBlock) -> String {
     }
 }
 
+#[cfg(test)]
 fn pressure_label(percent: Option<f64>) -> &'static str {
     // Delegate to the unified pressure thresholds so this diagnostic label can't
     // drift from `context_budget::PressureLevel`. `None` (unknown window) keeps
@@ -820,144 +880,31 @@ fn pressure_label(percent: Option<f64>) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn format_context_report(report: &PromptSourceMap) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "Context Source Map");
-    let _ = writeln!(
-        out,
-        "Estimated active context: {} tokens",
-        report.active_context_estimated_tokens
-    );
-    match (report.context_window_tokens, report.budget_used_percent) {
-        (Some(window), Some(percent)) => {
-            let source = report
-                .context_window_source
-                .as_deref()
-                .unwrap_or_else(|| crate::route_runtime::ContextWindowSource::Fallback.label());
-            // An unverified rung is a guess about the window printed on this
-            // same line; it must not claim a fixed 128K default the capability
-            // matrix may not hold. A label from no known rung is no evidence
-            // either, so it reads the same way.
-            let source_label = if crate::route_runtime::ContextWindowSource::from_label(source)
-                .is_some_and(crate::route_runtime::ContextWindowSource::is_verified)
-            {
-                source.to_string()
-            } else {
-                format!(
-                    "{source} (unverified — nothing describes this model, so this window is a guess)"
-                )
-            };
-            let _ = writeln!(
-                out,
-                "Window: {window} tokens ({percent:.1}% used, {}; source: {})",
-                pressure_label(Some(percent)),
-                source_label
-            );
-        }
-        _ => {
-            let _ = writeln!(out, "Window: unknown");
-        }
-    }
-    // #5134: the source label says where the window came from but not how to
-    // change it. Name the key here so the report answers the question it
-    // provokes.
-    let _ = writeln!(
-        out,
-        "Change the window: set `context_window` on the active `[providers.<name>]` table in config.toml (docs/CONFIGURATION.md, \"Context length\")."
-    );
-    let _ = writeln!(
-        out,
-        "Source-entry total: {} tokens",
-        report.total_estimated_tokens
-    );
-    let _ = writeln!(
-        out,
-        "Manage standing law: /constitution (status/preview), /constitution repo (repo-local law), /setup report (readiness)."
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Sources:");
-    for entry in &report.entries {
-        let path = entry
-            .source_path
-            .as_deref()
-            .map(|path| format!(" [{path}]"))
-            .unwrap_or_default();
-        let tier = entry
-            .authority_tier
-            .map(|tier| format!(", tier {tier}"))
-            .unwrap_or_default();
-        let omitted = entry
-            .truncation_reason
-            .as_deref()
-            .map(|reason| format!(" - {reason}"))
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "- {:?}: {}{} - {} tokens ({:?}{}){}",
-            entry.source_kind,
-            entry.label,
-            path,
-            entry.estimated_tokens,
-            entry.counting_confidence,
-            tier,
-            omitted
-        );
-    }
-    let _ = writeln!(out);
-    let _ = write!(out, "{}", report.note);
-    out
+    crate::diagnostics_reports::format_context_report(&project_source_map(report.clone()))
 }
 
+#[cfg(test)]
 pub fn format_context_summary(report: &PromptSourceMap) -> String {
-    let mut entries = report.entries.clone();
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.estimated_tokens));
-    let top = entries
-        .iter()
-        .take(5)
-        .map(|entry| format!("{} ({})", entry.label, entry.estimated_tokens))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut out = String::new();
-    let _ = writeln!(out, "Context Summary");
-    let _ = writeln!(
-        out,
-        "Pressure: {}",
-        pressure_label(report.budget_used_percent)
-    );
-    let _ = writeln!(
-        out,
-        "Estimated active context: {} tokens",
-        report.active_context_estimated_tokens
-    );
-    if let Some(percent) = report.budget_used_percent {
-        let _ = writeln!(out, "Budget used: {percent:.1}%");
-    }
-    let _ = write!(out, "Top sources: {top}");
-    out
+    crate::diagnostics_reports::format_context_summary(&project_source_map(report.clone()))
 }
 
 pub fn context_report_json(report: &PromptSourceMap) -> String {
-    serde_json::to_string_pretty(report).unwrap_or_else(|err| {
-        format!("{{\"error\":\"failed to serialize context report: {err}\"}}")
-    })
+    crate::diagnostics_reports::context_report_json(&project_source_map(report.clone()))
 }
 
-#[must_use]
-pub fn prompt_context_json(context: &PromptContext) -> String {
-    serde_json::to_string_pretty(context).unwrap_or_else(|error| {
-        format!(r#"{{"error":"failed to serialize prompt context: {error}"}}"#)
-    })
-}
+#[cfg(test)]
+mod pressure_fixture_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, Config};
-    use crate::models::Role;
-    use crate::models::Tool;
+    use crate::config::{Config, ProviderKind};
     use crate::route_runtime::{ContextWindowResolution, ContextWindowSource};
     use codewhale_config::route::RouteLimits;
+    use codewhale_models::Role;
+    use codewhale_models::Tool;
     use std::fs;
     use tempfile::tempdir;
 
@@ -974,6 +921,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_1".to_string(),
                     content: "large tool output".repeat(40),
                     is_error: None,
@@ -998,12 +946,14 @@ mod tests {
                 source: ContextWindowSource::Fallback,
             },
             123,
+            Some(185),
             "test",
         );
         let json = context_report_json(&report);
 
         assert!(json.contains("\"source_kind\": \"tool_result\""));
         assert!(json.contains("\"active_context_estimated_tokens\": 123"));
+        assert!(json.contains("\"overflow_guard_estimated_tokens\": 185"));
     }
 
     #[test]
@@ -1114,6 +1064,7 @@ mod tests {
                 custom: std::collections::HashMap::from([(
                     "custom".to_string(),
                     crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
                         api_key: Some("test-private-key".to_string()),
                         base_url: Some("https://private.test/v1".to_string()),
                         model: Some("private-1m-deployment-v9".to_string()),
@@ -1363,12 +1314,23 @@ mod tests {
                 source: ContextWindowSource::Fallback,
             },
             525,
+            Some(800),
             "test",
         );
         let summary = format_context_summary(&report);
 
         assert!(summary.contains("Context Summary"));
         assert!(summary.contains("Tool schemas (500)"));
+        // The headline is the pressure number; the inflated figure is only
+        // ever the labeled secondary overflow-guard line.
+        assert!(summary.contains("Estimated active context: 525 tokens"));
+        assert!(summary.contains("Overflow guard: 800 tokens"));
+        let full = format_context_report(&report);
+        let headline = full
+            .find("Estimated active context: 525 tokens")
+            .expect("pressure headline");
+        let guard = full.find("Overflow guard: 800 tokens").expect("guard line");
+        assert!(headline < guard, "{full}");
     }
 
     #[test]
@@ -1376,7 +1338,7 @@ mod tests {
         // deepseek-v4-pro defaults to a 1M window; a resolved route advertising a
         // smaller window must win in the report's context_window_tokens.
         let route_window = 128_000u64;
-        let model_default = crate::models::context_window_for_model("deepseek-v4-pro")
+        let model_default = codewhale_models::context_window_for_model("deepseek-v4-pro")
             .expect("model has a default window");
         assert_ne!(
             u64::from(model_default),
@@ -1390,15 +1352,16 @@ mod tests {
             output_tokens: None,
         };
         let resolved = crate::route_runtime::resolve_context_window(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-pro",
             Some(limits),
+            None,
             None,
         );
         assert_eq!(resolved.source, ContextWindowSource::Catalog);
 
         let builder = ReportBuilder::new();
-        let report = builder.finish(resolved, 10_000, "test");
+        let report = builder.finish(resolved, 10_000, None, "test");
 
         assert_eq!(report.context_window_tokens, Some(route_window as u32));
         assert_eq!(report.context_window_source.as_deref(), Some("catalog"));

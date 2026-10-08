@@ -191,6 +191,23 @@
       color: var(--muted);
       font-size: 13px;
     }
+    #agents-section[hidden] { display: none; }
+    .agent-row {
+      display: grid;
+      grid-template-columns: minmax(0, auto) auto;
+      gap: 2px 8px;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .agent-row:last-child { border-bottom: 0; }
+    .agent-name { font-weight: 600; overflow-wrap: anywhere; }
+    .agent-state { color: var(--muted); text-align: right; }
+    .agent-action {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
     @media (min-width: 900px) {
       main {
         grid-template-columns: 330px minmax(0, 1fr);
@@ -231,6 +248,14 @@
       <div class="body"><div id="threads"></div></div>
     </section>
 
+    <section id="agents-section" hidden>
+      <div class="head">
+        <strong>Agents</strong>
+        <span id="agent-count" class="meta"></span>
+      </div>
+      <div class="body"><div id="agents"></div></div>
+    </section>
+
     <section class="chat">
       <div class="head">
         <strong id="active-title">No thread selected</strong>
@@ -260,6 +285,7 @@
   </main>
 
   <script>
+    const streamMessages = __CODEWHALE_STREAM_MESSAGES__;
     const $ = (id) => document.getElementById(id);
     const MAX_VISIBLE_EVENTS = 100;
     const LEGACY_RUNTIME_TOKEN_STORAGE_KEY = "codewhale_runtime_token";
@@ -271,9 +297,17 @@
       threadId: "",
       activeTurnId: "",
       source: null,
+      // Seq of the last journal event shown for this thread: the resume
+      // cursor. Frames at or below it are replays and are skipped.
+      lastSeq: 0,
+      retryDelay: 750,
+      openedAt: 0,
       eventCount: 0,
       requestProof: "",
-      streamTicket: ""
+      streamTicket: "",
+      // Sub-agents of the open thread, by agent id: rebuilt from the
+      // agent.* events the stream replays, so a reconnect restores it.
+      agents: new Map()
     };
 
     function setStatus(message, tone = "") {
@@ -429,8 +463,81 @@
       return data && typeof data === "object" && "payload" in data ? data.payload : data;
     }
 
+    // The name every Codewhale surface shows for an agent (its workflow
+    // label or dispatch name), never its internal id. Hosts that predate the
+    // name get an ordinal instead.
+    function agentName(payload) {
+      const known = state.agents.get(payload.agent_id);
+      if (payload.agent_name) return payload.agent_name;
+      if (known && known.name) return known.name;
+      return "agent " + (known ? known.order : state.agents.size + 1);
+    }
+
+    // The first line of prose in a result summary, not its heading.
+    function resultHeadline(text) {
+      const summary = String(text || "").replace(/^Sub-agent .*? (completed|failed|cancelled|interrupted|budget_exhausted|settled \(outcome unconfirmed\)): /, "");
+      const line = summary.split("\n").map((part) => part.trim())
+        .find((part) => part && !part.startsWith("#") && !part.startsWith("<codewhale:"));
+      return line || "";
+    }
+
+    function noteAgentEvent(name, data) {
+      if (!name.startsWith("agent.")) return;
+      const payload = eventPayload(data) || {};
+      const id = payload.agent_id;
+      if (!id) return;
+      let agent = state.agents.get(id);
+      if (!agent) {
+        agent = { name: "", state: "", action: "", order: state.agents.size + 1 };
+        state.agents.set(id, agent);
+      }
+      if (payload.agent_name) agent.name = payload.agent_name;
+      if (name === "agent.spawned") {
+        agent.state = "running";
+        agent.action = "starting";
+      } else if (name === "agent.progress") {
+        agent.state = "running";
+        agent.action = [String(payload.worker_status || "").replace(/_/g, " "),
+          payload.step ? "step " + payload.step : ""].filter(Boolean).join(" · ");
+      } else if (name === "agent.completed") {
+        agent.state = String(payload.worker_status || "settled").replace(/_/g, " ");
+        agent.action = resultHeadline((payload.item || {}).summary);
+      }
+      renderAgents();
+    }
+
+    function renderAgents() {
+      const list = $("agents");
+      list.innerHTML = "";
+      let running = 0;
+      for (const [id, agent] of state.agents) {
+        if (agent.state === "running") running += 1;
+        const row = document.createElement("div");
+        row.className = "agent-row";
+        row.innerHTML =
+          "<span class='agent-name'>" + escapeHtml(agentName({ agent_id: id })) + "</span>" +
+          "<span class='agent-state'>" + escapeHtml(agent.state) + "</span>" +
+          (agent.action ? "<span class='agent-action'>" + escapeHtml(agent.action) + "</span>" : "");
+        list.appendChild(row);
+      }
+      $("agents-section").hidden = state.agents.size === 0;
+      $("agent-count").textContent = state.agents.size
+        ? running + " running · " + state.agents.size + " total"
+        : "";
+    }
+
     function eventText(name, data) {
       const payload = eventPayload(data) || {};
+      if (name === "agent.spawned") return agentName(payload) + " started";
+      if (name === "agent.progress") {
+        return agentName(payload) + ": " + String(payload.worker_status || "working").replace(/_/g, " ") +
+          (payload.step ? " · step " + payload.step : "");
+      }
+      if (name === "agent.completed") {
+        const headline = resultHeadline((payload.item || {}).summary);
+        return agentName(payload) + " " + String(payload.worker_status || "settled").replace(/_/g, " ") +
+          (headline ? ": " + headline : "");
+      }
       if (name === "item.delta") return payload.delta || "";
       if (name === "item.started") {
         const tool = payload.tool;
@@ -489,6 +596,7 @@
     }
 
     function appendEvent(name, data) {
+      noteAgentEvent(name, data);
       const text = eventText(name, data);
       if (!text) return;
       const item = document.createElement("div");
@@ -497,6 +605,7 @@
       if (name === "item.started" || name.includes("tool")) item.classList.add("tool");
       if (name.includes("failed") || name.includes("denied") || name.includes("timeout")) item.classList.add("error");
       if (name === "turn.completed" || name === "approval.decided") item.classList.add("ok");
+      if (name.startsWith("agent.")) item.classList.add("tool");
       item.innerHTML = "<div class='meta'>" + escapeHtml(name) + "</div>" + escapeHtml(text);
 
       const approval = approvalInfo(name, data);
@@ -563,21 +672,68 @@
     async function selectThread(id, title) {
       state.threadId = id;
       state.activeTurnId = "";
+      state.lastSeq = 0;
+      state.retryDelay = 750;
+      state.openedAt = 0;
       state.eventCount = 0;
       $("event-count").textContent = "0 events";
       $("active-title").textContent = title || id;
       $("events").innerHTML = "";
+      state.agents.clear();
+      renderAgents();
       if (state.source) state.source.close();
       await openThreadEvents(id);
       await loadThreads();
     }
 
-    async function openThreadEvents(id) {
+    // What the Runtime said when it ended the stream on purpose (`stream.end`).
+    function streamEndStatus(reason) {
+      switch (reason) {
+        case "replay_failed":
+          return streamMessages.replay_failed;
+        case "catch_up_failed":
+          return streamMessages.catch_up_failed;
+        case "runtime_shutdown":
+          return streamMessages.runtime_shutdown;
+        default:
+          return streamMessages.ended;
+      }
+    }
+
+    // Reconnect from `cursor` (undefined: nothing shown yet, open fresh) after
+    // a bounded backoff. The backoff resets only after a stream stayed open a
+    // while: a Runtime that opens and at once ends the stream (a history it
+    // cannot read) is retried ever more slowly, not hammered. A Runtime that is not
+    // reachable yet fails the stream-ticket fetch itself (a network TypeError):
+    // keep trying. An HTTP refusal (for example an expired session) is final.
+    function scheduleResume(id, cursor) {
+      if (state.openedAt && Date.now() - state.openedAt > 10000) state.retryDelay = 750;
+      state.openedAt = 0;
+      const delay = state.retryDelay;
+      state.retryDelay = Math.min(state.retryDelay * 2, 15000);
+      window.setTimeout(() => {
+        if (state.threadId !== id) return;
+        openThreadEvents(id, cursor).catch((err) => {
+          if (state.threadId !== id) return;
+          if (err instanceof TypeError) {
+            setStatus(streamMessages.reconnecting, "warn");
+            scheduleResume(id, cursor);
+          } else {
+            setStatus(err.message, "bad");
+          }
+        });
+      }, delay);
+    }
+
+    // `resumeFrom` undefined opens the newest tail; a number resumes after it,
+    // so a reconnect never replays (and duplicates) what is already shown.
+    async function openThreadEvents(id, resumeFrom) {
       const streamTicket = await takeStreamTicket();
-      const query = new URLSearchParams({
-        since_seq: "0",
-        replay_limit: String(MAX_VISIBLE_EVENTS)
-      });
+      const query = new URLSearchParams(
+        resumeFrom === undefined
+          ? { since_seq: "0", replay_limit: String(MAX_VISIBLE_EVENTS) }
+          : { since_seq: String(resumeFrom) }
+      );
       if (streamTicket) query.set(MOBILE_STREAM_TICKET_QUERY, streamTicket);
       const source = new EventSource(
         "/v1/threads/" + encodeURIComponent(id) + "/events?" + query.toString()
@@ -597,26 +753,57 @@
         "approval.required",
         "approval.decided",
         "approval.timeout",
-        "sandbox.denied"
+        "sandbox.denied",
+        "agent.spawned",
+        "agent.progress",
+        "agent.completed"
       ];
       for (const name of names) {
         source.addEventListener(name, (ev) => {
+          if (state.source !== source) return;
           let data = {};
           try { data = JSON.parse(ev.data || "{}"); } catch (_) {}
+          if (Number.isSafeInteger(data.seq)) {
+            if (data.seq <= state.lastSeq) return;
+            state.lastSeq = data.seq;
+          }
           if (data.turn_id) state.activeTurnId = data.turn_id;
           appendEvent(name, data);
         });
       }
-      source.onopen = () => setStatus("Connected", "ok");
+      // The Runtime ended the stream on purpose; `last_seq` is where to resume.
+      source.addEventListener("stream.end", (ev) => {
+        if (state.source !== source || state.threadId !== id) return;
+        source.close();
+        let data = {};
+        try { data = JSON.parse(ev.data || "{}"); } catch (_) {}
+        if (Number.isSafeInteger(data.last_seq)) {
+          state.lastSeq = Math.max(state.lastSeq, data.last_seq);
+        }
+        if (data.retryable !== true) {
+          setStatus(streamMessages.closed, "bad");
+          return;
+        }
+        setStatus(streamEndStatus(data.reason), "warn");
+        scheduleResume(id, state.lastSeq);
+      });
+      // A Runtime that cannot serve this thread answers and at once ends the
+      // stream; claim "Connected" only once the stream has stayed open.
+      source.onopen = () => {
+        state.openedAt = Date.now();
+        window.setTimeout(() => {
+          if (state.source === source && source.readyState === EventSource.OPEN) {
+            setStatus(streamMessages.connected, "ok");
+          }
+        }, 400);
+      };
+      // No `stream.end`: the connection dropped (network, proxy, or a Runtime
+      // that exited without warning). Resume from what is already shown.
       source.onerror = () => {
         if (state.source !== source || state.threadId !== id) return;
         source.close();
-        setStatus("Event stream disconnected; reconnecting", "warn");
-        window.setTimeout(() => {
-          if (state.threadId === id) {
-            openThreadEvents(id).catch((err) => setStatus(err.message, "bad"));
-          }
-        }, 750);
+        setStatus(streamMessages.reconnecting, "warn");
+        scheduleResume(id, state.lastSeq > 0 ? state.lastSeq : resumeFrom);
       };
     }
 
@@ -673,7 +860,7 @@
       $("steer").onclick = () => steerTurn().catch((err) => setStatus(err.message, "bad"));
       $("interrupt").onclick = () => interruptTurn().catch((err) => setStatus(err.message, "bad"));
       await loadThreads();
-      setStatus("Connected", "ok");
+      setStatus(streamMessages.connected, "ok");
     }
 
     boot().catch((err) => setStatus(err.message, "bad"));

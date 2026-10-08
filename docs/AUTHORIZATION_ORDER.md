@@ -1,5 +1,7 @@
 # Authorization order
 
+> 阅读简体中文版：[zh_hans/AUTHORIZATION_ORDER.md](zh_hans/AUTHORIZATION_ORDER.md)。
+
 Codewhale combines tool availability, hooks, typed permission rules, approval
 posture, repository policy, and sandboxing. An approval from one layer is not a
 universal bypass: a later safety layer can still require review or block the
@@ -78,8 +80,14 @@ typed deny that wins for any individual segment blocks the full invocation.
 The execution-policy result is combined with the registered-tool baseline; the
 two should not be interpreted independently.
 
-- Ask and Auto-Review may surface tool safety approvals. Auto-Review does not
-  pause for model-authored user questions, which are a separate channel.
+- Ask and Auto-Review may surface tool safety approvals. Model-authored user
+  questions (`request_user_input`) are a separate channel and reach the user in
+  every interactive posture, Auto-Review included. Only headless `exec` runs,
+  which have no responder, withhold the tool. Runtime threads (app
+  conversations, background tasks and automations) keep it: a question parks
+  the turn until someone answers or cancels it through the app or runtime API,
+  or until a positive `tools.user_input_timeout_seconds` expires. An omitted or
+  zero timeout waits indefinitely, the same way an Ask-posture approval parks.
 - Full Access and YOLO-compatible auto-approval paths do not let a typed `ask`
   downgrade the session into prompting. Non-bypassable registered holds
   auto-approve in Full Access. Typed deny, catastrophic background/headless
@@ -127,7 +135,7 @@ Focused commands:
 
 ```bash
 cargo test -p codewhale-execpolicy --test authorization_order --locked
-cargo test -p codewhale-tui --bin codewhale-tui --locked full_access_permission_allow_cannot_bypass
+cargo test -p codewhale-tui --lib --locked full_access_permission_allow_cannot_bypass
 cargo test -p codewhale-config --locked project_merge_only_tightens_approval_and_sandbox_policy
 ```
 

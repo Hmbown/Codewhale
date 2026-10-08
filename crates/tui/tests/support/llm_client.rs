@@ -13,7 +13,7 @@
 use anyhow::Result;
 use std::pin::Pin;
 
-use crate::models::{MessageRequest, MessageResponse, StreamEvent};
+use codewhale_models::{MessageRequest, MessageResponse, StreamEvent};
 
 pub type StreamEventBox =
     Pin<Box<dyn futures_util::Stream<Item = Result<StreamEvent>> + Send + 'static>>;

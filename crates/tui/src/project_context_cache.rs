@@ -101,31 +101,46 @@ impl ContentSignature {
     }
 }
 
+/// Largest candidate hashed by content. The context loader refuses files
+/// over 100 KiB whatever they hold, so a larger candidate is fingerprinted by
+/// length and mtime instead of being read whole on every prompt refresh.
+const FINGERPRINT_MAX_READ_BYTES: u64 = 1024 * 1024;
+
 fn file_fingerprint(path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() {
         return Some("non-file".to_string());
     }
+    let modified = || {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| format!("{}:{}", duration.as_secs(), duration.subsec_nanos()))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    if metadata.len() > FINGERPRINT_MAX_READ_BYTES {
+        return Some(format!("oversize:{}:{}", metadata.len(), modified()));
+    }
 
-    match std::fs::read(path) {
+    let read = std::fs::File::open(path).and_then(|file| {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        file.take(FINGERPRINT_MAX_READ_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    match read {
         Ok(bytes) => {
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
             Some(format!("sha256:{}", to_hex(&hasher.finalize())))
         }
-        Err(error) => {
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| format!("{}:{}", duration.as_secs(), duration.subsec_nanos()))
-                .unwrap_or_else(|| "unknown".to_string());
-            Some(format!(
-                "unreadable:{}:{}:{error}",
-                metadata.len(),
-                modified
-            ))
-        }
+        Err(error) => Some(format!(
+            "unreadable:{}:{}:{error}",
+            metadata.len(),
+            modified()
+        )),
     }
 }
 

@@ -557,6 +557,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_file_search_default_excludes_stop_at_the_directory() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("build")).expect("mkdir");
+        std::fs::create_dir_all(root.join("builders")).expect("mkdir");
+        std::fs::write(root.join("build").join("build_out.rs"), "no\n").expect("write");
+        std::fs::write(root.join("build.rs"), "yes\n").expect("write");
+        std::fs::write(root.join("builders").join("build_x.rs"), "yes\n").expect("write");
+
+        let ctx = ToolContext::new(root.to_path_buf());
+        let result = FileSearchTool
+            .execute(json!({"query": "build", "limit": 20}), &ctx)
+            .await
+            .expect("execute");
+
+        let matches: Value = serde_json::from_str(&result.content).expect("search json");
+        let paths: Vec<&str> = matches
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .collect();
+        // `build/**` hides the build directory, not same-prefix siblings.
+        assert!(paths.contains(&"build.rs"), "{paths:?}");
+        assert!(paths.contains(&"builders/build_x.rs"), "{paths:?}");
+        assert!(!paths.contains(&"build/build_out.rs"), "{paths:?}");
+    }
+
+    #[tokio::test]
     async fn test_file_search_respects_cancel_token() {
         let tmp = tempdir().expect("tempdir");
         let root = tmp.path();

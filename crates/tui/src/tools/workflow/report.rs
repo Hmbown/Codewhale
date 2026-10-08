@@ -1,5 +1,5 @@
 use super::{SCHEMA_RAW_PREVIEW_CHARS, WorkflowRunRecord, WorkflowRunStatus};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Persist a durable per-run report under `.codewhale/reports/<run_id>.md`
 /// so a settled background run leaves one synthesized artifact even after
@@ -14,30 +14,50 @@ pub(super) fn write_run_report_artifact(workspace: &Path, record: &WorkflowRunRe
     ) {
         return;
     }
-    // Run ids are generated slugs, but never trust one as a path segment.
-    let safe_id: String = record
-        .run_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        .collect();
-    if safe_id.is_empty() {
+    let Some(relative) = run_report_relative_path(&record.run_id) else {
         return;
-    }
-    let dir = workspace.join(".codewhale").join("reports");
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        crate::logging::warn(format!(
-            "workflow report dir {} not created: {err}",
-            dir.display()
-        ));
-        return;
-    }
-    let path = dir.join(format!("{safe_id}.md"));
-    if let Err(err) = std::fs::write(&path, render_run_report(record)) {
+    };
+    let path = workspace.join(&relative);
+    // Written through the confined helper: a link in `.codewhale` (or at the
+    // report's own name) is refused instead of redirecting the write out of
+    // the workspace, and missing parents are created without following links.
+    if let Err(err) =
+        crate::fs_confined::write(workspace, &path, render_run_report(record).as_bytes())
+    {
         crate::logging::warn(format!(
             "workflow report {} not written: {err}",
             path.display()
         ));
     }
+}
+
+/// Workspace-relative path of a run's report, `.codewhale/reports/<id>.md`.
+/// `None` when the id has no path-safe characters.
+fn run_report_relative_path(run_id: &str) -> Option<PathBuf> {
+    // Run ids are generated slugs, but never trust one as a path segment.
+    let safe_id: String = run_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect();
+    (!safe_id.is_empty()).then(|| {
+        Path::new(".codewhale")
+            .join("reports")
+            .join(format!("{safe_id}.md"))
+    })
+}
+
+/// The run's report path relative to the workspace, only when the report
+/// was actually written. Always `/`-separated: the path is shown to the model
+/// and the user in receipts, and must read the same on every platform.
+pub(super) fn written_run_report(workspace: &Path, run_id: &str) -> Option<String> {
+    let relative = run_report_relative_path(run_id)?;
+    workspace.join(&relative).is_file().then(|| {
+        relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    })
 }
 
 /// Bounded preview of a raw `responseSchema` reply for run records and
@@ -72,18 +92,12 @@ pub(super) fn write_schema_raw_artifact(
     if safe_run.is_empty() || safe_task.is_empty() {
         return None;
     }
-    let dir = workspace.join(".codewhale").join("reports");
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        crate::logging::warn(format!(
-            "workflow schema artifact dir {} not created: {err}",
-            dir.display()
-        ));
-        return None;
-    }
-    let path = dir.join(format!(
+    let path = workspace.join(".codewhale").join("reports").join(format!(
         "{safe_run}.schema.{safe_task}.attempt{attempt}.txt"
     ));
-    match std::fs::write(&path, raw) {
+    // Confined write: no link below the workspace is followed, and the missing
+    // `.codewhale/reports` parents are created without following one.
+    match crate::fs_confined::write(workspace, &path, raw.as_bytes()) {
         Ok(()) => Some(path.display().to_string()),
         Err(err) => {
             crate::logging::warn(format!(

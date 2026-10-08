@@ -82,13 +82,18 @@ Every phase persists its transition, so `codewhale dispatch --show <id>` /
 
 ### Where the run happens
 
-- The sandbox launches from the Codewhale cloud-agent snapshot — the
-  `codewhale` CLI is preinstalled in it (see
-  [`cloud-agent-snapshot/`](./cloud-agent-snapshot/)) — with the
-  dispatching account's machine token injected as `CODEWHALE_API_KEY`, so
-  the in-sandbox `codewhale exec --auto` runs as the account and resolves
-  the account's configured model. No provider API key widens into the
-  sandbox.
+- The launcher selects `codewhale-cloud-agent` by default, or the validated
+  `CODEWHALE_DISPATCH_SNAPSHOT` override. Its single image definition and build
+  instructions live in
+  [`computer/snapshots/cloud-agent/`](../computer/snapshots/cloud-agent/).
+  That image pins its own Engine version; a newer source checkout does not
+  update it automatically.
+- Current source sends the account machine token as `CODEWHALE_API_KEY` in
+  create-time environment. This is server-visible account identity, not an
+  inference-provider key. Source wiring for snapshot creation and toolbox
+  execution does not establish a working account-to-provider credential bridge
+  or an end-to-end Cloud Agent acceptance result; see the image's documented
+  limitations before operating it.
 - The CLI stays attached: after `--confirm` it prints the launching card and
   waits for the runner so a sandbox is never orphaned by an early exit
   (Ctrl-C exits the wait; the job record survives, and `--cancel` tears the

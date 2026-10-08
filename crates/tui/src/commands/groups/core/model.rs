@@ -1,15 +1,15 @@
 //! `/model` command.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "model",
     aliases: &["moxing", "route"],
-    usage: "/model [name|refresh]",
+    usage: "/model [name|refresh|router]",
     description_id: MessageId::CmdModelDescription,
 };
 

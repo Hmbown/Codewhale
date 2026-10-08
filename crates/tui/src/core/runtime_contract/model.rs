@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::llm_client::LlmClient;
 use crate::llm_client::StreamEventBox;
-use crate::models::{MessageRequest, MessageResponse};
+use codewhale_models::{MessageRequest, MessageResponse};
 
 /// Object-safe model boundary for Engine dependency injection.
 ///
@@ -14,7 +14,6 @@ use crate::models::{MessageRequest, MessageResponse};
 /// adapter preserves that provider trait while giving deterministic Engine
 /// tests and alternate adapters one injectable boundary.
 #[async_trait]
-#[allow(dead_code)]
 pub trait ModelClient: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model(&self) -> &str;
@@ -39,10 +38,9 @@ pub trait ModelClient: Send + Sync {
         requested_model: &str,
         dispatched_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
-        let provider = crate::config::ApiProvider::parse(self.provider_name())
-            .unwrap_or(crate::config::ApiProvider::Custom);
-        crate::cost_status::EffectiveRouteEnvelope::capture(
-            None,
+        let provider = crate::config::ProviderKind::parse(self.provider_name())
+            .unwrap_or(crate::config::ProviderKind::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture_observed(
             provider,
             self.provider_name(),
             requested_model,
@@ -51,7 +49,12 @@ pub trait ModelClient: Send + Sync {
         )
     }
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse>;
+    /// Fresh authorization evidence; cache-owning adapters must bypass it.
+    async fn create_message_uncached(&self, request: MessageRequest) -> Result<MessageResponse> {
+        self.create_message(request).await
+    }
     async fn create_message_stream(&self, request: MessageRequest) -> Result<StreamEventBox>;
+    #[expect(dead_code)]
     async fn health_check(&self) -> Result<bool>;
 }
 
@@ -95,6 +98,10 @@ where
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {
         LlmClient::create_message(self, request).await
+    }
+
+    async fn create_message_uncached(&self, request: MessageRequest) -> Result<MessageResponse> {
+        LlmClient::create_message_uncached(self, request).await
     }
 
     async fn create_message_stream(&self, request: MessageRequest) -> Result<StreamEventBox> {

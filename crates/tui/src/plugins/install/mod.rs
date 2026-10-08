@@ -51,12 +51,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use thiserror::Error;
 
+/// A validated manifest name is already occupied by another loaded bundle.
+/// Keep this typed so API clients receive a conflict, not a server failure.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct PluginNameConflict(pub String);
+
 use crate::network_policy::NetworkPolicy;
+use crate::plugins::manifest::PluginManifest;
 use crate::skills::install::{
     self as skill_install, FetchOutcome, InstallSource, InstalledFromMarker, fetch_tarball,
     sha256_hex, source_spec_string,
 };
 
+pub(crate) mod dsh;
 mod place;
 mod stage;
 mod tarball;
@@ -90,6 +98,11 @@ pub enum PluginInstallSource {
     /// through the shared skill-install machinery. There is no registry
     /// index in v1.
     Remote(InstallSource),
+    /// A local DeepSeek Harness bundle package, converted by [`dsh`] into a
+    /// native bundle that then takes the same staged, reviewed install path.
+    /// Parsed from `dsh:<dir>`, or from a plain local path that holds a DSH
+    /// `package.json` and no native manifest.
+    Dsh(PathBuf),
 }
 
 impl PluginInstallSource {
@@ -106,6 +119,13 @@ impl PluginInstallSource {
         if let Some(path) = trimmed.strip_prefix("path:") {
             return Self::local(path);
         }
+        if let Some(path) = trimmed.strip_prefix("dsh:") {
+            let path = path.trim();
+            if path.is_empty() {
+                bail!("DSH package path must not be empty");
+            }
+            return Ok(Self::Dsh(PathBuf::from(path)));
+        }
         if trimmed.starts_with("github:")
             || trimmed.starts_with("https://")
             || trimmed.starts_with("http://")
@@ -113,6 +133,7 @@ impl PluginInstallSource {
             let source = InstallSource::parse(trimmed)?;
             return match source {
                 InstallSource::GitHubRepo(_) | InstallSource::DirectUrl(_) => {
+                    remote_bundle_path(&source)?;
                     Ok(Self::Remote(source))
                 }
                 InstallSource::Registry(_) => {
@@ -128,8 +149,42 @@ impl PluginInstallSource {
         if trimmed.is_empty() {
             bail!("local install path must not be empty");
         }
-        Ok(Self::LocalPath(PathBuf::from(trimmed)))
+        let path = PathBuf::from(trimmed);
+        if crate::plugins::agent_plugin::resolve_manifest_path(&path).is_none()
+            && dsh::is_dsh_package(&path)
+        {
+            return Ok(Self::Dsh(path));
+        }
+        Ok(Self::LocalPath(path))
     }
+}
+
+/// Select one manifest-rooted bundle from a repository archive. The fragment
+/// is local extraction metadata, never a path sent to or executed by a server.
+fn remote_bundle_path(source: &InstallSource) -> Result<Option<String>> {
+    let InstallSource::DirectUrl(raw) = source else {
+        return Ok(None);
+    };
+    let url = reqwest::Url::parse(raw).context("invalid plugin archive URL")?;
+    let Some(fragment) = url.fragment() else {
+        return Ok(None);
+    };
+    let path = fragment
+        .strip_prefix("path=")
+        .context("plugin archive fragment must be #path=<bundle-directory>")?;
+    if path.is_empty()
+        || !path.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_' | b'.'))
+        })
+    {
+        bail!("plugin archive bundle path must contain only safe relative directory names");
+    }
+    Ok(Some(path.to_string()))
 }
 
 /// Serialize a source for the `.installed-from` marker. Must round-trip
@@ -141,6 +196,10 @@ fn plugin_spec_string(source: &PluginInstallSource, canonical_source: Option<&Pa
             format!("path:{}", path.display())
         }
         PluginInstallSource::Remote(remote) => source_spec_string(remote),
+        PluginInstallSource::Dsh(_) => {
+            let path = canonical_source.expect("DSH installs record the canonical source");
+            format!("dsh:{}", path.display())
+        }
     }
 }
 
@@ -290,7 +349,7 @@ async fn install_inner(
             verify_expected_content_hash(&staged, expected_content_hash)?;
             if let Some(conflict) = name_conflict(&staged.name) {
                 let _ = fs::remove_dir_all(&staged.staged_path);
-                bail!(conflict);
+                return Err(PluginNameConflict(conflict).into());
             }
             let canonical = path
                 .canonicalize()
@@ -302,6 +361,17 @@ async fn install_inner(
                 "",
                 user_plugins_dir,
                 update,
+            )
+        }
+        PluginInstallSource::Dsh(package) => {
+            let converted = convert_dsh_off_runtime(package.clone()).await?;
+            install_converted_dsh(
+                converted,
+                user_plugins_dir,
+                max_size,
+                update,
+                name_conflict,
+                expected_content_hash,
             )
         }
         PluginInstallSource::Remote(remote) => {
@@ -326,6 +396,79 @@ async fn install_inner(
             )
         }
     }
+}
+
+/// A DSH package converted into scratch; the scratch directory lives as long
+/// as this value.
+struct ConvertedDsh {
+    canonical: PathBuf,
+    _scratch: tempfile::TempDir,
+    bundle: PathBuf,
+}
+
+/// Parse and convert off the async runtime: conversion reads and copies the
+/// whole package synchronously.
+async fn convert_dsh_off_runtime(package: PathBuf) -> Result<ConvertedDsh> {
+    #[cfg(test)]
+    let env_scope = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _env_scope = crate::test_support::join_env_scope(env_scope);
+        let canonical = package
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", package.display()))?;
+        let (scratch, bundle, _conversion) = dsh::convert_to_scratch(&canonical)?;
+        Ok(ConvertedDsh {
+            canonical,
+            _scratch: scratch,
+            bundle,
+        })
+    })
+    .await
+    .context("DSH conversion task failed")?
+}
+
+/// Stage, verify and place a converted DSH bundle exactly like a local one.
+/// The marker records the package and the converted bundle's content hash,
+/// so update re-converts and can tell an unchanged package from a changed one.
+fn install_converted_dsh(
+    converted: ConvertedDsh,
+    user_plugins_dir: &Path,
+    max_size: u64,
+    update: bool,
+    name_conflict: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    expected_content_hash: Option<&str>,
+) -> Result<PluginInstallOutcome> {
+    let canonical = converted.canonical.clone();
+    let staged = stage_local_copy(&converted.bundle, user_plugins_dir, max_size)?;
+    verify_expected_content_hash(&staged, expected_content_hash)?;
+    if let Some(conflict) = name_conflict(&staged.name) {
+        let _ = fs::remove_dir_all(&staged.staged_path);
+        return Err(PluginNameConflict(conflict).into());
+    }
+    let checksum = staged.content_hash.clone();
+    finalize_install(
+        staged,
+        &plugin_spec_string(
+            &PluginInstallSource::Dsh(canonical.clone()),
+            Some(&canonical),
+        ),
+        None,
+        &checksum,
+        user_plugins_dir,
+        update,
+    )
+}
+
+/// Review a DSH package without installing it: the conversion receipt and the
+/// content hash that an exact install of the same package will stage.
+pub(crate) fn preview_dsh(package: &Path) -> Result<(dsh::DshConversion, String)> {
+    let (_scratch, bundle, conversion) = dsh::convert_to_scratch(package)?;
+    let manifest = crate::plugins::agent_plugin::resolve_manifest_path(&bundle)
+        .context("converted DSH bundle has no manifest")?;
+    let validated = PluginManifest::validate_from_path(&manifest)
+        .map_err(|error| anyhow::anyhow!("converted DSH bundle failed validation: {error}"))?;
+    Ok((conversion, validated.content_hash))
 }
 
 fn verify_expected_content_hash(
@@ -360,11 +503,12 @@ fn install_remote_bytes(
     expected_content_hash: Option<&str>,
 ) -> Result<PluginInstallOutcome> {
     let checksum = sha256_hex(bytes);
-    let staged = stage_tarball(bytes, user_plugins_dir, max_size)?;
+    let bundle_path = remote_bundle_path(remote)?;
+    let staged = stage_tarball(bytes, user_plugins_dir, max_size, bundle_path.as_deref())?;
     verify_expected_content_hash(&staged, expected_content_hash)?;
     if let Some(conflict) = name_conflict(&staged.name) {
         let _ = fs::remove_dir_all(&staged.staged_path);
-        bail!(conflict);
+        return Err(PluginNameConflict(conflict).into());
     }
     finalize_install(
         staged,
@@ -390,18 +534,60 @@ pub async fn update(
     network: &NetworkPolicy,
 ) -> Result<PluginUpdateResult> {
     let target = plugin_target_path(name, user_plugins_dir)?;
-    if target.exists() {
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
         ensure_target_within_plugins_dir(&target, user_plugins_dir)?;
     }
     let marker_path = target.join(INSTALLED_FROM_MARKER);
-    if !marker_path.exists() {
+    if !tokio::fs::try_exists(&marker_path).await.unwrap_or(false) {
         return Err(PluginInstallError::NotInstalledHere(name.to_string()).into());
     }
-    let marker_body = fs::read_to_string(&marker_path)
+    let marker_body = tokio::fs::read_to_string(&marker_path)
+        .await
         .with_context(|| format!("failed to read {}", marker_path.display()))?;
     let marker: InstalledFromMarker = serde_json::from_str(&marker_body)
         .with_context(|| format!("malformed {INSTALLED_FROM_MARKER} for {name}"))?;
     let source = PluginInstallSource::parse(&marker.spec)?;
+    if let PluginInstallSource::Dsh(package) = &source {
+        // Re-convert the recorded package. An identical converted bundle is
+        // no change; a different one replaces the installed copy, and its
+        // new content hash invalidates the trust receipt at next discovery.
+        let converted = convert_dsh_off_runtime(package.clone()).await?;
+        let content_hash = {
+            let manifest = crate::plugins::agent_plugin::resolve_manifest_path(&converted.bundle)
+                .context("converted DSH bundle has no manifest")?;
+            PluginManifest::validate_from_path(&manifest)
+                .map_err(|error| {
+                    anyhow::anyhow!("converted DSH bundle failed validation: {error}")
+                })?
+                .content_hash
+        };
+        if content_hash == marker.source_checksum() {
+            return Ok(PluginUpdateResult::NoChange);
+        }
+        let outcome = install_converted_dsh(
+            converted,
+            user_plugins_dir,
+            max_size,
+            true,
+            &|actual| {
+                (actual != name).then(|| {
+                    format!("updated plugin changed name from {name} to {actual}; original plugin preserved")
+                })
+            },
+            None,
+        )?;
+        return match outcome {
+            PluginInstallOutcome::Installed(installed) => {
+                Ok(PluginUpdateResult::Updated(installed))
+            }
+            PluginInstallOutcome::NeedsApproval(host) => {
+                Ok(PluginUpdateResult::NeedsApproval(host))
+            }
+            PluginInstallOutcome::NetworkDenied(host) => {
+                Ok(PluginUpdateResult::NetworkDenied(host))
+            }
+        };
+    }
     let PluginInstallSource::Remote(remote) = source else {
         bail!(
             "plugin '{name}' was installed from a local path ({}) and cannot be updated from the network; \
@@ -428,7 +614,13 @@ pub async fn update(
         user_plugins_dir,
         max_size,
         true,
-        &|_| None,
+        &|actual| {
+            (actual != name).then(|| {
+                format!(
+                    "updated plugin changed name from {name} to {actual}; original plugin preserved"
+                )
+            })
+        },
         None,
     )?;
     match outcome {

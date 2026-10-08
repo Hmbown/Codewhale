@@ -67,7 +67,7 @@ pub fn read_or_create_install_id(root: &Path) -> Result<InstallId> {
         let existing = std::fs::read_to_string(&path)
             .ok()
             .and_then(|body| serde_json::from_str::<InstallId>(&body).ok())
-            .filter(|record| uuid::Uuid::parse_str(record.install_id.trim()).is_ok())
+            .filter(|record| is_canonical_random_uuid(&record.install_id))
             .filter(|record| !is_expired(&record.rotated_at));
         if let Some(record) = existing {
             return Ok(record);
@@ -84,6 +84,21 @@ pub fn read_or_create_install_id(root: &Path) -> Result<InstallId> {
     .ok_or_else(|| anyhow::anyhow!("telemetry privacy lock is held"))
 }
 
+/// Exactly what [`read_or_create_install_id`] mints: a random (v4, RFC 4122
+/// variant) UUID in lowercase hyphenated form, byte for byte.
+///
+/// `Uuid::parse_str` alone also accepts surrounding whitespace after a trim,
+/// braced/URN/simple spellings (each a different wire string for one id),
+/// the nil UUID, and v1 ids, which embed a MAC address and a clock — a device
+/// fingerprint, the one thing an install id must never be.
+fn is_canonical_random_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| {
+        id.get_version() == Some(uuid::Version::Random)
+            && id.get_variant() == uuid::Variant::RFC4122
+            && id.hyphenated().to_string() == value
+    })
+}
+
 fn is_expired(rotated_at: &str) -> bool {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rotated_at) else {
         // An unreadable timestamp is treated as expired: minting a fresh random
@@ -91,7 +106,9 @@ fn is_expired(rotated_at: &str) -> bool {
         return true;
     };
     let age = chrono::Utc::now().signed_duration_since(parsed.with_timezone(&chrono::Utc));
-    age.num_days() >= ROTATION_DAYS
+    // A future `rotated_at` has a negative age that would never reach the
+    // rotation window, pinning the id forever. It is expired, not fresh.
+    age < chrono::TimeDelta::zero() || age.num_days() >= ROTATION_DAYS
 }
 
 /// Read `state.json`, or a default when it is missing or unreadable.
@@ -128,8 +145,9 @@ pub fn now_rfc3339() -> String {
 /// The build sha of a release-CI binary, or `None`.
 ///
 /// Sourced from `CODEWHALE_RELEASE_BUILD_SHA`, a rustc-env this crate's build
-/// script emits **only** when `CODEWHALE_BUILD_SHA`, its legacy build-only
-/// alias, or `GITHUB_SHA` was present in the build environment. `null` for
+/// script emits **only** when `CODEWHALE_BUILD_SHA` or its legacy build-only
+/// alias was present in the build environment (never the ambient
+/// `GITHUB_SHA` every Actions job carries). `null` for
 /// every locally built binary, unconditionally, with no runtime lookup of any
 /// kind.
 ///

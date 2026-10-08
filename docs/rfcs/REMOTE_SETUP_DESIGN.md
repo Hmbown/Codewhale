@@ -68,8 +68,9 @@ Verified against the codebase:
   `/mobile`.
 - `--host`, `--port`, `--workers`, `--auth-token`, `--insecure-no-auth`, and
   repeatable `--cors-origin` exist on `app-server --http` / `--mobile`.
-- `--mobile` without `--host` binds to `0.0.0.0` by design. Use
-  `--host 127.0.0.1` when putting Tailscale in front of the runtime.
+- `--mobile` is loopback-only: without `--host` it binds `127.0.0.1`, and a
+  non-loopback `--mobile` bind is rejected at startup (no TLS or verified
+  overlay boundary yet).
 - `/health` and `/v1/runtime/info` are public bootstrap/supervision endpoints.
   `/v1/*` control routes require the runtime bearer token unless auth is
   explicitly disabled on a trusted loopback bind.

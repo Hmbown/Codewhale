@@ -53,6 +53,12 @@ pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 900;
 pub const MIN_STREAM_CHUNK_TIMEOUT_SECS: u64 = 1;
 /// Maximum accepted stream chunk timeout.
 pub const MAX_STREAM_CHUNK_TIMEOUT_SECS: u64 = 3600;
+/// Default TCP/TLS connect timeout for the model HTTP client, in seconds.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Minimum accepted connect timeout.
+pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
+/// Maximum accepted connect timeout.
+pub const MAX_CONNECT_TIMEOUT_SECS: u64 = 300;
 pub(crate) const STREAM_CHUNK_TIMEOUT_ENV: &str = "CODEWHALE_STREAM_IDLE_TIMEOUT_SECS";
 /// Legacy alias for [`STREAM_CHUNK_TIMEOUT_ENV`].
 pub(crate) const LEGACY_STREAM_CHUNK_TIMEOUT_ENV: &str = "DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS";

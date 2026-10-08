@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::agent_roster::{RosterState, build_agent_roster};
 use crate::tools::subagent::{
     AgentRunUsage, AgentWorkerEvent, AgentWorkerRecord, AgentWorkerSpec, AgentWorkerStatus,
     AgentWorkerToolProfile, FleetRole,
@@ -13,10 +14,6 @@ fn usage_none() -> AgentRunUsage {
         output_tokens: None,
         total_tokens: None,
         cost_microusd: None,
-        token_budget: None,
-        budget_spent_tokens: None,
-        budget_remaining_tokens: None,
-        budget_scope: None,
         note: "no route audit for this worker".to_string(),
     }
 }
@@ -38,6 +35,7 @@ fn record(worker_id: &str, created_at_ms: u64) -> AgentWorkerRecord {
         worker_id: worker_id.to_string(),
         run_id: format!("run-{worker_id}"),
         parent_run_id: None,
+        workflow_run_id: None,
         session_name: Some(worker_id.to_string()),
         objective: "do the thing".to_string(),
         role: None,
@@ -415,4 +413,180 @@ fn rendered_roster_shape() {
     assert!(text.contains("1/2 agents done"), "{text}");
     assert!(text.contains("step 7 · apply_patch"), "{text}");
     assert!(text.contains("↓ 306.7k"), "{text}");
+}
+
+// === #5906: a parked husk is not an agent waiting for input ===
+
+/// A child parked at the parent's turn end settles as `WaitingForUser` like a
+/// child that really asked a question. Only `parked_at_turn_end` separates
+/// them, and the rail has to read it or it prints the same row for both.
+#[test]
+fn a_parked_record_is_its_own_roster_state_not_waiting() {
+    let mut parked = record("parked_child", 1_000);
+    parked.status = AgentWorkerStatus::WaitingForUser;
+    parked.parked_at_turn_end = true;
+
+    let mut asked = record("asking_child", 2_000);
+    asked.status = AgentWorkerStatus::WaitingForUser;
+
+    let rows = build_agent_roster(&[parked, asked], 5_000);
+    let parked_row = rows
+        .iter()
+        .find(|row| row.worker_id == "parked_child")
+        .expect("parked row");
+    let asked_row = rows
+        .iter()
+        .find(|row| row.worker_id == "asking_child")
+        .expect("asking row");
+
+    assert_eq!(parked_row.state, RosterState::Parked);
+    assert_eq!(
+        asked_row.state,
+        RosterState::Waiting,
+        "a child that genuinely asked must keep the answerable state"
+    );
+    assert_ne!(parked_row.state.glyph(), asked_row.state.glyph());
+    assert!(
+        !parked_row.state.is_terminal(),
+        "parked work is unfinished, not settled-done"
+    );
+}
+
+/// The rail is otherwise oldest-first, but a parked husk is exactly the row an
+/// operator must not have to scan past to find live work.
+#[test]
+fn parked_husks_sort_below_live_and_waiting_agents() {
+    let mut parked = record("aaa_parked", 1_000);
+    parked.status = AgentWorkerStatus::WaitingForUser;
+    parked.parked_at_turn_end = true;
+
+    let running = record("bbb_running", 2_000);
+
+    let mut waiting = record("ccc_waiting", 3_000);
+    waiting.status = AgentWorkerStatus::WaitingForUser;
+
+    let rows = build_agent_roster(&[parked, running, waiting], 9_000);
+    let order: Vec<&str> = rows.iter().map(|row| row.worker_id.as_str()).collect();
+    assert_eq!(
+        order,
+        vec!["bbb_running", "ccc_waiting", "aaa_parked"],
+        "the parked husk sinks below live and answerable rows despite being oldest"
+    );
+}
+
+/// Re-dispatch clears the flag on the record (#5921); the rail must follow it
+/// back rather than latching a row as parked forever.
+#[test]
+fn a_re_dispatched_record_stops_reading_as_parked() {
+    let mut rec = record("resumed", 1_000);
+    rec.status = AgentWorkerStatus::WaitingForUser;
+    rec.parked_at_turn_end = true;
+    assert_eq!(
+        build_agent_roster(&[rec.clone()], 5_000)[0].state,
+        RosterState::Parked
+    );
+
+    rec.parked_at_turn_end = false;
+    rec.status = AgentWorkerStatus::RunningTool;
+    assert_eq!(
+        build_agent_roster(&[rec], 5_000)[0].state,
+        RosterState::Running
+    );
+}
+
+#[test]
+fn result_headline_skips_scaffolding_and_returns_the_first_sentence() {
+    use crate::agent_roster::result_headline;
+    // #6565: the first line of a report is usually a heading or a rule, and
+    // showing it hid the answer.
+    let report = "\n## Summary\n\n---\n```text\nThe docs audit found 3 stale links. Two are in README.md.\n```\n<codewhale:subagent.done>{\"event\":\"subagent.completed\"}</codewhale:subagent.done>";
+    assert_eq!(
+        result_headline(report).as_deref(),
+        Some("The docs audit found 3 stale links.")
+    );
+    // A dotted version or file name inside the sentence does not end it.
+    assert_eq!(
+        result_headline("Bumped to v0.10.1 in Cargo.toml and tagged it. Done.").as_deref(),
+        Some("Bumped to v0.10.1 in Cargo.toml and tagged it.")
+    );
+    assert_eq!(
+        result_headline("修复了两个问题。其余正常。").as_deref(),
+        Some("修复了两个问题。")
+    );
+    // Only headings: the first one, without its marks.
+    assert_eq!(
+        result_headline("# Only a heading\n## Another").as_deref(),
+        Some("Only a heading")
+    );
+    assert_eq!(result_headline(""), None);
+    assert_eq!(
+        result_headline("  \n***\n<codewhale:subagent.done>{}</codewhale:subagent.done>"),
+        None
+    );
+}
+
+#[test]
+fn a_finished_worker_shows_its_result_not_its_last_tool() {
+    // #6565: the roster said `step 6 · read_file` for an agent that had
+    // already finished and reported. A settled row leads with the outcome.
+    let mut rec = record("auditor", 1_000);
+    rec.events.push_back(AgentWorkerEvent {
+        seq: 1,
+        worker_id: "auditor".to_string(),
+        status: AgentWorkerStatus::RunningTool,
+        timestamp_ms: 1_200,
+        message: None,
+        step: Some(6),
+        tool_name: Some("read_file".to_string()),
+    });
+    let long_tail = "detail ".repeat(400);
+    rec.status = AgentWorkerStatus::Completed;
+    rec.completed_at_ms = Some(1_900);
+    rec.result_summary = Some(format!(
+        "## Summary\n\nThe docs audit found 3 stale links.\n\n{long_tail}\n<codewhale:subagent.done>{{}}</codewhale:subagent.done>"
+    ));
+    let rows = build_agent_roster(&[rec.clone()], 2_000);
+    assert_eq!(
+        rows[0].activity.as_deref(),
+        Some("The docs audit found 3 stale links.")
+    );
+    // The row keeps the whole answer for the focused view.
+    assert!(
+        rows[0]
+            .outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome.contains(long_tail.trim_end()))
+    );
+
+    // Failed leads with the error; a live worker still shows its step and
+    // carries no outcome.
+    rec.status = AgentWorkerStatus::Failed;
+    rec.error = Some("provider returned 429".to_string());
+    let rows = build_agent_roster(&[rec.clone()], 2_000);
+    assert_eq!(rows[0].activity.as_deref(), Some("provider returned 429"));
+    assert_eq!(rows[0].outcome.as_deref(), Some("provider returned 429"));
+
+    rec.status = AgentWorkerStatus::RunningTool;
+    let rows = build_agent_roster(&[rec], 2_000);
+    assert_eq!(rows[0].activity.as_deref(), Some("step 6 · read_file"));
+    assert_eq!(rows[0].outcome, None);
+}
+
+#[test]
+fn a_finished_worker_without_a_result_falls_back_to_its_last_step() {
+    let mut rec = record("quiet", 1_000);
+    rec.events.push_back(AgentWorkerEvent {
+        seq: 1,
+        worker_id: "quiet".to_string(),
+        status: AgentWorkerStatus::RunningTool,
+        timestamp_ms: 1_200,
+        message: None,
+        step: Some(2),
+        tool_name: Some("Grep".to_string()),
+    });
+    rec.status = AgentWorkerStatus::Completed;
+    rec.result_summary = Some("   \n".to_string());
+    let rows = build_agent_roster(&[rec], 2_000);
+    assert_eq!(rows[0].activity.as_deref(), Some("step 2 · Grep"));
+    assert_eq!(rows[0].outcome, None);
 }

@@ -75,8 +75,7 @@ pub(crate) fn toggle_help_view(app: &mut App) {
     if app.view_stack.top_kind() == Some(ModalKind::Help) {
         app.view_stack.pop();
     } else {
-        let help = HelpView::new_for_shortcuts(app.ui_locale, &app.workspace, &app.cached_skills)
-            .with_groups_expanded(app.help_expand_groups);
+        let help = HelpView::new_for_app(app, true).with_groups_expanded(app.help_expand_groups);
         app.view_stack.push(help);
     }
     app.needs_redraw = true;
@@ -246,7 +245,7 @@ pub(crate) async fn open_onboarding_provider_picker(
     app.view_stack.push(
         crate::tui::provider_picker::ProviderPickerView::new_for_onboarding(
             app.api_provider,
-            recover_configured_route.then_some(app.onboarding_provider),
+            recover_configured_route.then(|| app.onboarding_provider.as_str().into()),
             config,
             runtime_status,
         )
@@ -295,13 +294,8 @@ pub(crate) async fn open_provider_picker(
     engine_handle: &EngineHandle,
 ) {
     if app.onboarding == OnboardingState::Provider {
-        open_onboarding_provider_picker(
-            app,
-            config,
-            engine_handle,
-            app.onboarding_missing_key_recovery,
-        )
-        .await;
+        let recover_configured_route = app.onboarding_recovers_configured_route();
+        open_onboarding_provider_picker(app, config, engine_handle, recover_configured_route).await;
     } else {
         open_launch_provider_picker(app, config, engine_handle).await;
     }
@@ -400,13 +394,17 @@ pub(crate) fn toggle_live_transcript_overlay(app: &mut App) {
 pub(crate) fn open_model_picker_for_provider(
     app: &mut App,
     config: &Config,
-    provider: crate::config::ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) {
+    if let Err(reason) = config.verify_provider_identity(identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
     if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
         app.view_stack
             .push(crate::tui::model_picker::ModelPickerView::new(app, config));
     }
-    for ch in provider.display_name().chars() {
+    for ch in identity.key.as_str().chars() {
         // Char input updates the query and never emits a ViewEvent, so the
         // returned (empty) event list is safe to drop.
         let _ = app.view_stack.handle_key(crossterm::event::KeyEvent::new(
@@ -441,19 +439,35 @@ pub(crate) fn disable_hotbar(app: &mut App, config: &mut Config) {
 }
 
 pub(crate) fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
-    if app.view_stack.top_kind() == Some(ModalKind::Config) {
-        let filter = app.view_stack.pop().and_then(|mut view| {
-            view.as_any_mut()
-                .downcast_mut::<ConfigView>()
-                .map(|config_view| config_view.filter_query().to_string())
-        });
-        let mut config_view = ConfigView::new_for_app(app);
-        if let Some(filter) = filter {
-            config_view.restore_filter(filter);
-        }
-        config_view.focus_key(focus_key);
-        app.view_stack.push(config_view);
+    refresh_config_view_after_commit(app, focus_key, false);
+}
+
+/// Rebuild an open settings view from disk truth after a commit. When the host
+/// rejected the value, the editor reopens with what the user typed.
+pub(crate) fn refresh_config_view_after_commit(app: &mut App, focus_key: &str, rejected: bool) {
+    if app.view_stack.top_kind() != Some(ModalKind::Config) {
+        return;
     }
+    let Some(mut boxed) = app.view_stack.pop() else {
+        return;
+    };
+    let rebuilt = match boxed.as_any_mut().downcast_ref::<ConfigView>() {
+        Some(previous) => {
+            let mut view = ConfigView::rebuild_preserving(app, previous, focus_key);
+            if rejected {
+                view.restore_rejected_commit(previous);
+            }
+            view
+        }
+        // Not a `ConfigView`: rebuild from scratch rather than restoring an
+        // unknown modal, matching how the stack got here.
+        None => {
+            let mut fresh = ConfigView::new_for_app(app);
+            fresh.focus_key(focus_key);
+            fresh
+        }
+    };
+    app.view_stack.push(rebuilt);
 }
 
 pub(crate) fn refresh_skills_manager_if_open(
@@ -488,10 +502,12 @@ pub(crate) fn push_approval_request_view(
     description: &str,
     tool_input: &serde_json::Value,
     approval_key: &str,
+    approval_grouping_key: &str,
     intent_summary: Option<&str>,
     default_selection: crate::config::ApprovalDefaultSelection,
+    timeout: Option<std::time::Duration>,
 ) {
-    let request = ApprovalRequest::new_with_intent(
+    let mut request = ApprovalRequest::new_with_intent(
         id,
         tool_name,
         description,
@@ -500,12 +516,26 @@ pub(crate) fn push_approval_request_view(
         intent_summary,
         &app.workspace,
     );
-    app.view_stack
-        .push(ApprovalView::new_with_default_selection(
-            request,
-            app.ui_locale,
-            default_selection,
-        ));
+    // The engine owns the grant scope: a child's grouping key is prefixed
+    // with its agent so "allow for this conversation" never covers the
+    // parent or a sibling (C3). Keep the card's own key only when the
+    // event carries none.
+    if !approval_grouping_key.is_empty() {
+        request.approval_grouping_key = approval_grouping_key.to_string();
+    }
+    // A child's gate never consults saved repo allow rules, so a child card
+    // must not offer "Always allow in this repo" — it would do nothing. The
+    // card names its agent (approvals C1).
+    if crate::tools::subagent::SubAgentManager::is_child_approval_id(id) {
+        request.persistent_allow_rules.clear();
+        if let Some(agent_id) = crate::tui::pending_requests::child_agent_id(id) {
+            request.owner = Some(crate::tui::pending_requests::owner_for(app, agent_id));
+        }
+    }
+    app.view_stack.push(
+        ApprovalView::new_with_default_selection(request, app.ui_locale, default_selection)
+            .with_timeout(timeout),
+    );
 }
 
 /// Push the new `selected_idx` into the live transcript overlay so the

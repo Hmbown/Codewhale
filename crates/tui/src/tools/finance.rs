@@ -14,6 +14,7 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_str, optional_u64,
 };
+use crate::network_policy::Decision;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
@@ -58,26 +59,30 @@ impl FinanceEndpoints {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct FinanceRequest {
     requested_ticker: String,
     resolved_symbol: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FinanceQuoteResponse {
     requested_ticker: String,
     ticker: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(deserialize_with = "deserialize_host_float")]
     price: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     change: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     change_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     previous_close: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     market_state: Option<String>,
@@ -86,9 +91,43 @@ struct FinanceQuoteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     exchange: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     market_time: Option<i64>,
     source: String,
     fallback_used: bool,
+}
+
+fn deserialize_host_float<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<f64, D::Error> {
+    let text = String::deserialize(decoder)?;
+    if text.len() > 32 {
+        return Err(serde::de::Error::custom(
+            "host numeric field exceeds its bound",
+        ));
+    }
+    text.parse().map_err(serde::de::Error::custom)
+}
+fn deserialize_host_optional<'de, D, T>(decoder: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    Option::<String>::deserialize(decoder)?
+        .map(|text| {
+            if text.len() > 32 {
+                return Err(serde::de::Error::custom(
+                    "host numeric field exceeds its bound",
+                ));
+            }
+            text.parse().map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+fn serialize_timestamp<S: serde::Serializer>(
+    value: &Option<i64>,
+    encoder: S,
+) -> Result<S::Ok, S::Error> {
+    value.map(|time| time.to_string()).serialize(encoder)
 }
 
 #[derive(Debug, Clone)]
@@ -188,7 +227,7 @@ impl ToolSpec for FinanceTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a live market quote for a stock, ETF, or crypto ticker using Yahoo Finance-style public endpoints."
+        "Fetch live stock, ETF or crypto quotes via Yahoo-style endpoints under the session network policy."
     }
 
     fn input_schema(&self) -> Value {
@@ -207,13 +246,9 @@ impl ToolSpec for FinanceTool {
                     "type": "string",
                     "description": "Optional asset type hint such as equity, fund, crypto, or index."
                 },
-                "market": {
-                    "type": "string",
-                    "description": "Optional market hint retained for compatibility with finance-style tool calls."
-                },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Request timeout in milliseconds (default: 10000, max: 60000)."
+                    "description": "Total lookup timeout in milliseconds, shared by the quote request and its chart fallback (default: 10000, max: 60000)."
                 }
             },
             "anyOf": [
@@ -240,7 +275,7 @@ impl ToolSpec for FinanceTool {
         true
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let raw_ticker = match optional_str(&input, "ticker")? {
             Some(ticker) => Some(ticker),
             None => optional_str(&input, "symbol")?,
@@ -252,21 +287,67 @@ impl ToolSpec for FinanceTool {
         }
 
         let type_hint = optional_str(&input, "type")?.map(str::trim);
-        let _market_hint = optional_str(&input, "market")?.map(str::trim);
         let timeout_ms =
             optional_u64(&input, "timeout_ms", DEFAULT_TIMEOUT_MS)?.clamp(100, MAX_TIMEOUT_MS);
 
         let request = normalize_request(raw_ticker, type_hint);
         let timeout = Duration::from_millis(timeout_ms);
 
-        let quote_result =
-            fetch_quote_endpoint(&self.client, timeout, &self.endpoints, &request).await;
+        // #135: quote and chart hosts are both vetted before any transport
+        // fires, so a tightened session (e.g. network.default = "deny")
+        // cannot leak a request through the chart fallback.
+        check_network_policy(context, &self.endpoints)?;
+
+        // One budget covers the quote request and its chart fallback
+        // (#6557 D03-m3): the fallback gets only what the first attempt left,
+        // so `timeout_ms` — and the Timeout error that reports it — is the
+        // real wall-clock bound rather than half of it.
+        let deadline = std::time::Instant::now() + timeout;
+        let host = context
+            .features
+            .enabled(crate::features::Feature::FinanceHost);
+        let quote_result = if host {
+            fetch_host_endpoint(
+                &self.client,
+                timeout,
+                &self.endpoints,
+                &request,
+                context,
+                deadline,
+                false,
+            )
+            .await
+            .map_err(|error| normalize_host_error(error, timeout_ms))?
+        } else {
+            fetch_quote_endpoint(&self.client, timeout, &self.endpoints, &request).await
+        };
         match quote_result {
             Ok(result) => {
                 ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
             }
             Err(first_failure) => {
-                match fetch_chart_endpoint(&self.client, timeout, &self.endpoints, &request).await {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let chart_result = if remaining.is_zero() {
+                    Err(AttemptFailure::timeout(CHART_SOURCE))
+                } else {
+                    if host {
+                        fetch_host_endpoint(
+                            &self.client,
+                            remaining,
+                            &self.endpoints,
+                            &request,
+                            context,
+                            deadline,
+                            true,
+                        )
+                        .await
+                        .map_err(|error| normalize_host_error(error, timeout_ms))?
+                    } else {
+                        fetch_chart_endpoint(&self.client, remaining, &self.endpoints, &request)
+                            .await
+                    }
+                };
+                match chart_result {
                     Ok(result) => ToolResult::json(&result)
                         .map_err(|e| ToolError::execution_failed(e.to_string())),
                     Err(second_failure) => Err(finalize_failure(
@@ -278,6 +359,39 @@ impl ToolSpec for FinanceTool {
             }
         }
     }
+}
+
+/// Fail closed when the session network policy denies (or has not approved)
+/// either endpoint host. Mirrors the Web/web_search/speech family: `Deny`
+/// and an undecided `Prompt` both stop before any request is made; no
+/// attached policy falls through permissively for back-compat.
+fn check_network_policy(
+    context: &ToolContext,
+    endpoints: &FinanceEndpoints,
+) -> Result<(), ToolError> {
+    let Some(decider) = context.network_policy.as_ref() else {
+        return Ok(());
+    };
+    for base in [&endpoints.quote_base, &endpoints.chart_base] {
+        let Some(host) = crate::network_policy::host_from_url(base) else {
+            continue;
+        };
+        match decider.evaluate(&host, "finance") {
+            Decision::Allow => {}
+            Decision::Deny => {
+                return Err(ToolError::permission_denied(format!(
+                    "finance lookup to '{host}' blocked by network policy"
+                )));
+            }
+            Decision::Prompt => {
+                return Err(ToolError::permission_denied(format!(
+                    "finance lookup to '{host}' requires approval; \
+                     re-run after `/network allow {host}` or set network.default = \"allow\" in config"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalize_request(raw_ticker: &str, type_hint: Option<&str>) -> FinanceRequest {
@@ -296,6 +410,152 @@ fn normalize_request(raw_ticker: &str, type_hint: Option<&str>) -> FinanceReques
         requested_ticker,
         resolved_symbol,
     }
+}
+
+fn normalize_host_error(error: ToolError, timeout_ms: u64) -> ToolError {
+    match error {
+        ToolError::Timeout { .. } => ToolError::Timeout {
+            seconds: millis_to_timeout_seconds(timeout_ms),
+        },
+        error => error,
+    }
+}
+
+/// The inner error is an upstream/business failure and may take the existing
+/// chart fallback. Host admission/runtime/result errors are outer errors and
+/// leave immediately, so an enabled Host failure never runs Rust normalization.
+async fn fetch_host_endpoint(
+    client: &Client,
+    timeout: Duration,
+    endpoints: &FinanceEndpoints,
+    request: &FinanceRequest,
+    context: &ToolContext,
+    deadline: std::time::Instant,
+    chart: bool,
+) -> Result<Result<FinanceQuoteResponse, AttemptFailure>, ToolError> {
+    let endpoint = if chart { CHART_SOURCE } else { QUOTE_SOURCE };
+    let url = if chart {
+        endpoints.chart_url(&request.resolved_symbol)
+    } else {
+        endpoints.quote_url(&request.resolved_symbol)
+    };
+    let body = tokio::select! {
+        biased;
+        _ = async { if let Some(cancel) = context.cancel_token.as_ref() { cancel.cancelled().await } else { std::future::pending::<()>().await } } => return Err(ToolError::not_available("finance cancelled")),
+        body = fetch_response_body_bounded(client, timeout, &url, endpoint) => match body { Ok(body) => body, Err(error) => return Ok(Err(error)) },
+    };
+    let parsed = if chart {
+        serde_json::from_str::<ChartEndpointResponse>(&body).and_then(serde_json::to_value)
+    } else {
+        serde_json::from_str::<QuoteEndpointResponse>(&body).and_then(serde_json::to_value)
+    };
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(Err(AttemptFailure::upstream(
+                endpoint,
+                format!("invalid JSON response: {error}"),
+            )));
+        }
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(Err(AttemptFailure::timeout(endpoint)));
+    }
+    let result = crate::extension_host::manager()
+        .execute_stock(
+            if chart {
+                crate::extension_host::StockOperation::FinanceChart
+            } else {
+                crate::extension_host::StockOperation::FinanceQuote
+            },
+            json!({"request":request,"parsed":parsed}),
+            context,
+            remaining,
+        )
+        .await?;
+    let metadata = result
+        .metadata
+        .ok_or_else(|| ToolError::execution_failed("Host finance result omitted metadata"))?;
+    if result.success {
+        let quote: FinanceQuoteResponse = serde_json::from_value(metadata)
+            .map_err(|_| ToolError::execution_failed("Host finance result malformed"))?;
+        if quote.requested_ticker != request.requested_ticker
+            || quote.source != endpoint
+            || quote.fallback_used != chart
+            || !quote.price.is_finite()
+        {
+            return Err(ToolError::execution_failed(
+                "Host finance result changed its captured request",
+            ));
+        }
+        Ok(Ok(quote))
+    } else {
+        if metadata.get("endpoint").and_then(Value::as_str) != Some(endpoint) {
+            return Err(ToolError::execution_failed(
+                "Host finance failure changed its endpoint",
+            ));
+        }
+        let detail = metadata
+            .get("detail")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::execution_failed("Host finance failure omitted detail"))?;
+        let failure = match metadata.get("kind").and_then(Value::as_str) {
+            Some("not_found") => AttemptFailure::not_found(endpoint, detail),
+            Some("upstream") => AttemptFailure::upstream(endpoint, detail),
+            _ => {
+                return Err(ToolError::execution_failed(
+                    "Host finance failure malformed",
+                ));
+            }
+        };
+        Ok(Err(failure))
+    }
+}
+
+/// Host captures are bounded before JSON parsing and before broker admission.
+/// The request's existing timeout includes every streamed body chunk.
+async fn fetch_response_body_bounded(
+    client: &Client,
+    timeout: Duration,
+    url: &str,
+    endpoint: &'static str,
+) -> Result<String, AttemptFailure> {
+    const MAX_BODY: usize = 1024 * 1024;
+    let mut response = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                AttemptFailure::timeout(endpoint)
+            } else {
+                AttemptFailure::upstream(endpoint, format!("request failed: {error}"))
+            }
+        })?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        if error.is_timeout() {
+            AttemptFailure::timeout(endpoint)
+        } else {
+            AttemptFailure::upstream(endpoint, format!("failed to read response body: {error}"))
+        }
+    })? {
+        if chunk.len() > MAX_BODY.saturating_sub(bytes.len()) {
+            return Err(AttemptFailure::upstream(
+                endpoint,
+                "Host finance response exceeds 1 MiB",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    if !status.is_success() {
+        return Err(status_failure(endpoint, status, &body));
+    }
+    Ok(body)
 }
 
 async fn fetch_quote_endpoint(
@@ -527,18 +787,18 @@ fn truncate_for_error(text: &str) -> String {
     out
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QuoteEndpointResponse {
     quote_response: QuoteResponseBody,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct QuoteResponseBody {
     result: Vec<QuoteItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QuoteItem {
     symbol: String,
@@ -555,6 +815,7 @@ struct QuoteItem {
     #[serde(default)]
     regular_market_previous_close: Option<f64>,
     #[serde(default)]
+    #[serde(serialize_with = "serialize_timestamp")]
     regular_market_time: Option<i64>,
     #[serde(default)]
     market_state: Option<String>,
@@ -568,12 +829,12 @@ struct QuoteItem {
     full_exchange_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartEndpointResponse {
     chart: ChartBody,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartBody {
     #[serde(default)]
     result: Option<Vec<ChartResult>>,
@@ -581,12 +842,12 @@ struct ChartBody {
     error: Option<ChartErrorBody>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartResult {
     meta: ChartMeta,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChartMeta {
     symbol: String,
@@ -599,6 +860,7 @@ struct ChartMeta {
     #[serde(default)]
     regular_market_price: Option<f64>,
     #[serde(default)]
+    #[serde(serialize_with = "serialize_timestamp")]
     regular_market_time: Option<i64>,
     #[serde(default)]
     chart_previous_close: Option<f64>,
@@ -612,7 +874,7 @@ struct ChartMeta {
     full_exchange_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartErrorBody {
     #[serde(default)]
     code: Option<String>,
@@ -785,7 +1047,7 @@ mod tests {
             .expect_err("double upstream failure should error");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 401"));
                 assert!(message.contains(CHART_SOURCE));
@@ -819,7 +1081,7 @@ mod tests {
             .expect_err("mixed upstream/not-found failures should not look like an invalid symbol");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 503"));
                 assert!(message.contains(CHART_SOURCE));
@@ -853,7 +1115,7 @@ mod tests {
             .expect_err("quote auth failures should not collapse into invalid input");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 401"));
                 assert!(message.contains(CHART_SOURCE));
@@ -904,6 +1166,87 @@ mod tests {
         assert!(matches!(err, ToolError::Timeout { .. }));
     }
 
+    /// #6557 D03-m3: the chart fallback used to get a fresh full timeout, so
+    /// a lookup could run for twice `timeout_ms`. Here the quote attempt
+    /// spends the whole budget; the fallback, which would answer in 150ms,
+    /// must not be given a second budget.
+    #[tokio::test]
+    async fn finance_fallback_shares_one_timeout_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .and(query_param("symbols", "AAPL"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(3_000))
+                    .set_body_json(json!({"quoteResponse": {"result": []}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chart/AAPL"))
+            .and(query_param("interval", "1d"))
+            .and(query_param("range", "5d"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(json!({
+                        "chart": {
+                            "result": [{
+                                "meta": {
+                                    "symbol": "AAPL",
+                                    "regularMarketPrice": 260.48,
+                                    "chartPreviousClose": 255.92
+                                }
+                            }],
+                            "error": null
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = tool_with_server(&server);
+        let started = std::time::Instant::now();
+        let err = tool
+            .execute(json!({"ticker": "AAPL", "timeout_ms": 500}), &context().0)
+            .await
+            .expect_err("the shared budget is spent before the fallback can answer");
+        assert!(matches!(err, ToolError::Timeout { seconds: 1 }), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2_500),
+            "lookup overran its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// JSON cannot carry NaN or infinity, and an overflowing literal is a
+    /// parse error rather than an infinite price.
+    #[tokio::test]
+    async fn finance_rejects_an_overflowing_price_literal() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .and(query_param("symbols", "AAPL"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"quoteResponse":{"result":[{"symbol":"AAPL","regularMarketPrice":1e400}]}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chart/AAPL"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = tool_with_server(&server)
+            .execute(json!({"ticker": "AAPL"}), &context().0)
+            .await
+            .expect_err("an overflowing price is not a quote");
+        assert!(err.to_string().contains("invalid JSON response"), "{err}");
+    }
+
     #[tokio::test]
     async fn finance_prefers_timeout_over_unknown_symbol_when_any_attempt_times_out() {
         let server = MockServer::start().await;
@@ -952,4 +1295,100 @@ mod tests {
         assert_eq!(any_of[0]["required"], json!(["ticker"]));
         assert_eq!(any_of[1]["required"], json!(["symbol"]));
     }
+
+    fn denied_context_for(host: &str) -> (ToolContext, tempfile::TempDir) {
+        use crate::network_policy::{NetworkPolicy, NetworkPolicyDecider};
+        let (ctx, tmp) = context();
+        let policy = NetworkPolicy {
+            default: Decision::Allow.into(),
+            allow: Vec::new(),
+            deny: vec![host.to_string()],
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        (
+            ctx.with_network_policy(NetworkPolicyDecider::new(policy, None)),
+            tmp,
+        )
+    }
+
+    #[tokio::test]
+    async fn finance_fails_closed_when_network_policy_denies_endpoint_host() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "quoteResponse": {"result": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let host = reqwest::Url::parse(&server.uri())
+            .expect("mock server URL")
+            .host_str()
+            .expect("mock server host")
+            .to_string();
+        let (blocked, _tmp) = denied_context_for(&host);
+
+        let tool = tool_with_server(&server);
+        let error = tool
+            .execute(json!({"ticker": "AAPL"}), &blocked)
+            .await
+            .expect_err("denied host must fail closed");
+        assert!(
+            error.to_string().contains("blocked by network policy"),
+            "{error}"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            0,
+            "no request may leave before the policy check"
+        );
+    }
+
+    #[tokio::test]
+    async fn finance_fails_closed_on_prompt_when_default_is_prompt() {
+        let server = MockServer::start().await;
+
+        // default = prompt with no allow list: the undecided host must fail
+        // closed with the approval hint, never with a silent request.
+        let (ctx, tmp) = context();
+        use crate::network_policy::{NetworkPolicy, NetworkPolicyDecider};
+        let policy = NetworkPolicy {
+            default: Decision::Prompt.into(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        let blocked = ctx.with_network_policy(NetworkPolicyDecider::new(policy, None));
+        drop(tmp);
+
+        let tool = tool_with_server(&server);
+        let error = tool
+            .execute(json!({"ticker": "AAPL"}), &blocked)
+            .await
+            .expect_err("undecided host must not reach the endpoint");
+        assert!(
+            error.to_string().contains("requires approval"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            0
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "stock_host_tests.rs"]
+mod stock_host_tests;

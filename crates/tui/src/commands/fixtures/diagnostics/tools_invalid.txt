@@ -1,0 +1,5 @@
+command: /tools yaml
+is_error: true
+message:
+Error: usage: /tools [text|json]
+action: <none>

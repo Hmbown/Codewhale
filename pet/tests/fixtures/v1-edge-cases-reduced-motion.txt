@@ -1,0 +1,27 @@
+f0000 d3c1d46eca00cd5d reasoning
+f0030 07b875ceb8fda6dc tool
+f0060 a98155b60941363e memory
+f0090 55f7910302b304d8 code
+f0120 751e793ac851f15e filesystem
+f0150 495c1a44be965047 network
+f0180 d053cc5e99a98d1e browser
+f0210 09d85d2dacae1a24 communication
+f0240 2d32993f291be69d agent
+f0270 3a521eb994a462b9 orchestration
+f0300 dd727efb37ae3729 error
+f0330 d5459527ccf733e0 human
+f0360 aef8fea05b900af1 other
+f0390 66dac42e583cd314 error
+f0420 66dac42e583cd314 error
+f0450 66dac42e583cd314 error
+f0480 66dac42e583cd314 error
+f0510 4f10054da7bd4fcd other
+f0540 4f10054da7bd4fcd other
+f0570 4f10054da7bd4fcd other
+f0600 5240b62461460e39 other
+f0630 5240b62461460e39 other
+f0660 d54fc727ccffdd5b human
+f0690 d54fc727ccffdd5b human
+f0720 63ffabae642cc7ee reasoning
+f0750 63ffabae642cc7ee reasoning
+final 63ffabae642cc7ee

@@ -16,31 +16,15 @@ use tokio::time::timeout as tokio_timeout;
 
 use crate::config::{
     TOGETHER_INKLING_MODEL, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_k3_route,
-    is_exact_xai_grok_4_6_route, is_exact_zai_chat_route, is_exact_zai_tiered_effort_route,
+    is_exact_zai_chat_route, is_exact_zai_forced_thinking_route, is_exact_zai_tiered_effort_route,
     is_kimi_code_membership_model, minimax_m3_route_uses_max_completion_tokens,
     moonshot_base_url_is_exact_kimi_code, wire_model_for_provider_route,
 };
 
-// The bounded response-header wait (`stream_open_timeout`) and its env
-// override live in the shared stream-entry seam; every streaming adapter
-// (Chat Completions / Anthropic Messages / Responses) uses the same policy.
-use super::stream_entry::stream_open_timeout;
-
-fn stream_idle_timeout_message(
-    idle: Duration,
-    bytes_received: usize,
-    stream_age: Duration,
-    since_last_chunk: Duration,
-) -> String {
-    // Shared seam: Chat Completions / Anthropic / Responses keep one message shape.
-    super::stream_entry::idle_timeout_message(idle, bytes_received, stream_age, since_last_chunk)
-}
-
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::llm_client::StreamEventBox;
-use crate::llm_client::sanitize_http_error_body;
 use crate::logging;
-use crate::models::{
+use codewhale_models::{
     ContentBlock, ContentBlockStart, Delta, Message, MessageDelta, MessageRequest, MessageResponse,
     StreamEvent, SystemPrompt, Tool, ToolCaller, Usage, is_openai_gpt_56_api_model,
     model_is_openai_reasoning_family, model_supports_reasoning,
@@ -48,23 +32,25 @@ use crate::models::{
 
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
+use super::wire::{extract_sse_data_value, flush_sse_line, push_sse_event_data, take_sse_line};
 use super::{
-    DeepSeekClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
+    CodewhaleClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
     SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer,
     apply_reasoning_effort, bounded_error_text, from_api_tool_name, parse_usage,
     release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
-use crate::models::Role;
+use codewhale_config::route::RouteLimits;
+use codewhale_models::Role;
 
 fn apply_provider_token_limit(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     max_tokens: u32,
 ) {
-    let use_max_completion_tokens = provider == ApiProvider::XiaomiMimo
-        || (provider == ApiProvider::Openai && model_is_openai_reasoning_family(model))
+    let use_max_completion_tokens = provider == ProviderKind::XiaomiMimo
+        || (provider == ProviderKind::Openai && model_is_openai_reasoning_family(model))
         || minimax_m3_route_uses_max_completion_tokens(provider, base_url, model)
         || is_exact_direct_moonshot_k3_route(provider, base_url, model);
     if !use_max_completion_tokens {
@@ -79,20 +65,17 @@ fn apply_provider_token_limit(
 
 fn apply_openai_reasoning_effort(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     effort: Option<&str>,
 ) {
     let model_lower = model.trim().to_ascii_lowercase();
     let is_gpt_56 =
-        provider == ApiProvider::Openai && is_openai_gpt_56_api_model(model_lower.as_str());
+        provider == ProviderKind::Openai && is_openai_gpt_56_api_model(model_lower.as_str());
     let is_openai_reasoning =
-        provider == ApiProvider::Openai && model_is_openai_reasoning_family(model);
-    let is_muse_spark = provider == ApiProvider::Meta
-        && matches!(
-            model_lower.as_str(),
-            "muse-spark-1.1" | "muse-spark-1.2" | "muse-spark-1.2-contributor"
-        );
+        provider == ProviderKind::Openai && model_is_openai_reasoning_family(model);
+    let is_muse_spark = provider == ProviderKind::Meta
+        && (model_lower == "muse-spark" || model_lower.starts_with("muse-spark-"));
     if !is_openai_reasoning && !is_muse_spark {
         return;
     }
@@ -104,22 +87,25 @@ fn apply_openai_reasoning_effort(
     body["reasoning_effort"] = json!(effort);
 }
 
-fn apply_xai_grok_4_6_reasoning_effort(
+/// xAI's first-party `reasoning_effort` ladder, driven by the bundled
+/// catalog row for the exact model id: a row that documents an `effort`
+/// option gets the field (`xhigh` only where the row lists it — grok-4.7 and
+/// grok-4.6 do, grok-4.5 maps it to `high`); a row without one (grok-4.3,
+/// grok-build) or no row at all sends nothing. Grok reasoning cannot be
+/// disabled, so `off` is sent as the documented default `high`
+/// (<https://docs.x.ai/docs/guides/reasoning>).
+fn apply_xai_grok_reasoning_effort(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
 ) {
-    if !(is_exact_xai_grok_4_6_route(provider, base_url, model)
-        || (provider == ApiProvider::Xai
-            && codewhale_config::provider::is_exact_xai_platform_route(
-                codewhale_config::ProviderKind::Xai,
-                base_url,
-            )
-            && model
-                .trim()
-                .eq_ignore_ascii_case(crate::config::XAI_GROK_4_5_MODEL)))
+    if provider != ProviderKind::Xai
+        || !codewhale_config::provider::is_exact_xai_platform_route(
+            codewhale_config::ProviderKind::Xai,
+            base_url,
+        )
     {
         return;
     }
@@ -127,11 +113,23 @@ fn apply_xai_grok_4_6_reasoning_effort(
         return;
     };
     let model = model.trim().to_ascii_lowercase();
-    let supports_xhigh = model == crate::config::XAI_GROK_4_6_MODEL;
-    let supports_effort = supports_xhigh || model == crate::config::XAI_GROK_4_5_MODEL;
-    if !supports_effort {
+    // The bundled row with Codewhale's corrections applied (#6396): the raw
+    // seed row carries Models.dev's ladder, which lists an effort control for
+    // grok-4.3 that xAI does not document.
+    let Some(row) =
+        crate::provider_lake::bundled_catalog_offering_for_model(ProviderKind::Xai, &model)
+    else {
         return;
-    }
+    };
+    let Some(documented) = row
+        .reasoning_options
+        .iter()
+        .find(|option| option["type"] == "effort")
+        .and_then(|option| option["values"].as_array())
+    else {
+        return;
+    };
+    let supports_xhigh = documented.iter().any(|value| value == "xhigh");
     let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
         "auto" | "automatic" | "" => return,
         "off" | "disabled" | "none" | "false" | "high" => "high",
@@ -151,11 +149,11 @@ fn apply_xai_grok_4_6_reasoning_effort(
 
 fn apply_inkling_reasoning_effort(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     effort: Option<&str>,
 ) {
-    if provider != ApiProvider::Together
+    if provider != ProviderKind::Together
         || !model.trim().eq_ignore_ascii_case(TOGETHER_INKLING_MODEL)
     {
         return;
@@ -188,7 +186,7 @@ fn apply_inkling_reasoning_effort(
 /// model identifier are both part of this guard.
 fn apply_kimi_code_k3_reasoning_effort(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
@@ -227,7 +225,7 @@ fn apply_kimi_code_k3_reasoning_effort(
 /// route-aware callers normalize it before it reaches this layer.
 fn apply_direct_moonshot_k3_reasoning_effort(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
@@ -255,18 +253,18 @@ fn apply_direct_moonshot_k3_reasoning_effort(
 }
 
 /// Keep Z.ai controls on exact first-party routes only. The tiered-effort GLM
-/// models (5.2, and 5.3 which inherits its reasoning options) receive the
-/// documented top-level effort, GLM-5.1 and GLM-5-Turbo keep only the generic
-/// thinking toggle, and compatible gateways receive neither field because their
+/// models (5.2, and the forced-thinking 5.3 family) receive the documented
+/// top-level effort, GLM-5.1 and GLM-5-Turbo keep only the generic thinking
+/// toggle, and compatible gateways receive neither field because their
 /// request dialect is not known from provider/model selection alone.
 fn apply_zai_route_reasoning_controls(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
 ) {
-    if provider != ApiProvider::Zai {
+    if provider != ProviderKind::Zai {
         return;
     }
 
@@ -291,6 +289,10 @@ fn apply_zai_route_reasoning_controls(
         // enabled/disabled thinking control.
         return;
     }
+    if is_exact_zai_forced_thinking_route(provider, base_url, model) {
+        apply_zai_forced_thinking_effort(body, effort);
+        return;
+    }
     match effort
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
@@ -305,17 +307,49 @@ fn apply_zai_route_reasoning_controls(
     }
 }
 
+/// GLM-5.3 and GLM-5.3-Flash are forced-thinking on the exact first-party
+/// Z.ai route: `thinking.type: "disabled"` is rejected with an error and
+/// `reasoning_effort` accepts only low/high/max. The generic Z.ai layer emits
+/// `disabled` for `off`, so a request that was valid for GLM-5.2 fails on
+/// 5.3. Rewrite that payload the way the vendor migration note prescribes —
+/// keep thinking enabled and send the lowest tier — and map the remaining
+/// aliases onto the three documented values, leaving unknown legacy values
+/// omitted so the API owns its documented default (`max`).
+fn apply_zai_forced_thinking_effort(body: &mut Value, effort: Option<&str>) {
+    let thinking_disabled = body
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled");
+    if thinking_disabled {
+        body["thinking"] = json!({
+            "type": "enabled",
+            "clear_thinking": false,
+        });
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "low" | "minimum" | "minimal" | "light" => "low",
+        "medium" | "mid" | "high" => "high",
+        "xhigh" | "max" | "highest" | "ultra" | "ultracode" => "max",
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(wire_effort);
+}
+
 /// Add MiniMax's Chat-only reasoning controls only when endpoint and model
 /// prove the exact first-party M3 route. A provider label alone is not enough
 /// to send MiniMax-specific fields to a compatible gateway or unknown model.
 fn apply_minimax_route_reasoning_controls(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
 ) {
-    if provider != ApiProvider::Minimax {
+    if provider != ProviderKind::Minimax {
         return;
     }
     if let Some(object) = body.as_object_mut() {
@@ -357,17 +391,17 @@ fn apply_minimax_route_reasoning_controls(
 /// `enable_thinking` left in the body would then go out unguarded.
 fn apply_modelstudio_route_reasoning_controls(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
 ) {
     if !matches!(
         provider,
-        ApiProvider::ModelstudioTokenPlan
-            | ApiProvider::ModelstudioTokenPlanAnthropic
-            | ApiProvider::ModelstudioCodingPlan
-            | ApiProvider::ModelstudioCodingPlanAnthropic
+        ProviderKind::ModelstudioTokenPlan
+            | ProviderKind::ModelstudioTokenPlanAnthropic
+            | ProviderKind::ModelstudioCodingPlan
+            | ProviderKind::ModelstudioCodingPlanAnthropic
     ) {
         return;
     }
@@ -411,7 +445,7 @@ fn apply_modelstudio_route_reasoning_controls(
 /// Fail-closed host guard: only Alibaba's own OpenAI-compatible Chat
 /// Completions URL shapes count. Anything else (a proxy, a self-hosted
 /// gateway, a typo) gets the Model Studio fields stripped and nothing added.
-fn is_exact_modelstudio_chat_route(provider: ApiProvider, base_url: &str) -> bool {
+fn is_exact_modelstudio_chat_route(provider: ProviderKind, base_url: &str) -> bool {
     let trimmed = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
     let Some((host, path)) = trimmed
         .strip_prefix("https://")
@@ -441,7 +475,7 @@ fn is_exact_modelstudio_chat_route(provider: ApiProvider, base_url: &str) -> boo
         // supported as well, so recognize either official Chat route for the
         // complete Model Studio OpenAI family. The `*Anthropic` identities
         // speak the Messages dialect and are never verified here.
-        ApiProvider::ModelstudioTokenPlan | ApiProvider::ModelstudioCodingPlan => {
+        ProviderKind::ModelstudioTokenPlan | ProviderKind::ModelstudioCodingPlan => {
             token_plan_chat || coding_plan_chat || classic_dashscope_chat
         }
         _ => false,
@@ -449,7 +483,7 @@ fn is_exact_modelstudio_chat_route(provider: ApiProvider, base_url: &str) -> boo
 }
 
 fn is_exact_modelstudio_thinking_only_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
 ) -> bool {
@@ -544,7 +578,7 @@ fn modelstudio_reasoning_effort_for_model(effort: &str) -> Option<&'static str> 
 /// layer so they can remove fields that are invalid for their exact endpoint.
 pub(super) fn apply_route_reasoning_controls(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
@@ -554,20 +588,20 @@ pub(super) fn apply_route_reasoning_controls(
     apply_minimax_route_reasoning_controls(body, provider, base_url, model, effort);
     apply_inkling_reasoning_effort(body, provider, model, effort);
     apply_openai_reasoning_effort(body, provider, model, effort);
-    apply_xai_grok_4_6_reasoning_effort(body, provider, base_url, model, effort);
+    apply_xai_grok_reasoning_effort(body, provider, base_url, model, effort);
     apply_direct_moonshot_k3_reasoning_effort(body, provider, base_url, model, effort);
     apply_kimi_code_k3_reasoning_effort(body, provider, base_url, model, effort);
     apply_zai_route_reasoning_controls(body, provider, base_url, model, effort);
     apply_mistral_route_reasoning_controls(body, provider, base_url, model, effort);
-    apply_google_thinking_level(body, provider, base_url, model, effort);
+    apply_google_reasoning_effort(body, base_url, model, effort);
 }
 
 /// Mistral's polymorphic reasoning-content contract is only proven on its
 /// first-party Chat Completions endpoints. A configured `mistral` provider may
 /// point at an arbitrary OpenAI-compatible gateway, so provider identity alone
 /// is not enough to opt that route into Mistral's request or response dialect.
-fn is_exact_mistral_chat_route(provider: ApiProvider, base_url: &str) -> bool {
-    if provider != ApiProvider::Mistral {
+fn is_exact_mistral_chat_route(provider: ProviderKind, base_url: &str) -> bool {
+    if provider != ProviderKind::Mistral {
         return false;
     }
     let trimmed = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
@@ -583,14 +617,20 @@ fn is_exact_mistral_chat_route(provider: ApiProvider, base_url: &str) -> bool {
     ) && path == "v1"
 }
 
-/// Google's OpenAI-compatibility route. Thought signatures are captured
+/// Google's OpenAI-compatibility route, identified by the **resolved base
+/// URL** rather than by provider identity. Thought signatures are captured
 /// from tool-call `extra_content.google.thought_signature` and replayed on
 /// the assistant tool-call messages of later turns; thinking models fail
 /// closed when a replayed call has no signature.
-fn is_exact_google_chat_route(provider: ApiProvider, base_url: &str) -> bool {
-    if provider != ApiProvider::Google {
-        return false;
-    }
+///
+/// The endpoint carries the signature contract, not the config row that
+/// happens to name it: a manually configured `kind="openai-compatible"`
+/// provider ([`ProviderKind::Custom`]) pointed at this exact host and path is
+/// byte-for-byte the same endpoint as the built-in `google` row, so it must
+/// preserve and replay signatures the same way. The converse still holds —
+/// a `google` row pointed at some other gateway is not this route and never
+/// carries Google-only fields off-endpoint.
+fn is_google_openai_compat_chat_route(base_url: &str) -> bool {
     let trimmed = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
     let Some((host, path)) = trimmed
         .strip_prefix("https://")
@@ -607,6 +647,12 @@ fn is_exact_google_chat_route(provider: ApiProvider, base_url: &str) -> bool {
 /// instead of failing the turn.
 fn google_model_requires_thought_signatures(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
+    // Google names the same model both ways on this endpoint, and a route
+    // configured as `models/gemini-3-pro` matched none of the prefixes below:
+    // the model that most needs a signature looked like one that needs none,
+    // so the fail-closed check waved it through and Google rejected the replay
+    // instead (#6018).
+    let model = model.strip_prefix("models/").unwrap_or(&model);
     if model.starts_with("gemini-3") {
         return true;
     }
@@ -616,46 +662,60 @@ fn google_model_requires_thought_signatures(model: &str) -> bool {
     model.starts_with("gemini-2.5-flash") && !model.starts_with("gemini-2.5-flash-lite")
 }
 
-/// Thinking level for the OpenAI-compat route rides the documented
-/// `google.thinking_config.thinking_level` body field (low/high; Gemini 3
-/// cannot disable thinking).
-fn apply_google_thinking_level(
+/// Google's compatibility endpoint accepts the ordinary `reasoning_effort`
+/// field across Gemini 2.5 and 3. A top-level `google` object is rejected;
+/// native thinking controls would require `extra_body.google` instead.
+/// Use one control, since the endpoint rejects overlapping effort and native
+/// thinking settings. https://ai.google.dev/gemini-api/docs/openai#thinking
+fn apply_google_reasoning_effort(
     body: &mut serde_json::Value,
-    provider: ApiProvider,
     base_url: &str,
-    _model: &str,
+    model: &str,
     effort: Option<&str>,
 ) {
-    if !is_exact_google_chat_route(provider, base_url) || effort.is_none() {
+    if !is_google_openai_compat_chat_route(base_url) {
         return;
     }
-    let level = match effort
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "off" | "disabled" | "none" | "false" | "" | "low" | "minimal" | "medium" | "mid" => "low",
-        _ => "high",
+    let Some(effort) = effort else {
+        return;
     };
-    body["google"]["thinking_config"]["thinking_level"] = json!(level);
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("models/").unwrap_or(&model);
+    let can_disable = model.starts_with("gemini-2.5-") && !model.starts_with("gemini-2.5-pro");
+    let effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" | "false" if can_disable => "none",
+        // Gemini 3 and 2.5 Pro cannot disable thinking. The compatibility
+        // layer maps minimal to the selected model's lowest supported level.
+        "off" | "disabled" | "none" | "false" | "minimal" => "minimal",
+        "low" => "low",
+        "medium" | "mid" | "" => "medium",
+        "high" | "xhigh" | "max" | "highest" | "ultra" | "ultracode" => "high",
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(effort);
 }
 
-/// Fail closed before transport when the exact Google route would replay
-/// tool calls without the thought signatures Google's thinking models
-/// require. The error names the model and tells the operator how to
-/// recover instead of letting Google reject or corrupt the tool loop.
+/// Fail closed before transport when Google's OpenAI-compat route would
+/// replay tool calls without the thought signatures Google's thinking models
+/// require. The error names the model and the tool call and tells the
+/// operator how to recover instead of letting Google reject or corrupt the
+/// tool loop.
+///
+/// Models whose thinking is off by default (Gemini 2.5 Flash-Lite) degrade
+/// instead of failing — but never silently: the unsigned replay is reported
+/// through the same warning path the reasoning-replay sanitizer uses, so a
+/// later tool-turn failure has a receipt. Only tool-call identifiers and the
+/// model id are logged; signature bytes never are.
 fn validate_google_thought_signature_replay(
-    provider: ApiProvider,
     base_url: &str,
     model: &str,
     messages: &[Value],
 ) -> Result<()> {
-    if !is_exact_google_chat_route(provider, base_url)
-        || !google_model_requires_thought_signatures(model)
-    {
+    if !is_google_openai_compat_chat_route(base_url) {
         return Ok(());
     }
+    let requires_signatures = google_model_requires_thought_signatures(model);
+    let mut unsigned_call_ids: Vec<&str> = Vec::new();
     for message in messages {
         let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
             continue;
@@ -667,23 +727,47 @@ fn validate_google_thought_signature_replay(
                 .is_none();
             if missing {
                 let id = call.get("id").and_then(Value::as_str).unwrap_or("?");
-                anyhow::bail!(
-                    "Gemini model `{model}` requires a thought signature to replay tool call \
-                     `{id}`, but none was captured (the turn predates signature capture, or \
-                     the provider omitted it). Start a new session before using tools on \
-                     this route."
-                );
+                if requires_signatures {
+                    anyhow::bail!(
+                        "Gemini model `{model}` requires a thought signature to replay tool call \
+                         `{id}`, but none was captured (the turn predates signature capture, or \
+                         the provider omitted it). Start a new session before using tools on \
+                         this route."
+                    );
+                }
+                unsigned_call_ids.push(id);
             }
         }
+    }
+    if !unsigned_call_ids.is_empty() {
+        // Bounded: identifiers only, and only the first few of them.
+        let sample = unsigned_call_ids
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            model = %model,
+            unsigned_tool_calls = unsigned_call_ids.len(),
+            sample_tool_call_ids = %sample,
+            "replaying tool calls without Google thought signatures on the Gemini \
+             OpenAI-compatible route; later signed tool turns may be rejected"
+        );
     }
     Ok(())
 }
 
 /// Captured Google signatures ride on tool calls as
-/// `extra_content.google.thought_signature`. Only the exact Google route
-/// may carry them on the wire; every other provider gets them stripped so
-/// a route switch never leaks Google-only fields to a foreign gateway.
-fn strip_google_tool_call_extra_content(messages: &mut [Value]) {
+/// `extra_content.google.thought_signature`. Only Google's OpenAI-compat
+/// endpoint may carry them on the wire; every other route gets them stripped
+/// so a route switch never leaks Google-only fields to a foreign gateway.
+///
+/// Returns how many tool calls lost a signature, so the caller can report a
+/// route switch that silently drops signed history instead of dropping it
+/// without a receipt. Never returns or logs the signature bytes.
+fn strip_google_tool_call_extra_content(messages: &mut [Value]) -> usize {
+    let mut stripped = 0usize;
     for message in messages {
         let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
             continue;
@@ -692,13 +776,16 @@ fn strip_google_tool_call_extra_content(messages: &mut [Value]) {
             if let Some(extra) = call.get_mut("extra_content")
                 && let Some(obj) = extra.as_object_mut()
             {
-                obj.remove("google");
+                if obj.remove("google").is_some() {
+                    stripped += 1;
+                }
                 if obj.is_empty() {
                     call.as_object_mut().map(|c| c.remove("extra_content"));
                 }
             }
         }
     }
+    stripped
 }
 
 fn mistral_model_has_adjustable_reasoning(model: &str) -> bool {
@@ -821,12 +908,12 @@ fn extract_mistral_polymorphic_content(value: &Value) -> (Option<String>, Option
 
 fn apply_mistral_route_reasoning_controls(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
 ) {
-    if provider != ApiProvider::Mistral {
+    if provider != ProviderKind::Mistral {
         return;
     }
     if let Some(object) = body.as_object_mut() {
@@ -852,7 +939,7 @@ fn apply_mistral_route_reasoning_controls(
 /// Source: <https://platform.kimi.ai/docs/guide/kimi-k3-quickstart> (verified 2026-07-20).
 fn apply_direct_moonshot_k3_fixed_sampling(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
 ) {
@@ -872,11 +959,11 @@ fn apply_direct_moonshot_k3_fixed_sampling(
 /// (verified 2026-08-26).
 fn apply_kimi_code_fixed_sampling(
     body: &mut Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
 ) {
-    if provider != ApiProvider::Moonshot
+    if provider != ProviderKind::Moonshot
         || !moonshot_base_url_is_exact_kimi_code(base_url)
         || !is_kimi_code_membership_model(model)
     {
@@ -932,8 +1019,8 @@ fn mirror_minimax_reasoning_details_for_messages(messages: &mut [Value]) {
     }
 }
 
-fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProvider) {
-    if provider != ApiProvider::Minimax {
+fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ProviderKind) {
+    if provider != ProviderKind::Minimax {
         return;
     }
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
@@ -1004,7 +1091,7 @@ fn sanitize_moonshot_chat_tools(chat_tools: &mut Vec<Value>) -> Vec<String> {
 ///
 /// Produced by [`build_chat_wire_body`], the single place where a
 /// `MessageRequest` becomes Chat-shaped JSON. It is reached only through
-/// [`super::DeepSeekClient::prepare_outbound_request`], the shared outbound
+/// [`super::CodewhaleClient::prepare_outbound_request`], the shared outbound
 /// seam that the blocking transport, the streaming transport, and
 /// `/preview-request` all consume — so a preview cannot drift from what would
 /// be sent, and no other dialect is projected through this builder.
@@ -1034,17 +1121,21 @@ pub(crate) struct ChatWireBody {
 /// sanitizer — the blocking path has never run it.
 pub(crate) fn build_chat_wire_body(
     request: &MessageRequest,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     stream: bool,
+    route_limits: Option<RouteLimits>,
 ) -> Result<ChatWireBody> {
-    let messages =
-        build_chat_messages_for_request_and_provider_and_route(request, provider, base_url);
+    let messages = PromptBuilder::for_request(request).build_for_provider_and_route(
+        provider,
+        base_url,
+        route_limits,
+    );
     let model = {
         let wire = wire_model_for_provider_route(provider, base_url, &request.model);
-        crate::models::effective_muse_wire_id(&wire).to_string()
+        codewhale_models::effective_muse_wire_id(&wire).to_string()
     };
-    validate_google_thought_signature_replay(provider, base_url, &model, &messages)?;
+    validate_google_thought_signature_replay(base_url, &model, &messages)?;
     let mut body = if stream {
         json!({
             "model": model.clone(),
@@ -1080,12 +1171,12 @@ pub(crate) fn build_chat_wire_body(
         // Flatten root composition, preserve valid nested anyOf, and drop
         // only the tools whose parameters cannot pass MFJS validation so one
         // incompatible tool never sinks the whole request.
-        if matches!(provider, crate::config::ApiProvider::Moonshot) {
+        if matches!(provider, crate::config::ProviderKind::Moonshot) {
             omitted_tool_names = sanitize_moonshot_chat_tools(&mut chat_tools);
         }
         // xAI rejects a parameters root that is not a plain object schema
         // (e.g. apply_patch's root `oneOf` required-groups) with a 400.
-        if matches!(provider, crate::config::ApiProvider::Xai) {
+        if matches!(provider, crate::config::ProviderKind::Xai) {
             for t in &mut chat_tools {
                 let Some(function) = t
                     .as_object_mut()
@@ -1120,7 +1211,7 @@ pub(crate) fn build_chat_wire_body(
         && let Some(choice) = request.tool_choice.as_ref()
         && let Some(mapped) = map_tool_choice_for_chat(choice)
     {
-        if matches!(provider, crate::config::ApiProvider::Moonshot)
+        if matches!(provider, crate::config::ProviderKind::Moonshot)
             && let Some(name) = mapped.pointer("/function/name").and_then(Value::as_str)
             && omitted_tool_names.iter().any(|omitted| omitted == name)
         {
@@ -1171,7 +1262,7 @@ pub(crate) fn build_chat_wire_body(
     })
 }
 
-impl DeepSeekClient {
+impl CodewhaleClient {
     pub(super) async fn create_message_chat(
         &self,
         prepared: &super::PreparedOutboundRequest,
@@ -1179,7 +1270,7 @@ impl DeepSeekClient {
     ) -> Result<MessageResponse> {
         let body = &prepared.body;
 
-        let response_cache_key = if cacheable {
+        let response_cache_key = if cacheable && self.plugin_provider.is_none() {
             let wire_body =
                 serde_json::to_vec(&body).context("Failed to serialize Chat API cache key")?;
             let key = crate::llm_response_cache::ResponseCache::make_key(
@@ -1207,14 +1298,14 @@ impl DeepSeekClient {
         crate::client::record_provider_response(self.api_provider, status.as_u16());
         if !status.is_success() {
             let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-            let error_text = sanitize_http_error_body(
-                Some(self.api_provider.display_name()),
+            let error_text = self.disclosed_http_error_body(
+                &super::ErrorBodyDisclosure::Full,
                 status.as_u16(),
                 &raw_error_text,
             );
             anyhow::bail!(
                 "Failed to call {} Chat Completions API: HTTP {status}: {error_text}",
-                self.api_provider.display_name()
+                self.api_provider.provider().display_name()
             );
         }
 
@@ -1232,16 +1323,13 @@ impl DeepSeekClient {
     }
 }
 
-impl DeepSeekClient {
+impl CodewhaleClient {
     async fn open_chat_stream_response(
         &self,
         url: &str,
         body: &Value,
     ) -> Result<(reqwest::Response, Duration)> {
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            stream_open_timeout(),
-            self.stream_idle_timeout,
-        );
+        let open_req = self.stream_open_request();
         let idle_timeout = open_req.idle_timeout;
         let response = super::stream_entry::open_sse_response(&open_req, |policy| async move {
             match policy {
@@ -1254,15 +1342,22 @@ impl DeepSeekClient {
                         self.http1_fallback_client(),
                         policy,
                     );
-                    Ok(client
-                        .post(url)
-                        .header(reqwest::header::CONTENT_TYPE, "application/json")
-                        .json(body)
+                    Ok(self
+                        .authorize_plugin_request(
+                            client
+                                .post(url)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .json(body),
+                        )
+                        .await?
                         .send()
                         .await?)
                 }
                 super::stream_entry::StreamHttpPolicy::DualWithH1Fallback => {
-                    self.send_json_with_retry(url, body).await
+                    // Stream open, not a JSON retry: the response body outlives
+                    // the open, so this path must not carry any total deadline
+                    // (`open_stream_json_with_retry`, not `send_json_with_retry`).
+                    self.open_stream_json_with_retry(url, body).await
                 }
             }
         })
@@ -1293,8 +1388,8 @@ impl DeepSeekClient {
         crate::client::record_provider_response(self.api_provider, status.as_u16());
         if !status.is_success() {
             let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-            let error_text = sanitize_http_error_body(
-                Some(self.api_provider.display_name()),
+            let error_text = self.disclosed_http_error_body(
+                &super::ErrorBodyDisclosure::Full,
                 status.as_u16(),
                 &raw_error_text,
             );
@@ -1381,17 +1476,20 @@ impl DeepSeekClient {
             // Skip further data-frame parsing so U+FFFD cannot enter the transcript.
             let mut decode_failed = false;
 
+            let first_byte = super::stream_entry::first_byte_timeout(idle);
             'stream: loop {
-                let chunk_result = match tokio_timeout(idle, byte_stream.next()).await {
+                let wait = super::stream_entry::next_chunk_timeout(idle, first_byte, bytes_received);
+                let chunk_result = match tokio_timeout(wait, byte_stream.next()).await {
                     Ok(Some(result)) => result,
                     Ok(None) => break, // Stream ended normally
                     Err(_elapsed) => {
                         stream_failed = true;
-                        yield Err(anyhow::anyhow!(stream_idle_timeout_message(
-                            idle,
+                        yield Err(anyhow::anyhow!(super::stream_entry::body_timeout_message(
+                            wait,
                             bytes_received,
                             stream_start.elapsed(),
                             last_event_at.elapsed(),
+                            api_provider.provider().display_name(),
                         )));
                         break;
                     }
@@ -1445,7 +1543,7 @@ impl DeepSeekClient {
                 // U+FFFD; genuine invalid bytes fail closed.
                 let mut lines_processed = 0usize;
                 loop {
-                    let line = match super::take_sse_line(&mut byte_buf) {
+                    let line = match take_sse_line(&mut byte_buf) {
                         Ok(Some(line)) => line,
                         Ok(None) => break,
                         Err(err) => {
@@ -1502,15 +1600,22 @@ impl DeepSeekClient {
                         continue;
                     }
 
-                    if let Some(data) = super::extract_sse_data_value(&line) {
-                        // The SSE spec joins multiple `data:` fields within one
-                        // event with '\n'; concatenating with no separator would
-                        // yield `{…}{…}` and fail JSON parsing, silently dropping
-                        // the frame.
-                        if !line_buf.is_empty() {
-                            line_buf.push('\n');
-                        }
-                        line_buf.push_str(data);
+                    if line.starts_with(':') {
+                        // SSE comment (`: keep-alive`, `: OPENROUTER PROCESSING`).
+                        // Surface it as a ping so the engine counts a provider
+                        // that is alive but queued/thinking as progress
+                        // (#6184) instead of timing out on a live stream.
+                        yield Ok(StreamEvent::Ping);
+                        continue;
+                    }
+
+                    if let Some(data) = extract_sse_data_value(&line)
+                        && let Err(err) = push_sse_event_data(&mut line_buf, data)
+                    {
+                        decode_failed = true;
+                        stream_failed = true;
+                        yield Err(anyhow::anyhow!("{err}"));
+                        break 'stream;
                     }
                     // Ignore other SSE fields (event:, id:, retry:)
 
@@ -1536,13 +1641,14 @@ impl DeepSeekClient {
             // Skipped after `[DONE]`, whose frame was already processed, and
             // after a fail-closed UTF-8 error.
             if !saw_done && !decode_failed {
-                match super::flush_sse_line(&mut byte_buf) {
+                match flush_sse_line(&mut byte_buf) {
                     Ok(Some(line)) => {
-                        if let Some(data) = super::extract_sse_data_value(&line) {
-                            if !line_buf.is_empty() {
-                                line_buf.push('\n');
-                            }
-                            line_buf.push_str(data);
+                        if let Some(data) = extract_sse_data_value(&line)
+                            && let Err(err) = push_sse_event_data(&mut line_buf, data)
+                        {
+                            decode_failed = true;
+                            stream_failed = true;
+                            yield Err(anyhow::anyhow!("{err}"));
                         }
                     }
                     Ok(None) => {}
@@ -1621,7 +1727,7 @@ pub(super) fn build_chat_messages(
     build_chat_messages_with_reasoning(
         system,
         messages,
-        model,
+        tool_result_sent_char_budget(model),
         should_replay_reasoning_content(model, None),
         false,
     )
@@ -1635,7 +1741,7 @@ pub(super) fn build_chat_messages_for_request(request: &MessageRequest) -> Vec<V
 #[cfg(test)]
 pub(super) fn build_chat_messages_for_request_and_provider(
     request: &MessageRequest,
-    provider: ApiProvider,
+    provider: ProviderKind,
 ) -> Vec<Value> {
     build_chat_messages_for_request_and_provider_and_route(request, provider, "")
 }
@@ -1646,12 +1752,13 @@ pub(super) fn build_chat_messages_for_request_and_provider(
 /// Code K3 is deliberately narrower: the bare `k3` model owns reasoning
 /// replay only on its official membership-plan endpoint, so callers that have
 /// a concrete base URL must retain it through prompt construction.
+#[cfg(test)]
 pub(super) fn build_chat_messages_for_request_and_provider_and_route(
     request: &MessageRequest,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
 ) -> Vec<Value> {
-    PromptBuilder::for_request(request).build_for_provider_and_route(provider, base_url)
+    PromptBuilder::for_request(request).build_for_provider_and_route(provider, base_url, None)
 }
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
@@ -1686,17 +1793,26 @@ impl<'a> PromptBuilder<'a> {
         build_chat_messages_with_reasoning(
             self.system,
             self.messages,
-            self.model,
+            tool_result_sent_char_budget(self.model),
             should_replay_reasoning_content(self.model, self.reasoning_effort),
             false,
         )
     }
 
-    fn build_for_provider_and_route(self, provider: ApiProvider, base_url: &str) -> Vec<Value> {
+    fn build_for_provider_and_route(
+        self,
+        provider: ProviderKind,
+        base_url: &str,
+        route_limits: Option<RouteLimits>,
+    ) -> Vec<Value> {
         let mut messages = build_chat_messages_with_reasoning(
             self.system,
             self.messages,
-            self.model,
+            crate::route_budget::route_inline_char_budget_for_route(
+                provider,
+                self.model,
+                route_limits,
+            ),
             should_replay_reasoning_content_for_provider_on_route(
                 provider,
                 base_url,
@@ -1706,17 +1822,29 @@ impl<'a> PromptBuilder<'a> {
             false,
         );
         dump_system_prompt_if_requested(&messages);
-        if provider == ApiProvider::Arcee {
+        if provider == ProviderKind::Arcee {
             apply_arcee_waf_safe_message_encoding(&mut messages);
         }
-        if provider == ApiProvider::Minimax {
+        if provider == ProviderKind::Minimax {
             mirror_minimax_reasoning_details_for_messages(&mut messages);
         }
         if is_exact_mistral_chat_route(provider, base_url) {
             reshape_mistral_messages_for_reasoning_replay(&mut messages);
         }
-        if !is_exact_google_chat_route(provider, base_url) {
-            strip_google_tool_call_extra_content(&mut messages);
+        if !is_google_openai_compat_chat_route(base_url) {
+            // A signature captured on Google's endpoint is meaningless — and
+            // potentially a leak — anywhere else, so it is stripped. Say so:
+            // the model will behave differently on the replayed tool history,
+            // and a silent strip is exactly what made this defect invisible.
+            let stripped = strip_google_tool_call_extra_content(&mut messages);
+            if stripped > 0 {
+                tracing::warn!(
+                    provider = ?provider,
+                    stripped_tool_calls = stripped,
+                    "dropping captured Google thought signatures: this route is not Google's \
+                     OpenAI-compatible endpoint, so the replayed tool history is unsigned"
+                );
+            }
         }
         messages
     }
@@ -1725,7 +1853,7 @@ impl<'a> PromptBuilder<'a> {
         let messages = build_chat_messages_with_reasoning(
             self.system,
             self.messages,
-            self.model,
+            tool_result_sent_char_budget(self.model),
             should_replay_reasoning_content(self.model, self.reasoning_effort),
             true,
         );
@@ -1866,15 +1994,17 @@ fn push_text_part(parts: &mut Vec<Value>, text: &str) {
 
 pub(crate) const CACHE_WARMUP_USER_TAIL: &str = "请只回复 OK";
 pub(crate) const CACHE_WARMUP_MAX_TOKENS: u32 = 8;
-const TOOL_RESULT_SENT_CHAR_BUDGET: usize = 12_000;
-
-fn tool_result_sent_char_budget() -> usize {
-    crate::tools::large_output_router::WorkshopConfig::active_tool_result_max_bytes()
-        .map(|bytes| bytes.clamp(TOOL_RESULT_SENT_CHAR_BUDGET, 2 * 1024 * 1024))
-        .unwrap_or(TOOL_RESULT_SENT_CHAR_BUDGET)
+/// Wire backstop for tool results (#6508). The engine already fits every
+/// result it gives the model to the route's inline budget, and marks any cut
+/// with a recovery footer. This pass only catches history that never went
+/// through the engine (legacy or restored raw results). Model-only inspection
+/// uses the catalog window; outbound requests pass their resolved route budget.
+/// Results with an engine recovery footer remain intact.
+fn tool_result_sent_char_budget(model: &str) -> usize {
+    crate::route_budget::route_inline_char_budget(codewhale_models::context_window_for_model(model))
 }
-const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
-const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
+/// Characters of an excerpted wire result spent on its labelled header.
+const TOOL_RESULT_EXCERPT_FRAME_CHARS: usize = 1_024;
 /// Tool results shorter than this stay inline even when repeated. The
 /// extra prompt bytes are cheaper than adding an earlier-message reference
 /// for tiny command outputs.
@@ -1971,6 +2101,7 @@ pub(crate) enum PromptLayerStability {
     Dynamic,
 }
 
+#[cfg(test)]
 impl PromptLayerStability {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -2382,6 +2513,7 @@ fn compact_tool_result_for_wire(
     input: &Value,
     content: &str,
     message_label: &str,
+    sent_budget: usize,
     seen_tool_results: &mut HashMap<String, SeenToolResult>,
 ) -> WireToolResult {
     let original_chars = content.chars().count();
@@ -2390,7 +2522,6 @@ fn compact_tool_result_for_wire(
     // Only medium, non-mutation results can point back to a full earlier
     // message in this one request. Oversized results are already excerpts, so
     // a back-reference would falsely imply the exact bytes remain available.
-    let sent_budget = tool_result_sent_char_budget();
     let dedup_eligible = (TOOL_RESULT_DEDUP_MIN_CHARS..=sent_budget).contains(&original_chars)
         && !is_mutation_tool(tool_name);
 
@@ -2446,8 +2577,10 @@ fn compact_tool_result_for_wire(
         };
     }
 
-    let head = first_chars(content, TOOL_RESULT_HEAD_CHARS);
-    let tail = last_chars(content, TOOL_RESULT_TAIL_CHARS);
+    let excerpt_chars = sent_budget.saturating_sub(TOOL_RESULT_EXCERPT_FRAME_CHARS);
+    let head_chars = excerpt_chars * 2 / 3;
+    let head = first_chars(content, head_chars);
+    let tail = last_chars(content, excerpt_chars - head_chars);
     let kept = head.chars().count() + tail.chars().count();
     let omitted = original_chars.saturating_sub(kept);
     let compacted = format!(
@@ -2527,10 +2660,27 @@ fn last_chars(value: &str, count: usize) -> String {
     chars.into_iter().collect()
 }
 
+fn merge_adjacent_user_content(previous: Value, current: Value) -> Value {
+    match (previous, current) {
+        (Value::String(left), Value::String(right)) => json!(format!("{left}\n\n{right}")),
+        (left, right) => {
+            let mut parts = Vec::new();
+            for content in [left, right] {
+                match content {
+                    Value::Array(items) => parts.extend(items),
+                    Value::String(text) => parts.push(json!({"type": "text", "text": text})),
+                    other => parts.push(other),
+                }
+            }
+            Value::Array(parts)
+        }
+    }
+}
+
 fn build_chat_messages_with_reasoning(
     system: Option<&SystemPrompt>,
     messages: &[Message],
-    _model: &str,
+    tool_result_budget: usize,
     include_reasoning: bool,
     include_tool_budget_metadata: bool,
 ) -> Vec<Value> {
@@ -2552,7 +2702,53 @@ fn build_chat_messages_with_reasoning(
         }));
     }
 
-    for (message_index, message) in messages.iter().enumerate() {
+    // Persisted compaction keeps its summary after the bounded last round.
+    // On strict paired chat templates a user message after a tool result is
+    // invalid. Reorder only a generated summary immediately after a tool
+    // result; its independent provenance block rules out quoted user text.
+    // The session log retains every original message and tool ID.
+    // Limitation: this normalization applies to Chat Completions only.
+    let summary_index = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            (index > 0
+                && crate::compaction::is_wire_compaction_checkpoint_message(message)
+                && messages[index - 1]
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. })))
+            .then_some(index)
+        });
+    let summary_target = summary_index.and_then(|summary_index| {
+        messages[..summary_index]
+            .iter()
+            .rposition(|message| {
+                crate::runtime_handoff::classify_user_turn_prompt(message)
+                    != crate::runtime_handoff::UserTurnPromptKind::NotPrompt
+            })
+            .or_else(|| {
+                messages[..summary_index]
+                    .iter()
+                    .position(|message| message.role.is_assistant_like())
+            })
+    });
+    let wire_messages = (0..messages.len())
+        .filter(|index| Some(*index) != summary_index || summary_target.is_none())
+        .flat_map(|index| {
+            if Some(index) == summary_target {
+                [summary_index, Some(index)]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            } else {
+                vec![index]
+            }
+        });
+
+    for message_index in wire_messages {
+        let message = &messages[message_index];
         // Which wire channel this message belongs in is decided by the shared
         // placement table, not by an `if` chain local to this adapter.
         let placement = role_placement(&message.role, WireDialect::ChatCompletions);
@@ -2591,6 +2787,7 @@ fn build_chat_messages_with_reasoning(
                     input,
                     caller,
                     thought_signature,
+                    ..
                 } => {
                     let args = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
                     let mut call = json!({
@@ -2644,7 +2841,7 @@ fn build_chat_messages_with_reasoning(
             let content = if placement == RolePlacement::InterruptedAssistant {
                 format!(
                     "{}{}",
-                    crate::models::INTERRUPTED_ASSISTANT_CONTEXT_PREFIX,
+                    codewhale_models::INTERRUPTED_ASSISTANT_CONTEXT_PREFIX,
                     text_parts.join("\n")
                 )
             } else {
@@ -2752,7 +2949,26 @@ fn build_chat_messages_with_reasoning(
                 if include_tool_budget_metadata && let Some(turn_meta) = &turn_meta_budget {
                     msg["_turn_meta_budget"] = turn_meta_budget_json(turn_meta);
                 }
-                out.push(msg);
+                if (Some(message_index) == summary_index
+                    || Some(message_index) == summary_target
+                    || crate::compaction::is_wire_compaction_checkpoint_message(message)
+                    || crate::runtime_handoff::is_agent_topology_checkpoint(message)
+                    || crate::runtime_handoff::is_restored_agent_topology_checkpoint(message))
+                    && let Some(previous) = out.last_mut()
+                    && previous.get("role").and_then(Value::as_str) == Some("user")
+                {
+                    let previous_content = previous["content"].take();
+                    let current_content = msg["content"].take();
+                    previous["content"] =
+                        merge_adjacent_user_content(previous_content, current_content);
+                    if previous.get("_turn_meta_budget").is_none()
+                        && let Some(meta) = msg.get("_turn_meta_budget")
+                    {
+                        previous["_turn_meta_budget"] = meta.clone();
+                    }
+                } else {
+                    out.push(msg);
+                }
             }
         }
 
@@ -2786,6 +3002,7 @@ fn build_chat_messages_with_reasoning(
                             &tool_info.input,
                             &content,
                             &message_label,
+                            tool_result_budget,
                             &mut seen_tool_results,
                         );
                         let mut tool_msg = json!({
@@ -3000,8 +3217,8 @@ fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
     }
 }
 
-fn should_send_tool_choice_for_chat(provider: ApiProvider, effort: Option<&str>) -> bool {
-    if !matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+fn should_send_tool_choice_for_chat(provider: ProviderKind, effort: Option<&str>) -> bool {
+    if !matches!(provider, ProviderKind::Deepseek) {
         return true;
     }
     !reasoning_effort_enables_thinking(effort)
@@ -3032,7 +3249,7 @@ pub(super) fn sanitize_thinking_mode_messages(
     body: &mut Value,
     model: &str,
     effort: Option<&str>,
-    provider: ApiProvider,
+    provider: ProviderKind,
 ) -> Option<u32> {
     sanitize_thinking_mode_messages_for_route(body, model, effort, provider, "")
 }
@@ -3047,7 +3264,7 @@ pub(super) fn sanitize_thinking_mode_messages_for_route(
     body: &mut Value,
     model: &str,
     effort: Option<&str>,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
 ) -> Option<u32> {
     // Mistral replay is encoded inside polymorphic `content` blocks, not the
@@ -3192,6 +3409,13 @@ fn requires_reasoning_content(model: &str) -> bool {
         || lower.starts_with("deepseek-chat")
         || lower.starts_with("deepseek-reasoner")
         || has_deepseek_r_series_marker(&lower)
+        // #6044: the V4.1 official id dropped the version number entirely
+        // (`deepseek-flash`), so the literal arms above cannot see it and
+        // the decode/replay classifiers depended on a later catalog fallback
+        // to catch it. The catalog owns the capability — consult it here so
+        // every caller (stream style, wire replay, prompt inspection) agrees
+        // without another hardcoded id.
+        || (lower.starts_with("deepseek-") && model_supports_reasoning(model))
 }
 
 fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
@@ -3212,7 +3436,7 @@ fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
 
 #[cfg(test)]
 fn should_replay_reasoning_content_for_provider(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     effort: Option<&str>,
 ) -> bool {
@@ -3226,7 +3450,7 @@ fn should_replay_reasoning_content_for_provider(
 /// model name, but only Kimi Code's exact membership-plan endpoint has this
 /// replay contract.
 fn should_replay_reasoning_content_for_provider_on_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
@@ -3287,6 +3511,14 @@ fn should_replay_reasoning_content_for_provider_on_route(
         return true;
     }
 
+    // Xiaomi MiMo's API requires the assistant `reasoning_content` back on
+    // tool-call turns (omitting it is a 400), for every MiMo chat model, not
+    // only the ids the offline catalog marks as reasoning (#6501). A turn
+    // that produced no reasoning replays nothing.
+    if provider == ProviderKind::XiaomiMimo {
+        return true;
+    }
+
     if is_exact_mistral_chat_route(provider, base_url)
         && mistral_model_has_adjustable_reasoning(model)
     {
@@ -3305,62 +3537,11 @@ fn should_replay_reasoning_content_for_provider_on_route(
     model_supports_reasoning(model)
 }
 
-/// Should the SSE parser treat incoming `reasoning_content` deltas as thinking
-/// (vs. inlining them as answer text)?
-///
-/// DeepSeek-family models are classified on any provider because their API
-/// requires `reasoning_content` replay on later turns (#1739 / #1694). Other
-/// known reasoning-capable large models are classified only on providers whose
-/// streaming shape exposes reasoning fields, so `reasoning`/`reasoning_content`
-/// deltas become Thinking cells instead of leaking as normal answer text.
+/// Test shorthand: does this route surface `reasoning_content` /
+/// `reasoning` / `reasoning_details` deltas as Thinking by default?
 #[cfg(test)]
-fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
-    is_reasoning_model_for_stream_on_route(provider, "", model)
-}
-
-/// Route-aware stream classification for providers that share model names.
-fn is_reasoning_model_for_stream_on_route(
-    provider: ApiProvider,
-    base_url: &str,
-    model: &str,
-) -> bool {
-    if is_exact_kimi_code_k3_route(provider, base_url, model)
-        || is_exact_direct_moonshot_k3_route(provider, base_url, model)
-    {
-        return true;
-    }
-
-    if is_exact_modelstudio_chat_route(provider, base_url)
-        && (modelstudio_model_is_thinking_only(model)
-            || modelstudio_model_supports_preserve_thinking(model))
-    {
-        return true;
-    }
-
-    if requires_reasoning_content(model) {
-        return true;
-    }
-
-    // Model Studio's OpenAI-compatible endpoints (Token Plan / Coding Plan)
-    // stream hybrid-model reasoning as `delta.reasoning_content` (DashScope
-    // dialect) whenever thinking is on — and for the qwen3.x families thinking
-    // is on by server default. Surface those deltas as Thinking instead of
-    // inlining them into the answer text. `reasoning_content` is deliberately
-    // NOT replayed back on later turns (the provider is absent from
-    // `provider_accepts_reasoning_content`): DashScope does not require the
-    // reasoning field in request history.
-    if matches!(
-        provider,
-        ApiProvider::ModelstudioTokenPlan
-            | ApiProvider::ModelstudioTokenPlanAnthropic
-            | ApiProvider::ModelstudioCodingPlan
-            | ApiProvider::ModelstudioCodingPlanAnthropic
-    ) && model_supports_reasoning(model)
-    {
-        return true;
-    }
-
-    provider_accepts_reasoning_content(provider) && model_supports_reasoning(model)
+fn is_reasoning_model_for_stream(provider: ProviderKind, model: &str) -> bool {
+    reasoning_stream_style_for_stream(provider, model, None) == ReasoningStreamStyle::SeparateField
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3373,7 +3554,7 @@ pub(super) enum ReasoningStreamStyle {
 
 #[cfg(test)]
 fn reasoning_stream_style_for_stream(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     configured: Option<&str>,
 ) -> ReasoningStreamStyle {
@@ -3382,7 +3563,7 @@ fn reasoning_stream_style_for_stream(
 
 /// Choose stream decoding semantics for a fully resolved provider route.
 fn reasoning_stream_style_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
     configured: Option<&str>,
@@ -3398,11 +3579,20 @@ fn reasoning_stream_style_for_route(
             "Ignoring unrecognized reasoning_stream_style `{configured}`; expected separate_field, inline_tags, or none"
         ));
     }
-    if is_reasoning_model_for_stream_on_route(provider, base_url, model) {
-        ReasoningStreamStyle::SeparateField
-    } else {
-        ReasoningStreamStyle::None
-    }
+    // #6501: the dedicated reasoning fields are reasoning on every
+    // Chat Completions route that sends them (DeepSeek, xAI, Xiaomi MiMo,
+    // Kimi, GLM, MiniMax, DashScope, vLLM/SGLang reasoning parsers, OpenRouter,
+    // Ollama, ...), and the non-streaming parser already treats them that way
+    // unconditionally. Gating the stream on a provider allowlist AND a
+    // per-model catalog row meant every unlisted provider (xAI, StepFun,
+    // Together, Ollama, the Codewhale gateway, ...) and every model id newer
+    // than the offline catalog (grok-4.7, a fresh MiMo id) rendered its
+    // reasoning as answer prose. Surfacing a field that never arrives costs
+    // nothing; a gateway that really puts its answer in `reasoning_content`
+    // opts out with `reasoning_stream_style = "none"`. Replay of reasoning in
+    // request history stays separately gated by
+    // `should_replay_reasoning_content_for_provider_on_route`.
+    ReasoningStreamStyle::SeparateField
 }
 
 fn parse_reasoning_stream_style(value: &str) -> Option<ReasoningStreamStyle> {
@@ -3428,24 +3618,23 @@ fn parse_reasoning_stream_style(value: &str) -> Option<ReasoningStreamStyle> {
 /// on assistant tool-call turns; dropping it makes the model emit tool calls as
 /// raw XML inside its thinking ("xml_in_reasoning" pitfall). Do not remove Arcee
 /// here without new live evidence — see docs.arcee.ai/capabilities/reasoning-traces.
-fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
+fn provider_accepts_reasoning_content(provider: ProviderKind) -> bool {
     matches!(
         provider,
-        ApiProvider::Deepseek
-            | ApiProvider::DeepseekCN
-            | ApiProvider::NvidiaNim
-            | ApiProvider::Openrouter
-            | ApiProvider::XiaomiMimo
-            | ApiProvider::Novita
-            | ApiProvider::Fireworks
-            | ApiProvider::Siliconflow
-            | ApiProvider::SiliconflowCn
-            | ApiProvider::Volcengine
-            | ApiProvider::Arcee
-            | ApiProvider::Minimax
-            | ApiProvider::Sglang
-            | ApiProvider::Zai
-            | ApiProvider::Moonshot // #3016: Kimi thinking traces use reasoning_content
+        ProviderKind::Deepseek
+            | ProviderKind::NvidiaNim
+            | ProviderKind::Openrouter
+            | ProviderKind::XiaomiMimo
+            | ProviderKind::Novita
+            | ProviderKind::Fireworks
+            | ProviderKind::Siliconflow
+            | ProviderKind::SiliconflowCN
+            | ProviderKind::Volcengine
+            | ProviderKind::Arcee
+            | ProviderKind::Minimax
+            | ProviderKind::Sglang
+            | ProviderKind::Zai
+            | ProviderKind::Moonshot // #3016: Kimi thinking traces use reasoning_content
     )
 }
 
@@ -3530,12 +3719,12 @@ fn reasoning_message_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
-    parse_chat_message_for_route(payload, ApiProvider::Openai, "")
+    parse_chat_message_for_route(payload, ProviderKind::Openai, "")
 }
 
 fn parse_chat_message_for_route(
     payload: &Value,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
 ) -> Result<MessageResponse> {
     let id = payload
@@ -3631,6 +3820,7 @@ fn parse_chat_message_for_route(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             content_blocks.push(ContentBlock::ToolUse {
+                execution_id: None,
                 id,
                 name: from_api_tool_name(&name),
                 input: arguments,
@@ -4220,7 +4410,7 @@ mod stream_diagnostics_tests {
 
     #[test]
     fn stream_idle_timeout_reports_progress_and_timing() {
-        let message = stream_idle_timeout_message(
+        let message = super::super::stream_entry::idle_timeout_message(
             Duration::from_secs(240),
             8192,
             Duration::from_millis(73_500),
@@ -4297,11 +4487,11 @@ mod stream_diagnostics_tests {
     fn deepseek_thinking_omits_tool_choice() {
         for effort in [Some("high"), Some("max"), Some("medium"), Some("")] {
             assert!(
-                !should_send_tool_choice_for_chat(ApiProvider::Deepseek, effort),
+                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort),
                 "DeepSeek thinking rejects explicit tool_choice for {effort:?}"
             );
             assert!(
-                !should_send_tool_choice_for_chat(ApiProvider::DeepseekCN, effort),
+                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort),
                 "DeepSeek CN thinking rejects explicit tool_choice for {effort:?}"
             );
         }
@@ -4314,12 +4504,12 @@ mod stream_diagnostics_tests {
             Some("false"),
         ] {
             assert!(should_send_tool_choice_for_chat(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 effort
             ));
         }
         assert!(should_send_tool_choice_for_chat(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some("high")
         ));
     }
@@ -4390,8 +4580,8 @@ mod stream_diagnostics_tests {
 #[cfg(test)]
 mod arcee_waf_message_encoding_tests {
     use super::build_chat_messages_for_request_and_provider;
-    use crate::config::ApiProvider;
-    use crate::models::{MessageRequest, SystemPrompt};
+    use crate::config::ProviderKind;
+    use codewhale_models::{MessageRequest, SystemPrompt};
     use serde_json::Value;
 
     fn request_with_system(system: &str) -> MessageRequest {
@@ -4428,7 +4618,7 @@ mod arcee_waf_message_encoding_tests {
         let system = "Run calculations with `python -c 'print(1)'` when a tool is available.";
         let request = request_with_system(system);
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee);
+        let messages = build_chat_messages_for_request_and_provider(&request, ProviderKind::Arcee);
         let content = &messages[0]["content"];
 
         assert!(
@@ -4448,7 +4638,7 @@ mod arcee_waf_message_encoding_tests {
         let system = "Run calculations with `python -c 'print(1)'` when a tool is available.";
         let request = request_with_system(system);
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai);
+        let messages = build_chat_messages_for_request_and_provider(&request, ProviderKind::Openai);
 
         assert_eq!(messages[0]["content"].as_str(), Some(system));
     }
@@ -4458,7 +4648,7 @@ mod arcee_waf_message_encoding_tests {
         let system = "Use read-only tools to inspect files before reporting results.";
         let request = request_with_system(system);
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee);
+        let messages = build_chat_messages_for_request_and_provider(&request, ProviderKind::Arcee);
 
         assert_eq!(messages[0]["content"].as_str(), Some(system));
     }
@@ -4471,11 +4661,11 @@ mod minimax_reasoning_replay_tests {
         build_chat_messages_for_request_and_provider_and_route,
     };
     use crate::config::{
-        ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, DEFAULT_MINIMAX_MODEL,
-        DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL, DEFAULT_MOONSHOT_BASE_URL, KIMI_CODE_K3_MODEL,
+        DEFAULT_KIMI_CODE_BASE_URL, DEFAULT_MINIMAX_MODEL, DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
+        DEFAULT_MOONSHOT_BASE_URL, KIMI_CODE_K3_MODEL, ProviderKind,
     };
-    use crate::models::Role;
-    use crate::models::{ContentBlock, Message, MessageRequest};
+    use codewhale_models::Role;
+    use codewhale_models::{ContentBlock, Message, MessageRequest};
 
     fn request_with_assistant_thinking() -> MessageRequest {
         MessageRequest {
@@ -4511,7 +4701,8 @@ mod minimax_reasoning_replay_tests {
     fn minimax_history_replays_thinking_as_reasoning_details() {
         let request = request_with_assistant_thinking();
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Minimax);
+        let messages =
+            build_chat_messages_for_request_and_provider(&request, ProviderKind::Minimax);
         let assistant = &messages[0];
 
         assert_eq!(
@@ -4541,7 +4732,7 @@ mod minimax_reasoning_replay_tests {
 
         let exact = build_chat_messages_for_request_and_provider_and_route(
             &request,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             DEFAULT_KIMI_CODE_BASE_URL,
         );
         assert_eq!(
@@ -4553,7 +4744,7 @@ mod minimax_reasoning_replay_tests {
 
         let neighbor = build_chat_messages_for_request_and_provider_and_route(
             &request,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             DEFAULT_MOONSHOT_BASE_URL,
         );
         assert!(
@@ -4592,6 +4783,7 @@ mod minimax_reasoning_replay_tests {
                         cache_control: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_qwen38_001".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({ "path": "widget.rs" }),
@@ -4603,6 +4795,7 @@ mod minimax_reasoning_replay_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_qwen38_001".to_string(),
                     content: "widget.rs: struct Widget { .. }".to_string(),
                     is_error: None,
@@ -4613,7 +4806,7 @@ mod minimax_reasoning_replay_tests {
 
         let messages = build_chat_messages_for_request_and_provider_and_route(
             &request,
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
         );
 
@@ -4688,7 +4881,7 @@ mod minimax_reasoning_replay_tests {
         preserve_request.model = "qwen3.7-plus".to_string();
         let preserve_messages = build_chat_messages_for_request_and_provider_and_route(
             &preserve_request,
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
         );
         let preserve_assistant = preserve_messages
@@ -4731,12 +4924,12 @@ mod alias_thinking_detection_tests {
         apply_inkling_reasoning_effort, apply_kimi_code_fixed_sampling,
         apply_kimi_code_k3_reasoning_effort, apply_openai_reasoning_effort,
         apply_provider_token_limit, apply_route_reasoning_controls, is_reasoning_model_for_stream,
-        is_reasoning_model_for_stream_on_route, provider_accepts_reasoning_content,
-        reasoning_stream_style_for_route, requires_reasoning_content,
-        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
+        provider_accepts_reasoning_content, reasoning_stream_style_for_route,
+        requires_reasoning_content, should_replay_reasoning_content,
+        should_replay_reasoning_content_for_provider,
         should_replay_reasoning_content_for_provider_on_route,
     };
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use serde_json::json;
 
     #[test]
@@ -4800,16 +4993,16 @@ mod alias_thinking_detection_tests {
 
     #[test]
     fn generic_openai_provider_does_not_accept_reasoning_content_semantics() {
-        assert!(!provider_accepts_reasoning_content(ApiProvider::Openai));
-        assert!(provider_accepts_reasoning_content(ApiProvider::Deepseek));
-        assert!(provider_accepts_reasoning_content(ApiProvider::NvidiaNim));
-        assert!(provider_accepts_reasoning_content(ApiProvider::XiaomiMimo));
-        assert!(provider_accepts_reasoning_content(ApiProvider::Arcee));
-        assert!(provider_accepts_reasoning_content(ApiProvider::Minimax));
-        assert!(provider_accepts_reasoning_content(ApiProvider::Zai));
+        assert!(!provider_accepts_reasoning_content(ProviderKind::Openai));
+        assert!(provider_accepts_reasoning_content(ProviderKind::Deepseek));
+        assert!(provider_accepts_reasoning_content(ProviderKind::NvidiaNim));
+        assert!(provider_accepts_reasoning_content(ProviderKind::XiaomiMimo));
+        assert!(provider_accepts_reasoning_content(ProviderKind::Arcee));
+        assert!(provider_accepts_reasoning_content(ProviderKind::Minimax));
+        assert!(provider_accepts_reasoning_content(ProviderKind::Zai));
         // #3016: Moonshot's native endpoint streams Kimi thinking as
         // reasoning_content.
-        assert!(provider_accepts_reasoning_content(ApiProvider::Moonshot));
+        assert!(provider_accepts_reasoning_content(ProviderKind::Moonshot));
     }
 
     /// Alibaba's classic pay-as-you-go DashScope endpoints are genuine
@@ -4825,13 +5018,16 @@ mod alias_thinking_detection_tests {
             "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/",
         ] {
             assert!(
-                super::is_exact_modelstudio_chat_route(ApiProvider::ModelstudioTokenPlan, base_url),
+                super::is_exact_modelstudio_chat_route(
+                    ProviderKind::ModelstudioTokenPlan,
+                    base_url
+                ),
                 "{base_url}"
             );
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 "qwen3.7-plus",
                 Some("off"),
@@ -4846,7 +5042,7 @@ mod alias_thinking_detection_tests {
         ] {
             assert!(
                 !super::is_exact_modelstudio_chat_route(
-                    ApiProvider::ModelstudioTokenPlan,
+                    ProviderKind::ModelstudioTokenPlan,
                     base_url
                 ),
                 "{base_url}"
@@ -4867,7 +5063,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 "qwen3.7-plus",
                 effort,
@@ -4887,7 +5083,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 "deepseek-v4-pro",
                 Some(requested),
@@ -4907,7 +5103,7 @@ mod alias_thinking_detection_tests {
         });
         apply_route_reasoning_controls(
             &mut body,
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             "https://proxy.example/v1",
             "qwen3.7-plus",
             Some("high"),
@@ -4925,8 +5121,8 @@ mod alias_thinking_detection_tests {
         // inherit the OpenAI-dialect fields — there is no provider-enum writer
         // left to re-add them.
         for provider in [
-            ApiProvider::ModelstudioTokenPlanAnthropic,
-            ApiProvider::ModelstudioCodingPlanAnthropic,
+            ProviderKind::ModelstudioTokenPlanAnthropic,
+            ProviderKind::ModelstudioCodingPlanAnthropic,
         ] {
             for base_url in [
                 crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
@@ -4954,7 +5150,7 @@ mod alias_thinking_detection_tests {
             // that can arrive before route normalization.
             assert_eq!(
                 reasoning_stream_style_for_route(
-                    ApiProvider::ModelstudioTokenPlan,
+                    ProviderKind::ModelstudioTokenPlan,
                     base_url,
                     model,
                     None,
@@ -4970,7 +5166,7 @@ mod alias_thinking_detection_tests {
             for effort in [None, Some("off"), Some("high"), Some("xhigh")] {
                 assert!(
                     !should_replay_reasoning_content_for_provider_on_route(
-                        ApiProvider::ModelstudioTokenPlan,
+                        ProviderKind::ModelstudioTokenPlan,
                         base_url,
                         model,
                         effort,
@@ -4984,7 +5180,7 @@ mod alias_thinking_detection_tests {
                 let mut body = json!({});
                 apply_route_reasoning_controls(
                     &mut body,
-                    ApiProvider::ModelstudioTokenPlan,
+                    ProviderKind::ModelstudioTokenPlan,
                     base_url,
                     model,
                     effort,
@@ -5004,7 +5200,7 @@ mod alias_thinking_detection_tests {
         let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
         assert_eq!(
             reasoning_stream_style_for_route(
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 "qwen3.7-plus",
                 None,
@@ -5012,13 +5208,13 @@ mod alias_thinking_detection_tests {
             ReasoningStreamStyle::SeparateField,
         );
         assert!(should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             base_url,
             "qwen3.7-plus",
             None,
         ));
         assert!(!should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             base_url,
             "qwen3.7-plus",
             Some("off"),
@@ -5036,7 +5232,7 @@ mod alias_thinking_detection_tests {
         for model in ["glm-5.2", "deepseek-v3.2", "deepseek-v3.1"] {
             assert!(
                 !should_replay_reasoning_content_for_provider_on_route(
-                    ApiProvider::ModelstudioTokenPlan,
+                    ProviderKind::ModelstudioTokenPlan,
                     base_url,
                     model,
                     None,
@@ -5045,7 +5241,7 @@ mod alias_thinking_detection_tests {
             );
         }
         assert!(should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             base_url,
             "deepseek-v4-pro",
             None,
@@ -5060,8 +5256,8 @@ mod alias_thinking_detection_tests {
         // also retains the legacy ModelstudioCodingPlan identity.
         let base_url = crate::config::DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL;
         for provider in [
-            ApiProvider::ModelstudioTokenPlan,
-            ApiProvider::ModelstudioCodingPlan,
+            ProviderKind::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioCodingPlan,
         ] {
             let mut body = json!({});
             apply_route_reasoning_controls(
@@ -5095,7 +5291,7 @@ mod alias_thinking_detection_tests {
         // Stream classification works on the workspace-scoped host...
         assert_eq!(
             reasoning_stream_style_for_route(
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 workspace_url,
                 "qwen3.8-max",
                 None,
@@ -5104,7 +5300,7 @@ mod alias_thinking_detection_tests {
         );
         assert_eq!(
             reasoning_stream_style_for_route(
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 workspace_url,
                 "qwen3.7-plus",
                 None,
@@ -5114,13 +5310,13 @@ mod alias_thinking_detection_tests {
         // ...and the route gate decides replay the same way it does on the
         // default host: qwen3.8 never replays, documented preserve models do.
         assert!(!should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             workspace_url,
             "qwen3.8-max",
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             workspace_url,
             "qwen3.7-plus",
             None,
@@ -5128,7 +5324,7 @@ mod alias_thinking_detection_tests {
         let mut body = json!({});
         apply_route_reasoning_controls(
             &mut body,
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             workspace_url,
             "qwen3.7-plus",
             Some("high"),
@@ -5153,7 +5349,7 @@ mod alias_thinking_detection_tests {
         ] {
             assert!(
                 !should_replay_reasoning_content_for_provider_on_route(
-                    ApiProvider::ModelstudioTokenPlan,
+                    ProviderKind::ModelstudioTokenPlan,
                     base_url,
                     model,
                     None,
@@ -5165,7 +5361,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({ "enable_thinking": true, "preserve_thinking": true });
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 model,
                 Some("high"),
@@ -5187,7 +5383,7 @@ mod alias_thinking_detection_tests {
         let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
         for model in ["qwen3.6-flash", "qwen3.6-flash-2026-04-16"] {
             assert!(should_replay_reasoning_content_for_provider_on_route(
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 model,
                 None,
@@ -5195,7 +5391,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 model,
                 Some("high"),
@@ -5205,7 +5401,7 @@ mod alias_thinking_detection_tests {
             // Hybrid semantics: an explicit off disables both, and replay
             // follows the effort gate.
             assert!(!should_replay_reasoning_content_for_provider_on_route(
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 model,
                 Some("off"),
@@ -5213,7 +5409,7 @@ mod alias_thinking_detection_tests {
             let mut off_body = json!({});
             apply_route_reasoning_controls(
                 &mut off_body,
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 model,
                 Some("off"),
@@ -5229,7 +5425,7 @@ mod alias_thinking_detection_tests {
         ] {
             assert!(
                 !should_replay_reasoning_content_for_provider_on_route(
-                    ApiProvider::ModelstudioTokenPlan,
+                    ProviderKind::ModelstudioTokenPlan,
                     base_url,
                     invented,
                     None,
@@ -5253,7 +5449,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 model,
                 Some("off"),
@@ -5263,7 +5459,7 @@ mod alias_thinking_detection_tests {
             assert_eq!(body["preserve_thinking"], json!(true), "{model}");
             assert_eq!(
                 reasoning_stream_style_for_route(
-                    ApiProvider::ModelstudioTokenPlan,
+                    ProviderKind::ModelstudioTokenPlan,
                     base_url,
                     model,
                     None,
@@ -5272,7 +5468,7 @@ mod alias_thinking_detection_tests {
                 "{model}",
             );
             assert!(should_replay_reasoning_content_for_provider_on_route(
-                ApiProvider::ModelstudioTokenPlan,
+                ProviderKind::ModelstudioTokenPlan,
                 base_url,
                 model,
                 Some("off"),
@@ -5284,11 +5480,11 @@ mod alias_thinking_detection_tests {
     fn stream_classifies_moonshot_kimi_as_reasoning() {
         // #3016: without this, Kimi thinking leaked into answer text.
         assert!(is_reasoning_model_for_stream(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "kimi-k2.6"
         ));
         assert!(
-            is_reasoning_model_for_stream(ApiProvider::Moonshot, "kimi-for-coding"),
+            is_reasoning_model_for_stream(ProviderKind::Moonshot, "kimi-for-coding"),
             "Kimi Code's stable model id now maps to K2.7 Code and streams reasoning_content"
         );
     }
@@ -5296,32 +5492,32 @@ mod alias_thinking_detection_tests {
     #[test]
     fn moonshot_and_minimax_replay_reasoning_content_for_supported_models() {
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "kimi-k2.7-code",
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "kimi-for-coding",
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Minimax,
+            ProviderKind::Minimax,
             "MiniMax-M3",
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             "GLM-5.2",
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             "GLM-5.3",
             None,
         ));
         assert!(!should_replay_reasoning_content_for_provider(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "kimi-for-coding",
             Some("off"),
         ));
@@ -5333,19 +5529,14 @@ mod alias_thinking_detection_tests {
         let direct_moonshot = crate::config::DEFAULT_MOONSHOT_BASE_URL;
 
         assert!(should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             kimi_code,
             crate::config::KIMI_CODE_K3_MODEL,
             Some("high"),
         ));
-        assert!(is_reasoning_model_for_stream_on_route(
-            ApiProvider::Moonshot,
-            kimi_code,
-            crate::config::KIMI_CODE_K3_MODEL,
-        ));
         assert_eq!(
             reasoning_stream_style_for_route(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 kimi_code,
                 crate::config::KIMI_CODE_K3_MODEL,
                 None,
@@ -5354,28 +5545,26 @@ mod alias_thinking_detection_tests {
         );
 
         assert!(!should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             direct_moonshot,
             crate::config::KIMI_CODE_K3_MODEL,
             Some("high"),
         ));
-        assert!(!is_reasoning_model_for_stream_on_route(
-            ApiProvider::Moonshot,
-            direct_moonshot,
-            crate::config::KIMI_CODE_K3_MODEL,
-        ));
+        // Display is not replay: a reasoning field that arrives on the
+        // neighboring route still renders as Thinking (#6501), while the
+        // replay contract above stays scoped to the exact membership route.
         assert_eq!(
             reasoning_stream_style_for_route(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 direct_moonshot,
                 crate::config::KIMI_CODE_K3_MODEL,
                 None,
             ),
-            ReasoningStreamStyle::None
+            ReasoningStreamStyle::SeparateField
         );
         assert!(
             should_replay_reasoning_content_for_provider_on_route(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 kimi_code,
                 crate::config::KIMI_CODE_K3_MODEL,
                 Some("off"),
@@ -5391,14 +5580,14 @@ mod alias_thinking_detection_tests {
 
         for effort in [Some("off"), Some("low"), Some("high"), Some("max"), None] {
             assert!(should_replay_reasoning_content_for_provider_on_route(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 direct,
                 model,
                 effort,
             ));
         }
         assert_eq!(
-            reasoning_stream_style_for_route(ApiProvider::Moonshot, direct, model, None),
+            reasoning_stream_style_for_route(ProviderKind::Moonshot, direct, model, None),
             ReasoningStreamStyle::SeparateField
         );
     }
@@ -5413,7 +5602,7 @@ mod alias_thinking_detection_tests {
 
         apply_provider_token_limit(
             &mut body,
-            ApiProvider::XiaomiMimo,
+            ProviderKind::XiaomiMimo,
             "https://api.xiaomimimo.com/v1",
             "mimo-v2.5-pro",
             8192,
@@ -5437,12 +5626,12 @@ mod alias_thinking_detection_tests {
 
         apply_provider_token_limit(
             &mut body,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             "gpt-5.5",
             4096,
         );
-        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.5", Some("high"));
+        apply_openai_reasoning_effort(&mut body, ProviderKind::Openai, "gpt-5.5", Some("high"));
 
         assert!(body.get("max_tokens").is_none());
         assert_eq!(
@@ -5467,12 +5656,12 @@ mod alias_thinking_detection_tests {
 
         apply_provider_token_limit(
             &mut body,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             "gpt-5.6-sol",
             8192,
         );
-        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.6-sol", Some("max"));
+        apply_openai_reasoning_effort(&mut body, ProviderKind::Openai, "gpt-5.6-sol", Some("max"));
 
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["max_completion_tokens"], json!(8192));
@@ -5480,30 +5669,55 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
-    fn grok_46_uses_exact_first_party_reasoning_effort_ladder() {
-        for (requested, expected) in [
-            ("off", "high"),
-            ("low", "low"),
-            ("medium", "medium"),
-            ("high", "high"),
-            ("xhigh", "xhigh"),
-            ("max", "xhigh"),
+    fn grok_47_and_46_use_exact_first_party_reasoning_effort_ladder() {
+        // Both catalog rows document low/medium/high/xhigh; reasoning cannot
+        // be disabled, so `off` is the documented default `high`.
+        for model in [
+            crate::config::XAI_GROK_4_7_MODEL,
+            crate::config::XAI_GROK_4_6_MODEL,
         ] {
+            for (requested, expected) in [
+                ("off", "high"),
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "high"),
+                ("xhigh", "xhigh"),
+                ("max", "xhigh"),
+            ] {
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ProviderKind::Xai,
+                    crate::config::DEFAULT_XAI_BASE_URL,
+                    model,
+                    Some(requested),
+                );
+                assert_eq!(
+                    body,
+                    json!({ "reasoning_effort": expected }),
+                    "{model} {requested}"
+                );
+            }
+        }
+
+        // A row without a documented effort option (grok-4.3) and an id the
+        // catalog does not know send nothing.
+        for model in [crate::config::XAI_GROK_4_3_MODEL, "grok-9-unknown"] {
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::Xai,
+                ProviderKind::Xai,
                 crate::config::DEFAULT_XAI_BASE_URL,
-                crate::config::XAI_GROK_4_6_MODEL,
-                Some(requested),
+                model,
+                Some("medium"),
             );
-            assert_eq!(body, json!({ "reasoning_effort": expected }), "{requested}");
+            assert_eq!(body, json!({}), "{model}");
         }
 
         let mut provider_default = json!({});
         apply_route_reasoning_controls(
             &mut provider_default,
-            ApiProvider::Xai,
+            ProviderKind::Xai,
             crate::config::DEFAULT_XAI_BASE_URL,
             crate::config::XAI_GROK_4_6_MODEL,
             Some("auto"),
@@ -5513,7 +5727,7 @@ mod alias_thinking_detection_tests {
         let mut custom = json!({});
         apply_route_reasoning_controls(
             &mut custom,
-            ApiProvider::Xai,
+            ProviderKind::Xai,
             "https://gateway.example/v1",
             crate::config::XAI_GROK_4_6_MODEL,
             Some("medium"),
@@ -5534,7 +5748,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::Xai,
+                ProviderKind::Xai,
                 crate::config::DEFAULT_XAI_BASE_URL,
                 crate::config::XAI_GROK_4_5_MODEL,
                 Some(requested),
@@ -5561,7 +5775,7 @@ mod alias_thinking_detection_tests {
 
             apply_inkling_reasoning_effort(
                 &mut body,
-                ApiProvider::Together,
+                ProviderKind::Together,
                 "thinkingmachines/inkling",
                 Some(requested),
             );
@@ -5576,7 +5790,7 @@ mod alias_thinking_detection_tests {
         let mut other_model = json!({ "thinking": { "type": "enabled" } });
         apply_inkling_reasoning_effort(
             &mut other_model,
-            ApiProvider::Together,
+            ProviderKind::Together,
             "deepseek-ai/DeepSeek-V4-Pro",
             Some("max"),
         );
@@ -5586,7 +5800,7 @@ mod alias_thinking_detection_tests {
         let mut other_provider = json!({ "thinking": { "type": "enabled" } });
         apply_inkling_reasoning_effort(
             &mut other_provider,
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             "thinkingmachines/inkling",
             Some("max"),
         );
@@ -5611,7 +5825,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({ "reasoning_effort": "stale" });
             apply_kimi_code_k3_reasoning_effort(
                 &mut body,
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL,
                 crate::config::KIMI_CODE_K3_MODEL,
                 Some(requested),
@@ -5631,14 +5845,14 @@ mod alias_thinking_detection_tests {
         });
         apply_kimi_code_k3_reasoning_effort(
             &mut body,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_256K_MODEL,
             Some("max"),
         );
         apply_kimi_code_fixed_sampling(
             &mut body,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_256K_MODEL,
         );
@@ -5656,17 +5870,17 @@ mod alias_thinking_detection_tests {
     fn kimi_code_fixed_sampling_does_not_leak_to_neighbor_routes() {
         for (provider, base_url, model) in [
             (
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 crate::config::DEFAULT_MOONSHOT_BASE_URL,
                 crate::config::KIMI_CODE_K3_256K_MODEL,
             ),
             (
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL,
                 crate::config::KIMI_CODE_K3_256K_MODEL,
             ),
             (
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL,
                 "k3-256k-preview",
             ),
@@ -5695,7 +5909,7 @@ mod alias_thinking_detection_tests {
             });
             apply_route_reasoning_controls(
                 &mut body,
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 crate::config::DEFAULT_MOONSHOT_BASE_URL,
                 crate::config::MOONSHOT_KIMI_K3_MODEL,
                 Some(requested),
@@ -5708,7 +5922,7 @@ mod alias_thinking_detection_tests {
         let mut provider_default = json!({ "thinking": { "type": "enabled" } });
         apply_route_reasoning_controls(
             &mut provider_default,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_MOONSHOT_BASE_URL,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
             Some("auto"),
@@ -5726,14 +5940,14 @@ mod alias_thinking_detection_tests {
         });
         apply_provider_token_limit(
             &mut direct,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_MOONSHOT_BASE_URL,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
             64,
         );
         apply_direct_moonshot_k3_fixed_sampling(
             &mut direct,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_MOONSHOT_BASE_URL,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         );
@@ -5749,14 +5963,14 @@ mod alias_thinking_detection_tests {
         });
         apply_provider_token_limit(
             &mut neighbor,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "https://proxy.example/v1",
             crate::config::MOONSHOT_KIMI_K3_MODEL,
             64,
         );
         apply_direct_moonshot_k3_fixed_sampling(
             &mut neighbor,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "https://proxy.example/v1",
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         );
@@ -5771,7 +5985,7 @@ mod alias_thinking_detection_tests {
         let mut membership = json!({});
         apply_route_reasoning_controls(
             &mut membership,
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
             Some("max"),
@@ -5799,7 +6013,7 @@ mod alias_thinking_detection_tests {
             let mut neighbor = json!({});
             apply_route_reasoning_controls(
                 &mut neighbor,
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 base_url,
                 model,
                 Some("max"),
@@ -5827,7 +6041,7 @@ mod alias_thinking_detection_tests {
             let mut body = json!({ "thinking": { "type": "enabled" } });
             apply_kimi_code_k3_reasoning_effort(
                 &mut body,
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 base_url,
                 model,
                 Some("max"),
@@ -5852,16 +6066,52 @@ mod alias_thinking_detection_tests {
 
         apply_provider_token_limit(
             &mut body,
-            ApiProvider::Meta,
+            ProviderKind::Meta,
             "https://api.meta.ai/v1",
             "muse-spark-1.1",
             8192,
         );
-        apply_openai_reasoning_effort(&mut body, ApiProvider::Meta, "muse-spark-1.1", Some("max"));
+        apply_openai_reasoning_effort(&mut body, ProviderKind::Meta, "muse-spark-1.1", Some("max"));
 
         assert_eq!(body["max_tokens"], json!(8192));
         assert!(body.get("max_completion_tokens").is_none());
         assert_eq!(body["reasoning_effort"], json!("xhigh"));
+    }
+
+    #[test]
+    fn provider_regression_5853_muse_family_preserves_reasoning_effort() {
+        for model in [
+            "muse-spark-1.2",
+            "muse-spark-1.3",
+            "muse-spark-1.3-contributor",
+            " MUSE-SPARK-1.3 ",
+        ] {
+            for (effort, wire) in [
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "high"),
+                ("xhigh", "xhigh"),
+                ("max", "xhigh"),
+                ("ultra", "xhigh"),
+            ] {
+                let mut body = json!({"model": model});
+                apply_openai_reasoning_effort(&mut body, ProviderKind::Meta, model, Some(effort));
+                assert_eq!(body["reasoning_effort"], wire, "{model}, effort={effort}");
+            }
+        }
+        for (provider, model, effort) in [
+            (ProviderKind::Openai, "muse-spark-1.3", Some("high")),
+            (ProviderKind::Meta, "muse-glimmer-fixture", Some("high")),
+            (ProviderKind::Meta, "muse-sparks-fixture", Some("high")),
+            (ProviderKind::Meta, "muse-spark-1.3", None),
+        ] {
+            let mut body = json!({"model": model});
+            apply_openai_reasoning_effort(&mut body, provider, model, effort);
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{provider:?}, {model}"
+            );
+        }
     }
 
     #[test]
@@ -5874,12 +6124,12 @@ mod alias_thinking_detection_tests {
 
         apply_provider_token_limit(
             &mut body,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             "gpt-4o",
             4096,
         );
-        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-4o", Some("high"));
+        apply_openai_reasoning_effort(&mut body, ProviderKind::Openai, "gpt-4o", Some("high"));
 
         assert_eq!(
             body.get("max_tokens").and_then(serde_json::Value::as_u64),
@@ -5899,14 +6149,14 @@ mod alias_thinking_detection_tests {
 
         apply_provider_token_limit(
             &mut body,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             "deepseek-v4-pro",
             4096,
         );
         apply_openai_reasoning_effort(
             &mut body,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-v4-pro",
             Some("high"),
         );
@@ -5926,23 +6176,23 @@ mod alias_thinking_detection_tests {
         // still replay reasoning_content, even though the provider itself does
         // not accept the field. Otherwise the thinking-mode API returns 400.
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-v4-flash",
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-v4-pro",
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-reasoner",
             Some("medium"),
         ));
         // The documented escape hatch still wins over model detection.
         assert!(!should_replay_reasoning_content_for_provider(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-v4-flash",
             Some("off"),
         ));
@@ -5953,12 +6203,12 @@ mod alias_thinking_detection_tests {
         // #1542 no-regression guard: a genuine non-DeepSeek model on the
         // openai provider must continue to have reasoning_content stripped.
         assert!(!should_replay_reasoning_content_for_provider(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "qwen3-coder",
             None,
         ));
         assert!(!should_replay_reasoning_content_for_provider(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "claude-sonnet-4-6",
             None,
         ));
@@ -5967,11 +6217,11 @@ mod alias_thinking_detection_tests {
     #[test]
     fn suggestive_unknown_model_names_never_authorize_reasoning_replay() {
         for provider in [
-            ApiProvider::Openai,
-            ApiProvider::Deepseek,
-            ApiProvider::Openrouter,
-            ApiProvider::Moonshot,
-            ApiProvider::Zai,
+            ProviderKind::Openai,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Moonshot,
+            ProviderKind::Zai,
         ] {
             for model in [
                 "foo-thinking",
@@ -5982,10 +6232,6 @@ mod alias_thinking_detection_tests {
                 assert!(
                     !should_replay_reasoning_content_for_provider(provider, model, None),
                     "{provider:?} {model}"
-                );
-                assert!(
-                    !is_reasoning_model_for_stream(provider, model),
-                    "stream classification must fail closed too: {provider:?} {model}"
                 );
             }
         }
@@ -5998,20 +6244,20 @@ mod alias_thinking_detection_tests {
         // reasoning model, or incoming `reasoning_content` tokens are stored
         // as answer text and the subsequent replay still 400s.
         assert!(is_reasoning_model_for_stream(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-v4-flash"
         ));
         assert!(is_reasoning_model_for_stream(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-v4-pro"
         ));
         assert!(is_reasoning_model_for_stream(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "deepseek-reasoner"
         ));
         // Native DeepSeek provider was already correct; stays correct.
         assert!(is_reasoning_model_for_stream(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-pro"
         ));
     }
@@ -6027,11 +6273,11 @@ mod alias_thinking_detection_tests {
             crate::config::ZAI_GLM_5_3_FLASH_MODEL,
         ] {
             let mut body = json!({});
-            apply_route_reasoning_controls(&mut body, ApiProvider::Zai, zai, model, Some("max"));
+            apply_route_reasoning_controls(&mut body, ProviderKind::Zai, zai, model, Some("max"));
             assert_eq!(body["reasoning_effort"], json!("max"), "{model} at max");
 
             let mut body = json!({});
-            apply_route_reasoning_controls(&mut body, ApiProvider::Zai, zai, model, Some("high"));
+            apply_route_reasoning_controls(&mut body, ProviderKind::Zai, zai, model, Some("high"));
             assert_eq!(body["reasoning_effort"], json!("high"), "{model} at high");
         }
 
@@ -6041,7 +6287,7 @@ mod alias_thinking_detection_tests {
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ] {
             let mut body = json!({});
-            apply_route_reasoning_controls(&mut body, ApiProvider::Zai, zai, model, Some("max"));
+            apply_route_reasoning_controls(&mut body, ProviderKind::Zai, zai, model, Some("max"));
             assert!(
                 body.get("reasoning_effort").is_none(),
                 "{model} must not receive tiered effort"
@@ -6053,7 +6299,7 @@ mod alias_thinking_detection_tests {
         let mut body = json!({"thinking": {"type": "enabled"}});
         apply_route_reasoning_controls(
             &mut body,
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             "https://gateway.example.com/v1",
             crate::config::ZAI_GLM_5_3_MODEL,
             Some("max"),
@@ -6063,25 +6309,163 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
+    fn zai_forced_thinking_models_never_send_thinking_disabled() {
+        // BigModel and Z.ai document GLM-5.3 / GLM-5.3-Flash as forced-thinking:
+        // `thinking.type: "disabled"` errors, effort accepts only low/high/max,
+        // and the migration note for a former `disabled` payload is
+        // `enabled` + `reasoning_effort: "low"`. Both hosts of the first-party
+        // open platform — api.z.ai and open.bigmodel.cn — get the rewrite.
+        for zai in [
+            crate::config::DEFAULT_ZAI_BASE_URL,
+            "https://open.bigmodel.cn/api/paas/v4",
+        ] {
+            for model in [
+                crate::config::ZAI_GLM_5_3_MODEL,
+                crate::config::ZAI_GLM_5_3_FLASH_MODEL,
+            ] {
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ProviderKind::Zai,
+                    zai,
+                    model,
+                    Some("off"),
+                );
+                assert_eq!(
+                    body["thinking"]["type"],
+                    json!("enabled"),
+                    "{model} must not send the rejected disabled toggle"
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("low"),
+                    "{model} off becomes low"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ProviderKind::Zai,
+                    zai,
+                    model,
+                    Some("low"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("low"),
+                    "{model} low is native"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ProviderKind::Zai,
+                    zai,
+                    model,
+                    Some("medium"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("high"),
+                    "{model} medium maps to high"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ProviderKind::Zai,
+                    zai,
+                    model,
+                    Some("max"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("max"),
+                    "{model} max stays max"
+                );
+
+                // Unknown legacy values leave the field omitted so the API keeps
+                // its documented default; nothing may reintroduce `disabled`.
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ProviderKind::Zai,
+                    zai,
+                    model,
+                    Some("auto"),
+                );
+                assert!(
+                    body.get("reasoning_effort").is_none(),
+                    "{model} auto stays omitted"
+                );
+                assert_ne!(body["thinking"]["type"], json!("disabled"));
+            }
+
+            // GLM-5.2 honours the generic disabled toggle on both hosts. On
+            // BigModel that toggle now reaches the API (its docs still list
+            // `disabled` for GLM-5.2) instead of being stripped by the
+            // fail-closed gateway path.
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ProviderKind::Zai,
+                zai,
+                crate::config::ZAI_GLM_5_2_MODEL,
+                Some("off"),
+            );
+            assert_eq!(body["thinking"]["type"], json!("disabled"));
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn zai_bigmodel_adjacent_routes_stay_fail_closed() {
+        // BigModel's `/preview` product and a plain-http neighbor are not the
+        // documented Chat dialect, so they keep the gateway treatment: no
+        // Z.ai reasoning fields, including on a forced-thinking model.
+        for neighboring_route in [
+            "https://open.bigmodel.cn/api/paas/v4/preview",
+            "http://open.bigmodel.cn/api/paas/v4",
+        ] {
+            let mut body = json!({"thinking": {"type": "enabled"}});
+            apply_route_reasoning_controls(
+                &mut body,
+                ProviderKind::Zai,
+                neighboring_route,
+                crate::config::ZAI_GLM_5_3_MODEL,
+                Some("max"),
+            );
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{neighboring_route} must not gain tiered effort"
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "{neighboring_route} must not keep the Z.ai thinking object"
+            );
+        }
+    }
+
+    #[test]
     fn stream_classifies_known_large_reasoning_models_as_reasoning() {
         // Xiaomi MiMo and OpenRouter/Qwen/Trinity can stream private reasoning through a
         // `reasoning` delta without using a DeepSeek-looking model name. The
         // renderer must still route that field into Thinking cells instead
         // of plain assistant prose.
         assert!(
-            is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro"),
+            is_reasoning_model_for_stream(ProviderKind::XiaomiMimo, "mimo-v2.5-pro"),
             "mimo-v2.5-pro should stream reasoning as thinking on Xiaomi MiMo"
         );
         assert!(
-            is_reasoning_model_for_stream(ApiProvider::Arcee, "trinity-large-thinking"),
+            is_reasoning_model_for_stream(ProviderKind::Arcee, "trinity-large-thinking"),
             "trinity-large-thinking should stream reasoning as thinking on direct Arcee"
         );
         assert!(
-            is_reasoning_model_for_stream(ApiProvider::Zai, "GLM-5.2"),
+            is_reasoning_model_for_stream(ProviderKind::Zai, "GLM-5.2"),
             "GLM-5.2 should stream reasoning_content as thinking on direct Z.ai"
         );
         assert!(
-            is_reasoning_model_for_stream(ApiProvider::Zai, "GLM-5.3"),
+            is_reasoning_model_for_stream(ProviderKind::Zai, "GLM-5.3"),
             "GLM-5.3 inherits GLM-5.2's reasoning capability on direct Z.ai"
         );
         for model in [
@@ -6090,46 +6474,74 @@ mod alias_thinking_detection_tests {
             "xiaomi/mimo-v2.5-pro",
         ] {
             assert!(
-                is_reasoning_model_for_stream(ApiProvider::Openrouter, model),
+                is_reasoning_model_for_stream(ProviderKind::Openrouter, model),
                 "{model} should stream reasoning as thinking on OpenRouter"
             );
         }
     }
 
     #[test]
-    fn stream_does_not_classify_generic_model_as_reasoning() {
-        // #1542 no-regression guard: a genuine non-DeepSeek model on the
-        // openai provider must NOT be treated as a reasoning model, so the
-        // parser keeps inlining any `reasoning_content` it emits as text.
-        assert!(!is_reasoning_model_for_stream(
-            ApiProvider::Openai,
-            "qwen3-coder"
-        ));
-        assert!(!is_reasoning_model_for_stream(
-            ApiProvider::Openai,
-            "claude-sonnet-4-6"
-        ));
-        // Non-DeepSeek model on a reasoning-aware provider is also unchanged.
-        assert!(!is_reasoning_model_for_stream(
-            ApiProvider::Deepseek,
-            "qwen3-coder"
+    fn stream_surfaces_reasoning_fields_on_every_unconfigured_route() {
+        // #6501: grok-4.7 on xAI and a MiMo id newer than the offline catalog
+        // streamed their reasoning as answer prose because the stream gate
+        // required a provider allowlist AND a catalog row. The reasoning
+        // fields are reasoning on every route that sends them; only an
+        // explicit `reasoning_stream_style = "none"` restores pass-through.
+        for (provider, model) in [
+            (ProviderKind::Xai, "grok-4.7"),
+            (ProviderKind::Xai, "grok-4.6"),
+            (ProviderKind::XiaomiMimo, "mimo-v2.7-pro-unreleased"),
+            (ProviderKind::XiaomiMimo, "mimo-v2.6-pro"),
+            (ProviderKind::Openai, "qwen3-coder"),
+            (ProviderKind::Deepseek, "qwen3-coder"),
+            (ProviderKind::Stepfun, "step-3.5"),
+            (ProviderKind::Together, "any/model"),
+            (ProviderKind::Ollama, "gpt-oss:20b"),
+            (ProviderKind::Codewhale, "grok-4.7"),
+        ] {
+            assert!(
+                is_reasoning_model_for_stream(provider, model),
+                "{provider:?} {model} must surface reasoning fields as Thinking"
+            );
+        }
+        assert_eq!(
+            super::reasoning_stream_style_for_stream(ProviderKind::Xai, "grok-4.7", Some("none")),
+            ReasoningStreamStyle::None,
+            "an explicit route override still wins"
+        );
+    }
+
+    #[test]
+    fn xiaomi_mimo_replays_reasoning_for_every_model_id() {
+        // #6501: MiMo returns 400 when a tool-call turn omits the assistant
+        // `reasoning_content`, including ids newer than the offline catalog.
+        for model in ["mimo-v2.5-pro", "mimo-v2.6-pro", "mimo-v2.7-pro-unreleased"] {
+            assert!(
+                should_replay_reasoning_content_for_provider(ProviderKind::XiaomiMimo, model, None),
+                "{model}"
+            );
+        }
+        assert!(!should_replay_reasoning_content_for_provider(
+            ProviderKind::XiaomiMimo,
+            "mimo-v2.6-pro",
+            Some("off"),
         ));
     }
 
     #[test]
-    fn stream_classification_matches_replay_predicate() {
-        // The streaming classifier and the replay predicate must agree on
-        // model identity, or stream parsing and message sanitisation disagree
-        // about where reasoning tokens live. Effort=None isolates the
-        // model/provider dimension shared by both.
-        for model in ["deepseek-v4-pro", "deepseek-reasoner", "qwen3-coder"] {
-            for provider in [ApiProvider::Openai, ApiProvider::Deepseek] {
-                assert_eq!(
-                    is_reasoning_model_for_stream(provider, model),
-                    should_replay_reasoning_content_for_provider(provider, model, None),
-                    "stream vs replay disagree for {model} on {provider:?}"
-                );
-            }
+    fn stream_display_does_not_authorize_reasoning_replay() {
+        // #1542 stays fixed: rendering a reasoning delta as Thinking must not
+        // make a provider that rejects `reasoning_content` receive it back.
+        for (provider, model) in [
+            (ProviderKind::Openai, "qwen3-coder"),
+            (ProviderKind::Openai, "claude-sonnet-4-6"),
+            (ProviderKind::Xai, "grok-4.7"),
+        ] {
+            assert!(is_reasoning_model_for_stream(provider, model));
+            assert!(
+                !should_replay_reasoning_content_for_provider(provider, model, None),
+                "{provider:?} {model}"
+            );
         }
     }
 }
@@ -6143,14 +6555,248 @@ mod image_block_wire_tests {
     //! most of them at once. The shape is fixed by OpenAI's spec: a `user`
     //! message whose `content` is an array of parts, with the image as
     //! `{"type":"image_url","image_url":{"url":…}}`.
-    use super::{ApiProvider, build_chat_messages, build_chat_wire_body};
-    use crate::models::Role;
-    use crate::models::{ContentBlock, ImageUrlContent, Message, MessageRequest};
+    use super::{ProviderKind, build_chat_messages, build_chat_wire_body};
+    use codewhale_models::Role;
+    use codewhale_models::{ContentBlock, ImageUrlContent, Message, MessageRequest};
 
     const DATA_URL: &str = "data:image/png;base64,QUJD";
 
+    #[test]
+    fn compaction_checkpoint_keeps_complete_tool_round_on_wire() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Analyze the data"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ready"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_2","name":"read","input":{"path":"b.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"done"}]}
+        ])).unwrap();
+        let summary = codewhale_models::SystemPrompt::Text(
+            crate::compaction::build_compaction_summary_block_text("Compacted summary", ""),
+        );
+        messages.push(crate::compaction::compaction_checkpoint_message(&summary));
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let stored = messages.clone();
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        assert_eq!(
+            messages, stored,
+            "request construction must not alter saved history"
+        );
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool"]);
+        let prompt = wire[0]["content"].as_str().unwrap();
+        assert!(prompt.contains("Compacted summary"));
+        assert!(prompt.contains("Analyze the data"));
+        assert!(prompt.contains("codewhale.agent_topology.v1"));
+        assert_eq!(wire[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+        assert_eq!(wire[3]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(wire[4]["tool_call_id"], "call_2");
+
+        messages.push(
+            serde_json::from_value(serde_json::json!({
+                "role":"assistant","content":[{"type":"text","text":"Analysis complete"}]
+            }))
+            .unwrap(),
+        );
+        messages.push(
+            serde_json::from_value(serde_json::json!({
+                "role":"user","content":[{"type":"text","text":"What happened next?"}]
+            }))
+            .unwrap(),
+        );
+        let later_wire = build_chat_messages(None, &messages, "gpt-4o");
+        let later_roles: Vec<&str> = later_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            later_roles,
+            [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "assistant",
+                "user"
+            ]
+        );
+        assert_eq!(later_wire[6]["content"], "What happened next?");
+
+        let restored = crate::compaction::restore_compaction_checkpoint(
+            crate::runtime_handoff::project_owned_messages_for_restore(messages.clone()),
+            Some(&summary),
+        );
+        let restored_wire = build_chat_messages(None, &restored, "gpt-4o");
+        let restored_roles: Vec<&str> = restored_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(restored_roles, later_roles);
+        assert!(
+            restored_wire[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("restored Agent topology checkpoint")
+        );
+        assert_eq!(restored_wire[6]["content"], "What happened next?");
+    }
+
+    #[test]
+    fn quoted_compaction_marker_does_not_reorder_user_wire_messages() {
+        // The current marker, and the legacy one older sessions still carry.
+        for marker in [
+            crate::compaction::COMPACTION_SUMMARY_MARKER,
+            crate::compaction::LEGACY_V2_COMPACTION_SUMMARY_MARKER,
+        ] {
+            let quote = format!("Please explain: {marker}");
+            let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+                {"role":"user","content":[{"type":"text","text":"First question"}]},
+                {"role":"assistant","content":[{"type":"text","text":"First answer"}]},
+                {"role":"user","content":[{"type":"text","text":quote}]},
+                {"role":"assistant","content":[{"type":"text","text":"It introduces a summary."}]},
+                {"role":"user","content":[{"type":"text","text":"Follow-up question"}]}
+            ]))
+            .unwrap();
+            let wire = build_chat_messages(None, &messages, "gpt-4o");
+            let roles: Vec<&str> = wire
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect();
+            assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"]);
+            assert_eq!(wire[0]["content"], "First question");
+            assert_eq!(wire[2]["content"], quote);
+            assert_eq!(wire[4]["content"], "Follow-up question");
+        }
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"First question"}]},
+            {"role":"assistant","content":[{"type":"text","text":"First answer"}]},
+            {"role":"user","content":[{"type":"text","text":"placeholder"}]},
+            {"role":"assistant","content":[{"type":"text","text":"It introduces a summary."}]},
+            {"role":"user","content":[{"type":"text","text":"Follow-up question"}]}
+        ]))
+        .unwrap();
+        let roles = ["user", "assistant", "user", "assistant", "user"];
+
+        let quoted_exact_header = crate::compaction::build_compaction_summary_block_text(
+            "This text was pasted by a user",
+            "",
+        );
+        let mut with_exact_quote = messages.clone();
+        with_exact_quote[2] = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: quoted_exact_header.clone(),
+                cache_control: None,
+            }],
+        };
+        let exact_wire = build_chat_messages(None, &with_exact_quote, "gpt-4o");
+        let exact_roles: Vec<&str> = exact_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(exact_roles, roles);
+        assert_eq!(exact_wire[2]["content"], quoted_exact_header);
+
+        let mut after_tool: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Read first"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]},
+            {"role":"user","content":[{"type":"text","text":"placeholder"}]},
+            {"role":"assistant","content":[{"type":"text","text":"Answer"}]}
+        ])).unwrap();
+        after_tool[3] = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: quoted_exact_header.clone(),
+                cache_control: None,
+            }],
+        };
+        let after_tool_wire = build_chat_messages(None, &after_tool, "gpt-4o");
+        let after_tool_roles: Vec<&str> = after_tool_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            after_tool_roles,
+            ["user", "assistant", "tool", "user", "assistant"]
+        );
+        assert_eq!(after_tool_wire[3]["content"], quoted_exact_header);
+    }
+
+    #[test]
+    fn topology_checkpoint_after_tool_result_keeps_wire_tool_pair() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Read the file"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]}
+        ])).unwrap();
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool"]);
+        assert!(
+            wire[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("agent_topology_v1")
+        );
+        assert_eq!(wire[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn compaction_without_retained_user_has_one_wire_user_before_tools() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]}
+        ])).unwrap();
+        let summary = codewhale_models::SystemPrompt::Text(
+            crate::compaction::build_compaction_summary_block_text("Summary", ""),
+        );
+        messages.push(crate::compaction::compaction_checkpoint_message(&summary));
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool"]);
+        let prompt = wire[0]["content"].as_str().unwrap();
+        assert!(prompt.contains("Summary"));
+        assert!(prompt.contains("agent_topology_v1"));
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn compaction_after_unanswered_user_prompt_has_one_wire_user() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Please continue"}]}
+        ]))
+        .unwrap();
+        let summary = codewhale_models::SystemPrompt::Text(
+            crate::compaction::build_compaction_summary_block_text("Earlier work", ""),
+        );
+        messages.push(crate::compaction::compaction_checkpoint_message(&summary));
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["role"], "user");
+        let prompt = wire[0]["content"].as_str().unwrap();
+        assert!(prompt.contains("Please continue"));
+        assert!(prompt.contains("Earlier work"));
+        assert!(prompt.contains("agent_topology_v1"));
+    }
+
     fn fixture_tool_use(id: &str) -> ContentBlock {
         ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: "read".to_string(),
             input: serde_json::json!({"path": format!("{id}.txt")}),
@@ -6163,6 +6809,7 @@ mod image_block_wire_tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: format!("result for {id}"),
                 is_error: Some(false),
@@ -6205,9 +6852,10 @@ mod image_block_wire_tests {
     fn user_image_becomes_a_multimodal_parts_array() {
         let body = build_chat_wire_body(
             &request_with_image(),
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             false,
+            None,
         )
         .expect("wire body");
 
@@ -6246,9 +6894,10 @@ mod image_block_wire_tests {
 
         let body = build_chat_wire_body(
             &request,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "https://api.deepseek.com/beta",
             false,
+            None,
         )
         .expect("DeepSeek vision wire body");
 
@@ -6284,9 +6933,10 @@ mod image_block_wire_tests {
 
         let body = build_chat_wire_body(
             &request,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             false,
+            None,
         )
         .expect("wire body");
 
@@ -6308,6 +6958,7 @@ mod image_block_wire_tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call_image_1".to_string(),
                     name: "read".to_string(),
                     input: serde_json::json!({"path": "shot.png"}),
@@ -6318,13 +6969,14 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_image_1".to_string(),
                     content: "screenshot captured".to_string(),
                     is_error: Some(false),
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6332,9 +6984,10 @@ mod image_block_wire_tests {
 
         let body = build_chat_wire_body(
             &request,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             false,
+            None,
         )
         .expect("wire body");
         let messages = body.body["messages"].as_array().expect("messages");
@@ -6349,7 +7002,10 @@ mod image_block_wire_tests {
         assert_eq!(image_message["role"], "user");
         let parts = image_message["content"].as_array().expect("image parts");
         assert_eq!(parts[1]["type"], "image_url");
-        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+        );
         assert!(
             parts[0]["text"]
                 .as_str()
@@ -6365,6 +7021,7 @@ mod image_block_wire_tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_image_1".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "first.png"}),
@@ -6372,6 +7029,7 @@ mod image_block_wire_tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_image_2".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "second.png"}),
@@ -6383,26 +7041,28 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_image_1".to_string(),
                     content: "first screenshot captured".to_string(),
                     is_error: Some(false),
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_image_2".to_string(),
                     content: "second screenshot captured".to_string(),
                     is_error: Some(false),
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "REVG",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6410,9 +7070,10 @@ mod image_block_wire_tests {
 
         let body = build_chat_wire_body(
             &request,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://api.openai.com/v1",
             false,
+            None,
         )
         .expect("wire body");
         let messages = body.body["messages"].as_array().expect("messages");
@@ -6428,11 +7089,11 @@ mod image_block_wire_tests {
         assert_eq!(image_parts.len(), 4);
         assert_eq!(
             image_parts[1]["image_url"]["url"],
-            "data:image/png;base64,QUJD"
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
         );
         assert_eq!(
             image_parts[3]["image_url"]["url"],
-            "data:image/png;base64,REVG"
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg=="
         );
     }
 
@@ -6489,6 +7150,7 @@ mod image_block_wire_tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_one".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "first.png"}),
@@ -6496,6 +7158,7 @@ mod image_block_wire_tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_two".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "second.png"}),
@@ -6507,13 +7170,14 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_one".to_string(),
                     content: "first screenshot captured".to_string(),
                     is_error: Some(false),
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6525,13 +7189,14 @@ mod image_block_wire_tests {
                         cache_control: None,
                     },
                     ContentBlock::ToolResult {
+                        execution_id: None,
                         tool_use_id: "call_two".to_string(),
                         content: "second screenshot captured".to_string(),
                         is_error: Some(false),
                         content_blocks: Some(vec![serde_json::json!({
                             "type": "image",
                             "mime_type": "image/png",
-                            "data": "REVG",
+                            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                         })]),
                     },
                 ],
@@ -6570,6 +7235,7 @@ mod image_block_wire_tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "duplicate".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "first.png"}),
@@ -6577,6 +7243,7 @@ mod image_block_wire_tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "duplicate".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "second.png"}),
@@ -6588,13 +7255,14 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "duplicate".to_string(),
                     content: "one result for two calls".to_string(),
                     is_error: Some(false),
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6648,6 +7316,7 @@ mod mistral_reasoning_tests {
                             cache_control: None,
                         },
                         ContentBlock::ToolUse {
+                            execution_id: None,
                             id: "call-1".to_string(),
                             name: "read_file".to_string(),
                             input: json!({"path": "README.md"}),
@@ -6659,6 +7328,7 @@ mod mistral_reasoning_tests {
                 Message {
                     role: Role::User,
                     content: vec![ContentBlock::ToolResult {
+                        execution_id: None,
                         tool_use_id: "call-1".to_string(),
                         content: "contents".to_string(),
                         is_error: None,
@@ -6724,7 +7394,7 @@ mod mistral_reasoning_tests {
         let mut body = json!({"model": "mistral-medium-latest"});
         apply_mistral_route_reasoning_controls(
             &mut body,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
             "mistral-medium-latest",
             Some("high"),
@@ -6734,7 +7404,7 @@ mod mistral_reasoning_tests {
         let mut body = json!({"model": "mistral-code-latest"});
         apply_mistral_route_reasoning_controls(
             &mut body,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
             "mistral-code-latest",
             Some("high"),
@@ -6747,7 +7417,7 @@ mod mistral_reasoning_tests {
         let mut body = json!({"model": "mistral-medium-latest", "reasoning_effort": "stale"});
         apply_mistral_route_reasoning_controls(
             &mut body,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
             "mistral-medium-latest",
             Some("low"),
@@ -6761,7 +7431,7 @@ mod mistral_reasoning_tests {
         let mut body = json!({"model": "deepseek-v4-pro", "reasoning_effort": "high"});
         apply_mistral_route_reasoning_controls(
             &mut body,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
             "deepseek-v4-pro",
             Some("high"),
@@ -6775,7 +7445,7 @@ mod mistral_reasoning_tests {
         });
         apply_mistral_route_reasoning_controls(
             &mut body,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             "https://gateway.example.test/v1",
             "mistral-medium-latest",
             Some("high"),
@@ -6786,7 +7456,7 @@ mod mistral_reasoning_tests {
         let mut native = json!({"model": "magistral-small-latest"});
         apply_mistral_route_reasoning_controls(
             &mut native,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
             "magistral-small-latest",
             Some("off"),
@@ -6804,7 +7474,7 @@ mod mistral_reasoning_tests {
             "https://api.eu.mistral.ai/v1/",
             "https://api.us.mistral.ai/v1",
         ] {
-            assert!(is_exact_mistral_chat_route(ApiProvider::Mistral, official));
+            assert!(is_exact_mistral_chat_route(ProviderKind::Mistral, official));
         }
         for neighbor in [
             "http://api.mistral.ai/v1",
@@ -6812,15 +7482,18 @@ mod mistral_reasoning_tests {
             "https://proxy.example.test/v1",
             "https://api.mistral.ai.evil.test/v1",
         ] {
-            assert!(!is_exact_mistral_chat_route(ApiProvider::Mistral, neighbor));
+            assert!(!is_exact_mistral_chat_route(
+                ProviderKind::Mistral,
+                neighbor
+            ));
         }
         assert!(!is_exact_mistral_chat_route(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
         ));
         assert_eq!(
             reasoning_stream_style_for_route(
-                ApiProvider::Mistral,
+                ProviderKind::Mistral,
                 crate::config::DEFAULT_MISTRAL_BASE_URL,
                 "mistral-medium-latest",
                 None,
@@ -6829,12 +7502,12 @@ mod mistral_reasoning_tests {
         );
         assert_eq!(
             reasoning_stream_style_for_route(
-                ApiProvider::Mistral,
+                ProviderKind::Mistral,
                 "https://gateway.example.test/v1",
                 "mistral-medium-latest",
                 None,
             ),
-            ReasoningStreamStyle::None
+            ReasoningStreamStyle::SeparateField
         );
     }
 
@@ -6932,7 +7605,7 @@ mod mistral_reasoning_tests {
         let request = request_with_assistant_thinking_and_tool();
         let exact = build_chat_messages_for_request_and_provider_and_route(
             &request,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
         );
         let assistant = &exact[0];
@@ -6950,8 +7623,11 @@ mod mistral_reasoning_tests {
         assert_eq!(content[1]["text"], "I will inspect it now.");
 
         for (provider, base_url) in [
-            (ApiProvider::Mistral, "https://gateway.example.test/v1"),
-            (ApiProvider::Openai, crate::config::DEFAULT_MISTRAL_BASE_URL),
+            (ProviderKind::Mistral, "https://gateway.example.test/v1"),
+            (
+                ProviderKind::Openai,
+                crate::config::DEFAULT_MISTRAL_BASE_URL,
+            ),
         ] {
             let neighbor = build_chat_messages_for_request_and_provider_and_route(
                 &request, provider, base_url,
@@ -6970,9 +7646,10 @@ mod mistral_reasoning_tests {
         let request = request_with_assistant_thinking_and_tool();
         let wire = build_chat_wire_body(
             &request,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
             true,
+            None,
         )
         .expect("Mistral stream wire body");
         let assistant = &wire.body["messages"][0];
@@ -7001,7 +7678,7 @@ mod mistral_reasoning_tests {
         });
         let mistral = parse_chat_message_for_route(
             &payload,
-            ApiProvider::Mistral,
+            ProviderKind::Mistral,
             crate::config::DEFAULT_MISTRAL_BASE_URL,
         )
         .expect("Mistral payload parses");
@@ -7031,10 +7708,13 @@ mod mistral_reasoning_tests {
             "mistral-small-latest",
             "magistral-small-latest",
         ] {
-            assert!(crate::models::model_supports_reasoning(model), "{model}");
+            assert!(codewhale_models::model_supports_reasoning(model), "{model}");
         }
         for model in ["mistral-code-latest", "mistral-large-latest"] {
-            assert!(!crate::models::model_supports_reasoning(model), "{model}");
+            assert!(
+                !codewhale_models::model_supports_reasoning(model),
+                "{model}"
+            );
         }
     }
 }
@@ -7046,43 +7726,55 @@ mod google_thought_signature_tests {
     // ── Google thought signatures (#v0.9.8 Google backend) ──────────────
     use crate::config::{DEFAULT_GOOGLE_BASE_URL, DEFAULT_OPENAI_BASE_URL};
 
-    fn google_request_with_signed_tool(signature: Option<&str>) -> MessageRequest {
+    /// One signed tool turn. `paired` false is the restart shape: the process
+    /// died between the tool call and its result, so the terminal
+    /// `tool_result` never reached durable history.
+    fn signed_history(signature: Option<&str>, paired: bool) -> Vec<Message> {
+        let mut messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "Read the config.".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "Reading now.".to_string(),
+                        cache_control: None,
+                    },
+                    ContentBlock::ToolUse {
+                        execution_id: None,
+                        id: "call-g-1".to_string(),
+                        name: "read".to_string(),
+                        input: json!({"path": "config.toml"}),
+                        caller: None,
+                        thought_signature: signature.map(str::to_string),
+                    },
+                ],
+            },
+        ];
+        if paired {
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
+                    tool_use_id: "call-g-1".to_string(),
+                    content: "key = \"value\"".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            });
+        }
+        messages
+    }
+
+    fn request_from(messages: Vec<Message>) -> MessageRequest {
         MessageRequest {
             model: "gemini-3.1-pro-preview".to_string(),
-            messages: vec![
-                Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text {
-                        text: "Read the config.".to_string(),
-                        cache_control: None,
-                    }],
-                },
-                Message {
-                    role: Role::Assistant,
-                    content: vec![
-                        ContentBlock::Text {
-                            text: "Reading now.".to_string(),
-                            cache_control: None,
-                        },
-                        ContentBlock::ToolUse {
-                            id: "call-g-1".to_string(),
-                            name: "read".to_string(),
-                            input: json!({"path": "config.toml"}),
-                            caller: None,
-                            thought_signature: signature.map(str::to_string),
-                        },
-                    ],
-                },
-                Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::ToolResult {
-                        tool_use_id: "call-g-1".to_string(),
-                        content: "key = \"value\"".to_string(),
-                        is_error: None,
-                        content_blocks: None,
-                    }],
-                },
-            ],
+            messages,
             max_tokens: 64,
             system: None,
             tools: None,
@@ -7096,12 +7788,97 @@ mod google_thought_signature_tests {
         }
     }
 
+    fn google_request_with_signed_tool(signature: Option<&str>) -> MessageRequest {
+        request_from(signed_history(signature, true))
+    }
+
+    #[tokio::test]
+    async fn gateway_thought_signature_rejection_explains_recovery_after_transport() {
+        use crate::llm_client::LlmClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // An unsigned replay must reach the gateway: it may manage Google's
+        // signatures itself. Only an actual rejection warrants recovery advice.
+        for streaming in [false, true] {
+            for status in [200, 400] {
+                let server = MockServer::start().await;
+                let response = if status == 400 {
+                    ResponseTemplate::new(status).set_body_json(json!({
+                        "error": {
+                            "code": 400,
+                            "message": "Function call is missing a thought_signature in functionCall parts."
+                        }
+                    }))
+                } else if streaming {
+                    ResponseTemplate::new(status)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(status).set_body_json(json!({
+                        "id": "gateway-replay",
+                        "model": "gemini-3.1-pro-preview",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "Done."},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                };
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+
+                let mut client = CodewhaleClient::new(&crate::config::Config {
+                    provider: Some("openai".to_string()),
+                    providers: Some(crate::config::ProvidersConfig {
+                        openai: crate::config::ProviderConfig {
+                            api_key: Some("gateway-test-key".to_string()),
+                            base_url: Some(format!("{}/v1", server.uri())),
+                            model: Some("gemini-3.1-pro-preview".to_string()),
+                            ..crate::config::ProviderConfig::default()
+                        },
+                        ..crate::config::ProvidersConfig::default()
+                    }),
+                    ..crate::config::Config::default()
+                })
+                .expect("gateway client");
+                client.isolated_request_state = true;
+                let request = google_request_with_signed_tool(None);
+                let result = if streaming {
+                    client.create_message_stream(request).await.map(|_| ())
+                } else {
+                    client
+                        .create_message_without_response_cache(request)
+                        .await
+                        .map(|_| ())
+                };
+                if status == 400 {
+                    let error = result.expect_err("gateway rejects unsigned replay");
+                    let message = error.to_string();
+                    assert!(message.contains("built-in `google` provider"), "{message}");
+                    assert!(message.contains("start a new session"), "{message}");
+                    assert!(matches!(
+                        error.downcast_ref::<crate::llm_client::LlmError>(),
+                        Some(crate::llm_client::LlmError::InvalidRequest { status: 400, .. })
+                    ));
+                } else {
+                    result.expect("gateway-managed signatures must still work");
+                }
+                server.verify().await;
+            }
+        }
+    }
+
     #[test]
     fn google_route_round_trips_thought_signatures_on_replayed_tool_calls() {
         let request = google_request_with_signed_tool(Some("SIG-abc123"));
         let messages = build_chat_messages_for_request_and_provider_and_route(
             &request,
-            ApiProvider::Google,
+            ProviderKind::Google,
             DEFAULT_GOOGLE_BASE_URL,
         );
         let assistant = messages
@@ -7119,12 +7896,36 @@ mod google_thought_signature_tests {
         let request = google_request_with_signed_tool(None);
         let error = build_chat_wire_body(
             &request,
-            ApiProvider::Google,
+            ProviderKind::Google,
             DEFAULT_GOOGLE_BASE_URL,
             false,
+            None,
         )
         .err()
         .expect("missing signature must fail closed before transport");
+        assert!(
+            error.to_string().contains("thought signature"),
+            "error must name the missing signature: {error}"
+        );
+    }
+
+    /// Google names the same model `gemini-3-pro` and `models/gemini-3-pro` on
+    /// this endpoint. The prefixed spelling used to match none of the thinking
+    /// families, so the model that most needs a signature was treated as one
+    /// that needs none and the replay reached Google unsigned (#6018).
+    #[test]
+    fn google_route_fails_closed_for_a_models_prefixed_thinking_id() {
+        let mut request = google_request_with_signed_tool(None);
+        request.model = "models/gemini-3-pro-preview".to_string();
+        let error = build_chat_wire_body(
+            &request,
+            ProviderKind::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+            false,
+            None,
+        )
+        .err()
+        .expect("a models/-prefixed thinking id must fail closed like its bare spelling");
         assert!(
             error.to_string().contains("thought signature"),
             "error must name the missing signature: {error}"
@@ -7139,9 +7940,10 @@ mod google_thought_signature_tests {
         request.model = "gemini-2.5-flash-lite".to_string();
         build_chat_wire_body(
             &request,
-            ApiProvider::Google,
+            ProviderKind::Google,
             DEFAULT_GOOGLE_BASE_URL,
             false,
+            None,
         )
         .expect("flash-lite replay must not require a signature");
     }
@@ -7151,7 +7953,7 @@ mod google_thought_signature_tests {
         let request = google_request_with_signed_tool(Some("SIG-abc123"));
         let messages = build_chat_messages_for_request_and_provider_and_route(
             &request,
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             DEFAULT_OPENAI_BASE_URL,
         );
         for message in &messages {
@@ -7174,14 +7976,15 @@ mod google_thought_signature_tests {
         let request = google_request_with_signed_tool(None);
         build_chat_wire_body(
             &request,
-            ApiProvider::Google,
+            ProviderKind::Google,
             "https://gateway.example.com/v1",
             false,
+            None,
         )
         .expect("non-official Google base URL must not require signatures");
         let messages = build_chat_messages_for_request_and_provider_and_route(
             &google_request_with_signed_tool(Some("SIG")),
-            ApiProvider::Google,
+            ProviderKind::Google,
             "https://gateway.example.com/v1",
         );
         assert!(
@@ -7192,34 +7995,187 @@ mod google_thought_signature_tests {
         );
     }
 
+    /// The manually configured OpenAI-compatible row (#1519,
+    /// `ProviderKind::Custom`) pointed at Google's OpenAI-compat endpoint is
+    /// byte-for-byte the same endpoint as the built-in `google` row. C22: it
+    /// used to fail the `provider == Google` half of the route gate, so its
+    /// signatures were stripped on replay with no warning and later signed
+    /// tool turns failed. The gate now binds to the endpoint.
     #[test]
-    fn google_thinking_level_maps_effort_onto_documented_body_field() {
-        let mut request = google_request_with_signed_tool(Some("SIG"));
-        request.reasoning_effort = Some("high".to_string());
-        let body = build_chat_wire_body(
-            &request,
-            ApiProvider::Google,
+    fn manually_configured_openai_compatible_google_endpoint_replays_signatures() {
+        let request = google_request_with_signed_tool(Some("SIG-abc123"));
+        for base_url in [
             DEFAULT_GOOGLE_BASE_URL,
-            false,
-        )
-        .expect("valid google body");
-        assert_eq!(
-            body.body
-                .pointer("/google/thinking_config/thinking_level")
-                .and_then(serde_json::Value::as_str),
-            Some("high")
-        );
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://GenerativeLanguage.googleapis.com/v1beta/openai/",
+        ] {
+            let messages = build_chat_messages_for_request_and_provider_and_route(
+                &request,
+                ProviderKind::Custom,
+                base_url,
+            );
+            let assistant = messages
+                .iter()
+                .find(|m| m.get("role") == Some(&json!("assistant")))
+                .expect("assistant replay message");
+            assert_eq!(
+                assistant
+                    .pointer("/tool_calls/0/extra_content/google/thought_signature")
+                    .and_then(serde_json::Value::as_str),
+                Some("SIG-abc123"),
+                "custom row at Google's endpoint must replay the signature ({base_url})"
+            );
+        }
+    }
 
-        let mut low = google_request_with_signed_tool(Some("SIG"));
-        low.reasoning_effort = Some("low".to_string());
-        let body = build_chat_wire_body(&low, ApiProvider::Google, DEFAULT_GOOGLE_BASE_URL, false)
-            .expect("valid google body");
-        assert_eq!(
-            body.body
-                .pointer("/google/thinking_config/thinking_level")
-                .and_then(serde_json::Value::as_str),
-            Some("low")
+    /// Signature preservation is a property of the endpoint, never of the
+    /// reasoning setting: an operator who turns reasoning off (or whose
+    /// effort is simply absent) still has to replay signed tool history.
+    #[test]
+    fn signatures_survive_replay_regardless_of_the_reasoning_setting() {
+        for effort in [None, Some("off"), Some("low"), Some("high")] {
+            for (provider, base_url) in [
+                (ProviderKind::Google, DEFAULT_GOOGLE_BASE_URL),
+                (
+                    ProviderKind::Custom,
+                    "https://generativelanguage.googleapis.com/v1beta/openai",
+                ),
+            ] {
+                let mut request = google_request_with_signed_tool(Some("SIG-abc123"));
+                request.reasoning_effort = effort.map(str::to_string);
+                let body = build_chat_wire_body(&request, provider, base_url, true, None)
+                    .expect("signed replay builds on a signature-bearing route");
+                let assistant = body.body["messages"]
+                    .as_array()
+                    .expect("messages")
+                    .iter()
+                    .find(|m| m.get("role") == Some(&json!("assistant")))
+                    .expect("assistant replay message");
+                assert_eq!(
+                    assistant
+                        .pointer("/tool_calls/0/extra_content/google/thought_signature")
+                        .and_then(serde_json::Value::as_str),
+                    Some("SIG-abc123"),
+                    "reasoning={effort:?} must not govern signature replay ({base_url})"
+                );
+            }
+        }
+    }
+
+    /// Fail closed on the manually configured row too — the missing-signature
+    /// error is the useful feedback that replaces a silent strip.
+    #[test]
+    fn custom_row_at_google_endpoint_fails_closed_without_a_signature() {
+        let request = google_request_with_signed_tool(None);
+        let error = build_chat_wire_body(
+            &request,
+            ProviderKind::Custom,
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            false,
+            None,
+        )
+        .err()
+        .expect("missing signature must fail closed before transport");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("thought signature") && rendered.contains("call-g-1"),
+            "error must name the missing signature and the tool call: {rendered}"
         );
+    }
+
+    /// A custom row pointed somewhere else is still a foreign gateway: the
+    /// signature is stripped, and the strip reports how much it removed so
+    /// the drop is never silent.
+    #[test]
+    fn custom_row_off_google_endpoint_strips_and_reports_signatures() {
+        let request = google_request_with_signed_tool(Some("SIG-abc123"));
+        let mut messages = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ProviderKind::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+        );
+        assert_eq!(
+            strip_google_tool_call_extra_content(&mut messages),
+            1,
+            "the strip must report the signatures it dropped"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.pointer("/tool_calls/0/extra_content").is_none()),
+            "stripped history must carry no Google-only fields"
+        );
+        let via_route = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ProviderKind::Custom,
+            "https://gateway.example.com/v1",
+        );
+        assert!(
+            via_route
+                .iter()
+                .all(|m| m.pointer("/tool_calls/0/extra_content").is_none()),
+            "signatures must not reach a non-Google endpoint"
+        );
+    }
+
+    #[test]
+    fn google_reasoning_uses_compatible_effort_without_rejected_native_fields() {
+        // Wire examples and model limits from Google's compatibility docs.
+        // Cover the actual request builder, both transport modes and both
+        // ways a fresh install can configure the official endpoint (#6018).
+        for (model, effort, expected) in [
+            ("gemini-3.1-pro-preview", Some("low"), Some("low")),
+            ("gemini-3.1-pro-preview", Some("medium"), Some("medium")),
+            ("gemini-3.1-pro-preview", Some("high"), Some("high")),
+            ("gemini-3.1-pro-preview", Some("max"), Some("high")),
+            ("gemini-3.5-flash-lite", Some("off"), Some("minimal")),
+            ("gemini-2.5-flash", Some("off"), Some("none")),
+            ("models/gemini-2.5-flash-lite", Some("off"), Some("none")),
+            ("gemini-2.5-pro", Some("off"), Some("minimal")),
+            ("gemini-3.1-pro-preview", None, None),
+        ] {
+            for provider in [ProviderKind::Google, ProviderKind::Custom] {
+                for streaming in [false, true] {
+                    let mut request = google_request_with_signed_tool(Some("SIG"));
+                    request.model = model.to_string();
+                    request.reasoning_effort = effort.map(str::to_string);
+                    let wire = build_chat_wire_body(
+                        &request,
+                        provider,
+                        DEFAULT_GOOGLE_BASE_URL,
+                        streaming,
+                        None,
+                    )
+                    .expect("valid signed Google request");
+                    assert_eq!(
+                        wire.body.get("reasoning_effort").and_then(Value::as_str),
+                        expected,
+                        "{model}: {effort:?}, {provider:?}, streaming={streaming}"
+                    );
+                    assert!(wire.body.get("google").is_none());
+                    assert!(wire.body.get("extra_body").is_none());
+                    assert!(wire.body.get("thinking").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn google_reasoning_control_does_not_rewrite_other_endpoints() {
+        for provider in [ProviderKind::Google, ProviderKind::Custom] {
+            let request = google_request_with_signed_tool(Some("SIG"));
+            let wire = build_chat_wire_body(
+                &request,
+                provider,
+                "https://gateway.example.com/v1",
+                false,
+                None,
+            )
+            .expect("valid gateway request");
+            assert!(wire.body.get("reasoning_effort").is_none());
+            assert!(wire.body.get("google").is_none());
+            assert!(wire.body.get("extra_body").is_none());
+        }
     }
 
     #[test]
@@ -7303,5 +8259,145 @@ mod google_thought_signature_tests {
             _ => None,
         });
         assert_eq!(signature.as_deref(), Some("SIG-delta"));
+    }
+
+    /// Run the production restart/resume chain over a message history:
+    /// persist to disk, reload, repair crashed tool pairs, then project for
+    /// restore exactly as `apply.rs` does before assigning `api_messages`.
+    /// Returns the recovery receipt, the restored messages, and the raw
+    /// session JSON as it actually sits on disk.
+    fn resumed(
+        messages: &[Message],
+    ) -> (
+        crate::session_manager::SessionRecovery,
+        Vec<Message>,
+        String,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = crate::session_manager::SessionManager::new(dir.path().join("sessions"))
+            .expect("session manager");
+        let session = crate::session_manager::create_saved_session(
+            messages,
+            "gemini-3.1-pro-preview",
+            dir.path(),
+            0,
+            None,
+        );
+        let id = session.metadata.id.clone();
+        let path = manager.save_session(&session).expect("save session");
+        let on_disk = std::fs::read_to_string(&path).expect("read persisted session");
+        let recovery = manager
+            .recover_session_for_resume(&id)
+            .expect("recover session for resume");
+        let restored = crate::runtime_handoff::project_owned_messages_for_restore(
+            recovery.session.messages.clone(),
+        );
+        (recovery, restored, on_disk)
+    }
+
+    fn replayed_signature(body: &serde_json::Value) -> Option<String> {
+        body["messages"]
+            .as_array()
+            .expect("wire messages")
+            .iter()
+            // The crash repair appends a trailing assistant text receipt, so
+            // find the tool-call message by shape, never by index.
+            .find(|message| message.get("tool_calls").is_some())
+            .expect("assistant tool-call message")
+            .pointer("/tool_calls/0/extra_content/google/thought_signature")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// C22 done-evidence item 3: restarting and resuming must continue the
+    /// signed history. This walks the whole persistence chain — durable JSON,
+    /// reload, restore projection, wire body — because the signature can be
+    /// lost at any of them, and a serde round-trip alone would prove none of
+    /// it. Local unit evidence only: it does not exercise a real Gemini call.
+    #[test]
+    fn resumed_google_session_replays_signed_tool_calls() {
+        let original = signed_history(Some("SIG-abc123"), true);
+        let (recovery, restored, on_disk) = resumed(&original);
+
+        assert!(
+            !recovery.changed,
+            "a fully paired history needs no repair on resume"
+        );
+        assert_eq!(
+            recovery.session.messages, original,
+            "reload must return the signed history unchanged"
+        );
+        assert_eq!(
+            restored, original,
+            "the restore projection must not touch signed tool history"
+        );
+        assert!(
+            on_disk.contains("\"thought_signature\"") && on_disk.contains("SIG-abc123"),
+            "the signature must reach durable storage, not just live memory"
+        );
+
+        for (provider, base_url) in [
+            (ProviderKind::Google, DEFAULT_GOOGLE_BASE_URL),
+            (
+                ProviderKind::Custom,
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            ),
+        ] {
+            let body = build_chat_wire_body(
+                &request_from(restored.clone()),
+                provider,
+                base_url,
+                true,
+                None,
+            )
+            .expect("a resumed signed history must build, not fail closed");
+            assert_eq!(
+                replayed_signature(&body.body).as_deref(),
+                Some("SIG-abc123"),
+                "resumed history must still replay the signature ({base_url})"
+            );
+        }
+    }
+
+    /// The real restart shape: the process died between the tool call and its
+    /// result, so resume runs `repair_tool_call_pairs`, which rebuilds every
+    /// message. That rebuild must not strip `ToolUse` fields — if it did, the
+    /// repaired history would fail closed on Gemini 3 forever after.
+    #[test]
+    fn crash_repaired_resume_keeps_the_signature_on_the_repaired_tool_call() {
+        let (recovery, restored, on_disk) = resumed(&signed_history(Some("SIG-abc123"), false));
+
+        assert!(recovery.changed, "a dangling tool call must be repaired");
+        assert_eq!(recovery.repaired_call_count, 1);
+        assert_eq!(recovery.duplicate_result_count, 0);
+        assert_eq!(recovery.orphan_result_count, 0);
+        assert!(
+            on_disk.contains("\"thought_signature\"") && on_disk.contains("SIG-abc123"),
+            "the signature must reach durable storage, not just live memory"
+        );
+        assert!(
+            restored
+                .iter()
+                .any(|message| message.content.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, content, .. }
+                        if tool_use_id == "call-g-1" && content.contains("crashed_and_repaired")
+                ))),
+            "the repair must pair the dangling call with a terminal result"
+        );
+
+        let body = build_chat_wire_body(
+            &request_from(restored),
+            ProviderKind::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+            true,
+            None,
+        )
+        .expect("a crash-repaired signed history must build, not fail closed");
+        assert_eq!(
+            replayed_signature(&body.body).as_deref(),
+            Some("SIG-abc123"),
+            "crash repair must not strip the thought signature"
+        );
     }
 }

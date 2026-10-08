@@ -7,6 +7,8 @@
 mod memory;
 mod note;
 
+pub(crate) use note::{notes_path, read_notes};
+
 use crate::commands::traits::{CommandGroup, ContextualCommand};
 
 pub struct MemoryCommands;

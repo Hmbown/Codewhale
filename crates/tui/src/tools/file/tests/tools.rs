@@ -555,28 +555,28 @@ async fn test_read_file_missing_path() {
     );
 }
 
-#[test]
-fn pdf_detected_by_extension() {
+#[tokio::test]
+async fn pdf_detected_by_extension() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join("paper.PDF");
     fs::write(&path, b"not really a pdf, but extension says yes").unwrap();
-    assert!(is_pdf(&path).unwrap());
+    assert!(is_pdf(&path).await.unwrap());
 }
 
-#[test]
-fn pdf_detected_by_magic_bytes_without_extension() {
+#[tokio::test]
+async fn pdf_detected_by_magic_bytes_without_extension() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join("blob");
     fs::write(&path, b"%PDF-1.7\nrest of bytes").unwrap();
-    assert!(is_pdf(&path).unwrap());
+    assert!(is_pdf(&path).await.unwrap());
 }
 
-#[test]
-fn non_pdf_not_detected() {
+#[tokio::test]
+async fn non_pdf_not_detected() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join("notes.txt");
     fs::write(&path, "hello").unwrap();
-    assert!(!is_pdf(&path).unwrap());
+    assert!(!is_pdf(&path).await.unwrap());
 }
 
 #[test]
@@ -682,7 +682,12 @@ async fn test_write_file_tool() {
     let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
     assert_eq!(
         mutation["files"],
-        json!([{ "path": "output.txt", "outcome": "created" }])
+        json!([{
+            "path": "output.txt",
+            "outcome": "created",
+            "size": "test content".len(),
+            "sha256": crate::hashing::sha256_hex(b"test content"),
+        }])
     );
     assert!(
         mutation["diff"]
@@ -777,6 +782,81 @@ async fn write_file_tool_preserves_existing_mode() {
     assert_eq!(fs::read_to_string(&path).expect("read"), "after");
 }
 
+#[tokio::test]
+async fn write_file_over_crlf_file_preserves_crlf_line_endings() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("crlf.txt");
+    fs::write(&path, b"alpha\r\nbeta\r\n").expect("initial CRLF write");
+
+    WriteFileTool
+        .execute(
+            json!({"path": "crlf.txt", "content": "gamma\ndelta\n"}),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+
+    let written = fs::read(&path).expect("read");
+    assert_eq!(
+        written, b"gamma\r\ndelta\r\n",
+        "write_file must preserve the existing CRLF style, like edit_file"
+    );
+}
+
+#[tokio::test]
+async fn contract_write_over_crlf_file_preserves_crlf_line_endings() {
+    // The contract `write` path (WriteFileTool::execute_contract_write) must
+    // honor the same line-ending policy as the full write_file tool.
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("crlf.txt");
+    fs::write(&path, b"alpha\r\nbeta\r\n").expect("initial CRLF write");
+
+    WriteFileTool::execute_contract_write(
+        json!({"path": "crlf.txt", "content": "gamma\ndelta\n"}),
+        &ctx,
+    )
+    .await
+    .expect("execute");
+
+    let written = fs::read(&path).expect("read");
+    assert_eq!(
+        written, b"gamma\r\ndelta\r\n",
+        "contract write must preserve the existing CRLF style, like edit_file"
+    );
+}
+
+#[test]
+fn preserve_prior_line_endings_keeps_the_prior_style() {
+    // Existing CRLF file: incoming LF content is re-emitted as CRLF.
+    assert_eq!(
+        preserve_prior_line_endings("gamma\ndelta\n", "alpha\r\nbeta\r\n"),
+        "gamma\r\ndelta\r\n"
+    );
+    // Existing LF file: incoming CRLF content is re-emitted as LF.
+    assert_eq!(
+        preserve_prior_line_endings("gamma\r\ndelta\r\n", "alpha\nbeta\n"),
+        "gamma\ndelta\n"
+    );
+    // Brand-new file (no prior content): written verbatim, including CRLF.
+    assert_eq!(
+        preserve_prior_line_endings("gamma\r\ndelta\r\n", ""),
+        "gamma\r\ndelta\r\n"
+    );
+    assert_eq!(preserve_prior_line_endings("plain", ""), "plain");
+    // A lone CR in the incoming content is normalized like edit_file does: the
+    // bare \r becomes \n, then is re-emitted as CRLF when the prior is CRLF.
+    assert_eq!(
+        preserve_prior_line_endings("alpha\rbeta\n", "x\r\ny\r\n"),
+        "alpha\r\nbeta\r\n"
+    );
+    assert_eq!(
+        preserve_prior_line_endings("alpha\rbeta\n", "x\ny\n"),
+        "alpha\nbeta\n"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn edit_file_tool_preserves_executable_bits() {
@@ -807,6 +887,203 @@ async fn edit_file_tool_preserves_executable_bits() {
     assert_eq!(
         fs::read_to_string(&path).expect("read"),
         "#!/bin/sh\nexit 1\n"
+    );
+}
+
+/// #6205 — a sloppy edit to a rustfmt-clean file lands normalized, and the
+/// tool result's returned diff matches the bytes on disk, so the model's next
+/// anchor is the real text.
+#[tokio::test]
+async fn edit_file_normalizes_a_sloppy_edit_in_a_rustfmt_clean_file() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("clean.rs");
+    fs::write(&path, "fn main() {\n    let x = 1;\n}\n").expect("write");
+    read_before_edit(&ctx, "clean.rs").await;
+
+    let result = EditFileTool
+        .execute(
+            json!({
+                "path": "clean.rs",
+                "search": "    let x = 1;",
+                "replace": "    let x = 1;\n        let y=2;",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+
+    // No skip-if-missing branch: rustfmt ships with the pinned toolchain, and a
+    // test that passes vacuously without it proves nothing.
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n}\n"
+    );
+    assert!(
+        result.content.contains("rustfmt-normalized"),
+        "the result must say the content was normalized: {}",
+        result.content
+    );
+    let diff = result.metadata.as_ref().expect("metadata")["mutation"]["diff"]
+        .as_str()
+        .expect("diff")
+        .to_string();
+    assert!(
+        diff.contains("+    let y = 2;"),
+        "the returned diff must show the normalized text, not what was sent: {diff}"
+    );
+    assert!(!diff.contains("let y=2;"), "{diff}");
+}
+
+/// A file the author formats by hand is never reformatted wholesale.
+#[tokio::test]
+async fn edit_file_leaves_a_hand_formatted_file_alone() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("handmade.rs");
+    // Two-space indentation: rustfmt would rewrite every line of this file.
+    fs::write(&path, "fn main() {\n  let x = 1;\n}\n").expect("write");
+    read_before_edit(&ctx, "handmade.rs").await;
+
+    EditFileTool
+        .execute(
+            json!({
+                "path": "handmade.rs",
+                "search": "  let x = 1;",
+                "replace": "  let x = 1;\n  let y = 2;",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "fn main() {\n  let x = 1;\n  let y = 2;\n}\n",
+        "unrelated user formatting must survive the edit"
+    );
+}
+
+/// #6206 — a dependency bump that leaves `Cargo.toml` unparseable is refused
+/// at edit time, not discovered by the next `cargo` invocation.
+#[tokio::test]
+async fn edit_file_refuses_an_edit_that_breaks_a_cargo_manifest() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("Cargo.toml");
+    let original = "[dependencies]\nserde = \"1.0\"\n";
+    fs::write(&path, original).expect("write");
+    read_before_edit(&ctx, "Cargo.toml").await;
+
+    let error = EditFileTool
+        .execute(
+            json!({
+                "path": "Cargo.toml",
+                "search": "serde = \"1.0\"",
+                // Unterminated string: the classic half-finished version bump.
+                "replace": "serde = \"1.0",
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("an unparseable manifest must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("TOML syntax error at line"), "{message}");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        original,
+        "a refused edit must leave the manifest unchanged"
+    );
+}
+
+/// A valid structured-config edit is untouched by the gate.
+#[tokio::test]
+async fn edit_file_applies_a_valid_json_edit() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("data.json");
+    fs::write(&path, "{\n  \"port\": 8080\n}\n").expect("write");
+    read_before_edit(&ctx, "data.json").await;
+
+    EditFileTool
+        .execute(
+            json!({
+                "path": "data.json",
+                "search": "8080",
+                "replace": "9090",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("a valid JSON edit must proceed unchanged");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "{\n  \"port\": 9090\n}\n"
+    );
+}
+
+/// #6204 — an edit that takes a parseable Rust file to an unparseable one is
+/// refused before the write, with a `line:column` from `syn`.
+#[tokio::test]
+async fn edit_file_refuses_an_edit_that_breaks_rust_syntax() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("main.rs");
+    let original = "fn main() {\n    println!(\"hi\");\n}\n";
+    fs::write(&path, original).expect("write");
+    read_before_edit(&ctx, "main.rs").await;
+
+    let error = EditFileTool
+        .execute(
+            json!({
+                "path": "main.rs",
+                // Same brace balance, so the payload-corruption heuristic has
+                // no objection; the parenthesis is what breaks the grammar.
+                "search": "fn main() {",
+                "replace": "fn main( {",
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("an edit that breaks Rust syntax must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("Rust syntax error at line"), "{message}");
+    assert!(message.contains("Nothing was written"), "{message}");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        original,
+        "a refused edit must leave the file byte-for-byte unchanged"
+    );
+}
+
+/// The gate catches the edit that *introduces* breakage, never the one that
+/// repairs it: a file that already fails to parse stays editable.
+#[tokio::test]
+async fn edit_file_still_repairs_an_already_broken_rust_file() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("broken.rs");
+    fs::write(&path, "fn main( {\n    println!(\"hi\");\n}\n").expect("write");
+    read_before_edit(&ctx, "broken.rs").await;
+
+    EditFileTool
+        .execute(
+            json!({
+                "path": "broken.rs",
+                "search": "fn main( {",
+                "replace": "fn main() {",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("repairing a broken file must not be gated");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "fn main() {\n    println!(\"hi\");\n}\n"
     );
 }
 
@@ -939,7 +1216,14 @@ async fn test_edit_file_tool() {
     let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
     assert_eq!(
         mutation["files"],
-        json!([{ "path": "edit_me.txt", "outcome": "updated" }])
+        json!([{
+            "path": "edit_me.txt",
+            "outcome": "updated",
+            "size": fs::read(tmp.path().join("edit_me.txt")).expect("edited").len(),
+            "sha256": crate::hashing::sha256_hex(
+                fs::read(tmp.path().join("edit_me.txt")).expect("edited")
+            ),
+        }])
     );
     let receipt_diff = mutation["diff"].as_str().expect("receipt diff");
     assert!(receipt_diff.contains("--- a/edit_me.txt"), "{receipt_diff}");
@@ -1635,6 +1919,50 @@ async fn test_edit_file_not_found_shows_search_preview() {
         err.contains("first line"),
         "error should preview search text: {err}"
     );
+}
+
+/// #6542 — a missed search returns the nearest region with line numbers and
+/// names a whitespace-only difference, so the retry can copy the real text.
+#[tokio::test]
+async fn edit_miss_returns_nearest_excerpt_with_line_numbers_and_whitespace_note() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    fs::write(
+        tmp.path().join("near.rs"),
+        "fn a() {}\n\nfn compute(x: u32) -> u32 {\n    x + 1\n}\n",
+    )
+    .expect("write");
+    read_before_edit(&ctx, "near.rs").await;
+
+    let err = EditFileTool
+        .execute(
+            json!({
+                "path": "near.rs",
+                "search": "fn compute(x: u32) -> u32 {   \n    x + 1\n}",
+                "replace": "fn compute(x: u32) -> u32 {\n    x + 2\n}"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("trailing whitespace keeps the search from matching")
+        .to_string();
+    assert!(err.contains("Closest match (lines 3-5"), "{err}");
+    assert!(err.contains("3\tfn compute(x: u32) -> u32 {"), "{err}");
+    assert!(err.contains("trailing whitespace"), "{err}");
+
+    let err = EditFileTool
+        .execute(
+            json!({
+                "path": "near.rs",
+                "search": "completely unrelated text\nnothing like it",
+                "replace": "x"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("no match")
+        .to_string();
+    assert!(err.contains("No similar region"), "{err}");
 }
 
 /// #157 / #5209 — `replacement` is an unambiguous synonym for `replace`, so
@@ -2429,6 +2757,13 @@ async fn expected_hash_is_advertised_on_every_mutating_action() {
 /// applies to the built-in defaults with no config required.
 #[test]
 fn read_tools_refuse_paths_under_the_default_sandbox_read_denylist() {
+    // Take the env lock WITHOUT rebinding `HOME`. The sandbox denylist is a
+    // process-wide `OnceLock` (sandbox/read_guard.rs:346-347, 411-416) that
+    // snapshots the home directory the first time it is built, so pointing
+    // `HOME` at a fixture here could never match the cached table. What this
+    // test needs is mutual exclusion against siblings that DO rebind `HOME`,
+    // not a home of its own.
+    let _env_lock = crate::test_support::lock_test_env();
     let Some(home) = dirs::home_dir() else {
         // No home directory: only machine-wide rules exist and the assertion
         // below would be vacuous. Skip rather than pretend to have evidence.
@@ -2461,8 +2796,16 @@ fn read_tools_refuse_paths_under_the_default_sandbox_read_denylist() {
 /// theater, and `resolve_path` deliberately *permits* a workspace symlink that
 /// resolves outside the workspace.
 #[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn read_file_refuses_a_workspace_symlink_pointing_at_a_denied_tree() {
+    // Take the env lock WITHOUT rebinding `HOME`. The sandbox denylist is a
+    // process-wide `OnceLock` (sandbox/read_guard.rs:346-347, 411-416) that
+    // snapshots the home directory the first time it is built, so pointing
+    // `HOME` at a fixture here could never match the cached table. What this
+    // test needs is mutual exclusion against siblings that DO rebind `HOME`,
+    // not a home of its own.
+    let _env_lock = crate::test_support::lock_test_env();
     let Some(home) = dirs::home_dir() else {
         return;
     };
@@ -2492,8 +2835,16 @@ async fn read_file_refuses_a_workspace_symlink_pointing_at_a_denied_tree() {
 /// F1: `list_dir ~/.ssh` used to hand back the key file names — enumerating a
 /// denied directory is a read of it, exactly what Seatbelt's
 /// `deny file-read*` blocks at the OS layer.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn list_dir_refuses_to_enumerate_a_denied_directory() {
+    // Take the env lock WITHOUT rebinding `HOME`. The sandbox denylist is a
+    // process-wide `OnceLock` (sandbox/read_guard.rs:346-347, 411-416) that
+    // snapshots the home directory the first time it is built, so pointing
+    // `HOME` at a fixture here could never match the cached table. What this
+    // test needs is mutual exclusion against siblings that DO rebind `HOME`,
+    // not a home of its own.
+    let _env_lock = crate::test_support::lock_test_env();
     let ctx = ToolContext::new(std::env::temp_dir());
 
     // Deterministic anchor independent of the machine's home layout: the
@@ -2536,8 +2887,16 @@ async fn list_dir_refuses_to_enumerate_a_denied_directory() {
 /// resolved path answers the probe ("where does this link really go?") in the
 /// error text. The raw-spelling check runs before resolution, so it wins.
 #[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn read_file_refusal_names_the_callers_spelling_not_the_symlink_target() {
+    // Take the env lock WITHOUT rebinding `HOME`. The sandbox denylist is a
+    // process-wide `OnceLock` (sandbox/read_guard.rs:346-347, 411-416) that
+    // snapshots the home directory the first time it is built, so pointing
+    // `HOME` at a fixture here could never match the cached table. What this
+    // test needs is mutual exclusion against siblings that DO rebind `HOME`,
+    // not a home of its own.
+    let _env_lock = crate::test_support::lock_test_env();
     let Some(home) = dirs::home_dir() else {
         return;
     };
@@ -2567,5 +2926,340 @@ async fn read_file_refusal_names_the_callers_spelling_not_the_symlink_target() {
     assert!(
         !message.contains(&ssh.display().to_string()),
         "the refusal must not reveal the symlink target's location: {message}"
+    );
+}
+
+// Reads process-global `HOME` (via `effective_home_dir`) and then resolves `~`
+// again through the tool, so it must hold the env lock for the whole span: any
+// sibling that rebinds `HOME` between those two reads makes the fixture path
+// stop matching the tilde path.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn read_and_write_file_home_path_in_allowed_real_home_fixture() {
+    let _env_lock = crate::test_support::lock_test_env();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let _home = crate::test_support::EnvVarGuard::set("HOME", home.path());
+    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", home.path());
+    let real_home = crate::config::effective_home_dir().expect("test home must be available");
+    let home_fixture = tempfile::Builder::new()
+        .prefix("cw_home_tool_fixture_")
+        .tempdir_in(&real_home)
+        .expect("create fixture inside test home");
+
+    let test_file = home_fixture.path().join("home_note.txt");
+    let rel = test_file
+        .strip_prefix(&real_home)
+        .expect("fixture is below test home");
+    let tilde_path = format!("~/{}", rel.to_string_lossy());
+
+    let ctx = ToolContext::new(home_fixture.path().to_path_buf());
+
+    // 1. Write content to home-relative path
+    let write_result = WriteFileTool
+        .execute(
+            json!({
+                "path": &tilde_path,
+                "content": "initial home content\n"
+            }),
+            &ctx,
+        )
+        .await
+        .expect("write_file to home-relative path inside workspace should succeed");
+    assert!(write_result.success);
+
+    // 2. Read content back and verify content and hash
+    let read_result = ReadFileTool
+        .execute(json!({ "path": &tilde_path }), &ctx)
+        .await
+        .expect("read_file from home-relative path should succeed");
+    assert!(read_result.success);
+    assert!(read_result.content.contains("initial home content\n"));
+    let expected_hash = crate::tools::file::content_hash(b"initial home content\n");
+    assert!(read_result.content.contains(&expected_hash));
+
+    // 3. Edit content with read-before-write consistency
+    let edit_result = EditFileTool
+        .execute(
+            json!({
+                "path": &tilde_path,
+                "search": "initial home",
+                "replace": "updated home"
+            }),
+            &ctx,
+        )
+        .await
+        .expect("edit_file on home-relative path should succeed after read");
+    assert!(edit_result.success);
+
+    // 4. Verify updated read
+    let updated_read = ReadFileTool
+        .execute(json!({ "path": &tilde_path }), &ctx)
+        .await
+        .expect("read_file after edit should succeed");
+    assert!(updated_read.content.contains("updated home content\n"));
+
+    // 5. list_dir on home-relative directory
+    let dir_rel = home_fixture.path().strip_prefix(&real_home).unwrap();
+    let dir_tilde = format!("~/{}", dir_rel.to_string_lossy());
+    let list_result = ListDirTool
+        .execute(json!({ "path": &dir_tilde }), &ctx)
+        .await
+        .expect("list_dir on home-relative directory should succeed");
+    assert!(list_result.success);
+    assert!(list_result.content.contains("home_note.txt"));
+}
+
+#[tokio::test]
+async fn read_file_home_path_restricted_refusal() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let ctx = ToolContext::new(workspace.path().to_path_buf());
+
+    let error = ReadFileTool
+        .execute(
+            json!({ "path": "~/untrusted_outside_workspace_file_98765.txt" }),
+            &ctx,
+        )
+        .await
+        .expect_err("home path outside workspace without trust must be refused");
+    assert!(
+        matches!(
+            error,
+            ToolError::PathEscape { .. } | ToolError::ExecutionFailed { .. }
+        ),
+        "expected path escape or execution failed, got: {error:?}"
+    );
+
+    let write_error = WriteFileTool
+        .execute(
+            json!({
+                "path": "~/untrusted_outside_workspace_file_98765.txt",
+                "content": "illegal write"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("write to untrusted home path must be refused");
+    assert!(
+        matches!(
+            write_error,
+            ToolError::PathEscape { .. } | ToolError::ExecutionFailed { .. }
+        ),
+        "expected path escape or execution failed, got: {write_error:?}"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn read_file_home_path_trusted_external_allowance() {
+    // Take the env lock WITHOUT rebinding `HOME`. The sandbox denylist is a
+    // process-wide `OnceLock` (sandbox/read_guard.rs:346-347, 411-416) that
+    // snapshots the home directory the first time it is built, so pointing
+    // `HOME` at a fixture here could never match the cached table. What this
+    // test needs is mutual exclusion against siblings that DO rebind `HOME`,
+    // not a home of its own.
+    let _env_lock = crate::test_support::lock_test_env();
+    let real_home = crate::config::effective_home_dir().expect("test home must be available");
+    let trusted_fixture = tempfile::Builder::new()
+        .prefix("cw_home_trusted_fixture_")
+        .tempdir_in(&real_home)
+        .expect("create fixture inside test home");
+
+    let test_file = trusted_fixture.path().join("external.txt");
+    std::fs::write(&test_file, "external trusted data\n").expect("write external");
+    let rel = test_file
+        .strip_prefix(&real_home)
+        .expect("fixture is below test home");
+    let tilde_path = format!("~/{}", rel.to_string_lossy());
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let canonical_trusted = trusted_fixture
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| trusted_fixture.path().to_path_buf());
+    let ctx = ToolContext::new(workspace.path().to_path_buf())
+        .with_trusted_external_paths(vec![canonical_trusted]);
+
+    let result = ReadFileTool
+        .execute(json!({ "path": &tilde_path }), &ctx)
+        .await
+        .expect("read_file on trusted external home path should succeed");
+    assert!(result.success);
+    assert!(result.content.contains("external trusted data\n"));
+}
+
+#[tokio::test]
+async fn read_file_literal_tilde_stays_literal() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let literal_dir = workspace.path().join("~");
+    std::fs::create_dir_all(&literal_dir).expect("create literal ~ dir");
+    let literal_file = literal_dir.join("payload.txt");
+    std::fs::write(&literal_file, "literal dir content").expect("write payload");
+
+    let ctx = ToolContext::new(workspace.path().to_path_buf());
+    let result = ReadFileTool
+        .execute(json!({ "path": "./~/payload.txt" }), &ctx)
+        .await
+        .expect("read_file on literal ./~/ path should read from workspace literal ~ directory");
+    assert!(result.success);
+    assert!(result.content.contains("literal dir content"));
+}
+
+#[tokio::test]
+async fn read_file_no_shell_expansion() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let home_var_dir = workspace.path().join("$HOME");
+    std::fs::create_dir_all(&home_var_dir).expect("create literal $HOME dir");
+    let var_file = home_var_dir.join("shell.txt");
+    std::fs::write(&var_file, "literal $HOME file").expect("write var file");
+
+    let ctx = ToolContext::new(workspace.path().to_path_buf());
+    let result = ReadFileTool
+        .execute(json!({ "path": "$HOME/shell.txt" }), &ctx)
+        .await
+        .expect("read_file on $HOME/file should read from workspace literal $HOME directory without expanding env vars");
+    assert!(result.success);
+    assert!(result.content.contains("literal $HOME file"));
+}
+
+// Seals `HOME` to a fixture: this test used to resolve `~` against the
+// developer's real home, so a sibling test setting `CODEWHALE_HOME` between the
+// tilde expansion and the guard's own lookup could flip it to a pass — and the
+// failure printed the developer's actual config file, credentials included.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn read_file_denies_home_credential_path() {
+    let _env_lock = crate::test_support::lock_test_env();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let _home = crate::test_support::EnvVarGuard::set("HOME", home.path());
+    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", home.path());
+    let _codewhale_home = crate::test_support::EnvVarGuard::remove("CODEWHALE_HOME");
+    let _config_path = crate::test_support::EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
+    let _legacy_config_path = crate::test_support::EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+    fs::create_dir_all(home.path().join(".codewhale")).expect("create fixture home");
+    fs::write(
+        home.path().join(".codewhale").join("config.toml"),
+        "api_key = \"fixture-secret\"\n",
+    )
+    .expect("write fixture config");
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    // Even in trust mode, credential paths must be blocked
+    let ctx = ToolContext::new(workspace.path().to_path_buf()).with_trust_mode(true);
+
+    let error = ReadFileTool
+        .execute(json!({ "path": "~/.codewhale/config.toml" }), &ctx)
+        .await
+        .expect_err("reading ~/.codewhale/config.toml must be denied");
+    assert!(
+        matches!(error, ToolError::PermissionDenied { .. }),
+        "expected permission denied, got: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot expose Codewhale configuration or credential-store files"),
+        "error message must protect credentials: {message}"
+    );
+}
+
+/// `CODEWHALE_HOME` relocates the runtime home. It must not un-guard the user's
+/// real `~/.codewhale/config.toml`: the guard derived every root from
+/// `codewhale_home()`, which returns the override when set, so pointing that
+/// variable anywhere else left the ambient config (OAuth tokens included)
+/// readable in trust mode. `sandbox::read_guard` only covers
+/// `~/.codewhale/secrets`, so nothing else was denying this file.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn read_file_denies_ambient_home_config_even_when_codewhale_home_is_relocated() {
+    let _env_lock = crate::test_support::lock_test_env();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let relocated = tempfile::tempdir().expect("relocated home tempdir");
+    let _home = crate::test_support::EnvVarGuard::set("HOME", home.path());
+    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", home.path());
+    // The override points somewhere else entirely — the ambient store must stay guarded.
+    let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", relocated.path());
+    let _config_path = crate::test_support::EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
+    let _legacy_config_path = crate::test_support::EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+
+    let ambient = home.path().join(".codewhale");
+    fs::create_dir_all(&ambient).expect("create ambient home");
+    fs::write(
+        ambient.join("config.toml"),
+        "[providers.openai]\napi_key = \"sk-ambient-must-not-leak\"\n",
+    )
+    .expect("write ambient config");
+    fs::write(
+        ambient.join("config.toml.bak"),
+        "[providers.openai]\napi_key = \"sk-ambient-backup-must-not-leak\"\n",
+    )
+    .expect("write ambient config backup");
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let ctx = ToolContext::new(workspace.path().to_path_buf()).with_trust_mode(true);
+
+    for name in ["config.toml", "config.toml.bak"] {
+        let target = ambient.join(name);
+        let error = ReadFileTool
+            .execute(json!({ "path": target.to_string_lossy() }), &ctx)
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("reading the ambient {name} must be denied despite CODEWHALE_HOME")
+            });
+        assert!(
+            matches!(error, ToolError::PermissionDenied { .. }),
+            "expected permission denied for {name}, got: {error:?}"
+        );
+        assert!(
+            !error.to_string().contains("must-not-leak"),
+            "the denial must not echo credential content for {name}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn read_file_refusal_names_home_spelling_not_denied_symlink_target() {
+    // Take the env lock WITHOUT rebinding `HOME`. The sandbox denylist is a
+    // process-wide `OnceLock` (sandbox/read_guard.rs:346-347, 411-416) that
+    // snapshots the home directory the first time it is built, so pointing
+    // `HOME` at a fixture here could never match the cached table. What this
+    // test needs is mutual exclusion against siblings that DO rebind `HOME`,
+    // not a home of its own.
+    let _env_lock = crate::test_support::lock_test_env();
+    let real_home = crate::config::effective_home_dir().expect("test home must be available");
+    let home_fixture = tempfile::Builder::new()
+        .prefix("cw_home_symlink_fixture_")
+        .tempdir_in(&real_home)
+        .expect("create fixture inside test home");
+
+    let denied_file = home_fixture.path().join(".env");
+    std::fs::write(&denied_file, "SYNTHETIC_FIXTURE=not-a-secret").expect("create denied fixture");
+    let link = home_fixture.path().join("ssh_probe");
+    std::os::unix::fs::symlink(&denied_file, &link).expect("symlink to denied file");
+
+    let rel = link
+        .strip_prefix(&real_home)
+        .expect("fixture is below test home");
+    let tilde_path = format!("~/{}", rel.to_string_lossy());
+
+    let ctx = ToolContext::new(home_fixture.path().to_path_buf());
+    let error = ReadFileTool
+        .execute(json!({ "path": &tilde_path }), &ctx)
+        .await
+        .expect_err("symlink pointing to a denied file must be refused");
+    assert!(
+        matches!(error, ToolError::PermissionDenied { .. }),
+        "expected permission refusal, got: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&tilde_path),
+        "refusal message must name caller's tilde path ({tilde_path}): {message}"
+    );
+    assert!(
+        !message.contains(&denied_file.display().to_string()),
+        "refusal message must NOT leak target path ({}): {message}",
+        denied_file.display()
     );
 }

@@ -1,0 +1,49 @@
+{
+  "requests_summary": {
+    "authorization_shapes": [
+      null
+    ],
+    "rpcs": [
+      "initialize"
+    ],
+    "statuses": [
+      401
+    ]
+  },
+  "server_received": [],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": {
+        "err": "conformance: MCP server <SERVER_URL> rejected the request with 401 Unauthorized; the session is no longer accepted. Re-authorize this server (/mcp login <name>) to continue."
+      }
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Authenticate with MCP server \"conformance\" via OAuth.\n\nThis server requires an OAuth login that has not yet been completed, so its real tools are currently unavailable. Calling this tool starts the authorization flow:\n\n1. A browser window is opened for the user to sign in and approve the Codewhale client, and the exact authorization URL is shown to the user in the session status while this call waits. The same URL is returned in this call's result; if the user reports the browser did not open, show that URL to the user verbatim and ask them to complete the sign-in there.\n2. The call blocks (up to 5 minutes) until the browser flow completes on the local callback listener, is declined, or times out. Do not assume success before the call returns.\n3. On success the server reconnects and its real MCP tools replace this synthetic authenticate tool, becoming callable from the next model request in this session.\n\nTreat the URL as sensitive — do not modify it or strip query parameters. If the flow is declined, cancelled, or times out, the call returns an error; relay it truthfully and suggest `/mcp login conformance` in the TUI or `codewhale mcp login conformance` from a terminal.",
+          "input_schema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mcp_conformance_authenticate"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP server 'conformance' requires OAuth login (◆ auth required); call the `mcp_conformance_authenticate` tool to authenticate, or run `/mcp login conformance`",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    }
+  ]
+}

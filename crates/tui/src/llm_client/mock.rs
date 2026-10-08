@@ -50,12 +50,12 @@ use anyhow::{Result, anyhow};
 use async_stream::try_stream;
 use futures_util::Stream;
 
-use crate::models::{
+use codewhale_models::{
     ContentBlock, MessageDelta, MessageRequest, MessageResponse, StreamEvent, Usage,
 };
 
 use super::{LlmClient, StreamEventBox};
-use crate::models::Role;
+use codewhale_models::Role;
 
 /// A pre-recorded "turn" the mock will replay on the next streaming call.
 ///
@@ -74,9 +74,12 @@ pub enum FauxStep {
     /// outgoing request must still carry `reasoning_content` (represented in
     /// this model as a [`ContentBlock::Thinking`] block). If it is missing,
     /// DeepSeek V4 returns HTTP 400 on the follow-up turn. This guards the
-    /// [v0.4.9-v0.5.1 regression range](https://github.com/Hmbown/CodeWhale/compare/v0.4.9...v0.5.1)
+    /// [v0.4.9-v0.5.1 regression range](https://github.com/codewhale-hq/CodeWhale/compare/v0.4.9...v0.5.1)
     /// where that content was dropped.
     Factory(Box<dyn Fn(&MessageRequest) -> CannedTurn + Send + Sync>),
+    /// Fail the request itself with this message, as a provider that refuses
+    /// it (a 401 for a bad key, say) does before any stream starts.
+    Error(String),
 }
 
 /// A queue-driven mock LLM client.
@@ -153,6 +156,14 @@ impl MockLlmClient {
             .push_back(FauxStep::Factory(Box::new(factory)));
     }
 
+    /// Push a request failure onto the back of the queue.
+    pub fn push_error(&self, message: impl Into<String>) {
+        self.canned
+            .lock()
+            .expect("MockLlmClient.canned mutex poisoned")
+            .push_back(FauxStep::Error(message.into()));
+    }
+
     /// Push a canned non-streaming `MessageResponse`. Consumed by
     /// [`LlmClient::create_message`] (FIFO).
     pub fn push_message_response(&self, response: MessageResponse) {
@@ -213,10 +224,11 @@ impl MockLlmClient {
             .pop_front()
     }
 
-    fn turn_from_step(&self, step: FauxStep, request: &MessageRequest) -> CannedTurn {
+    fn turn_from_step(&self, step: FauxStep, request: &MessageRequest) -> Result<CannedTurn> {
         match step {
-            FauxStep::Canned(turn) => turn,
-            FauxStep::Factory(factory) => factory(request),
+            FauxStep::Canned(turn) => Ok(turn),
+            FauxStep::Factory(factory) => Ok(factory(request)),
+            FauxStep::Error(message) => Err(anyhow!(message)),
         }
     }
 
@@ -252,7 +264,7 @@ impl LlmClient for MockLlmClient {
             ));
         };
 
-        let turn = self.turn_from_step(step, &request);
+        let turn = self.turn_from_step(step, &request)?;
         Ok(synthesize_message_response(turn, &self.model))
     }
 
@@ -266,7 +278,7 @@ impl LlmClient for MockLlmClient {
             ));
         };
 
-        let turn = self.turn_from_step(step, &request);
+        let turn = self.turn_from_step(step, &request)?;
         Ok(stream_from_canned(turn))
     }
 
@@ -294,7 +306,7 @@ fn stream_from_canned(turn: CannedTurn) -> StreamEventBox {
 /// `MessageResponse` by concatenating text deltas. Used only as a fallback
 /// when callers `create_message` without a queued `MessageResponse`.
 fn synthesize_message_response(turn: CannedTurn, model: &str) -> MessageResponse {
-    use crate::models::Delta;
+    use codewhale_models::Delta;
 
     let mut text = String::new();
     let mut stop_reason: Option<String> = None;
@@ -336,7 +348,7 @@ fn synthesize_message_response(turn: CannedTurn, model: &str) -> MessageResponse
 pub mod canned {
     use serde_json::Value;
 
-    use crate::models::{
+    use codewhale_models::{
         ContentBlockStart, Delta, MessageDelta, MessageResponse, StreamEvent, Usage,
     };
 
@@ -477,7 +489,7 @@ mod tests {
 
     use super::*;
     use crate::llm_client::LlmClient;
-    use crate::models::{Delta, Message, MessageRequest, StreamEvent};
+    use codewhale_models::{Delta, Message, MessageRequest, StreamEvent};
 
     fn empty_request() -> MessageRequest {
         MessageRequest {
@@ -641,7 +653,7 @@ mod tests {
         while let Some(ev) = stream.next().await {
             match ev.unwrap() {
                 StreamEvent::ContentBlockStart { content_block, .. } => {
-                    use crate::models::ContentBlockStart;
+                    use codewhale_models::ContentBlockStart;
                     if let ContentBlockStart::ToolUse { name, .. } = content_block {
                         assert_eq!(name, "list_dir");
                         saw_tool_use = true;

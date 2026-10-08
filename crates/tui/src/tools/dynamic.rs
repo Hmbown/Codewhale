@@ -22,6 +22,17 @@ impl ToolSpec for RuntimeDynamicTool {
         &self.spec.name
     }
 
+    fn registration_origin(&self) -> std::borrow::Cow<'_, str> {
+        match &self.spec.namespace {
+            Some(namespace) => format!(
+                "runtime dynamic namespace {}",
+                crate::safe_label::SafeLabel::identifier(namespace)
+            )
+            .into(),
+            None => "runtime dynamic (no namespace)".into(),
+        }
+    }
+
     fn description(&self) -> &str {
         &self.spec.description
     }

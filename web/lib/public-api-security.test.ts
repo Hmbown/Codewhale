@@ -61,16 +61,6 @@ describe("public API security contracts", () => {
     );
   });
 
-  it("digest post: GitHub API failure surfaces a 502 error, not ok:true", () => {
-    const source = routeSource("admin/post");
-    // On a failed digest GitHub call the handler must return a non-ok error payload
-    expect(source).toContain("digestRes.ok");
-    // Must propagate the GitHub status rather than swallowing it
-    const digestErrorPath = source.slice(
-      source.indexOf("digestRes.ok"),
-      source.indexOf("digestRes.ok") + 300,
-    );
-    expect(digestErrorPath).toContain("status: 502");
-    expect(digestErrorPath).not.toContain('ok: true');
-  });
+  // "digest post: GitHub API failure surfaces a 502" is covered behaviorally
+  // in community-agent-review-state.test.ts.
 });

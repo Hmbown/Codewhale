@@ -9,12 +9,40 @@ fi
 CODEWHALE_USER="${CODEWHALE_USER:-${DEEPSEEK_USER:-codewhale}}"
 CODEWHALE_ROOT="${CODEWHALE_ROOT:-${DEEPSEEK_ROOT:-/opt/codewhale}}"
 WHALEBRO_ROOT="${WHALEBRO_ROOT:-/opt/whalebro}"
-REPO_URL="${CODEWHALE_REPO_URL:-${DEEPSEEK_REPO_URL:-https://github.com/Hmbown/CodeWhale.git}}"
+REPO_URL="${CODEWHALE_REPO_URL:-${DEEPSEEK_REPO_URL:-https://github.com/codewhale-hq/CodeWhale.git}}"
 WHALEBRO_EXTRA_REPOS="${WHALEBRO_EXTRA_REPOS:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SOURCE_BRANCH="$(git -C "${SOURCE_ROOT}" branch --show-current 2>/dev/null || true)"
 REPO_BRANCH="${CODEWHALE_REPO_BRANCH:-${DEEPSEEK_REPO_BRANCH:-${SOURCE_BRANCH:-main}}}"
+
+# SSH_ALLOWED_CIDRS accepts comma/space separated IPv4 /8-/32 or IPv6
+# /16-/128 CIDRs. Validate the whole list before any host changes. For a
+# deliberately public SSH endpoint, explicitly set SSH_ALLOW_ANY_SOURCE=1.
+ssh_cidrs="${SSH_ALLOWED_CIDRS:-}"
+ssh_cidrs="${ssh_cidrs//,/ }"
+if [[ -z "${ssh_cidrs//[[:space:]]/}" ]]; then
+  if [[ "${SSH_ALLOW_ANY_SOURCE:-0}" != "1" ]]; then
+    echo "Set SSH_ALLOWED_CIDRS to trusted source CIDRs, or explicitly set SSH_ALLOW_ANY_SOURCE=1. No host changes were made." >&2
+    exit 1
+  fi
+else
+  command -v python3 >/dev/null || { echo "Python 3 is required to validate SSH source CIDRs. No host changes were made." >&2; exit 1; }
+  for cidr in ${ssh_cidrs}; do
+    if ! python3 -c 'import ipaddress, sys
+value = sys.argv[1]
+if "/" not in value or "%" in value:
+    sys.exit(1)
+try:
+    network = ipaddress.ip_network(value, strict=False)
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if (8 if network.version == 4 else 16) <= network.prefixlen else 1)' "${cidr}"; then
+      echo "SSH_ALLOWED_CIDRS entry '${cidr}' is not an IPv4 /8-/32 or IPv6 /16-/128 CIDR. No host changes were made." >&2
+      exit 1
+    fi
+  done
+fi
 
 apt-get update
 apt-get install -y \
@@ -109,7 +137,17 @@ EOF
   chmod 0640 /etc/codewhale/feishu-bridge.env
 fi
 
-ufw allow OpenSSH
+# Apply the already validated narrow rules before deleting the broad one.
+# SSH_ALLOW_ANY_SOURCE=1 is an explicit operator choice, never the default.
+if [[ -n "${ssh_cidrs//[[:space:]]/}" ]]; then
+  for cidr in ${ssh_cidrs}; do
+    ufw allow from "${cidr}" to any app OpenSSH
+  done
+  ufw delete allow OpenSSH >/dev/null 2>&1 || true
+else
+  echo "WARNING: SSH is reachable from every source. SSH_ALLOW_ANY_SOURCE=1 explicitly allows this. Set SSH_ALLOWED_CIDRS (e.g. 203.0.113.4/32) and rerun to restrict it." >&2
+  ufw allow OpenSSH
+fi
 ufw --force enable
 
 cat <<EOF
@@ -117,12 +155,11 @@ cat <<EOF
 Base server setup complete.
 
 Next:
-1. Install Rust 1.88+ for ${CODEWHALE_USER}; rustup is the usual path.
-2. Build/install both binaries:
+1. Install Rust 1.89+ for ${CODEWHALE_USER}; rustup is the usual path.
+2. Build/install the unified binary:
    sudo -iu ${CODEWHALE_USER}
    cd ${WHALEBRO_ROOT}/codewhale
    cargo install --path crates/cli --locked --force
-   cargo install --path crates/tui --locked --force
 3. Copy integrations/feishu-bridge or integrations/telegram-bridge to ${CODEWHALE_ROOT} and run npm install.
 4. Edit /etc/codewhale/runtime.env and the selected bridge env file.
 5. Install systemd units with scripts/tencent-lighthouse/install-services.sh.

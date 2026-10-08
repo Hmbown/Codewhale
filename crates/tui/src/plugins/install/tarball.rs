@@ -1,6 +1,6 @@
 //! Two-pass tarball reader for remote bundles.
 //!
-//! Pass one ([`scan_tarball`]) writes nothing: it rejects traversal and
+//! Pass one ([`scan_tarball_for_bundle`]) writes nothing: it rejects traversal and
 //! absolute paths, enforces the uncompressed size cap from the headers, and
 //! locates the single bundle root — the directory holding the bundle's
 //! manifest (`plugin.json`, `kimi.plugin.json`, or the legacy `plugin.toml`). Pass two
@@ -26,8 +26,9 @@ pub(super) fn stage_tarball(
     bytes: &[u8],
     user_plugins_dir: &Path,
     max_size: u64,
+    bundle_path: Option<&str>,
 ) -> Result<StagedPlugin> {
-    let scan = scan_tarball(bytes, max_size)?;
+    let scan = scan_tarball_for_bundle(bytes, max_size, bundle_path)?;
     let staged_path = fresh_staging_dir(user_plugins_dir)?;
     let result = extract_into(&scan, bytes, &staged_path, max_size)
         .and_then(|()| validate_staged(&staged_path));
@@ -53,7 +54,16 @@ pub(super) struct TarballScan {
 
 /// First pass: validate entry paths, enforce the uncompressed size cap, and
 /// locate the single bundle root. Nothing is written in this pass.
+#[cfg(test)]
 pub(super) fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
+    scan_tarball_for_bundle(bytes, max_size, None)
+}
+
+fn scan_tarball_for_bundle(
+    bytes: &[u8],
+    max_size: u64,
+    bundle_path: Option<&str>,
+) -> Result<TarballScan> {
     let cursor = std::io::Cursor::new(bytes);
     let gz = GzDecoder::new(cursor);
     let mut archive = tar::Archive::new(gz);
@@ -99,10 +109,17 @@ pub(super) fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
     let roots: BTreeSet<String> = manifest_paths
         .iter()
         .map(|manifest| {
-            manifest
-                .rsplit_once('/')
-                .map(|(dir, _)| dir.to_string())
+            crate::plugins::agent_plugin::plugin_root_for_manifest(Path::new(manifest))
+                .map(|root| root.to_string_lossy().into_owned())
                 .unwrap_or_default()
+        })
+        .filter(|root| {
+            bundle_path.is_none_or(|wanted| {
+                root == wanted
+                    || root
+                        .split_once('/')
+                        .is_some_and(|(_, relative)| relative == wanted)
+            })
         })
         .collect();
     if roots.len() != 1 {
@@ -185,13 +202,26 @@ fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) ->
             if total_size > max_size {
                 return Err(PluginInstallError::OversizedBundle { limit: max_size }.into());
             }
-            let mut out = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut out = options
                 .open(&target)
                 .with_context(|| format!("failed to create {}", target.display()))?;
             out.write_all(&buf)
                 .with_context(|| format!("failed to write {}", target.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let executable = header.mode().context("invalid archive file mode")? & 0o111 != 0;
+                let mode = if executable { 0o700 } else { 0o600 };
+                out.set_permissions(fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("failed to set mode for {}", target.display()))?;
+            }
         }
     }
     Ok(())

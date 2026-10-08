@@ -1,4 +1,4 @@
-//! Real-PTY regression for the active composer's painted `[↑]` submit
+//! Real-PTY regression for the active composer's painted `[↵]` submit
 //! affordance (#5773, TUI-UX-01 active-work half).
 //!
 //! The session is driven through the real onboarding flow into deterministic
@@ -62,7 +62,7 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
     std::fs::create_dir_all(&trust_dir).expect("workspace trust dir");
     std::fs::write(trust_dir.join("trusted"), "").expect("workspace trust marker");
 
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -98,19 +98,25 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
         &format!("{size}: offline explore ready"),
     );
     tui.send(keys::key::enter()).expect("leave onboarding");
-    wait_or_panic(
-        &mut tui,
-        "New session",
+    // PTY reads can split a redraw: the launch header arrives before the
+    // composer, with onboarding rows still on screen (Buildkite #1861/#1867).
+    // Wait for the input surface as well as the header before asserting it.
+    tui.wait_for(
+        |frame| {
+            let text = frame.text();
+            text.contains("New session") && text.contains('❯') && !text.contains("You're ready.")
+        },
         STARTUP_WAIT,
-        &format!("{size}: show the launch card"),
-    );
+    )
+    .unwrap_or_else(|error| panic!("{size}: show the launch card and composer: {error}"));
     tui.pump();
     assert_startup_contract(tui.frame(), rows, cols, &size);
     // Typing goes straight to the composer; Enter sends the first message
     // and the session begins (the card dissolved on the first keystroke).
-    tui.send("start the session")
-        .expect("type the first prompt");
-    tui.send(keys::key::enter()).expect("send the first prompt");
+    // type_line, not send+enter: a zero-gap PTY write is paste-classified
+    // and the immediate Enter would be absorbed as a pasted newline.
+    tui.type_line("start the session")
+        .expect("type and send the first prompt");
     if tui
         .wait_for(|frame| !frame.text().contains('\u{2442}'), STARTUP_WAIT)
         .is_err()
@@ -161,9 +167,9 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
     std::thread::sleep(Duration::from_millis(200));
 
     tui.pump();
-    let (send_row, send_col) = tui.frame().find_text("[↑]").unwrap_or_else(|| {
+    let (send_row, send_col) = tui.frame().find_text("[↵]").unwrap_or_else(|| {
         panic!(
-            "{size}: [↑] submit affordance not painted\n{}",
+            "{size}: [↵] submit affordance not painted\n{}",
             tui.diagnostics()
         )
     });
@@ -179,14 +185,14 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
         tui.diagnostics()
     );
 
-    // Click the middle cell of the three-cell `[↑]` affordance: SGR down,
+    // Click the middle cell of the three-cell `[↵]` affordance: SGR down,
     // settle, SGR up — the sequence a real terminal sends for one click.
     tui.send(keys::mouse::down(send_row, send_col + 1))
-        .expect("SGR mouse down on [↑]");
+        .expect("SGR mouse down on [↵]");
     tui.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))
         .expect("down settles");
     tui.send(keys::mouse::up(send_row, send_col + 1))
-        .expect("SGR mouse up on [↑]");
+        .expect("SGR mouse up on [↵]");
 
     // Distinguishing assertion: a real submit — the pointer click or keyboard
     // Enter alike — consumes the draft into the deterministic offline queue
@@ -225,21 +231,21 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
         // may take a beat to process the second gesture.
         if !retried && Instant::now() >= retry_at {
             retried = true;
-            let (retry_row, retry_col) = tui.frame().find_text("[↑]").unwrap_or_else(|| {
+            let (retry_row, retry_col) = tui.frame().find_text("[↵]").unwrap_or_else(|| {
                 panic!(
-                    "{size}: [↑] submit affordance not painted on retry\n{}",
+                    "{size}: [↵] submit affordance not painted on retry\n{}",
                     tui.diagnostics()
                 )
             });
             tui.send(keys::mouse::down(retry_row, retry_col + 1))
-                .expect("SGR mouse down on [↑] retry");
+                .expect("SGR mouse down on [↵] retry");
             std::thread::sleep(Duration::from_millis(150));
             tui.send(keys::mouse::up(retry_row, retry_col + 1))
-                .expect("SGR mouse up on [↑] retry");
+                .expect("SGR mouse up on [↵] retry");
         }
         if Instant::now() >= deadline {
             panic!(
-                "{size}: click on [↑] at ({send_row},{}) produced no queue receipt \
+                "{size}: click on [↵] at ({send_row},{}) produced no queue receipt \
                  {receipt:?} and no queue growth — pointer submit did not reach the \
                  keyboard-submit dispatch path (seen={seen:?})\n{}",
                 send_col + 1,
@@ -308,21 +314,17 @@ fn assert_startup_contract(frame: &Frame, rows: u16, cols: u16, size: &str) {
             frame.debug_dump()
         );
     }
-    // The card sheds rows on narrow stages; the new-session entry holds
-    // last. The sealed harness home has no saved sessions, so wide stages
-    // also paint the empty-workspace note.
-    let needles: &[&str] = if cols < 56 {
-        &["New session"]
-    } else {
-        &["New session", "No recent sessions"]
-    };
-    for needle in needles {
-        assert!(
-            text.contains(needle),
-            "{size}: startup misses {needle:?}\n{}",
-            frame.debug_dump()
-        );
-    }
+    // Empty workspaces keep the invitation without an empty history section.
+    assert!(
+        text.contains("New session"),
+        "{size}: startup misses invitation\n{}",
+        frame.debug_dump()
+    );
+    assert!(
+        !text.contains("No recent sessions"),
+        "{size}: empty history adds noise\n{}",
+        frame.debug_dump()
+    );
     for retired_mark_row in ["▄▄▄▄██▌", "▜████▀▘"] {
         assert!(
             !text.contains(retired_mark_row),
@@ -341,24 +343,18 @@ fn assert_startup_contract(frame: &Frame, rows: u16, cols: u16, size: &str) {
 
 fn assert_live_shell_contract(frame: &Frame, cols: u16, size: &str) {
     let text = frame.text();
+    // The bottom metrics row owns the model; repository state belongs to
+    // the launch header and git view. This sealed offline session carries no
+    // key, so the route chip says the model is not connected instead of
+    // naming a default route that cannot answer (experience mark 8, U3). That
+    // chip must remain visible even at 40 columns.
+    let metrics = frame.row(frame.rows().saturating_sub(1));
     assert!(
-        text.contains("no git"),
-        "{size}: live shell misses the info line\n{}",
+        metrics.contains("model not connected"),
+        "{size}: live shell misses the model in the metrics line\n{}",
         frame.debug_dump()
     );
-    // The shell advertises one help route per surface: the info line's
-    // `Ctrl+/ help`, or the footer's compact `? help`. Below the Compact
-    // floor the help hint sheds first by design (SHELL-DESIGN-20260901
-    // §2.2 shed order), so only then is it allowed to be absent.
-    if cols >= 60 {
-        assert!(
-            ["? help", "Ctrl+/ help", ":keys"]
-                .iter()
-                .any(|route| text.contains(route)),
-            "{size}: live shell hides help\n{}",
-            frame.debug_dump()
-        );
-    }
+    // Compact metrics omit the passive help hint; F1 still opens Help.
     assert!(
         !text.contains("RUNS") || cols < 100,
         "{size}: passive duplicate Tideline rail is still visible\n{}",

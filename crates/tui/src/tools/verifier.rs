@@ -7,8 +7,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,10 +21,66 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
 
-const MAX_GATE_OUTPUT_CHARS: usize = 16_000;
 const DEFAULT_MAX_PYTHON_FILES: usize = 200;
 const MAX_CUSTOM_GATES: usize = 12;
 const BACKGROUND_GATE_TIMEOUT_MS: u64 = 600_000;
+/// Wall-clock bound for a built-in (detected) foreground gate unless the call
+/// sets `timeout_ms`.
+const DEFAULT_GATE_TIMEOUT_MS: u64 = 600_000;
+/// Wall-clock bound for a custom foreground gate when `timeout_ms` is absent.
+/// Custom gates run arbitrary programs (headless browsers, servers) that can
+/// finish their work and never exit, so the default is deliberately tighter.
+const DEFAULT_CUSTOM_GATE_TIMEOUT_MS: u64 = 180_000;
+const MAX_GATE_TIMEOUT_MS: u64 = 1_800_000;
+
+/// Wall-clock bounds a foreground gate plan is built with. Background gates
+/// are shell jobs, which the shell manager does not bound; they run until they
+/// finish or are cancelled through task state, so `timeout_ms` is refused there.
+#[derive(Debug, Clone, Copy)]
+struct GateTimeouts {
+    /// Bound for every built-in (detected) gate.
+    builtin_ms: u64,
+    /// Bound for a custom gate that does not set its own `timeout_ms`.
+    custom_default_ms: u64,
+}
+
+impl GateTimeouts {
+    /// A custom gate that never exits (a headless browser that wrote its
+    /// output) holds the turn, so its default is tighter than a built-in's.
+    const DEFAULT: Self = Self {
+        builtin_ms: DEFAULT_GATE_TIMEOUT_MS,
+        custom_default_ms: DEFAULT_CUSTOM_GATE_TIMEOUT_MS,
+    };
+
+    /// `timeout_ms` on the call overrides the built-in gates' bound.
+    fn for_call(builtin_override_ms: Option<u64>) -> Result<Self, ToolError> {
+        let mut timeouts = Self::DEFAULT;
+        if let Some(ms) = builtin_override_ms {
+            check_gate_timeout("timeout_ms", ms)?;
+            timeouts.builtin_ms = ms;
+        }
+        Ok(timeouts)
+    }
+}
+
+fn check_gate_timeout(field: &str, ms: u64) -> Result<(), ToolError> {
+    if (1..=MAX_GATE_TIMEOUT_MS).contains(&ms) {
+        Ok(())
+    } else {
+        Err(ToolError::invalid_input(format!(
+            "{field} must be between 1 and {MAX_GATE_TIMEOUT_MS}"
+        )))
+    }
+}
+/// Bytes of a gate stream kept in memory from its start, and from its end,
+/// once the stream is longer than both together. Every byte also goes to a
+/// session artifact, so the middle stays readable (#6508). What the model
+/// sees of the result is the engine's one recoverable budget.
+const GATE_CAPTURE_HEAD_BYTES: usize = 512 * 1024;
+const GATE_CAPTURE_TAIL_BYTES: usize = 512 * 1024;
+/// After a gate's own process exits, how long a helper it started may keep
+/// stdout/stderr open before the gate's process group is killed.
+const GATE_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Tool for running independent verifier gates concurrently.
 pub struct RunVerifiersTool;
@@ -98,6 +154,8 @@ struct RunVerifiersInput {
     max_python_files: usize,
     commands: Vec<CustomVerifierInput>,
     background: bool,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
 }
 
 impl Default for RunVerifiersInput {
@@ -108,6 +166,8 @@ impl Default for RunVerifiersInput {
             max_python_files: DEFAULT_MAX_PYTHON_FILES,
             commands: Vec::new(),
             background: false,
+            cwd: None,
+            timeout_ms: None,
         }
     }
 }
@@ -119,6 +179,7 @@ struct CustomVerifierInput {
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +191,7 @@ struct VerifierGate {
     args: Vec<String>,
     env: Vec<(String, String)>,
     skipped_reason: Option<String>,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +207,12 @@ struct GateResult {
     stderr: String,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    /// Session artifact (`art_<id>`) holding the whole stream when it was
+    /// longer than what the result keeps in memory (#6508).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_log_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_log_ref: Option<String>,
     skipped_reason: Option<String>,
 }
 
@@ -174,22 +242,6 @@ impl VerifierVerdict {
             Self::Pass
         }
     }
-
-    fn hunt_verdict(self) -> &'static str {
-        match self {
-            Self::Pass => "hunted",
-            Self::Partial => "wounded",
-            Self::Fail => "escaped",
-        }
-    }
-
-    fn goal_status(self) -> &'static str {
-        match self {
-            Self::Pass => "complete",
-            Self::Partial => "paused",
-            Self::Fail => "blocked",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,8 +255,6 @@ struct RunVerifiersOutput {
     failed: usize,
     skipped: usize,
     verifier_verdict: VerifierVerdict,
-    hunt_verdict: String,
-    goal_status: String,
     summary: String,
     gates: Vec<GateResult>,
 }
@@ -295,6 +345,12 @@ impl ToolSpec for RunVerifiersTool {
                             "cwd": {
                                 "type": "string",
                                 "description": "Optional working directory relative to the workspace."
+                            },
+                            "timeout_ms": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_GATE_TIMEOUT_MS,
+                                "description": format!("Wall-clock limit for this gate (foreground only; refused with background). When it elapses the gate's whole process tree is killed and the gate fails as timed out. Defaults to {DEFAULT_CUSTOM_GATE_TIMEOUT_MS}. Raise it for long test suites.")
                             }
                         },
                         "required": ["name", "program"],
@@ -305,6 +361,17 @@ impl ToolSpec for RunVerifiersTool {
                     "type": "boolean",
                     "default": false,
                     "description": "Start verifier gates as background shell jobs and return task_ids immediately. Use for long build/test/lint gates; completion is tracked in task/status state, and `Bash` with action 'wait' / task_shell_wait are only for early output, final output, or true dependency barriers."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory, relative to the workspace, to detect projects and run gates in. Per-command cwd stays relative to it. Must exist inside the workspace."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_GATE_TIMEOUT_MS,
+                    "default": DEFAULT_GATE_TIMEOUT_MS,
+                    "description": "Wall-clock limit for each built-in (detected) gate. When it elapses the gate's whole process tree is killed and the gate fails as timed out. Raise it for a `full` run on a large workspace. Foreground only; refused with background. Custom commands use their own timeout_ms."
                 }
             },
             "additionalProperties": false
@@ -324,8 +391,27 @@ impl ToolSpec for RunVerifiersTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        crate::core::engine::tool_catalog::enforce_tool_denial(context, self.name(), &input)?;
         let input: RunVerifiersInput = serde_json::from_value(input)
             .map_err(|err| ToolError::invalid_input(err.to_string()))?;
+        // `cwd` scopes the whole call — project detection, gate roots, and
+        // reported paths — to an existing in-workspace subdirectory.
+        let scoped;
+        let context = match input
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+        {
+            None => context,
+            Some(raw) => {
+                let root = context.resolve_existing_dir(raw, "cwd")?;
+                let mut narrowed = context.clone();
+                narrowed.workspace = root;
+                scoped = narrowed;
+                &scoped
+            }
+        };
         let profile = VerifierProfile::parse(input.profile.as_str())?;
         let level = VerifierLevel::parse(input.level.as_str())?;
         if input.max_python_files == 0 || input.max_python_files > 1000 {
@@ -339,12 +425,25 @@ impl ToolSpec for RunVerifiersTool {
             )));
         }
 
+        if input.background
+            && (input.timeout_ms.is_some()
+                || input
+                    .commands
+                    .iter()
+                    .any(|custom| custom.timeout_ms.is_some()))
+        {
+            return Err(ToolError::invalid_input(
+                "timeout_ms applies only to foreground gates; background gates run as shell jobs until they finish or are cancelled through task state",
+            ));
+        }
+        let timeouts = GateTimeouts::for_call(input.timeout_ms)?;
         let gates = build_gate_plan(
             context,
             profile,
             level,
             input.max_python_files,
             &input.commands,
+            timeouts,
         )?;
         if gates.is_empty() {
             let verifier_verdict = VerifierVerdict::from_counts(0, 0, 0);
@@ -358,8 +457,6 @@ impl ToolSpec for RunVerifiersTool {
                 failed: 0,
                 skipped: 0,
                 verifier_verdict,
-                hunt_verdict: verifier_verdict.hunt_verdict().to_string(),
-                goal_status: verifier_verdict.goal_status().to_string(),
                 summary: "No verifier gates were detected. Provide custom commands or choose a profile that matches this workspace.".to_string(),
                 gates: Vec::new(),
             };
@@ -370,31 +467,15 @@ impl ToolSpec for RunVerifiersTool {
             return start_background_gates(context, profile, level, gates);
         }
 
-        let mut handles = Vec::with_capacity(gates.len());
-        for gate in gates {
-            handles.push(tokio::task::spawn_blocking(move || run_gate(gate)));
-        }
-
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            match handle.await {
-                Ok(result) => results.push(result),
-                Err(err) => results.push(GateResult {
-                    name: "internal-join".to_string(),
-                    ecosystem: "internal".to_string(),
-                    status: GateStatus::Failed,
-                    command: "tokio::task::spawn_blocking".to_string(),
-                    cwd: context.workspace.display().to_string(),
-                    exit_code: None,
-                    duration_ms: 0,
-                    stdout: String::new(),
-                    stderr: format!("Verifier task join failed: {err}"),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    skipped_reason: None,
-                }),
-            }
-        }
+        // Gates run as futures of this call, not detached blocking tasks: when
+        // Stop drops the tool future, every running gate's process group is
+        // killed with it instead of being orphaned.
+        let mut results = futures_util::future::join_all(
+            gates
+                .into_iter()
+                .map(|gate| run_gate(gate, &context.state_namespace)),
+        )
+        .await;
         results.sort_by(|a, b| a.name.cmp(&b.name));
 
         let passed = results
@@ -427,8 +508,6 @@ impl ToolSpec for RunVerifiersTool {
             failed,
             skipped,
             verifier_verdict,
-            hunt_verdict: verifier_verdict.hunt_verdict().to_string(),
-            goal_status: verifier_verdict.goal_status().to_string(),
             summary,
             gates: results,
         };
@@ -447,6 +526,7 @@ pub(crate) async fn run_workflow_completion_gates(
         VerifierLevel::Quick,
         DEFAULT_MAX_PYTHON_FILES,
         &[],
+        GateTimeouts::DEFAULT,
     )?;
     if gates.is_empty() {
         return Ok(json!({
@@ -459,32 +539,12 @@ pub(crate) async fn run_workflow_completion_gates(
         }));
     }
 
-    let workspace = context.workspace.display().to_string();
-    let mut handles = Vec::with_capacity(gates.len());
-    for gate in gates {
-        handles.push(tokio::task::spawn_blocking(move || run_gate(gate)));
-    }
-
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(result) => results.push(result),
-            Err(err) => results.push(GateResult {
-                name: "internal-join".to_string(),
-                ecosystem: "internal".to_string(),
-                status: GateStatus::Failed,
-                command: "tokio::task::spawn_blocking".to_string(),
-                cwd: workspace.clone(),
-                exit_code: None,
-                duration_ms: 0,
-                stdout: String::new(),
-                stderr: format!("Verifier task join failed: {err}"),
-                stdout_truncated: false,
-                stderr_truncated: false,
-                skipped_reason: None,
-            }),
-        }
-    }
+    let mut results = futures_util::future::join_all(
+        gates
+            .into_iter()
+            .map(|gate| run_gate(gate, &context.state_namespace)),
+    )
+    .await;
     results.sort_by(|a, b| a.name.cmp(&b.name));
 
     let passed = results
@@ -524,11 +584,6 @@ fn verifier_tool_result(output: &RunVerifiersOutput) -> Result<ToolResult, ToolE
         .map(|result| {
             result.with_metadata(json!({
                 "verifier_verdict": output.verifier_verdict,
-                "hunt_verdict": output.hunt_verdict,
-                "goal_status": output.goal_status,
-                "task_updates": {
-                    "hunt_verdict": output.hunt_verdict
-                }
             }))
         })
 }
@@ -651,7 +706,7 @@ fn start_background_gates(
         "completion_surface": "task_status",
         "background_policy": "nonblocking",
         "task_ids": task_ids,
-        "poll_with": ["exec_shell_wait", "task_shell_wait"]
+        "poll_with": ["task_shell_wait"]
     })))
 }
 
@@ -666,6 +721,7 @@ fn build_gate_plan(
     level: VerifierLevel,
     max_python_files: usize,
     custom_commands: &[CustomVerifierInput],
+    timeouts: GateTimeouts,
 ) -> Result<Vec<VerifierGate>, ToolError> {
     let workspace = &context.workspace;
     let mut gates = Vec::new();
@@ -693,8 +749,12 @@ fn build_gate_plan(
         add_go_gates(&mut gates, workspace, level);
     }
 
+    let builtin_timeout = Duration::from_millis(timeouts.builtin_ms);
+    for gate in &mut gates {
+        gate.timeout = builtin_timeout;
+    }
     for custom in custom_commands {
-        gates.push(custom_gate(context, custom)?);
+        gates.push(custom_gate(context, custom, timeouts)?);
     }
 
     Ok(gates)
@@ -847,6 +907,7 @@ where
             .collect(),
         env: Vec::new(),
         skipped_reason: None,
+        timeout: Duration::from_millis(DEFAULT_GATE_TIMEOUT_MS),
     }
 }
 
@@ -864,12 +925,14 @@ fn skipped_gate(
         args: Vec::new(),
         env: Vec::new(),
         skipped_reason: Some(reason.into()),
+        timeout: Duration::from_millis(DEFAULT_GATE_TIMEOUT_MS),
     }
 }
 
 fn custom_gate(
     context: &ToolContext,
     custom: &CustomVerifierInput,
+    timeouts: GateTimeouts,
 ) -> Result<VerifierGate, ToolError> {
     if custom.name.trim().is_empty() {
         return Err(ToolError::invalid_input(
@@ -886,6 +949,11 @@ fn custom_gate(
         Some(raw) if !raw.trim().is_empty() => context.resolve_path(raw)?,
         _ => context.workspace.clone(),
     };
+    let timeout_ms = custom.timeout_ms.unwrap_or(timeouts.custom_default_ms);
+    check_gate_timeout(
+        &format!("Custom verifier '{}' timeout_ms", custom.name),
+        timeout_ms,
+    )?;
     Ok(VerifierGate {
         name: custom.name.clone(),
         ecosystem: "custom".to_string(),
@@ -894,6 +962,7 @@ fn custom_gate(
         args: custom.args.clone(),
         env: Vec::new(),
         skipped_reason: None,
+        timeout: Duration::from_millis(timeout_ms),
     })
 }
 
@@ -1116,7 +1185,7 @@ fn should_skip_dir_name(name: &str) -> bool {
     )
 }
 
-fn run_gate(gate: VerifierGate) -> GateResult {
+async fn run_gate(gate: VerifierGate, session_id: &str) -> GateResult {
     let command = render_command(gate.program.as_deref(), &gate.args);
     if let Some(reason) = gate.skipped_reason {
         return GateResult {
@@ -1131,6 +1200,8 @@ fn run_gate(gate: VerifierGate) -> GateResult {
             stderr: String::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_log_ref: None,
+            stderr_log_ref: None,
             skipped_reason: Some(reason),
         };
     }
@@ -1148,22 +1219,37 @@ fn run_gate(gate: VerifierGate) -> GateResult {
             stderr: String::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_log_ref: None,
+            stderr_log_ref: None,
             skipped_reason: Some("verifier has no executable program".to_string()),
         };
     };
 
     let started = Instant::now();
-    let mut cmd = Command::new(&program);
+    let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&gate.args)
         .current_dir(&gate.cwd)
+        // A gate never reads input; an inherited stdin could block it on the
+        // Engine's own terminal or pipe.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in &gate.env {
-        cmd.env(key, value);
-    }
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Its own process group, so a timeout or Stop reaches every helper the
+    // gate started (headless Chrome forks several), not just the leader.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    // Gates run workspace code: start from the sanitized child environment
+    // and layer only the gate's own declared variables on top.
+    crate::child_env::apply_to_tokio_command(
+        &mut cmd,
+        gate.env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
 
-    let output = match cmd.output() {
-        Ok(output) => output,
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return GateResult {
                 name: gate.name,
@@ -1177,6 +1263,8 @@ fn run_gate(gate: VerifierGate) -> GateResult {
                 stderr: String::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                stdout_log_ref: None,
+                stderr_log_ref: None,
                 skipped_reason: Some(format!("{program} is not installed or not in PATH")),
             };
         }
@@ -1193,36 +1281,298 @@ fn run_gate(gate: VerifierGate) -> GateResult {
                 stderr: format!("Failed to spawn verifier: {err}"),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                stdout_log_ref: None,
+                stderr_log_ref: None,
                 skipped_reason: None,
             };
         }
     };
+    // Armed until the gate settles cleanly; dropping this future (Stop)
+    // kills the whole group.
+    let mut group = GateProcessGroup::new(child.id());
 
-    let (stdout, stdout_truncated) = truncate_with_note(
-        &String::from_utf8_lossy(&output.stdout),
-        MAX_GATE_OUTPUT_CHARS,
-    );
-    let (stderr, stderr_truncated) = truncate_with_note(
-        &String::from_utf8_lossy(&output.stderr),
-        MAX_GATE_OUTPUT_CHARS,
-    );
+    let mut stdout = GateCapture::new(session_id, &gate.name, "stdout");
+    let mut stderr = GateCapture::new(session_id, &gate.name, "stderr");
+    let mut exit: Option<std::io::Result<std::process::ExitStatus>> = None;
+    let mut pipes_open = true;
+    let mut timed_out = false;
+    {
+        let read_stdout = read_capped(child.stdout.take(), &mut stdout);
+        let read_stderr = read_capped(child.stderr.take(), &mut stderr);
+        let mut read_pipes = std::pin::pin!(async move {
+            tokio::join!(read_stdout, read_stderr);
+        });
+        let deadline = tokio::time::sleep(gate.timeout);
+        let mut deadline = std::pin::pin!(deadline);
+        let mut drain_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        loop {
+            if exit.is_some() && !pipes_open {
+                break;
+            }
+            tokio::select! {
+                status = child.wait(), if exit.is_none() => {
+                    exit = Some(status);
+                    drain_deadline = Some(Box::pin(tokio::time::sleep(GATE_PIPE_DRAIN_GRACE)));
+                }
+                () = &mut read_pipes, if pipes_open => pipes_open = false,
+                () = async { drain_deadline.as_mut().expect("guarded").await },
+                    if drain_deadline.is_some() => break,
+                () = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut notes = Vec::new();
+    if timed_out || pipes_open {
+        group.kill();
+        if exit.is_none() {
+            // The group is SIGKILLed; reaping the leader is bounded anyway so
+            // an uninterruptible child cannot wedge the verifier again.
+            exit = tokio::time::timeout(GATE_PIPE_DRAIN_GRACE, child.wait())
+                .await
+                .ok();
+        }
+    } else {
+        group.disarm();
+    }
+    if timed_out {
+        notes.push(format!(
+            "[verifier gate timed out after {}s and its process group was killed; raise timeout_ms if it legitimately needs longer]",
+            gate.timeout.as_secs_f64()
+        ));
+    } else if pipes_open {
+        notes.push(
+            "[the gate exited but a process it started kept stdout/stderr open; its process group was killed]"
+                .to_string(),
+        );
+    }
+
+    let exit_status = match exit {
+        Some(Ok(status)) => Some(status),
+        Some(Err(err)) => {
+            notes.push(format!("[failed to wait for verifier: {err}]"));
+            None
+        }
+        None => None,
+    };
+    let stdout = stdout.finish().await;
+    let stderr = stderr.finish().await;
+    let mut stderr_text = stderr.text;
+    for note in notes {
+        if !stderr_text.is_empty() && !stderr_text.ends_with('\n') {
+            stderr_text.push('\n');
+        }
+        stderr_text.push_str(&note);
+    }
+    let passed = !timed_out && exit_status.is_some_and(|status| status.success());
     GateResult {
         name: gate.name,
         ecosystem: gate.ecosystem,
-        status: if output.status.success() {
+        status: if passed {
             GateStatus::Passed
         } else {
             GateStatus::Failed
         },
         command,
         cwd: gate.cwd.display().to_string(),
-        exit_code: output.status.code(),
+        exit_code: exit_status.and_then(|status| status.code()),
         duration_ms: started.elapsed().as_millis() as u64,
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
+        stdout: stdout.text,
+        stderr: stderr_text,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+        stdout_log_ref: stdout.log_ref,
+        stderr_log_ref: stderr.log_ref,
         skipped_reason: None,
+    }
+}
+
+/// Read a gate's pipe to EOF into `capture`.
+async fn read_capped<R>(pipe: Option<R>, capture: &mut GateCapture)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return;
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => capture.push(&chunk[..n]).await,
+        }
+    }
+}
+
+/// One gate stream: every byte while it fits in memory, then its first
+/// [`GATE_CAPTURE_HEAD_BYTES`] and a rolling last [`GATE_CAPTURE_TAIL_BYTES`],
+/// with every byte teed to a session artifact so nothing is lost.
+struct GateCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+    session_id: String,
+    artifact_id: String,
+    log: Option<tokio::fs::File>,
+    /// Opening or writing the log failed; the middle is gone, and the result
+    /// says so instead of naming a ref.
+    log_failed: bool,
+}
+
+/// What a gate stream contributes to its [`GateResult`].
+struct CapturedStream {
+    text: String,
+    truncated: bool,
+    log_ref: Option<String>,
+}
+
+impl GateCapture {
+    fn new(session_id: &str, gate_name: &str, stream: &str) -> Self {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            total: 0,
+            session_id: session_id.to_string(),
+            artifact_id: crate::artifacts::artifact_id_for_tool_call(&format!(
+                "gate_{gate_name}_{stream}_{}",
+                &id[..12]
+            )),
+            log: None,
+            log_failed: false,
+        }
+    }
+
+    fn overflowed(&self) -> bool {
+        self.total > (GATE_CAPTURE_HEAD_BYTES + GATE_CAPTURE_TAIL_BYTES) as u64
+    }
+
+    async fn push(&mut self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.total += bytes.len() as u64;
+        if !self.overflowed() {
+            self.head.extend_from_slice(bytes);
+            return;
+        }
+        if self.log.is_none() && !self.log_failed {
+            // First overflow: everything so far is still in `head`. Save it,
+            // then keep only the head window in memory.
+            self.log = self.open_log().await;
+            self.log_failed = self.log.is_none();
+            let kept = std::mem::take(&mut self.head);
+            if let Some(log) = self.log.as_mut()
+                && log.write_all(&kept).await.is_err()
+            {
+                self.log = None;
+                self.log_failed = true;
+            }
+            self.head = kept[..GATE_CAPTURE_HEAD_BYTES.min(kept.len())].to_vec();
+            self.tail
+                .extend(&kept[GATE_CAPTURE_HEAD_BYTES.min(kept.len())..]);
+        }
+        if let Some(log) = self.log.as_mut()
+            && log.write_all(bytes).await.is_err()
+        {
+            self.log = None;
+            self.log_failed = true;
+        }
+        if self.head.len() < GATE_CAPTURE_HEAD_BYTES {
+            let room = GATE_CAPTURE_HEAD_BYTES - self.head.len();
+            self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
+            self.tail.extend(&bytes[room.min(bytes.len())..]);
+        } else {
+            self.tail.extend(bytes);
+        }
+        let excess = self.tail.len().saturating_sub(GATE_CAPTURE_TAIL_BYTES);
+        self.tail.drain(..excess);
+    }
+
+    async fn open_log(&self) -> Option<tokio::fs::File> {
+        let relative = crate::artifacts::session_artifact_relative_path(&self.artifact_id);
+        let path = crate::artifacts::session_artifact_absolute_path(&self.session_id, &relative)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok()?;
+        }
+        tokio::fs::File::create(&path).await.ok()
+    }
+
+    async fn finish(mut self) -> CapturedStream {
+        use tokio::io::AsyncWriteExt;
+        if !self.overflowed() {
+            return CapturedStream {
+                text: String::from_utf8_lossy(&self.head).into_owned(),
+                truncated: false,
+                log_ref: None,
+            };
+        }
+        let saved = match self.log.as_mut() {
+            Some(log) => log.flush().await.is_ok() && !self.log_failed,
+            None => false,
+        };
+        let omitted = self.total - (self.head.len() + self.tail.len()) as u64;
+        let middle = if saved {
+            format!(
+                "[{omitted} bytes omitted from the middle; the whole stream is artifact {}: read it with retrieve_tool_result]",
+                self.artifact_id
+            )
+        } else {
+            format!("[{omitted} bytes omitted from the middle; the full stream could not be saved]")
+        };
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        CapturedStream {
+            text: format!(
+                "{}\n\n{middle}\n\n{}",
+                String::from_utf8_lossy(&self.head),
+                String::from_utf8_lossy(&tail)
+            ),
+            truncated: true,
+            log_ref: saved.then_some(self.artifact_id),
+        }
+    }
+}
+
+/// The process group a foreground gate runs in. Killed on timeout, on
+/// held-open pipes, and on drop unless the gate settled cleanly first.
+struct GateProcessGroup {
+    pid: Option<u32>,
+}
+
+impl GateProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+
+    fn kill(&mut self) {
+        let Some(pid) = self.pid.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Ok(pgid) = libc::pid_t::try_from(pid)
+            && pgid > 0
+        {
+            // SAFETY: kill(2) dereferences no pointers; a negative pid targets
+            // the group this gate created with process_group(0).
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        // Elsewhere `kill_on_drop` on the child covers the leader.
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+}
+
+impl Drop for GateProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -1233,36 +1583,6 @@ fn render_command(program: Option<&str>, args: &[String]) -> String {
     parts.join(" ")
 }
 
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    (
-        format!(
-            "{truncated}\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-        ),
-        true,
-    )
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1271,6 +1591,71 @@ mod tests {
     use tempfile::tempdir;
 
     const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
+
+    fn capture_stream(session_id: &str, content: &[u8]) -> CapturedStream {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let mut capture = GateCapture::new(session_id, "cargo test", "stdout");
+                for chunk in content.chunks(8192) {
+                    capture.push(chunk).await;
+                }
+                capture.finish().await
+            })
+    }
+
+    #[test]
+    fn gate_output_over_1mib_keeps_head_and_tail_and_writes_full_log() {
+        // #6508: the verifier kept only the first 1 MiB of a stream and
+        // dropped the end, where a failing gate reports its failure.
+        let home = tempdir().expect("tempdir");
+        crate::tools::truncate::with_test_home(home.path(), || {
+            let content = format!(
+                "FIRST LINE\n{}LAST LINE: test result: FAILED\n",
+                "gate output line\n".repeat(100_000)
+            );
+            assert!(content.len() > GATE_CAPTURE_HEAD_BYTES + GATE_CAPTURE_TAIL_BYTES);
+
+            let captured = capture_stream("session-6508", content.as_bytes());
+
+            assert!(captured.truncated);
+            assert!(captured.text.starts_with("FIRST LINE"));
+            assert!(captured.text.ends_with("LAST LINE: test result: FAILED\n"));
+            let reference = captured.log_ref.expect("full log ref");
+            assert!(captured.text.contains(&reference));
+            let path = crate::artifacts::session_artifact_absolute_path(
+                "session-6508",
+                &crate::artifacts::session_artifact_relative_path(&reference),
+            )
+            .expect("artifact path");
+            let log = fs::read(path).expect("full log");
+            assert_eq!(log.len(), content.len());
+            assert_eq!(log, content.as_bytes());
+        });
+    }
+
+    #[test]
+    fn gate_output_that_fits_is_kept_whole_without_a_log() {
+        let content = "short gate output\n".repeat(1_000);
+        let captured = capture_stream("session-6508", content.as_bytes());
+        assert!(!captured.truncated);
+        assert_eq!(captured.text, content);
+        assert!(captured.log_ref.is_none());
+    }
+
+    #[test]
+    fn gate_output_whose_log_cannot_be_saved_says_so() {
+        // An invalid session id has no artifact directory, so no ref is
+        // promised; head and tail are still kept.
+        let content = format!("HEAD\n{}TAIL\n", "x".repeat(1_200_000));
+        let captured = capture_stream("", content.as_bytes());
+        assert!(captured.truncated);
+        assert!(captured.log_ref.is_none());
+        assert!(captured.text.starts_with("HEAD"));
+        assert!(captured.text.ends_with("TAIL\n"));
+        assert!(captured.text.contains("the full stream could not be saved"));
+    }
 
     fn wait_for_completed_shell(
         manager: &mut crate::tools::shell::ShellManager,
@@ -1336,6 +1721,7 @@ mod tests {
             VerifierLevel::Quick,
             DEFAULT_MAX_PYTHON_FILES,
             &[],
+            GateTimeouts::DEFAULT,
         )
         .expect("plan");
         let names: BTreeSet<&str> = gates.iter().map(|gate| gate.name.as_str()).collect();
@@ -1362,9 +1748,10 @@ mod tests {
             program: "bash".to_string(),
             args: vec!["-lc".to_string(), "echo ok".to_string()],
             cwd: None,
+            timeout_ms: None,
         };
 
-        let gate = custom_gate(&ctx, &custom).expect("custom gate");
+        let gate = custom_gate(&ctx, &custom, GateTimeouts::DEFAULT).expect("custom gate");
 
         assert_eq!(gate.program.as_deref(), Some("bash"));
         assert_eq!(gate.args, vec!["-lc", "echo ok"]);
@@ -1420,7 +1807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_verifiers_emits_hunt_verdict_mapping() {
+    async fn run_verifiers_emits_verdict_mapping() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path());
         let tool = RunVerifiersTool;
@@ -1429,8 +1816,7 @@ mod tests {
             .execute(json!({"profile": "auto"}), &ctx)
             .await
             .expect("execute partial verifier");
-        assert_hunt_mapping(&partial.content, "partial", "wounded", "paused");
-        assert_hunt_metadata(&partial, "partial", "wounded", "paused");
+        assert_verdict(&partial, "partial");
 
         if !crate::dependencies::RustC::available() {
             return;
@@ -1452,8 +1838,7 @@ mod tests {
             )
             .await
             .expect("execute passing verifier");
-        assert_hunt_mapping(&pass.content, "pass", "hunted", "complete");
-        assert_hunt_metadata(&pass, "pass", "hunted", "complete");
+        assert_verdict(&pass, "pass");
 
         let fail = tool
             .execute(
@@ -1471,23 +1856,49 @@ mod tests {
             )
             .await
             .expect("execute failing verifier");
-        assert_hunt_mapping(&fail.content, "fail", "escaped", "blocked");
-        assert_hunt_metadata(&fail, "fail", "escaped", "blocked");
+        assert_verdict(&fail, "fail");
     }
 
-    fn assert_hunt_mapping(content: &str, verifier: &str, hunt: &str, goal: &str) {
-        let parsed: Value = serde_json::from_str(content).expect("verifier output json");
-        assert_eq!(parsed["verifier_verdict"], verifier, "{content}");
-        assert_eq!(parsed["hunt_verdict"], hunt, "{content}");
-        assert_eq!(parsed["goal_status"], goal, "{content}");
+    #[tokio::test]
+    async fn run_verifiers_cwd_scopes_detection_to_subdir() {
+        let tmp = tempdir().expect("tempdir");
+        let sub = tmp.path().join("nested");
+        std::fs::create_dir(&sub).expect("subdir");
+        let ctx = ToolContext::new(tmp.path());
+
+        // Empty subdir: no gates detected, and the reported workspace is the
+        // scoped root rather than the parent workspace.
+        let result = RunVerifiersTool
+            .execute(json!({"profile": "auto", "cwd": "nested"}), &ctx)
+            .await
+            .expect("cwd-scoped execute");
+        let parsed: RunVerifiersOutput =
+            serde_json::from_str(&result.content).expect("verifier output json");
+        assert_eq!(parsed.gate_count, 0);
+        assert_eq!(
+            parsed.workspace,
+            sub.canonicalize().expect("canonical").display().to_string()
+        );
+
+        // Missing dir: refused with the fallback named.
+        let err = RunVerifiersTool
+            .execute(json!({"profile": "auto", "cwd": "no-such-dir"}), &ctx)
+            .await
+            .expect_err("missing dir must be refused");
+        let message = err.to_string();
+        assert!(message.contains("not an existing directory"), "{message}");
+        assert!(message.contains("drop `cwd`"), "{message}");
     }
 
-    fn assert_hunt_metadata(result: &ToolResult, verifier: &str, hunt: &str, goal: &str) {
-        let metadata = result.metadata.as_ref().expect("hunt metadata");
+    fn assert_verdict(result: &ToolResult, verifier: &str) {
+        let parsed: Value = serde_json::from_str(&result.content).expect("verifier output json");
+        assert_eq!(parsed["verifier_verdict"], verifier, "{}", result.content);
+        assert!(parsed.get("hunt_verdict").is_none(), "{}", result.content);
+        assert!(parsed.get("goal_status").is_none(), "{}", result.content);
+        let metadata = result.metadata.as_ref().expect("verifier metadata");
         assert_eq!(metadata["verifier_verdict"], verifier, "{metadata}");
-        assert_eq!(metadata["hunt_verdict"], hunt, "{metadata}");
-        assert_eq!(metadata["goal_status"], goal, "{metadata}");
-        assert_eq!(metadata["task_updates"]["hunt_verdict"], hunt, "{metadata}");
+        assert!(metadata.get("hunt_verdict").is_none(), "{metadata}");
+        assert!(metadata.get("task_updates").is_none(), "{metadata}");
     }
 
     #[tokio::test]
@@ -1587,5 +1998,237 @@ mod tests {
             "stdout should include the test listing: {:?}",
             output.stdout
         );
+    }
+
+    /// Headless Chrome (`--print-to-pdf` / `--dump-dom`) writes its output and
+    /// then never exits while a helper keeps stdout/stderr open. This script
+    /// reproduces that shape deterministically: a leader plus a background
+    /// child, both holding the gate's pipes, neither ever exiting.
+    #[cfg(unix)]
+    fn hung_gate_script(pidfile: &Path) -> String {
+        format!(
+            "sleep 600 & echo $! > '{p}'; echo $$ >> '{p}'; echo started; wait",
+            p = pidfile.display()
+        )
+    }
+
+    #[cfg(unix)]
+    async fn read_gate_pids(pidfile: &Path) -> Vec<libc::pid_t> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let pids: Vec<libc::pid_t> = fs::read_to_string(pidfile)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect();
+            if pids.len() >= 2 {
+                return pids;
+            }
+            assert!(Instant::now() < deadline, "hung gate never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_pids_gone(pids: &[libc::pid_t]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only probes for existence.
+            let alive: Vec<_> = pids
+                .iter()
+                .copied()
+                .filter(|pid| unsafe { libc::kill(*pid, 0) } == 0)
+                .collect();
+            if alive.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                for pid in &alive {
+                    // SAFETY: best-effort cleanup of the leaked test processes.
+                    unsafe {
+                        libc::kill(*pid, libc::SIGKILL);
+                    }
+                }
+                panic!("verifier gate processes still running: {alive:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_verifiers_hung_gate_times_out_and_kills_its_process_group() {
+        let tmp = tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("pids");
+        let ctx = ToolContext::new(tmp.path());
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            RunVerifiersTool.execute(
+                json!({
+                    "profile": "auto",
+                    "commands": [{
+                        "name": "hung",
+                        "program": "/bin/sh",
+                        "args": ["-c", hung_gate_script(&pidfile)],
+                        "timeout_ms": 500
+                    }]
+                }),
+                &ctx,
+            ),
+        )
+        .await
+        .expect("a hung verifier gate must not hang run_verifiers")
+        .expect("execute");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed-out gate took {:?}",
+            started.elapsed()
+        );
+
+        let parsed: RunVerifiersOutput =
+            serde_json::from_str(&result.content).expect("verifier output json");
+        assert_eq!(parsed.failed, 1, "result: {}", result.content);
+        let gate = &parsed.gates[0];
+        assert_eq!(gate.status, GateStatus::Failed);
+        assert!(
+            gate.stderr.contains("timed out"),
+            "stderr: {:?}",
+            gate.stderr
+        );
+        assert!(
+            gate.stdout.contains("started"),
+            "partial stdout kept: {:?}",
+            gate.stdout
+        );
+        assert_pids_gone(&read_gate_pids(&pidfile).await).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_verifiers_dropped_on_stop_kills_running_gates() {
+        let tmp = tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("pids");
+        let ctx = ToolContext::new(tmp.path());
+        let script = hung_gate_script(&pidfile);
+        // Stop drops the active tool future (turn_loop's biased select on the
+        // cancel token). That drop must take the gate's processes with it.
+        let task = tokio::spawn(async move {
+            RunVerifiersTool
+                .execute(
+                    json!({
+                        "profile": "auto",
+                        "commands": [{
+                            "name": "hung",
+                            "program": "/bin/sh",
+                            "args": ["-c", script]
+                        }]
+                    }),
+                    &ctx,
+                )
+                .await
+        });
+        let pids = read_gate_pids(&pidfile).await;
+        task.abort();
+        let _ = task.await;
+        assert_pids_gone(&pids).await;
+    }
+
+    #[test]
+    fn built_in_gates_take_the_call_timeout_and_custom_gates_keep_their_own() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("cargo manifest");
+        let ctx = ToolContext::new(tmp.path());
+        let custom = [
+            CustomVerifierInput {
+                name: "default".to_string(),
+                program: "true".to_string(),
+                ..CustomVerifierInput::default()
+            },
+            CustomVerifierInput {
+                name: "explicit".to_string(),
+                program: "true".to_string(),
+                timeout_ms: Some(42_000),
+                ..CustomVerifierInput::default()
+            },
+        ];
+        let long = MAX_GATE_TIMEOUT_MS;
+        let gates = build_gate_plan(
+            &ctx,
+            VerifierProfile::Rust,
+            VerifierLevel::Full,
+            DEFAULT_MAX_PYTHON_FILES,
+            &custom,
+            GateTimeouts::for_call(Some(long)).expect("in range"),
+        )
+        .expect("plan");
+        let rust: Vec<_> = gates
+            .iter()
+            .filter(|gate| gate.ecosystem == "rust")
+            .collect();
+        assert!(!rust.is_empty(), "rust gates detected");
+        // A `full` run on a large workspace is no longer capped at 600s.
+        for gate in rust {
+            assert_eq!(gate.timeout, Duration::from_millis(long), "{}", gate.name);
+        }
+        let timeout_of = |name: &str| {
+            gates
+                .iter()
+                .find(|gate| gate.name == name)
+                .unwrap_or_else(|| panic!("gate {name}"))
+                .timeout
+        };
+        assert_eq!(
+            timeout_of("default"),
+            Duration::from_millis(DEFAULT_CUSTOM_GATE_TIMEOUT_MS)
+        );
+        assert_eq!(timeout_of("explicit"), Duration::from_millis(42_000));
+        assert!(GateTimeouts::for_call(Some(0)).is_err());
+        assert!(GateTimeouts::for_call(Some(long + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn run_verifiers_background_refuses_timeout_ms_it_cannot_enforce() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+        for input in [
+            json!({"background": true, "timeout_ms": 1000,
+                   "commands": [{"name": "a", "program": "true"}]}),
+            json!({"background": true,
+                   "commands": [{"name": "a", "program": "true", "timeout_ms": 1000}]}),
+        ] {
+            let err = RunVerifiersTool
+                .execute(input.clone(), &ctx)
+                .await
+                .expect_err("background timeout_ms must be refused");
+            assert!(err.to_string().contains("foreground"), "{input}: {err}");
+        }
+        let jobs = ctx.shell_manager.lock().expect("shell manager").list_jobs();
+        assert!(jobs.is_empty(), "nothing may start: {jobs:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_gate_does_not_inherit_parent_secret_env_but_keeps_gate_env() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _env_lock = lock_test_env();
+        let _secret = EnvVarGuard::set("CODEWHALE_TEST_VERIFIER_SECRET", "verifier-secret-value");
+        let tmp = tempdir().expect("tempdir");
+        let gate = VerifierGate {
+            name: "env-probe".to_string(),
+            ecosystem: "custom".to_string(),
+            cwd: tmp.path().to_path_buf(),
+            program: Some("/bin/sh".to_string()),
+            args: vec![
+                "-c".to_string(),
+                "printf '%s|%s' \"${CODEWHALE_TEST_VERIFIER_SECRET-unset}\" \"${GATE_DECLARED-missing}\""
+                    .to_string(),
+            ],
+            env: vec![("GATE_DECLARED".to_string(), "declared".to_string())],
+            skipped_reason: None,
+            timeout: Duration::from_secs(30),
+        };
+        let result = run_gate(gate, "env-probe-test").await;
+        assert_eq!(result.stdout.trim(), "unset|declared", "{result:?}");
     }
 }

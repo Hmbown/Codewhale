@@ -38,236 +38,11 @@ pub fn new_shared_goal_state_from_host_status(
     Arc::new(Mutex::new(state))
 }
 
-/// Create shared state restored from a persisted goal record, keeping the
-/// accumulated usage and continuation counters. See
-/// [`GoalState::from_persisted`].
+/// Restore the complete durable history; loading is not an explicit resume.
 #[must_use]
-pub fn new_shared_goal_state_from_persisted(
-    objective: &str,
-    token_budget: Option<u32>,
-    status: GoalStatus,
-    pause_reason: Option<GoalPauseReason>,
-    tokens_used: u64,
-    time_used_seconds: u64,
-    continuation_count: u32,
-) -> SharedGoalState {
-    Arc::new(Mutex::new(GoalState::from_persisted(
-        objective,
-        token_budget,
-        status,
-        pause_reason,
-        tokens_used,
-        time_used_seconds,
-        continuation_count,
-    )))
+pub fn new_shared_goal_state_from_snapshot(snapshot: &GoalSnapshot) -> SharedGoalState {
+    Arc::new(Mutex::new(GoalState::from_snapshot(snapshot)))
 }
-
-/// A goal declaration stated in ordinary user prose rather than as a leading
-/// `/goal <objective>` command.
-///
-/// This intentionally recognizes only a narrow, explicit `/goal` directive.
-/// Ordinary long-running requests are not silently promoted to goals, and a
-/// quoted multi-line transcript cannot authorize one through a later line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplicitGoalDirective {
-    pub objective: String,
-}
-
-/// Extract an explicit natural-language `/goal` declaration from the user's
-/// first non-empty line.
-///
-/// The provider never participates in this decision. That makes an explicit
-/// declaration behave the same on DeepSeek, Zai, and every compatible route,
-/// while keeping ordinary tasks and discussion *about* `/goal` untouched.
-#[must_use]
-pub fn explicit_goal_directive(input: &str) -> Option<ExplicitGoalDirective> {
-    let line = input.lines().find(|line| !line.trim().is_empty())?.trim();
-    let lower = line.to_ascii_lowercase();
-
-    // Objective follows the directive.
-    for pattern in [
-        "make it your /goal to",
-        "make this your /goal to",
-        "make that your /goal to",
-        "set your /goal to",
-        "set my /goal to",
-        "set the /goal to",
-        "set /goal to",
-        "your /goal is",
-        "my /goal is",
-        "the /goal is",
-    ] {
-        let Some(index) = lower.find(pattern) else {
-            continue;
-        };
-        if !is_direct_goal_clause(&lower[..index]) {
-            continue;
-        }
-        let objective = normalize_explicit_goal_objective(&line[index + pattern.len()..])?;
-        return Some(ExplicitGoalDirective { objective });
-    }
-
-    // Objective precedes the marker: "make solving X your /goal".
-    for marker in [" your /goal", " my /goal", " the /goal"] {
-        let Some(marker_index) = lower.find(marker) else {
-            continue;
-        };
-        let before_marker = &lower[..marker_index];
-        let Some(make_index) = before_marker.rfind("make ") else {
-            continue;
-        };
-        if !is_direct_goal_clause(&lower[..make_index]) {
-            continue;
-        }
-        let objective =
-            normalize_explicit_goal_objective(&line[make_index + "make ".len()..marker_index])?;
-        if matches!(
-            objective.to_ascii_lowercase().as_str(),
-            "it" | "this" | "that"
-        ) {
-            continue;
-        }
-        return Some(ExplicitGoalDirective { objective });
-    }
-
-    None
-}
-
-fn is_direct_goal_clause(prefix: &str) -> bool {
-    let prefix = prefix.trim_end();
-    if prefix.is_empty() {
-        return true;
-    }
-    [
-        "please",
-        "and",
-        "then",
-        "also",
-        "now",
-        "you to",
-        "need to",
-        "can you",
-        "could you",
-        "would you",
-        "can we",
-        "could we",
-        "should",
-        "must",
-        "-",
-        ";",
-        ":",
-        ",",
-    ]
-    .iter()
-    .any(|ending| prefix.ends_with(ending))
-}
-
-fn normalize_explicit_goal_objective(raw: &str) -> Option<String> {
-    let objective = raw
-        .trim()
-        .trim_start_matches([':', '-', '–', '—'])
-        .trim()
-        .trim_end_matches(['.', '!', '?'])
-        .trim();
-    (!objective.is_empty()).then(|| objective.to_string())
-}
-
-/// Operate's automatic goal: Operate turns an ordinary work prompt into the
-/// session goal when no unfinished goal exists (docs/MODES.md, "Operate loop").
-/// It feeds the same `GoalState::create` path as [`explicit_goal_directive`];
-/// an explicit `/goal` declaration always wins, and Plan and Work never call
-/// this.
-///
-/// The whole "is this real work?" rule lives here: the prompt is work when it
-/// has at least [`OPERATE_GOAL_MIN_WORDS`] words, or opens (after "please")
-/// with an imperative work verb and has at least three words. Greetings,
-/// acknowledgements, and short questions stay chat. The objective is the whole
-/// prompt, whitespace-collapsed and bounded so continuation prompts stay small;
-/// the transcript still holds the full text.
-#[must_use]
-pub fn operate_goal_from_prompt(input: &str) -> Option<ExplicitGoalDirective> {
-    let words: Vec<&str> = input.split_whitespace().collect();
-    if words.len() < 3 {
-        return None;
-    }
-    let normalize = |word: &str| {
-        word.trim_matches(|c: char| !c.is_alphanumeric())
-            .to_ascii_lowercase()
-    };
-    let head = words
-        .iter()
-        .map(|word| normalize(word))
-        .find(|word| word != "please")
-        .unwrap_or_default();
-    if OPERATE_CHAT_OPENERS.contains(&head.as_str()) {
-        return None;
-    }
-    let first_line = input.lines().find(|line| !line.trim().is_empty())?.trim();
-    if first_line.ends_with('?') && words.len() < OPERATE_GOAL_QUESTION_WORDS {
-        return None;
-    }
-    if words.len() < OPERATE_GOAL_MIN_WORDS && !OPERATE_WORK_VERBS.contains(&head.as_str()) {
-        return None;
-    }
-    let mut objective = words.join(" ");
-    if objective.chars().count() > OPERATE_GOAL_MAX_OBJECTIVE_CHARS {
-        objective = objective
-            .chars()
-            .take(OPERATE_GOAL_MAX_OBJECTIVE_CHARS)
-            .collect::<String>()
-            .trim_end()
-            .to_string();
-        objective.push('…');
-    }
-    Some(ExplicitGoalDirective { objective })
-}
-
-const OPERATE_GOAL_MIN_WORDS: usize = 8;
-const OPERATE_GOAL_QUESTION_WORDS: usize = 12;
-const OPERATE_GOAL_MAX_OBJECTIVE_CHARS: usize = 600;
-const OPERATE_CHAT_OPENERS: &[&str] = &[
-    "hi", "hello", "hey", "thanks", "thank", "ok", "okay", "yes", "no", "sure", "great", "cool",
-    "nice", "lol",
-];
-const OPERATE_WORK_VERBS: &[&str] = &[
-    "add",
-    "build",
-    "change",
-    "clean",
-    "convert",
-    "create",
-    "debug",
-    "deploy",
-    "design",
-    "document",
-    "extract",
-    "finish",
-    "fix",
-    "implement",
-    "improve",
-    "integrate",
-    "investigate",
-    "make",
-    "migrate",
-    "move",
-    "optimize",
-    "port",
-    "refactor",
-    "remove",
-    "rename",
-    "replace",
-    "resolve",
-    "rewrite",
-    "run",
-    "ship",
-    "split",
-    "test",
-    "update",
-    "upgrade",
-    "verify",
-    "wire",
-    "write",
-];
 
 /// Runtime status for a goal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -291,16 +66,7 @@ impl GoalStatus {
     }
 }
 
-/// Why an otherwise unfinished goal is paused.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalPauseReason {
-    User,
-    Backoff,
-    NoProgress,
-    UsageLimit,
-    BudgetLimit,
-}
+pub use codewhale_protocol::GoalPauseReason;
 
 /// Whether a goal review is allowed to decide the judged contract.
 ///
@@ -322,23 +88,25 @@ pub struct GoalAdvisoryNote {
     pub summary: String,
 }
 
-impl GoalPauseReason {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Backoff => "run limit",
-            Self::NoProgress => "no progress",
-            Self::UsageLimit => "usage limit",
-            Self::BudgetLimit => "budget limit",
-        }
-    }
+/// The model's own reported progress for the active goal: a coarse percent
+/// plus what is happening now and what comes next. Runtime-only — the durable
+/// record deliberately keeps no volatile progress projection. The percent is
+/// the model's estimate, rendered as reported progress, never as a verified
+/// fraction of the work.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GoalProgressReport {
+    pub percent: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// Session-local goal state. `Instant` stays runtime-only; snapshots expose
 /// elapsed seconds so tool output remains serializable and stable.
 #[derive(Debug, Clone, Default)]
 pub struct GoalState {
+    goal_id: Option<String>,
     objective: Option<String>,
     token_budget: Option<u32>,
     status: Option<GoalStatus>,
@@ -354,6 +122,20 @@ pub struct GoalState {
     advisories: Vec<GoalAdvisoryNote>,
     last_gap_fingerprint: Option<String>,
     repeated_gap_count: u32,
+    /// The continuation pass the repeated-gap counter last advanced on.
+    /// The bound is "equivalent gaps on consecutive PASSES", so a verifier
+    /// reporting the same gap several times inside one turn must not trip it
+    /// before any continuation has happened.
+    last_gap_pass: Option<u32>,
+    /// Latest reported progress, kept out of the stall accounting entirely.
+    progress: Option<GoalProgressReport>,
+    /// The current blocker was set by the runtime (a continuation turn that
+    /// failed, timed out or never started), not reported by the model or the
+    /// user. Such a stop is not a judgement about the work, so the user's next
+    /// message resumes the goal (see [`Self::resume_after_runtime_block`]).
+    /// Known limitation: session-local, like the rest of this state's
+    /// lifecycle detail; a restored Blocked goal needs `/goal resume`.
+    runtime_blocked: bool,
 }
 
 impl GoalState {
@@ -389,6 +171,7 @@ impl GoalState {
                         .status
                         .is_some_and(|previous| previous != GoalStatus::Active);
                 if changed {
+                    self.goal_id = Some(uuid::Uuid::new_v4().to_string());
                     self.objective = Some(objective.to_string());
                     self.token_budget = token_budget;
                     self.tokens_used = 0;
@@ -402,17 +185,22 @@ impl GoalState {
                     self.advisories.clear();
                     self.last_gap_fingerprint = None;
                     self.repeated_gap_count = 0;
+                    self.last_gap_pass = None;
+                    self.progress = None;
                 } else if self.token_budget != token_budget {
                     self.token_budget = token_budget;
                 }
 
                 if resumed {
+                    self.goal_id = Some(uuid::Uuid::new_v4().to_string());
                     self.evidence = None;
                     self.blocker = None;
                     self.pause_reason = None;
                     self.completion_verification = None;
                     self.last_gap_fingerprint = None;
                     self.repeated_gap_count = 0;
+                    self.last_gap_pass = None;
+                    self.progress = None;
                 }
 
                 if changed || status_changed || self.status.is_none() {
@@ -443,6 +231,7 @@ impl GoalState {
                 "An unfinished goal already exists. Complete or clear it before creating another.",
             );
         }
+        self.goal_id = Some(uuid::Uuid::new_v4().to_string());
         self.objective = Some(objective);
         self.token_budget = token_budget;
         self.status = Some(GoalStatus::Active);
@@ -458,6 +247,8 @@ impl GoalState {
         self.advisories.clear();
         self.last_gap_fingerprint = None;
         self.repeated_gap_count = 0;
+        self.last_gap_pass = None;
+        self.progress = None;
         Ok(())
     }
 
@@ -470,6 +261,7 @@ impl GoalState {
     /// the engine is rehydrating, not re-declaring, the goal. Evidence,
     /// blockers, and review notes are runtime-only and start empty; the
     /// durable loop re-derives them on the next pass.
+    ///
     #[must_use]
     pub fn from_persisted(
         objective: &str,
@@ -481,6 +273,7 @@ impl GoalState {
         continuation_count: u32,
     ) -> Self {
         Self {
+            goal_id: None,
             objective: Some(objective.to_string()),
             token_budget,
             status: Some(status),
@@ -496,6 +289,91 @@ impl GoalState {
             advisories: Vec::new(),
             last_gap_fingerprint: None,
             repeated_gap_count: 0,
+            last_gap_pass: None,
+            progress: None,
+            // The origin of a persisted blocker is not recorded; treat it as
+            // reported so only an explicit resume clears it.
+            runtime_blocked: false,
+        }
+    }
+
+    /// Keep the pre-pause review window on ordinary load. Invalid in-memory
+    /// input is held paused; durable stores reject it before this constructor.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &GoalSnapshot) -> Self {
+        let Some(objective) = snapshot.objective.as_deref() else {
+            return Self::default();
+        };
+        let status = match snapshot.status.as_str() {
+            "active" => GoalStatus::Active,
+            "complete" => GoalStatus::Complete,
+            "blocked" => GoalStatus::Blocked,
+            _ => GoalStatus::Paused,
+        };
+        let mut state = Self::from_persisted(
+            objective,
+            snapshot.token_budget,
+            status,
+            snapshot.pause_reason,
+            snapshot.tokens_used,
+            snapshot.time_used_seconds,
+            snapshot.continuation_count,
+        );
+        state.goal_id.clone_from(&snapshot.goal_id);
+        state
+            .last_gap_fingerprint
+            .clone_from(&snapshot.last_gap_fingerprint);
+        state.repeated_gap_count = snapshot.repeated_gap_count;
+        state.last_gap_pass = snapshot.last_gap_pass;
+        state.progress = snapshot.progress.clone();
+        let now = Instant::now();
+        state.started_at = now
+            .checked_sub(std::time::Duration::from_secs(
+                snapshot
+                    .elapsed_seconds
+                    .unwrap_or(snapshot.time_used_seconds),
+            ))
+            .or(Some(now));
+        let stall_window_exhausted = state.status == Some(GoalStatus::Active)
+            && state.repeated_gap_count >= crate::goal_loop::MAX_REPEATED_GAP_PASSES;
+        if let Err(error) = snapshot.validate_stall_state() {
+            tracing::warn!("holding invalid restored goal paused: {error}");
+            state.status = Some(GoalStatus::Paused);
+            state.pause_reason = Some(GoalPauseReason::NoProgress);
+            state.finished_at = Some(now);
+        } else if stall_window_exhausted {
+            // The engine pauses NoProgress in the same mutation that fills
+            // the stall window, so a restored Active goal at the ceiling is
+            // corrupt; hold it paused rather than re-arming spent passes.
+            tracing::warn!("holding exhausted-stall-window restored goal paused");
+            state.status = Some(GoalStatus::Paused);
+            state.pause_reason = Some(GoalPauseReason::NoProgress);
+            state.finished_at = Some(now);
+        }
+        state
+    }
+
+    /// An accepted user resume is a new control revision, even when already
+    /// active. Cached loads never call this path.
+    pub fn resume(&mut self, goal_id: Option<String>) {
+        let objective = self.objective.clone();
+        self.sync_from_host_status(objective.as_deref(), self.token_budget, GoalStatus::Active);
+        if self.objective.is_some() {
+            self.goal_id = Some(goal_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+            self.last_gap_fingerprint = None;
+            self.repeated_gap_count = 0;
+            self.last_gap_pass = None;
+            self.progress = None;
+        }
+    }
+
+    /// A new explicit declaration replaces the old revision, including when
+    /// the user repeats the same objective text.
+    pub fn replace(&mut self, objective: &str, token_budget: Option<u32>, goal_id: Option<String>) {
+        self.clear();
+        self.sync_from_host_status(Some(objective), token_budget, GoalStatus::Active);
+        if let Some(goal_id) = goal_id {
+            self.goal_id = Some(goal_id);
         }
     }
 
@@ -539,6 +417,14 @@ impl GoalState {
         Ok(())
     }
 
+    /// Replace the reported progress projection. This never touches the
+    /// stall window or lifecycle state; it is display context only.
+    pub fn record_progress(&mut self, progress: GoalProgressReport) {
+        if self.is_active() {
+            self.progress = Some(progress);
+        }
+    }
+
     pub fn record_advisory(&mut self, summary: String) -> Result<(), &'static str> {
         if !self.is_active() {
             return Err("Advisory notes require an active goal.");
@@ -565,20 +451,79 @@ impl GoalState {
 
         let fingerprint = gap_fingerprint(&verification.gaps)
             .ok_or("Critical not-achieved verification requires at least one concrete gap.")?;
-        self.repeated_gap_count = if self.last_gap_fingerprint.as_deref() == Some(&fingerprint) {
-            self.repeated_gap_count.saturating_add(1)
-        } else {
+        // Advance at most once per continuation pass. `record_not_achieved`
+        // runs per `update_goal` tool call, so counting calls would let a
+        // verifier that reports one gap three times in a single turn pause the
+        // goal before a single continuation had been spent — stopping valid
+        // work rather than a stall.
+        let same_gap = self.last_gap_fingerprint.as_deref() == Some(&fingerprint);
+        let already_counted_this_pass = self.last_gap_pass == Some(self.continuation_count);
+        self.repeated_gap_count = if !same_gap {
             1
+        } else if already_counted_this_pass {
+            self.repeated_gap_count
+        } else {
+            self.repeated_gap_count.saturating_add(1)
         };
+        self.last_gap_pass = Some(self.continuation_count);
         self.last_gap_fingerprint = Some(fingerprint);
 
+        // The stall bound the continuation prompt promises. Pausing *is* the
+        // stop: both continuation dispatchers refuse to re-dispatch a goal
+        // whose snapshot is not "active", and the runtime host mirrors a
+        // non-limit pause into the durable `ThreadGoalStatus::Paused`, so this
+        // needs no second gate in `decide_continuation` and survives a restart
+        // until someone explicitly resumes.
+        if self.repeated_gap_count >= crate::goal_loop::MAX_REPEATED_GAP_PASSES {
+            tracing::warn!(
+                repeated_gap_count = self.repeated_gap_count,
+                max_repeated_gap_passes = crate::goal_loop::MAX_REPEATED_GAP_PASSES,
+                "goal stall pause: critical verifier reported an equivalent gap set on \
+                 consecutive passes; pausing for inspection instead of spending further"
+            );
+            self.mark_paused(GoalPauseReason::NoProgress)?;
+        }
+
         Ok(())
+    }
+
+    /// Block on a runtime stop rather than a reported blocker; see
+    /// [`Self::runtime_blocked`].
+    pub fn mark_runtime_blocked(&mut self, blocker: String) -> Result<(), &'static str> {
+        self.mark_blocked(blocker)?;
+        self.runtime_blocked = true;
+        Ok(())
+    }
+
+    /// Resume a goal whose only blocker was a runtime stop, as a new control
+    /// revision. Returns false, changing nothing, for any other state: a
+    /// reported blocker stays until an explicit resume.
+    pub fn resume_after_runtime_block(&mut self) -> bool {
+        if !(self.runtime_blocked && self.status == Some(GoalStatus::Blocked)) {
+            return false;
+        }
+        self.resume(None);
+        self.runtime_blocked = false;
+        true
+    }
+
+    /// Whether a judged completion has sealed this goal. A sealed goal is
+    /// terminal: blocking or pausing it would overwrite the verified
+    /// completion, so only an explicit resume or a new goal moves it on.
+    fn completion_sealed(&self) -> bool {
+        self.status == Some(GoalStatus::Complete) || self.completion_verification.is_some()
     }
 
     pub fn mark_blocked(&mut self, blocker: String) -> Result<(), &'static str> {
         if self.objective.is_none() {
             return Err("No active goal exists to block.");
         }
+        if self.completion_sealed() {
+            return Err(
+                "The goal is already complete with a judged verification; it cannot be blocked.",
+            );
+        }
+        self.runtime_blocked = false;
         self.status = Some(GoalStatus::Blocked);
         self.finished_at = Some(Instant::now());
         self.blocker = Some(blocker);
@@ -591,6 +536,11 @@ impl GoalState {
     pub fn mark_paused(&mut self, reason: GoalPauseReason) -> Result<(), &'static str> {
         if self.objective.is_none() {
             return Err("No active goal exists to pause.");
+        }
+        if self.completion_sealed() {
+            return Err(
+                "The goal is already complete with a judged verification; it cannot be paused.",
+            );
         }
         self.status = Some(GoalStatus::Paused);
         self.finished_at = Some(Instant::now());
@@ -617,6 +567,7 @@ impl GoalState {
             (None, _) => None,
         };
         GoalSnapshot {
+            goal_id: self.goal_id.clone(),
             objective: self.objective.clone(),
             status: self
                 .status
@@ -635,6 +586,8 @@ impl GoalState {
             advisories: self.advisories.clone(),
             last_gap_fingerprint: self.last_gap_fingerprint.clone(),
             repeated_gap_count: self.repeated_gap_count,
+            last_gap_pass: self.last_gap_pass,
+            progress: self.progress.clone(),
         }
     }
 }
@@ -642,6 +595,7 @@ impl GoalState {
 /// Serializable tool output and prompt input for the current goal.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct GoalSnapshot {
+    pub goal_id: Option<String>,
     pub objective: Option<String>,
     pub status: String,
     pub token_budget: Option<u32>,
@@ -656,6 +610,11 @@ pub struct GoalSnapshot {
     pub advisories: Vec<GoalAdvisoryNote>,
     pub last_gap_fingerprint: Option<String>,
     pub repeated_gap_count: u32,
+    pub last_gap_pass: Option<u32>,
+    /// Latest reported progress. Skipped when absent so tool output and the
+    /// continuation prompt stay stable for goals that never report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<GoalProgressReport>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -739,10 +698,20 @@ impl GoalSnapshot {
         self.objective.is_some() && self.status == GoalStatus::Active.as_str()
     }
 
+    pub fn validate_stall_state(&self) -> Result<(), &'static str> {
+        codewhale_protocol::validate_goal_stall_state(
+            self.last_gap_fingerprint.as_deref(),
+            self.repeated_gap_count,
+            self.last_gap_pass,
+            self.continuation_count,
+        )
+    }
+
     #[must_use]
     pub fn from_thread_goal(goal: &codewhale_protocol::ThreadGoal) -> Self {
         let (status, pause_reason) = thread_goal_status_projection(goal.status.clone());
         Self {
+            goal_id: Some(goal.goal_id.clone()),
             objective: Some(goal.objective.clone()),
             status: status.as_str().to_string(),
             token_budget: goal
@@ -754,11 +723,13 @@ impl GoalSnapshot {
             elapsed_seconds: None,
             evidence: None,
             blocker: None,
-            pause_reason,
+            pause_reason: goal.pause_reason.or(pause_reason),
             completion_verification: None,
             advisories: Vec::new(),
-            last_gap_fingerprint: None,
-            repeated_gap_count: 0,
+            last_gap_fingerprint: goal.last_gap_fingerprint.clone(),
+            repeated_gap_count: goal.repeated_gap_count,
+            last_gap_pass: goal.last_gap_pass,
+            progress: None,
         }
     }
 }
@@ -790,11 +761,25 @@ pub fn thread_goal_status_projection(
 pub fn render_continuation_prompt(snapshot: &GoalSnapshot, continuation_index: u32) -> String {
     let goal_json = serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".to_string());
     format!(
-        "{}\n\n## Active Goal State\n\n```json\n{}\n```\n\nContinuation pass #{}.\nIf a critical verifier finds remaining work, call `update_goal` with `status: \"not_achieved\"` and its concrete `verification.gaps`; repeated equivalent gap sets pause the loop for inspection instead of spending indefinitely. If the goal is complete, first run or cite a concrete verifier/check when one applies, then call `update_goal` with `status: \"complete\"`, concrete evidence, and `verification: {{\"status\":\"passed\",\"check\":\"...\",\"summary\":\"...\"}}`. For non-verifiable work (docs, research, writing), use `verification: {{\"status\":\"not_applicable\",\"check\":\"...\",\"summary\":\"...\"}}` with a clear rationale instead of fabricating a verifier receipt. If it is blocked, call `update_goal` with `status: \"blocked\"` and the blocker. Otherwise continue making progress toward the objective.",
+        "{}\n\n## Active Goal State\n\n```json\n{}\n```\n\nContinuation pass #{}.\nIf a critical verifier finds remaining work, call `update_goal` with `status: \"not_achieved\"` and its concrete `verification.gaps`; {} equivalent gap sets in a row pause this goal (`no progress`) for inspection instead of spending indefinitely, so report what actually still fails rather than restating the previous pass. If the goal is complete, first run or cite a concrete verifier/check when one applies, then call `update_goal` with `status: \"complete\"`, concrete evidence, and `verification: {{\"status\":\"passed\",\"check\":\"...\",\"summary\":\"...\"}}`. For non-verifiable work (docs, research, writing), use `verification: {{\"status\":\"not_applicable\",\"check\":\"...\",\"summary\":\"...\"}}` with a clear rationale instead of fabricating a verifier receipt. If it is blocked, call `update_goal` with `status: \"blocked\"` and the blocker. Otherwise continue making progress toward the objective.",
         crate::prompts::GOAL_CONTINUATION_PROMPT.trim(),
         goal_json,
         continuation_index,
+        crate::goal_loop::MAX_REPEATED_GAP_PASSES,
     )
+}
+
+/// Render the reported-progress bar used by the transcript receipt and the
+/// metrics line: eight cells, filled in proportion to the percent. The bar
+/// visualizes a model-reported estimate; it is not a verified fraction.
+#[must_use]
+pub fn goal_progress_bar(percent: u8) -> String {
+    const CELLS: usize = 8;
+    let filled = (usize::from(percent.min(100)) * CELLS + 50) / 100;
+    let mut bar = String::with_capacity(CELLS * 3);
+    bar.push_str(&"▓".repeat(filled));
+    bar.push_str(&"░".repeat(CELLS - filled));
+    bar
 }
 
 fn lock_goal_state(
@@ -878,6 +863,36 @@ fn parse_progress_verification(input: &Value) -> Result<GoalProgressVerification
     Ok(verification)
 }
 
+fn parse_progress_report(input: &Value) -> Result<Option<GoalProgressReport>, ToolError> {
+    let Some(raw) = input.get("progress") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let percent = raw.get("percent").and_then(Value::as_u64).ok_or_else(|| {
+        ToolError::invalid_input("progress.percent must be an integer from 0 to 100")
+    })?;
+    let percent = u8::try_from(percent)
+        .ok()
+        .filter(|percent| *percent <= 100)
+        .ok_or_else(|| {
+            ToolError::invalid_input("progress.percent must be an integer from 0 to 100")
+        })?;
+    let note = |key: &str| -> Option<String> {
+        raw.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(160).collect())
+    };
+    Ok(Some(GoalProgressReport {
+        percent,
+        now: note("now"),
+        next: note("next"),
+    }))
+}
+
 fn json_result(snapshot: &GoalSnapshot) -> Result<ToolResult, ToolError> {
     ToolResult::json(snapshot).map_err(|err| ToolError::execution_failed(err.to_string()))
 }
@@ -909,7 +924,7 @@ impl ToolSpec for CreateGoalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create the session's one persistent goal: a completion objective Codewhale keeps working toward across turns until it is verified complete, blocked, or the user stops it. Call this only when the user explicitly asks to use `/goal`, make an objective the goal, or otherwise explicitly requests persistent goal tracking. When the request is explicit, call `create_goal` before doing the rest of the work; acknowledging it in prose is not sufficient. Never infer a goal from an ordinary task, its apparent length, a question, or a one-file edit. Keep the user's full objective, not a shortened one-turn version. Set token_budget only when the user explicitly provides one. Creating a goal shows the user a one-line receipt (they can /goal pause or /goal clear); do not also ask for confirmation. Only one unfinished goal exists at a time: complete or clear it before creating another."
+        "Create the session's one persistent goal: a completion objective Codewhale keeps working toward across turns until it is verified complete, blocked, or the user stops it. A goal is for a durable objective that outlasts one turn: a multi-step outcome the user wants continued and verified. A question, a greeting, or a one-shot edit completes as an ordinary turn. When the user explicitly asks to use `/goal` or to make something the goal, `create_goal` is what records it; acknowledging it in prose records nothing. The objective is the user's full objective, not a shortened one-turn version. token_budget carries a budget the user stated; with none stated it stays unset. Creating a goal shows the user a one-line receipt (they can /goal pause or /goal clear), so it needs no separate confirmation. Only one unfinished goal exists at a time: an existing one is completed or cleared before another is created."
     }
 
     fn input_schema(&self) -> Value {
@@ -1029,7 +1044,7 @@ impl ToolSpec for UpdateGoalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update the runtime goal completion gate. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input."
+        "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input."
     }
 
     fn input_schema(&self) -> Value {
@@ -1083,6 +1098,28 @@ impl ToolSpec for UpdateGoalTool {
                 "advisory": {
                     "type": "string",
                     "description": "Required when status is advisory. Appended separately from the judged completion contract."
+                },
+                "progress": {
+                    "type": "object",
+                    "description": "Optional with not_achieved or advisory: your current best estimate of overall completion, shown to the user as reported progress. Keep percent honest — it is an estimate, never a verified fraction.",
+                    "properties": {
+                        "percent": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "Estimated percent complete, 0-100."
+                        },
+                        "now": {
+                            "type": "string",
+                            "description": "One short line: what is being worked on right now."
+                        },
+                        "next": {
+                            "type": "string",
+                            "description": "One short line: what comes next."
+                        }
+                    },
+                    "required": ["percent"],
+                    "additionalProperties": false
                 }
             },
             "required": ["status"],
@@ -1114,8 +1151,23 @@ impl ToolSpec for UpdateGoalTool {
             ));
         }
         let status = required_str(&input, "status")?.trim().to_ascii_lowercase();
+        let progress = parse_progress_report(&input)?;
+        if progress.is_some() && !matches!(status.as_str(), "not_achieved" | "advisory") {
+            return Err(ToolError::invalid_input(
+                "progress is only accepted with status not_achieved or advisory",
+            ));
+        }
         let snapshot = {
             let mut state = lock_goal_state(&self.goal_state)?;
+            // #6542: with no goal there is nothing to update. Say so as a
+            // successful no-op rather than an error the model retries.
+            if state.objective.is_none() {
+                return Ok(ToolResult::success(format!(
+                    "No goal is set, so update_goal(status: {status}) changed nothing. \
+                     Continue the user's request directly; create_goal only if the user \
+                     asked for a tracked goal."
+                )));
+            }
             match status.as_str() {
                 "complete" => {
                     let evidence = input
@@ -1155,6 +1207,9 @@ impl ToolSpec for UpdateGoalTool {
                     state
                         .record_not_achieved(verification)
                         .map_err(ToolError::invalid_input)?;
+                    if let Some(progress) = progress {
+                        state.record_progress(progress);
+                    }
                 }
                 "advisory" => {
                     let advisory = input
@@ -1171,6 +1226,9 @@ impl ToolSpec for UpdateGoalTool {
                     state
                         .record_advisory(advisory)
                         .map_err(ToolError::invalid_input)?;
+                    if let Some(progress) = progress {
+                        state.record_progress(progress);
+                    }
                 }
                 other => {
                     return Err(ToolError::invalid_input(format!(
@@ -1189,84 +1247,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-
-    #[test]
-    fn explicit_goal_directive_extracts_user_requested_objective() {
-        let request = explicit_goal_directive(
-            "hello - take over and make it your /goal to solve navier stokes",
-        )
-        .expect("explicit /goal request");
-        assert_eq!(request.objective, "solve navier stokes");
-
-        let request = explicit_goal_directive("Please make ship the release your /goal.")
-            .expect("objective-before-marker request");
-        assert_eq!(request.objective, "ship the release");
-
-        let request = explicit_goal_directive("Could you set /goal to repair provider routing?")
-            .expect("set /goal request");
-        assert_eq!(request.objective, "repair provider routing");
-    }
-
-    #[test]
-    fn explicit_goal_directive_rejects_ordinary_or_quoted_goal_discussion() {
-        for input in [
-            "solve navier stokes",
-            "why didn't you make it your /goal to solve navier stokes?",
-            "what does /goal do?",
-            "review the /goal implementation",
-            "see this transcript where /goal was ignored:\nhello - take over and make it your /goal to solve navier stokes",
-        ] {
-            assert_eq!(
-                explicit_goal_directive(input),
-                None,
-                "must not activate from: {input}"
-            );
-        }
-    }
-
-    #[test]
-    fn operate_goal_from_prompt_promotes_work_and_leaves_chat_alone() {
-        let goal = operate_goal_from_prompt(
-            "Migrate the settings loader to the new config crate\nand keep the old keys readable.",
-        )
-        .expect("multi-line work prompt");
-        assert_eq!(
-            goal.objective,
-            "Migrate the settings loader to the new config crate and keep the old keys readable."
-        );
-        assert_eq!(
-            operate_goal_from_prompt("Please fix the flaky CI test")
-                .expect("imperative after please")
-                .objective,
-            "Please fix the flaky CI test"
-        );
-        assert!(
-            operate_goal_from_prompt(
-                "Could you look at why the provider table drops rows after a reload and repair it?"
-            )
-            .is_some(),
-            "a long question is still work"
-        );
-        for chat in [
-            "hi",
-            "thanks, looks good",
-            "ok go ahead",
-            "hello there, how are you doing today my friend",
-            "what does /goal do?",
-            "why is the build slow?",
-            "the tests",
-        ] {
-            assert_eq!(
-                operate_goal_from_prompt(chat),
-                None,
-                "must stay chat: {chat}"
-            );
-        }
-        let long = "fix ".repeat(400);
-        let objective = operate_goal_from_prompt(&long).expect("bounded").objective;
-        assert!(objective.chars().count() <= OPERATE_GOAL_MAX_OBJECTIVE_CHARS + 1);
-        assert!(objective.ends_with('…'));
-    }
 
     #[tokio::test]
     async fn update_goal_rejects_objective_knob_instead_of_ignoring_it() {
@@ -1300,6 +1280,29 @@ mod tests {
         assert!(message.contains("create_goal"), "{message}");
         // The rejected call must not have mutated goal state.
         assert!(state.lock().expect("goal lock").is_active());
+    }
+
+    #[tokio::test]
+    async fn update_goal_without_a_goal_is_a_clear_no_op() {
+        let state = new_shared_goal_state();
+        let update = UpdateGoalTool::new(state.clone());
+        for input in [
+            json!({"status": "complete", "evidence": "done"}),
+            json!({"status": "blocked", "blocker": "x"}),
+            json!({"status": "advisory", "advisory": "note"}),
+        ] {
+            let result = update
+                .execute(input, &ToolContext::new("."))
+                .await
+                .expect("no goal is a no-op, not an error");
+            assert!(result.success);
+            assert!(
+                result.content.contains("No goal is set"),
+                "{}",
+                result.content
+            );
+        }
+        assert!(state.lock().expect("goal lock").objective.is_none());
     }
 
     #[tokio::test]
@@ -1440,6 +1443,46 @@ mod tests {
         assert_eq!(resumed.evidence, None);
         assert_eq!(resumed.blocker, None);
         assert_eq!(resumed.completion_verification, None);
+    }
+
+    /// #6561 D04-12: blocking or pausing used to overwrite a sealed, judged
+    /// completion and clear its verification.
+    #[test]
+    fn sealed_completion_cannot_be_blocked_or_paused() {
+        let mut state = GoalState::default();
+        state
+            .create("ship the verified change".to_string(), None)
+            .expect("create goal");
+        state
+            .mark_complete(
+                "focused tests passed".to_string(),
+                GoalCompletionVerification {
+                    status: "passed".to_string(),
+                    check: "cargo test".to_string(),
+                    summary: "goal tests passed".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("complete goal");
+        let sealed = state.snapshot();
+
+        assert!(state.mark_blocked("late blocker".to_string()).is_err());
+        assert!(
+            state
+                .mark_runtime_blocked("runtime stop".to_string())
+                .is_err()
+        );
+        assert!(state.mark_paused(GoalPauseReason::NoProgress).is_err());
+
+        let after = state.snapshot();
+        assert_eq!(after.status, "complete");
+        assert_eq!(after.evidence, sealed.evidence);
+        assert_eq!(after.blocker, None);
+        assert!(after.completion_verification.is_some());
+        assert_eq!(
+            after.completion_verification,
+            sealed.completion_verification
+        );
     }
 
     #[test]
@@ -1729,6 +1772,9 @@ mod tests {
                 &["first gap"],
             ))
             .expect("first critical review");
+        // Two reports of one gap only count twice when they land on separate
+        // continuation passes; several inside one turn are one pass.
+        state.record_continuation();
         state
             .record_not_achieved(not_achieved_review(
                 GoalReviewRole::Critical,
@@ -1757,6 +1803,97 @@ mod tests {
         let progressed = state.snapshot();
         assert_eq!(progressed.repeated_gap_count, 1);
         assert_eq!(progressed.status, "active");
+    }
+
+    #[test]
+    fn repeated_equivalent_gap_sets_pause_the_loop_for_no_progress() {
+        // The continuation prompt promises this stop, and until it existed the
+        // default Operate goal had none: `DEFAULT_MAX_GOAL_CONTINUATIONS` is 0,
+        // so only the model volunteering complete/blocked ended a run.
+        let mut state = GoalState::default();
+        state
+            .create("stall on purpose".to_string(), None)
+            .expect("create goal");
+
+        for pass in 1..crate::goal_loop::MAX_REPEATED_GAP_PASSES {
+            state
+                .record_not_achieved(not_achieved_review(
+                    GoalReviewRole::Critical,
+                    &["provider copy still wrong", "  Regression   test MISSING "],
+                ))
+                .expect("critical review below the stall bound");
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.repeated_gap_count, pass);
+            assert!(
+                snapshot.is_active(),
+                "pass {pass} is under the bound and must keep working",
+            );
+            // The bound counts continuation PASSES, so each iteration has to
+            // actually be one. Without this the loop would be several reports
+            // inside a single turn, which deliberately no longer advances it.
+            state.record_continuation();
+        }
+
+        // Reordered and re-cased wording is the same gap set, so restating the
+        // previous pass cannot buy another pass.
+        state
+            .record_not_achieved(not_achieved_review(
+                GoalReviewRole::Critical,
+                &["Regression test missing", "PROVIDER copy still wrong"],
+            ))
+            .expect("stall review is recorded, not rejected");
+
+        let stalled = state.snapshot();
+        assert_eq!(
+            stalled.repeated_gap_count,
+            crate::goal_loop::MAX_REPEATED_GAP_PASSES
+        );
+        assert_eq!(stalled.status, "paused");
+        assert_eq!(stalled.pause_reason, Some(GoalPauseReason::NoProgress));
+        assert!(
+            !stalled.is_active(),
+            "an inactive goal is what stops both continuation dispatchers",
+        );
+
+        // The pause holds: a stalled goal cannot keep reporting gaps at itself.
+        let err = state
+            .record_not_achieved(not_achieved_review(
+                GoalReviewRole::Critical,
+                &["provider copy still wrong"],
+            ))
+            .expect_err("a paused goal takes no further verifier progress");
+        assert!(err.contains("active goal"));
+    }
+
+    #[test]
+    fn repeating_one_gap_inside_a_single_turn_does_not_trip_the_stall_bound() {
+        // `record_not_achieved` runs per `update_goal` tool call. Counting
+        // calls rather than passes meant a verifier that restated the same gap
+        // three times in ONE turn paused the goal before a single continuation
+        // had been spent — stopping valid work and calling it a stall.
+        let mut state = GoalState::default();
+        state
+            .create("one turn, several reports".to_string(), None)
+            .expect("create goal");
+
+        for _ in 0..(crate::goal_loop::MAX_REPEATED_GAP_PASSES + 2) {
+            state
+                .record_not_achieved(not_achieved_review(
+                    GoalReviewRole::Critical,
+                    &["provider copy still wrong"],
+                ))
+                .expect("repeated reports inside one turn are recorded");
+        }
+
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.repeated_gap_count, 1,
+            "many reports in one turn are still one pass",
+        );
+        assert!(
+            snapshot.is_active(),
+            "no continuation was spent, so there is no stall to pause on",
+        );
     }
 
     #[tokio::test]
@@ -1860,6 +1997,10 @@ mod tests {
             tokens_used: 750,
             time_used_seconds: 44,
             continuation_count: 3,
+            last_gap_fingerprint: None,
+            repeated_gap_count: 0,
+            last_gap_pass: None,
+            pause_reason: None,
             created_at: 1,
             updated_at: 2,
         });
@@ -1914,12 +2055,164 @@ mod tests {
         assert!(prompt.contains("Goal Continuation"));
         assert!(prompt.contains("finish issue 2199"));
         assert!(prompt.contains("Continuation pass #2"));
+        // The named bound has to be the one the state machine actually
+        // enforces; the prompt used to promise a stall stop that nothing
+        // implemented.
+        assert!(
+            prompt.contains(&format!(
+                "{} equivalent gap sets in a row",
+                crate::goal_loop::MAX_REPEATED_GAP_PASSES
+            )),
+            "{prompt}"
+        );
     }
 
     #[test]
     fn update_goal_contract_treats_required_user_input_as_blocking() {
         let update = UpdateGoalTool::new(new_shared_goal_state());
         assert!(update.description().contains("requires user input"));
+    }
+
+    #[test]
+    fn goal_progress_bar_fills_in_proportion() {
+        assert_eq!(goal_progress_bar(0), "░░░░░░░░");
+        assert_eq!(goal_progress_bar(50), "▓▓▓▓░░░░");
+        assert_eq!(goal_progress_bar(100), "▓▓▓▓▓▓▓▓");
+        assert_eq!(goal_progress_bar(200), "▓▓▓▓▓▓▓▓");
+    }
+
+    #[tokio::test]
+    async fn update_goal_records_progress_with_not_achieved_and_advisory() {
+        let state = new_shared_goal_state();
+        {
+            let mut guard = state.lock().expect("goal lock");
+            guard
+                .create("ship the release".to_string(), None)
+                .expect("create");
+        }
+        let tool = UpdateGoalTool::new(state.clone());
+        let context = ToolContext::new(".");
+        let result = tool
+            .execute(
+                json!({
+                    "status": "not_achieved",
+                    "verification": {
+                        "status": "not_achieved",
+                        "check": "cargo test",
+                        "summary": "two failures remain",
+                        "gaps": ["picker test", "pricing test"]
+                    },
+                    "progress": {"percent": 40, "now": "fixing the picker", "next": "rerun gates"}
+                }),
+                &context,
+            )
+            .await
+            .expect("not_achieved accepted");
+        let snapshot: Value = serde_json::from_str(&result.content).expect("snapshot json");
+        let progress = snapshot.get("progress").expect("progress recorded");
+        assert_eq!(progress.get("percent").and_then(Value::as_u64), Some(40));
+        assert_eq!(
+            progress.get("now").and_then(Value::as_str),
+            Some("fixing the picker")
+        );
+        assert_eq!(
+            progress.get("next").and_then(Value::as_str),
+            Some("rerun gates")
+        );
+
+        let result = tool
+            .execute(
+                json!({
+                    "status": "advisory",
+                    "advisory": "cache eviction is likely",
+                    "progress": {"percent": 55}
+                }),
+                &context,
+            )
+            .await
+            .expect("advisory accepted");
+        let snapshot: Value = serde_json::from_str(&result.content).expect("snapshot json");
+        assert_eq!(
+            snapshot
+                .get("progress")
+                .and_then(|progress| progress.get("percent"))
+                .and_then(Value::as_u64),
+            Some(55)
+        );
+    }
+
+    #[tokio::test]
+    async fn update_goal_rejects_progress_on_terminal_status_and_bad_percent() {
+        let state = new_shared_goal_state();
+        {
+            let mut guard = state.lock().expect("goal lock");
+            guard
+                .create("ship the release".to_string(), None)
+                .expect("create");
+        }
+        let tool = UpdateGoalTool::new(state.clone());
+        let context = ToolContext::new(".");
+        let err = tool
+            .execute(
+                json!({
+                    "status": "complete",
+                    "evidence": "all gates pass",
+                    "verification": {"status": "passed", "check": "cargo test", "summary": "ok"},
+                    "progress": {"percent": 100}
+                }),
+                &context,
+            )
+            .await
+            .expect_err("progress is not terminal evidence");
+        assert!(
+            err.to_string().contains("not_achieved or advisory"),
+            "{err}"
+        );
+
+        let err = tool
+            .execute(
+                json!({
+                    "status": "advisory",
+                    "advisory": "note",
+                    "progress": {"percent": 140}
+                }),
+                &context,
+            )
+            .await
+            .expect_err("percent above 100 must fail");
+        assert!(err.to_string().contains("0 to 100"), "{err}");
+    }
+
+    #[test]
+    fn from_snapshot_holds_exhausted_stall_window_paused() {
+        // A restored snapshot that is still Active with a full stall window
+        // is corrupt: the engine pauses NoProgress in the same mutation that
+        // reaches the ceiling. The rehydrated state must stay paused instead
+        // of arming another pass.
+        let snapshot = GoalSnapshot {
+            goal_id: Some("goal-stall".to_string()),
+            objective: Some("finish issue 2199".to_string()),
+            status: "active".to_string(),
+            continuation_count: 3,
+            last_gap_fingerprint: Some("b".repeat(64)),
+            repeated_gap_count: crate::goal_loop::MAX_REPEATED_GAP_PASSES,
+            last_gap_pass: Some(3),
+            ..Default::default()
+        };
+        snapshot.validate_stall_state().expect("structurally valid");
+        let state = GoalState::from_snapshot(&snapshot);
+        assert_eq!(state.status, Some(GoalStatus::Paused));
+        assert_eq!(state.pause_reason, Some(GoalPauseReason::NoProgress));
+        assert!(!state.is_active());
+
+        // One below the ceiling restores as ordinary Active state.
+        let below = GoalSnapshot {
+            repeated_gap_count: crate::goal_loop::MAX_REPEATED_GAP_PASSES - 1,
+            ..snapshot
+        };
+        let state = GoalState::from_snapshot(&below);
+        assert_eq!(state.status, Some(GoalStatus::Active));
+        assert!(state.is_active());
     }
 
     #[test]

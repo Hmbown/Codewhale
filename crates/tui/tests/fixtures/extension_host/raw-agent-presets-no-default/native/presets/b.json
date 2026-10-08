@@ -1,0 +1,119 @@
+{
+  "catalog": {
+    "version": 1,
+    "mode_selection_enabled": true,
+    "presets": [
+      {
+        "id": "a",
+        "trust": "user",
+        "is_default": false,
+        "name": "Preset Alpha",
+        "description": "First caller only",
+        "order": 1,
+        "entry": {
+          "path": "native/presets/a.mjs",
+          "sha256": "bd5cb0ecb616db7df173e69d01ce68168432adf3541bfad4927bf93bdff46f6d"
+        }
+      },
+      {
+        "id": "b",
+        "trust": "user",
+        "is_default": false,
+        "name": "Preset Beta",
+        "description": "Second caller only",
+        "order": 2,
+        "entry": {
+          "path": "native/presets/b.mjs",
+          "sha256": "3d5fa7f503184098d473990f1f0336059b67a46c2e9a482d4549c2e3281ba894"
+        }
+      }
+    ],
+    "inventory": {
+      "a": {
+        "path": "presets/a/agent.cordis.yml",
+        "rows": [
+          {
+            "entryId": null,
+            "moduleName": "../../common.mjs",
+            "enabled": true
+          }
+        ]
+      },
+      "b": {
+        "path": "presets/b/agent.cordis.yml",
+        "rows": [
+          {
+            "entryId": null,
+            "moduleName": "@demo/preset-row",
+            "enabled": true
+          }
+        ]
+      }
+    }
+  },
+  "selected": {
+    "metadata": {
+      "id": "b",
+      "trust": "user",
+      "is_default": false,
+      "name": "Preset Beta",
+      "description": "Second caller only",
+      "order": 2
+    },
+    "composition": {
+      "version": 1,
+      "layers": [
+        {
+          "path": "presets/b/agent.cordis.yml",
+          "sha256": "6f3b5d28753f9cb525adb799f4fb03b9e564145b71ca7f942a363c3b4d5ed680",
+          "source": "[{\"insert\":[{\"name\":\"@demo/preset-row\",\"config\":{\"text\":\"B\"}}]}]"
+        }
+      ],
+      "modules": [
+        {
+          "name": "@demo/preset-row",
+          "path": "node_modules/@demo/preset-row/index.mjs",
+          "sha256": "171813dc4b1aaadf097944d41e775dd75718d65cd4192afd36457443c635011b"
+        }
+      ],
+      "files": {
+        "package.json": "1ba1f585268e1a36ed9520a6a1896c8c8bee4580b08f4f91788af9083a2af92b",
+        "cordis.patch.json": "17ac2f43fb1a5536d1dc07249504e28c56f3e65778fbc791c4b030482d6a4f4d",
+        "presets/a/agent.cordis.yml": "342270bf4e208a016a78c16cb762d9f701bf9781e995d1306dee7cfbf64258eb",
+        "presets/a/preset.yml": "becb11a9077e0dce820c67e696073c954da1b56121ab2eb5d65a0277669ebb42",
+        "presets/b/agent.cordis.yml": "9294afc1b4ac261d3560e4b55b59f6997239ce8f7f08ce09d52df7d881b3e5fc",
+        "presets/b/preset.yml": "9bca35dbb92a0eea118513763f13fe4d4202d8898a7d1c84b873840a309d8c50",
+        "common.mjs": "171813dc4b1aaadf097944d41e775dd75718d65cd4192afd36457443c635011b",
+        "node_modules/@demo/preset-row/package.json": "610e96eb9caa6596b1cd9746a1ba98c2e5517306022d9a659f202c8eb846189b",
+        "node_modules/@demo/preset-row/index.mjs": "171813dc4b1aaadf097944d41e775dd75718d65cd4192afd36457443c635011b",
+        "skills/a/preset-note/SKILL.md": "4aa8b17b4d3d4c4a671c6ca54508be4cd3354da7c83cc860c203296772e7f354",
+        "skills/b/preset-note/SKILL.md": "c2434166e576ec8d0fca23a1d288edcbf2d33f77c1001c7b185dcc9d9fb3fbf1"
+      }
+    },
+    "source": "- name: \"@demo/preset-row\"\n  config: {text: B}\n"
+  },
+  "composition": {
+    "version": 1,
+    "layers": [
+      {
+        "path": "cordis.patch.json",
+        "sha256": "17ac2f43fb1a5536d1dc07249504e28c56f3e65778fbc791c4b030482d6a4f4d",
+        "source": "[{\"insert\":[{\"id\":\"raw-roster\",\"name\":\"@deepseek-ai/dsh-agent-presets\",\"config\":{\"roots\":[{\"path\":\"presets\",\"trust\":\"user\"}],\"includeShippedRoot\":false,\"includeUserRoot\":false}}]}]"
+      }
+    ],
+    "modules": [],
+    "files": {
+      "package.json": "1ba1f585268e1a36ed9520a6a1896c8c8bee4580b08f4f91788af9083a2af92b",
+      "cordis.patch.json": "17ac2f43fb1a5536d1dc07249504e28c56f3e65778fbc791c4b030482d6a4f4d",
+      "presets/a/agent.cordis.yml": "342270bf4e208a016a78c16cb762d9f701bf9781e995d1306dee7cfbf64258eb",
+      "presets/a/preset.yml": "becb11a9077e0dce820c67e696073c954da1b56121ab2eb5d65a0277669ebb42",
+      "presets/b/agent.cordis.yml": "9294afc1b4ac261d3560e4b55b59f6997239ce8f7f08ce09d52df7d881b3e5fc",
+      "presets/b/preset.yml": "9bca35dbb92a0eea118513763f13fe4d4202d8898a7d1c84b873840a309d8c50",
+      "common.mjs": "171813dc4b1aaadf097944d41e775dd75718d65cd4192afd36457443c635011b",
+      "node_modules/@demo/preset-row/package.json": "610e96eb9caa6596b1cd9746a1ba98c2e5517306022d9a659f202c8eb846189b",
+      "node_modules/@demo/preset-row/index.mjs": "171813dc4b1aaadf097944d41e775dd75718d65cd4192afd36457443c635011b",
+      "skills/a/preset-note/SKILL.md": "4aa8b17b4d3d4c4a671c6ca54508be4cd3354da7c83cc860c203296772e7f354",
+      "skills/b/preset-note/SKILL.md": "c2434166e576ec8d0fca23a1d288edcbf2d33f77c1001c7b185dcc9d9fb3fbf1"
+    }
+  }
+}

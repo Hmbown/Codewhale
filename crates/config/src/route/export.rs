@@ -76,6 +76,7 @@ impl ProvidersExport {
         let offerings = bundled_catalog_offerings();
         let mut routes: Vec<RouteExport> = provider::all_providers()
             .iter()
+            .filter(|entry| entry.kind() != ProviderKind::Antigravity)
             .map(|entry| {
                 let descriptor = ProviderDescriptor::for_kind(entry.kind());
                 route_export(&descriptor, &offerings)
@@ -152,17 +153,13 @@ pub fn parse_route_kind(value: &str) -> Option<ProviderKind> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(kind) = exact_config_identity(trimmed) {
-        return Some(kind);
-    }
     let folded = trimmed.replace('_', "-");
-    if let Some(kind) = exact_config_identity(&folded) {
-        return Some(kind);
-    }
-    if let Some(kind) = clap_compat_alias(trimmed) {
-        return Some(kind);
-    }
-    ProviderKind::parse(trimmed).or_else(|| ProviderKind::parse(&folded.to_ascii_lowercase()))
+    exact_config_identity(trimmed)
+        .or_else(|| exact_config_identity(&folded))
+        .or_else(|| clap_compat_alias(trimmed))
+        .or_else(|| ProviderKind::parse(trimmed))
+        .or_else(|| ProviderKind::parse(&folded.to_ascii_lowercase()))
+        .filter(|kind| *kind != ProviderKind::Antigravity)
 }
 
 /// Exact id / config-table key only. Does not collapse dialect aliases onto
@@ -181,7 +178,6 @@ fn exact_config_identity(value: &str) -> Option<ProviderKind> {
 fn clap_compat_alias(value: &str) -> Option<ProviderKind> {
     let key = value.replace('_', "-").to_ascii_lowercase();
     Some(match key.as_str() {
-        "agy" => ProviderKind::Antigravity,
         "opencodego" | "opencode-go" => ProviderKind::OpencodeGo,
         "ollama-cloud" => ProviderKind::OllamaCloud,
         "mini-max-anthropic" => ProviderKind::MinimaxAnthropic,
@@ -193,6 +189,7 @@ fn clap_compat_alias(value: &str) -> Option<ProviderKind> {
         "x-ai" | "grok" => ProviderKind::Xai,
         "mistral-ai" | "mistralai" | "la-plateforme" => ProviderKind::Mistral,
         "eden-ai" => ProviderKind::Edenai,
+        "zen-mux" => ProviderKind::Zenmux,
         _ => return None,
     })
 }
@@ -213,9 +210,10 @@ mod tests {
         let ids = export.route_ids();
         let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "route ids must be unique");
-        assert_eq!(ids.len(), provider::all_providers().len());
+        assert_eq!(ids.len(), provider::all_providers().len() - 1);
         assert!(ids.contains(&"deepseek"));
         assert!(ids.contains(&"custom"));
+        assert!(!ids.contains(&"antigravity"));
     }
 
     #[test]
@@ -248,13 +246,32 @@ mod tests {
             parse_route_kind("mini-max-anthropic"),
             Some(ProviderKind::MinimaxAnthropic)
         );
+        assert_eq!(parse_route_kind("antigravity"), None);
+        assert_eq!(parse_route_kind("agy"), None);
+        assert_eq!(
+            ProviderKind::parse_config_identity("antigravity"),
+            Some(ProviderKind::Antigravity)
+        );
+        assert_eq!(
+            ProviderKind::parse_config_identity("agy"),
+            Some(ProviderKind::Antigravity)
+        );
         assert_eq!(parse_route_kind(""), None);
         assert_eq!(parse_route_kind("not-a-provider"), None);
     }
 
+    /// Runtime version stamped into every golden fixture.
+    ///
+    /// `codewhale providers export --json` stamps the real build version
+    /// (`env!("CODEWHALE_BUILD_VERSION")` at the call site in `crates/cli`).
+    /// The fixture tracks this crate's version so the committed golden can
+    /// never disagree with the tree it ships in. The route ids are the
+    /// contract; the stamped version only has to be true.
+    const GOLDEN_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
     #[test]
     fn golden_route_ids_are_stable() {
-        let export = ProvidersExport::from_registry("0.9.12");
+        let export = ProvidersExport::from_registry(GOLDEN_RUNTIME_VERSION);
         let actual: Vec<&str> = export.route_ids();
         let expected: Vec<&str> = include_str!("golden_route_ids.txt")
             .lines()
@@ -273,7 +290,7 @@ mod tests {
         if std::env::var("WRITE_GOLDEN").ok().as_deref() != Some("1") {
             return;
         }
-        let export = ProvidersExport::from_registry("0.9.12");
+        let export = ProvidersExport::from_registry(GOLDEN_RUNTIME_VERSION);
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/route/providers-export.golden.json"
@@ -287,13 +304,22 @@ mod tests {
 
     #[test]
     fn golden_providers_export_matches_registry() {
-        let export = ProvidersExport::from_registry("0.9.12");
+        let export = ProvidersExport::from_registry(GOLDEN_RUNTIME_VERSION);
         let golden: ProvidersExport =
             serde_json::from_str(include_str!("providers-export.golden.json"))
                 .expect("providers-export.golden.json must parse");
         assert_eq!(
             export.routes, golden.routes,
             "update providers-export.golden.json from ProvidersExport::from_registry"
+        );
+        // The route rows are the contract, but a golden stamped with a version
+        // the tree has moved past is a stale artifact nothing else catches.
+        assert_eq!(
+            golden.runtime_version, GOLDEN_RUNTIME_VERSION,
+            "providers-export.golden.json is stamped {}; regenerate with: \
+             WRITE_GOLDEN=1 cargo test -p codewhale-config --lib -- --ignored \
+             write_golden_providers_export_when_requested",
+            golden.runtime_version
         );
         assert!(
             !serde_json::to_string(&export)

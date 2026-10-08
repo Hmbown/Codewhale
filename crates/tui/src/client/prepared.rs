@@ -4,7 +4,7 @@
 //! Every **primary agent turn** — `LlmClient::create_message` and
 //! `create_message_stream`, in Chat Completions, Anthropic Messages, and
 //! OpenAI Responses alike — reaches the wire through
-//! [`crate::client::DeepSeekClient::prepare_outbound_request`], which returns a
+//! [`crate::client::CodewhaleClient::prepare_outbound_request`], which returns a
 //! [`PreparedOutboundRequest`]. The transports send it; the preview command
 //! describes it. Because there is exactly one builder, a preview cannot
 //! report a request different from the one a turn would send.
@@ -28,7 +28,7 @@ use serde_json::Value;
 
 use codewhale_config::provider::WireFormat;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 
 /// The wire protocol a prepared request speaks.
 ///
@@ -44,8 +44,6 @@ pub(crate) enum WireDialect {
     AnthropicMessages,
     /// OpenAI-style `POST /responses`.
     OpenAiResponses,
-    /// Google Antigravity / `agy` cloud-code (`POST /v1internal:streamGenerateContent`).
-    GoogleCloudCode,
 }
 
 impl WireDialect {
@@ -63,7 +61,6 @@ impl WireDialect {
             Self::ChatCompletions => "chat-completions",
             Self::AnthropicMessages => "anthropic-messages",
             Self::OpenAiResponses => "openai-responses",
-            Self::GoogleCloudCode => "google-cloud-code",
         }
     }
 }
@@ -86,14 +83,12 @@ pub(crate) enum RouteShape {
     KimiCodeK3,
     /// The exact pay-as-you-go Moonshot K3 route (fixed sampling).
     DirectMoonshotK3,
-    /// The ChatGPT backend Responses path used by the Codex provider.
+    /// The ChatGPT plan Responses path; identifier retained for saved receipts.
     CodexResponses,
     /// OpenCode Zen, whose model route re-resolves the wire model per request.
     OpencodeZen,
     /// A user-configured custom/compatible endpoint on a standard dialect.
     CustomCompatible,
-    /// Google Antigravity / `agy` `/v1internal:streamGenerateContent`.
-    CloudCode,
 }
 
 impl RouteShape {
@@ -106,7 +101,6 @@ impl RouteShape {
             Self::CodexResponses => "codex-responses",
             Self::OpencodeZen => "opencode-zen",
             Self::CustomCompatible => "custom-compatible",
-            Self::CloudCode => "cloud-code",
         }
     }
 }
@@ -120,7 +114,7 @@ impl RouteShape {
 /// deployment secret.
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointIdentity {
-    /// Stable provider id (`ApiProvider::as_str`).
+    /// Stable provider id (`ProviderKind::as_str`).
     pub(crate) provider_id: String,
     /// Human-facing provider name.
     pub(crate) provider_display: String,
@@ -169,7 +163,6 @@ impl ReasoningReceipt {
             ],
             WireDialect::AnthropicMessages => &["thinking", "output_config"],
             WireDialect::OpenAiResponses => &["reasoning", "include"],
-            WireDialect::GoogleCloudCode => &[],
         }
     }
 
@@ -277,7 +270,7 @@ impl CallerStreamMode {
 
 /// One fully prepared, not-yet-sent outbound request.
 ///
-/// Both `DeepSeekClient::create_message*` and `/preview-request` consume this
+/// Both `CodewhaleClient::create_message*` and `/preview-request` consume this
 /// value. Adding a field here is how a new wire fact becomes visible to the
 /// preview; there is no second builder to keep in sync.
 #[derive(Debug, Clone)]
@@ -545,7 +538,6 @@ impl<'a> WireBodyView<'a> {
             WireDialect::ChatCompletions => (None, "messages"),
             WireDialect::AnthropicMessages => (Some("system"), "messages"),
             WireDialect::OpenAiResponses => (Some("instructions"), "input"),
-            WireDialect::GoogleCloudCode => (None, "request"),
         };
 
         // The system region is accumulated as canonical text so it can be
@@ -561,7 +553,20 @@ impl<'a> WireBodyView<'a> {
             let canonical_tools = canonical_json(tools);
             view.tool_schema_bytes = canonical_tools.len();
             view.tool_schema_sha256 = crate::hashing::sha256_hex(canonical_tools.as_bytes());
-            view.tool_count = tools.as_array().map(Vec::len).unwrap_or(0);
+            view.tool_count = tools.as_array().map_or(0, |tools| {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+                            tool.get("tools")
+                                .and_then(Value::as_array)
+                                .map_or(0, Vec::len)
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            });
         }
 
         if let Some(items_value) = object.get(items_key) {
@@ -638,7 +643,6 @@ fn is_tool_result_item(dialect: WireDialect, item: &Value) -> bool {
         WireDialect::OpenAiResponses => {
             item.get("type").and_then(Value::as_str) == Some("function_call_output")
         }
-        WireDialect::GoogleCloudCode => false,
     }
 }
 
@@ -662,7 +666,6 @@ fn count_attachments(dialect: WireDialect, item: &Value) -> (usize, usize) {
             WireDialect::OpenAiResponses => {
                 matches!(part_type, Some("input_image" | "input_file"))
             }
-            WireDialect::GoogleCloudCode => false,
         };
         if !is_attachment {
             continue;
@@ -675,12 +678,12 @@ fn count_attachments(dialect: WireDialect, item: &Value) -> (usize, usize) {
 
 /// Classify the provider-specific shape of a prepared Chat Completions body.
 pub(crate) fn chat_route_shape(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
     url: &str,
 ) -> RouteShape {
-    if provider == ApiProvider::OpencodeZen {
+    if provider == ProviderKind::OpencodeZen {
         return RouteShape::OpencodeZen;
     }
     if url.contains("/beta/chat/completions") {
@@ -692,7 +695,7 @@ pub(crate) fn chat_route_shape(
     if crate::config::is_exact_direct_moonshot_k3_route(provider, base_url, wire_model) {
         return RouteShape::DirectMoonshotK3;
     }
-    if provider == ApiProvider::Custom {
+    if provider == ProviderKind::Custom {
         return RouteShape::CustomCompatible;
     }
     RouteShape::Standard
@@ -1236,7 +1239,7 @@ mod tests {
 /// the same bytes.
 ///
 /// Each case builds a real client for a production route, prepares a request
-/// through [`DeepSeekClient::prepare_outbound_request`] — the value the
+/// through [`CodewhaleClient::prepare_outbound_request`] — the value the
 /// transports send and the preview describes — and compares its whole-body
 /// hash against the dialect's own builder run over the identically
 /// pre-processed request. A divergence here means a second body builder has
@@ -1245,11 +1248,11 @@ mod tests {
 mod dialect_seam_tests {
     use super::*;
     use crate::config::{Config, ProviderConfig, ProvidersConfig};
-    use crate::models::Role;
-    use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Tool};
+    use codewhale_models::Role;
+    use codewhale_models::{ContentBlock, Message, MessageRequest, SystemPrompt, Tool};
     use serde_json::json;
 
-    use super::super::DeepSeekClient;
+    use super::super::CodewhaleClient;
 
     fn tool(name: &str) -> Tool {
         Tool {
@@ -1288,10 +1291,10 @@ mod dialect_seam_tests {
         }
     }
 
-    fn client(provider: &str, configure: impl FnOnce(&mut ProvidersConfig)) -> DeepSeekClient {
+    fn client(provider: &str, configure: impl FnOnce(&mut ProvidersConfig)) -> CodewhaleClient {
         let mut providers = ProvidersConfig::default();
         configure(&mut providers);
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some(provider.to_string()),
             providers: Some(providers),
             ..Config::default()
@@ -1315,11 +1318,51 @@ mod dialect_seam_tests {
     /// The exact pre-processing `prepare_outbound_request` applies before the
     /// dialect builder runs. Reproduced here so the reference body is built
     /// from the same input, not from a differently-sanitized one.
-    fn preprocessed(client: &DeepSeekClient, request: MessageRequest) -> MessageRequest {
+    fn preprocessed(client: &CodewhaleClient, request: MessageRequest) -> MessageRequest {
         client
             .bind_request_to_protocol(client.prepare_model_bound_request(request))
             .expect("protocol binding succeeds")
             .0
+    }
+
+    #[test]
+    fn output_cap_reaches_all_three_wire_dialects_with_reasoning_inside_allowance() {
+        let _env = crate::test_support::lock_test_env();
+        for wire in ["chat-completions", "anthropic-messages", "responses"] {
+            let config = Config {
+                provider: Some("output-cap-fixture".into()),
+                providers: Some(ProvidersConfig {
+                    custom: std::collections::HashMap::from([(
+                        "output-cap-fixture".into(),
+                        ProviderConfig {
+                            kind: Some("openai-compatible".into()),
+                            base_url: Some("http://127.0.0.1:18181/v1".into()),
+                            api_key: Some("fixture-output-cap".into()),
+                            model: Some("fixture-model".into()),
+                            wire: Some(wire.into()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Config::default()
+            };
+            let client = CodewhaleClient::new(&config).unwrap();
+            let mut request = request("fixture-model");
+            request.max_tokens = 1500;
+            let prepared = client.prepare_outbound_request(request, true).unwrap();
+            assert_eq!(prepared.wire_output_cap_tokens(), Some(1500), "{wire}");
+            if let Some(thinking) = prepared
+                .body
+                .pointer("/thinking/budget_tokens")
+                .and_then(Value::as_u64)
+            {
+                assert!(
+                    thinking < 1500,
+                    "reasoning must fit inside the shared allowance"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1337,6 +1380,7 @@ mod dialect_seam_tests {
             client.api_provider(),
             client.base_url(),
             true,
+            None,
         )
         .expect("reference body builds");
 
@@ -1384,6 +1428,7 @@ mod dialect_seam_tests {
             client.api_provider(),
             client.base_url(),
             true,
+            None,
         )
         .expect("reference body builds");
         assert_eq!(
@@ -1434,25 +1479,6 @@ mod dialect_seam_tests {
             })
             .expect("compaction summary survives");
         assert_eq!(carried["role"], "user");
-    }
-
-    /// Same seam, same rejection, on the wire that has always failed closed.
-    #[test]
-    fn seam_refuses_the_interrupted_sentinel_on_cloud_code() {
-        let client = client("antigravity", |providers| {
-            providers.antigravity = configured("agy-test", None, "gemini-3-pro");
-        });
-        let mut request = request("gemini-3-pro");
-        request.system = None;
-        request.tools = None;
-        request
-            .messages
-            .push(message(Role::InterruptedAssistant, "half a thought"));
-
-        let error = client
-            .prepare_outbound_request(request, true)
-            .expect_err("cloud-code has never accepted the interrupted sentinel");
-        assert!(error.to_string().contains("google-cloud-code"), "{error}");
     }
 
     /// The dialects that have always dropped an unrepresentable role keep
@@ -1556,16 +1582,25 @@ mod dialect_seam_tests {
         }
     }
 
-    /// Codex resolves its bearer through OAuth, so the test pins a token the
-    /// same way the Responses adapter's own tests do.
-    fn codex_client() -> DeepSeekClient {
+    /// The official plan route requires Codewhale's own protected grant.
+    fn codex_client() -> CodewhaleClient {
         let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        client("openai-codex", |providers| {
-            providers.openai_codex = configured("", None, "gpt-5-codex");
-        })
+        let home = tempfile::tempdir().expect("isolated ChatGPT credential home");
+        let root = home
+            .path()
+            .canonicalize()
+            .expect("canonical credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let mut config = Config {
+            provider: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::OpenaiCodex))
+            .unwrap()
+            .model = Some("gpt-5-codex".into());
+        crate::oauth::install_test_chatgpt_registration(&mut config).expect("official test grant");
+        CodewhaleClient::new(&config).expect("official ChatGPT client")
     }
 
     #[test]
@@ -1577,13 +1612,74 @@ mod dialect_seam_tests {
 
         assert_eq!(prepared.dialect, WireDialect::OpenAiResponses);
         assert_eq!(prepared.endpoint.shape, RouteShape::CodexResponses);
+        assert_eq!(prepared.endpoint.url, "https://api.openai.com/v1/responses");
+        assert_eq!(prepared.body["tools"][0]["type"], "namespace");
+        assert_eq!(prepared.body["tools"][0]["name"], "codewhale");
+        assert_eq!(
+            prepared.body["tools"][0]["tools"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            prepared.wire_view().tool_count,
+            2,
+            "namespace wrappers are not executable tools"
+        );
 
-        let reference = super::super::responses::build_responses_body(&preprocessed(
-            &client,
-            request("gpt-5-codex"),
-        ));
+        let reference = super::super::responses::build_responses_body_for_provider(
+            &preprocessed(&client, request("gpt-5-codex")),
+            ProviderKind::OpenaiCodex,
+            client.chatgpt_reasoning_api.as_deref(),
+        );
         assert_eq!(prepared.body_sha256(), sha256(&canonical_json(&reference)));
         assert_eq!(prepared.body.get("tool_choice"), Some(&json!("auto")));
+    }
+
+    #[test]
+    fn responses_prepared_request_preserves_full_history_for_its_grant() {
+        let client = codex_client();
+        let scope = client.chatgpt_reasoning_api.as_ref().unwrap();
+        let mut request = request("gpt-5-codex");
+        for id in ["first", "second"] {
+            request.messages.push(codewhale_models::Message {
+                role: codewhale_models::Role::Assistant,
+                content: vec![codewhale_models::ContentBlock::Thinking {
+                    thinking: "readable-reasoning-must-stay-local".into(),
+                    signature: None,
+                    state: Some(codewhale_models::OpaqueReasoningState {
+                        provider: "openai-codex".into(),
+                        api: scope.clone(),
+                        model: "gpt-5-codex".into(),
+                        id: Some(id.into()),
+                        encrypted_content: format!("opaque-{id}"),
+                    }),
+                }],
+            });
+        }
+        let prepared = client
+            .prepare_outbound_request(request.clone(), true)
+            .unwrap();
+        let reasoning: Vec<_> = prepared.body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .collect();
+        assert_eq!(reasoning.len(), 2);
+        assert_eq!(reasoning[0]["encrypted_content"], "opaque-first");
+        assert_eq!(reasoning[1]["encrypted_content"], "opaque-second");
+        assert!(
+            !prepared
+                .body
+                .to_string()
+                .contains("readable-reasoning-must-stay-local")
+        );
+        let mut different_grant = client.clone();
+        different_grant.chatgpt_reasoning_api = Some("openai-responses-siwc-v1:other".into());
+        let rejected = different_grant
+            .prepare_outbound_request(request, true)
+            .unwrap();
+        assert!(!rejected.body.to_string().contains("opaque-first"));
+        assert!(!rejected.body.to_string().contains("opaque-second"));
     }
 
     #[test]

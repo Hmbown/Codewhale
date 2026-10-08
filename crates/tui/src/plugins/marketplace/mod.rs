@@ -8,7 +8,7 @@
 //! This layer is parser-only: no network, no filesystem reads, no process
 //! execution. Every fetch happens through the existing reviewed installer
 //! when an operator explicitly installs a candidate. The one filesystem
-//! seam — reading a local catalog document a operator pointed at — lives in
+//! seam — reading a local catalog document an operator pointed at — lives in
 //! [`document`] and is shared by the TUI command and the Runtime API.
 
 pub mod document;

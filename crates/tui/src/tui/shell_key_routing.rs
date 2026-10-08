@@ -1,8 +1,8 @@
 //! Shell keyboard bindings for details / context / help.
 //!
 //! Footer hints, help catalog chords, and live handlers must agree on one
-//! source. Printable characters always belong to the composer: bare `v`
-//! types `v` in every focus state — work surface, transcript selection,
+//! source. Outside exclusive consent gates, printable characters belong to
+//! the composer: bare `v` types `v` in every ordinary focus state — work surface, transcript selection,
 //! panel, or modal (TUI-DOG-002). Details/output fires only on
 //! Option+V / Alt+V, and macOS renders the label as `⌥V`, never `Alt`/`Cmd`.
 //! Help answers to `F1` and `Ctrl+/` (with `/help`); chrome advertises only
@@ -30,6 +30,8 @@ use crate::tui::views::ModalKind;
 /// the text itself; every shell binding asks this instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    /// The model-bound redaction consent gate exclusively owns its decision.
+    RedactionGate,
     /// The onboarding rail owns every key until it finishes.
     Onboarding,
     /// A modal view is on top of the stack and handles its own keys.
@@ -45,9 +47,15 @@ pub enum Focus {
 /// Which focus states a binding is live in — the `ShellBinding` focus rule
 /// that used to be re-invented at every call site as
 /// `&& app.view_stack.is_empty()`. The variants nest: each admits everything
-/// the one above it does, plus one more surface.
+/// the one above it does, plus one more surface. The redaction consent gate
+/// is exclusive and sits outside that shell hierarchy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusScope {
+    PetHabitat,
+    /// Only the sandbox-elevation decision card.
+    Elevation,
+    /// Only the model-bound redaction consent gate.
+    RedactionGate,
     /// A live session: the composer, or a rail/workflow panel that has taken
     /// the keys from it.
     SessionShell,
@@ -56,7 +64,8 @@ pub enum FocusScope {
     /// [`FocusScope::AnyShell`], plus the Config modal, which displays the
     /// very setting the binding changes.
     AnyShellOrConfig,
-    /// Every focus state, onboarding and modals included.
+    /// Every ordinary shell state, onboarding and modals included. Exclusive
+    /// consent gates keep their own keys.
     Everywhere,
 }
 
@@ -64,13 +73,16 @@ impl FocusScope {
     #[must_use]
     pub fn admits(self, focus: Focus) -> bool {
         match self {
+            Self::PetHabitat => focus == Focus::Modal(ModalKind::PetHabitat),
+            Self::Elevation => focus == Focus::Modal(ModalKind::Elevation),
+            Self::RedactionGate => focus == Focus::RedactionGate,
             Self::SessionShell => matches!(focus, Focus::Composer | Focus::Panel),
             Self::AnyShell => matches!(focus, Focus::Composer | Focus::Panel | Focus::Launch),
             Self::AnyShellOrConfig => matches!(
                 focus,
                 Focus::Composer | Focus::Panel | Focus::Launch | Focus::Modal(ModalKind::Config)
             ),
-            Self::Everywhere => true,
+            Self::Everywhere => focus != Focus::RedactionGate,
         }
     }
 }
@@ -78,6 +90,22 @@ impl FocusScope {
 /// Stable binding ids shared by handlers, footer hints, and help catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellBindingId {
+    ElevationUp,
+    ElevationDown,
+    ElevationConfirm,
+    ElevationAbort,
+    PetResultUp,
+    PetResultDown,
+    PetResultPageUp,
+    PetResultPageDown,
+    PetBack,
+    PetSound,
+    PetBrowser,
+    PetWindow,
+    RedactionGateConfirm,
+    RedactionGateKeepOrBack,
+    RedactionGateQuit,
+    RedactionGateScroll,
     ToolDetails,
     ContextInspector,
     ProviderRoute,
@@ -112,6 +140,35 @@ impl ShellBinding {
     #[must_use]
     pub fn matches(&self, key: &KeyEvent) -> bool {
         match self.id {
+            ShellBindingId::ElevationUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
+            ShellBindingId::ElevationDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
+            ShellBindingId::ElevationConfirm => {
+                key.code == KeyCode::Enter && key.modifiers.is_empty()
+            }
+            ShellBindingId::ElevationAbort => key.code == KeyCode::Esc && key.modifiers.is_empty(),
+            ShellBindingId::PetResultUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
+            ShellBindingId::PetResultDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
+            ShellBindingId::PetResultPageUp => {
+                key.code == KeyCode::PageUp && key.modifiers.is_empty()
+            }
+            ShellBindingId::PetResultPageDown => {
+                key.code == KeyCode::PageDown && key.modifiers.is_empty()
+            }
+            ShellBindingId::PetBack => key.code == KeyCode::Esc && key.modifiers.is_empty(),
+            ShellBindingId::PetSound => key.code == KeyCode::F(6) && key.modifiers.is_empty(),
+            ShellBindingId::PetBrowser => key.code == KeyCode::F(8) && key.modifiers.is_empty(),
+            ShellBindingId::PetWindow => key.code == KeyCode::F(9) && key.modifiers.is_empty(),
+
+            ShellBindingId::RedactionGateConfirm => is_redaction_gate_choice(key, '1', 'y'),
+            ShellBindingId::RedactionGateKeepOrBack => is_redaction_gate_choice(key, '2', 'u'),
+            ShellBindingId::RedactionGateQuit => is_redaction_gate_choice(key, '3', 'n'),
+            ShellBindingId::RedactionGateScroll => {
+                key.modifiers.is_empty()
+                    && matches!(
+                        key.code,
+                        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                    )
+            }
             ShellBindingId::ToolDetails => is_tool_details_shortcut(key),
             ShellBindingId::ContextInspector => is_context_inspector_shortcut(key),
             ShellBindingId::ProviderRoute => is_provider_route_shortcut(key),
@@ -141,6 +198,102 @@ pub fn route(focus: Focus, key: &KeyEvent) -> Option<ShellBindingId> {
 
 /// Canonical shell bindings. Handlers and chrome read from here.
 pub const SHELL_BINDINGS: &[ShellBinding] = &[
+    ShellBinding {
+        id: ShellBindingId::ElevationUp,
+        catalog_chord: "Up",
+        footer_chord: "↑",
+        focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::ElevationDown,
+        catalog_chord: "Down",
+        footer_chord: "↓",
+        focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::ElevationConfirm,
+        catalog_chord: "Enter",
+        footer_chord: "Enter",
+        focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::ElevationAbort,
+        catalog_chord: "Esc",
+        footer_chord: "Esc",
+        focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultUp,
+        catalog_chord: "Up",
+        footer_chord: "↑",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultDown,
+        catalog_chord: "Down",
+        footer_chord: "↓",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultPageUp,
+        catalog_chord: "PgUp",
+        footer_chord: "PgUp",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultPageDown,
+        catalog_chord: "PgDn",
+        footer_chord: "PgDn",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetBack,
+        catalog_chord: "Esc",
+        footer_chord: "Esc",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetSound,
+        catalog_chord: "F6",
+        footer_chord: "F6",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetBrowser,
+        catalog_chord: "F8",
+        footer_chord: "F8",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetWindow,
+        catalog_chord: "F9",
+        footer_chord: "F9",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::RedactionGateConfirm,
+        catalog_chord: "1/Y",
+        footer_chord: "1/Y",
+        focus: FocusScope::RedactionGate,
+    },
+    ShellBinding {
+        id: ShellBindingId::RedactionGateKeepOrBack,
+        catalog_chord: "2/U",
+        footer_chord: "2/U",
+        focus: FocusScope::RedactionGate,
+    },
+    ShellBinding {
+        id: ShellBindingId::RedactionGateQuit,
+        catalog_chord: "3/N",
+        footer_chord: "3/N",
+        focus: FocusScope::RedactionGate,
+    },
+    ShellBinding {
+        id: ShellBindingId::RedactionGateScroll,
+        catalog_chord: "↑/↓",
+        footer_chord: "↑/↓",
+        focus: FocusScope::RedactionGate,
+    },
     ShellBinding {
         id: ShellBindingId::ToolDetails,
         catalog_chord: "Alt+V",
@@ -186,11 +339,12 @@ pub const SHELL_BINDINGS: &[ShellBinding] = &[
         id: ShellBindingId::ModeCycle,
         catalog_chord: "Tab",
         footer_chord: "Tab",
-        // Tab is the session's mode cycle. The composer's own completions
-        // get the key first, but *having typed* never disables it. The
-        // launch screen is excluded: there Tab moves focus between the
-        // startup menu and the pre-session composer.
-        focus: FocusScope::SessionShell,
+        // Tab is the shell's mode cycle. The composer's own completions
+        // get the key first, but *having typed* never disables it. Live on
+        // the launch screen too: the card's rows are arrowed, the composer
+        // is always focused, so Tab had no focus left to move and read as
+        // dead (0.9.12 defect #5).
+        focus: FocusScope::AnyShell,
     },
     ShellBinding {
         id: ShellBindingId::PermissionCycle,
@@ -209,15 +363,23 @@ pub const SHELL_BINDINGS: &[ShellBinding] = &[
         // (Ctrl+F is), tmux, iTerm2, Terminal.app, or Windows Terminal.
         catalog_chord: "Ctrl+Tab / Ctrl+]",
         footer_chord: "Ctrl+]",
-        focus: FocusScope::SessionShell,
+        // The launch card advertises this same work-bar control.
+        focus: FocusScope::AnyShell,
     },
     ShellBinding {
         id: ShellBindingId::ViewCycleBack,
         catalog_chord: "Ctrl+Shift+Tab",
         footer_chord: "Ctrl+Shift+Tab",
-        focus: FocusScope::SessionShell,
+        focus: FocusScope::AnyShell,
     },
 ];
+
+fn is_redaction_gate_choice(key: &KeyEvent, digit: char, letter: char) -> bool {
+    // Modifiers must not turn an unrelated shortcut into consent. Shift is
+    // accepted for the uppercase letter advertised in the action rail.
+    (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char(ch) if ch == digit || ch.eq_ignore_ascii_case(&letter))
+}
 
 /// The chord the info line advertises for help.
 ///
@@ -226,18 +388,28 @@ pub const SHELL_BINDINGS: &[ShellBinding] = &[
 /// advertising a key that does nothing for many users. Not `?` either — bare
 /// `?` is composer text in every focus state, and help only answers to
 /// `Alt+?`, which stays unadvertised until it is proven in real terminals
-/// (TUI-DOG-003). `Ctrl+/` is the chord [`is_help_shortcut`] accepts
-/// unconditionally, together with its legacy `Ctrl+7` / `Ctrl+_` encodings,
-/// so it is the one hint chrome can print honestly.
-pub const HELP_CHROME_CHORD: &str = "Ctrl+/";
+/// (TUI-DOG-003). `Ctrl+/` remains accepted, together with its legacy
+/// `Ctrl+7` / `Ctrl+_` encodings, but it is no longer what chrome advertises:
+/// how a terminal encodes Ctrl+/ varies enough that the printed hint was a
+/// promise the product could not keep on the founder's own machine. `/help`
+/// is a slash command — it reaches the same view through the composer, it
+/// works in every terminal, and typing `/` already reveals it.
+pub const HELP_CHROME_CHORD: &str = "/help";
 
-/// The info line's single right-hand key hint, e.g. `Ctrl+/ help`.
+/// The info line's single right-hand key hint.
+///
+/// A slash command names itself, so it prints bare (`/help`); a key chord
+/// still needs the word (`Ctrl+/ help`).
 #[must_use]
-pub fn info_help_hint(locale: crate::localization::Locale) -> String {
+pub fn info_help_hint(locale: codewhale_localization::Locale) -> String {
+    let chord = binding(ShellBindingId::Help).footer_chord;
+    if chord.starts_with('/') {
+        return chord.to_string();
+    }
     format!(
         "{} {}",
-        binding(ShellBindingId::Help).footer_chord,
-        crate::localization::tr(locale, crate::localization::MessageId::InfoLineHelp)
+        chord,
+        codewhale_localization::tr(locale, codewhale_localization::MessageId::InfoLineHelp)
     )
 }
 
@@ -374,7 +546,8 @@ pub fn is_permission_cycle_shortcut(key: &KeyEvent) -> bool {
 }
 
 /// Ctrl+Tab (kitty protocol: `Tab` + CONTROL) or Ctrl+] cycles the bottom
-/// dock view forward. AltGr chords stay text (#4723).
+/// dock view forward. Legacy terminals send Ctrl+] as ASCII 0x1d, which
+/// crossterm decodes as Ctrl+5. AltGr chords stay text (#4723).
 #[must_use]
 pub fn is_view_cycle_shortcut(key: &KeyEvent) -> bool {
     if crate::tui::widgets::key_hint::is_altgr(key.modifiers) {
@@ -384,7 +557,7 @@ pub fn is_view_cycle_shortcut(key: &KeyEvent) -> bool {
         && !key
             .modifiers
             .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::SHIFT);
-    ctrl_only && matches!(key.code, KeyCode::Tab | KeyCode::Char(']'))
+    ctrl_only && matches!(key.code, KeyCode::Tab | KeyCode::Char(']' | '5'))
 }
 
 /// Ctrl+Shift+Tab (kitty protocol: `BackTab` or `Tab` with CONTROL|SHIFT)
@@ -461,6 +634,34 @@ mod tests {
     }
 
     #[test]
+    fn work_bar_accepts_legacy_and_enhanced_keys_on_launch() {
+        for code in [KeyCode::Tab, KeyCode::Char(']'), KeyCode::Char('5')] {
+            let key = KeyEvent::new(code, KeyModifiers::CONTROL);
+            assert_eq!(route(Focus::Launch, &key), Some(ShellBindingId::ViewCycle));
+            assert_eq!(route(Focus::Onboarding, &key), None);
+            assert_eq!(route(Focus::Modal(ModalKind::Pager), &key), None);
+        }
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            assert!(!is_view_cycle_shortcut(&KeyEvent::new(
+                KeyCode::Char('5'),
+                modifiers
+            )));
+        }
+        let backwards = KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            route(Focus::Launch, &backwards),
+            Some(ShellBindingId::ViewCycleBack)
+        );
+    }
+
+    #[test]
     fn bare_v_is_never_a_shortcut_in_any_state() {
         // TUI-DOG-002: bare `v` always types `v`; there is no focus state in
         // which it opens details, so the matcher takes no focus argument.
@@ -488,9 +689,15 @@ mod tests {
     fn chrome_never_advertises_a_key_terminals_eat() {
         // F1 stays in the catalog (it works where delivered) but no chrome
         // hint may print it; the help hint is derived from the binding.
-        assert_eq!(binding(ShellBindingId::Help).footer_chord, "Ctrl+/");
-        let hint = info_help_hint(crate::localization::Locale::En);
-        assert!(hint.starts_with("Ctrl+/ "), "{hint}");
+        // Ctrl+/ is still accepted, but chrome advertises the route that
+        // works in every terminal.
+        assert_eq!(binding(ShellBindingId::Help).footer_chord, "/help");
+        let hint = info_help_hint(codewhale_localization::Locale::En);
+        assert_eq!(hint, "/help", "a slash command names itself");
+        assert!(
+            is_help_shortcut(&KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)),
+            "Ctrl+/ must keep working for the terminals that deliver it"
+        );
         for binding in SHELL_BINDINGS {
             assert!(!binding.footer_chord.contains("F1"), "{:?}", binding.id);
             assert!(!binding.footer_chord.contains("Alt+?"), "{:?}", binding.id);
@@ -596,11 +803,55 @@ mod tests {
         // The metrics line's help hint is built from this table, so it must
         // not be able to name a chord the same table refuses at any focus
         // the chrome is rendered in (the hint paints on every screen).
-        let hint = info_help_hint(crate::localization::Locale::En);
+        let hint = info_help_hint(codewhale_localization::Locale::En);
         let help = binding(ShellBindingId::Help);
         assert!(hint.starts_with(help.footer_chord), "{hint}");
         assert_eq!(help.focus, FocusScope::Everywhere);
         assert!(help.matches(&KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn elevation_bindings_are_nontext_and_stay_in_the_elevation_card() {
+        for (code, id) in [
+            (KeyCode::Up, ShellBindingId::ElevationUp),
+            (KeyCode::Down, ShellBindingId::ElevationDown),
+            (KeyCode::Enter, ShellBindingId::ElevationConfirm),
+            (KeyCode::Esc, ShellBindingId::ElevationAbort),
+        ] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(route(Focus::Modal(ModalKind::Elevation), &key), Some(id));
+            assert!(!binding(id).footer_chord.is_empty());
+            for focus in [
+                Focus::Composer,
+                Focus::Launch,
+                Focus::Modal(ModalKind::Approval),
+            ] {
+                assert_ne!(route(focus, &key), Some(id));
+            }
+            for modifiers in [
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::SUPER,
+                KeyModifiers::SHIFT,
+            ] {
+                assert_ne!(
+                    route(
+                        Focus::Modal(ModalKind::Elevation),
+                        &KeyEvent::new(code, modifiers)
+                    ),
+                    Some(id)
+                );
+            }
+        }
+        for letter in "nwfajkN W F A J K123".chars() {
+            assert_eq!(
+                route(
+                    Focus::Modal(ModalKind::Elevation),
+                    &KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE)
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -612,6 +863,7 @@ mod tests {
             FocusScope::Everywhere,
         ];
         let states = [
+            Focus::RedactionGate,
             Focus::Composer,
             Focus::Panel,
             Focus::Launch,
@@ -652,12 +904,74 @@ mod tests {
             route(Focus::Composer, &shift_tab),
             Some(ShellBindingId::PermissionCycle)
         );
-        // Tab moves focus on the launch stage; the posture control still works.
-        assert_eq!(route(Focus::Launch, &tab), None);
+        // Both shell controls are live on the launch stage as well.
+        assert_eq!(route(Focus::Launch, &tab), Some(ShellBindingId::ModeCycle));
         assert_eq!(
             route(Focus::Launch, &shift_tab),
             Some(ShellBindingId::PermissionCycle)
         );
+    }
+
+    #[test]
+    fn redaction_choices_require_the_gate_and_explicit_unmodified_keys() {
+        for (id, keys) in [
+            (ShellBindingId::RedactionGateConfirm, ['1', 'y', 'Y']),
+            (ShellBindingId::RedactionGateKeepOrBack, ['2', 'u', 'U']),
+            (ShellBindingId::RedactionGateQuit, ['3', 'n', 'N']),
+        ] {
+            for key in keys {
+                for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                    let event = KeyEvent::new(KeyCode::Char(key), modifiers);
+                    assert_eq!(route(Focus::RedactionGate, &event), Some(id));
+                    for focus in [
+                        Focus::Composer,
+                        Focus::Panel,
+                        Focus::Launch,
+                        Focus::Onboarding,
+                        Focus::Modal(ModalKind::Approval),
+                    ] {
+                        assert_eq!(route(focus, &event), None, "{focus:?}: {event:?}");
+                    }
+                }
+                for modifiers in [
+                    KeyModifiers::CONTROL,
+                    KeyModifiers::ALT,
+                    KeyModifiers::SUPER,
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ] {
+                    assert_eq!(
+                        route(
+                            Focus::RedactionGate,
+                            &KeyEvent::new(KeyCode::Char(key), modifiers)
+                        ),
+                        None
+                    );
+                }
+            }
+        }
+        for code in [KeyCode::Enter, KeyCode::F(1), KeyCode::F(2), KeyCode::Tab] {
+            assert_eq!(
+                route(
+                    Focus::RedactionGate,
+                    &KeyEvent::new(code, KeyModifiers::NONE)
+                ),
+                None
+            );
+        }
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            assert_eq!(
+                route(
+                    Focus::RedactionGate,
+                    &KeyEvent::new(code, KeyModifiers::NONE)
+                ),
+                Some(ShellBindingId::RedactionGateScroll)
+            );
+        }
     }
 
     #[test]

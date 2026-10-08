@@ -1,0 +1,4590 @@
+[
+  {
+    "variant": "Underwater",
+    "name": "underwater",
+    "light": false,
+    "roles": [
+      [
+        6,
+        19,
+        32
+      ],
+      [
+        10,
+        30,
+        51
+      ],
+      [
+        13,
+        34,
+        58
+      ],
+      [
+        16,
+        42,
+        69
+      ],
+      [
+        35,
+        45,
+        65
+      ],
+      [
+        246,
+        242,
+        232
+      ],
+      [
+        147,
+        160,
+        184
+      ],
+      [
+        42,
+        63,
+        114
+      ],
+      [
+        182,
+        192,
+        212
+      ],
+      [
+        106,
+        166,
+        220
+      ],
+      [
+        10,
+        30,
+        51
+      ],
+      [
+        79,
+        209,
+        197
+      ],
+      [
+        246,
+        196,
+        83
+      ],
+      [
+        255,
+        134,
+        178
+      ],
+      [
+        138,
+        153,
+        179
+      ],
+      [
+        138,
+        153,
+        179
+      ],
+      [
+        18,
+        42,
+        34
+      ],
+      [
+        52,
+        24,
+        39
+      ]
+    ],
+    "slots": {
+      "name": "underwater",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        10,
+        30,
+        51
+      ],
+      "panel_bg": [
+        13,
+        34,
+        58
+      ],
+      "elevated_bg": [
+        16,
+        42,
+        69
+      ],
+      "composer_bg": [
+        13,
+        34,
+        58
+      ],
+      "selection_bg": [
+        35,
+        45,
+        65
+      ],
+      "header_bg": [
+        6,
+        19,
+        32
+      ],
+      "footer_bg": [
+        6,
+        19,
+        32
+      ],
+      "text_dim": [
+        138,
+        153,
+        179
+      ],
+      "text_hint": [
+        138,
+        153,
+        179
+      ],
+      "text_muted": [
+        147,
+        160,
+        184
+      ],
+      "text_body": [
+        246,
+        242,
+        232
+      ],
+      "text_soft": [
+        182,
+        192,
+        212
+      ],
+      "border": [
+        42,
+        63,
+        114
+      ],
+      "accent_primary": [
+        106,
+        166,
+        220
+      ],
+      "accent_secondary": [
+        79,
+        209,
+        197
+      ],
+      "accent_action": [
+        246,
+        196,
+        83
+      ],
+      "error_fg": [
+        255,
+        134,
+        178
+      ],
+      "error_hover": [
+        255,
+        156,
+        194
+      ],
+      "error_surface": [
+        43,
+        21,
+        34
+      ],
+      "error_border": [
+        255,
+        134,
+        178
+      ],
+      "error_text": [
+        255,
+        219,
+        232
+      ],
+      "warning": [
+        255,
+        122,
+        89
+      ],
+      "success": [
+        155,
+        214,
+        111
+      ],
+      "info": [
+        106,
+        166,
+        220
+      ],
+      "mode_agent": [
+        126,
+        180,
+        232
+      ],
+      "mode_yolo": [
+        255,
+        112,
+        160
+      ],
+      "mode_plan": [
+        185,
+        220,
+        236
+      ],
+      "mode_operate": [
+        173,
+        136,
+        255
+      ],
+      "permission_ask": [
+        224,
+        153,
+        72
+      ],
+      "permission_auto_review": [
+        246,
+        196,
+        83
+      ],
+      "permission_full_access": [
+        255,
+        122,
+        89
+      ],
+      "status_ready": [
+        147,
+        160,
+        184
+      ],
+      "status_working": [
+        79,
+        209,
+        197
+      ],
+      "status_warning": [
+        255,
+        122,
+        89
+      ],
+      "diff_added_fg": [
+        87,
+        199,
+        133
+      ],
+      "diff_deleted_fg": [
+        255,
+        134,
+        178
+      ],
+      "diff_added_bg": [
+        18,
+        42,
+        34
+      ],
+      "diff_deleted_bg": [
+        52,
+        24,
+        39
+      ],
+      "tool_running": [
+        79,
+        209,
+        197
+      ],
+      "tool_success": [
+        155,
+        214,
+        111
+      ],
+      "tool_failed": [
+        255,
+        134,
+        178
+      ]
+    }
+  },
+  {
+    "variant": "UnderwaterRetro",
+    "name": "underwater-retro",
+    "light": false,
+    "roles": [
+      [
+        3,
+        12,
+        19
+      ],
+      [
+        5,
+        16,
+        25
+      ],
+      [
+        7,
+        21,
+        34
+      ],
+      [
+        10,
+        28,
+        44
+      ],
+      [
+        35,
+        45,
+        65
+      ],
+      [
+        246,
+        242,
+        232
+      ],
+      [
+        147,
+        160,
+        184
+      ],
+      [
+        20,
+        80,
+        94
+      ],
+      [
+        182,
+        192,
+        212
+      ],
+      [
+        106,
+        166,
+        220
+      ],
+      [
+        5,
+        16,
+        25
+      ],
+      [
+        79,
+        209,
+        197
+      ],
+      [
+        246,
+        196,
+        83
+      ],
+      [
+        255,
+        134,
+        178
+      ],
+      [
+        138,
+        153,
+        179
+      ],
+      [
+        138,
+        153,
+        179
+      ],
+      [
+        18,
+        42,
+        34
+      ],
+      [
+        52,
+        24,
+        39
+      ]
+    ],
+    "slots": {
+      "name": "underwater-retro",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        5,
+        16,
+        25
+      ],
+      "panel_bg": [
+        7,
+        21,
+        34
+      ],
+      "elevated_bg": [
+        10,
+        28,
+        44
+      ],
+      "composer_bg": [
+        7,
+        21,
+        34
+      ],
+      "selection_bg": [
+        35,
+        45,
+        65
+      ],
+      "header_bg": [
+        3,
+        12,
+        19
+      ],
+      "footer_bg": [
+        3,
+        12,
+        19
+      ],
+      "text_dim": [
+        138,
+        153,
+        179
+      ],
+      "text_hint": [
+        138,
+        153,
+        179
+      ],
+      "text_muted": [
+        147,
+        160,
+        184
+      ],
+      "text_body": [
+        246,
+        242,
+        232
+      ],
+      "text_soft": [
+        182,
+        192,
+        212
+      ],
+      "border": [
+        20,
+        80,
+        94
+      ],
+      "accent_primary": [
+        106,
+        166,
+        220
+      ],
+      "accent_secondary": [
+        79,
+        209,
+        197
+      ],
+      "accent_action": [
+        246,
+        196,
+        83
+      ],
+      "error_fg": [
+        255,
+        134,
+        178
+      ],
+      "error_hover": [
+        255,
+        156,
+        194
+      ],
+      "error_surface": [
+        43,
+        21,
+        34
+      ],
+      "error_border": [
+        255,
+        134,
+        178
+      ],
+      "error_text": [
+        255,
+        219,
+        232
+      ],
+      "warning": [
+        255,
+        122,
+        89
+      ],
+      "success": [
+        155,
+        214,
+        111
+      ],
+      "info": [
+        106,
+        166,
+        220
+      ],
+      "mode_agent": [
+        126,
+        180,
+        232
+      ],
+      "mode_yolo": [
+        255,
+        112,
+        160
+      ],
+      "mode_plan": [
+        185,
+        220,
+        236
+      ],
+      "mode_operate": [
+        173,
+        136,
+        255
+      ],
+      "permission_ask": [
+        224,
+        153,
+        72
+      ],
+      "permission_auto_review": [
+        246,
+        196,
+        83
+      ],
+      "permission_full_access": [
+        255,
+        122,
+        89
+      ],
+      "status_ready": [
+        147,
+        160,
+        184
+      ],
+      "status_working": [
+        79,
+        209,
+        197
+      ],
+      "status_warning": [
+        255,
+        122,
+        89
+      ],
+      "diff_added_fg": [
+        87,
+        199,
+        133
+      ],
+      "diff_deleted_fg": [
+        255,
+        134,
+        178
+      ],
+      "diff_added_bg": [
+        18,
+        42,
+        34
+      ],
+      "diff_deleted_bg": [
+        52,
+        24,
+        39
+      ],
+      "tool_running": [
+        79,
+        209,
+        197
+      ],
+      "tool_success": [
+        155,
+        214,
+        111
+      ],
+      "tool_failed": [
+        255,
+        134,
+        178
+      ]
+    }
+  },
+  {
+    "variant": "Shoreline",
+    "name": "shoreline",
+    "light": false,
+    "roles": [
+      [
+        26,
+        24,
+        28
+      ],
+      [
+        33,
+        31,
+        35
+      ],
+      [
+        43,
+        40,
+        46
+      ],
+      [
+        53,
+        49,
+        58
+      ],
+      [
+        44,
+        70,
+        84
+      ],
+      [
+        242,
+        236,
+        229
+      ],
+      [
+        176,
+        167,
+        178
+      ],
+      [
+        73,
+        66,
+        77
+      ],
+      [
+        217,
+        210,
+        220
+      ],
+      [
+        103,
+        184,
+        214
+      ],
+      [
+        33,
+        31,
+        35
+      ],
+      [
+        127,
+        214,
+        198
+      ],
+      [
+        246,
+        196,
+        83
+      ],
+      [
+        255,
+        143,
+        168
+      ],
+      [
+        154,
+        145,
+        159
+      ],
+      [
+        126,
+        117,
+        131
+      ],
+      [
+        30,
+        44,
+        37
+      ],
+      [
+        51,
+        32,
+        42
+      ]
+    ],
+    "slots": {
+      "name": "shoreline",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        33,
+        31,
+        35
+      ],
+      "panel_bg": [
+        43,
+        40,
+        46
+      ],
+      "elevated_bg": [
+        53,
+        49,
+        58
+      ],
+      "composer_bg": [
+        43,
+        40,
+        46
+      ],
+      "selection_bg": [
+        44,
+        70,
+        84
+      ],
+      "header_bg": [
+        26,
+        24,
+        28
+      ],
+      "footer_bg": [
+        26,
+        24,
+        28
+      ],
+      "text_dim": [
+        126,
+        117,
+        131
+      ],
+      "text_hint": [
+        154,
+        145,
+        159
+      ],
+      "text_muted": [
+        176,
+        167,
+        178
+      ],
+      "text_body": [
+        242,
+        236,
+        229
+      ],
+      "text_soft": [
+        217,
+        210,
+        220
+      ],
+      "border": [
+        73,
+        66,
+        77
+      ],
+      "accent_primary": [
+        103,
+        184,
+        214
+      ],
+      "accent_secondary": [
+        127,
+        214,
+        198
+      ],
+      "accent_action": [
+        246,
+        196,
+        83
+      ],
+      "error_fg": [
+        255,
+        143,
+        168
+      ],
+      "error_hover": [
+        255,
+        166,
+        187
+      ],
+      "error_surface": [
+        58,
+        32,
+        41
+      ],
+      "error_border": [
+        255,
+        143,
+        168
+      ],
+      "error_text": [
+        255,
+        220,
+        230
+      ],
+      "warning": [
+        240,
+        168,
+        104
+      ],
+      "success": [
+        163,
+        217,
+        119
+      ],
+      "info": [
+        103,
+        184,
+        214
+      ],
+      "mode_agent": [
+        126,
+        180,
+        232
+      ],
+      "mode_yolo": [
+        255,
+        112,
+        160
+      ],
+      "mode_plan": [
+        185,
+        220,
+        236
+      ],
+      "mode_operate": [
+        173,
+        136,
+        255
+      ],
+      "permission_ask": [
+        176,
+        167,
+        178
+      ],
+      "permission_auto_review": [
+        246,
+        196,
+        83
+      ],
+      "permission_full_access": [
+        240,
+        168,
+        104
+      ],
+      "status_ready": [
+        163,
+        217,
+        119
+      ],
+      "status_working": [
+        127,
+        214,
+        198
+      ],
+      "status_warning": [
+        240,
+        168,
+        104
+      ],
+      "diff_added_fg": [
+        127,
+        214,
+        160
+      ],
+      "diff_deleted_fg": [
+        255,
+        154,
+        171
+      ],
+      "diff_added_bg": [
+        30,
+        44,
+        37
+      ],
+      "diff_deleted_bg": [
+        51,
+        32,
+        42
+      ],
+      "tool_running": [
+        127,
+        214,
+        198
+      ],
+      "tool_success": [
+        163,
+        217,
+        119
+      ],
+      "tool_failed": [
+        255,
+        143,
+        168
+      ]
+    }
+  },
+  {
+    "variant": "ShorelineLight",
+    "name": "shoreline-light",
+    "light": true,
+    "roles": [
+      [
+        237,
+        231,
+        224
+      ],
+      [
+        245,
+        240,
+        233
+      ],
+      [
+        236,
+        229,
+        224
+      ],
+      [
+        255,
+        252,
+        247
+      ],
+      [
+        201,
+        224,
+        231
+      ],
+      [
+        48,
+        40,
+        50
+      ],
+      [
+        107,
+        96,
+        110
+      ],
+      [
+        215,
+        206,
+        213
+      ],
+      [
+        74,
+        65,
+        76
+      ],
+      [
+        0,
+        102,
+        132
+      ],
+      [
+        245,
+        240,
+        233
+      ],
+      [
+        31,
+        122,
+        107
+      ],
+      [
+        122,
+        85,
+        0
+      ],
+      [
+        180,
+        35,
+        90
+      ],
+      [
+        117,
+        112,
+        128
+      ],
+      [
+        138,
+        130,
+        144
+      ],
+      [
+        226,
+        242,
+        230
+      ],
+      [
+        251,
+        230,
+        236
+      ]
+    ],
+    "slots": {
+      "name": "shoreline-light",
+      "mode": "PaletteMode::Light",
+      "surface_bg": [
+        245,
+        240,
+        233
+      ],
+      "panel_bg": [
+        236,
+        229,
+        224
+      ],
+      "elevated_bg": [
+        255,
+        252,
+        247
+      ],
+      "composer_bg": [
+        251,
+        247,
+        241
+      ],
+      "selection_bg": [
+        201,
+        224,
+        231
+      ],
+      "header_bg": [
+        237,
+        231,
+        224
+      ],
+      "footer_bg": [
+        237,
+        231,
+        224
+      ],
+      "text_dim": [
+        138,
+        130,
+        144
+      ],
+      "text_hint": [
+        117,
+        112,
+        128
+      ],
+      "text_muted": [
+        107,
+        96,
+        110
+      ],
+      "text_body": [
+        48,
+        40,
+        50
+      ],
+      "text_soft": [
+        74,
+        65,
+        76
+      ],
+      "border": [
+        215,
+        206,
+        213
+      ],
+      "accent_primary": [
+        0,
+        102,
+        132
+      ],
+      "accent_secondary": [
+        31,
+        122,
+        107
+      ],
+      "accent_action": [
+        122,
+        85,
+        0
+      ],
+      "error_fg": [
+        180,
+        35,
+        90
+      ],
+      "error_hover": [
+        180,
+        35,
+        90
+      ],
+      "error_surface": [
+        251,
+        228,
+        236
+      ],
+      "error_border": [
+        180,
+        35,
+        90
+      ],
+      "error_text": [
+        122,
+        18,
+        53
+      ],
+      "warning": [
+        143,
+        85,
+        20
+      ],
+      "success": [
+        47,
+        107,
+        58
+      ],
+      "info": [
+        0,
+        102,
+        132
+      ],
+      "mode_agent": [
+        22,
+        54,
+        178
+      ],
+      "mode_yolo": [
+        181,
+        35,
+        90
+      ],
+      "mode_plan": [
+        52,
+        92,
+        128
+      ],
+      "mode_operate": [
+        112,
+        71,
+        184
+      ],
+      "permission_ask": [
+        107,
+        96,
+        110
+      ],
+      "permission_auto_review": [
+        122,
+        85,
+        0
+      ],
+      "permission_full_access": [
+        143,
+        85,
+        20
+      ],
+      "status_ready": [
+        47,
+        107,
+        58
+      ],
+      "status_working": [
+        31,
+        122,
+        107
+      ],
+      "status_warning": [
+        143,
+        85,
+        20
+      ],
+      "diff_added_fg": [
+        31,
+        107,
+        69
+      ],
+      "diff_deleted_fg": [
+        168,
+        40,
+        80
+      ],
+      "diff_added_bg": [
+        226,
+        242,
+        230
+      ],
+      "diff_deleted_bg": [
+        251,
+        230,
+        236
+      ],
+      "tool_running": [
+        31,
+        122,
+        107
+      ],
+      "tool_success": [
+        47,
+        107,
+        58
+      ],
+      "tool_failed": [
+        180,
+        35,
+        90
+      ]
+    }
+  },
+  {
+    "variant": "Whale",
+    "name": "whale",
+    "light": false,
+    "roles": [
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      [
+        26,
+        44,
+        99
+      ],
+      [
+        35,
+        45,
+        65
+      ],
+      [
+        246,
+        242,
+        232
+      ],
+      [
+        147,
+        160,
+        184
+      ],
+      [
+        42,
+        63,
+        114
+      ],
+      [
+        182,
+        192,
+        212
+      ],
+      [
+        106,
+        166,
+        220
+      ],
+      "Color::Reset",
+      [
+        79,
+        209,
+        197
+      ],
+      [
+        246,
+        196,
+        83
+      ],
+      [
+        255,
+        134,
+        178
+      ],
+      [
+        138,
+        153,
+        179
+      ],
+      [
+        138,
+        153,
+        179
+      ],
+      [
+        18,
+        42,
+        34
+      ],
+      [
+        52,
+        24,
+        39
+      ]
+    ],
+    "slots": {
+      "name": "whale",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": "Color::Reset",
+      "panel_bg": "Color::Reset",
+      "elevated_bg": [
+        26,
+        44,
+        99
+      ],
+      "composer_bg": "Color::Reset",
+      "selection_bg": [
+        35,
+        45,
+        65
+      ],
+      "header_bg": "Color::Reset",
+      "footer_bg": "Color::Reset",
+      "text_dim": [
+        138,
+        153,
+        179
+      ],
+      "text_hint": [
+        138,
+        153,
+        179
+      ],
+      "text_muted": [
+        147,
+        160,
+        184
+      ],
+      "text_body": [
+        246,
+        242,
+        232
+      ],
+      "text_soft": [
+        182,
+        192,
+        212
+      ],
+      "border": [
+        42,
+        63,
+        114
+      ],
+      "accent_primary": [
+        106,
+        166,
+        220
+      ],
+      "accent_secondary": [
+        79,
+        209,
+        197
+      ],
+      "accent_action": [
+        246,
+        196,
+        83
+      ],
+      "error_fg": [
+        255,
+        134,
+        178
+      ],
+      "error_hover": [
+        255,
+        156,
+        194
+      ],
+      "error_surface": [
+        43,
+        21,
+        34
+      ],
+      "error_border": [
+        255,
+        134,
+        178
+      ],
+      "error_text": [
+        255,
+        219,
+        232
+      ],
+      "warning": [
+        255,
+        122,
+        89
+      ],
+      "success": [
+        155,
+        214,
+        111
+      ],
+      "info": [
+        106,
+        166,
+        220
+      ],
+      "mode_agent": [
+        126,
+        180,
+        232
+      ],
+      "mode_yolo": [
+        255,
+        112,
+        160
+      ],
+      "mode_plan": [
+        185,
+        220,
+        236
+      ],
+      "mode_operate": [
+        173,
+        136,
+        255
+      ],
+      "permission_ask": [
+        224,
+        153,
+        72
+      ],
+      "permission_auto_review": [
+        246,
+        196,
+        83
+      ],
+      "permission_full_access": [
+        255,
+        122,
+        89
+      ],
+      "status_ready": [
+        147,
+        160,
+        184
+      ],
+      "status_working": [
+        79,
+        209,
+        197
+      ],
+      "status_warning": [
+        255,
+        122,
+        89
+      ],
+      "diff_added_fg": [
+        87,
+        199,
+        133
+      ],
+      "diff_deleted_fg": [
+        255,
+        134,
+        178
+      ],
+      "diff_added_bg": [
+        18,
+        42,
+        34
+      ],
+      "diff_deleted_bg": [
+        52,
+        24,
+        39
+      ],
+      "tool_running": [
+        79,
+        209,
+        197
+      ],
+      "tool_success": [
+        155,
+        214,
+        111
+      ],
+      "tool_failed": [
+        255,
+        134,
+        178
+      ]
+    }
+  },
+  {
+    "variant": "WhaleLight",
+    "name": "whale-light",
+    "light": true,
+    "roles": [
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      [
+        232,
+        238,
+        248
+      ],
+      [
+        238,
+        246,
+        255
+      ],
+      [
+        20,
+        33,
+        58
+      ],
+      [
+        91,
+        103,
+        128
+      ],
+      [
+        169,
+        184,
+        207
+      ],
+      [
+        69,
+        81,
+        104
+      ],
+      [
+        21,
+        53,
+        178
+      ],
+      "Color::Reset",
+      [
+        8,
+        118,
+        109
+      ],
+      [
+        122,
+        85,
+        0
+      ],
+      [
+        180,
+        35,
+        90
+      ],
+      [
+        95,
+        107,
+        129
+      ],
+      [
+        95,
+        107,
+        129
+      ],
+      [
+        223,
+        247,
+        231
+      ],
+      [
+        252,
+        235,
+        242
+      ]
+    ],
+    "slots": {
+      "name": "whale-light",
+      "mode": "PaletteMode::Light",
+      "surface_bg": "Color::Reset",
+      "panel_bg": "Color::Reset",
+      "elevated_bg": [
+        232,
+        238,
+        248
+      ],
+      "composer_bg": "Color::Reset",
+      "selection_bg": [
+        238,
+        246,
+        255
+      ],
+      "header_bg": "Color::Reset",
+      "footer_bg": "Color::Reset",
+      "text_dim": [
+        95,
+        107,
+        129
+      ],
+      "text_hint": [
+        95,
+        107,
+        129
+      ],
+      "text_muted": [
+        91,
+        103,
+        128
+      ],
+      "text_body": [
+        20,
+        33,
+        58
+      ],
+      "text_soft": [
+        69,
+        81,
+        104
+      ],
+      "border": [
+        169,
+        184,
+        207
+      ],
+      "accent_primary": [
+        21,
+        53,
+        178
+      ],
+      "accent_secondary": [
+        8,
+        118,
+        109
+      ],
+      "accent_action": [
+        122,
+        85,
+        0
+      ],
+      "error_fg": [
+        180,
+        35,
+        90
+      ],
+      "error_hover": [
+        201,
+        71,
+        120
+      ],
+      "error_surface": [
+        252,
+        235,
+        242
+      ],
+      "error_border": [
+        180,
+        35,
+        90
+      ],
+      "error_text": [
+        109,
+        22,
+        56
+      ],
+      "warning": [
+        169,
+        71,
+        36
+      ],
+      "success": [
+        20,
+        118,
+        61
+      ],
+      "info": [
+        21,
+        53,
+        178
+      ],
+      "mode_agent": [
+        22,
+        54,
+        178
+      ],
+      "mode_yolo": [
+        181,
+        35,
+        90
+      ],
+      "mode_plan": [
+        52,
+        92,
+        128
+      ],
+      "mode_operate": [
+        112,
+        71,
+        184
+      ],
+      "permission_ask": [
+        146,
+        64,
+        14
+      ],
+      "permission_auto_review": [
+        122,
+        85,
+        0
+      ],
+      "permission_full_access": [
+        169,
+        71,
+        36
+      ],
+      "status_ready": [
+        91,
+        103,
+        128
+      ],
+      "status_working": [
+        8,
+        118,
+        109
+      ],
+      "status_warning": [
+        169,
+        71,
+        36
+      ],
+      "diff_added_fg": [
+        22,
+        101,
+        52
+      ],
+      "diff_deleted_fg": [
+        180,
+        35,
+        90
+      ],
+      "diff_added_bg": [
+        223,
+        247,
+        231
+      ],
+      "diff_deleted_bg": [
+        252,
+        235,
+        242
+      ],
+      "tool_running": [
+        8,
+        118,
+        109
+      ],
+      "tool_success": [
+        20,
+        118,
+        61
+      ],
+      "tool_failed": [
+        180,
+        35,
+        90
+      ]
+    }
+  },
+  {
+    "variant": "Terminal",
+    "name": "terminal",
+    "light": false,
+    "roles": [
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Blue",
+      "Color::Reset",
+      "Color::Cyan",
+      "Color::Yellow",
+      "Color::Red",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset",
+      "Color::Reset"
+    ],
+    "slots": {
+      "name": "terminal",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": "Color::Reset",
+      "panel_bg": "Color::Reset",
+      "elevated_bg": "Color::Reset",
+      "composer_bg": "Color::Reset",
+      "selection_bg": "Color::Reset",
+      "header_bg": "Color::Reset",
+      "footer_bg": "Color::Reset",
+      "text_dim": "Color::Reset",
+      "text_hint": "Color::Reset",
+      "text_muted": "Color::Reset",
+      "text_body": "Color::Reset",
+      "text_soft": "Color::Reset",
+      "border": "Color::Reset",
+      "accent_primary": "Color::Blue",
+      "accent_secondary": "Color::Cyan",
+      "accent_action": "Color::Yellow",
+      "error_fg": "Color::Red",
+      "error_hover": "Color::Red",
+      "error_surface": "Color::Reset",
+      "error_border": "Color::Red",
+      "error_text": "Color::Red",
+      "warning": "Color::Yellow",
+      "success": "Color::Green",
+      "info": "Color::Cyan",
+      "mode_agent": "Color::LightBlue",
+      "mode_yolo": "Color::LightRed",
+      "mode_plan": "Color::Magenta",
+      "mode_operate": "Color::LightCyan",
+      "permission_ask": "Color::Yellow",
+      "permission_auto_review": "Color::LightYellow",
+      "permission_full_access": "Color::LightRed",
+      "status_ready": "Color::DarkGray",
+      "status_working": "Color::Cyan",
+      "status_warning": "Color::Yellow",
+      "diff_added_fg": "Color::Green",
+      "diff_deleted_fg": "Color::Red",
+      "diff_added_bg": "Color::Reset",
+      "diff_deleted_bg": "Color::Reset",
+      "tool_running": "Color::Cyan",
+      "tool_success": "Color::Green",
+      "tool_failed": "Color::Red"
+    }
+  },
+  {
+    "variant": "Grayscale",
+    "name": "grayscale",
+    "light": false,
+    "roles": [
+      [
+        10,
+        10,
+        10
+      ],
+      [
+        10,
+        10,
+        10
+      ],
+      [
+        18,
+        18,
+        18
+      ],
+      [
+        31,
+        31,
+        31
+      ],
+      [
+        62,
+        62,
+        62
+      ],
+      [
+        236,
+        236,
+        236
+      ],
+      [
+        180,
+        180,
+        180
+      ],
+      [
+        96,
+        96,
+        96
+      ],
+      [
+        220,
+        220,
+        220
+      ],
+      [
+        220,
+        220,
+        220
+      ],
+      [
+        10,
+        10,
+        10
+      ],
+      [
+        180,
+        180,
+        180
+      ],
+      [
+        210,
+        210,
+        210
+      ],
+      [
+        236,
+        236,
+        236
+      ],
+      [
+        138,
+        138,
+        138
+      ],
+      [
+        138,
+        138,
+        138
+      ],
+      [
+        34,
+        34,
+        34
+      ],
+      [
+        42,
+        42,
+        42
+      ]
+    ],
+    "slots": {
+      "name": "grayscale",
+      "mode": "PaletteMode::Grayscale",
+      "surface_bg": [
+        10,
+        10,
+        10
+      ],
+      "panel_bg": [
+        18,
+        18,
+        18
+      ],
+      "elevated_bg": [
+        31,
+        31,
+        31
+      ],
+      "composer_bg": [
+        18,
+        18,
+        18
+      ],
+      "selection_bg": [
+        62,
+        62,
+        62
+      ],
+      "header_bg": [
+        10,
+        10,
+        10
+      ],
+      "footer_bg": [
+        10,
+        10,
+        10
+      ],
+      "text_dim": [
+        138,
+        138,
+        138
+      ],
+      "text_hint": [
+        138,
+        138,
+        138
+      ],
+      "text_muted": [
+        180,
+        180,
+        180
+      ],
+      "text_body": [
+        236,
+        236,
+        236
+      ],
+      "text_soft": [
+        220,
+        220,
+        220
+      ],
+      "border": [
+        96,
+        96,
+        96
+      ],
+      "accent_primary": [
+        220,
+        220,
+        220
+      ],
+      "accent_secondary": [
+        180,
+        180,
+        180
+      ],
+      "accent_action": [
+        210,
+        210,
+        210
+      ],
+      "error_fg": [
+        236,
+        236,
+        236
+      ],
+      "error_hover": [
+        220,
+        220,
+        220
+      ],
+      "error_surface": [
+        42,
+        42,
+        42
+      ],
+      "error_border": [
+        96,
+        96,
+        96
+      ],
+      "error_text": [
+        220,
+        220,
+        220
+      ],
+      "warning": [
+        180,
+        180,
+        180
+      ],
+      "success": [
+        220,
+        220,
+        220
+      ],
+      "info": [
+        180,
+        180,
+        180
+      ],
+      "mode_agent": [
+        200,
+        200,
+        200
+      ],
+      "mode_yolo": [
+        237,
+        237,
+        237
+      ],
+      "mode_plan": [
+        181,
+        181,
+        181
+      ],
+      "mode_operate": [
+        250,
+        250,
+        250
+      ],
+      "permission_ask": [
+        181,
+        181,
+        181
+      ],
+      "permission_auto_review": [
+        210,
+        210,
+        210
+      ],
+      "permission_full_access": [
+        237,
+        237,
+        237
+      ],
+      "status_ready": [
+        180,
+        180,
+        180
+      ],
+      "status_working": [
+        220,
+        220,
+        220
+      ],
+      "status_warning": [
+        236,
+        236,
+        236
+      ],
+      "diff_added_fg": [
+        220,
+        220,
+        220
+      ],
+      "diff_deleted_fg": [
+        236,
+        236,
+        236
+      ],
+      "diff_added_bg": [
+        34,
+        34,
+        34
+      ],
+      "diff_deleted_bg": [
+        42,
+        42,
+        42
+      ],
+      "tool_running": [
+        220,
+        220,
+        220
+      ],
+      "tool_success": [
+        138,
+        138,
+        138
+      ],
+      "tool_failed": [
+        236,
+        236,
+        236
+      ]
+    }
+  },
+  {
+    "variant": "CatppuccinMocha",
+    "name": "catppuccin-mocha",
+    "light": false,
+    "roles": [
+      [
+        17,
+        17,
+        27
+      ],
+      [
+        30,
+        30,
+        46
+      ],
+      [
+        24,
+        24,
+        37
+      ],
+      [
+        49,
+        50,
+        68
+      ],
+      [
+        69,
+        71,
+        90
+      ],
+      [
+        205,
+        214,
+        244
+      ],
+      [
+        166,
+        173,
+        200
+      ],
+      [
+        69,
+        71,
+        90
+      ],
+      [
+        186,
+        194,
+        222
+      ],
+      [
+        137,
+        180,
+        250
+      ],
+      [
+        30,
+        30,
+        46
+      ],
+      [
+        116,
+        199,
+        236
+      ],
+      [
+        250,
+        179,
+        135
+      ],
+      [
+        243,
+        139,
+        168
+      ],
+      [
+        127,
+        132,
+        156
+      ],
+      [
+        108,
+        112,
+        134
+      ],
+      [
+        31,
+        51,
+        41
+      ],
+      [
+        58,
+        31,
+        42
+      ]
+    ],
+    "slots": {
+      "name": "catppuccin-mocha",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        30,
+        30,
+        46
+      ],
+      "panel_bg": [
+        24,
+        24,
+        37
+      ],
+      "elevated_bg": [
+        49,
+        50,
+        68
+      ],
+      "composer_bg": [
+        24,
+        24,
+        37
+      ],
+      "selection_bg": [
+        69,
+        71,
+        90
+      ],
+      "header_bg": [
+        17,
+        17,
+        27
+      ],
+      "footer_bg": [
+        17,
+        17,
+        27
+      ],
+      "text_dim": [
+        108,
+        112,
+        134
+      ],
+      "text_hint": [
+        127,
+        132,
+        156
+      ],
+      "text_muted": [
+        166,
+        173,
+        200
+      ],
+      "text_body": [
+        205,
+        214,
+        244
+      ],
+      "text_soft": [
+        186,
+        194,
+        222
+      ],
+      "border": [
+        69,
+        71,
+        90
+      ],
+      "accent_primary": [
+        137,
+        180,
+        250
+      ],
+      "accent_secondary": [
+        116,
+        199,
+        236
+      ],
+      "accent_action": [
+        250,
+        179,
+        135
+      ],
+      "error_fg": [
+        243,
+        139,
+        168
+      ],
+      "error_hover": [
+        245,
+        162,
+        188
+      ],
+      "error_surface": [
+        58,
+        31,
+        42
+      ],
+      "error_border": [
+        243,
+        139,
+        168
+      ],
+      "error_text": [
+        245,
+        194,
+        208
+      ],
+      "warning": [
+        249,
+        226,
+        175
+      ],
+      "success": [
+        166,
+        227,
+        161
+      ],
+      "info": [
+        137,
+        217,
+        235
+      ],
+      "mode_agent": [
+        138,
+        180,
+        250
+      ],
+      "mode_yolo": [
+        243,
+        140,
+        168
+      ],
+      "mode_plan": [
+        250,
+        180,
+        135
+      ],
+      "mode_operate": [
+        203,
+        166,
+        247
+      ],
+      "permission_ask": [
+        249,
+        226,
+        175
+      ],
+      "permission_auto_review": [
+        250,
+        179,
+        135
+      ],
+      "permission_full_access": [
+        243,
+        139,
+        168
+      ],
+      "status_ready": [
+        127,
+        132,
+        156
+      ],
+      "status_working": [
+        116,
+        199,
+        236
+      ],
+      "status_warning": [
+        249,
+        226,
+        175
+      ],
+      "diff_added_fg": [
+        166,
+        227,
+        161
+      ],
+      "diff_deleted_fg": [
+        243,
+        139,
+        168
+      ],
+      "diff_added_bg": [
+        31,
+        51,
+        41
+      ],
+      "diff_deleted_bg": [
+        58,
+        31,
+        42
+      ],
+      "tool_running": [
+        116,
+        199,
+        236
+      ],
+      "tool_success": [
+        127,
+        132,
+        156
+      ],
+      "tool_failed": [
+        243,
+        139,
+        168
+      ]
+    }
+  },
+  {
+    "variant": "TokyoNight",
+    "name": "tokyo-night",
+    "light": false,
+    "roles": [
+      [
+        22,
+        22,
+        30
+      ],
+      [
+        26,
+        27,
+        38
+      ],
+      [
+        22,
+        22,
+        30
+      ],
+      [
+        41,
+        46,
+        66
+      ],
+      [
+        40,
+        52,
+        87
+      ],
+      [
+        192,
+        202,
+        245
+      ],
+      [
+        169,
+        177,
+        214
+      ],
+      [
+        65,
+        72,
+        104
+      ],
+      [
+        187,
+        194,
+        224
+      ],
+      [
+        122,
+        162,
+        247
+      ],
+      [
+        26,
+        27,
+        38
+      ],
+      [
+        125,
+        207,
+        255
+      ],
+      [
+        255,
+        158,
+        100
+      ],
+      [
+        247,
+        118,
+        142
+      ],
+      [
+        115,
+        122,
+        162
+      ],
+      [
+        92,
+        101,
+        141
+      ],
+      [
+        27,
+        43,
+        31
+      ],
+      [
+        51,
+        28,
+        36
+      ]
+    ],
+    "slots": {
+      "name": "tokyo-night",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        26,
+        27,
+        38
+      ],
+      "panel_bg": [
+        22,
+        22,
+        30
+      ],
+      "elevated_bg": [
+        41,
+        46,
+        66
+      ],
+      "composer_bg": [
+        22,
+        22,
+        30
+      ],
+      "selection_bg": [
+        40,
+        52,
+        87
+      ],
+      "header_bg": [
+        22,
+        22,
+        30
+      ],
+      "footer_bg": [
+        22,
+        22,
+        30
+      ],
+      "text_dim": [
+        92,
+        101,
+        141
+      ],
+      "text_hint": [
+        115,
+        122,
+        162
+      ],
+      "text_muted": [
+        169,
+        177,
+        214
+      ],
+      "text_body": [
+        192,
+        202,
+        245
+      ],
+      "text_soft": [
+        187,
+        194,
+        224
+      ],
+      "border": [
+        65,
+        72,
+        104
+      ],
+      "accent_primary": [
+        122,
+        162,
+        247
+      ],
+      "accent_secondary": [
+        125,
+        207,
+        255
+      ],
+      "accent_action": [
+        255,
+        158,
+        100
+      ],
+      "error_fg": [
+        247,
+        118,
+        142
+      ],
+      "error_hover": [
+        249,
+        146,
+        164
+      ],
+      "error_surface": [
+        51,
+        28,
+        36
+      ],
+      "error_border": [
+        247,
+        118,
+        142
+      ],
+      "error_text": [
+        250,
+        204,
+        212
+      ],
+      "warning": [
+        224,
+        175,
+        104
+      ],
+      "success": [
+        158,
+        206,
+        106
+      ],
+      "info": [
+        125,
+        207,
+        255
+      ],
+      "mode_agent": [
+        123,
+        162,
+        247
+      ],
+      "mode_yolo": [
+        247,
+        119,
+        142
+      ],
+      "mode_plan": [
+        255,
+        159,
+        100
+      ],
+      "mode_operate": [
+        187,
+        154,
+        247
+      ],
+      "permission_ask": [
+        224,
+        175,
+        104
+      ],
+      "permission_auto_review": [
+        255,
+        158,
+        100
+      ],
+      "permission_full_access": [
+        247,
+        118,
+        142
+      ],
+      "status_ready": [
+        92,
+        101,
+        141
+      ],
+      "status_working": [
+        125,
+        207,
+        255
+      ],
+      "status_warning": [
+        224,
+        175,
+        104
+      ],
+      "diff_added_fg": [
+        158,
+        206,
+        106
+      ],
+      "diff_deleted_fg": [
+        247,
+        118,
+        142
+      ],
+      "diff_added_bg": [
+        27,
+        43,
+        31
+      ],
+      "diff_deleted_bg": [
+        51,
+        28,
+        36
+      ],
+      "tool_running": [
+        125,
+        207,
+        255
+      ],
+      "tool_success": [
+        86,
+        95,
+        137
+      ],
+      "tool_failed": [
+        247,
+        118,
+        142
+      ]
+    }
+  },
+  {
+    "variant": "Dracula",
+    "name": "dracula",
+    "light": false,
+    "roles": [
+      [
+        33,
+        34,
+        44
+      ],
+      [
+        40,
+        42,
+        54
+      ],
+      [
+        33,
+        34,
+        44
+      ],
+      [
+        52,
+        55,
+        70
+      ],
+      [
+        68,
+        71,
+        90
+      ],
+      [
+        248,
+        248,
+        242
+      ],
+      [
+        192,
+        196,
+        214
+      ],
+      [
+        68,
+        71,
+        90
+      ],
+      [
+        226,
+        226,
+        220
+      ],
+      [
+        189,
+        147,
+        249
+      ],
+      [
+        40,
+        42,
+        54
+      ],
+      [
+        139,
+        233,
+        253
+      ],
+      [
+        255,
+        184,
+        108
+      ],
+      [
+        255,
+        85,
+        85
+      ],
+      [
+        138,
+        142,
+        170
+      ],
+      [
+        98,
+        114,
+        164
+      ],
+      [
+        33,
+        58,
+        42
+      ],
+      [
+        58,
+        31,
+        34
+      ]
+    ],
+    "slots": {
+      "name": "dracula",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        40,
+        42,
+        54
+      ],
+      "panel_bg": [
+        33,
+        34,
+        44
+      ],
+      "elevated_bg": [
+        52,
+        55,
+        70
+      ],
+      "composer_bg": [
+        33,
+        34,
+        44
+      ],
+      "selection_bg": [
+        68,
+        71,
+        90
+      ],
+      "header_bg": [
+        33,
+        34,
+        44
+      ],
+      "footer_bg": [
+        33,
+        34,
+        44
+      ],
+      "text_dim": [
+        98,
+        114,
+        164
+      ],
+      "text_hint": [
+        138,
+        142,
+        170
+      ],
+      "text_muted": [
+        192,
+        196,
+        214
+      ],
+      "text_body": [
+        248,
+        248,
+        242
+      ],
+      "text_soft": [
+        226,
+        226,
+        220
+      ],
+      "border": [
+        68,
+        71,
+        90
+      ],
+      "accent_primary": [
+        189,
+        147,
+        249
+      ],
+      "accent_secondary": [
+        139,
+        233,
+        253
+      ],
+      "accent_action": [
+        255,
+        184,
+        108
+      ],
+      "error_fg": [
+        255,
+        85,
+        85
+      ],
+      "error_hover": [
+        255,
+        124,
+        124
+      ],
+      "error_surface": [
+        58,
+        31,
+        34
+      ],
+      "error_border": [
+        255,
+        85,
+        85
+      ],
+      "error_text": [
+        255,
+        187,
+        187
+      ],
+      "warning": [
+        241,
+        250,
+        140
+      ],
+      "success": [
+        80,
+        250,
+        123
+      ],
+      "info": [
+        139,
+        233,
+        253
+      ],
+      "mode_agent": [
+        190,
+        147,
+        249
+      ],
+      "mode_yolo": [
+        255,
+        86,
+        85
+      ],
+      "mode_plan": [
+        255,
+        185,
+        108
+      ],
+      "mode_operate": [
+        140,
+        233,
+        253
+      ],
+      "permission_ask": [
+        241,
+        250,
+        140
+      ],
+      "permission_auto_review": [
+        255,
+        184,
+        108
+      ],
+      "permission_full_access": [
+        255,
+        85,
+        85
+      ],
+      "status_ready": [
+        98,
+        114,
+        164
+      ],
+      "status_working": [
+        139,
+        233,
+        253
+      ],
+      "status_warning": [
+        241,
+        250,
+        140
+      ],
+      "diff_added_fg": [
+        80,
+        250,
+        123
+      ],
+      "diff_deleted_fg": [
+        255,
+        85,
+        85
+      ],
+      "diff_added_bg": [
+        33,
+        58,
+        42
+      ],
+      "diff_deleted_bg": [
+        58,
+        31,
+        34
+      ],
+      "tool_running": [
+        139,
+        233,
+        253
+      ],
+      "tool_success": [
+        98,
+        114,
+        164
+      ],
+      "tool_failed": [
+        255,
+        85,
+        85
+      ]
+    }
+  },
+  {
+    "variant": "GruvboxDark",
+    "name": "gruvbox-dark",
+    "light": false,
+    "roles": [
+      [
+        29,
+        32,
+        33
+      ],
+      [
+        40,
+        40,
+        40
+      ],
+      [
+        60,
+        56,
+        54
+      ],
+      [
+        80,
+        73,
+        69
+      ],
+      [
+        102,
+        92,
+        84
+      ],
+      [
+        235,
+        219,
+        178
+      ],
+      [
+        197,
+        184,
+        160
+      ],
+      [
+        102,
+        92,
+        84
+      ],
+      [
+        213,
+        196,
+        161
+      ],
+      [
+        131,
+        165,
+        152
+      ],
+      [
+        40,
+        40,
+        40
+      ],
+      [
+        142,
+        192,
+        124
+      ],
+      [
+        254,
+        128,
+        25
+      ],
+      [
+        251,
+        73,
+        52
+      ],
+      [
+        168,
+        153,
+        132
+      ],
+      [
+        146,
+        131,
+        116
+      ],
+      [
+        41,
+        50,
+        22
+      ],
+      [
+        53,
+        28,
+        24
+      ]
+    ],
+    "slots": {
+      "name": "gruvbox-dark",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        40,
+        40,
+        40
+      ],
+      "panel_bg": [
+        60,
+        56,
+        54
+      ],
+      "elevated_bg": [
+        80,
+        73,
+        69
+      ],
+      "composer_bg": [
+        60,
+        56,
+        54
+      ],
+      "selection_bg": [
+        102,
+        92,
+        84
+      ],
+      "header_bg": [
+        29,
+        32,
+        33
+      ],
+      "footer_bg": [
+        29,
+        32,
+        33
+      ],
+      "text_dim": [
+        146,
+        131,
+        116
+      ],
+      "text_hint": [
+        168,
+        153,
+        132
+      ],
+      "text_muted": [
+        197,
+        184,
+        160
+      ],
+      "text_body": [
+        235,
+        219,
+        178
+      ],
+      "text_soft": [
+        213,
+        196,
+        161
+      ],
+      "border": [
+        102,
+        92,
+        84
+      ],
+      "accent_primary": [
+        131,
+        165,
+        152
+      ],
+      "accent_secondary": [
+        142,
+        192,
+        124
+      ],
+      "accent_action": [
+        254,
+        128,
+        25
+      ],
+      "error_fg": [
+        251,
+        73,
+        52
+      ],
+      "error_hover": [
+        252,
+        124,
+        107
+      ],
+      "error_surface": [
+        53,
+        28,
+        24
+      ],
+      "error_border": [
+        251,
+        73,
+        52
+      ],
+      "error_text": [
+        252,
+        196,
+        184
+      ],
+      "warning": [
+        250,
+        189,
+        47
+      ],
+      "success": [
+        142,
+        192,
+        124
+      ],
+      "info": [
+        131,
+        165,
+        152
+      ],
+      "mode_agent": [
+        132,
+        165,
+        152
+      ],
+      "mode_yolo": [
+        251,
+        74,
+        52
+      ],
+      "mode_plan": [
+        254,
+        129,
+        25
+      ],
+      "mode_operate": [
+        211,
+        134,
+        155
+      ],
+      "permission_ask": [
+        250,
+        189,
+        47
+      ],
+      "permission_auto_review": [
+        254,
+        128,
+        25
+      ],
+      "permission_full_access": [
+        251,
+        73,
+        52
+      ],
+      "status_ready": [
+        146,
+        131,
+        116
+      ],
+      "status_working": [
+        142,
+        192,
+        124
+      ],
+      "status_warning": [
+        250,
+        189,
+        47
+      ],
+      "diff_added_fg": [
+        142,
+        192,
+        124
+      ],
+      "diff_deleted_fg": [
+        251,
+        73,
+        52
+      ],
+      "diff_added_bg": [
+        41,
+        50,
+        22
+      ],
+      "diff_deleted_bg": [
+        53,
+        28,
+        24
+      ],
+      "tool_running": [
+        142,
+        192,
+        124
+      ],
+      "tool_success": [
+        146,
+        131,
+        116
+      ],
+      "tool_failed": [
+        251,
+        73,
+        52
+      ]
+    }
+  },
+  {
+    "variant": "Claude",
+    "name": "claude",
+    "light": false,
+    "roles": [
+      [
+        24,
+        23,
+        21
+      ],
+      [
+        24,
+        23,
+        21
+      ],
+      [
+        37,
+        35,
+        32
+      ],
+      [
+        31,
+        30,
+        27
+      ],
+      [
+        48,
+        45,
+        40
+      ],
+      [
+        250,
+        249,
+        245
+      ],
+      [
+        160,
+        157,
+        150
+      ],
+      [
+        48,
+        45,
+        40
+      ],
+      [
+        208,
+        205,
+        197
+      ],
+      [
+        204,
+        120,
+        92
+      ],
+      [
+        24,
+        23,
+        21
+      ],
+      [
+        93,
+        184,
+        166
+      ],
+      [
+        232,
+        165,
+        90
+      ],
+      [
+        224,
+        96,
+        96
+      ],
+      [
+        125,
+        122,
+        115
+      ],
+      [
+        114,
+        112,
+        106
+      ],
+      [
+        26,
+        36,
+        29
+      ],
+      [
+        36,
+        26,
+        26
+      ]
+    ],
+    "slots": {
+      "name": "claude",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        24,
+        23,
+        21
+      ],
+      "panel_bg": [
+        37,
+        35,
+        32
+      ],
+      "elevated_bg": [
+        31,
+        30,
+        27
+      ],
+      "composer_bg": [
+        37,
+        35,
+        32
+      ],
+      "selection_bg": [
+        48,
+        45,
+        40
+      ],
+      "header_bg": [
+        24,
+        23,
+        21
+      ],
+      "footer_bg": [
+        24,
+        23,
+        21
+      ],
+      "text_dim": [
+        114,
+        112,
+        106
+      ],
+      "text_hint": [
+        125,
+        122,
+        115
+      ],
+      "text_muted": [
+        160,
+        157,
+        150
+      ],
+      "text_body": [
+        250,
+        249,
+        245
+      ],
+      "text_soft": [
+        208,
+        205,
+        197
+      ],
+      "border": [
+        48,
+        45,
+        40
+      ],
+      "accent_primary": [
+        204,
+        120,
+        92
+      ],
+      "accent_secondary": [
+        93,
+        184,
+        166
+      ],
+      "accent_action": [
+        232,
+        165,
+        90
+      ],
+      "error_fg": [
+        224,
+        96,
+        96
+      ],
+      "error_hover": [
+        217,
+        102,
+        102
+      ],
+      "error_surface": [
+        42,
+        28,
+        28
+      ],
+      "error_border": [
+        224,
+        96,
+        96
+      ],
+      "error_text": [
+        232,
+        184,
+        184
+      ],
+      "warning": [
+        212,
+        160,
+        23
+      ],
+      "success": [
+        93,
+        184,
+        114
+      ],
+      "info": [
+        93,
+        184,
+        166
+      ],
+      "mode_agent": [
+        205,
+        120,
+        92
+      ],
+      "mode_yolo": [
+        199,
+        69,
+        69
+      ],
+      "mode_plan": [
+        232,
+        166,
+        90
+      ],
+      "mode_operate": [
+        138,
+        99,
+        210
+      ],
+      "permission_ask": [
+        212,
+        160,
+        23
+      ],
+      "permission_auto_review": [
+        232,
+        165,
+        90
+      ],
+      "permission_full_access": [
+        224,
+        96,
+        96
+      ],
+      "status_ready": [
+        160,
+        157,
+        150
+      ],
+      "status_working": [
+        93,
+        184,
+        166
+      ],
+      "status_warning": [
+        212,
+        160,
+        23
+      ],
+      "diff_added_fg": [
+        93,
+        184,
+        114
+      ],
+      "diff_deleted_fg": [
+        198,
+        69,
+        69
+      ],
+      "diff_added_bg": [
+        26,
+        36,
+        29
+      ],
+      "diff_deleted_bg": [
+        36,
+        26,
+        26
+      ],
+      "tool_running": [
+        93,
+        184,
+        166
+      ],
+      "tool_success": [
+        160,
+        157,
+        150
+      ],
+      "tool_failed": [
+        198,
+        69,
+        69
+      ]
+    }
+  },
+  {
+    "variant": "Matrix",
+    "name": "matrix",
+    "light": false,
+    "roles": [
+      [
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        51,
+        0
+      ],
+      [
+        0,
+        51,
+        0
+      ],
+      [
+        136,
+        255,
+        136
+      ],
+      [
+        0,
+        169,
+        0
+      ],
+      [
+        0,
+        204,
+        0
+      ],
+      [
+        221,
+        255,
+        221
+      ],
+      [
+        0,
+        204,
+        0
+      ],
+      [
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        153,
+        0
+      ],
+      [
+        136,
+        255,
+        136
+      ],
+      [
+        180,
+        0,
+        0
+      ],
+      [
+        0,
+        135,
+        0
+      ],
+      [
+        0,
+        108,
+        0
+      ],
+      [
+        13,
+        26,
+        13
+      ],
+      [
+        26,
+        13,
+        13
+      ]
+    ],
+    "slots": {
+      "name": "matrix",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        0,
+        10,
+        0
+      ],
+      "panel_bg": [
+        0,
+        10,
+        0
+      ],
+      "elevated_bg": [
+        0,
+        51,
+        0
+      ],
+      "composer_bg": [
+        0,
+        10,
+        0
+      ],
+      "selection_bg": [
+        0,
+        51,
+        0
+      ],
+      "header_bg": [
+        0,
+        10,
+        0
+      ],
+      "footer_bg": [
+        0,
+        10,
+        0
+      ],
+      "text_dim": [
+        0,
+        108,
+        0
+      ],
+      "text_hint": [
+        0,
+        135,
+        0
+      ],
+      "text_muted": [
+        0,
+        169,
+        0
+      ],
+      "text_body": [
+        136,
+        255,
+        136
+      ],
+      "text_soft": [
+        221,
+        255,
+        221
+      ],
+      "border": [
+        0,
+        204,
+        0
+      ],
+      "accent_primary": [
+        0,
+        204,
+        0
+      ],
+      "accent_secondary": [
+        0,
+        153,
+        0
+      ],
+      "accent_action": [
+        136,
+        255,
+        136
+      ],
+      "error_fg": [
+        180,
+        0,
+        0
+      ],
+      "error_hover": [
+        224,
+        0,
+        0
+      ],
+      "error_surface": [
+        26,
+        13,
+        13
+      ],
+      "error_border": [
+        180,
+        0,
+        0
+      ],
+      "error_text": [
+        255,
+        68,
+        68
+      ],
+      "warning": [
+        204,
+        204,
+        0
+      ],
+      "success": [
+        136,
+        255,
+        136
+      ],
+      "info": [
+        0,
+        204,
+        0
+      ],
+      "mode_agent": [
+        0,
+        154,
+        0
+      ],
+      "mode_yolo": [
+        255,
+        100,
+        100
+      ],
+      "mode_plan": [
+        255,
+        170,
+        60
+      ],
+      "mode_operate": [
+        100,
+        255,
+        220
+      ],
+      "permission_ask": [
+        204,
+        204,
+        0
+      ],
+      "permission_auto_review": [
+        255,
+        170,
+        60
+      ],
+      "permission_full_access": [
+        255,
+        100,
+        100
+      ],
+      "status_ready": [
+        0,
+        108,
+        0
+      ],
+      "status_working": [
+        136,
+        255,
+        136
+      ],
+      "status_warning": [
+        204,
+        204,
+        0
+      ],
+      "diff_added_fg": [
+        136,
+        255,
+        136
+      ],
+      "diff_deleted_fg": [
+        188,
+        29,
+        29
+      ],
+      "diff_added_bg": [
+        13,
+        26,
+        13
+      ],
+      "diff_deleted_bg": [
+        26,
+        13,
+        13
+      ],
+      "tool_running": [
+        136,
+        255,
+        136
+      ],
+      "tool_success": [
+        0,
+        102,
+        0
+      ],
+      "tool_failed": [
+        180,
+        0,
+        0
+      ]
+    }
+  },
+  {
+    "variant": "SolarizedLight",
+    "name": "solarized-light",
+    "light": true,
+    "roles": [
+      [
+        253,
+        246,
+        227
+      ],
+      [
+        253,
+        246,
+        227
+      ],
+      [
+        240,
+        237,
+        231
+      ],
+      [
+        228,
+        223,
+        207
+      ],
+      [
+        214,
+        210,
+        201
+      ],
+      [
+        0,
+        43,
+        54
+      ],
+      [
+        82,
+        102,
+        109
+      ],
+      [
+        147,
+        161,
+        161
+      ],
+      [
+        7,
+        54,
+        66
+      ],
+      [
+        38,
+        139,
+        210
+      ],
+      [
+        253,
+        246,
+        227
+      ],
+      [
+        41,
+        158,
+        150
+      ],
+      [
+        203,
+        75,
+        22
+      ],
+      [
+        220,
+        50,
+        47
+      ],
+      [
+        114,
+        129,
+        130
+      ],
+      [
+        101,
+        123,
+        131
+      ],
+      [
+        234,
+        242,
+        224
+      ],
+      [
+        253,
+        238,
+        235
+      ]
+    ],
+    "slots": {
+      "name": "solarized-light",
+      "mode": "PaletteMode::SolarizedLight",
+      "surface_bg": [
+        253,
+        246,
+        227
+      ],
+      "panel_bg": [
+        240,
+        237,
+        231
+      ],
+      "elevated_bg": [
+        228,
+        223,
+        207
+      ],
+      "composer_bg": [
+        240,
+        237,
+        231
+      ],
+      "selection_bg": [
+        214,
+        210,
+        201
+      ],
+      "header_bg": [
+        253,
+        246,
+        227
+      ],
+      "footer_bg": [
+        253,
+        246,
+        227
+      ],
+      "text_dim": [
+        101,
+        123,
+        131
+      ],
+      "text_hint": [
+        114,
+        129,
+        130
+      ],
+      "text_muted": [
+        82,
+        102,
+        109
+      ],
+      "text_body": [
+        0,
+        43,
+        54
+      ],
+      "text_soft": [
+        7,
+        54,
+        66
+      ],
+      "border": [
+        147,
+        161,
+        161
+      ],
+      "accent_primary": [
+        38,
+        139,
+        210
+      ],
+      "accent_secondary": [
+        41,
+        158,
+        150
+      ],
+      "accent_action": [
+        203,
+        75,
+        22
+      ],
+      "error_fg": [
+        220,
+        50,
+        47
+      ],
+      "error_hover": [
+        224,
+        85,
+        82
+      ],
+      "error_surface": [
+        253,
+        238,
+        235
+      ],
+      "error_border": [
+        220,
+        50,
+        47
+      ],
+      "error_text": [
+        139,
+        0,
+        0
+      ],
+      "warning": [
+        180,
+        136,
+        0
+      ],
+      "success": [
+        127,
+        146,
+        0
+      ],
+      "info": [
+        38,
+        139,
+        210
+      ],
+      "mode_agent": [
+        39,
+        139,
+        210
+      ],
+      "mode_yolo": [
+        221,
+        50,
+        47
+      ],
+      "mode_plan": [
+        204,
+        75,
+        22
+      ],
+      "mode_operate": [
+        108,
+        113,
+        196
+      ],
+      "permission_ask": [
+        180,
+        136,
+        0
+      ],
+      "permission_auto_review": [
+        203,
+        75,
+        22
+      ],
+      "permission_full_access": [
+        220,
+        50,
+        47
+      ],
+      "status_ready": [
+        41,
+        158,
+        150
+      ],
+      "status_working": [
+        41,
+        158,
+        150
+      ],
+      "status_warning": [
+        180,
+        136,
+        0
+      ],
+      "diff_added_fg": [
+        127,
+        146,
+        0
+      ],
+      "diff_deleted_fg": [
+        220,
+        50,
+        47
+      ],
+      "diff_added_bg": [
+        234,
+        242,
+        224
+      ],
+      "diff_deleted_bg": [
+        253,
+        238,
+        235
+      ],
+      "tool_running": [
+        38,
+        139,
+        210
+      ],
+      "tool_success": [
+        127,
+        146,
+        0
+      ],
+      "tool_failed": [
+        220,
+        50,
+        47
+      ]
+    }
+  },
+  {
+    "variant": "Uwu",
+    "name": "uwu",
+    "light": false,
+    "roles": [
+      [
+        18,
+        14,
+        24
+      ],
+      [
+        22,
+        18,
+        28
+      ],
+      [
+        31,
+        24,
+        40
+      ],
+      [
+        44,
+        34,
+        56
+      ],
+      [
+        61,
+        46,
+        78
+      ],
+      [
+        247,
+        240,
+        248
+      ],
+      [
+        184,
+        170,
+        200
+      ],
+      [
+        74,
+        58,
+        92
+      ],
+      [
+        232,
+        220,
+        238
+      ],
+      [
+        255,
+        158,
+        205
+      ],
+      [
+        22,
+        18,
+        28
+      ],
+      [
+        154,
+        236,
+        224
+      ],
+      [
+        255,
+        214,
+        154
+      ],
+      [
+        255,
+        107,
+        138
+      ],
+      [
+        138,
+        124,
+        152
+      ],
+      [
+        110,
+        96,
+        122
+      ],
+      [
+        26,
+        42,
+        36
+      ],
+      [
+        58,
+        24,
+        40
+      ]
+    ],
+    "slots": {
+      "name": "uwu",
+      "mode": "PaletteMode::Dark",
+      "surface_bg": [
+        22,
+        18,
+        28
+      ],
+      "panel_bg": [
+        31,
+        24,
+        40
+      ],
+      "elevated_bg": [
+        44,
+        34,
+        56
+      ],
+      "composer_bg": [
+        31,
+        24,
+        40
+      ],
+      "selection_bg": [
+        61,
+        46,
+        78
+      ],
+      "header_bg": [
+        18,
+        14,
+        24
+      ],
+      "footer_bg": [
+        18,
+        14,
+        24
+      ],
+      "text_dim": [
+        110,
+        96,
+        122
+      ],
+      "text_hint": [
+        138,
+        124,
+        152
+      ],
+      "text_muted": [
+        184,
+        170,
+        200
+      ],
+      "text_body": [
+        247,
+        240,
+        248
+      ],
+      "text_soft": [
+        232,
+        220,
+        238
+      ],
+      "border": [
+        74,
+        58,
+        92
+      ],
+      "accent_primary": [
+        255,
+        158,
+        205
+      ],
+      "accent_secondary": [
+        154,
+        236,
+        224
+      ],
+      "accent_action": [
+        255,
+        214,
+        154
+      ],
+      "error_fg": [
+        255,
+        107,
+        138
+      ],
+      "error_hover": [
+        255,
+        143,
+        168
+      ],
+      "error_surface": [
+        58,
+        24,
+        40
+      ],
+      "error_border": [
+        255,
+        107,
+        138
+      ],
+      "error_text": [
+        255,
+        200,
+        214
+      ],
+      "warning": [
+        255,
+        224,
+        138
+      ],
+      "success": [
+        154,
+        239,
+        192
+      ],
+      "info": [
+        184,
+        200,
+        255
+      ],
+      "mode_agent": [
+        196,
+        168,
+        255
+      ],
+      "mode_yolo": [
+        255,
+        85,
+        119
+      ],
+      "mode_plan": [
+        255,
+        180,
+        232
+      ],
+      "mode_operate": [
+        138,
+        212,
+        255
+      ],
+      "permission_ask": [
+        255,
+        224,
+        138
+      ],
+      "permission_auto_review": [
+        255,
+        214,
+        154
+      ],
+      "permission_full_access": [
+        255,
+        107,
+        138
+      ],
+      "status_ready": [
+        138,
+        124,
+        152
+      ],
+      "status_working": [
+        154,
+        236,
+        224
+      ],
+      "status_warning": [
+        255,
+        224,
+        138
+      ],
+      "diff_added_fg": [
+        154,
+        239,
+        192
+      ],
+      "diff_deleted_fg": [
+        255,
+        107,
+        138
+      ],
+      "diff_added_bg": [
+        26,
+        42,
+        36
+      ],
+      "diff_deleted_bg": [
+        58,
+        24,
+        40
+      ],
+      "tool_running": [
+        154,
+        236,
+        224
+      ],
+      "tool_success": [
+        138,
+        124,
+        152
+      ],
+      "tool_failed": [
+        255,
+        107,
+        138
+      ]
+    }
+  }
+]

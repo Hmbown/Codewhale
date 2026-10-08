@@ -160,7 +160,10 @@ pub fn resolve_git_mention(kind: GitMentionKind, cwd: &Path) -> GitMentionPayloa
 
     let raw = match kind {
         GitMentionKind::Status => git_status_payload(cwd),
-        GitMentionKind::Diff => git_output(&["diff", "HEAD"], cwd),
+        GitMentionKind::Diff => git_output(
+            &[&["diff"][..], &Git::REVIEW_DIFF_ARGS[..], &["HEAD"][..]].concat(),
+            cwd,
+        ),
     };
     let Some(raw) = raw else {
         return GitMentionPayload::unavailable(kind, "git command failed");
@@ -215,8 +218,11 @@ fn is_git_repository(cwd: &Path) -> bool {
 
 /// Run git and return stdout, or `None` when the binary is missing or the
 /// command exits non-zero.
+///
+/// Runs under [`Git::review_command`], so repository-configured filters,
+/// fsmonitor and hooks do not execute while reading the working tree.
 fn git_output(args: &[&str], cwd: &Path) -> Option<String> {
-    let output = Git::output(args, cwd).ok()?;
+    let output = Git::review_command(cwd).ok()?.args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -305,6 +311,55 @@ mod tests {
         let payload = resolve_git_mention(GitMentionKind::Diff, dir.path());
         assert_eq!(payload.bytes, 0);
         assert!(payload.block.contains("no working-tree changes"));
+    }
+
+    /// `@diff` and `@git` read the working tree without running the
+    /// repository's external diff, textconv or clean filter.
+    #[cfg(unix)]
+    #[test]
+    fn mentions_run_no_repository_configured_commands() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("marker");
+        let script = outside.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho ran >> '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = script.display().to_string();
+        init_repo(dir.path());
+        std::fs::write(
+            dir.path().join(".gitattributes"),
+            "a.txt diff=conv filter=x\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        for (key, value) in [
+            ("filter.x.clean", &script),
+            ("diff.conv.textconv", &script),
+            ("diff.external", &script),
+        ] {
+            let status = Command::new("git")
+                .args(["config", key, value])
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+
+        let diff = resolve_git_mention(GitMentionKind::Diff, dir.path());
+        let status = resolve_git_mention(GitMentionKind::Status, dir.path());
+        assert!(
+            !marker.exists(),
+            "a mention ran a repository-configured command"
+        );
+        assert!(diff.block.contains("+changed"), "{}", diff.block);
+        assert!(status.block.contains("a.txt"), "{}", status.block);
     }
 
     #[test]

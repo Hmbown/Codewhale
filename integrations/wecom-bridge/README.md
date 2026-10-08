@@ -48,7 +48,7 @@ node src/index.mjs
 | `/model <name\|default>` | 设置或重置聊天模型 |
 | `/interrupt` | 中断活动 turn |
 | `/compact` | 压缩当前线程 |
-| `/allow <approval_id> [remember]` | 批准待处理的工具调用 |
+| `/allow <approval_id>` | 批准待处理的工具调用 |
 | `/deny <approval_id>` | 拒绝待处理的工具调用 |
 
 其他所有内容均作为 Codewhale 提示发送。群聊中需要在消息前加 `/cw` 前缀。

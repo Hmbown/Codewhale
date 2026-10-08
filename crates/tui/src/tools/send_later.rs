@@ -178,7 +178,7 @@ Returns trigger_id and resolved fire_at."
             "status".to_string(),
             json!({
                 "type": "string",
-                "enum": ["pending", "fired", "canceled", "failed"],
+                "enum": ["pending", "dispatching", "fired", "canceled", "failed"],
                 "description": "Filter by trigger status. (action=list)"
             }),
         );
@@ -310,6 +310,11 @@ async fn execute_schedule(input: &Value, context: &ToolContext) -> Result<ToolRe
 
     let record = {
         let manager = automations.lock().await;
+        // A pending trigger is fired only by the scope that owns it
+        // (`fire_due_triggers`), and a trigger has no paused state to fall
+        // back to, so an unbound host must refuse rather than store a delayed
+        // message that never arrives.
+        crate::tools::automation::require_dispatch_owner(&manager, "schedule a delayed message")?;
         manager.create_trigger(req).map_err(|err| {
             ToolError::execution_failed(format!("send_later schedule failed: {err}"))
         })?
@@ -428,11 +433,12 @@ async fn execute_cancel(input: &Value, context: &ToolContext) -> Result<ToolResu
 fn parse_trigger_status(s: &str) -> Result<DelayedTriggerStatus, String> {
     match s {
         "pending" => Ok(DelayedTriggerStatus::Pending),
+        "dispatching" => Ok(DelayedTriggerStatus::Dispatching),
         "fired" => Ok(DelayedTriggerStatus::Fired),
         "canceled" => Ok(DelayedTriggerStatus::Canceled),
         "failed" => Ok(DelayedTriggerStatus::Failed),
         other => Err(format!(
-            "unknown trigger status '{other}'; expected one of: pending, fired, canceled, failed"
+            "unknown trigger status '{other}'; expected one of: pending, dispatching, fired, canceled, failed"
         )),
     }
 }
@@ -440,6 +446,7 @@ fn parse_trigger_status(s: &str) -> Result<DelayedTriggerStatus, String> {
 fn trigger_status_str(status: DelayedTriggerStatus) -> &'static str {
     match status {
         DelayedTriggerStatus::Pending => "pending",
+        DelayedTriggerStatus::Dispatching => "dispatching",
         DelayedTriggerStatus::Fired => "fired",
         DelayedTriggerStatus::Canceled => "canceled",
         DelayedTriggerStatus::Failed => "failed",
@@ -467,7 +474,7 @@ mod tests {
     }
 
     fn make_context_for_session(tmp: &TempDir, session_id: &str) -> ToolContext {
-        let manager = AutomationManager::open(tmp.path().to_path_buf()).unwrap();
+        let manager = AutomationManager::open_for_test(tmp.path().to_path_buf()).unwrap();
         let shared = Arc::new(Mutex::new(manager));
         ToolContext::new(".")
             .with_state_namespace(session_id)
@@ -873,7 +880,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let manager = AutomationManager::open(tmp.path().to_path_buf()).unwrap();
+        let manager = AutomationManager::open_for_test(tmp.path().to_path_buf()).unwrap();
         let mut legacy = manager
             .create_trigger(crate::automation_manager::CreateDelayedTriggerRequest {
                 fire_at: chrono::Utc::now() + Duration::hours(1),
@@ -950,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn collect_due_triggers_returns_past_pending() {
         let tmp = TempDir::new().unwrap();
-        let manager = AutomationManager::open(tmp.path().to_path_buf()).unwrap();
+        let manager = AutomationManager::open_for_test(tmp.path().to_path_buf()).unwrap();
 
         // Create a trigger with fire_at one hour from now — not due yet.
         let req = crate::automation_manager::CreateDelayedTriggerRequest {
@@ -971,5 +978,52 @@ mod tests {
 
         let due = manager.collect_due_triggers(chrono::Utc::now()).unwrap();
         assert_eq!(due.len(), 1, "should fire a past-due trigger");
+    }
+
+    /// A pending trigger is fired only by the scope that owns it, and a
+    /// trigger has no paused state, so a one-shot host that attaches the
+    /// store for inspection must refuse to schedule rather than store a
+    /// delayed message that never arrives.
+    #[tokio::test]
+    async fn scheduling_requires_a_dispatch_owner() {
+        let tmp = TempDir::new().unwrap();
+        let manager = AutomationManager::open(tmp.path().to_path_buf()).unwrap();
+        assert!(
+            manager.execution_scope().is_none(),
+            "fixture must model the unbound one-shot host"
+        );
+        let ctx = ToolContext::new(".").with_runtime_services(RuntimeToolServices {
+            automations: Some(Arc::new(Mutex::new(manager))),
+            ..Default::default()
+        });
+        let tool = SendLaterTool::new("send_later");
+
+        let err = tool
+            .execute(
+                json!({"action": "schedule", "delay_minutes": 60, "message": "Check CI."}),
+                &ctx,
+            )
+            .await
+            .expect_err("must refuse without a dispatch owner");
+        assert!(
+            err.to_string().contains("persistent execution owner"),
+            "{err}"
+        );
+
+        // Inspection still works against the attached store, and nothing was
+        // persisted by the refused schedule.
+        let listed = tool
+            .execute(json!({"action": "list"}), &ctx)
+            .await
+            .expect("list must serve an attached store");
+        assert!(
+            AutomationManager::open(tmp.path().to_path_buf())
+                .unwrap()
+                .list_triggers(None, None)
+                .unwrap()
+                .is_empty(),
+            "a refused schedule must not leave a trigger behind: {}",
+            listed.content
+        );
     }
 }

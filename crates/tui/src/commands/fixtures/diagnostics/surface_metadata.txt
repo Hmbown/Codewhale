@@ -1,0 +1,73 @@
+command: registry metadata
+name: tokens
+aliases: []
+usage: /tokens
+description_en: Show token usage
+palette_en: Show token usage
+requires_argument: false
+unlisted: false
+show_in_empty_discovery: true
+---
+name: cost
+aliases: []
+usage: /cost
+description_en: Show session cost breakdown
+palette_en: Show session cost breakdown
+requires_argument: false
+unlisted: false
+show_in_empty_discovery: true
+---
+name: balance
+aliases: []
+usage: /balance
+description_en: Check your provider account balance
+palette_en: Check your provider account balance
+requires_argument: false
+unlisted: false
+show_in_empty_discovery: false
+---
+name: cache
+aliases: []
+usage: /cache [count|inspect|stats|zones|warmup]
+description_en: Show cache hit/miss stats for recent turns
+palette_en: Show cache hit/miss stats for recent turns
+requires_argument: true
+unlisted: false
+show_in_empty_discovery: false
+---
+name: preview-request
+aliases: ["dryrun", "preview_request"]
+usage: /preview-request [json] [--prompt <text>]
+description_en: Preview the next request (redacted) without sending it
+palette_en: Preview the next request (redacted) without sending it  aliases: dryrun, preview_request
+requires_argument: true
+unlisted: false
+show_in_empty_discovery: false
+---
+name: tools
+aliases: ["tool-studio"]
+usage: /tools [text|json]
+description_en: Inspect the latest prepared tool request (read-only)
+palette_en: Inspect the latest prepared tool request (read-only)  aliases: tool-studio
+requires_argument: true
+unlisted: false
+show_in_empty_discovery: false
+---
+name: system
+aliases: ["xitong"]
+usage: /system
+description_en: Show the system prompt
+palette_en: Show the system prompt  aliases: xitong
+requires_argument: false
+unlisted: false
+show_in_empty_discovery: false
+---
+name: context
+aliases: ["ctx"]
+usage: /context [report|json|prompt-json|summary]
+description_en: Open the context inspector
+palette_en: Open the context inspector  aliases: ctx
+requires_argument: true
+unlisted: false
+show_in_empty_discovery: false
+---

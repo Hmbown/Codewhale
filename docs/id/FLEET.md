@@ -37,4 +37,16 @@ Status fleet disimpan di dalam ruang kerja di bawah `.codewhale/fleet.jsonl`. Lo
 ### Perbedaan Status fleet dan Worker Sesi
 
 - Perintah TUI `/fleet status` dan perintah shell `codewhale fleet status` membaca ledger fleet persisten yang sama di `.codewhale/fleet.jsonl`.
-- Gunakan `/subagents` atau `/fleet workers` untuk menampilkan sub-agen yang hanya terhubung ke sesi TUI saat ini.
+- Gunakan `/subagents`, `/fleet workers`, atau Tab / `w` dari roster `/fleet` untuk menampilkan sub-agen yang hanya terhubung ke sesi TUI saat ini.
+
+---
+
+## Bentuk Spesifikasi Tugas
+
+`codewhale fleet run` menerima JSON atau TOML dalam salah satu dari tiga bentuk, yang dipilih dari strukturnya sebelum field apa pun dibaca:
+
+- **dokumen** — objek dengan `tasks` (serta opsional `name`, `labels`, `workers`, `usage_ceiling`);
+- **array tugas** — array JSON berisi objek tugas;
+- **tugas tunggal** — satu objek tugas dengan `id` / `instructions` di tingkat teratas (JSON atau TOML; file TOML tidak pernah berupa array tugas).
+
+Karena bentuk dipilih lebih dulu, spesifikasi yang rusak melaporkan masalah sebenarnya, misalnya ``JSON spec document at tasks[1] (id "review"): missing field `instructions` ``. Contoh [`docs/examples/fleet-dogfood.toml`](../examples/fleet-dogfood.toml) diuji oleh test suite sehingga tetap valid.

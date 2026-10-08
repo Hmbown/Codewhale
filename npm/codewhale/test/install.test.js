@@ -84,7 +84,7 @@ test("install failure hint explains release base override for blocked GitHub dow
   try {
     const error = Object.assign(
       new Error(
-        "fetch https://github.com/Hmbown/CodeWhale/releases/download/v0.8.19/codewhale-artifacts-sha256.txt failed after 5 attempts:\ngetaddrinfo ENOTFOUND github.com",
+        "fetch https://github.com/codewhale-hq/CodeWhale/releases/download/v0.8.19/codewhale-artifacts-sha256.txt failed after 5 attempts:\ngetaddrinfo ENOTFOUND github.com",
       ),
       { code: "ENOTFOUND" },
     );
@@ -129,13 +129,13 @@ test("install failure hint checks configured release base when override is alrea
 test("glibc preflight message is Codewhale-branded and actionable", () => {
   const message = glibcInternal.glibcCompatibilityMessage([2, 39, 0], [2, 35, 0]);
 
-  assert.match(message, /Prebuilt Codewhale Linux binaries require GLIBC_2\.39/);
+  assert.match(message, /This Codewhale binary requires GLIBC_2\.39/);
   assert.match(message, /this system has glibc 2\.35/);
   assert.match(message, /cargo install codewhale-cli --locked/);
   assert.match(message, /ln -sf .*codewhale.*codew/);
   assert.doesNotMatch(message, /cargo install codewhale-tui/);
-  assert.match(message, /Linux x64 release asset is a static \(musl\) build/);
-  assert.match(message, /Linux arm64 asset is a GNU libc build/);
+  assert.match(message, /Linux release assets \(x64 and arm64\) are static musl builds/);
+  assert.doesNotMatch(message, /GNU libc/);
   assert.match(message, /CODEWHALE_SKIP_GLIBC_CHECK=1/);
 });
 
@@ -184,7 +184,7 @@ test("ensureBinary adopts a manually placed target binary after checksum validat
   await fs.promises.writeFile(`${target}.version`, "0.8.24", "utf8");
 
   const result = await withoutForcedDownload(() =>
-    _internal.ensureBinary(target, assetName, version, "Hmbown/CodeWhale", async () => {
+    _internal.ensureBinary(target, assetName, version, "codewhale-hq/CodeWhale", async () => {
       checksumLoads += 1;
       return new Map([[assetName, sha256(content)]]);
     }),
@@ -209,7 +209,7 @@ test("ensureBinary adopts an official release-named binary placed in downloads",
   await fs.promises.writeFile(assetPath, content);
 
   const result = await withoutForcedDownload(() =>
-    _internal.ensureBinary(target, assetName, version, "Hmbown/CodeWhale", async () =>
+    _internal.ensureBinary(target, assetName, version, "codewhale-hq/CodeWhale", async () =>
       new Map([[assetName, sha256(content)]]),
     ),
   );
@@ -345,4 +345,110 @@ test("httpRequest handles invalid URL parsing errors", async () => {
     assert.equal(err.name, "NonRetryableError");
     assert.match(err.message, /Invalid URL: not-a-valid-url/);
   }
+});
+
+// A server that sends headers and part of a body, then either
+// goes silent or keeps trickling bytes, and never ends the response.
+async function withStallingServer(t, { trickleMs = 0 } = {}) {
+  const http = require("node:http");
+  const timers = [];
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/octet-stream" });
+    res.write("partial body");
+    if (trickleMs > 0) {
+      timers.push(setInterval(() => res.write("."), trickleMs));
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    for (const timer of timers) clearInterval(timer);
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  // Keep a developer's proxy variables from routing the loopback request.
+  const noProxy = process.env.NO_PROXY;
+  process.env.NO_PROXY = "*";
+  t.after(() => {
+    if (noProxy === undefined) delete process.env.NO_PROXY;
+    else process.env.NO_PROXY = noProxy;
+  });
+  return `http://127.0.0.1:${server.address().port}/asset`;
+}
+
+// Consume a handed-off body the way `downloadText` and `streamToFile` do:
+// resolve on `end`, reject on `error`.
+function consumeBody(response) {
+  return new Promise((resolve, reject) => {
+    response.on("data", () => {});
+    response.on("end", resolve);
+    response.on("error", reject);
+    response.resume();
+  });
+}
+
+test("a body that stalls after the headers fails with the stall timeout", { timeout: 5000 }, async (t) => {
+  const url = await withStallingServer(t);
+  const { response } = await _internal.httpRequest(url, {
+    stallMs: 150,
+    totalTimeoutMs: 30000,
+  });
+  await assert.rejects(consumeBody(response), (error) => {
+    assert.equal(error.code, "EDOWNLOADTIMEOUT");
+    assert.match(error.message, /stalled/);
+    return true;
+  });
+});
+
+test("a body that trickles past the total budget fails with the total timeout", { timeout: 5000 }, async (t) => {
+  const url = await withStallingServer(t, { trickleMs: 40 });
+  const { response } = await _internal.httpRequest(url, {
+    stallMs: 1000,
+    totalTimeoutMs: 400,
+  });
+  await assert.rejects(consumeBody(response), (error) => {
+    assert.equal(error.code, "EDOWNLOADTIMEOUT");
+    assert.match(error.message, /total timeout/);
+    return true;
+  });
+});
+
+test("a body paused by a slow consumer is not reported as a stall", { timeout: 5000 }, async (t) => {
+  const http = require("node:http");
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/octet-stream" });
+    res.write("first chunk ");
+    setTimeout(() => res.end("rest of the body"), 50);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  const noProxy = process.env.NO_PROXY;
+  process.env.NO_PROXY = "*";
+  t.after(() => {
+    if (noProxy === undefined) delete process.env.NO_PROXY;
+    else process.env.NO_PROXY = noProxy;
+  });
+  const { response } = await _internal.httpRequest(
+    `http://127.0.0.1:${server.address().port}/asset`,
+    { stallMs: 150, totalTimeoutMs: 30000 },
+  );
+  // Hold the stream paused for several stall budgets, as `pipe` does while a
+  // slow disk drains, then let it flow again.
+  let body = "";
+  const done = new Promise((resolve, reject) => {
+    response.on("data", (chunk) => {
+      body += chunk;
+    });
+    response.on("end", resolve);
+    response.on("error", reject);
+  });
+  response.resume();
+  response.once("data", () => {
+    response.pause();
+    setTimeout(() => response.resume(), 600);
+  });
+  await done;
+  assert.equal(body, "first chunk rest of the body");
 });

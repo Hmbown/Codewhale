@@ -1,0 +1,29 @@
+command: /context report
+is_error: false
+message:
+Context Source Map
+Estimated active context: 48 tokens
+Overflow guard: 48 tokens (conservative 1.5x estimate that blocks oversized requests; not the pressure the meter and auto-compaction read)
+Window: 1000000 tokens (0.0% used, low; source: catalog)
+Change the window: set `context_window` on the active `[providers.<name>]` table in config.toml (docs/CONFIGURATION.md, "Context length").
+Source-entry total: 2367 tokens
+Manage standing law: /constitution (status/preview), /constitution repo (repo-local law), /setup report (readiness).
+
+Sources:
+- Constitution: Bundled constitution, language policy, and output policy [bundled in this codewhale-tui build (BASE_PROMPT, compiled in)] - 1803 tokens (High, tier 1)
+- ProjectContext: Project instructions - 160 tokens (High, tier 5)
+- ProjectContextPack: Project context pack [<workspace>] - 0 tokens (High, tier 5) - disabled; project_map provides this information on demand
+- SkillsBlock: Available skills [<skills>] - 0 tokens (High, tier 5) - no skills discovered
+- ContextManagement: ACT runtime mode - 0 tokens (High, tier 3) - mode enforced by runtime policy and the live tool catalog; no prompt doctrine
+- CompactionRelayTemplate: Session relay template [bundled in this codewhale-tui build (COMPACT_TEMPLATE, compiled in)] - 0 tokens (High, tier 3) - loaded only when /relay is requested; automatic compaction owns its successor brief
+- RuntimePolicy: Core execution discipline - 295 tokens (High, tier 3)
+- AuthorityRecap: Authority recap - 88 tokens (High, tier 1)
+- EnvironmentBlock: Runtime environment [<workspace>] - 21 tokens (High, tier 4)
+- HandoffRelay: Previous session relay [<workspace>/.codewhale/handoff.md] - 0 tokens (High, tier 6) - no relay artifact found
+- UserMemory: User memory [<memory>] - 0 tokens (High, tier 6) - disabled, missing, or empty
+- SessionGoal: Session goal - 0 tokens (High, tier 6) - no active /goal objective
+- ToolSchemas: Tool schemas - 0 tokens (High, tier 3) - no tool catalog has been sent yet
+- ConversationHistory: Conversation history - 0 tokens (High) - no API messages yet
+
+Diagnostic source map. The headline is the pressure estimate the context meter and auto-compaction gate use; per-source counts are conservative estimates. All counts may differ from provider billing.
+action: <none>

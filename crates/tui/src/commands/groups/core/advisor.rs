@@ -12,8 +12,8 @@
 //! Failures do not affect the parent turn. Off by default.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 

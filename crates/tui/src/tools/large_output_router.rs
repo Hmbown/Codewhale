@@ -1,10 +1,12 @@
-//! Adaptive evidence routing for tool results (#4619).
+//! Adaptive evidence routing for tool results (#4619) — explicit opt-in.
 //!
-//! Results are classified as inline, hybrid, or handle-only before they enter
-//! model context. Non-inline results are published exactly once under their
-//! origin session and remain available through bounded retrieval. The earlier
-//! workshop preview behavior remains only behind the explicit classic-output
-//! rollback switch.
+//! Classic bounded spillover is the default: `tools/truncate.rs` keeps results
+//! at or under its byte threshold fully inline and gives larger ones a
+//! head/tail preview plus a session artifact. Set
+//! `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` to enable the adaptive lane, which
+//! classifies results as inline, hybrid, or handle-only by estimated tokens
+//! and publishes non-inline results exactly once under their origin session
+//! with immutable evidence metadata for bounded retrieval.
 
 use std::collections::HashMap;
 use std::io;
@@ -31,9 +33,6 @@ pub const DEFAULT_LARGE_OUTPUT_THRESHOLD_TOKENS: usize = 32_768;
 /// on the side of routing rather than dumping raw data into the parent.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 3;
 
-/// Workshop variable name where the raw tool output is stored.
-pub const WORKSHOP_LAST_TOOL_RESULT_VAR: &str = "last_tool_result";
-
 static ACTIVE_WORKSHOP: OnceLock<Mutex<WorkshopConfig>> = OnceLock::new();
 
 #[cfg(test)]
@@ -49,9 +48,15 @@ std::thread_local! {
 /// Holds every test-side workshop activation behind one process-wide gate.
 /// The thread-local marker lets the owning current-thread test call
 /// `install_active` without trying to acquire its own non-reentrant lock.
+///
+/// The guard also owns the process-wide test env barrier, because holding this
+/// gate across a `reload_config` is holding it across `Settings::load` and
+/// `Config`'s env reads, which take that barrier (#6306). Field order is the
+/// release order: the serial gate first, then the barrier.
 #[cfg(test)]
 pub(crate) struct ActiveWorkshopTestGuard {
     _serial: std::sync::MutexGuard<'static, ()>,
+    _env: Option<crate::test_support::TestEnvLock>,
 }
 
 #[cfg(test)]
@@ -61,18 +66,42 @@ impl Drop for ActiveWorkshopTestGuard {
     }
 }
 
+/// Take the workshop gate, and the env barrier under it, in that order (#6306).
+///
+/// A holder of this gate keeps it across whole product calls — `reload_config`
+/// installs the budgets and then loads settings — and those calls read the
+/// environment through `test_support::with_test_env_lock`. A test that sealed
+/// the environment first and then reaches `install_active` through the very
+/// same `reload_config` takes the two locks in the opposite order, and the
+/// pair wedges the whole binary: `cargo test -p codewhale-tui --lib config`
+/// never returned, with dozens of unrelated tests queued on the barrier.
+/// Acquiring the barrier here, before the gate, makes that inversion
+/// impossible for every caller at once — the same shape as
+/// `provider_lake::lock_live_snapshot`.
+///
+/// Known limitation: this orders these two locks and nothing else. A future
+/// process-wide test gate held across product code has to join the same order
+/// rather than invent a third one.
 #[cfg(test)]
 pub(crate) fn active_workshop_test_guard() -> ActiveWorkshopTestGuard {
     assert!(
         !ACTIVE_WORKSHOP_TEST_SERIAL_HELD.with(std::cell::Cell::get),
         "active workshop test guard is not reentrant"
     );
+    let env = if crate::test_support::current_thread_holds_test_env_lock() {
+        None
+    } else {
+        Some(crate::test_support::lock_test_env())
+    };
     let serial = ACTIVE_WORKSHOP_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     ACTIVE_WORKSHOP_TEST_SERIAL_HELD.with(|held| held.set(true));
-    ActiveWorkshopTestGuard { _serial: serial }
+    ActiveWorkshopTestGuard {
+        _serial: serial,
+        _env: env,
+    }
 }
 
 fn active_workshop_slot() -> &'static Mutex<WorkshopConfig> {
@@ -178,21 +207,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-/// Decision returned by [`LargeOutputRouter::route`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum RouteDecision {
-    /// The output is small enough; pass it through unmodified.
-    PassThrough,
-    /// The output exceeded the threshold and was (or should be) synthesised.
-    Synthesise {
-        /// Estimated token count of the raw output.
-        estimated_tokens: usize,
-        /// The threshold that was breached.
-        threshold: usize,
-    },
-}
-
-/// Intercepts tool results and routes large ones through the workshop.
+/// Classifies tool results for adaptive evidence routing.
 ///
 /// This type is intentionally `Clone` and `Default` so it can be embedded
 /// cheaply in [`ToolContext`](crate::tools::spec::ToolContext) without
@@ -209,94 +224,18 @@ impl LargeOutputRouter {
         Self { config }
     }
 
-    /// Decide whether classic routing would synthesize `result`.
-    ///
-    /// This is used only by the rollback implementation.
-    #[must_use]
-    pub fn route(&self, tool_name: &str, result: &ToolResult, raw_bypass: bool) -> RouteDecision {
-        if raw_bypass || !result.success {
-            return RouteDecision::PassThrough;
-        }
-        let threshold = self.config.threshold_for(tool_name);
-        let estimated_tokens = estimate_tokens(&result.content);
-        if estimated_tokens > threshold {
-            RouteDecision::Synthesise {
-                estimated_tokens,
-                threshold,
-            }
-        } else {
-            RouteDecision::PassThrough
-        }
-    }
-
     #[must_use]
     pub fn evidence_routing(
         &self,
         tool_name: &str,
         result: &ToolResult,
-        _raw_bypass: bool,
     ) -> (EvidenceRouting, usize, usize) {
         let threshold = self.config.threshold_for(tool_name);
         let estimated_tokens = estimate_tokens(&result.content);
-        // `raw=true` no longer bypasses the context bound. Exact bytes remain
-        // available through the artifact handle, so bypass is unnecessary.
+        // There is no per-call bypass of the context bound: exact bytes stay
+        // available through the artifact handle.
         let routing = EvidenceRouting::from_token_estimate(estimated_tokens, threshold);
         (routing, estimated_tokens, threshold)
-    }
-
-    /// Wrap a synthesis result with a workshop provenance header and a hint
-    /// about the stored raw output.
-    #[must_use]
-    pub fn wrap_synthesis(
-        tool_name: &str,
-        synthesis: &str,
-        estimated_tokens: usize,
-        threshold: usize,
-    ) -> String {
-        format!(
-            "[workshop-synthesis: tool={tool_name}, raw_tokens≈{estimated_tokens}, \
-             threshold={threshold}, raw_stored_in={WORKSHOP_LAST_TOOL_RESULT_VAR}]\n\n{synthesis}"
-        )
-    }
-}
-
-// ── Workshop variable store ───────────────────────────────────────────────────
-
-/// In-process store for workshop variables that persist across tool calls
-/// within a session. The only variable exposed today is `last_tool_result`
-/// which holds the most recent raw large-tool output for `promote_to_context`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WorkshopVariables {
-    /// Raw content of the most recent large tool output that was routed
-    /// through the workshop. Empty string when no routing has occurred.
-    #[serde(default)]
-    pub last_tool_result: String,
-
-    /// Name of the tool that produced `last_tool_result`.
-    #[serde(default)]
-    pub last_tool_name: String,
-}
-
-impl WorkshopVariables {
-    /// Store the raw output from a large-tool routing event.
-    pub fn store_raw(&mut self, tool_name: &str, raw: &str) {
-        self.last_tool_result = raw.to_string();
-        self.last_tool_name = tool_name.to_string();
-    }
-
-    /// Retrieve and clear the stored raw output (consume semantics so the
-    /// variable is not accidentally promoted twice).
-    ///
-    /// Called by the `promote_to_context` tool (not yet wired in this PR).
-    #[must_use]
-    #[allow(dead_code)] // consumed by promote_to_context tool in follow-up
-    pub fn take_raw(&mut self) -> Option<(String, String)> {
-        if self.last_tool_result.is_empty() {
-            return None;
-        }
-        let content = std::mem::take(&mut self.last_tool_result);
-        let name = std::mem::take(&mut self.last_tool_name);
-        Some((name, content))
     }
 }
 
@@ -358,11 +297,24 @@ pub enum EvidenceRetentionState {
 
 pub const EVIDENCE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Whether adaptive evidence routing (#4619) is enabled for this process.
+///
+/// Off by default — classic bounded spillover owns large results. Set
+/// `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` to opt in. The retired rollback
+/// variable is still honored in the negative, so
+/// `CODEWHALE_CLASSIC_OUTPUT_ROUTING=0` also selects the adaptive lane.
 #[must_use]
-pub fn classic_output_routing_enabled() -> bool {
-    std::env::var("CODEWHALE_CLASSIC_OUTPUT_ROUTING")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+pub fn adaptive_output_routing_enabled() -> bool {
+    if let Ok(value) = std::env::var("CODEWHALE_ADAPTIVE_OUTPUT_ROUTING") {
+        return matches!(value.trim(), "1" | "true" | "yes" | "on");
+    }
+    matches!(
+        std::env::var("CODEWHALE_CLASSIC_OUTPUT_ROUTING")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("0" | "false" | "no" | "off")
+    )
 }
 
 #[must_use]
@@ -385,9 +337,27 @@ pub fn publish_evidence_metadata(
 
 pub fn read_evidence_metadata(session_id: &str, handle: &str) -> io::Result<EvidenceArtifact> {
     let relative = evidence_metadata_relative_path(handle);
-    let path = crate::artifacts::session_artifact_absolute_path(session_id, &relative)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "invalid evidence owner"))?;
-    let raw = std::fs::read(path)?;
+    let file = crate::artifacts::open_session_relative(session_id, &relative, false)?;
+    read_evidence_metadata_file(&file)
+}
+
+/// Bounded, no-follow read shared by publication/replay and authenticated HTTP
+/// retrieval. The caller chooses the existing session-root authority.
+pub(crate) fn read_evidence_metadata_file(
+    file: &crate::fleet::files::WorkspaceFile,
+) -> io::Result<EvidenceArtifact> {
+    use std::io::Read;
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    let mut raw = Vec::new();
+    file.open_file()?
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "evidence metadata exceeds limit",
+        ));
+    }
     serde_json::from_slice(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
@@ -418,62 +388,16 @@ mod tests {
     }
 
     #[test]
-    fn pass_through_below_threshold() {
-        let router = LargeOutputRouter::default();
-        let small = "x".repeat(100);
-        let result = make_result(&small);
-        assert_eq!(
-            router.route("read_file", &result, false),
-            RouteDecision::PassThrough
-        );
-    }
-
-    #[test]
     fn default_threshold_is_32k_tokens() {
         assert_eq!(DEFAULT_LARGE_OUTPUT_THRESHOLD_TOKENS, 32_768);
     }
 
     #[test]
-    fn synthesise_above_threshold() {
-        let router = LargeOutputRouter::default();
-        // DEFAULT threshold = 32768 tokens; 3 chars/token → 32768*3 = 98304 chars
-        let big = "a".repeat(100_000);
-        let result = make_result(&big);
-        assert!(matches!(
-            router.route("read_file", &result, false),
-            RouteDecision::Synthesise { .. }
-        ));
-    }
-
-    #[test]
-    fn raw_bypass_skips_routing() {
-        let router = LargeOutputRouter::default();
-        let big = "a".repeat(100_000);
-        let result = make_result(&big);
-        // raw=true → always pass through regardless of size
-        assert_eq!(
-            router.route("exec_shell", &result, true),
-            RouteDecision::PassThrough
-        );
-    }
-
-    #[test]
-    fn adaptive_evidence_cannot_bypass_context_bound_with_raw_flag() {
+    fn oversized_result_becomes_handle_only_evidence() {
         let router = LargeOutputRouter::default();
         let big = make_result(&"a".repeat(100_000));
-        let (routing, _, _) = router.evidence_routing("exec_shell", &big, true);
+        let (routing, _, _) = router.evidence_routing("bash", &big);
         assert_eq!(routing, EvidenceRouting::HandleOnly);
-    }
-
-    #[test]
-    fn error_results_always_pass_through() {
-        let router = LargeOutputRouter::default();
-        let big = "error: ".repeat(2_000);
-        let result = ToolResult::error(big);
-        assert_eq!(
-            router.route("exec_shell", &result, false),
-            RouteDecision::PassThrough
-        );
     }
 
     #[test]
@@ -486,18 +410,12 @@ mod tests {
             read_result_max_bytes: None,
             tool_result_max_bytes: None,
         };
-        let router = LargeOutputRouter::new(config);
-        // 100 tokens * 3 = 300 chars → trigger with 400 chars
-        let medium = "b".repeat(400);
-        let result = make_result(&medium);
-        assert!(matches!(
-            router.route("grep_files", &result, false),
-            RouteDecision::Synthesise { .. }
-        ));
-        // Other tools still use the global threshold
+        assert_eq!(config.threshold_for("grep_files"), 100);
+        assert_eq!(config.threshold_for("read_file"), 4096);
+        let default_config = WorkshopConfig::default();
         assert_eq!(
-            router.route("read_file", &result, false),
-            RouteDecision::PassThrough
+            default_config.threshold_for("read_file"),
+            DEFAULT_LARGE_OUTPUT_THRESHOLD_TOKENS
         );
     }
 
@@ -532,28 +450,5 @@ mod tests {
         assert_eq!(estimate_tokens("1234567890"), 4);
         // Empty string
         assert_eq!(estimate_tokens(""), 0);
-    }
-
-    #[test]
-    fn workshop_variables_store_and_take() {
-        let mut vars = WorkshopVariables::default();
-        assert!(vars.take_raw().is_none());
-
-        vars.store_raw("read_file", "raw content here");
-        let taken = vars.take_raw().expect("should have content");
-        assert_eq!(taken.0, "read_file");
-        assert_eq!(taken.1, "raw content here");
-
-        // Second take is empty — consume semantics
-        assert!(vars.take_raw().is_none());
-    }
-
-    #[test]
-    fn wrap_synthesis_includes_provenance_header() {
-        let wrapped = LargeOutputRouter::wrap_synthesis("web_search", "key facts here", 5000, 4096);
-        assert!(wrapped.contains("workshop-synthesis"));
-        assert!(wrapped.contains("web_search"));
-        assert!(wrapped.contains("5000"));
-        assert!(wrapped.contains("key facts here"));
     }
 }

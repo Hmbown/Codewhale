@@ -1,21 +1,5 @@
-# cargo-audit configuration (read by `cargo audit`).
-#
-# The advisories below are all "unmaintained" warnings — NOT security
-# vulnerabilities. Each crate is pulled in transitively only by the `starlark`
-# 0.13.0 family (starlark / starlark_syntax / starlark_map), which crates/tui
-# depends on directly for Starlark execpolicy files.
-# `cargo tree -i <crate>` confirms starlark is the sole path for each.
-#
-# There is no fix available without an upstream `starlark` release that drops
-# these deps, and none is exploitable here. They are accepted for now and
-# tracked in this file so `cargo audit` stays clean for genuinely new advisories.
-# Remove an entry once a starlark upgrade/removal drops the transitive dep
-# (re-check with `cargo tree -i derivative` and `cargo audit`).
-#
-# Audit #11, scratchpad/bug-audit-2026-06-24.md.
+# No suppressions: the old Starlark dependencies are absent from Cargo.lock.
+# Keep remaining maintenance warnings visible in cargo-audit. The separately
+# scoped cargo-deny exception is explained in docs/dependency-maintenance.md.
 [advisories]
-ignore = [
-    "RUSTSEC-2024-0388", # derivative 2.2.0 unmaintained — transitive via starlark 0.13.0
-    "RUSTSEC-2025-0057", # fxhash 0.2.1 unmaintained — transitive via starlark_map 0.13.0
-    "RUSTSEC-2024-0436", # paste 1.0.15 unmaintained — transitive via starlark 0.13.0
-]
+ignore = []

@@ -373,7 +373,7 @@ const FULL_RESYNC_INTERVAL_SECS: i64 = 30 * 24 * 60 * 60;
 const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (compatible; codewhale/",
     env!("CARGO_PKG_VERSION"),
-    "; +https://github.com/Hmbown/CodeWhale)"
+    "; +https://github.com/codewhale-hq/CodeWhale)"
 );
 /// Bounded retries for one sync. The on-disk cache only changes at the
 /// final atomic replace, so a failed fetch (HTTP/parse error) never
@@ -561,18 +561,26 @@ fn server_to_entry(server: RegistryServer) -> Option<McpRegistryServerEntry> {
     })
 }
 
-/// Prompt attached to every `registry_sync` result (Registry-first policy).
+/// Prompt attached to every `registry_sync` result.
+///
+/// A scored list is not a verdict. This used to read "you must call
+/// start_registry_mcp_server ... before using shell commands, local programs,
+/// custom code, or a manual implementation", which turned any near-miss row
+/// into an obligation: a turn that only had to write an HTML file and read a
+/// fixture matched a browser-automation server and spent itself on starting
+/// that server. The result now describes the list and leaves the choice with
+/// the model, while keeping the one instruction the host actually depends on —
+/// start an entry through `start_registry_mcp_server`, never by running its
+/// package command through the shell.
 const REGISTRY_FIRST_PROMPT: &str = concat!(
-    "REGISTRY-FIRST POLICY: These are the top scored matches for your ",
-    "query from the local Registry snapshot; the full catalog stays on the ",
-    "host. Treat a server as a match when it plausibly covers the task's ",
-    "core specialized capability; wording need not be exact. If a returned ",
-    "match is plausible, you must call start_registry_mcp_server with its ",
-    "exact name and inspect its tools before using shell commands, local ",
-    "programs, custom code, or a manual implementation. When no returned ",
-    "match plausibly covers the capability, refine the query once; if the ",
-    "refined query still returns nothing plausible, fall back to local ",
-    "tools.",
+    "These are the top scored matches for your query from the local Registry ",
+    "snapshot; the full catalog stays on the host. A match is only worth ",
+    "starting when it covers a capability you do not already have — if an ",
+    "available tool, a project script, or a few lines of local code already ",
+    "does the job, use that and ignore these results. To start one, call ",
+    "start_registry_mcp_server with its exact name; never install or run its ",
+    "package command through the shell. If nothing here covers the missing ",
+    "capability, refine the query once, then continue with local tools.",
 );
 
 /// Host-side cap on model-visible Registry matches. The complete catalog
@@ -810,9 +818,7 @@ fn merge_incremental_entries(
 /// memory, and atomically replace the cache file. Retried on failure;
 /// the old snapshot survives any failed sync.
 async fn sync_once(path: &Path) -> Result<(), ToolError> {
-    // rustls default-provider install pattern (matches `client.rs`).
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder()
+    let client = crate::tls::reqwest_client_builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
@@ -852,14 +858,22 @@ async fn sync_once(path: &Path) -> Result<(), ToolError> {
         servers,
         synced_at: Some(now),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ToolError::execution_failed(format!("Create cache dir: {e}")))?;
-    }
+    // Blocking filesystem work (including `write_atomic`'s publish-retry)
+    // runs on the blocking pool — tool handlers execute on the Tokio
+    // runtime (blocking-call convention, #6149).
     let json_str = serde_json::to_string_pretty(&index)
         .map_err(|e| ToolError::execution_failed(format!("Serialize: {e}")))?;
-    write_atomic(path, json_str.as_bytes())
-        .map_err(|e| ToolError::execution_failed(format!("Write cache: {e}")))?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ToolError::execution_failed(format!("Create cache dir: {e}")))?;
+        }
+        write_atomic(&path, json_str.as_bytes())
+            .map_err(|e| ToolError::execution_failed(format!("Write cache: {e}")))
+    })
+    .await
+    .map_err(|e| ToolError::execution_failed(format!("Write cache task: {e}")))??;
     Ok(())
 }
 
@@ -870,14 +884,14 @@ impl ToolSpec for McpSyncRegistry {
     }
 
     fn description(&self) -> &str {
-        "Search installable local MCP servers for a specialized capability \
-         and return at most eight scored matches; the full Registry index \
-         stays host-side. Describe the capability you need in the query. \
-         The index contains only stdio packages that declare no environment \
-         variables or API keys. If a match plausibly covers the task's core \
-         specialized capability, call start_registry_mcp_server with its \
-         exact name and inspect its tools before choosing a local \
-         alternative; do not run its package command through exec_shell."
+        "Search installable local MCP servers for a capability this session \
+         does not already have, and return at most eight scored matches; the \
+         full Registry index stays host-side. Describe the missing capability \
+         in the query. The index contains only stdio packages that declare no \
+         environment variables or API keys. Use this when an available tool, a \
+         project script, or ordinary local code cannot do the job — not before \
+         ordinary work. To use a match, call start_registry_mcp_server with its \
+         exact name; do not run its package command through the shell."
     }
 
     fn input_schema(&self) -> Value {
@@ -1423,6 +1437,28 @@ mod tests {
         let miss = catalog_from_cache(&cache, "database");
         assert_eq!(miss.total, 1);
         assert!(miss.servers.is_empty());
+    }
+
+    /// A scored row must not read as an obligation. The prompt this result
+    /// carries used to say the model "must call start_registry_mcp_server ...
+    /// before using shell commands, local programs, custom code, or a manual
+    /// implementation", which is how a turn that only needed to write an HTML
+    /// file and read a fixture ended up trying to start a browser server.
+    #[test]
+    fn result_prompt_does_not_oblige_starting_a_match() {
+        let catalog = catalog_from_cache(&make_test_cache(), "filesystem");
+        let instruction = catalog.instruction;
+
+        assert!(!instruction.contains("must call"));
+        assert!(!instruction.contains("custom code"));
+        assert!(!instruction.contains("manual implementation"));
+
+        // What the result is still responsible for saying: the matches are
+        // only worth starting for a capability the session lacks, and a
+        // package is started through the approved host path, never the shell.
+        assert!(instruction.contains("a capability you do not already have"));
+        assert!(instruction.contains("start_registry_mcp_server with its exact name"));
+        assert!(instruction.contains("never install or run its package command through the shell"));
     }
 
     /// Parse one `ServerResponse` JSON object the way the upstream list

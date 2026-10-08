@@ -33,15 +33,16 @@ use std::borrow::Cow;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::localization::{Locale, MessageId, tr};
-use crate::palette::{self, UiTheme};
 use crate::tools::subagent::{AgentWorkerStatus, FleetRole, SubAgentResult, SubAgentStatus};
 use crate::tui::glyphs;
 use crate::tui::motion::mode::MotionMode;
 use crate::tui::underwater::ShellPhase;
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette::{self as palette, UiTheme};
 
 /// Cells occupied by a badge (species mark + body).
-pub const BADGE_WIDTH: usize = 2;
+#[cfg(test)]
+const BADGE_WIDTH: usize = 2;
 /// Working wake loop: four frames over 720 ms, as in the CWC GIFs.
 pub const WORKING_FRAME_MS: u64 = 180;
 pub const WORKING_FRAMES: usize = 4;
@@ -267,8 +268,8 @@ impl WhaleState {
 
     /// State from the operator session phase. Public contract for the shell
     /// header / Fleet setup role pane (no consumer in this lane yet).
-    #[allow(dead_code)]
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn for_shell_phase(phase: ShellPhase) -> Self {
         match phase {
             ShellPhase::Idle | ShellPhase::Done => Self::Resting,
@@ -463,7 +464,7 @@ pub fn badge_ascii(species: WhaleSpecies) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::palette::contrast_ratio;
+    use codewhale_palette::contrast_ratio;
 
     fn theme_dark() -> UiTheme {
         palette::UI_THEME
@@ -577,6 +578,7 @@ mod tests {
     #[test]
     fn subagent_state_is_derived_from_runtime_facts_only() {
         let mut agent = SubAgentResult {
+            usage: None,
             name: "child-1".into(),
             agent_id: "child-1".into(),
             context_mode: "fresh".into(),
@@ -585,6 +587,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
                 objective: "objective".into(),
                 role: None,
             },
@@ -603,6 +606,8 @@ mod tests {
             duration_ms: 0,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         };
         assert_eq!(WhaleState::for_subagent(&agent), WhaleState::Working);
         agent.status = SubAgentStatus::Completed;

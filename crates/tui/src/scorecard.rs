@@ -14,13 +14,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 #[cfg(test)]
 use crate::config::{DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC};
-use crate::models::Usage;
 use crate::pricing::{
     CostEstimate, TurnCostAudit, audit_turn_cost_for_route_at, token_usage_for_pricing,
 };
+use codewhale_models::Usage;
 
 /// One turn's normalized token economics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -297,7 +297,7 @@ impl AvailableCost {
 }
 
 fn provider_scoped_cost(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     usage: &Usage,
     created_at: Option<&DateTime<Utc>>,
@@ -307,10 +307,10 @@ fn provider_scoped_cost(
     // override stale/junk recorded surfaces: they cannot become PAYG merely
     // because an older recorder wrote a bogus endpoint classification.
     let intrinsic_surface = match provider {
-        ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => {
+        ProviderKind::Ollama | ProviderKind::Sglang | ProviderKind::Vllm => {
             Some(crate::pricing::LOCAL_BILLING_SURFACE)
         }
-        ApiProvider::OpenaiCodex | ApiProvider::OpencodeGo => {
+        ProviderKind::OpenaiCodex | ProviderKind::OpencodeGo => {
             Some(crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE)
         }
         _ => None,
@@ -322,22 +322,22 @@ fn provider_scoped_cost(
     if billing_surface.is_none()
         && matches!(
             provider,
-            ApiProvider::Zai
-                | ApiProvider::Moonshot
-                | ApiProvider::Anthropic
-                | ApiProvider::XiaomiMimo
-                | ApiProvider::Xai
-                | ApiProvider::Minimax
-                | ApiProvider::MinimaxAnthropic
-                | ApiProvider::Stepfun
-                | ApiProvider::Custom
+            ProviderKind::Zai
+                | ProviderKind::Moonshot
+                | ProviderKind::Anthropic
+                | ProviderKind::XiaomiMimo
+                | ProviderKind::Xai
+                | ProviderKind::Minimax
+                | ProviderKind::MinimaxAnthropic
+                | ProviderKind::Stepfun
+                | ProviderKind::Custom
         )
     {
         return AvailableCost::failed_closed("missing_billing_surface");
     }
     let direct_deepseek = matches!(
         provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
     );
     let normalized_model = model.trim();
     let model_lower = normalized_model.to_ascii_lowercase();
@@ -352,8 +352,8 @@ fn provider_scoped_cost(
     // contract it had during its introductory window (Anthropic later made
     // that $2/$10 rate permanent; the row still prices at the turn's own time
     // rather than the wall clock, and undated turns still fail closed).
-    let needs_recorded_time =
-        direct_deepseek || (provider == ApiProvider::Anthropic && model_lower == "claude-sonnet-5");
+    let needs_recorded_time = direct_deepseek
+        || (provider == ProviderKind::Anthropic && model_lower == "claude-sonnet-5");
     let recorded_at = match (created_at, needs_recorded_time) {
         (Some(recorded_at), _) => recorded_at.to_owned(),
         // A time-windowed rate without a recorded time cannot be resolved to a
@@ -455,7 +455,7 @@ impl Scorecard {
                 .provider
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            let cost = provider.and_then(ApiProvider::parse).map_or_else(
+            let cost = provider.and_then(ProviderKind::parse).map_or_else(
                 AvailableCost::unknown_route,
                 |provider| {
                     provider_scoped_cost(
@@ -648,12 +648,22 @@ impl ScorecardMetrics {
     /// Flag metrics that grew more than `threshold_pct` over `baseline`. Cost
     /// and token counts are "lower is better", so only *increases* are
     /// regressions. (Cache-hit ratio is the opposite, reported separately.)
+    ///
+    /// Fails closed on values that cannot be compared: a non-finite threshold
+    /// admits no growth at all (it is treated as 0%), and a metric whose
+    /// change is `NaN` counts as regressed. Every `NaN` comparison is false,
+    /// so without this a `NaN` threshold would pass any run.
     #[must_use]
     pub fn regressions_against(
         &self,
         baseline: &ScorecardMetrics,
         threshold_pct: f64,
     ) -> Vec<Regression> {
+        let threshold_pct = if threshold_pct.is_finite() {
+            threshold_pct
+        } else {
+            0.0
+        };
         let mut out = Vec::new();
         // A partial/unknown subtotal is not comparable to a complete baseline,
         // but losing completeness is itself a regression. Otherwise removing
@@ -711,7 +721,7 @@ impl ScorecardMetrics {
             let drop_pct = (baseline.cache_hit_ratio - self.cache_hit_ratio)
                 / baseline.cache_hit_ratio
                 * 100.0;
-            if drop_pct > threshold_pct {
+            if drop_pct.is_nan() || drop_pct > threshold_pct {
                 out.push(Regression {
                     metric: "cache_hit_ratio_drop".to_string(),
                     baseline: baseline.cache_hit_ratio,
@@ -733,7 +743,7 @@ fn push_regression(
 ) {
     if base > 0.0 {
         let pct = (cur - base) / base * 100.0;
-        if pct > threshold_pct {
+        if pct.is_nan() || pct > threshold_pct {
             out.push(Regression {
                 metric: metric.to_string(),
                 baseline: base,
@@ -840,10 +850,10 @@ mod tests {
     fn dual_mode_routes_require_surface_but_intrinsic_routes_override_junk() {
         let usage = usage(10_000, 1_000, 0);
         for (provider, model) in [
-            (ApiProvider::Anthropic, "claude-haiku-4-5"),
-            (ApiProvider::Moonshot, "kimi-k2.7-code"),
-            (ApiProvider::Zai, "glm-5.2"),
-            (ApiProvider::Minimax, "minimax-m3"),
+            (ProviderKind::Anthropic, "claude-haiku-4-5"),
+            (ProviderKind::Moonshot, "kimi-k2.7-code"),
+            (ProviderKind::Zai, "glm-5.2"),
+            (ProviderKind::Minimax, "minimax-m3"),
         ] {
             let cost = provider_scoped_cost(provider, model, &usage, None, None);
             assert_eq!(
@@ -854,7 +864,7 @@ mod tests {
             assert!(cost.usd.is_none(), "{provider:?}");
         }
 
-        for provider in [ApiProvider::OpenaiCodex, ApiProvider::OpencodeGo] {
+        for provider in [ProviderKind::OpenaiCodex, ProviderKind::OpencodeGo] {
             let cost = provider_scoped_cost(
                 provider,
                 "gpt-5.5",
@@ -866,7 +876,7 @@ mod tests {
             assert!(!cost.counts_toward_money_coverage);
         }
         let local = provider_scoped_cost(
-            ApiProvider::Ollama,
+            ProviderKind::Ollama,
             "llama3.2",
             &usage,
             None,
@@ -876,7 +886,7 @@ mod tests {
         assert!(!local.counts_toward_money_coverage);
 
         let cloud = provider_scoped_cost(
-            ApiProvider::OllamaCloud,
+            ProviderKind::OllamaCloud,
             crate::config::DEFAULT_OLLAMA_CLOUD_MODEL,
             &usage,
             None,
@@ -1906,6 +1916,53 @@ mod tests {
         assert!(names.contains(&"total_cost_usd"));
         assert!(names.contains(&"total_output_tokens"));
         assert!(!names.contains(&"total_input_tokens")); // under threshold
+    }
+
+    #[test]
+    fn a_non_finite_threshold_cannot_pass_a_regressed_run() {
+        let baseline = ScorecardMetrics {
+            turns: 1,
+            money_metered_turns: 1,
+            unpriced_turns: 0,
+            cny_unpriced_turns: 0,
+            cost_complete: true,
+            cny_cost_complete: true,
+            unpriced_classes: Vec::new(),
+            total_input_tokens: 1000,
+            total_output_tokens: 1000,
+            total_cache_read_tokens: 0,
+            total_cache_write_tokens: 0,
+            total_reasoning_tokens: 0,
+            total_cost_usd: 0.10,
+            total_cost_cny: 0.7,
+            cache_hit_ratio: 0.5,
+        };
+        let current = ScorecardMetrics {
+            total_output_tokens: 2000,
+            ..baseline.clone()
+        };
+        for threshold in [f64::NAN, f64::INFINITY] {
+            let names: Vec<String> = current
+                .regressions_against(&baseline, threshold)
+                .into_iter()
+                .map(|r| r.metric)
+                .collect();
+            assert!(
+                names.iter().any(|name| name == "total_output_tokens"),
+                "threshold {threshold} passed a +100% regression: {names:?}"
+            );
+        }
+        // A metric whose change cannot be computed is not a pass either.
+        let unknown = ScorecardMetrics {
+            cache_hit_ratio: f64::NAN,
+            ..baseline.clone()
+        };
+        assert!(
+            unknown
+                .regressions_against(&baseline, 5.0)
+                .iter()
+                .any(|r| r.metric == "cache_hit_ratio_drop")
+        );
     }
 
     #[test]

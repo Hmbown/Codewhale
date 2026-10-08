@@ -1,7 +1,8 @@
 //! Legacy parser for text-based tool calls from DeepSeek models.
 //!
-//! Structured tool-call items are preferred, so the engine no longer invokes
-//! this parser. It is kept for reference/debugging.
+//! The engine prefers structured tool-call items and uses this fallback when
+//! a response has tool-call markers but no structured calls. Unbalanced argument
+//! objects are rejected; they must not become calls with invented empty args.
 //!
 //! Some DeepSeek outputs tool calls as text in various formats:
 //! ```text
@@ -313,9 +314,16 @@ fn parse_tool_call_inner(inner: &str, id_counter: &mut u32) -> Option<ParsedTool
         return parse_from_json(&json, id_counter);
     }
 
-    // Try the arrow syntax: {tool => "name", args => {...}}
-    if let Some(parsed) = parse_arrow_syntax(inner, id_counter) {
-        return Some(parsed);
+    // Once the arrow format is recognized, invalid arguments must not fall
+    // through to the looser name search inside the argument text.
+    let tool_regex = Regex::new(r#"tool\s*=>\s*"([^"]+)""#).ok()?;
+    if let Some(cap) = tool_regex.captures(inner) {
+        let name = cap.get(1)?.as_str().to_string();
+        return parse_arrow_syntax(inner, name, id_counter);
+    }
+
+    if inner.starts_with('{') && extract_braced_object(inner, ArgumentSyntax::Json)? != inner {
+        return None;
     }
 
     // Try to extract tool name and args from any format
@@ -352,47 +360,50 @@ fn parse_from_json(json: &Value, id_counter: &mut u32) -> Option<ParsedToolCall>
 }
 
 /// Parse the arrow syntax: {tool => "name", args => {...}}
-fn parse_arrow_syntax(inner: &str, id_counter: &mut u32) -> Option<ParsedToolCall> {
-    // Extract tool name
-    let tool_regex = Regex::new(r#"tool\s*=>\s*"([^"]+)""#).ok()?;
-    let name = tool_regex.captures(inner)?.get(1)?.as_str().to_string();
-
-    // Extract args - try to find the JSON object after "args =>"
-    let args = if let Some(args_start) = inner.find("args =>") {
-        let args_str = inner[args_start + 7..].trim();
+fn parse_arrow_syntax(inner: &str, name: String, id_counter: &mut u32) -> Option<ParsedToolCall> {
+    // Match the same whitespace-tolerant arrow form as the tool name.
+    let args_regex = Regex::new(r"\bargs\s*=>").ok()?;
+    let args = if let Some(args_start) = args_regex.find(inner) {
+        let args_str = inner[args_start.end()..].trim();
+        let syntax = if args_str.strip_prefix('{').is_some_and(|content| {
+            let content = content.trim_start();
+            !content.starts_with('"') && !content.starts_with('}')
+        }) {
+            ArgumentSyntax::Cli
+        } else {
+            ArgumentSyntax::Json
+        };
+        // The enclosing arrow object must close too. Its arguments decide
+        // the quote rules: CLI backslashes are literal, unlike JSON escapes.
+        if inner.starts_with('{') && extract_braced_object(inner, syntax)? != inner {
+            return None;
+        }
         // Try to parse as JSON first
         if let Ok(args_json) = serde_json::from_str::<Value>(args_str) {
             args_json
-        } else if let Some(brace_start) = args_str.find('{') {
-            // Try to extract the content between braces
-            let mut brace_count = 0;
-            let mut end_idx = brace_start;
-            for (i, c) in args_str[brace_start..].chars().enumerate() {
-                match c {
-                    '{' => brace_count += 1,
-                    '}' => {
-                        brace_count -= 1;
-                        if brace_count == 0 {
-                            end_idx = brace_start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let content = &args_str[brace_start + 1..end_idx - 1];
-
-            // Try to parse as JSON
-            if let Ok(json) = serde_json::from_str::<Value>(&format!("{{{content}}}")) {
+        } else {
+            let object = extract_braced_object(args_str, syntax)?;
+            if let Ok(json) = serde_json::from_str::<Value>(object) {
                 json
             } else {
+                let content = &object[1..object.len() - 1];
+                // A broken JSON object is not a CLI argument list, even if a
+                // string inside it happens to contain `key=value` text.
+                if matches!(syntax, ArgumentSyntax::Json) {
+                    return None;
+                }
                 // Try CLI-style args: --arg_name "value" or --arg_name value
-                parse_cli_style_args(content)
+                let args = parse_cli_style_args(content);
+                if args.as_object()?.is_empty() {
+                    return None;
+                }
+                args
             }
-        } else {
-            json!({})
         }
     } else {
+        if inner.starts_with('{') && extract_braced_object(inner, ArgumentSyntax::Json)? != inner {
+            return None;
+        }
         json!({})
     };
 
@@ -474,8 +485,13 @@ fn parse_flexible_format(inner: &str, id_counter: &mut u32) -> Option<ParsedTool
         {
             let name = name_match.as_str().to_string();
 
-            // Try to extract args/input as JSON
-            let args = extract_json_object(inner).unwrap_or(json!({}));
+            // Missing arguments may be empty; a present but malformed object
+            // must not silently turn into an empty-argument tool call.
+            let args = if inner.contains('{') {
+                extract_json_object(inner)?
+            } else {
+                json!({})
+            };
 
             *id_counter += 1;
             return Some(ParsedToolCall {
@@ -491,26 +507,53 @@ fn parse_flexible_format(inner: &str, id_counter: &mut u32) -> Option<ParsedTool
 
 /// Extract the first JSON object from a string.
 fn extract_json_object(text: &str) -> Option<Value> {
-    let start = text.find('{')?;
-    let mut brace_count = 0;
-    let mut end_idx = start;
+    serde_json::from_str(extract_braced_object(text, ArgumentSyntax::Json)?).ok()
+}
 
-    for (i, c) in text[start..].chars().enumerate() {
-        match c {
-            '{' => brace_count += 1,
+#[derive(Clone, Copy)]
+enum ArgumentSyntax {
+    Json,
+    Cli,
+}
+
+/// Extract one balanced object without treating quoted braces as delimiters.
+/// Both JSON and the legacy CLI argument form use this byte-safe boundary scan.
+fn extract_braced_object(text: &str, syntax: ArgumentSyntax) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut at_value_start = true;
+
+    for (offset, ch) in text[start..].char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if matches!(syntax, ArgumentSyntax::Json) && ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+                at_value_start = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' if matches!(syntax, ArgumentSyntax::Json) || at_value_start => quote = Some(ch),
+            '\'' if matches!(syntax, ArgumentSyntax::Cli) && at_value_start => quote = Some(ch),
+            '{' => depth += 1,
             '}' => {
-                brace_count -= 1;
-                if brace_count == 0 {
-                    end_idx = start + i + 1;
-                    break;
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..start + offset + ch.len_utf8()]);
                 }
             }
             _ => {}
         }
+        // The existing CLI regex recognizes quotes only at the start of a
+        // value; an apostrophe inside O'Brien.txt is ordinary filename data.
+        at_value_start = ch.is_whitespace() || matches!(ch, '{' | ':' | '=' | '>');
     }
-
-    let json_str = &text[start..end_idx];
-    serde_json::from_str(json_str).ok()
+    None
 }
 
 /// Check if text contains tool call markers (either format).
@@ -552,6 +595,111 @@ mod tests {
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "read_file");
         assert_eq!(result.tool_calls[0].args["path"], "test.txt");
+    }
+
+    #[test]
+    fn unicode_and_quoted_braces_preserve_json_arguments() {
+        for args in [
+            json!({"content": "日本語"}),
+            json!({"content": "你好世界，这是一个测试"}),
+            json!({"content": "café 🐋"}),
+            json!({
+                "content": "literal } then {, escaped \"quote }\", and \\ slash",
+                "nested": {"items": [{"text": "{深い}"}]},
+            }),
+        ] {
+            for body in [
+                format!(r#"{{tool => "write_file", args => {args}}}"#),
+                format!(r#"{{tool=>"write_file", args=>{args}}}"#),
+                format!("{{tool\t=>\"write_file\", args\t\n=>{args}}}"),
+                format!("tool: write_file {args}"),
+            ] {
+                let result = parse_tool_calls(&format!("[TOOL_CALL]{body}[/TOOL_CALL]"));
+                assert_eq!(result.tool_calls.len(), 1, "{body}");
+                assert_eq!(result.tool_calls[0].name, "write_file");
+                assert_eq!(result.tool_calls[0].args, args, "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_and_quoted_braces_preserve_cli_arguments() {
+        let result = parse_tool_calls(
+            r#"[TOOL_CALL]
+{tool => "write_file", args => {
+--path "鲸鱼.md"
+--content '你好 } { 世界'
+}}
+[/TOOL_CALL]"#,
+        );
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].args,
+            json!({"path": "鲸鱼.md", "content": "你好 } { 世界"})
+        );
+
+        // The legacy CLI grammar treats quoted backslashes literally,
+        // including one immediately before the closing quote.
+        let result = parse_tool_calls(
+            r#"[TOOL_CALL]{tool => "write_file", args => {--path '目录\' --content 'literal } {\'}}[/TOOL_CALL]"#,
+        );
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].args,
+            json!({"path": "目录\\", "content": "literal } {\\"})
+        );
+
+        for (arguments, path) in [
+            (r#"--path "C:\""#, "C:\\"),
+            (r#"--path 'C:\'"#, "C:\\"),
+            ("--path O'Brien.txt", "O'Brien.txt"),
+            (r#"path="C:\""#, "C:\\"),
+            ("path=O'Brien.txt", "O'Brien.txt"),
+            (r#"--path "O'Brien {界}.txt""#, "O'Brien {界}.txt"),
+        ] {
+            let text =
+                format!(r#"[TOOL_CALL]{{tool=>"read_file", args=>{{{arguments}}}}}[/TOOL_CALL]"#);
+            let result = parse_tool_calls(&text);
+            assert_eq!(result.tool_calls.len(), 1, "{text}");
+            assert_eq!(result.tool_calls[0].name, "read_file");
+            assert_eq!(result.tool_calls[0].args["path"], path, "{text}");
+        }
+    }
+
+    #[test]
+    fn malformed_objects_do_not_become_empty_or_nested_tool_calls() {
+        for body in [
+            r#"{tool => "write_file", args => {"#,
+            // The argument object closes, but the enclosing arrow object does not.
+            r#"{tool => "write_file", args => {"content":"日本語"}"#,
+            r#"{tool => "write_file", args => {"content":"日本語",}}"#,
+            r#"{tool => "write_file", args=> {"content":"x",}}"#,
+            r#"{tool => "write_file", args  => {"content":"x",}}"#,
+            "{tool => \"write_file\", args\t\n=> {\"content\":\"x\",}}",
+            // Neither the tool name nor CLI-looking text in a broken JSON
+            // string may be reinterpreted as a different argument format.
+            r#"{tool => "write_file", args => {"content":"tool: exec_shell key=value",}}"#,
+            r#"{tool => "write_file", args => {--content "unterminated}}"#,
+            r#"{tool => "read_file", args => {--path "C:\"}"#,
+            r#"{tool => "read_file", args => {--path O'Brien.txt}"#,
+            r#"tool: write_file {"#,
+            r#"tool: write_file {"content":"日本語""#,
+            r#"tool: write_file {"content":"日本語",}"#,
+            r#"tool: write_file {"content":"escaped quote \"}"#,
+        ] {
+            let result = parse_tool_calls(&format!("[TOOL_CALL]{body}[/TOOL_CALL]"));
+            assert!(result.tool_calls.is_empty(), "{body}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn flexible_call_without_an_argument_object_still_parses() {
+        for body in ["tool: list_dir", r#"{tool => "list_dir"}"#] {
+            let result = parse_tool_calls(&format!("[TOOL_CALL]{body}[/TOOL_CALL]"));
+            assert_eq!(result.tool_calls.len(), 1);
+            assert_eq!(result.tool_calls[0].name, "list_dir");
+            assert_eq!(result.tool_calls[0].args, json!({}));
+        }
     }
 
     #[test]

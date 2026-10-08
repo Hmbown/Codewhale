@@ -18,13 +18,11 @@
 #   daytona snapshot create codewhale-cloud-agent \
 #     -f Dockerfile --cpu 4 --memory 8 --disk 10   (plan max; resources bind to the snapshot)
 #
-# Current dispatcher boundary: this is an image definition, not a wired cloud
-# execution path. `crates/tui/src/cloud_dispatch.rs` currently creates a
-# Daytona sandbox with a name and labels only; it does not select this snapshot,
-# clone a repository, inject any sandbox environment, or execute `codewhale`.
-# A manual image build or Daytona probe is therefore not Cloud Agent launch
-# evidence. Do not add a create-time provider-key shortcut while that product
-# wiring is built.
+# Dispatcher source selects this snapshot name, sends account identity, and
+# uses the toolbox to clone and execute commands. That wiring does not prove
+# provider-credential resolution or end-to-end Cloud Agent acceptance. See
+# README.md beside this Dockerfile for the source and image evidence limits.
+# Never substitute a create-time provider-key shortcut for that missing bridge.
 
 FROM debian:bookworm-slim
 
@@ -33,7 +31,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # ---- pins (release v0.9.11, tag commit 96d13a0bc3f40280ea3865280ad5ccf0e2845e6f)
 ENV CODEWHALE_VERSION=0.9.11 \
     CODEWHALE_COMMIT=96d13a0bc3f40280ea3865280ad5ccf0e2845e6f \
-    CODEWHALE_ASSET_URL=https://github.com/Hmbown/CodeWhale/releases/download/v0.9.11/codewhale-linux-x64 \
+    CODEWHALE_ASSET_URL=https://github.com/codewhale-hq/CodeWhale/releases/download/v0.9.11/codewhale-linux-x64 \
     CODEWHALE_ASSET_SHA256=c02969556e51e138afa3fe9c97a1359878cd3d1986b1ce1f5fa96c93c6909416 \
     NODE_MAJOR=22
 
@@ -85,12 +83,12 @@ LABEL org.opencontainers.image.title="codewhale-cloud-agent" \
       org.opencontainers.image.description="Codewhale cloud agent Computer: released codewhale CLI preinstalled for dispatched turns" \
       org.opencontainers.image.version="0.9.11" \
       org.opencontainers.image.revision="96d13a0bc3f40280ea3865280ad5ccf0e2845e6f" \
-      org.opencontainers.image.source="https://github.com/Hmbown/CodeWhale" \
+      org.opencontainers.image.source="https://github.com/codewhale-hq/CodeWhale" \
       net.codewhale.binary.asset="codewhale-linux-x64" \
       net.codewhale.binary.sha256="c02969556e51e138afa3fe9c97a1359878cd3d1986b1ce1f5fa96c93c6909416" \
       net.codewhale.binary.commit="96d13a0bc3f40280ea3865280ad5ccf0e2845e6f" \
       net.codewhale.binary.version="0.9.11" \
-      net.codewhale.release.image="ghcr.io/hmbown/codewhale:0.9.11@sha256:6de13fe5e62fb3cb815c423bcb17455bef4d9f7db2107888beb88fe4b7c9ac14"
+      net.codewhale.release.image="ghcr.io/codewhale-hq/codewhale:0.9.11@sha256:6de13fe5e62fb3cb815c423bcb17455bef4d9f7db2107888beb88fe4b7c9ac14"
 
 USER agent
 WORKDIR /work

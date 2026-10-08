@@ -1,6 +1,5 @@
 use super::*;
-use crate::config::{ApiProvider, Config, ProviderConfig, ProvidersConfig};
-use crate::models::Usage;
+use crate::config::{Config, ProviderConfig, ProviderKind, ProvidersConfig};
 use crate::settings::Settings;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
@@ -8,6 +7,7 @@ use crate::tools::todo::TodoStatus;
 use crate::tui::clipboard::{ClipboardHandler, PastedImage};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
 use crate::tui::motion::MotionMode;
+use codewhale_models::Usage;
 
 fn test_options(yolo: bool) -> TuiOptions {
     TuiOptions {
@@ -20,6 +20,60 @@ fn test_options(yolo: bool) -> TuiOptions {
         yolo,
         ..crate::test_support::test_tui_options(PathBuf::from("."))
     }
+}
+
+#[test]
+fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
+    let mut app = App::new(test_options(false), &Config::default());
+    let message = |text: &str| Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let first = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let third = first + chrono::Duration::minutes(2);
+    // Reproduce partial legacy/test state without going through restoration,
+    // which already fills missing stamps. Reading it must preserve both rows.
+    app.api_messages = std::sync::Arc::new(vec![message("first"), message("unstamped")]);
+    app.api_message_stamps = vec![first];
+    let observed = app.api_messages_stamped().collect::<Vec<_>>();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].1, first);
+    assert_eq!(observed[1].0, &message("unstamped"));
+
+    app.push_api_message_stamped(message("third"), third);
+    assert_eq!(app.api_message_stamps.len(), 3);
+    assert_eq!(app.api_message_stamps[0], first);
+    assert_eq!(app.api_message_stamps[2], third);
+    app.truncate_api_messages(2);
+    assert_eq!(app.api_messages.len(), 2);
+    assert_eq!(app.api_message_stamps.len(), 2);
+    app.truncate_api_messages(1);
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(app.api_message_stamps, vec![first]);
+}
+
+#[test]
+fn set_api_messages_installs_the_shared_snapshot_without_copying() {
+    let mut app = App::new(test_options(false), &Config::default());
+    let snapshot = Arc::new(vec![Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    }]);
+    app.set_api_messages(Arc::clone(&snapshot));
+    assert!(Arc::ptr_eq(&app.api_messages, &snapshot));
+    // Mutating the mirror detaches; the engine snapshot is untouched.
+    app.push_api_message(Message {
+        role: codewhale_models::Role::Assistant,
+        content: vec![],
+    });
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(app.api_messages.len(), 2);
 }
 
 #[test]
@@ -311,44 +365,54 @@ fn test_trust_mode_follows_yolo_on_startup() {
 }
 
 #[test]
-fn reasoning_effort_display_label_uses_codex_xhigh() {
+fn reasoning_effort_display_label_keeps_codex_top_tiers_distinct() {
     assert_eq!(
-        ReasoningEffort::Off.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::Off.display_label_for_provider(ProviderKind::OpenaiCodex),
         "low"
     );
     assert_eq!(
-        ReasoningEffort::Medium.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::Medium.display_label_for_provider(ProviderKind::OpenaiCodex),
         "medium"
     );
+    // The roster publishes xhigh, max and ultra as separate rungs, so the
+    // label must not collapse them onto the old ceiling.
     assert_eq!(
-        ReasoningEffort::Max.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::XHigh.display_label_for_provider(ProviderKind::OpenaiCodex),
         "xhigh"
     );
     assert_eq!(
-        ReasoningEffort::Max.display_label_for_provider(ApiProvider::Deepseek),
+        ReasoningEffort::Max.display_label_for_provider(ProviderKind::OpenaiCodex),
         "max"
     );
     assert_eq!(
-        ReasoningEffort::High.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::Ultra.display_label_for_provider(ProviderKind::OpenaiCodex),
+        "ultra"
+    );
+    assert_eq!(
+        ReasoningEffort::Max.display_label_for_provider(ProviderKind::Deepseek),
+        "max"
+    );
+    assert_eq!(
+        ReasoningEffort::High.display_label_for_provider(ProviderKind::OpenaiCodex),
         "high"
     );
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::OpenaiCodex;
+    app.api_provider = ProviderKind::OpenaiCodex;
     app.reasoning_effort = ReasoningEffort::Max;
     app.auto_model = false;
-    assert_eq!(app.reasoning_effort_display_label(), "xhigh");
+    assert_eq!(app.reasoning_effort_display_label(), "max");
 
     app.reasoning_effort = ReasoningEffort::Auto;
     app.last_effective_reasoning_effort =
         Some(EffectiveReasoningEffort::Tier(ReasoningEffort::Max));
-    assert_eq!(app.reasoning_effort_display_label(), "auto: xhigh");
+    assert_eq!(app.reasoning_effort_display_label(), "auto: max");
 }
 
 #[test]
 fn fixed_auto_reasoning_label_preserves_untiered_effective_receipt() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.api_provider = ProviderKind::Zai;
     app.auto_model = false;
     app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
@@ -365,7 +429,7 @@ fn fixed_auto_reasoning_label_preserves_untiered_effective_receipt() {
 #[test]
 fn cache_replay_keeps_untiered_reasoning_enabled() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.api_provider = ProviderKind::Zai;
     app.auto_model = false;
     app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::Auto;
@@ -374,18 +438,18 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
 
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
         Some("high")
     );
 
-    app.api_provider = ApiProvider::Minimax;
+    app.api_provider = ProviderKind::Minimax;
     app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Minimax,
+            ProviderKind::Minimax,
             crate::config::DEFAULT_MINIMAX_BASE_URL,
             crate::config::DEFAULT_MINIMAX_MODEL,
         ),
@@ -395,7 +459,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     app.last_effective_reasoning_effort = Some(EffectiveReasoningEffort::Unavailable);
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
@@ -406,14 +470,14 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
 #[test]
 fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "auto".to_string();
     app.auto_model = true;
 
     app.reasoning_effort = ReasoningEffort::Off;
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::OpenaiCodex,
+            ProviderKind::OpenaiCodex,
             crate::config::DEFAULT_OPENAI_CODEX_BASE_URL,
             crate::config::DEFAULT_OPENAI_CODEX_MODEL,
         ),
@@ -424,7 +488,7 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     app.reasoning_effort = ReasoningEffort::Medium;
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
         ),
@@ -438,13 +502,13 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
     let mut app = App::new(test_options(false), &Config::default());
     app.model = "auto".to_string();
     app.auto_model = true;
-    app.last_effective_provider = Some(ApiProvider::OpenaiCodex);
-    app.last_effective_provider_identity = Some(ApiProvider::OpenaiCodex.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::OpenaiCodex);
+    app.last_effective_provider_identity = Some(ProviderKind::OpenaiCodex.as_str().to_string());
     app.last_effective_model = Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string());
     app.session.last_base_url = Some(crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string());
     app.push_turn_cache_record(TurnCacheRecord {
-        provider: Some(ApiProvider::OpenaiCodex),
-        provider_identity: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        provider: Some(ProviderKind::OpenaiCodex),
+        provider_identity: Some(ProviderKind::OpenaiCodex.as_str().to_string()),
         model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
         auto_model: true,
         input_tokens: 1,
@@ -462,11 +526,11 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
         .cache_replay_target()
         .expect("completed Auto route must be replayable");
 
-    assert_eq!(target.provider, ApiProvider::OpenaiCodex);
-    assert_eq!(target.provider_identity, ApiProvider::OpenaiCodex.as_str());
+    assert_eq!(target.provider, ProviderKind::OpenaiCodex);
+    assert_eq!(target.provider_identity, ProviderKind::OpenaiCodex.as_str());
     assert_eq!(
         target.provider_id.as_deref(),
-        Some(ApiProvider::OpenaiCodex.as_str())
+        Some(ProviderKind::OpenaiCodex.as_str())
     );
     assert_eq!(target.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
     assert_eq!(
@@ -480,7 +544,7 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
     app.session.turn_cache_history.clear();
     app.session.last_base_url = None;
     app.session.last_warmup_key = Some(CacheWarmupKey {
-        provider: ApiProvider::OpenaiCodex.as_str().to_string(),
+        provider: ProviderKind::OpenaiCodex.as_str().to_string(),
         model: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
         base_url: crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
         static_prefix_hash: "static".to_string(),
@@ -499,13 +563,13 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
 #[test]
 fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "auto".to_string();
     app.auto_model = true;
     app.reasoning_effort = ReasoningEffort::Low;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
-    app.last_effective_provider = Some(ApiProvider::OpenaiCodex);
-    app.last_effective_provider_identity = Some(ApiProvider::OpenaiCodex.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::OpenaiCodex);
+    app.last_effective_provider_identity = Some(ProviderKind::OpenaiCodex.as_str().to_string());
     app.last_effective_model = Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string());
     app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
         tier: crate::model_routing::AutoRouteTier::Strong,
@@ -515,9 +579,11 @@ fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
         },
         scope: crate::model_routing::AutoRouteScope::ResolvedProvider,
         data_path: crate::model_routing::AutoRouteDataPath::LocalHeuristic,
-        reason: crate::model_routing::AutoRouteReason::LocalHeuristic(
-            crate::model_routing::AutoRouteHeuristicReason::ComplexRequest,
+        reason: crate::model_routing::AutoRouteReason::LocalFallback(
+            crate::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
         ),
+        decision: None,
+        router_failure: None,
     });
     app.last_effective_reasoning_effort =
         Some(EffectiveReasoningEffort::Tier(ReasoningEffort::Max));
@@ -603,7 +669,7 @@ fn cycle_effort_updates_effort_status_and_compaction() {
     // effort must surface a status message and refresh the compaction budget,
     // not just silently flip the setting.
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
     // Sentinel so the test can observe update_model_compaction_budget().
@@ -641,7 +707,7 @@ fn cycle_effort_updates_effort_status_and_compaction() {
         } => {
             assert_eq!(*requested, crate::work_graph::ReasoningEffortTier::Low);
             assert_eq!(*effective, crate::work_graph::ReasoningEffortTier::Low);
-            assert_eq!(*provider_kind, Some(ApiProvider::Deepseek));
+            assert_eq!(*provider_kind, Some(ProviderKind::Deepseek));
             assert_eq!(provider, "deepseek");
             assert!(operation.is_none());
         }
@@ -657,7 +723,11 @@ fn cycle_effort_updates_effort_status_and_compaction() {
 #[test]
 fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
@@ -706,7 +776,11 @@ fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
 #[test]
 fn glm_5_1_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = crate::config::ZAI_GLM_5_1_MODEL.to_string();
@@ -738,7 +812,11 @@ fn glm_5_1_records_enabled_with_granularity_unavailable() {
 #[test]
 fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = "glm-future-unknown".to_string();
@@ -770,7 +848,11 @@ fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
 #[test]
 fn compatible_zai_gateway_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = "https://gateway.example/v1".to_string();
     app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
@@ -823,7 +905,11 @@ fn minimax_m3_high_and_max_receipts_do_not_claim_tier_granularity() {
         (ReasoningEffort::Auto, ReasoningEffort::Off, "off"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Minimax;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Minimax.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_MINIMAX_BASE_URL.to_string();
         app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
@@ -873,7 +959,11 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
         (ReasoningEffort::Auto, ReasoningEffort::Off, "off"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::MinimaxAnthropic;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::MinimaxAnthropic.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL.to_string();
         app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
@@ -910,7 +1000,7 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
                 crate::work_graph::ReasoningEffortTier::Off
             }
         );
-        assert_eq!(provider_kind, Some(ApiProvider::MinimaxAnthropic));
+        assert_eq!(provider_kind, Some(ProviderKind::MinimaxAnthropic));
         assert_eq!(provider, "minimax-anthropic");
         assert_eq!(
             endpoint_identity.as_deref(),
@@ -923,7 +1013,7 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
 #[test]
 fn named_custom_route_displays_and_persists_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.set_provider_identity(ApiProvider::Custom, "my-gateway");
+    app.set_provider_identity(ProviderKind::Custom, "my-gateway");
     app.auto_model = false;
     app.active_route_base_url = "https://gateway.example/v1?api_key=must-not-persist".to_string();
     app.model = "vendor-model-x".to_string();
@@ -959,7 +1049,7 @@ fn named_custom_route_displays_and_persists_effective_unavailable() {
         effective,
         crate::work_graph::ReasoningEffortTier::Unavailable
     );
-    assert_eq!(provider_kind, Some(ApiProvider::Custom));
+    assert_eq!(provider_kind, Some(ProviderKind::Custom));
     assert_eq!(provider, "my-gateway");
     let endpoint = endpoint_identity.expect("redacted endpoint provenance");
     assert!(endpoint.contains("gateway.example"), "{endpoint}");
@@ -971,7 +1061,7 @@ fn named_custom_route_displays_and_persists_effective_unavailable() {
 fn custom_routes_named_with_builtin_slugs_retain_custom_kind_and_fail_closed() {
     for identity in ["openai", "zai"] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.set_provider_identity(ApiProvider::Custom, identity);
+        app.set_provider_identity(ProviderKind::Custom, identity);
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
@@ -1004,7 +1094,7 @@ fn custom_routes_named_with_builtin_slugs_retain_custom_kind_and_fail_closed() {
             effective,
             crate::work_graph::ReasoningEffortTier::Unavailable
         );
-        assert_eq!(provider_kind, Some(ApiProvider::Custom));
+        assert_eq!(provider_kind, Some(ProviderKind::Custom));
         assert_eq!(provider, identity);
     }
 }
@@ -1016,7 +1106,11 @@ fn zai_gateway_off_and_high_receipts_remain_unavailable() {
         (ReasoningEffort::Max, ReasoningEffort::Auto, "auto"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
@@ -1035,11 +1129,15 @@ fn zai_gateway_off_and_high_receipts_remain_unavailable() {
 #[test]
 fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
     for (previous, requested) in [
-        (ReasoningEffort::Off, ReasoningEffort::Low),
+        (ReasoningEffort::Auto, ReasoningEffort::Low),
         (ReasoningEffort::High, ReasoningEffort::Max),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Moonshot;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
         app.model = crate::config::KIMI_CODE_K3_MODEL.to_string();
@@ -1076,7 +1174,7 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
 #[test]
 fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.active_route_base_url = crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string();
     app.model = "deepseek-chat".to_string();
     app.reasoning_effort = ReasoningEffort::High;
@@ -1084,20 +1182,22 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
         turn_id: "turn-zai-receipt".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Zai,
+            provider: ProviderKind::Zai,
             provider_identity: "openai".to_string(),
             model: "mutable-wrong-model".to_string(),
             auto_model: false,
             receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
-                ApiProvider::Zai,
+                ProviderKind::Zai,
                 "zai",
                 crate::config::ZAI_GLM_5_TURBO_MODEL,
                 crate::config::DEFAULT_ZAI_BASE_URL,
                 "test-secret-never-persisted",
             )),
             billing: Some(crate::core::events::RouteBillingEnvelope {
+                openrouter_vendor: None,
                 billing_surface: None,
                 endpoint_fingerprint: None,
+                provider_live_pricing: None,
                 billing_mode: crate::cost_status::RouteBillingMode::Unknown,
                 dispatched_at: chrono::Utc::now(),
             }),
@@ -1132,7 +1232,7 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
         model,
         ..
     } = activity;
-    assert_eq!(provider_kind, Some(ApiProvider::Zai));
+    assert_eq!(provider_kind, Some(ProviderKind::Zai));
     assert_eq!(provider, "zai");
     assert_eq!(
         endpoint_identity.as_deref(),
@@ -1144,11 +1244,11 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
 #[test]
 fn pending_zai_route_without_endpoint_receipt_is_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Max;
     app.pending_turn_route = Some((
-        ApiProvider::Zai,
+        ProviderKind::Zai,
         crate::config::ZAI_GLM_5_2_MODEL.to_string(),
         true,
     ));
@@ -1165,7 +1265,7 @@ fn reasoning_effort_scenario() {
     // from reasoning_effort_display_receipts_route_normalization
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Moonshot;
+        app.api_provider = ProviderKind::Moonshot;
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
         app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
@@ -1183,23 +1283,33 @@ fn reasoning_effort_scenario() {
     // from reasoning_effort_api_values_are_provider_aware_for_codex
     {
         assert_eq!(
-            ReasoningEffort::Off.normalize_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Off.normalize_for_provider(ProviderKind::OpenaiCodex),
             ReasoningEffort::Low
         );
         assert_eq!(
-            ReasoningEffort::Auto.normalize_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Auto.normalize_for_provider(ProviderKind::OpenaiCodex),
             ReasoningEffort::Medium
         );
+        // Codex sends the rung the operator picked: the roster offers xhigh,
+        // max and ultra as separate efforts per model.
         assert_eq!(
-            ReasoningEffort::Max.api_value_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::XHigh.api_value_for_provider(ProviderKind::OpenaiCodex),
             Some("xhigh")
         );
         assert_eq!(
-            ReasoningEffort::Off.api_value_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Max.api_value_for_provider(ProviderKind::OpenaiCodex),
+            Some("max")
+        );
+        assert_eq!(
+            ReasoningEffort::Ultra.api_value_for_provider(ProviderKind::OpenaiCodex),
+            Some("ultra")
+        );
+        assert_eq!(
+            ReasoningEffort::Off.api_value_for_provider(ProviderKind::OpenaiCodex),
             Some("low")
         );
         assert_eq!(
-            ReasoningEffort::Max.api_value_for_provider(ApiProvider::Deepseek),
+            ReasoningEffort::Max.api_value_for_provider(ProviderKind::Deepseek),
             Some("max")
         );
         assert_eq!(
@@ -1221,17 +1331,17 @@ fn ollama_cloud_normal_turns_preserve_the_documented_reasoning_ladder() {
         ReasoningEffort::Max,
     ] {
         assert_eq!(
-            effort.normalize_for_route(ApiProvider::OllamaCloud, base_url, model),
+            effort.normalize_for_route(ProviderKind::OllamaCloud, base_url, model),
             effort,
             "{effort:?} must remain distinct on Ollama's documented Cloud ladder"
         );
     }
     assert_eq!(
-        ReasoningEffort::Minimal.normalize_for_route(ApiProvider::OllamaCloud, base_url, model,),
+        ReasoningEffort::Minimal.normalize_for_route(ProviderKind::OllamaCloud, base_url, model,),
         ReasoningEffort::Low
     );
     assert_eq!(
-        ReasoningEffort::XHigh.normalize_for_route(ApiProvider::OllamaCloud, base_url, model),
+        ReasoningEffort::XHigh.normalize_for_route(ProviderKind::OllamaCloud, base_url, model),
         ReasoningEffort::Max
     );
 }
@@ -1241,9 +1351,15 @@ fn reasoning_effort_uses_one_strict_alias_table_and_legacy_fallback() {
     for raw in ["off", "none", "disabled", "false"] {
         assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Off));
     }
-    for raw in ["low", "minimum", "minimal", "light"] {
+    for raw in ["low", "minimum", "light"] {
         assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Low));
     }
+    // `minimal` is its own rung: `parse_strict(as_setting(Minimal))` must not
+    // lose the variant by collapsing it onto `Low` (Slice 4, D3).
+    assert_eq!(
+        ReasoningEffort::parse_strict("minimal"),
+        Ok(ReasoningEffort::Minimal)
+    );
     for raw in ["medium", "mid"] {
         assert_eq!(
             ReasoningEffort::parse_strict(raw),
@@ -1275,30 +1391,30 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     let kimi_base = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
     let moonshot_base = crate::config::DEFAULT_MOONSHOT_BASE_URL;
     assert_eq!(
-        ReasoningEffort::Off.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Off.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Low,
         "membership K3 stays on K3 by mapping off to its lowest thinking tier"
     );
     assert_eq!(
-        ReasoningEffort::Auto.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Auto.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Auto,
         "route normalization preserves the Auto sentinel until dispatch selects a concrete tier"
     );
     assert_eq!(
-        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Low.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Low
     );
     assert_eq!(
-        ReasoningEffort::Medium.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Medium.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Medium
     );
     assert_eq!(
-        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, moonshot_base, "k3"),
+        ReasoningEffort::Low.normalize_for_route(ProviderKind::Moonshot, moonshot_base, "k3"),
         ReasoningEffort::High
     );
     assert_eq!(
         ReasoningEffort::Medium.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             kimi_base,
             "kimi-for-coding",
         ),
@@ -1307,7 +1423,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
 
     assert_eq!(
         ReasoningEffort::Off.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             moonshot_base,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1316,7 +1432,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     );
     assert_eq!(
         ReasoningEffort::Low.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             moonshot_base,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1324,7 +1440,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     );
     assert_eq!(
         ReasoningEffort::Medium.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             moonshot_base,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1332,7 +1448,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     );
     assert_eq!(
         ReasoningEffort::Off.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "https://proxy.example/v1",
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1347,8 +1463,8 @@ fn picker_uses_scenario() {
     // from picker_uses_catalog_reasoning_efforts_for_grok_46
     {
         let labels: Vec<&str> = crate::tui::model_picker::picker_efforts_for_route(
-            ApiProvider::Xai,
-            ApiProvider::Xai.default_base_url(),
+            ProviderKind::Xai,
+            ProviderKind::Xai.provider().default_base_url(),
             crate::config::XAI_GROK_4_6_MODEL,
             false,
         )
@@ -1360,8 +1476,8 @@ fn picker_uses_scenario() {
     // from picker_uses_catalog_reasoning_efforts_for_grok_45
     {
         let labels: Vec<&str> = crate::tui::model_picker::picker_efforts_for_route(
-            ApiProvider::Xai,
-            ApiProvider::Xai.default_base_url(),
+            ProviderKind::Xai,
+            ProviderKind::Xai.provider().default_base_url(),
             crate::config::XAI_GROK_4_5_MODEL,
             false,
         )
@@ -1387,14 +1503,14 @@ fn reasoning_effort_preserves_grok_46_ladder_only_on_exact_xai_route() {
         (ReasoningEffort::Auto, ReasoningEffort::Auto),
     ] {
         assert_eq!(
-            requested.normalize_for_route(ApiProvider::Xai, xai, model),
+            requested.normalize_for_route(ProviderKind::Xai, xai, model),
             expected,
             "{requested:?}"
         );
     }
     assert_eq!(
         ReasoningEffort::Medium.normalize_for_route(
-            ApiProvider::Xai,
+            ProviderKind::Xai,
             "https://gateway.example/v1",
             model,
         ),
@@ -1437,7 +1553,7 @@ fn app_new_scenario() {
         let config = xai_grok_46_startup_config();
         let app = xai_grok_46_startup_app(&config);
 
-        assert_eq!(app.api_provider, ApiProvider::Xai);
+        assert_eq!(app.api_provider, ProviderKind::Xai);
         assert_eq!(app.model, crate::config::XAI_GROK_4_6_MODEL);
         assert_eq!(
             app.active_route_base_url,
@@ -1546,9 +1662,9 @@ fn app_new_scenario() {
         let _legacy_provider_env = EnvVarGuard::remove("DEEPSEEK_PROVIDER");
 
         let config = Config {
-            api_key: Some("sk-test-onboarding-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("sk-test-onboarding-key".to_string()), None);
         let app = App::new(test_options(false), &config);
         assert!(
             !app.onboarding_needs_api_key,
@@ -1571,7 +1687,11 @@ fn cycle_effort_scenario() {
     // from cycle_effort_walks_grok_46_official_ladder
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Xai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Xai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
         app.model = crate::config::XAI_GROK_4_6_MODEL.to_string();
@@ -1592,7 +1712,11 @@ fn cycle_effort_scenario() {
     // from cycle_effort_walks_grok_45_official_ladder_without_xhigh
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Xai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Xai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
         app.model = crate::config::XAI_GROK_4_5_MODEL.to_string();
@@ -1612,7 +1736,7 @@ fn cycle_effort_scenario() {
 #[test]
 fn set_model_selection_normalizes_codex_fixed_model_effort() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::OpenaiCodex;
+    app.api_provider = ProviderKind::OpenaiCodex;
     app.reasoning_effort = ReasoningEffort::Off;
     app.reasoning_effort_preference = Some(ReasoningEffort::Off);
 
@@ -1638,12 +1762,12 @@ fn auto_model_selection_preserves_only_explicit_reasoning_effort() {
 
     for (provider, requested, normalized) in [
         (
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             ReasoningEffort::Low,
             ReasoningEffort::High,
         ),
         (
-            ApiProvider::OpenaiCodex,
+            ProviderKind::OpenaiCodex,
             ReasoningEffort::Off,
             ReasoningEffort::Low,
         ),
@@ -1687,7 +1811,9 @@ fn app_new_normalizes_saved_codex_reasoning_effort() {
     for (raw, expected, display) in [
         ("off", ReasoningEffort::Low, "low"),
         ("auto", ReasoningEffort::Medium, "medium"),
-        ("max", ReasoningEffort::Max, "xhigh"),
+        ("max", ReasoningEffort::Max, "max"),
+        ("xhigh", ReasoningEffort::XHigh, "xhigh"),
+        ("ultra", ReasoningEffort::Ultra, "ultra"),
     ] {
         std::fs::write(
             tmp.path().join("settings.toml"),
@@ -1697,7 +1823,7 @@ fn app_new_normalizes_saved_codex_reasoning_effort() {
 
         let app = App::new(test_options(false), &config);
 
-        assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+        assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
         assert_eq!(app.reasoning_effort, expected, "raw setting {raw}");
         assert_eq!(
             app.reasoning_effort_preference,
@@ -1737,7 +1863,7 @@ fn app_new_exposes_direct_moonshot_k3_off_as_effective_low() {
     options.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Moonshot);
+    assert_eq!(app.api_provider, ProviderKind::Moonshot);
     assert_eq!(app.model, crate::config::MOONSHOT_KIMI_K3_MODEL);
     assert_eq!(
         app.active_route_base_url,
@@ -1751,27 +1877,14 @@ fn app_new_exposes_direct_moonshot_k3_off_as_effective_low() {
 fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
     let _lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical_home = tmp
+        .path()
+        .canonicalize()
+        .expect("canonical private fixture home");
     let config_path = tmp.path().join("config.toml");
-    let codex_home = tmp.path().join("codex-home");
-    std::fs::create_dir_all(&codex_home).expect("Codex home");
-    std::fs::write(
-        codex_home.join("models_cache.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "fetched_at": chrono::Utc::now(),
-            "models": [{
-                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
-                "priority": 1,
-                "context_window": 128000,
-                "supported_reasoning_levels": [{"effort": "high"}]
-            }]
-        }))
-        .expect("serialize cache"),
-    )
-    .expect("write cache");
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-    let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
-    let _token = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-startup-token");
-    let config = Config {
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
+    let mut config = Config {
         provider: Some("openai-codex".to_string()),
         providers: Some(ProvidersConfig {
             openai_codex: ProviderConfig {
@@ -1783,11 +1896,25 @@ fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
         ..Config::default()
     };
 
+    crate::oauth::install_test_chatgpt_registration(&mut config)
+        .expect("owned ChatGPT registration");
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        vec![crate::codex_model_cache::CodexModelMetadata {
+            id: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+            display_name: None,
+            context_window: Some(128_000),
+            reasoning: Some(true),
+            efforts: vec!["high".to_string()],
+        }],
+    )
+    .expect("account-scoped roster");
+
     let mut options = test_options(false);
     options.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
     assert_eq!(
         app.active_route_limits
             .and_then(|limits| limits.context_tokens),
@@ -1830,7 +1957,7 @@ fn settings_default_provider_auth_check_uses_provider_scoped_key() {
 
     let app = App::new(test_options(false), &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
     assert!(
         !app.onboarding_needs_api_key,
         "OpenAI provider config key should satisfy startup auth without a DeepSeek key"
@@ -1872,7 +1999,7 @@ fn saved_startup_provider_overrides_config_file_provider() {
     options.model = "mimo-v2.5-pro".to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
     assert!(
         !app.onboarding_needs_api_key,
@@ -1923,7 +2050,7 @@ openrouter = "openai/gpt-5"
     options.model = "deepseek-v4-flash-vision-exp".to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash-vision-exp");
     assert_eq!(app.reasoning_effort, ReasoningEffort::High);
     assert_eq!(app.reasoning_effort_preference, Some(ReasoningEffort::High));
@@ -1964,7 +2091,7 @@ fn explicit_launch_provider_overrides_saved_startup_provider() {
     options.model = "mimo-v2.5-pro".to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(app.api_provider, ProviderKind::XiaomiMimo);
     assert_eq!(app.model, "mimo-v2.5-pro");
 }
 
@@ -2054,7 +2181,8 @@ fn critical_context_pressure_remains_visible_over_transient_info_toasts() {
     app.push_status_toast("Saved", StatusToastLevel::Info, None);
 
     assert_eq!(
-        app.active_status_toast().map(|toast| toast.text),
+        app.active_status_toast(crate::tui::underwater::ShellPhase::Working)
+            .map(|toast| toast.text),
         Some("Context critical: 95%".to_string())
     );
 }
@@ -2121,7 +2249,9 @@ fn subscription_route_hides_stale_session_dollars_in_footer() {
         !matches!(chip, crate::route_billing::UsageChip::Money(_)),
         "{chip:?}"
     );
-    let rendered = crate::route_billing::format_usage_chip(&chip).unwrap_or_default();
+    let rendered =
+        crate::route_billing::format_usage_chip(&chip, codewhale_localization::Locale::En)
+            .unwrap_or_default();
     assert!(!rendered.contains('$'), "{rendered}");
     assert!(rendered.contains("Codex OAuth quota"), "{rendered}");
 }
@@ -2129,13 +2259,13 @@ fn subscription_route_hides_stale_session_dollars_in_footer() {
 #[test]
 fn provider_switch_keeps_audited_cumulative_spend_visible() {
     let mut app = App::new(test_options(false), &Config::default());
-    let usage = crate::models::Usage {
+    let usage = codewhale_models::Usage {
         input_tokens: 10_000,
         output_tokens: 1_000,
         ..Default::default()
     };
     let priced = crate::pricing::audit_turn_cost_for_provider_at(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-v4-flash",
         &usage,
         chrono::Utc::now(),
@@ -2143,7 +2273,7 @@ fn provider_switch_keeps_audited_cumulative_spend_visible() {
     app.record_turn_cost_audit(&priced);
     app.accrue_session_cost_estimate(priced.estimate.expect("priced"));
 
-    app.api_provider = ApiProvider::OpenaiCodex;
+    app.api_provider = ProviderKind::OpenaiCodex;
     app.model = "gpt-5.5".to_string();
     app.billing_presentation =
         crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
@@ -2152,12 +2282,12 @@ fn provider_switch_keeps_audited_cumulative_spend_visible() {
         crate::route_billing::UsageChip::Money(_)
     ));
     assert!(
-        crate::route_billing::format_usage_chip(&app.cumulative_usage_chip())
+        crate::route_billing::format_usage_chip(&app.cumulative_usage_chip(), app.ui_locale)
             .is_some_and(|label| !label.is_empty())
     );
 
     let unknown = crate::pricing::audit_turn_cost_for_route_at(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         "gpt-5.5",
         Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE),
         &usage,
@@ -2230,6 +2360,34 @@ fn submit_input_records_absolute_slash_path_as_message_history() {
 
     assert_eq!(submitted, input);
     assert_eq!(app.input_history.last().map(String::as_str), Some(input));
+}
+
+#[test]
+fn submit_input_recalls_slash_commands_and_persists_them_for_the_next_session() {
+    let _env_lock = lock_test_env();
+    let home = tempfile::tempdir().expect("isolated home");
+    let _home = EnvVarGuard::set("HOME", home.path());
+    let _profile = EnvVarGuard::set("USERPROFILE", home.path());
+    let _state = EnvVarGuard::set("CODEWHALE_HOME", home.path().join(".codewhale"));
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input_history.clear();
+    for input in ["/theme", "/theme", "/theme", "/compact", "/compact"] {
+        app.input = input.to_string();
+        app.cursor_position = input.chars().count();
+        assert_eq!(app.submit_input().as_deref(), Some(input));
+    }
+    assert_eq!(app.input_history, ["/theme", "/compact"]);
+    app.history_up();
+    assert_eq!(app.input, "/compact");
+    app.history_up();
+    assert_eq!(app.input, "/theme");
+
+    crate::composer_history::flush_history_writer_for_tests(std::time::Duration::from_secs(5));
+    let mut resumed = App::new(test_options(false), &Config::default());
+    resumed.history_up();
+    assert_eq!(resumed.input, "/compact");
+    resumed.history_up();
+    assert_eq!(resumed.input, "/theme");
 }
 
 #[test]
@@ -2550,15 +2708,21 @@ fn returning_user_missing_api_key_goes_to_canonical_provider_setup() {
 }
 
 #[test]
-fn first_run_user_starts_at_composer() {
+fn first_run_user_without_a_key_starts_on_connect_a_model() {
+    // #6566: a new user with no key used to land on a composer that could
+    // not answer. The one launch screen is the provider picker.
     assert_eq!(
         initial_onboarding_state(false, false, true, true, true),
-        OnboardingState::None
+        OnboardingState::Provider
     );
     assert_eq!(
         initial_onboarding_state(false, false, false, true, true),
-        OnboardingState::None
+        OnboardingState::Provider
     );
+}
+
+#[test]
+fn first_run_user_with_a_key_starts_at_composer() {
     assert_eq!(
         initial_onboarding_state(false, false, false, false, true),
         OnboardingState::None
@@ -2630,7 +2794,7 @@ fn app_new_detects_missing_api_key_with_default_config() {
 }
 
 #[test]
-fn first_run_app_starts_on_composer_when_a_key_is_missing() {
+fn first_run_app_without_a_key_opens_provider_setup() {
     let _lock = lock_test_env();
     let home = tempfile::TempDir::new().expect("isolated first-run home");
     let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path().to_string_lossy().as_ref());
@@ -2662,9 +2826,15 @@ fn first_run_app_starts_on_composer_when_a_key_is_missing() {
     .collect();
 
     let app = App::new(test_options(false), &Config::default());
-    assert_eq!(app.onboarding, OnboardingState::None);
+    // #6566: the first screen connects a model; Esc returns to the composer.
+    assert_eq!(app.onboarding, OnboardingState::Provider);
     assert!(app.onboarding_needs_api_key);
-    assert!(!app.onboarding_missing_key_recovery);
+    assert!(app.onboarding_missing_key_recovery);
+    // A new user has no saved route, so the picker opens on the provider
+    // list, not on the built-in default's missing key.
+    assert!(!app.onboarding_recovers_configured_route());
+    // Language is asked in /setup, so the launch screen is not "2/3".
+    assert!(!app.onboarding_had_language_step);
 }
 
 #[test]
@@ -2673,6 +2843,7 @@ fn new_caches_workspace_skills_for_slash_menu() {
     let workspace = tmp.path().join("workspace");
     let skill_dir = workspace.join(".agents").join("skills").join("local-skill");
     std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    crate::test_support::trust_workspace(&workspace);
     std::fs::write(
         skill_dir.join("SKILL.md"),
         "---\nname: local-skill\ndescription: Local workspace skill\n---\nUse the local skill.\n",
@@ -2694,6 +2865,7 @@ fn new_caches_workspace_skills_for_slash_menu() {
 fn cached_skills_merges_across_candidate_directories() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     // Higher-precedence directory contains a stale empty dir for `foo`
     // (no SKILL.md). This used to shadow the real definition further
@@ -2728,6 +2900,7 @@ fn cached_skills_merges_across_candidate_directories() {
 fn cached_skills_respect_codewhale_only_scan_config() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     let claude_dir = workspace
         .join(".claude")
@@ -2808,6 +2981,39 @@ fn resolve_skills_dir_requires_codewhale_skills_to_be_directory() {
 }
 
 #[test]
+fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let global_skills_dir = tmp.path().join("global-skills");
+    for relative in [".agents/skills", "skills"] {
+        let workspace = tmp
+            .path()
+            .join(format!("ws-{}", relative.replace('/', "-")));
+        let local_skills = workspace.join(relative);
+        std::fs::create_dir_all(&local_skills).expect("skills dir");
+        let config = Config {
+            skills_dir: Some(global_skills_dir.to_string_lossy().into_owned()),
+            skills: Some(crate::config::SkillsConfig {
+                flat_workspace_root: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_skills_dir(&workspace, &global_skills_dir, &config),
+            global_skills_dir,
+            "untrusted {relative} must not be resolved as the skills dir"
+        );
+        crate::test_support::trust_workspace(&workspace);
+        assert_eq!(
+            resolve_skills_dir(&workspace, &global_skills_dir, &config),
+            local_skills,
+            "trusted {relative} resolves as before"
+        );
+    }
+}
+
+#[test]
 fn cached_skills_include_configured_directory() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
@@ -2844,6 +3050,7 @@ fn cached_skills_include_configured_directory() {
 fn cached_skills_preserve_configured_directory_in_codewhale_only_scan() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     let codewhale_skill_dir = workspace
         .join(".codewhale")
@@ -3151,6 +3358,48 @@ fn submit_input_consolidates_oversized_input_into_paste_file() {
 }
 
 #[test]
+fn submit_input_holds_oversized_input_when_paste_file_cannot_be_written() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // `.codewhale` is a file, so `.codewhale/pastes` cannot be created.
+    std::fs::write(tmp.path().join(".codewhale"), "not a dir").expect("seed file");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+    let full_content = "y".repeat(MAX_SUBMITTED_INPUT_CHARS + 128);
+    app.input = full_content.clone();
+    app.cursor_position = app.input.chars().count();
+
+    assert_eq!(
+        app.submit_input(),
+        None,
+        "a truncated prompt must not be sent"
+    );
+    assert_eq!(
+        app.input, full_content,
+        "the full text stays in the composer"
+    );
+    // The toast is short enough to survive the footer's clause-shedding...
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.starts_with("Not sent")
+                && toast.text.contains("paste file not saved")),
+        "expected a short not-sent toast"
+    );
+    // ...and the actionable reason, with the write error, is in the transcript.
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { content }
+                if content.starts_with("Not sent")
+                    && content.contains("shorten it")
+                    && !content.contains("{error}")
+        )),
+        "expected the full reason in the transcript"
+    );
+}
+
+#[test]
 fn app_starts_without_seeded_transcript_messages() {
     let app = App::new(test_options(false), &Config::default());
     assert!(app.history.is_empty());
@@ -3416,44 +3665,6 @@ fn entering_operate_preserves_user_rail_panel() {
 }
 
 #[test]
-fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
-    assert_eq!(AppMode::parse("agent"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("act"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("work"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("2"), Some(AppMode::Plan));
-    assert_eq!(AppMode::parse("auto"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("3"), Some(AppMode::Operate));
-    assert_eq!(AppMode::parse("operate"), Some(AppMode::Operate));
-    // Legacy YOLO spellings resolve to Act; the bypass posture they imply
-    // travels on the permission surface, not on a mode.
-    assert_eq!(AppMode::parse("YOLO"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("4"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("bypass"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("bypass-permissions"), Some(AppMode::Agent));
-    assert_eq!(AppMode::parse("multitask"), None);
-    assert_eq!(AppMode::parse("5"), None);
-    assert_eq!(AppMode::parse("fast"), None);
-    assert_eq!(AppMode::from_setting("multitask"), AppMode::Operate);
-    assert_eq!(AppMode::from_setting("5"), AppMode::Operate);
-
-    assert_eq!(AppMode::Agent.as_setting(), "agent");
-    assert_eq!(AppMode::Plan.display_name(), "Plan");
-    assert_eq!(AppMode::Agent.number(), '1');
-    assert_eq!(AppMode::Operate.number(), '3');
-    assert_eq!(
-        AppMode::CYCLE,
-        [AppMode::Plan, AppMode::Agent, AppMode::Operate]
-    );
-
-    assert_eq!(AppMode::Plan.next(), AppMode::Agent);
-    assert_eq!(AppMode::Agent.next(), AppMode::Operate);
-    assert_eq!(AppMode::Operate.next(), AppMode::Plan);
-    assert_eq!(AppMode::Plan.previous(), AppMode::Operate);
-    assert_eq!(AppMode::Agent.previous(), AppMode::Plan);
-    assert_eq!(AppMode::Operate.previous(), AppMode::Agent);
-}
-
-#[test]
 fn test_cycle_scenario() {
     // Scenario consolidation of: test_cycle_mode_transitions, test_cycle_mode_reverse_transitions
     // from test_cycle_mode_transitions
@@ -3486,18 +3697,18 @@ fn test_cycle_scenario() {
 fn effective_route_display_tracks_inflight_and_last_auto_provider() {
     let mut app = App::new(test_options(false), &Config::default());
     app.auto_model = true;
-    app.pending_turn_route = Some((ApiProvider::Zai, "glm-5.2".to_string(), true));
+    app.pending_turn_route = Some((ProviderKind::Zai, "glm-5.2".to_string(), true));
     assert_eq!(
         app.effective_route_display(),
-        (ApiProvider::Zai, "glm-5.2".to_string())
+        (ProviderKind::Zai, "glm-5.2".to_string())
     );
 
     app.pending_turn_route = None;
-    app.last_effective_provider = Some(ApiProvider::Xai);
+    app.last_effective_provider = Some(ProviderKind::Xai);
     app.last_effective_model = Some("grok-4.5".to_string());
     assert_eq!(
         app.effective_route_display(),
-        (ApiProvider::Xai, "grok-4.5".to_string())
+        (ProviderKind::Xai, "grok-4.5".to_string())
     );
 }
 
@@ -3779,8 +3990,17 @@ fn cycle_approval_scenario() {
     }
 }
 
+/// Tab cycles the mode, Shift+Tab cycles the permission posture. They are two
+/// independent axes, and Plan used to veto the second key — which welded them
+/// together on the keyboard: Shift+Tab silently did nothing in Plan.
+///
+/// Allowing it weakens nothing. Plan's read-only guarantee is mode-derived:
+/// `authority` maps `(Plan, _, Bypass)` to `SandboxPolicy::ReadOnly` and
+/// `tool_catalog` gates every write tool on `mode != AppMode::Plan`. So the
+/// cycle moves the durable Act/Operate baseline while the *live* Plan policy
+/// stays `Suggest`, and the new posture lands when the mode leaves Plan.
 #[test]
-fn plan_permission_cycle_is_rejected_without_mutating_agent_baseline() {
+fn plan_permission_cycle_moves_the_baseline_and_leaves_plan_read_only() {
     let _env_lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
@@ -3791,18 +4011,44 @@ fn plan_permission_cycle_is_rejected_without_mutating_agent_baseline() {
     app.set_agent_approval_posture(ApprovalMode::Auto);
     app.set_mode(AppMode::Plan);
 
-    assert!(!app.cycle_approval_posture());
-    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
-    assert_eq!(app.mode_prefs.agent_approval_mode, ApprovalMode::Auto);
-    assert!(!tmp.path().join("settings.toml").exists());
+    assert!(
+        app.cycle_approval_posture(),
+        "Shift+Tab must still change permissions while in Plan"
+    );
+    assert_eq!(
+        app.mode_prefs.agent_approval_mode,
+        ApprovalMode::Bypass,
+        "the durable baseline advances Auto -> Full Access"
+    );
+    assert_eq!(
+        app.approval_mode,
+        ApprovalMode::Suggest,
+        "Plan's live policy is untouched: it stays read-only and asks"
+    );
+    assert_eq!(
+        app.mode,
+        AppMode::Plan,
+        "changing permissions must not move the mode"
+    );
     assert!(
         app.status_toasts
             .iter()
-            .any(|toast| toast.text.contains("Read Only"))
+            .any(|toast| toast.text.contains("applies in Act and Operate")),
+        "the receipt must say when the new posture starts applying"
+    );
+
+    let persisted = std::fs::read_to_string(tmp.path().join("settings.toml")).expect("settings");
+    assert!(
+        persisted.contains("permission_posture = \"full-access\""),
+        "the posture is durable, not dropped because Plan was active: {persisted}"
     );
 
     app.set_mode(AppMode::Operate);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(
+        app.approval_mode,
+        ApprovalMode::Bypass,
+        "leaving Plan projects the posture chosen while in Plan"
+    );
 }
 
 #[test]
@@ -4017,6 +4263,53 @@ fn managed_requirements_ignore_saved_full_access_and_lock_changes() {
             .iter()
             .any(|toast| toast.text.contains("controlled"))
     );
+}
+
+#[test]
+fn sandbox_requirements_prevent_full_access_overrides() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let requirements_path = tmp.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        "allowed_sandbox_modes = [\"workspace-write\"]\n",
+    )
+    .expect("requirements");
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let config = Config {
+        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
+        ..Config::default()
+    };
+
+    for (settings, cli_yolo) in [
+        ("permission_posture = \"full-access\"\n", false),
+        ("", true),
+        ("default_mode = \"yolo\"\n", false),
+    ] {
+        std::fs::write(tmp.path().join("settings.toml"), settings).expect("settings");
+        let mut options = test_options(cli_yolo);
+        options.workspace = tmp.path().to_path_buf();
+        let mut app = App::new(options, &config);
+
+        assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+        assert!(!app.trust_mode);
+        assert!(!app.yolo);
+        assert!(app.approval_policy_requirements_managed());
+        assert!(!app.cycle_approval_posture());
+        assert_eq!(app.select_yolo_compat(), SettingSelection::Refused);
+        assert!(matches!(
+            crate::core::authority::sandbox_policy_for_turn(
+                app.mode,
+                app.approval_mode,
+                config.sandbox_mode.as_deref(),
+                &app.workspace,
+                crate::core::authority::SandboxNetworkAccess::Restricted,
+            ),
+            crate::sandbox::SandboxPolicy::WorkspaceWrite { .. }
+        ));
+    }
 }
 
 #[test]
@@ -4498,7 +4791,7 @@ fn test_update_model_compaction_budget() {
     // depend on the developer's local `auto_compact_threshold_percent`
     // setting (App::new loads real settings) or on auto-model resolution.
     app.auto_model = false;
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.active_route_limits = None;
     app.active_context_window_override = None;
     app.auto_compact_threshold_percent = 80.0;
@@ -4536,6 +4829,53 @@ fn test_input_history_navigation() {
 
     // Navigate down
     app.history_down();
+}
+
+#[test]
+fn paste_while_navigating_history_detaches_before_down_can_discard_it() {
+    // A paste (insert_str family) while a history entry is on screen must
+    // detach navigation like typing does; otherwise the next Down replaces
+    // the buffer and silently destroys the pasted text.
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input_history.push("older".to_string());
+    app.input_history.push("newer".to_string());
+    app.input = "draft".to_string();
+
+    app.history_up();
+    assert_eq!(app.input, "newer");
+    app.insert_str(" pasted");
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input, "newer pasted");
+
+    app.history_down();
+    assert_eq!(
+        app.input, "newer pasted",
+        "detached edit must survive history keys"
+    );
+}
+
+#[test]
+fn external_edit_while_navigating_history_detaches_stale_state() {
+    // Same hazard through the $EDITOR round-trip: the edited buffer replaces
+    // recalled history, so the stale index, draft, selection, and attachment
+    // positions must not survive it.
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input_history.push("older".to_string());
+    app.input = "draft".to_string();
+
+    app.history_up();
+    assert_eq!(app.input, "older");
+    app.apply_external_edit("edited in vi".to_string());
+    assert!(app.history_index.is_none());
+    assert!(app.history_navigation_draft.is_none());
+    assert!(app.selection_anchor.is_none());
+    assert_eq!(app.input, "edited in vi");
+
+    app.history_down();
+    assert_eq!(
+        app.input, "edited in vi",
+        "detached edit must survive history keys"
+    );
 }
 
 #[test]
@@ -5302,24 +5642,29 @@ fn bare_enter_scenario() {
 }
 
 #[test]
-fn double_tap_takes_the_just_queued_message_only_inside_the_window() {
+fn double_tap_drains_every_queued_message_oldest_first_inside_the_window() {
     let mut app = App::new(test_options(false), &Config::default());
     app.is_loading = true;
     app.streaming_message_index = Some(0);
     app.queue_message(QueuedMessage::new("older queued".to_string(), None));
     app.queue_message(QueuedMessage::new("just typed follow-up".to_string(), None));
     assert!(
-        app.take_queued_for_double_tap_steer().is_none(),
+        app.take_queued_for_double_tap_steer().is_empty(),
         "no window armed"
     );
     app.arm_double_tap_window();
-    let taken = app
-        .take_queued_for_double_tap_steer()
-        .expect("the window is open");
-    assert_eq!(taken.display, "just typed follow-up");
-    assert_eq!(app.queued_message_count(), 1);
+    let taken = app.take_queued_for_double_tap_steer();
+    assert_eq!(
+        taken
+            .iter()
+            .map(|message| message.display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["older queued", "just typed follow-up"],
+        "the window drains the whole queue in order"
+    );
+    assert_eq!(app.queued_message_count(), 0);
     assert!(
-        app.take_queued_for_double_tap_steer().is_none(),
+        app.take_queued_for_double_tap_steer().is_empty(),
         "one steer per tap"
     );
 }
@@ -5775,6 +6120,37 @@ fn cursor_moves_by_grapheme_over_emoji_and_cjk() {
     assert_eq!(app.cursor_position, 0); // clamped at start
 }
 
+/// U01-m4: vim Normal-mode clamps, `a`, and `j`/`k` column moves land on
+/// grapheme-cluster starts, never inside a combining or skin-tone sequence.
+#[test]
+fn vim_cursor_moves_never_split_a_grapheme_cluster() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.vim_enabled = true;
+    // "e" + COMBINING ACUTE: two scalars, one cluster.
+    app.input = "e\u{301}".to_string();
+    app.cursor_position = char_count(&app.input);
+    app.vim_enter_normal();
+    assert_eq!(
+        app.cursor_position, 0,
+        "Normal mode sits on the cluster start"
+    );
+    app.vim_enter_append();
+    assert_eq!(
+        app.cursor_position, 2,
+        "`a` appends after the whole cluster"
+    );
+
+    // Scalar column 1 falls inside the other line's skin-tone emoji.
+    app.input = "ab\n\u{1f44d}\u{1f3fd}c".to_string();
+    app.cursor_position = 1; // on `b`
+    app.vim_move_down();
+    assert_eq!(app.cursor_position, 3, "`j` lands on the emoji's start");
+    app.input = "\u{1f44d}\u{1f3fd}c\nab".to_string();
+    app.cursor_position = 5; // on `b`
+    app.vim_move_up();
+    assert_eq!(app.cursor_position, 0, "`k` lands on the emoji's start");
+}
+
 #[test]
 fn backspace_removes_whole_emoji_cluster() {
     let mut app = App::new(test_options(false), &Config::default());
@@ -5911,9 +6287,9 @@ fn word_selection_extends_by_word_and_replaces_on_type() {
 /// settings home is isolated too: an intentional saved default from a previous
 /// test or a developer's real profile must not replace the chain primary.
 fn app_with_fallback_chain(
-    active: ApiProvider,
+    active: ProviderKind,
     fallbacks: &[codewhale_config::ProviderKind],
-    keyed: &[ApiProvider],
+    keyed: &[ProviderKind],
 ) -> App {
     let settings_home = tempfile::tempdir().expect("isolated fallback settings home");
     let _home = EnvVarGuard::set("HOME", settings_home.path());
@@ -5929,11 +6305,11 @@ fn app_with_fallback_chain(
             ..Default::default()
         };
         match provider {
-            ApiProvider::Deepseek => providers.deepseek = entry,
-            ApiProvider::Openai => providers.openai = entry,
-            ApiProvider::Openrouter => providers.openrouter = entry,
-            ApiProvider::Together => providers.together = entry,
-            ApiProvider::Fireworks => providers.fireworks = entry,
+            ProviderKind::Deepseek => providers.deepseek = entry,
+            ProviderKind::Openai => providers.openai = entry,
+            ProviderKind::Openrouter => providers.openrouter = entry,
+            ProviderKind::Together => providers.together = entry,
+            ProviderKind::Fireworks => providers.fireworks = entry,
             other => panic!("unhandled keyed provider in test helper: {other:?}"),
         }
     }
@@ -5960,19 +6336,19 @@ fn advance_fallback_skips_unauthed_middle_provider_and_lands_on_next_ready() {
 
     // Chain: Openai (active, keyed) -> Openrouter (no key) -> Together (keyed).
     let mut app = app_with_fallback_chain(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         &[
             codewhale_config::ProviderKind::Openrouter,
             codewhale_config::ProviderKind::Together,
         ],
-        &[ApiProvider::Openai, ApiProvider::Together],
+        &[ProviderKind::Openai, ProviderKind::Together],
     );
     assert_eq!(app.fallback_chain_position(), Some(0));
 
     // Openrouter is skipped (needs auth); we land on Together.
     let next = app.advance_fallback("network error");
-    assert_eq!(next, Some(ApiProvider::Together));
-    assert_eq!(app.api_provider, ApiProvider::Together);
+    assert_eq!(next, Some(ProviderKind::Together));
+    assert_eq!(app.api_provider, ProviderKind::Together);
     assert_eq!(app.fallback_chain_position(), Some(2));
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
@@ -5996,18 +6372,18 @@ fn advance_fallback_scenario() {
 
         // Chain: Openai (active, keyed) -> Ollama (local, no key needed).
         let mut app = app_with_fallback_chain(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             &[codewhale_config::ProviderKind::Ollama],
-            &[ApiProvider::Openai],
+            &[ProviderKind::Openai],
         );
 
         let next = app.advance_fallback("timeout");
         assert_eq!(
             next,
-            Some(ApiProvider::Ollama),
+            Some(ProviderKind::Ollama),
             "self-hosted providers are ready without a key"
         );
-        assert_eq!(app.api_provider, ApiProvider::Ollama);
+        assert_eq!(app.api_provider, ProviderKind::Ollama);
         let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
         assert!(reason.contains("Fell back to ollama"), "{reason}");
         assert!(
@@ -6022,7 +6398,7 @@ fn advance_fallback_scenario() {
         // Local primary (Ollama) -> local sibling (vLLM). Both are self-hosted, so
         // the local/private posture is preserved and the fallback is allowed.
         let mut app = app_with_fallback_chain(
-            ApiProvider::Ollama,
+            ProviderKind::Ollama,
             &[codewhale_config::ProviderKind::Vllm],
             &[],
         );
@@ -6030,10 +6406,10 @@ fn advance_fallback_scenario() {
         let next = app.advance_fallback("local runtime unavailable");
         assert_eq!(
             next,
-            Some(ApiProvider::Vllm),
+            Some(ProviderKind::Vllm),
             "local->local fallback stays within the private posture"
         );
-        assert_eq!(app.api_provider, ApiProvider::Vllm);
+        assert_eq!(app.api_provider, ProviderKind::Vllm);
         let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
         assert!(reason.contains("Fell back to vllm"), "{reason}");
     }
@@ -6049,18 +6425,18 @@ fn advance_fallback_all_unready_exhausts_with_clear_reason() {
     // Chain: Openai (active, keyed) -> Openrouter (no key) -> Together (no key).
     // Every fallback entry is unready, so the chain exhausts.
     let mut app = app_with_fallback_chain(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         &[
             codewhale_config::ProviderKind::Openrouter,
             codewhale_config::ProviderKind::Together,
         ],
-        &[ApiProvider::Openai],
+        &[ProviderKind::Openai],
     );
 
     let next = app.advance_fallback("rate limited");
     assert_eq!(next, None, "no ready fallback remains");
     // Active provider is unchanged on exhaustion.
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
     assert!(
@@ -6094,8 +6470,7 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
     let _cli_source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
 
     let config = Config {
-        provider: Some(ApiProvider::Deepseek.as_str().to_string()),
-        api_key: Some("active-deepseek-key".to_string()),
+        provider: Some(ProviderKind::Deepseek.as_str().to_string()),
         fallback_providers: vec![
             codewhale_config::ProviderKind::OpenaiCodex,
             codewhale_config::ProviderKind::Xai,
@@ -6126,7 +6501,8 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("active-deepseek-key".to_string()), None);
     let mut options = test_options(false);
     options.skip_onboarding = true;
 
@@ -6169,14 +6545,14 @@ fn advance_fallback_local_primary_does_not_fall_back_to_cloud() {
     // cloud entry is policy-blocked even though it is otherwise ready, so the
     // chain exhausts rather than leaking a local/private route out to cloud.
     let mut app = app_with_fallback_chain(
-        ApiProvider::Ollama,
+        ProviderKind::Ollama,
         &[codewhale_config::ProviderKind::Deepseek],
-        &[ApiProvider::Deepseek],
+        &[ProviderKind::Deepseek],
     );
 
     let next = app.advance_fallback("local runtime unavailable");
     assert_eq!(next, None, "local->cloud fallback must be blocked");
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
     assert!(
@@ -6200,21 +6576,21 @@ fn advance_fallback_cloud_primary_can_hop_cloud_to_local_to_cloud() {
     // is otherwise ready; only local/private primaries are blocked from leaking
     // out to cloud.
     let mut app = app_with_fallback_chain(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         &[
             codewhale_config::ProviderKind::Ollama,
             codewhale_config::ProviderKind::Deepseek,
         ],
-        &[ApiProvider::Openai, ApiProvider::Deepseek],
+        &[ProviderKind::Openai, ProviderKind::Deepseek],
     );
 
     let local = app.advance_fallback("cloud provider timed out");
-    assert_eq!(local, Some(ApiProvider::Ollama));
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(local, Some(ProviderKind::Ollama));
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
 
     let cloud = app.advance_fallback("local runtime unavailable");
-    assert_eq!(cloud, Some(ApiProvider::Deepseek));
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(cloud, Some(ProviderKind::Deepseek));
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
     assert!(reason.contains("Fell back to deepseek"), "{reason}");
@@ -6239,7 +6615,7 @@ fn status_classifier_does_not_paint_negated_success_green() {
     assert_ne!(level, StatusToastLevel::Success);
 
     // Genuine successes still classify green.
-    let (level, _, _) = App::classify_status_text("Fleet profile saved: reviewer.toml");
+    let (level, _, _) = App::classify_status_text("Team profile saved: reviewer.toml");
     assert_eq!(level, StatusToastLevel::Success);
 
     // Both cancel spellings classify as Warning.
@@ -6251,7 +6627,7 @@ fn status_classifier_does_not_paint_negated_success_green() {
 
 #[test]
 fn onboarding_provider_copy_is_provider_neutral_in_en() {
-    use crate::localization::{Locale, MessageId, tr};
+    use codewhale_localization::{Locale, MessageId, tr};
 
     let title = tr(Locale::En, MessageId::OnboardProviderTitle);
     let blurb = tr(Locale::En, MessageId::OnboardProviderBlurb);
@@ -6448,7 +6824,7 @@ fn reasoning_cycle_persists_through_the_same_owner_as_the_picker() {
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -6563,7 +6939,7 @@ async fn rapid_thinking_selections_persist_the_last_one() {
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -6595,7 +6971,11 @@ async fn fixed_route_thinking_cycle_persists_raw_preference() {
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Moonshot;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
     app.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
@@ -6622,68 +7002,31 @@ async fn fixed_route_thinking_cycle_persists_raw_preference() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn interleaved_mode_thinking_and_model_writes_do_not_clobber_each_other() {
+async fn queued_mode_and_thinking_writes_finish_before_a_synchronous_selection() {
     let _lock = lock_test_env();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let _env = sealed_settings_home(tmp.path());
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
-
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
-
-    // Queued, non-blocking: mode then thinking.
     assert_eq!(app.select_mode(AppMode::Plan), SettingSelection::Changed);
     app.apply_reasoning_effort_cycle();
-    let cycled_effort = app.reasoning_effort.as_setting_for_route(
-        app.api_provider,
-        &app.active_route_base_url,
-        &app.model,
-    );
 
-    // The model picker's synchronous write. It must apply *behind* the two
-    // queued selections above, so neither is lost and neither is re-applied
-    // over a newer value.
+    // A newer synchronous effort selection drains the older queued mode and
+    // effort first, so a late background writer cannot restore the old effort.
     app.startup_defaults
-        .apply_blocking(
-            crate::tui::startup_defaults::StartupDefaults::default()
-                .with_default_model("deepseek-chat"),
-        )
-        .expect("model write must land");
-
-    let after_model = Settings::load().expect("reload");
-    let persisted_model = after_model
-        .default_model
-        .clone()
-        .expect("model picker write must be on disk");
-    assert_eq!(
-        after_model.default_mode, "plan",
-        "the queued mode selection must have been applied before the model write"
-    );
-    assert_eq!(
-        after_model.reasoning_effort.as_deref(),
-        Some(cycled_effort),
-        "the queued thinking selection must not be lost by the model write"
-    );
-
-    // A later mode selection must win for its own field and leave the other
-    // two fields exactly as the earlier writes left them.
+        .apply_blocking(crate::tui::startup_defaults::StartupDefaults::reasoning_effort("high"))
+        .expect("effort write must land");
+    let saved = Settings::load_persisted().expect("reload");
+    assert_eq!(saved.default_mode, "plan");
+    assert_eq!(saved.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(app.select_mode(AppMode::Operate), SettingSelection::Changed);
     app.startup_defaults.flush();
-
-    let final_settings = Settings::load().expect("reload");
-    assert_eq!(final_settings.default_mode, "operate");
-    assert_eq!(
-        final_settings.default_model.as_deref(),
-        Some(persisted_model.as_str()),
-        "a mode write must not roll back the model"
-    );
-    assert_eq!(
-        final_settings.reasoning_effort.as_deref(),
-        Some(cycled_effort),
-        "a mode write must not roll back the thinking level"
-    );
+    let saved = Settings::load_persisted().expect("reload");
+    assert_eq!(saved.default_mode, "operate");
+    assert_eq!(saved.reasoning_effort.as_deref(), Some("high"));
     assert!(app.startup_defaults.drain_failures().is_empty());
 }
 
@@ -6790,7 +7133,7 @@ async fn thinking_and_an_unrelated_direct_setting_write_do_not_clobber_each_othe
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -6839,7 +7182,7 @@ async fn rapid_mixed_writes_settle_on_the_last_value_for_every_field() {
     options.start_in_agent_mode = true;
     options.config_path = Some(config_path);
     let mut app = App::new(options, &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
     app.approval_mode = ApprovalMode::Suggest;
@@ -6861,14 +7204,12 @@ async fn rapid_mixed_writes_settle_on_the_last_value_for_every_field() {
         Settings::transact(|settings| settings.set("max_history", &(200 + index).to_string()))
             .expect("the direct write must land");
     }
-    // A model write goes through the synchronous startup-defaults path, which
-    // must land behind everything queued before it.
+    // A synchronous mode selection must land after every queued writer.
     app.startup_defaults
-        .apply_blocking(
-            crate::tui::startup_defaults::StartupDefaults::default()
-                .with_default_model("deepseek-chat"),
-        )
-        .expect("model write must land");
+        .apply_blocking(crate::tui::startup_defaults::StartupDefaults::mode(
+            app.mode,
+        ))
+        .expect("mode write must land");
     app.startup_defaults.flush();
 
     let expected_effort = app.reasoning_effort.as_setting_for_route(
@@ -6882,7 +7223,6 @@ async fn rapid_mixed_writes_settle_on_the_last_value_for_every_field() {
     assert_eq!(saved.reasoning_effort.as_deref(), Some(expected_effort));
     assert_eq!(saved.permission_posture.as_deref(), Some(expected_posture));
     assert_eq!(saved.max_input_history, 204);
-    assert_eq!(saved.default_model.as_deref(), Some("deepseek-chat"));
     assert!(app.startup_defaults.drain_failures().is_empty());
 }
 
@@ -6946,7 +7286,7 @@ fn slash_config_and_set_refuse_every_live_route_key_while_a_turn_runs() {
     let before = Settings::load_persisted().expect("read the seeded settings");
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.set_model_selection("deepseek-chat".to_string());
     app.reasoning_effort = ReasoningEffort::Off;
@@ -7247,6 +7587,7 @@ fn hotbar_mode_row_for_the_live_mode_still_shows_the_saved_receipt() {
 fn an_explicit_launch_model_outranks_the_remembered_provider_model() {
     let _lock = lock_test_env();
     let temp = tempfile::tempdir().expect("sealed state root");
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path());
     let config_path = temp.path().join("config.toml");
     std::fs::write(
         &config_path,
@@ -7261,12 +7602,11 @@ fn an_explicit_launch_model_outranks_the_remembered_provider_model() {
     let _config_path_guard = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let _codewhale_config_path = EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
 
-    let config = Config::load(Some(config_path.clone()), None).expect("load sealed config");
-
     // Without an explicit request this launch, the remembered pick still wins:
     // that stickiness is what `/model` exists for.
     let _no_flag = EnvVarGuard::remove("CODEWHALE_MODEL");
     let _no_legacy_flag = EnvVarGuard::remove("DEEPSEEK_MODEL");
+    let config = Config::load(Some(config_path.clone()), None).expect("load sealed config");
     let remembered = App::new(
         TuiOptions {
             model: config.default_model(),
@@ -7281,6 +7621,7 @@ fn an_explicit_launch_model_outranks_the_remembered_provider_model() {
 
     // `--model` reaches this binary as CODEWHALE_MODEL. It must win.
     let _model_flag = EnvVarGuard::set("CODEWHALE_MODEL", "kimi-k3");
+    let config = Config::load(Some(config_path), None).expect("load explicit launch snapshot");
     let requested = App::new(
         TuiOptions {
             model: config.default_model(),
@@ -7368,19 +7709,387 @@ fn launch_onboarding_scenario() {
     }
     // from launch_onboarding_starts_first_run_at_composer
     {
-        // First paint is the composer. Recovery picker is returning-user only.
+        // xAI OAuth re-auth never reopens the generic picker, first run or not.
         let (onboarding, recovery) =
             launch_onboarding_decision(false, false, false, true, false, true);
         assert_eq!(onboarding, OnboardingState::None);
         assert!(!recovery);
 
-        let (language, _) = launch_onboarding_decision(false, false, true, true, true, false);
-        assert_eq!(language, OnboardingState::None);
+        // #6566: a first run with no key opens the picker directly, with the
+        // same Esc-to-composer exit as missing-key recovery.
+        let (keyless, recovery) = launch_onboarding_decision(false, false, true, true, true, false);
+        assert_eq!(keyless, OnboardingState::Provider);
+        assert!(recovery);
 
+        // A first run with a key starts at the composer.
         let (trust, _) = launch_onboarding_decision(false, false, false, false, true, false);
         assert_eq!(trust, OnboardingState::None);
 
         let (ready, _) = launch_onboarding_decision(false, false, false, false, false, false);
         assert_eq!(ready, OnboardingState::None);
     }
+}
+
+/// Memory note M3: a resume owns the loaded session, so its journal and
+/// history move into the App instead of being cloned beside a copy that is
+/// dropped right after. The journal's entry buffer is the *same allocation*
+/// afterwards, and the result matches the borrowing path exactly.
+#[test]
+fn owned_restore_moves_the_journal_and_matches_the_borrowing_restore() {
+    let message = |text: &str| Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let messages = vec![message("first"), message("second")];
+    let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let t1 = t0 + chrono::Duration::seconds(12);
+    let saved = crate::session_manager::create_saved_session_with_id_mode_and_stamps(
+        "owned-restore".to_string(),
+        &messages,
+        &[t0, t1],
+        "test-model",
+        Path::new("."),
+        0,
+        None,
+        None,
+    );
+
+    let mut borrowed = App::new(test_options(false), &Config::default());
+    borrowed.restore_api_messages(
+        crate::runtime_handoff::project_owned_messages_for_restore(saved.messages.clone()),
+        &saved,
+    );
+
+    let mut owned_session = saved.clone();
+    let entries_buffer = owned_session
+        .journal
+        .as_ref()
+        .expect("journal")
+        .entries
+        .as_ptr();
+    let mut owned = App::new(test_options(false), &Config::default());
+    owned.restore_api_messages_from_owned(&mut owned_session);
+
+    assert_eq!(
+        owned.session_journal.entries.as_ptr(),
+        entries_buffer,
+        "the journal must be moved into the App, not cloned"
+    );
+    assert!(owned_session.journal.is_none());
+    assert!(owned_session.messages.is_empty());
+    assert_eq!(
+        owned.session_journal.entries,
+        borrowed.session_journal.entries
+    );
+    assert_eq!(owned.api_messages, borrowed.api_messages);
+    assert_eq!(owned.api_message_stamps, vec![t0, t1]);
+    assert_eq!(owned.api_message_stamps, borrowed.api_message_stamps);
+
+    // A legacy session without a journal rebuilds it from the history, on
+    // both paths alike.
+    let mut legacy = saved.clone();
+    legacy.journal = None;
+    let mut legacy_borrowed = App::new(test_options(false), &Config::default());
+    legacy_borrowed.restore_api_messages(
+        crate::runtime_handoff::project_owned_messages_for_restore(legacy.messages.clone()),
+        &legacy,
+    );
+    let mut legacy_owned = App::new(test_options(false), &Config::default());
+    legacy_owned.restore_api_messages_from_owned(&mut legacy);
+    assert_eq!(legacy_owned.api_messages, legacy_borrowed.api_messages);
+    assert_eq!(
+        legacy_owned.session_journal.entries.len(),
+        legacy_borrowed.session_journal.entries.len()
+    );
+    assert_eq!(legacy_owned.api_message_stamps.len(), 2);
+}
+
+/// Walk Ctrl+T for two full laps on a concrete route and assert that every
+/// press changes the effective tier — the value `/status`, the effort status
+/// line, and Work receipts report — not merely the requested label.
+fn assert_every_ctrl_t_press_changes_the_effective_tier(
+    provider: ProviderKind,
+    base_url: &str,
+    model: &str,
+) -> Vec<ReasoningEffort> {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(provider.as_str())
+            .expect("captured fixture provider"),
+    );
+    app.auto_model = false;
+    app.active_route_base_url = base_url.to_string();
+    app.model = model.to_string();
+    app.reasoning_effort = ReasoningEffort::Auto;
+    let ladder =
+        crate::tui::model_picker::picker_efforts_for_route(provider, base_url, model, false);
+    let mut effective = app.effective_reasoning_effort_for_active_route(app.reasoning_effort);
+    let mut walked = Vec::new();
+    // Two full laps: the report was about presses after the first lap.
+    for press in 0..ladder.len() * 2 {
+        assert_eq!(app.cycle_effort(), SettingSelection::Changed);
+        let next = app.effective_reasoning_effort_for_active_route(app.reasoning_effort);
+        assert_ne!(
+            next, effective,
+            "{model}: press {press} ({:?}) left the effective tier at {effective:?}",
+            app.reasoning_effort
+        );
+        effective = next;
+        walked.push(app.reasoning_effort);
+    }
+    let mut expected = ladder.clone();
+    expected.rotate_left(1);
+    expected.extend(expected.clone());
+    assert_eq!(walked, expected, "{model} walks the picker ladder");
+    ladder
+}
+
+#[test]
+fn every_ctrl_t_press_changes_the_effective_thinking_tier() {
+    // #6650: Ctrl+T walked rungs that resolved to the tier already in effect,
+    // so presses looked dead.
+    let _catalog = crate::provider_lake::lock_live_snapshot();
+    crate::provider_lake::clear_live_snapshot();
+    for (provider, base_url, model) in [
+        (
+            ProviderKind::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            "deepseek-v4.1-flash",
+        ),
+        (
+            ProviderKind::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            "deepseek-v4.1",
+        ),
+        (
+            ProviderKind::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+        ),
+        (
+            ProviderKind::Xai,
+            crate::config::DEFAULT_XAI_BASE_URL,
+            crate::config::XAI_GROK_4_6_MODEL,
+        ),
+    ] {
+        assert_every_ctrl_t_press_changes_the_effective_tier(provider, base_url, model);
+    }
+}
+
+#[test]
+fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
+    // A catalog can publish effort spellings the route collapses: DeepSeek
+    // sends `medium`/`xhigh` as `high`, and Z.ai GLM-5.2 sends `low`/`medium`
+    // as `high`. Each Ctrl+T press must still reach a new effective tier.
+    use ReasoningEffort::{Auto, High, Low, Max, Off};
+    let _catalog = crate::provider_lake::lock_live_snapshot();
+    crate::provider_lake::clear_live_snapshot();
+    let fetched_at = u64::try_from(chrono::Utc::now().timestamp()).expect("timestamp");
+    let offering = |provider: ProviderKind, model: &str, values: &[&str]| {
+        codewhale_config::catalog::CatalogOffering {
+            provider: provider.as_str().to_string(),
+            wire_model_id: model.to_string(),
+            endpoint_key: "chat".to_string(),
+            reasoning_options: vec![serde_json::json!({ "type": "effort", "values": values })],
+            source: codewhale_config::catalog::CatalogSource::Live {
+                base_url_fingerprint: "models-dev-capabilities".to_string(),
+                fetched_at,
+            },
+            ..Default::default()
+        }
+    };
+    crate::provider_lake::set_live_snapshot(
+        codewhale_config::catalog::CatalogSnapshot {
+            offerings: vec![
+                offering(
+                    ProviderKind::Deepseek,
+                    "deepseek-v4.1-flash",
+                    &["low", "medium", "high", "xhigh", "max"],
+                ),
+                offering(
+                    ProviderKind::Zai,
+                    crate::config::ZAI_GLM_5_2_MODEL,
+                    &["off", "low", "medium", "high", "max"],
+                ),
+            ],
+        },
+        crate::provider_lake::LiveSource::ModelsDev,
+    );
+
+    let deepseek = assert_every_ctrl_t_press_changes_the_effective_tier(
+        ProviderKind::Deepseek,
+        crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+        "deepseek-v4.1-flash",
+    );
+    let zai = assert_every_ctrl_t_press_changes_the_effective_tier(
+        ProviderKind::Zai,
+        crate::config::DEFAULT_ZAI_BASE_URL,
+        crate::config::ZAI_GLM_5_2_MODEL,
+    );
+    crate::provider_lake::clear_live_snapshot();
+
+    assert_eq!(deepseek, vec![Auto, Low, High, Max]);
+    assert_eq!(zai, vec![Auto, Off, High, Max]);
+}
+
+#[test]
+fn ctrl_t_moves_past_a_persisted_alias_the_ladder_dropped() {
+    // DeepSeek has no `medium`; it resolves to `high`, so the next press must
+    // reach `max` rather than re-select `high`.
+    let _catalog = crate::provider_lake::lock_live_snapshot();
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ProviderKind::Deepseek;
+    app.auto_model = false;
+    app.active_route_base_url = crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string();
+    app.model = "deepseek-v4.1-flash".to_string();
+    app.reasoning_effort = ReasoningEffort::Medium;
+
+    app.cycle_effort();
+
+    assert_eq!(app.reasoning_effort, ReasoningEffort::Max);
+}
+
+#[test]
+fn skills_cache_hides_model_only_and_preserves_argument_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
+    let root = workspace.join(".codewhale/skills");
+    for (name, policy) in [
+        ("model", "user-invocable: false"),
+        (
+            "user",
+            "disable-model-invocation: true\nargument-hint: '[path]'",
+        ),
+        (
+            "disabled",
+            "disable-model-invocation: true\nuser-invocable: false",
+        ),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: routing\n{policy}\n---\nbody"),
+        )
+        .unwrap();
+    }
+    let mut options = test_options(false);
+    options.workspace = workspace;
+    options.skills_dir = root;
+    let app = App::new(options, &Config::default());
+    assert!(
+        app.cached_skills
+            .iter()
+            .all(|(name, _)| name != "model" && name != "disabled")
+    );
+    assert!(
+        app.cached_skills
+            .iter()
+            .any(|(name, description)| name == "user" && description.contains("[path]"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oversized_paste_is_not_written_through_a_linked_pastes_directory() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let outside = tempfile::TempDir::new().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join(".codewhale")).expect("link");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+    app.insert_paste_text(&"y".repeat(MAX_SUBMITTED_INPUT_CHARS + 256));
+
+    let _ = app.submit_input();
+
+    assert!(
+        std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "the pasted text must not land outside the workspace"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn dropped_screenshot_path_becomes_an_image_attachment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    // Terminal.app / iTerm2 deliver a drop as a shell-escaped paste.
+    let dropped = shot.display().to_string().replace(' ', "\\ ");
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "what is wrong here?".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    app.insert_paste_text(&dropped);
+
+    let line = format!("[Attached image: {}]", shot.display());
+    assert!(app.input.contains(&line), "{}", app.input);
+    assert!(!app.input.contains("\\ "), "{}", app.input);
+    assert_eq!(app.composer_attachment_count(), 1);
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(format!("Attached image: {}", shot.display()).as_str())
+    );
+    let expanded = crate::image_attach::expand_attachment_blocks(&app.input);
+    assert!(expanded.notices.is_empty(), "{expanded:?}");
+    assert!(
+        expanded
+            .blocks
+            .iter()
+            .any(|block| matches!(block, codewhale_models::ContentBlock::ImageUrl { .. }))
+    );
+}
+
+#[test]
+fn image_path_pasted_on_a_command_line_stays_literal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("shot.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "/rename ".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    app.insert_paste_text(&shot.display().to_string());
+
+    assert_eq!(app.input, format!("/rename {}", shot.display()));
+    assert_eq!(app.composer_attachment_count(), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_typed_drop_with_the_question_on_its_line_still_sends_the_image() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let mut app = App::new(test_options(false), &Config::default());
+    // Arrived as keystrokes, so the paste-time check never saw it.
+    app.input = format!(
+        "{}  why does it show jobs 2?",
+        shot.display().to_string().replace(' ', "\\ ")
+    );
+    app.cursor_position = app.input.chars().count();
+
+    let submitted = app.submit_input().expect("submitted");
+
+    assert!(
+        submitted.starts_with(&format!("[Attached image: {}]\n", shot.display())),
+        "{submitted}"
+    );
+    assert!(
+        submitted.ends_with("why does it show jobs 2?"),
+        "{submitted}"
+    );
+    let expanded = crate::image_attach::expand_attachment_blocks(&submitted);
+    assert!(expanded.notices.is_empty(), "{expanded:?}");
+    assert!(
+        expanded
+            .blocks
+            .iter()
+            .any(|block| matches!(block, codewhale_models::ContentBlock::ImageUrl { .. }))
+    );
 }

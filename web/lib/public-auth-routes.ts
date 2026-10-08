@@ -13,13 +13,15 @@ import { pathLocale } from "./i18n/path";
 
 /**
  * App-icon raster (1254×1254) used on public account-entry pages: the canonical
- * mark in white on a navy field, generated from `public/brand/mark.svg`. The
- * vector is the master — never hand-edit this PNG, regenerate it. Pinned by
- * hash so a redrawn or stale substitute fails the test rather than shipping.
+ * mark in the current brand treatment — blue gradient glyph on a white rounded
+ * tile. The master vectors are the canonical family in
+ * `codewhale-apps/packages/brand/svg/` (byte copies in `web/public/brand/`) —
+ * never hand-edit this PNG, regenerate it from the family. Pinned by hash so a
+ * redrawn or stale substitute fails the test rather than shipping.
  */
 export const CANONICAL_MARK_SRC = "/brand/codewhale-mark.png";
 export const CANONICAL_MARK_SHA256 =
-  "8b4c25460cb2a913bc42e4b97a06a09e4fd3bb31a93dc2da169a2858bbb34f01";
+  "7c174d1125b279d6c8200c776a6ed7b89a21e18bbf1c6e7dccf486a7a6879d8f";
 
 export const APP_AUTH_CALLBACK_URL = `${APP_URL}/auth/callback`;
 

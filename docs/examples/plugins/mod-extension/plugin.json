@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "mod-extension",
+  "version": "0.1.0",
+  "description": "An explicit counter mod with scoped admission, prompt instructions and owner-local state.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": { "path": "mod.mjs" }
+    }
+  }
+}

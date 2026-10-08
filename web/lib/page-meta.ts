@@ -14,7 +14,7 @@ export const SITE_CONTACT_EMAIL = "help@codewhale.net";
 export const SITE_SECURITY_EMAIL = "hunter@codewhale.net";
 
 /** The one-line product identity, used as the default OG image alt text. */
-export const IDENTITY_PHRASE = "Codewhale dives into the deep so you don't have to.";
+export const IDENTITY_PHRASE = "Codewhale — build and automate with the models you choose.";
 
 /** Accessible text for the shared Open Graph card. */
 export const OG_ALT = IDENTITY_PHRASE;
@@ -63,17 +63,20 @@ const OG_LOCALE: Record<string, string> = {
  * @param locale      Locale of the page being rendered (a routed locale).
  * @param title       Localized page <title> (full string; no template is applied).
  * @param description Localized meta description, same locale as `title`.
+ * @param robots      Optional robots directives, e.g. `{ index: false, follow: true }`
+ *                    for draft, auth, or flag-gated pages that must stay out of
+ *                    search indexes. Omitted → no robots field (site default).
  *
  * Usage in a page or layout:
  * ```ts
  * export async function generateMetadata({ params }) {
  *   const { locale } = await params;
- *   const isZh = locale === "zh";
+ *   const t = getFaq(locale);
  *   return buildPageMetadata({
- *     path: "/install",
+ *     path: "/faq",
  *     locale,
- *     title: isZh ? "安装 · Codewhale" : "Install · Codewhale",
- *     description: isZh ? "…" : "…",
+ *     title: t.metaTitle,
+ *     description: t.metaDescription,
  *   });
  * }
  * ```
@@ -83,11 +86,13 @@ export function buildPageMetadata({
   locale,
   title,
   description,
+  robots,
 }: {
   path: string;
   locale: string;
   title: string;
   description: string;
+  robots?: Metadata["robots"];
 }): Metadata {
   // "/" → "" so the homepage canonical is /en, not /en/.
   const suffix = path === "/" ? "" : path.replace(/\/+$/, "");
@@ -106,6 +111,7 @@ export function buildPageMetadata({
     metadataBase: new URL(SITE_URL),
     title,
     description,
+    ...(robots === undefined ? {} : { robots }),
     alternates: {
       canonical,
       languages,

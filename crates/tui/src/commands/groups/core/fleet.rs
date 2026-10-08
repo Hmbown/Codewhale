@@ -1,17 +1,22 @@
-//! `/fleet` command — the agent team behind the session.
+//! `/fleet` command — the agent fleet behind the session.
 //!
-//! Fleet = who. Bare `/fleet` (and `/fleet roster`) opens the familiar roster
-//! surface for the selected Fleet; `/fleet setup` opens the authoring wizard.
-//! `/fleet fleets` (other aliases: `saved`, `manage`)
-//! opens the named-fleet picker
-//! for switching between saved configurations — never the primary face.
+//! Fleet = who is working right now. Bare `/fleet` (and `/fleet roster`)
+//! opens the familiar roster surface for the selected team; `/fleet setup`
+//! opens the authoring wizard. `/fleet teams` (other aliases: `fleets`,
+//! `saved`, `manage`) opens the named-team picker for switching between
+//! saved configurations — never the primary face.
 //! `/fleet list|status|interrupt|resume` are control-plane verbs that run
 //! against the **durable** workspace ledger through the shared contract in
 //! `codewhale-lane`, exactly as `codewhale fleet …` does (#1888, #4022).
+//! #5888: the usage line presents only the prioritized core verbs — open the
+//! team, author it, switch saved teams, watch session workers, ask for help.
+//! Model-route verbs, saved-route verbs, and the durable control plane stay
+//! dispatchable and live one level deeper, documented in `/fleet help`,
+//! instead of all fourteen competing in one usage string.
 //!
 //! `/fleet status` used to show the current TUI session's sub-agents. That was
 //! a different thing wearing the same name: session sub-agents are not the
-//! durable Fleet ledger, and a run started by `codewhale fleet run` never
+//! durable fleet ledger, and a run started by `codewhale fleet run` never
 //! appeared. The session view is still reachable as `/fleet workers` (and
 //! `/subagents`), now labelled as what it is.
 
@@ -21,31 +26,46 @@ use codewhale_lane::{ControlDomain, ControlOperation, ControlSurface};
 use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::config::Config;
 use crate::fleet::control::execute_fleet_control;
-use crate::localization::{Locale, MessageId, tr};
 use crate::tui::app::{App, AppAction};
+use codewhale_localization::{Locale, MessageId, tr};
 
 use super::CommandResult;
 
+/// The verbs `/fleet` advertises up front (#5888): open the team, author it,
+/// switch saved teams, watch current-session workers, ask for the rest.
+/// Every other verb stays dispatchable; it is documented one level deeper in
+/// `/fleet help` instead of competing for attention in the usage line.
+const PRIMARY_VERBS: [&str; 5] = ["members", "setup", "teams", "workers", "help"];
+
+const PRIMARY_USAGE: &str = "/fleet [members|setup|teams|workers|help]";
+
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "fleet",
-    aliases: &["loadout", "party"],
-    usage: "/fleet [members|models|add <provider> <model> [role…]|remove <provider> <model>|setup|fleets|workers|save|save-as|list|status|runs|interrupt <worker-id>|resume <run-id>]",
+    aliases: &[],
+    usage: PRIMARY_USAGE,
     description_id: MessageId::CmdFleetDescription,
 };
 
 pub(in crate::commands) struct FleetCmd;
 
 fn help_text() -> String {
-    let mut out = String::from(
-        "Usage: /fleet [members|setup|fleets|workers|save|save-as|list|status|runs|interrupt <worker-id>|resume <run-id>]\n\n\
-         Fleet is who. /fleet (or /fleet members) opens the fleet member list and orchestration \
-         state — each member's role, model, and access. /fleet setup opens the authoring wizard. \
-         /fleet fleets (or saved/manage) switches between named saved fleets.\n\n\
-         /fleet list, status, interrupt, and resume act on the durable .codewhale/fleet.jsonl \
-         ledger for this workspace — the same records `codewhale fleet` reads and writes. \
-         /fleet workers (and /subagents) shows sub-agents in the current TUI session only, which \
-         is a different set: it does not include durable fleet runs. the ledger file, saved rosters, and config \
-         tables keep the Fleet name.\n",
+    let mut out = format!(
+        "Usage: {PRIMARY_USAGE}\n\n\
+         The fleet is who is working right now. The primary verbs cover the daily loop:\n\
+         /fleet (or /fleet members) opens the roster — each member's role, model, and access; \
+         Enter on a member row opens that member's editor. /fleet setup opens the authoring \
+         wizard. /fleet teams (or fleets/saved/manage) switches between named saved teams. \
+         /fleet workers (and /subagents) shows sub-agents in the current TUI session only, \
+         which is a different set: it does not include durable fleet runs.\n\n\
+         Advanced — team model routes (still typed, one level deeper):\n\
+         /fleet models lists the selected team's models. \
+         /fleet add <provider> <model> [role…] and /fleet remove <provider> <model> edit them.\n\n\
+         Advanced — saved routes:\n\
+         /fleet save persists the current session route into the selected team's operator. \
+         /fleet save-as saves it as a new team.\n\n\
+         Durable runs — these act on the durable .codewhale/fleet.jsonl ledger for this \
+         workspace, the same records `codewhale fleet` reads and writes. the ledger file, \
+         saved rosters, and config tables keep the Fleet name:\n",
     );
     for descriptor in operations_for_domain(ControlDomain::Fleet) {
         out.push_str(&format!(
@@ -88,7 +108,7 @@ fn fleet_models_text(app: &App) -> String {
             .replace("{count}", &models.len().to_string()),
     ];
     for member in &models {
-        let provider = crate::config::ApiProvider::parse(&member.provider);
+        let provider = crate::config::ProviderKind::parse(&member.provider);
         let facts = provider
             .and_then(|p| crate::provider_lake::catalog_offering_for_model(p, &member.model))
             .map(|row| {
@@ -134,35 +154,20 @@ fn fleet_models_text(app: &App) -> String {
 /// **live** `config`, the same source the `/provider` and `/model` pickers
 /// consult. A startup snapshot goes stale after an in-session provider change.
 fn provider_id_is_configured(app: &App, config: &Config, provider_id: &str) -> bool {
-    let provider_id = provider_id.trim();
-    if provider_id.is_empty() {
+    let Some(active) = app
+        .provider_identity
+        .as_ref()
+        .filter(|identity| config.verify_provider_identity(identity).is_ok())
+    else {
         return false;
-    }
-    if let Some(provider) = crate::config::ApiProvider::parse(provider_id) {
-        return crate::config::provider_is_configured_for_active(
-            config,
-            provider,
-            app.api_provider,
-        );
-    }
-    // Named custom provider: allow the active custom route, or any explicit
-    // `[providers.<name>]` table.
-    if app.api_provider == crate::config::ApiProvider::Custom
-        && app
-            .provider_identity_for_persistence()
-            .eq_ignore_ascii_case(provider_id)
-    {
-        return true;
-    }
-    config.providers.as_ref().is_some_and(|providers| {
-        providers
-            .custom
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case(provider_id))
-    })
+    };
+    let Ok(identity) = config.resolve_provider_selection_identity(provider_id) else {
+        return false;
+    };
+    crate::config::provider_is_configured_for_active(config, &identity, active)
 }
 
-/// The localized reason `provider` may not enter the fleet, or `None` when
+/// The localized reason `provider` may not enter the team, or `None` when
 /// it is configured. Shared by `/fleet add` and the picker's ⇧F so a locked
 /// or unauthenticated provider row is refused on both surfaces alike.
 #[must_use]
@@ -185,7 +190,7 @@ pub(crate) fn fleet_catalog_rejection(
     provider: &str,
     model: &str,
 ) -> Option<String> {
-    let known = crate::config::ApiProvider::parse(provider)?;
+    let known = crate::config::ProviderKind::parse(provider)?;
     let served = crate::provider_lake::all_catalog_models_for_provider(known);
     (!served.is_empty() && !served.iter().any(|id| id.eq_ignore_ascii_case(model))).then(|| {
         tr(locale, MessageId::FleetAddModelNotServed)
@@ -237,9 +242,9 @@ impl RegisterCommand for FleetCmd {
 
     fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
         let Some((verb, target)) = split_verb(arg) else {
-            // Primary face: the familiar roster for the selected fleet.
-            // Named-fleet switching lives under /fleet fleets — never between
-            // the operator and their fleet.
+            // Primary face: the familiar roster for the selected team.
+            // Named-team switching lives under /fleet teams — never between
+            // the operator and their team.
             return CommandResult::action(AppAction::OpenFleetRoster);
         };
         match verb {
@@ -261,25 +266,30 @@ impl RegisterCommand for FleetCmd {
             _ => {}
         }
         match verb {
-            // The fleet as models (design §10 F1): what the person added,
+            // The team as models (design §10 F1): what the person added,
             // provider-exact, with the roles each model fills.
             "models" | "model" => CommandResult::message(fleet_models_text(app)),
             "add" => fleet_add(app, target),
             "remove" | "rm" | "drop" => fleet_remove(app, target),
-            "members" | "member" | "roster" | "party" | "loadout" | "roles" | "role"
-            | "profiles" | "profile" => CommandResult::action(AppAction::OpenFleetRoster),
+            "members" | "member" | "roster" | "roles" | "role" | "profiles" | "profile" => {
+                CommandResult::action(AppAction::OpenFleetRoster)
+            }
             "setup" | "edit" | "new" => CommandResult::action(AppAction::OpenFleetSetup),
-            // Named saved fleets — secondary surface for multi-fleet pick/switch.
+            // Named saved teams — secondary surface for multi-team pick/switch.
             // Deliberately not "list": that verb is the durable ledger (#4022).
-            "fleets" | "saved" | "manage" => CommandResult::action(AppAction::OpenFleetList),
+            // "fleets" stays as a compatibility spelling for the wire name.
+            "teams" | "team" | "fleets" | "saved" | "manage" => {
+                CommandResult::action(AppAction::OpenFleetList)
+            }
             // The current-session sub-agent projection, named for what it is.
             "workers" | "worker" | "agents" | "subagents" => super::core::subagents(app),
             "help" | "?" => CommandResult::message(help_text()),
             other => match ControlOperation::parse_verb(ControlDomain::Fleet, other) {
                 Some(operation) => run_control(app, operation, target),
                 None => CommandResult::error(format!(
-                    "Unknown /fleet target '{other}'. Use members, setup, fleets, list, status, \
-                     workers, interrupt <worker-id>, or resume <run-id>.."
+                    "Unknown /fleet target '{other}'. Use {} — or /fleet help for the full \
+                     verb list.",
+                    PRIMARY_VERBS[..PRIMARY_VERBS.len() - 1].join(", ")
                 )),
             },
         }
@@ -386,11 +396,11 @@ mod tests {
             "got: {listed}"
         );
         assert!(
-            listed.starts_with("Your fleet `My fleet` (1 models)"),
+            listed.starts_with("Your team `My fleet` (1 models)"),
             "got: {listed}"
         );
 
-        // A selected fleet whose file is gone is a broken selection, and
+        // A selected team whose file is gone is a broken selection, and
         // `/fleet models` says so instead of "session model only".
         let selected = crate::fleet::store::resolve_selected_fleet(&workspace)
             .expect("ok")
@@ -413,8 +423,11 @@ mod tests {
         );
         assert!(fleet_provider_rejection(&app, &live, "openrouter").is_some());
         // An in-session credential change is visible without restarting.
-        live.provider_config_for_mut(crate::config::ApiProvider::Openrouter)
-            .api_key = Some("test-key".to_string());
+        live.provider_config_for_mut(
+            &live.test_identity_for_kind(crate::config::ProviderKind::Openrouter),
+        )
+        .unwrap()
+        .api_key = Some("test-key".to_string());
         assert_eq!(fleet_provider_rejection(&app, &live, "openrouter"), None);
 
         assert!(
@@ -439,7 +452,7 @@ mod tests {
 
     #[test]
     fn fleet_saved_fleet_verbs_open_the_named_fleet_list() {
-        for arg in ["fleets", "saved", "manage"] {
+        for arg in ["teams", "team", "fleets", "saved", "manage"] {
             let mut app = test_app();
 
             let result = FleetCmd::execute(&mut app, Some(arg));
@@ -481,8 +494,7 @@ mod tests {
     #[test]
     fn fleet_members_and_roster_aliases_open_roster_view() {
         for arg in [
-            "members", "member", "roster", "party", "loadout", "roles", "role", "profiles",
-            "profile",
+            "members", "member", "roster", "roles", "role", "profiles", "profile",
         ] {
             let mut app = test_app();
 
@@ -506,7 +518,7 @@ mod tests {
     }
 
     /// #4022: the session sub-agent projection keeps its own name. It is no
-    /// longer allowed to answer for the durable Fleet ledger.
+    /// longer allowed to answer for the durable worker ledger.
     #[test]
     fn fleet_workers_arg_opens_the_session_subagent_view() {
         for arg in ["workers", "worker", "agents", "subagents"] {
@@ -580,7 +592,7 @@ mod tests {
         for surface in [
             "/fleet members",
             "/fleet setup",
-            "/fleet fleets",
+            "/fleet teams",
             "/fleet status",
         ] {
             assert!(message.contains(surface), "help must describe {surface}");
@@ -627,19 +639,24 @@ mod tests {
             result
                 .message
                 .as_deref()
-                .is_some_and(|message| message.contains("Use members, setup, fleets"))
+                .is_some_and(|message| message.contains("Use members, setup, teams"))
         );
     }
 
     #[test]
     fn fleet_aliases_are_registered_on_command_info() {
         assert_eq!(FleetCmd::info().name, "fleet");
-        assert!(!FleetCmd::info().aliases.contains(&"pod"));
-        assert!(!FleetCmd::info().aliases.contains(&"fleet"));
-        assert!(FleetCmd::info().aliases.contains(&"loadout"));
-        assert!(FleetCmd::info().usage.contains("fleets"));
+        assert!(FleetCmd::info().aliases.is_empty());
+        assert!(FleetCmd::info().usage.contains("teams"));
         assert!(FleetCmd::info().usage.contains("workers"));
-        assert!(FleetCmd::info().usage.contains("save-as"));
+        // #5888: the usage line is the prioritized core; advanced verbs stay
+        // dispatchable but are documented in /fleet help, not here.
+        for advanced in ["save-as", "interrupt", "resume", "models", "status"] {
+            assert!(
+                !FleetCmd::info().usage.contains(advanced),
+                "usage must not advertise {advanced}"
+            );
+        }
         assert!(!FleetCmd::info().usage.contains("pods"));
     }
 
@@ -651,6 +668,9 @@ mod tests {
         assert!(!result.is_error);
 
         assert!(crate::commands::get_command_info("pod").is_none());
+        // Model B (2026-09-03): the live collective is the fleet; there is
+        // no separate `/team` command.
+        assert!(crate::commands::get_command_info("team").is_none());
 
         let workspace = tempfile::tempdir().expect("workspace");
         let mut fleet_app = app_in(workspace.path().to_path_buf());
@@ -666,9 +686,11 @@ mod tests {
         for descriptor in operations_for_domain(ControlDomain::Fleet) {
             assert_eq!(descriptor.slash_command, COMMAND_INFO.name);
             assert_eq!(descriptor.hotbar_action_id(), "slash.fleet");
+            // #5888: usage presents only the prioritized core; every durable
+            // control verb is documented one level deeper in /fleet help.
             assert!(
-                COMMAND_INFO.usage.contains(descriptor.verb) || descriptor.verb == "restart",
-                "/fleet usage must document {} or declare it CLI-only",
+                help_text().contains(&format!("/fleet {}", descriptor.verb)),
+                "/fleet help must document {} now that usage does not",
                 descriptor.verb
             );
             assert!(descriptor.offers(ControlSurface::Cli));
@@ -677,5 +699,40 @@ mod tests {
             !COMMAND_INFO.requires_required_argument(),
             "/fleet must stay directly runnable from the palette and hotbar"
         );
+    }
+
+    /// #5888: the primary surface is a small, prioritized set, and every
+    /// advanced verb remains named by `/fleet help` — nothing is
+    /// unreachable, it just lives one level deeper.
+    #[test]
+    fn fleet_usage_presents_a_prioritized_core_and_help_keeps_the_rest_reachable() {
+        let verbs: Vec<&str> = FleetCmd::info()
+            .usage
+            .trim_start_matches("/fleet [")
+            .trim_end_matches(']')
+            .split('|')
+            .collect();
+        assert_eq!(
+            verbs, PRIMARY_VERBS,
+            "the usage line is exactly the primary set"
+        );
+
+        let help = help_text();
+        for advanced in [
+            "/fleet models",
+            "/fleet add",
+            "/fleet remove",
+            "/fleet save",
+            "/fleet save-as",
+        ] {
+            assert!(help.contains(advanced), "help must name {advanced}");
+        }
+        for descriptor in operations_for_domain(ControlDomain::Fleet) {
+            assert!(
+                help.contains(&format!("/fleet {}", descriptor.verb)),
+                "help must keep {} reachable",
+                descriptor.verb
+            );
+        }
     }
 }

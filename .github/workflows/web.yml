@@ -3,71 +3,96 @@ name: Web Frontend
 on:
   push:
     branches: [master, main]
+    paths:
+      # Everything the web gates read, not only web/. derive-facts,
+      # check-facts, check-docs, check-cloud-facts, gt-site and the vitest
+      # contract tests read these repo paths (and git history of the model
+      # declarations under crates/). workflow_dispatch ignores path filters,
+      # so a manual deploy always runs.
+      - 'web/**'
+      - 'crates/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - 'Cargo.toml'
+      - 'package.json'
+      - 'npm/codewhale/**'
+      - 'vendor/codewhale-design/**'
+      - 'telemetry-ingest/test/golden/**'
+      - 'workflows/**'
+      - 'fleets/**'
+      - '.codewhale/**'
+      - '.github/SECURITY.md'
+      - '.github/workflows/web.yml'
+      - 'scripts/export-design-tokens.py'
   pull_request:
     branches: [master, main]
+    # Same list as push above.
+    paths:
+      - 'web/**'
+      - 'crates/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - 'Cargo.toml'
+      - 'package.json'
+      - 'npm/codewhale/**'
+      - 'vendor/codewhale-design/**'
+      - 'telemetry-ingest/test/golden/**'
+      - 'workflows/**'
+      - 'fleets/**'
+      - '.codewhale/**'
+      - '.github/SECURITY.md'
+      - '.github/workflows/web.yml'
+      - 'scripts/export-design-tokens.py'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  # A new push to a PR cancels its superseded web run. Push and dispatch runs
+  # get a per-run group so a queued manual deploy is never cancelled by a
+  # later push (the deploy job additionally serializes on its own group).
+  group: ${{ github.event_name == 'pull_request' && format('web-pr-{0}', github.event.pull_request.number) || format('web-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     name: Lint & Type Check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # `check:facts` derives each model's `addedAt` from the commit date on
+          # which its id first appeared in the model declaration paths
+          # (web/scripts/facts-lib.mjs). A shallow checkout cannot see that
+          # history, so every date collapses to the tip commit and the committed
+          # facts always read as stale. ci.yml pins depth 0 for the same reason.
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
       - name: Install dependencies
         run: npm ci
-      - name: Check facts drift
-        # facts.generated.ts is TRACKED (committed), so verify the committed
-        # copy matches the workspace BEFORE regenerating. Running prebuild first
-        # would self-heal the working tree and let a stale committed file pass
-        # (#3771). check:facts ignores the volatile generatedAt/latestRelease
-        # fields by design, so it is safe to run against the committed copy that
-        # exists at checkout.
-        run: npm run check:facts
-      - name: Check published-release fact is current
-        # web/data/latest-published-release.json is hand-maintained and feeds
-        # facts.generated.ts. Nothing wrote it, so it drifted to v0.9.10 while
-        # v0.9.11 was live, and the post-deploy comparison below failed on
-        # latestPublishedRelease.tag AFTER the site had already shipped. Gate it
-        # here so the mismatch is caught before deploying, not after.
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: npm run check:latest-release
-      - name: Generate derived facts
-        # Regenerate after the drift gate so tsc --noEmit (TS2307 without it) and
-        # the build use a current facts.generated.ts. When the gate passes this
-        # only refreshes the generatedAt timestamp.
-        run: npm run prebuild
-      - name: Check docs parity
-        # Fails CI when docs-map.ts references non-existent repo files or
-        # when website version / command snippets are stale.
-        run: npm run check:docs
-      - name: Check design tokens
-        # app/tokens.css is generated from crates/tui/src/palette/tokens.rs.
-        # Fails CI when the palette moved and the export was not re-run.
-        run: npm run check:tokens
       - name: Run tests
         run: npm test
-      - name: Run ESLint
-        run: npm run lint
-      - name: TypeScript type check
-        run: npx tsc --noEmit
-      - name: Build production site
-        run: npm run build
+      - name: Check web surface
+        # The shared gate checks committed facts before generating build inputs.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run check
 
   deploy-reminder:
     name: Deployment approval needed
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: lint
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
@@ -81,12 +106,13 @@ jobs:
             echo
             echo "Revision \`${REVISION}\` passed the web gates but has **not** been deployed."
             echo
-            echo "A maintainer can publish it with \`gh workflow run web.yml --repo Hmbown/CodeWhale --ref main\`."
+            echo "A maintainer can publish it with \`gh workflow run web.yml --repo codewhale-hq/CodeWhale --ref main\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     name: Deploy to Cloudflare
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: lint
     # Deploy is MANUAL ONLY: a human dispatches this workflow on main. Pushes
     # and pull requests still run `lint` above, but they never reach Cloudflare.
@@ -113,14 +139,14 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         # Pin the checkout to the exact revision this dispatch resolved, so the
         # SHA reported to compare:deployed-facts and asserted on the public
         # receipt below is the SHA that was actually built, even if main moves
         # while the run is queued behind the concurrency group.
         with:
           ref: ${{ github.sha }}
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: 'npm'
@@ -136,8 +162,8 @@ jobs:
       - name: Check Cloudflare deploy environment
         run: npm run check:deploy-env
       # npm's deploy script performs one OpenNext build, then deploys that exact
-      # bundle. Wrangler must not run a custom post-cache build: OpenNext
-      # populates the remote cache before it hands the bundle to Wrangler.
+      # bundle. OpenNext populates the remote cache before cf deploy --prebuilt;
+      # the bundler has no custom build that could invalidate that cache.
       - name: Build and deploy exact OpenNext bundle
         run: npm run deploy
       - name: Verify exact deployed revision

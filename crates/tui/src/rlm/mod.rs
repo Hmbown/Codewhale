@@ -1,38 +1,26 @@
-//! Recursive Language Model (RLM) loop — paper-spec Algorithm 1.
+//! Recursive Language Model presentation and persistent Python context.
 //!
-//! Implements Zhang, Kraska & Khattab (arXiv:2512.24601, §2 Algorithm 1):
+//! The serving Engine captures one call-local route, policy, service and
+//! cancellation receipt. `llm_query` and `rlm_query` submit bounded invocations
+//! to the same `Engine::run_turn`; this module owns no provider/code loop.
 //!
-//! ```text
-//! state ← InitREPL(prompt=P)
-//! state ← AddFunction(state, sub_RLM)
-//! hist ← [Metadata(state)]
-//! while True:
-//!     code ← LLM(hist)
-//!     (state, stdout) ← REPL(state, code)
-//!     hist ← hist ∥ code ∥ Metadata(stdout)
-//!     if state[Final] is set:
-//!         return state[Final]
-//! ```
-//!
-//! Invariants:
-//! - `P` is held only as a REPL variable (`context` / `ctx`); never
-//!   appears in the root LLM's window.
-//! - The root LLM receives small metadata messages — length, preview,
-//!   helper list, prior-round summary.
-//! - Code rounds and sub-LLM calls travel over a single stdin/stdout
-//!   pipe to a long-lived Python subprocess. No HTTP sidecar.
+//! Long input stays in `_context` (`_ctx` / `content` compatibility aliases).
+//! Core's session keeps initial metadata plus every code/result round until
+//! FINAL, the strict partial-response refusal or the bounded deadline/cap.
+//! Python kernels retain variables and pipes, never their borrowed dispatcher
+//! or caller. The persistent `rlm` action surface is caller-session scoped;
+//! `share_session=true` explicitly refuses. No HTTP sidecar is created.
 
-use crate::models::Usage;
+use codewhale_models::Usage;
 
 pub mod bridge;
 pub mod prompt;
 pub mod session;
 pub mod turn;
 
-pub(crate) use bridge::ModelClientRlmAdapter;
-pub use bridge::RlmBridge;
+pub(crate) use bridge::RlmBridge;
 pub use prompt::rlm_system_prompt;
-pub use turn::{RlmTermination, RlmTurnResult, run_rlm_turn, run_rlm_turn_with_root};
+pub use turn::{RlmTermination, RlmTurnResult};
 
 fn add_usage_with_prompt_cache(total: &mut Usage, delta: &Usage) {
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
@@ -92,7 +80,7 @@ mod tests {
             prompt_cache_miss_tokens: Some(20),
             reasoning_tokens: Some(4),
             reasoning_replay_tokens: Some(3),
-            server_tool_use: Some(crate::models::ServerToolUsage {
+            server_tool_use: Some(codewhale_models::ServerToolUsage {
                 code_execution_requests: Some(2),
                 tool_search_requests: Some(1),
             }),
@@ -109,7 +97,7 @@ mod tests {
         assert_eq!(total.reasoning_replay_tokens, Some(3));
         assert_eq!(
             total.server_tool_use,
-            Some(crate::models::ServerToolUsage {
+            Some(codewhale_models::ServerToolUsage {
                 code_execution_requests: Some(2),
                 tool_search_requests: Some(1),
             })

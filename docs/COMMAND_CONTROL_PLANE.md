@@ -1,5 +1,7 @@
 # Shared command / control-plane contract
 
+> 阅读简体中文版：[zh_hans/COMMAND_CONTROL_PLANE.md](zh_hans/COMMAND_CONTROL_PLANE.md)。
+
 Issues #1888 and #4022.
 
 Codewhale exposes the same lifecycle operations on three surfaces: a slash

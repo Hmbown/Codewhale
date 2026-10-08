@@ -1,0 +1,4 @@
+command: /preview-request json
+is_error: false
+message: <none>
+action: PreviewOutboundRequest { json: true, base_prompt_only: false, hypothetical_prompt: None }

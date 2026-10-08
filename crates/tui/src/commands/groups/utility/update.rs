@@ -84,7 +84,7 @@ pub(super) enum UpdaterPlan {
     NoUpdater { exe: PathBuf },
 }
 
-/// The binary name that carries the `update` subcommand.
+/// The primary binary name. `codew` carries the same CLI and update subcommand.
 const UPDATER_BIN_STEM: &str = "codewhale";
 
 /// Resolve the update path without touching the process environment, so the
@@ -104,7 +104,10 @@ pub(super) fn resolve_updater(
             exe: PathBuf::from(UPDATER_BIN_STEM),
         };
     };
-    if exe.file_stem().and_then(|stem| stem.to_str()) == Some(UPDATER_BIN_STEM) {
+    if matches!(
+        exe.file_stem().and_then(|stem| stem.to_str()),
+        Some(UPDATER_BIN_STEM | "codew")
+    ) {
         return UpdaterPlan::Run(exe.to_path_buf());
     }
     // A `codewhale-tui` build has no `update` subcommand, but the CLI that
@@ -128,11 +131,11 @@ pub(super) fn resolve_updater(
 pub(super) fn managed_install_message(method: InstallMethod) -> String {
     format!(
         "Codewhale was installed with {label}, which owns this binary.\n\
-         Run `{command}` in a shell, then restart Codewhale.\n\n\
-         /update deliberately will not self-update here: replacing a binary {label} manages \
-         leaves its metadata describing a version that is no longer on disk, and the next \
-         upgrade silently reverts you.",
+         {migration_help}\n\n\
+         To keep this secondary {label} installation, run `{command}` in a shell.\n\
+         /update will not replace a binary owned by {label}; restart Codewhale after changing installs.",
         label = method.label(),
+        migration_help = codewhale_release::install::GITHUB_MIGRATION_HELP,
         command = method.update_command(),
     )
 }
@@ -269,6 +272,8 @@ mod tests {
             assert_eq!(plan, UpdaterPlan::Managed(method), "{method:?}");
 
             let message = managed_install_message(method);
+            assert!(message.contains(codewhale_release::install::GITHUB_MIGRATION_HELP));
+            assert!(message.contains("mktemp -d"));
             assert!(
                 message.contains(method.update_command()),
                 "{method:?} message must name its own update command: {message}"
@@ -331,6 +336,19 @@ mod tests {
             ),
             UpdaterPlan::Run(PathBuf::from("C:/tools/codewhale.exe"))
         );
+    }
+
+    #[test]
+    fn standalone_codew_uses_its_own_updater_without_a_companion() {
+        for exe in ["/usr/local/bin/codew", "C:/tools/codew.exe"] {
+            let exe = Path::new(exe);
+            assert_eq!(
+                resolve_updater(Some(exe), InstallMethod::Binary, &|_| {
+                    panic!("the full codew CLI must not look for another installation")
+                }),
+                UpdaterPlan::Run(exe.to_path_buf())
+            );
+        }
     }
 
     #[test]

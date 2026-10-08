@@ -24,14 +24,38 @@ fn component_paths(plugin: &LoadedPlugin, capability: PluginActivationCapability
         PluginActivationCapability::Commands => &plugin.components.commands,
         PluginActivationCapability::Agents => &plugin.components.agents,
         PluginActivationCapability::Hooks => &plugin.components.hooks,
+        // Extension-host entry modules; only active under the v6 policy.
+        PluginActivationCapability::Native => &plugin.components.native,
         PluginActivationCapability::Skills
         | PluginActivationCapability::McpStdio
         | PluginActivationCapability::McpRemote
+        | PluginActivationCapability::Providers
         | PluginActivationCapability::Lsp
-        | PluginActivationCapability::Native
         | PluginActivationCapability::FilesystemRoots
         | PluginActivationCapability::LifecycleMutation => &[],
     }
+}
+
+/// Why `path` cannot be an extension-host entry, if it cannot.
+///
+/// A `native` entry is one `.mjs`, `.js` or `.mts` ES module file: the host imports
+/// exactly that file and re-hashes it first. This is the one statement of the
+/// rule. Discovery reports it as an error diagnostic (so `/plugin validate`
+/// and the review screen show it) and activation refuses the entry, both only
+/// while the activation policy supports `Native` (`[features]
+/// extension_host`). With the flag off, `native` stays inventory-only and any
+/// path is accepted as before.
+///
+/// `is_regular_file` comes from the caller's own view of the bundle (the
+/// validated manifest's hashed files, or the activation read), so this
+/// function touches no filesystem.
+#[must_use]
+pub fn native_entry_problem(path: &Path, is_regular_file: bool) -> Option<&'static str> {
+    const RULE: &str = "a native entry must be one .mjs, .js or .mts ES module file";
+    let is_module = path
+        .extension()
+        .is_some_and(|extension| extension == "mjs" || extension == "js" || extension == "mts");
+    (!is_module || !is_regular_file).then_some(RULE)
 }
 
 fn scope_precedence(scope: PluginScope) -> u8 {
@@ -105,7 +129,7 @@ pub fn active_component_sources(
     (sources, errors)
 }
 
-fn staged_component_path(
+pub(super) fn staged_component_path(
     canonical_root: &Path,
     staged_root: &Path,
     source_path: &Path,

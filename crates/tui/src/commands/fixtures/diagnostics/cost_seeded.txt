@@ -1,0 +1,15 @@
+command: /cost
+is_error: false
+message:
+Session Cost:
+ ─────────────────────────────
+ Estimated total: $0.0500
+
+ Based on audited provider-reported usage and published rates.
+
+Breakdown (components sum to the total above):
+  Parent turns: $0.0500
+
+This is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.
+Covered: 1 of 1 money-metered turn(s) priced.
+action: <none>

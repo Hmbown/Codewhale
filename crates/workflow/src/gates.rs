@@ -9,8 +9,8 @@
 //! - **approve** — promote an artifact into the next role's context substrate
 //! - **escalate** — after N retries, surface to parent / lane status
 //!
-//! This module is pure IR + evaluation. Runtime execution and Lane status UI
-//! wire in later; unit tests cover block/approve/retry/escalate paths.
+//! This module is pure IR + evaluation. Runtime admission and Lane status UI
+//! consume the same board; gates do not grant tool or publication authority.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ pub enum GateOn {
     /// After a fleet role task completes successfully.
     RoleComplete,
     /// Before a fleet role is allowed to start.
+    /// Hosts without start-time gate evaluation must refuse this trigger.
     RoleStart,
 }
 
@@ -36,7 +37,8 @@ pub enum GateKind {
     Verify,
     /// Diff review (reviewer role).
     Review,
-    /// Explicit human/operator approve.
+    /// Accept a role's result and promote its handoff artifact. This kind does
+    /// not imply human approval; an explicit override is `GateOutcome::HumanApprove`.
     Approve,
 }
 
@@ -91,11 +93,19 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateState {
+    /// A required outcome has not arrived; dependent roles must wait.
     Pending,
     Passed,
-    Blocked { reason: String },
-    Retrying { attempt: u32, reason: String },
-    Escalated { reason: String },
+    Blocked {
+        reason: String,
+    },
+    Retrying {
+        attempt: u32,
+        reason: String,
+    },
+    Escalated {
+        reason: String,
+    },
 }
 
 impl GateState {
@@ -110,18 +120,16 @@ impl GateState {
     }
 
     pub fn is_blocking(&self) -> bool {
-        matches!(
-            self,
-            Self::Blocked { .. } | Self::Escalated { .. } | Self::Retrying { .. }
-        )
+        !matches!(self, Self::Passed)
     }
 
     pub fn blocked_reason(&self) -> Option<&str> {
         match self {
+            Self::Pending => Some("waiting for required gate outcome"),
             Self::Blocked { reason }
             | Self::Retrying { reason, .. }
             | Self::Escalated { reason } => Some(reason.as_str()),
-            _ => None,
+            Self::Passed => None,
         }
     }
 }
@@ -223,20 +231,26 @@ impl LaneGateBoard {
         }
     }
 
-    /// Whether `role` is currently blocked by any gate that targets it.
+    /// Whether `role` has an unmet prerequisite. Missing board entries are
+    /// pending too: an incomplete persisted board cannot imply a passed gate.
     pub fn role_is_blocked(&self, specs: &[GateSpec], role: &str) -> Option<&GateState> {
+        static PENDING: GateState = GateState::Pending;
+        let role = role.trim();
+        if role.is_empty() {
+            return None;
+        }
         for spec in specs {
             let blocks = spec
                 .blocks_role
                 .as_deref()
                 .unwrap_or("")
+                .trim()
                 .eq_ignore_ascii_case(role);
             if !blocks {
                 continue;
             }
-            if let Some(state) = self.gates.get(&spec.id)
-                && state.is_blocking()
-            {
+            let state = self.gates.get(&spec.id).unwrap_or(&PENDING);
+            if state.is_blocking() {
                 return Some(state);
             }
         }
@@ -411,11 +425,133 @@ mod tests {
             .expect("findings artifact");
         assert_eq!(art.id, "art-1");
         assert!(art.payload.contains("4090"));
+        assert_eq!(
+            board.role_is_blocked(&gates, "implementer"),
+            Some(&GateState::Pending),
+            "an artifact alone does not satisfy its approval gate"
+        );
 
         // Approve scout gate so implementer unblocks.
         let state = board.evaluate(&gates[0], GateOutcome::Pass).unwrap();
         assert_eq!(state, GateState::Passed);
         assert!(board.role_is_blocked(&gates, "implementer").is_none());
+    }
+
+    #[test]
+    fn pending_prerequisite_blocks_only_its_target_until_passed() {
+        let mut board = LaneGateBoard::new("lane-pending");
+        let mut gates = stopship_gate_pipeline();
+        gates[0].blocks_role = Some(" Implementer ".into());
+        board.install_gates(&gates);
+
+        let pending = board
+            .role_is_blocked(&gates, " IMPLEMENTER ")
+            .expect("pending prerequisite blocks normalized role");
+        assert_eq!(pending, &GateState::Pending);
+        assert_eq!(
+            pending.blocked_reason(),
+            Some("waiting for required gate outcome")
+        );
+        assert!(board.role_is_blocked(&gates, "scout").is_none());
+        assert!(board.role_is_blocked(&gates, "unrelated").is_none());
+        assert!(board.role_is_blocked(&gates, "").is_none());
+
+        board.evaluate(&gates[0], GateOutcome::Pass).unwrap();
+        assert!(board.role_is_blocked(&gates, "implementer").is_none());
+        assert_eq!(
+            board.role_is_blocked(&gates, "verifier"),
+            Some(&GateState::Pending),
+            "another role's gate remains unsatisfied"
+        );
+    }
+
+    #[test]
+    fn every_prerequisite_must_pass_before_the_shared_target_runs() {
+        let mut board = LaneGateBoard::new("lane-multiple");
+        let mut gates = stopship_gate_pipeline();
+        gates[0].blocks_role = Some("release_lead".into());
+        board.install_gates(&gates);
+
+        board.evaluate(&gates[0], GateOutcome::Pass).unwrap();
+        assert_eq!(
+            board.role_is_blocked(&gates, "release_lead"),
+            Some(&GateState::Pending),
+            "scout approval cannot satisfy the verifier prerequisite"
+        );
+        board.evaluate(&gates[2], GateOutcome::Pass).unwrap();
+        assert!(board.role_is_blocked(&gates, "release_lead").is_none());
+        assert_eq!(
+            board.role_is_blocked(&gates, "verifier"),
+            Some(&GateState::Pending),
+            "unrelated pending prerequisites retain their own targets"
+        );
+    }
+
+    #[test]
+    fn missing_persisted_gate_is_pending_and_reinstall_preserves_real_passes() {
+        let dir = tempdir().unwrap();
+        let gates = stopship_gate_pipeline();
+        let mut board = LaneGateBoard::new("lane-incomplete");
+        board.install_gates(&gates);
+        board.evaluate(&gates[0], GateOutcome::Pass).unwrap();
+        board.gates.remove(&gates[1].id);
+        board.save_to_dir(dir.path()).unwrap();
+
+        let mut restored = LaneGateBoard::load_from_dir(dir.path()).unwrap();
+        assert!(restored.role_is_blocked(&gates, "implementer").is_none());
+        assert_eq!(
+            restored.role_is_blocked(&gates, "verifier"),
+            Some(&GateState::Pending),
+            "absence of a gate record is not successful evaluation"
+        );
+        restored.install_gates(&gates);
+        assert!(restored.role_is_blocked(&gates, "implementer").is_none());
+        assert_eq!(restored.gates[&gates[1].id], GateState::Pending);
+        restored.evaluate(&gates[1], GateOutcome::Pass).unwrap();
+        assert!(restored.role_is_blocked(&gates, "verifier").is_none());
+    }
+
+    #[test]
+    fn cancelled_prerequisite_stays_blocked_through_retry_and_escalation() {
+        let mut board = LaneGateBoard::new("lane-cancelled");
+        let gates = stopship_gate_pipeline();
+        let verify = &gates[2];
+        board.install_gates(&gates);
+        assert_eq!(
+            board.role_is_blocked(&gates, "release_lead"),
+            Some(&GateState::Pending)
+        );
+
+        for attempt in 1..=verify.max_retries + 1 {
+            let state = board
+                .evaluate(
+                    verify,
+                    GateOutcome::Fail {
+                        reason: "prerequisite worker cancelled".into(),
+                    },
+                )
+                .unwrap();
+            if attempt <= verify.max_retries {
+                assert!(
+                    matches!(state, GateState::Retrying { attempt: actual, .. } if actual == attempt)
+                );
+            } else {
+                assert!(matches!(state, GateState::Escalated { .. }));
+            }
+            assert_eq!(board.role_is_blocked(&gates, "release_lead"), Some(&state));
+            assert_eq!(board.retries[&verify.id], attempt);
+        }
+
+        board
+            .evaluate(
+                verify,
+                GateOutcome::HumanApprove {
+                    note: "operator reviewed the prerequisite evidence".into(),
+                },
+            )
+            .unwrap();
+        assert!(board.role_is_blocked(&gates, "release_lead").is_none());
+        assert!(!board.retries.contains_key(&verify.id));
     }
 
     #[test]

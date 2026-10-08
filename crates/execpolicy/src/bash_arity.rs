@@ -295,7 +295,8 @@ impl BashArityDict {
     ///
     /// # Algorithm
     ///
-    /// 1. Strip all flag tokens (tokens that start with `-`).
+    /// 1. Strip all flag tokens (tokens that start with `-`), except the
+    ///    `-m` of `python -m`.
     /// 2. Build candidates of depth 1..=3 from positional tokens (longest first).
     /// 3. If a candidate matches a dictionary entry, return `arity` positional
     ///    tokens joined with spaces.
@@ -306,11 +307,22 @@ impl BashArityDict {
             return String::new();
         }
 
-        // Collect positional (non-flag) tokens, lowercased.
+        // Collect positional (non-flag) tokens, lowercased. `-m` directly
+        // after `python`/`python3` is kept: it names the module runner, and
+        // the table keys `python -m <module>` on it.
         let positional: Vec<String> = tokens
             .iter()
-            .filter(|t| !t.starts_with('-'))
-            .map(|t| t.to_ascii_lowercase())
+            .enumerate()
+            .filter(|(index, token)| {
+                !token.starts_with('-')
+                    || (*index == 1
+                        && **token == "-m"
+                        && matches!(
+                            tokens[0].to_ascii_lowercase().as_str(),
+                            "python" | "python3"
+                        ))
+            })
+            .map(|(_, token)| token.to_ascii_lowercase())
             .collect();
 
         if positional.is_empty() {
@@ -354,8 +366,12 @@ impl BashArityDict {
         // Classify the concrete command through the arity dictionary.
         let canonical = self.classify(&command_tokens);
 
-        // Primary check: the classified prefix equals the allow-rule pattern.
-        if canonical == pattern_lower {
+        // Primary check: the classified prefix equals the allow-rule pattern
+        // and is spelled literally at the front of the command, so a global
+        // option before the subcommand (`git -c k=v status`) is not covered.
+        if canonical == pattern_lower
+            && crate::command_safety::canonical_prefix_is_leading(&command_tokens, &canonical)
+        {
             return true;
         }
 

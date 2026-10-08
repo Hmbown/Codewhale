@@ -1,45 +1,54 @@
 import Link from "next/link";
+import { LegalTabs } from "@/components/legal-tabs";
+import { PageHeader } from "@/components/page-header";
+import { UsagePreferenceControl } from "@/components/usage-counting";
+import { USAGE_COUNTING_COPY } from "@/lib/content/usage-counting";
+import { BUILD_FACTS } from "@/lib/facts";
+import { getChrome, getLegalPrivacy, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
-import { LEGAL_UPDATED, PRIVACY_SECTIONS } from "@/lib/legal-copy";
+import { formatLegalDocumentStatus, LEGAL_DOCUMENTS, PrivacyContent, WEBSITE_USAGE_DISCLOSURE } from "@/lib/legal-copy";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getLegalPrivacy(locale);
   return buildPageMetadata({
     path: "/legal/privacy",
     locale,
-    title: isZh ? "隐私政策 · Codewhale" : "Privacy policy · Codewhale",
-    description: isZh
-      ? "Shannon Labs 如何在你使用 Codewhale 时处理信息。"
-      : "How Shannon Labs handles information when you use Codewhale.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
 export default async function PrivacyPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getLegalPrivacy(locale);
   return (
-    <div className="portal-home">
-      <article className="legal-doc">
-        <p className="legal-doc-kicker">{isZh ? "法律" : "Legal"}</p>
-        <h1>{isZh ? "隐私政策" : "Privacy policy"}</h1>
-        <p className="legal-doc-updated">
-          {isZh ? "生效并最近更新于" : "Effective and last updated"} {LEGAL_UPDATED}
-          {isZh ? "。以下为具有约束力的英文文本。" : "."}
-        </p>
-        <p>This policy explains how Shannon Labs handles information when you use Codewhale.</p>
-        {PRIVACY_SECTIONS.map((section) => (
-          <section key={section.title}>
-            <h2>{section.title}</h2>
-            <p>{section.body}</p>
-          </section>
-        ))}
-        <p className="legal-doc-nav">
-          <Link href={`/${locale}/legal/terms`}>{isZh ? "服务条款" : "Terms of service"}</Link>
-          <Link href={`/${locale}/pricing`}>{isZh ? "价格" : "Pricing"}</Link>
-          <Link href={`/${locale}`}>{isZh ? "返回首页" : "Back home"}</Link>
-        </p>
-      </article>
-    </div>
+    <>
+      <PageHeader
+        kicker={t.kicker}
+        title={t.title}
+        meta={formatLegalDocumentStatus("privacy", getChrome(locale).dateLocale)}
+      />
+      <div className="page-body">
+        <div className="page-body-narrow">
+          <LegalTabs locale={locale} current="privacy" />
+          <article className="prose legal-doc [&>section>p+p]:mt-[var(--space-4)]" data-legal-version={LEGAL_DOCUMENTS.privacy.version} data-legal-status={LEGAL_DOCUMENTS.privacy.status} data-legal-effective-at={LEGAL_DOCUMENTS.privacy.effectiveAt ?? undefined}>
+            <PrivacyContent />
+            <section>
+              <h2>{WEBSITE_USAGE_DISCLOSURE.title}</h2>
+              <p>{WEBSITE_USAGE_DISCLOSURE.body}</p>
+            </section>
+            <section id="usage-counting" className="scroll-mt-32">
+              <h2>{pickText(USAGE_COUNTING_COPY.heading, locale)}</h2>
+              <UsagePreferenceControl locale={locale} appVersion={BUILD_FACTS.version ?? "0.0.0"} />
+            </section>
+            <p className="status-line">
+              <Link href={`/${locale}/legal/terms`} className="link">{t.termsLink}</Link>
+              <Link href={`/${locale}`} className="link">{t.homeLink}</Link>
+            </p>
+          </article>
+        </div>
+      </div>
+    </>
   );
 }

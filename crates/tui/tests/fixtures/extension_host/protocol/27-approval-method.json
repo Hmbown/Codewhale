@@ -1,0 +1,13 @@
+{
+  "direction": "host_to_core",
+  "valid": false,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "approval/respond",
+    "params": {
+      "id": "call-1",
+      "decision": "allow"
+    }
+  }
+}

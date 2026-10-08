@@ -65,7 +65,6 @@ impl SettingsPickerController {
     }
 
     #[must_use]
-    #[allow(dead_code)] // catalog accessors for model/provider migration (TUI-DOG-009)
     pub fn options(&self) -> &[SettingOption] {
         &self.options
     }
@@ -206,20 +205,25 @@ impl SettingsPickerController {
         self.recompute_filter(keep.as_deref());
     }
 
-    pub fn next_tab(&mut self) {
+    /// Switch to the next tab. Previews the row it lands on only when that
+    /// row is available — a disabled row is shown, never previewed.
+    pub fn next_tab(&mut self) -> PickerNavResult {
         if self.tabs.is_empty() {
-            return;
+            return PickerNavResult::None;
         }
         let next = (self.active_tab + 1) % self.tabs.len();
         self.set_active_tab(next);
+        self.preview_if_available()
     }
 
-    pub fn prev_tab(&mut self) {
+    /// Switch to the previous tab; same preview rule as [`Self::next_tab`].
+    pub fn prev_tab(&mut self) -> PickerNavResult {
         if self.tabs.is_empty() {
-            return;
+            return PickerNavResult::None;
         }
         let prev = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
         self.set_active_tab(prev);
+        self.preview_if_available()
     }
 
     /// Select by source index when that option is currently visible.

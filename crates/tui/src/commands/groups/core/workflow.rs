@@ -10,12 +10,13 @@
 //! `/workflow` alone.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
-use crate::models::ContentBlock;
 use crate::tui::app::WORKFLOW_DRAFT_INSTRUCTION_PREFIX;
-use crate::tui::app::{App, AppAction, AppMode};
+use crate::tui::app::{App, AppAction};
+use codewhale_config::AppMode;
 #[cfg(test)]
-use crate::tui::approval::ApprovalMode;
+use codewhale_execpolicy::ApprovalMode;
+use codewhale_localization::MessageId;
+use codewhale_models::ContentBlock;
 
 use super::CommandResult;
 
@@ -131,7 +132,7 @@ fn envelope_from_instruction(prefix: &str, instruction: &str) -> Option<Workflow
     serde_json::from_str(encoded).ok()
 }
 
-fn user_instruction(message: &crate::models::Message) -> Option<&str> {
+fn user_instruction(message: &codewhale_models::Message) -> Option<&str> {
     if message.role != "user" {
         return None;
     }
@@ -504,7 +505,7 @@ pub fn auto(app: &mut App, arg: Option<&str>) -> CommandResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Role;
+    use codewhale_models::Role;
     use std::path::PathBuf;
 
     use crate::tui::app::TuiOptions;
@@ -519,7 +520,7 @@ mod tests {
     #[test]
     fn auto_sets_auto_review_and_explains_the_trio() {
         let mut app = test_app();
-        app.ui_locale = crate::localization::Locale::En;
+        app.ui_locale = codewhale_localization::Locale::En;
         app.set_agent_approval_posture(ApprovalMode::Suggest);
 
         let result = auto(&mut app, None);
@@ -595,14 +596,14 @@ mod tests {
         assert_eq!(objective.chars().count(), WORKFLOW_OBJECTIVE_MAX_CHARS);
         assert!(objective.ends_with('…'));
 
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: instruction,
                 cache_control: None,
             }],
         });
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: "Reviewed bounded objective and proposed phases.".to_string(),
@@ -636,14 +637,14 @@ mod tests {
         else {
             panic!("expected WorkflowInstruction action");
         };
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: format!("{instruction}\n\n---\n\nUser request: {display}"),
                 cache_control: None,
             }],
         });
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: "Objective, phases, workers, and risks. Run /workflow confirm to start."
@@ -656,7 +657,7 @@ mod tests {
         // explicit confirm must still find the reviewed draft (regression: the
         // old supersede rule cancelled the draft on any ordinary message and
         // made repeated confirm attempts impossible).
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "hmm it won't let me confirm it lol".to_string(),
@@ -679,7 +680,7 @@ mod tests {
         else {
             panic!("expected WorkflowInstruction action");
         };
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: format!("{redraft_instruction}\n\n---\n\nUser request: {redraft_display}"),
@@ -710,7 +711,7 @@ mod tests {
         else {
             panic!("expected WorkflowInstruction action");
         };
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: format!("{instruction}\n\n---\n\nUser request: {display}"),
@@ -721,7 +722,7 @@ mod tests {
             workflow(&mut app, Some("confirm")).is_error,
             "a failed or unfinished draft turn is not a reviewed plan"
         );
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: "Objective, phases, workers, and risks. Run /workflow confirm to start."
@@ -747,7 +748,7 @@ mod tests {
             "only the later explicit confirmation restores the normal catalog"
         );
 
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: instruction,
@@ -850,14 +851,14 @@ mod tests {
             Some(Vec::new())
         );
 
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: instruction,
                 cache_control: None,
             }],
         });
-        app.api_messages.push(crate::models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
                 text: "Saved Workflow path and risks reviewed.".to_string(),
@@ -959,10 +960,12 @@ mod tests {
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let manager = new_shared_subagent_manager(dir.path().to_path_buf(), 2);
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = crate::client::DeepSeekClient::new(&crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            ..crate::config::Config::default()
-        })
+        let client = crate::client::CodewhaleClient::new(
+            &crate::config::Config {
+                ..crate::config::Config::default()
+            }
+            .with_legacy_root(Some("test-key".to_string()), None),
+        )
         .expect("stub client");
         let mut runtime = SubAgentRuntime::new(
             client,

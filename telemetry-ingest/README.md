@@ -2,8 +2,8 @@
 
 A Cloudflare Worker that accepts the batches described in
 [`docs/TELEMETRY.md`](../docs/TELEMETRY.md) and writes them to Workers Analytics
-Engine. One POST route. No response body on any path. No client IP, anywhere,
-ever.
+Engine. One POST route. No response body on any path. The handler never reads
+client-IP metadata and the closed payload schema accepts no address field.
 
 It lives here and not in `web/` because the site is a separate deploy with its
 own build (Next.js via OpenNext); this is a single 13 KiB script with no assets,
@@ -13,12 +13,64 @@ and coupling the two would mean a telemetry change rebuilding the marketing site
 is the shipped default for `telemetry_endpoint`. workers.dev is disabled; that
 hostname is the only way in.
 
-Anonymous usage counting is on by default in v0.9.6, with a clear first-run
-disclosure and a durable opt-out. Prior declines remain off. A user who wants
+The current source defaults usage analytics on under notice version5, with a
+clear opt-out. Prior explicit declines remain off; a missing acceptance record
+is not treated as consent. Schema3 carries `notice_version: 5` policy metadata;
+legacy schema2 retains its original explicit `consent_version: 4` contract.
+Schema1 clients are accepted only into first-party Analytics Engine. Local
+schema3 validation is not proof this updated Worker has been deployed. A user who wants
 to contact nobody sets `telemetry_endpoint = ""`, which writes batches to
 `$CODEWHALE_HOME/telemetry/dryrun.jsonl` instead.
 
 ---
+
+## Optional PostHog processor
+
+The new sink is **unconfigured by default**. It uses no analytics SDK and does
+not create a second collector. `POSTHOG_HOST` must be exactly
+`https://us.i.posthog.com` or `https://eu.i.posthog.com`, and
+`POSTHOG_PROJECT_TOKEN` must be supplied as a Worker secret. The separate
+`POSTHOG_IP_SAFE_EGRESS_VERIFIED="true"` prerequisite requires the staging
+receipt below. Never commit a real token. Missing any prerequisite or using
+an untrusted host leaves the sink off.
+Deployment, token configuration, retention/privacy settings, and activation
+require separate operator approval; none is established by the local tests.
+
+Validated schema3 batches carrying `notice_version: 5` and legacy schema2
+batches carrying explicit `consent_version: 4` can reach the processor. Legacy v1 always remains first-party only. Capture uses
+`/batch/`, fixed anonymous/no-geo controls, no incoming headers, no cookies,
+no redirects, no response parsing, no retries, and a 1.5-second timeout.
+PostHog failure is isolated from the successful Analytics Engine write.
+See [the complete disclosure](../docs/TELEMETRY.md) and
+[PostHog's capture contract](https://posthog.com/docs/api/capture).
+
+**Egress activation remains unproved.** Cloudflare can add client-IP headers to
+Worker subrequests destined for non-Cloudflare zones, even when application
+code builds fresh headers. The guard is an operator prerequisite, not code
+that strips platform headers. Before setting it, record a staging receipt for
+the actual deployment and regional destination proving original client IPs
+are absent from all received headers, including `CF-Connecting-IP`,
+`X-Forwarded-For`, and `X-Real-IP`. Requalify if the egress path changes. Without
+that receipt, leave the sink disabled; use a detached first-party delivery
+context if the deployed network cannot satisfy the invariant. Local fetch
+mocks do not prove edge behavior. See [Cloudflare's header behavior](https://developers.cloudflare.com/fundamentals/reference/http-headers/#cf-connecting-ip-in-worker-subrequests).
+
+The cross-repository CWC contract is generated, not independently authored:
+`node scripts/export-product-schema.mjs` (Node 22.18+) exports
+`schema/cwc-product-v3.schema.json` from this validator's constants. The v2
+artifact remains available for existing clients. It accepts
+only `web-app` / `desktop`, one closed `product_usage` event, and the fixed
+no-fingerprint browser envelope. Copies must be compared with this generated
+artifact when changing the schema. `test/golden/browser-v3.json` is a complete
+website wire example; CWC changes only its surface to `web-app` or `desktop`.
+`operations_summary` is separate operator-consented service health: six `u32`
+aggregates on `control-plane` with a new random install ID per batch, never
+individual request records or end-user identifiers.
+
+The website/app same-origin proxy, when configured, must validate and forward
+only the closed batch body and reconstruct a content-type header. Do not pass
+through the incoming request, cookies, user agent, authentication, or metadata.
+The ingest's two-header invariant remains unchanged.
 
 ## The one property that matters
 
@@ -80,7 +132,7 @@ take the next free slot.
 | column | contents |
 |---|---|
 | `index1` | `install_id` — random v4 UUID, client-rotated every 90 days. The only identifier in the schema. |
-| `blob1` | `event` — `install_or_upgrade` \| `session_start` \| `session_end` \| `panic` |
+| `blob1` | `event` — `install_or_upgrade` \| `session_start` \| `session_end` \| `panic` \| `product_usage` \| `operations_summary` |
 | `blob2` | `surface` |
 | `blob3` | `os` |
 | `blob4` | `arch` |
@@ -97,6 +149,9 @@ take the next free slot.
 | `blob15` | `providers`, comma-joined, already sorted and deduplicated |
 | `blob16` | `panic_site` (`panic` only) — a `crates/…` path or the literal `<dep>` |
 | `blob17` | `sent_at` — the *batch* timestamp. Events carry none. |
+| `blob18` | `aggregate_counters` — closed JSON counts, for `product_usage` or `operations_summary` |
+| `blob19` | `schema_version` |
+| `blob20` | `privacy_version`: notice5 for v3, consent4 for v2, empty for v1; `blob19` keeps their meanings distinct |
 | `double1..10` | `counters`: `turns`, `tool_calls`, `fleet_dispatch`, `workflow_run`, `subagent_spawn`, `mcp_server_connected`, `memory_search`, `approval_modal_shown`, `approval_auto_allowed`, `command_palette_open` |
 | `double11..16` | `errors`: `auth_preflight_failed`, `provider_http_4xx`, `provider_http_5xx`, `tool_denied_by_policy`, `tool_timeout`, `network_error` |
 | `double17..20` | `turn_wall`: `lt_5s`, `5_30s`, `30_120s`, `gte_120s` |

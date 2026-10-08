@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 
 import {
   activeTurnBlock,
@@ -19,7 +20,8 @@ import {
   readSse,
   splitMessage,
   stripGroupPrefix,
-  ThreadStore
+  ThreadStore,
+  writeFileDurable
 } from "../src/lib.mjs";
 
 test("env and primitive parsers handle bridge env conventions", () => {
@@ -121,14 +123,31 @@ test("ThreadStore supports chat state, message dedupe, and action tokens", async
     assert.equal(await store.recordMessage("m3"), false);
     assert.deepEqual(store.data.messages, ["m2", "m3"]);
 
-    const token = await store.putAction({ kind: "resume", threadId: "thread-a" });
-    assert.equal((await store.getAction(token)).kind, "resume");
-    assert.equal((await store.takeAction(token)).threadId, "thread-a");
-    assert.equal(await store.getAction(token), null);
+    const token = await store.putAction({ kind: "resume", threadId: "thread-a" }, { chatId: "chat-a" });
+    assert.equal((await store.getAction(token, { chatId: "chat-a" })).kind, "resume");
+    assert.equal((await store.takeAction(token, { chatId: "chat-a" })).threadId, "thread-a");
+    assert.equal(await store.getAction(token, { chatId: "chat-a" }), null);
 
     const saved = await ThreadStore.open(statePath, { messageLimit: 2, actions: true });
     assert.equal((await saved.getChat("chat-a")).threadId, "thread-a");
     assert.deepEqual(saved.data.messages, ["m2", "m3"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("action tokens remain distinct when clock and legacy randomness repeat", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-action-tokens-"));
+  try {
+    const store = await ThreadStore.open(path.join(dir, "state.json"), { actions: true });
+    t.mock.method(Date, "now", () => 1);
+    t.mock.method(Math, "random", () => 0.5);
+    const first = await store.putAction({ threadId: "thread-a" }, { chatId: "chat-a" });
+    const second = await store.putAction({ threadId: "thread-b" }, { chatId: "chat-a" });
+    assert.notEqual(first, second);
+    assert.match(first, /^[a-f0-9]{32}$/);
+    assert.equal((await store.getAction(first, { chatId: "chat-a" })).threadId, "thread-a");
+    assert.equal((await store.getAction(second, { chatId: "chat-a" })).threadId, "thread-b");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -234,6 +253,88 @@ test("ThreadStore persists numeric cursors", async () => {
 
     const saved = await ThreadStore.open(statePath);
     assert.equal(saved.getCursor("telegram.update_offset"), 42);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeFileDurable replaces the file through unique temp names and leaves none behind", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+  try {
+    const target = path.join(dir, "sync-buf.txt");
+    // Concurrent writers used to share one fixed `.tmp` path and race on it.
+    await Promise.all(Array.from({ length: 8 }, (_, index) => writeFileDurable(target, `cursor-${index}`)));
+    assert.match(await readFile(target, "utf8"), /^cursor-[0-7]$/);
+    assert.deepEqual(await readdir(dir), ["sync-buf.txt"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Windows sharing locks retry replacement and preserve old bytes on refusal", { skip: process.platform !== "win32", timeout: 30000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-lock-"));
+  const target = path.join(dir, "state.txt");
+  const lockers = [];
+  async function lock() {
+    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      '$file = [System.IO.File]::Open($env:CODEWHALE_TEST_LOCK_FILE, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read); try { [Console]::WriteLine("LOCKED"); [Console]::Out.Flush(); [Console]::ReadLine() | Out-Null } finally { $file.Dispose() }'],
+    { env: { ...process.env, CODEWHALE_TEST_LOCK_FILE: target }, stdio: ["pipe", "pipe", "pipe"] });
+    lockers.push(child);
+    // The child may already have exited when failure cleanup releases its pipe.
+    child.stdin.on("error", () => {});
+    await new Promise((resolve, reject) => {
+      let output = "", errors = "";
+      const timeout = setTimeout(() => reject(new Error(`file lock did not open: ${errors}`)), 10000);
+      child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+      child.once("exit", (code) => { clearTimeout(timeout); reject(new Error(`file lock exited ${code}: ${errors}`)); });
+      child.stderr.on("data", (data) => { errors += data; });
+      child.stdout.on("data", (data) => {
+        output += data;
+        if (output.includes("LOCKED")) { clearTimeout(timeout); resolve(); }
+      });
+    });
+    return child;
+  }
+  try {
+    await writeFileDurable(target, "old");
+    const transient = await lock();
+    const release = setTimeout(() => transient.stdin.end("release\n"), 200);
+    try { await writeFileDurable(target, "new"); } finally { clearTimeout(release); if (!transient.stdin.writableEnded) transient.stdin.end("release\n"); }
+    assert.equal(await readFile(target, "utf8"), "new");
+    assert.deepEqual(await readdir(dir), ["state.txt"]);
+
+    const held = await lock();
+    const started = Date.now();
+    await assert.rejects(writeFileDurable(target, "must-not-publish"), (error) => ["EPERM", "EACCES", "EBUSY"].includes(error.code));
+    assert.ok(Date.now() - started < 10000, "permanent refusal must stay bounded");
+    assert.equal(await readFile(target, "utf8"), "new", "failed publication retains the old record");
+    assert.deepEqual(await readdir(dir), ["state.txt"], "failed publication cleans up its temporary file");
+    held.stdin.end("release\n");
+  } finally {
+    await Promise.all(lockers.map((child) => new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
+      child.once("exit", resolve);
+      if (!child.stdin.writableEnded) child.stdin.end("release\n");
+      child.kill();
+    })));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ThreadStore claims survive a restart: finished messages skip, an in-flight one is reported", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+  try {
+    const statePath = path.join(dir, "thread-map.json");
+    const store = await ThreadStore.open(statePath, { messageLimit: 10 });
+    assert.equal(await store.claimMessage("u:1"), "new");
+    await store.completeMessage("u:1");
+    assert.equal(await store.claimMessage("u:2"), "new");
+    // The process dies here, before completeMessage("u:2").
+    const restarted = await ThreadStore.open(statePath, { messageLimit: 10 });
+    assert.equal(await restarted.claimMessage("u:1"), "done");
+    assert.equal(await restarted.claimMessage("u:2"), "interrupted");
+    assert.equal(await restarted.claimMessage("u:2"), "done", "reported once, then an ordinary duplicate");
+    assert.equal(await restarted.claimMessage("u:3"), "new");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

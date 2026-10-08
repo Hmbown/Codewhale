@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "studio-girl",
+  "name": "Studio whale girl",
+  "columns": 2,
+  "rows": 2,
+  "tileWidth": 672,
+  "tileHeight": 672,
+  "actions": {
+    "idle": {
+      "frames": [
+        0,
+        1
+      ],
+      "durationsMs": [
+        3800,
+        180
+      ],
+      "poster": 0,
+      "repeat": true
+    },
+    "greet": {
+      "frames": [
+        2,
+        3
+      ],
+      "durationsMs": [
+        3800,
+        180
+      ],
+      "poster": 2,
+      "repeat": true
+    }
+  },
+  "states": {
+    "rest": "idle",
+    "listen": "greet"
+  },
+  "views": {
+    "front": "idle"
+  },
+  "atlases": [
+    "page-00.png"
+  ]
+}

@@ -548,7 +548,8 @@ fn primitive_schemas_are_separate_and_small_contract_shaped() {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        ["limit", "offset", "path"]
+        // `max_bytes` is the model-requested per-call output budget (C05).
+        ["limit", "max_bytes", "offset", "path"]
             .into_iter()
             .map(str::to_string)
             .collect()

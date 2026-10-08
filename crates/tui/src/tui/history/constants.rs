@@ -1,10 +1,12 @@
 //! Shared constants for history transcript rendering.
 //!
-//! ## How the live tool-card budgets were chosen
+//! ## Live tool-card budgets
 //!
-//! The caps below were measured, not guessed. The sample is 53 real saved
+//! The general command/output caps were measured against 53 real saved
 //! sessions from `~/.codewhale/sessions` — 5,470 tool results, 4,001 of them
-//! `Bash` (the "run" cards) and 3,777 `Bash` commands.
+//! `Bash` (the "run" cards) and 3,777 `Bash` commands. Successful output uses
+//! a smaller preview to reduce routine transcript noise; the details pager
+//! retains the complete result.
 //!
 //! Observed `Bash` result length, in source lines:
 //! `p25=3  p50=9  p75=25  p90=60  p95=113  max=1161`.
@@ -12,10 +14,10 @@
 //! Observed `Bash` command length: `p50=251 chars`, `p90=1404` — i.e. the
 //! median command is multi-line once wrapped, not a one-liner.
 //!
-//! Each cap sits at the knee of its own coverage curve: the point past which
-//! more rows buy very little more content. Going further chases a long tail
-//! that a single card should never try to hold — that is what the details
-//! pager is for.
+//! General command/output caps sit at the knee of their coverage curves: the
+//! point past which more rows buy very little more content. Going further
+//! chases a long tail that a single card should never try to hold — that is
+//! what the details pager is for.
 
 /// Wrapped rows of the *command* echoed inside a live tool card.
 ///
@@ -25,6 +27,10 @@
 /// more and 10 only 2. At 3 the *median* command was clipped, which is the
 /// "run cards never show enough" complaint at its source.
 pub(super) const TOOL_COMMAND_LINE_LIMIT: usize = 6;
+
+/// Failed generic and MCP results keep a six-row head/tail excerpt.
+/// Full output remains available in the transcript and details pager.
+pub(super) const TOOL_FAILURE_PREVIEW_LINES: usize = 6;
 
 /// Wrapped rows of tool *output* shown in a live card before the details
 /// affordance takes over.
@@ -37,18 +43,11 @@ pub(super) const TOOL_COMMAND_LINE_LIMIT: usize = 6;
 pub(super) const TOOL_OUTPUT_LINE_LIMIT: usize = 20;
 
 /// Rows of output a *successful* live `run` card shows before the details
-/// affordance takes over.
-///
-/// This used to be zero: success collapsed to the bare header, so a card told
-/// you a command finished but nothing at all about what it produced. Against
-/// the sampled corpus (3,465 `Bash` results with no error marker,
-/// `p25=3 p50=8 p75=26`), a six-row preview shows ~45% of successful runs in
-/// their entirety and the opening of the rest. Eight rows would reach ~51%,
-/// but it spends two more rows on *every* successful card, and the transcript
-/// now also spends a separator row between blocks. Failures are unaffected —
-/// they keep the full `TOOL_OUTPUT_LINE_LIMIT` budget, because an error you
-/// cannot read is the expensive one.
-pub(super) const TOOL_SUCCESS_OUTPUT_PREVIEW_LINES: usize = 6;
+/// affordance takes over. Two opening rows and one tail row retain a quick
+/// read on what the command did while keeping routine successes quiet; failures
+/// keep their larger preview budget. The full result remains in the details
+/// transcript.
+pub(super) const TOOL_SUCCESS_OUTPUT_PREVIEW_LINES: usize = 3;
 
 pub(super) const TOOL_TEXT_LIMIT: usize = 300;
 
@@ -85,7 +84,7 @@ pub(super) const ASSISTANT_GLYPH: &str = crate::tui::glyphs::CURRENT;
 /// competing with content.
 pub(super) const TRANSCRIPT_RAIL: &str = crate::tui::glyphs::TRANSCRIPT_RAIL;
 /// Total rendered rows a non-failed tool card keeps when `show_tool_details`
-/// is off — the shipped default, so this is the cap almost every user
+/// is off or calm mode is on — both shipped defaults, so this is the cap a user
 /// actually sees.
 ///
 /// It was an unnamed literal `2`: header plus a single row, then an "expand"
@@ -97,16 +96,5 @@ pub(super) const TRANSCRIPT_RAIL: &str = crate::tui::glyphs::TRANSCRIPT_RAIL;
 /// budget.
 pub(super) const TOOL_SUMMARY_CARD_LINES: usize = 6;
 
-/// Total rendered rows a non-failed tool card keeps in calm mode — also on by
-/// default, and applied *after* the `show_tool_details` summary cap above.
-///
-/// It was 4, i.e. stricter than the summary cap, which inverted the two: a
-/// user who turned tool details *on* while leaving calm mode alone saw fewer
-/// rows than one who left both at their defaults. Calm mode is about quiet,
-/// not about hiding, so it bounds the card at the header plus the full
-/// successful-run preview plus the expand affordance.
-pub(super) const TOOL_CARD_SUMMARY_LINES: usize = TOOL_SUCCESS_OUTPUT_PREVIEW_LINES + 2;
 pub(super) const TOOL_DONE_SYMBOL: &str = crate::tui::glyphs::DONE;
 pub(super) const TOOL_FAILED_SYMBOL: &str = crate::tui::glyphs::FAILED;
-/// Compact Ctrl+B affordance for foreground shell waits in the live transcript.
-pub(super) const FOREGROUND_SHELL_WAIT_HINT: &str = "Ctrl+B → /jobs";

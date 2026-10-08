@@ -10,9 +10,9 @@
 //! - Human-only. This is a slash command, never a model-visible tool, event,
 //!   or authority, and it writes nothing back into App/session/plan/workflow
 //!   state (see the registry/catalog contract test).
-//! - Read-only projection over existing state. Redaction reuses the
-//!   transcript/export seams (`export::redact_json` for values,
-//!   `export::sanitize_text` for keys and status labels, which
+//! - Read-only projection over existing state. Redaction reuses the shared
+//!   sanitizer seams in `codewhale_sanitize::sanitize` (`redact_json` for
+//!   values, `sanitize_text` for keys and status labels, which
 //!   `redact_json` does not reach) plus a strict pass that strips URL
 //!   userinfo/query/fragment entirely and folds the workspace and home
 //!   prefixes to labels, removes other absolute paths, and handles generic
@@ -28,8 +28,8 @@
 //! - It is not a general PII scrubber. Workspace/home paths retain a useful
 //!   labelled suffix; other absolute POSIX, drive-letter, and UNC paths are
 //!   replaced outright.
-//! - Redaction is pattern-based (the export seam's private-key/bearer/JWT/
-//!   URL/secret regexes plus this module's strict URL pass). A secret that
+//! - Redaction is pattern-based (the shared sanitizer's private-key/bearer/
+//!   JWT/URL/secret regexes plus this module's strict URL pass). A secret that
 //!   matches none of those patterns and sits under a non-sensitive key is
 //!   copied as-is.
 //! - Delivery to the clipboard is not confirmed. Terminal-client transports
@@ -38,71 +38,72 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
-use std::path::Path;
 
 use serde_json::{Value, json};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::{Locale, MessageId, tr};
-use crate::models::{ContentBlock, Message};
-use crate::tui::app::App;
-
-use super::CommandResult;
-use super::export::{is_internal_role, is_sensitive_key, redact_json, sanitize_text};
+use codewhale_command_contract::facets::*;
+use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts, CommandHandler};
+use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
+use codewhale_command_contract::outcome::StructcopyCommandResult as CommandResult;
+use codewhale_sanitize::sanitize::{is_sensitive_key, redact_json, sanitize_text};
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "structcopy",
     aliases: &[],
     usage: "/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
-    description_id: MessageId::CmdStructcopyDescription,
+    description_key: "cmd_structcopy_description",
 };
+pub(in crate::commands) const CAPABILITIES: CommandCapabilities =
+    CommandCapabilities::SESSION_STRUCTCOPY.union(CommandCapabilities::PRESENTATION);
 
 pub(in crate::commands) struct StructcopyCmd;
-
-impl RegisterCommand for StructcopyCmd {
+impl RegisterCommand<CommandResult> for StructcopyCmd {
     fn info() -> &'static CommandInfo {
         &COMMAND_INFO
     }
-
-    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        execute_structcopy(app, arg)
+    fn handler() -> CommandHandler<CommandResult> {
+        CommandHandler::Contextual {
+            capabilities: CAPABILITIES,
+            handler: execute_structcopy,
+        }
     }
 }
 
 /// Versioned envelope identity carried in every receipt.
-const SCHEMA_ID: &str = "codewhale/structcopy/v1";
+pub(in crate::commands) const SCHEMA_ID: &str = "codewhale/structcopy/v1";
 /// Redaction contract label so consumers can tell which seams ran.
-const REDACTION_CONTRACT: &str = "export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2";
+pub(in crate::commands) const REDACTION_CONTRACT: &str =
+    "export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2";
 /// Marker substituted for subtrees cut by the depth cap. Structural markers
 /// are inserted after bounding and are intentionally exempt from
 /// `max_string_bytes`; they are still counted as retained bytes.
-const DEPTH_OMISSION_MARKER: &str = "omitted:depth_cap";
+pub(in crate::commands) const DEPTH_OMISSION_MARKER: &str = "omitted:depth_cap";
 /// Marker substituted for a URL token that cannot be parsed and therefore
 /// cannot be proven free of userinfo/query/fragment. Fail closed.
-const URL_OMISSION_MARKER: &str = "redacted:url";
+pub(in crate::commands) const URL_OMISSION_MARKER: &str = "redacted:url";
 /// Marker substituted for an absolute filesystem path outside the labelled
 /// workspace/home roots. Paths are privacy-bearing even when they contain no
 /// conventional secret token.
-const PATH_OMISSION_MARKER: &str = "redacted:absolute_path";
-const BEARER_REDACTION_MARKER: &str = "redacted:bearer";
-const SENSITIVE_VALUE_REDACTION_MARKER: &str = "redacted:sensitive_value";
+pub(in crate::commands) const PATH_OMISSION_MARKER: &str = "redacted:absolute_path";
+pub(in crate::commands) const BEARER_REDACTION_MARKER: &str = "redacted:bearer";
+pub(in crate::commands) const SENSITIVE_VALUE_REDACTION_MARKER: &str = "redacted:sensitive_value";
 
 /// Selectors are echoed into the receipt and into status messages, so they
 /// get their own tight cap independent of the payload string cap.
-const MAX_SELECTOR_BYTES: usize = 256;
+pub(in crate::commands) const MAX_SELECTOR_BYTES: usize = 256;
 /// Hard caps enforced on every emitted artifact. The byte cap stays well
 /// under the OSC 52 clipboard ceiling (100 KiB) so the default clipboard
 /// target always fits its weakest transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Caps {
-    max_output_bytes: usize,
-    max_array_items: usize,
-    max_string_bytes: usize,
-    max_depth: usize,
+pub(in crate::commands) struct Caps {
+    pub(in crate::commands) max_output_bytes: usize,
+    pub(in crate::commands) max_array_items: usize,
+    pub(in crate::commands) max_string_bytes: usize,
+    pub(in crate::commands) max_depth: usize,
 }
 
-const DEFAULT_CAPS: Caps = Caps {
+pub(in crate::commands) const DEFAULT_CAPS: Caps = Caps {
     max_output_bytes: 48 * 1024,
     max_array_items: 64,
     max_string_bytes: 2 * 1024,
@@ -112,10 +113,10 @@ const DEFAULT_CAPS: Caps = Caps {
 /// Object keys are bounded separately from values: they are short by nature,
 /// they participate in collision handling, and they are rewritten once during
 /// redaction rather than per byte-cap retry.
-const MAX_KEY_BYTES: usize = 256;
+pub(in crate::commands) const MAX_KEY_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CopyKind {
+pub(in crate::commands) enum CopyKind {
     Turn(usize),
     Tool(String),
     Plan,
@@ -123,14 +124,17 @@ enum CopyKind {
 }
 
 impl CopyKind {
-    fn display_label(&self, locale: Locale) -> String {
-        let id = match self {
-            CopyKind::Turn(_) => MessageId::CmdStructcopyKindTurn,
-            CopyKind::Tool(_) => MessageId::CmdStructcopyKindTool,
-            CopyKind::Plan => MessageId::CmdStructcopyKindPlan,
-            CopyKind::Workflow(_) => MessageId::CmdStructcopyKindWorkflow,
+    fn display_label(
+        &self,
+        presentation: &dyn CommandPresentationContext,
+    ) -> Result<String, String> {
+        let key = match self {
+            CopyKind::Turn(_) => "cmd_structcopy_kind_turn",
+            CopyKind::Tool(_) => "cmd_structcopy_kind_tool",
+            CopyKind::Plan => "cmd_structcopy_kind_plan",
+            CopyKind::Workflow(_) => "cmd_structcopy_kind_workflow",
         };
-        tr(locale, id).into_owned()
+        presentation.translate(key, &[])
     }
 }
 
@@ -140,47 +144,54 @@ struct CopyRequest {
     stdout: bool,
 }
 
-fn execute_structcopy(app: &mut App, arg: Option<&str>) -> CommandResult {
+pub(in crate::commands) fn execute_structcopy(
+    contexts: CommandContexts<'_>,
+    arg: Option<&str>,
+) -> CommandResult {
+    let parts = contexts.into_parts();
+    let Some(copy) = parts.structcopy else {
+        return CommandResult::error("Command capability unavailable: session_structcopy");
+    };
+    let Some(presentation) = parts.presentation else {
+        return CommandResult::error("Command capability unavailable: presentation");
+    };
+    execute_portable(copy, presentation, arg, &DEFAULT_CAPS).unwrap_or_else(CommandResult::error)
+}
+
+fn execute_portable(
+    copy: &dyn CommandSessionStructcopyContext,
+    presentation: &dyn CommandPresentationContext,
+    arg: Option<&str>,
+    caps: &Caps,
+) -> Result<CommandResult, String> {
     let request = match parse_request(arg) {
         Ok(request) => request,
         Err(()) => {
-            return CommandResult::error(
-                tr(app.ui_locale, MessageId::CmdStructcopyUsageError)
-                    .replace("{usage}", COMMAND_INFO.usage),
-            );
+            return Err(presentation.translate(
+                "cmd_structcopy_usage_error",
+                &[("usage", COMMAND_INFO.usage)],
+            )?);
         }
     };
-    let label = request.kind.display_label(app.ui_locale);
-    let json = match render_copy(app, &request.kind, &DEFAULT_CAPS) {
-        Ok(json) => json,
-        Err(err) => return CommandResult::error(err),
-    };
+    let label = request.kind.display_label(presentation)?;
+    let json = render_copy(copy, presentation, &request.kind, caps)?;
     if request.stdout {
-        // The text view exists only because a human explicitly asked for it;
-        // the default clipboard path never prints the payload.
-        return CommandResult::message(json);
+        return Ok(CommandResult::message(json));
     }
-    // `requires_terminal_paste()` is true only for an SSH session with no
-    // forwarded display, where the sole transport is the terminal client
-    // itself. That write is queued on a background writer, so a successful
-    // return means "accepted for transport", not "in the clipboard".
-    let terminal_client = app.clipboard.requires_terminal_paste();
-    let bytes = json.len();
-    match app.clipboard.write_text(&json) {
-        Ok(()) if terminal_client => CommandResult::message(
-            tr(app.ui_locale, MessageId::CmdStructcopyClipboardQueued)
-                .replace("{kind}", &label)
-                .replace("{bytes}", &bytes.to_string()),
-        ),
-        Ok(()) => CommandResult::message(
-            tr(app.ui_locale, MessageId::CmdStructcopyClipboardAccepted)
-                .replace("{kind}", &label)
-                .replace("{bytes}", &bytes.to_string()),
-        ),
-        Err(err) => CommandResult::error(
-            tr(app.ui_locale, MessageId::CmdStructcopyClipboardFailed)
-                .replace("{error}", &err.to_string()),
-        ),
+    let bytes = json.len().to_string();
+    match copy.write_clipboard(&json) {
+        Ok(transport) => {
+            let key = match transport {
+                StructcopyTransport::Native => "cmd_structcopy_clipboard_accepted",
+                StructcopyTransport::TerminalQueued => "cmd_structcopy_clipboard_queued",
+            };
+            Ok(CommandResult::message(
+                presentation.translate(key, &[("kind", &label), ("bytes", &bytes)])?,
+            ))
+        }
+        Err(error) => {
+            Err(presentation.translate("cmd_structcopy_clipboard_failed", &[("error", &error)])?)
+        }
     }
 }
 
@@ -218,225 +229,114 @@ fn parse_request(arg: Option<&str>) -> Result<CopyRequest, ()> {
 // === Object selection (read-only; unavailable objects are reported, never
 // fabricated) ===
 
-fn build_payload(app: &App, kind: &CopyKind) -> Result<(&'static str, Value, Value), String> {
+fn build_payload(
+    copy: &dyn CommandSessionStructcopyContext,
+    kind: &CopyKind,
+) -> Result<(&'static str, Value, Value), StructcopyError> {
     match kind {
-        CopyKind::Turn(index) => turn_payload(app, *index),
-        CopyKind::Tool(call_id) => tool_payload(app, call_id),
-        CopyKind::Plan => plan_payload(app),
-        CopyKind::Workflow(run_id) => workflow_payload(app, run_id),
-    }
-}
-
-fn turn_payload(app: &App, index: usize) -> Result<(&'static str, Value, Value), String> {
-    if app.api_messages.is_empty() {
-        return Err(unavailable_message(app, &CopyKind::Turn(index)));
-    }
-    let Some(message) = app.api_messages.get(index - 1) else {
-        return Err(unavailable_message(app, &CopyKind::Turn(index)));
-    };
-    Ok(("turn", json!(index), message_payload(message, index)))
-}
-
-fn message_payload(message: &Message, index: usize) -> Value {
-    if is_internal_role(message.role.as_str()) {
-        return json!({
-            "index": index,
-            "role": message.role,
-            "omission_code": "internal_context",
-        });
-    }
-    let content: Vec<Value> = message.content.iter().map(block_payload).collect();
-    json!({
-        "index": index,
-        "role": message.role,
-        "content": content,
-    })
-}
-
-/// JSON `null` is the only truthful encoding for an unknown tri-state flag.
-/// Collapsing `None` to `false` would assert an outcome the session never
-/// observed, so every optional boolean in this projection goes through here.
-fn optional_bool(value: Option<bool>) -> Value {
-    match value {
-        Some(flag) => Value::Bool(flag),
-        None => Value::Null,
-    }
-}
-
-fn block_payload(block: &ContentBlock) -> Value {
-    match block {
-        ContentBlock::Text { text, .. } => json!({
-            "type": "text",
-            "text": text,
-        }),
-        ContentBlock::Thinking { .. } => json!({
-            "type": "thinking",
-            "omission_code": "internal_reasoning_and_signature",
-        }),
-        ContentBlock::ToolUse {
-            id,
-            name,
-            input,
-            caller,
-            ..
-        } => json!({
-            "type": "tool_use",
-            "id": id,
-            // `null` here means "no caller recorded", not "no caller".
-            "caller_type": caller.as_ref().map(|caller| caller.caller_type.as_str()),
-            "name": name,
-            "input": input,
-        }),
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-            content_blocks,
-        } => json!({
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "is_error": optional_bool(*is_error),
-            "content": content,
-            "content_blocks": crate::image_attach::safe_tool_result_content_blocks(content_blocks.as_deref()),
-        }),
-        ContentBlock::ImageUrl { image_url } => {
-            if image_url.url.starts_with("http://") || image_url.url.starts_with("https://") {
-                json!({
-                    "type": "image",
-                    "url": image_url.url,
-                })
-            } else {
-                json!({
-                    "type": "image",
-                    "omission_code": "inline_or_local_image_payload",
-                })
-            }
-        }
-        ContentBlock::ServerToolUse { id, name, input } => json!({
-            "type": "server_tool_use",
-            "id": id,
-            "name": name,
-            "input": input,
-        }),
-        ContentBlock::ToolSearchToolResult {
-            tool_use_id,
-            content,
-        } => json!({
-            "type": "tool_search_tool_result",
-            "tool_use_id": tool_use_id,
-            "content": content,
-        }),
-        ContentBlock::CodeExecutionToolResult {
-            tool_use_id,
-            content,
-        } => json!({
-            "type": "code_execution_tool_result",
-            "tool_use_id": tool_use_id,
-            "content": content,
-        }),
-    }
-}
-
-fn tool_payload(app: &App, call_id: &str) -> Result<(&'static str, Value, Value), String> {
-    let mut found_call: Option<(String, Value)> = None;
-    let mut found_result: Option<(Option<bool>, String, Option<Vec<Value>>)> = None;
-    for message in &app.api_messages {
-        for block in &message.content {
-            match block {
-                ContentBlock::ToolUse {
-                    id, name, input, ..
-                } => {
-                    if id.as_str() == call_id {
-                        found_call = Some((name.clone(), input.clone()));
-                    }
+        CopyKind::Turn(index) => Ok((
+            "turn",
+            json!(index),
+            message_payload(&copy.transcript_item(*index)?),
+        )),
+        CopyKind::Tool(call_id) => {
+            let pair = copy.tool_pair(call_id)?;
+            let result = match pair.result {
+                Some(result) => {
+                    json!({"found":true,"is_error":optional_bool(result.is_error),"content":result.content,"content_blocks":result.content_blocks})
                 }
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    content_blocks,
-                } if tool_use_id.as_str() == call_id => {
-                    found_result = Some((*is_error, content.clone(), content_blocks.clone()));
-                }
-                _ => {}
-            }
+                None => json!({"found":false}),
+            };
+            Ok((
+                "tool",
+                json!(call_id),
+                json!({"call_id":call_id,"name":pair.name,"input":pair.input,"result":result}),
+            ))
         }
-    }
-    let Some((name, input)) = found_call else {
-        return Err(unavailable_message(
-            app,
-            &CopyKind::Tool(call_id.to_string()),
-        ));
-    };
-    let result = match found_result {
-        Some((is_error, content, content_blocks)) => json!({
-            "found": true,
-            // `null` = the result carried no error flag, which is distinct
-            // from `false` (an explicitly successful result).
-            "is_error": optional_bool(is_error),
-            "content": content,
-            "content_blocks": crate::image_attach::safe_tool_result_content_blocks(content_blocks.as_deref()),
-        }),
-        None => json!({
-            "found": false,
-        }),
-    };
-    Ok((
-        "tool",
-        json!(call_id),
-        json!({
-            "call_id": call_id,
-            "name": name,
-            "input": input,
-            "result": result,
-        }),
-    ))
-}
-
-fn plan_payload(app: &App) -> Result<(&'static str, Value, Value), String> {
-    let snapshot = {
-        let state = app
-            .plan_state
-            .try_lock()
-            .map_err(|_| busy_message(app, &CopyKind::Plan))?;
-        state.snapshot()
-    };
-    if snapshot.is_empty() {
-        return Err(unavailable_message(app, &CopyKind::Plan));
-    }
-    let value = serde_json::to_value(&snapshot)
-        .map_err(|err| prepare_failed_message(app, &CopyKind::Plan, &err.to_string()))?;
-    Ok(("plan", Value::Null, value))
-}
-
-fn workflow_payload(app: &App, run_id: &str) -> Result<(&'static str, Value, Value), String> {
-    match crate::tools::workflow::structcopy_run_projection(
-        &app.workspace,
-        run_id,
-        app.current_session_id.as_deref(),
-    ) {
-        Some(value) => Ok(("workflow", json!(run_id), value)),
-        None => Err(unavailable_message(
-            app,
-            &CopyKind::Workflow(run_id.to_string()),
+        CopyKind::Plan => Ok((
+            "plan",
+            Value::Null,
+            serde_json::to_value(copy.plan_snapshot()?)
+                .map_err(|error| StructcopyError::Preparation(error.to_string()))?,
+        )),
+        CopyKind::Workflow(run_id) => Ok((
+            "workflow",
+            json!(run_id),
+            serde_json::to_value(copy.workflow_projection(run_id)?)
+                .map_err(|error| StructcopyError::Preparation(error.to_string()))?,
         )),
     }
 }
 
-fn unavailable_message(app: &App, kind: &CopyKind) -> String {
-    tr(app.ui_locale, MessageId::CmdStructcopyUnavailable)
-        .replace("{kind}", &kind.display_label(app.ui_locale))
+fn message_payload(message: &StructcopyTranscript) -> Value {
+    match &message.content {
+        StructcopyContent::InternalContext => {
+            json!({"index":message.index,"role":message.role,"omission_code":"internal_context"})
+        }
+        StructcopyContent::Visible(blocks) => {
+            json!({"index":message.index,"role":message.role,"content":blocks.iter().map(block_payload).collect::<Vec<_>>()})
+        }
+    }
 }
 
-fn busy_message(app: &App, kind: &CopyKind) -> String {
-    tr(app.ui_locale, MessageId::CmdStructcopyBusy)
-        .replace("{kind}", &kind.display_label(app.ui_locale))
+pub(in crate::commands) fn optional_bool(value: Option<bool>) -> Value {
+    value.map_or(Value::Null, Value::Bool)
 }
 
-fn prepare_failed_message(app: &App, kind: &CopyKind, error: &str) -> String {
-    tr(app.ui_locale, MessageId::CmdStructcopyPrepareFailed)
-        .replace("{kind}", &kind.display_label(app.ui_locale))
-        .replace("{error}", error)
+fn block_payload(block: &StructcopyBlock) -> Value {
+    match block {
+        StructcopyBlock::Text(text) => json!({"type":"text","text":text}),
+        StructcopyBlock::ThinkingOmitted => {
+            json!({"type":"thinking","omission_code":"internal_reasoning_and_signature"})
+        }
+        StructcopyBlock::ToolUse {
+            id,
+            name,
+            input,
+            caller_type,
+        } => json!({"type":"tool_use","id":id,"caller_type":caller_type,"name":name,"input":input}),
+        StructcopyBlock::ToolResult {
+            tool_use_id,
+            result,
+        } => {
+            json!({"type":"tool_result","tool_use_id":tool_use_id,"is_error":optional_bool(result.is_error),"content":result.content,"content_blocks":result.content_blocks})
+        }
+        StructcopyBlock::ImageUrl(url) => json!({"type":"image","url":url}),
+        StructcopyBlock::ImageOmitted => {
+            json!({"type":"image","omission_code":"inline_or_local_image_payload"})
+        }
+        StructcopyBlock::ServerToolUse { id, name, input } => {
+            json!({"type":"server_tool_use","id":id,"name":name,"input":input})
+        }
+        StructcopyBlock::ToolSearchToolResult {
+            tool_use_id,
+            content,
+        } => json!({"type":"tool_search_tool_result","tool_use_id":tool_use_id,"content":content}),
+        StructcopyBlock::CodeExecutionToolResult {
+            tool_use_id,
+            content,
+        } => {
+            json!({"type":"code_execution_tool_result","tool_use_id":tool_use_id,"content":content})
+        }
+    }
+}
+
+fn selection_error(
+    presentation: &dyn CommandPresentationContext,
+    kind: &CopyKind,
+    error: StructcopyError,
+) -> Result<String, String> {
+    let label = kind.display_label(presentation)?;
+    match error {
+        StructcopyError::Unavailable => {
+            presentation.translate("cmd_structcopy_unavailable", &[("kind", &label)])
+        }
+        StructcopyError::Busy => presentation.translate("cmd_structcopy_busy", &[("kind", &label)]),
+        StructcopyError::Preparation(error) => presentation.translate(
+            "cmd_structcopy_prepare_failed",
+            &[("kind", &label), ("error", &error)],
+        ),
+    }
 }
 
 // === Redaction (composed from existing central seams) ===
@@ -471,35 +371,29 @@ fn redact_payload(value: &mut Value, labels: &PathLabels, keys: &mut KeyStats) {
 /// on macOS where `/var` symlinks to `/private/var`) and `$HOME` /
 /// `%USERPROFILE%`. The later strict pass removes every remaining absolute
 /// POSIX, drive-letter, or UNC path.
-struct PathLabels {
+pub(in crate::commands) struct PathLabels {
     /// `(prefix, label)` sorted longest-first so that a workspace nested
     /// inside `$HOME` folds to `<workspace>` rather than `<home>/…`.
-    labels: Vec<(String, &'static str)>,
+    pub(in crate::commands) labels: Vec<(String, &'static str)>,
 }
 
 impl PathLabels {
-    fn new(workspace: &Path) -> Self {
+    pub(in crate::commands) fn new(roots: &StructcopyPathRoots) -> Self {
         let mut workspace_forms: Vec<String> = Vec::new();
-        let literal = workspace.to_string_lossy().into_owned();
-        if literal.len() > 1 {
-            workspace_forms.push(literal);
-        }
-        // Read-only; `canonicalize` never creates state.
-        if let Ok(canonical) = workspace.canonicalize() {
-            let canonical = canonical.to_string_lossy().into_owned();
-            if canonical.len() > 1 && !workspace_forms.contains(&canonical) {
-                workspace_forms.push(canonical);
+        for form in std::iter::once(&roots.workspace).chain(roots.canonical_workspace.iter()) {
+            if form.len() > 1 && !workspace_forms.contains(form) {
+                workspace_forms.push(form.clone());
             }
         }
         let mut labels: Vec<(String, &'static str)> = workspace_forms
             .iter()
             .map(|form| (form.clone(), "<workspace>"))
             .collect();
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            let home = home.to_string_lossy().into_owned();
-            if home.len() > 3 && !workspace_forms.contains(&home) {
-                labels.push((home, "<home>"));
-            }
+        if let Some(home) = &roots.home
+            && home.len() > 3
+            && !workspace_forms.contains(home)
+        {
+            labels.push((home.clone(), "<home>"));
         }
         labels.sort_by(|left, right| {
             right
@@ -511,7 +405,7 @@ impl PathLabels {
         Self { labels }
     }
 
-    fn apply(&self, text: &str) -> String {
+    pub(in crate::commands) fn apply(&self, text: &str) -> String {
         let mut out = text.to_string();
         for (prefix, label) in &self.labels {
             out = replace_path_root(&out, prefix, label);
@@ -709,7 +603,7 @@ fn flatten_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn scrub_string(text: &str, labels: &PathLabels) -> String {
+pub(in crate::commands) fn scrub_string(text: &str, labels: &PathLabels) -> String {
     // `sanitize_text` first: it strips ANSI and control bytes, so the URL
     // scan below cannot be fooled by an escape sequence spliced into a
     // scheme. It is idempotent, so re-running it over values that
@@ -720,7 +614,7 @@ fn scrub_string(text: &str, labels: &PathLabels) -> String {
     scrub_paths(&scrub_urls(&labelled))
 }
 
-/// Convert the prose placeholders owned by the shared export seam into stable
+/// Convert the prose placeholders owned by the shared sanitizer into stable
 /// language-neutral codes. Structural JSON is a machine artifact and must not
 /// change with the UI locale.
 fn normalize_redaction_codes(value: &mut Value) {
@@ -783,7 +677,7 @@ const URL_TRAILING_PUNCTUATION: &[char] = &[
 /// Strip URL userinfo, query, and fragment entirely, leaving a
 /// `scheme://host[:port]/path` label.
 ///
-/// The export seam has already masked credentials in URLs it recognised;
+/// The shared sanitizer has already masked credentials in URLs it recognised;
 /// this pass enforces the stricter structural-copy contract that no
 /// userinfo, query string, or fragment may survive at all — including for
 /// URLs that are punctuation-wrapped (`(https://…)`, `<https://…>`,
@@ -833,7 +727,7 @@ fn next_url_start(text: &str) -> Option<usize> {
 fn scrub_url_token(token: &str) -> String {
     let trimmed = token.trim_end_matches(URL_TRAILING_PUNCTUATION);
     let suffix = &token[trimmed.len()..];
-    let Ok(mut parsed) = reqwest::Url::parse(trimmed) else {
+    let Ok(mut parsed) = url::Url::parse(trimmed) else {
         return format!("{URL_OMISSION_MARKER}{suffix}");
     };
     // `set_username`/`set_password` only fail for cannot-be-a-base URLs.
@@ -901,27 +795,27 @@ fn next_absolute_path_start(text: &str, from: usize) -> Option<usize> {
 // === Bounding (hard caps + exact accounting) ===
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct BoundStats {
+pub(in crate::commands) struct BoundStats {
     /// Strings present in the full redacted tree, at every depth.
-    strings_total: u64,
+    pub(in crate::commands) strings_total: u64,
     /// Strings actually present in the emitted payload, including the
     /// structural markers substituted for depth-omitted subtrees.
-    strings_retained: u64,
-    strings_truncated: u64,
-    string_bytes_original: u64,
-    string_bytes_retained: u64,
+    pub(in crate::commands) strings_retained: u64,
+    pub(in crate::commands) strings_truncated: u64,
+    pub(in crate::commands) string_bytes_original: u64,
+    pub(in crate::commands) string_bytes_retained: u64,
     /// Array elements present in the full redacted tree, at every depth —
     /// including elements inside subtrees that the depth cap later omits.
-    array_items_original: u64,
-    array_items_retained: u64,
-    depth_omissions: u64,
+    pub(in crate::commands) array_items_original: u64,
+    pub(in crate::commands) array_items_retained: u64,
+    pub(in crate::commands) depth_omissions: u64,
 }
 
 /// Exact full-tree original counts. Deliberately depth-unbounded: the
 /// receipt's `*_original` numbers describe the whole redacted object, so
 /// that a subtree removed by the depth cap still shows up in the difference
 /// between original and retained.
-fn collect_original_counts(value: &Value, stats: &mut BoundStats) {
+pub(in crate::commands) fn collect_original_counts(value: &Value, stats: &mut BoundStats) {
     match value {
         Value::String(text) => {
             stats.strings_total += 1;
@@ -1007,7 +901,10 @@ fn omit_for_depth(value: &mut Value, stats: &mut BoundStats, reasons: &mut BTree
 /// emit both content and a truncation marker inside the cap. The honest
 /// answer is the empty string plus `true`: the caller records a truncation,
 /// and no partial content escapes under a cap it does not fit.
-fn truncate_string_grapheme_safe(text: &str, max_bytes: usize) -> (String, bool) {
+pub(in crate::commands) fn truncate_string_grapheme_safe(
+    text: &str,
+    max_bytes: usize,
+) -> (String, bool) {
     if text.len() <= max_bytes {
         return (text.to_string(), false);
     }
@@ -1075,9 +972,17 @@ fn write_canonical(value: &Value, out: &mut String) {
 
 // === Envelope assembly ===
 
-fn render_copy(app: &App, kind: &CopyKind, caps: &Caps) -> Result<String, String> {
-    let (kind_label, mut selector, mut payload) = build_payload(app, kind)?;
-    let labels = PathLabels::new(&app.workspace);
+pub(in crate::commands) fn render_copy(
+    copy: &dyn CommandSessionStructcopyContext,
+    presentation: &dyn CommandPresentationContext,
+    kind: &CopyKind,
+    caps: &Caps,
+) -> Result<String, String> {
+    let (kind_label, mut selector, mut payload) = match build_payload(copy, kind) {
+        Ok(payload) => payload,
+        Err(error) => return Err(selection_error(presentation, kind, error)?),
+    };
+    let labels = PathLabels::new(&copy.path_roots());
 
     // The selector is echoed verbatim into the receipt, so it goes through
     // the same redaction as the payload and gets its own tight byte bound.
@@ -1111,8 +1016,10 @@ fn render_copy(app: &App, kind: &CopyKind, caps: &Caps) -> Result<String, String
     if encoded.len() <= caps.max_output_bytes {
         return Ok(encoded);
     }
-    Err(tr(app.ui_locale, MessageId::CmdStructcopyReceiptTooLarge)
-        .replace("{bytes}", &caps.max_output_bytes.to_string()))
+    Err(presentation.translate(
+        "cmd_structcopy_receipt_too_large",
+        &[("bytes", &caps.max_output_bytes.to_string())],
+    )?)
 }
 
 /// Bound the selector independently of the payload caps. Selectors are
@@ -1237,683 +1144,9 @@ fn caps_value(caps: &Caps) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::models::Role;
-    use crate::models::{ImageUrlContent, ToolCaller};
-    use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
-    use crate::tui::app::TuiOptions;
-    use crate::tui::clipboard::ClipboardHandler;
-    use tempfile::TempDir;
-
-    fn test_app(tmpdir: &TempDir) -> App {
-        let options = TuiOptions {
-            skills_dir: tmpdir.path().join("skills"),
-            memory_path: tmpdir.path().join("memory.md"),
-            notes_path: tmpdir.path().join("notes.txt"),
-            mcp_config_path: tmpdir.path().join("mcp.json"),
-            ..crate::test_support::test_tui_options(tmpdir.path())
-        };
-        let mut app = App::new(options, &Config::default());
-        app.ui_locale = Locale::En;
-        app
-    }
-
-    fn stdout_json(result: &CommandResult) -> String {
-        assert!(!result.is_error, "{:?}", result.message);
-        result.message.clone().expect("stdout payload")
-    }
-
-    fn parsed(json: &str) -> Value {
-        serde_json::from_str(json).expect("structcopy output must be valid JSON")
-    }
-
     fn no_labels() -> PathLabels {
         PathLabels { labels: Vec::new() }
     }
-
-    fn seed_transcript(app: &mut App) {
-        app.api_messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "please run the fetch".to_string(),
-                    cache_control: None,
-                }],
-            },
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Thinking {
-                        thinking: "private chain of thought".to_string(),
-                        signature: Some("signature-secret".to_string()),
-                        state: None,
-                    },
-                    ContentBlock::ToolUse {
-                        id: "call-7".to_string(),
-                        name: "fetch_url".to_string(),
-                        input: json!({
-                            "url": "https://alice:hunter2@example.com/path?token=abc123&ok=1#frag",
-                            "api_key": "literal-api-secret",
-                        }),
-                        caller: Some(ToolCaller {
-                            caller_type: "code_execution_20250825".to_string(),
-                            tool_id: None,
-                        }),
-                        thought_signature: None,
-                    },
-                ],
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call-7".to_string(),
-                    content: "Authorization: Bearer result-secret-token\nfetch ok".to_string(),
-                    is_error: Some(false),
-                    content_blocks: None,
-                }],
-            },
-        ];
-    }
-
-    #[test]
-    fn turn_copy_projects_one_item_and_redacts() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-
-        let json = stdout_json(&execute_structcopy(&mut app, Some("turn 2 stdout")));
-        let value = parsed(&json);
-        assert_eq!(value["receipt"]["schema"], json!(SCHEMA_ID));
-        assert_eq!(value["receipt"]["kind"], json!("turn"));
-        assert_eq!(value["receipt"]["selector"], json!(2));
-        assert_eq!(value["object"]["role"], json!("assistant"));
-        let content = value["object"]["content"].as_array().expect("content");
-        assert_eq!(content[0]["type"], json!("thinking"));
-        assert!(content[0].get("thinking").is_none());
-        assert_eq!(
-            content[0]["omission_code"],
-            json!("internal_reasoning_and_signature")
-        );
-        assert_eq!(content[1]["type"], json!("tool_use"));
-        assert_eq!(content[1]["caller_type"], json!("code_execution_20250825"));
-        for forbidden in [
-            "private chain of thought",
-            "signature-secret",
-            "literal-api-secret",
-            "hunter2",
-            "abc123",
-            "frag",
-        ] {
-            assert!(!json.contains(forbidden), "leaked {forbidden:?}: {json}");
-        }
-        // URL userinfo/query/fragment are stripped outright.
-        assert!(json.contains("https://example.com/path"), "{json}");
-        assert!(json.contains(SENSITIVE_VALUE_REDACTION_MARKER), "{json}");
-        for prose in [
-            "internal context omitted",
-            "internal reasoning and signature omitted",
-            "inline or local image payload omitted",
-            "[redacted private key]",
-            "Bearer [redacted]",
-            "[redacted token]",
-            "[redacted]",
-        ] {
-            assert!(!json.contains(prose), "prose marker {prose:?}: {json}");
-        }
-    }
-
-    #[test]
-    fn generated_omissions_are_language_neutral_codes() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.api_messages = vec![
-            Message {
-                role: Role::System,
-                content: vec![ContentBlock::Text {
-                    text: "must not be copied".to_string(),
-                    cache_control: None,
-                }],
-            },
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::ImageUrl {
-                    image_url: ImageUrlContent {
-                        url: "data:image/png;base64,private".to_string(),
-                    },
-                }],
-            },
-        ];
-
-        let internal = parsed(&stdout_json(&execute_structcopy(
-            &mut app,
-            Some("turn 1 stdout"),
-        )));
-        assert_eq!(
-            internal["object"]["omission_code"],
-            json!("internal_context")
-        );
-        assert!(internal["object"].get("omitted").is_none());
-
-        let image = parsed(&stdout_json(&execute_structcopy(
-            &mut app,
-            Some("turn 2 stdout"),
-        )));
-        assert_eq!(
-            image["object"]["content"][0]["omission_code"],
-            json!("inline_or_local_image_payload")
-        );
-        assert!(image["object"]["content"][0].get("omitted").is_none());
-
-        let english = stdout_json(&execute_structcopy(&mut app, Some("turn 2 stdout")));
-        app.ui_locale = Locale::ZhHans;
-        let chinese_ui = stdout_json(&execute_structcopy(&mut app, Some("turn 2 stdout")));
-        assert_eq!(
-            english, chinese_ui,
-            "machine payload must not vary with the UI locale"
-        );
-    }
-
-    #[test]
-    fn tool_copy_pairs_call_and_result() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-
-        let json = stdout_json(&execute_structcopy(&mut app, Some("tool call-7 stdout")));
-        let value = parsed(&json);
-        assert_eq!(value["receipt"]["kind"], json!("tool"));
-        assert_eq!(value["receipt"]["selector"], json!("call-7"));
-        assert_eq!(value["object"]["name"], json!("fetch_url"));
-        assert_eq!(value["object"]["result"]["found"], json!(true));
-        assert_eq!(value["object"]["result"]["is_error"], json!(false));
-        assert!(!json.contains("result-secret-token"), "{json}");
-
-        // A call without a result is honest, not fabricated.
-        app.api_messages[1].content.push(ContentBlock::ToolUse {
-            id: "call-lonely".to_string(),
-            name: "view_image".to_string(),
-            input: json!({}),
-            caller: None,
-            thought_signature: None,
-        });
-        let json = stdout_json(&execute_structcopy(
-            &mut app,
-            Some("tool call-lonely stdout"),
-        ));
-        let value = parsed(&json);
-        assert_eq!(value["object"]["result"]["found"], json!(false));
-    }
-
-    /// An unknown `Option<bool>` must serialize as JSON `null`. Collapsing it
-    /// to `false` would assert an outcome nothing observed.
-    #[test]
-    fn unknown_optional_booleans_stay_null_and_are_not_dropped() {
-        assert_eq!(optional_bool(None), Value::Null);
-        assert_eq!(optional_bool(Some(false)), Value::Bool(false));
-        assert_eq!(optional_bool(Some(true)), Value::Bool(true));
-
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.api_messages = vec![
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "call-unknown".to_string(),
-                    name: "exec_command".to_string(),
-                    input: json!({}),
-                    // No caller recorded: also an unknown, also null.
-                    caller: None,
-                    thought_signature: None,
-                }],
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call-unknown".to_string(),
-                    content: "no error flag was recorded".to_string(),
-                    is_error: None,
-                    content_blocks: None,
-                }],
-            },
-        ];
-
-        // Tool-pair projection.
-        let json = stdout_json(&execute_structcopy(
-            &mut app,
-            Some("tool call-unknown stdout"),
-        ));
-        let value = parsed(&json);
-        let result = value["object"]["result"].as_object().expect("result");
-        assert!(
-            result.contains_key("is_error"),
-            "the unknown flag must be present, not dropped: {json}"
-        );
-        assert_eq!(result["is_error"], Value::Null);
-        assert_ne!(result["is_error"], json!(false));
-
-        // Turn projection of the same result block, plus the unknown caller.
-        let json = stdout_json(&execute_structcopy(&mut app, Some("turn 2 stdout")));
-        let value = parsed(&json);
-        let block = &value["object"]["content"][0];
-        assert!(
-            block.as_object().expect("block").contains_key("is_error"),
-            "{json}"
-        );
-        assert_eq!(block["is_error"], Value::Null);
-
-        let json = stdout_json(&execute_structcopy(&mut app, Some("turn 1 stdout")));
-        let value = parsed(&json);
-        let block = &value["object"]["content"][0];
-        assert!(
-            block
-                .as_object()
-                .expect("block")
-                .contains_key("caller_type"),
-            "{json}"
-        );
-        assert_eq!(block["caller_type"], Value::Null);
-    }
-
-    #[test]
-    fn plan_copy_snapshots_current_plan() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        {
-            let mut state = app.plan_state.try_lock().expect("plan lock");
-            state.update(UpdatePlanArgs {
-                title: Some("Ship structcopy".to_string()),
-                plan: vec![
-                    PlanItemArg {
-                        step: "Read seams".to_string(),
-                        status: StepStatus::Completed,
-                    },
-                    PlanItemArg {
-                        step: "Copy exactly one object".to_string(),
-                        status: StepStatus::InProgress,
-                    },
-                ],
-                ..Default::default()
-            });
-        }
-
-        let json = stdout_json(&execute_structcopy(&mut app, Some("plan stdout")));
-        let value = parsed(&json);
-        assert_eq!(value["receipt"]["kind"], json!("plan"));
-        assert_eq!(value["object"]["title"], json!("Ship structcopy"));
-        let items = value["object"]["items"].as_array().expect("items");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[1]["status"], json!("in_progress"));
-    }
-
-    #[test]
-    fn workflow_copy_projects_existing_run_without_side_effects() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.current_session_id = Some("structcopy-workflow-test-session".to_string());
-
-        // Unknown run, no state: honest error, and the read must not create
-        // the workflow journal on disk.
-        let missing = execute_structcopy(&mut app, Some("workflow nope stdout"));
-        assert!(missing.is_error);
-        assert!(
-            missing
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("unavailable"),
-            "{:?}",
-            missing.message
-        );
-        assert!(
-            !tmpdir.path().join(".codewhale").exists(),
-            "read-only copy must not create the workflow journal"
-        );
-
-        crate::tools::workflow::structcopy_test_seed_run(
-            tmpdir.path(),
-            "structcopy-test-run-alpha",
-            app.current_session_id
-                .as_deref()
-                .expect("test session identity"),
-        );
-        let json = stdout_json(&execute_structcopy(
-            &mut app,
-            Some("workflow structcopy-test-run-alpha stdout"),
-        ));
-        let value = parsed(&json);
-        assert_eq!(value["receipt"]["kind"], json!("workflow"));
-        assert_eq!(
-            value["object"]["run_id"],
-            json!("structcopy-test-run-alpha")
-        );
-        assert_eq!(value["object"]["status"], json!("running"));
-        assert_eq!(value["object"]["leaf_count"], Value::Null);
-        assert_eq!(value["object"]["branch_count"], Value::Null);
-        assert_eq!(value["object"]["control_count"], Value::Null);
-        assert!(
-            value["object"].get("source_path").is_none(),
-            "filesystem paths must not leave the projection: {json}"
-        );
-
-        let unknown = execute_structcopy(&mut app, Some("workflow nope stdout"));
-        assert!(unknown.is_error);
-        let message = unknown.message.as_deref().unwrap_or_default();
-        assert!(message.contains("unavailable"), "{message}");
-        assert!(
-            !message.contains("structcopy-test-run-alpha"),
-            "unavailable errors must not enumerate private run ids: {message}"
-        );
-    }
-
-    #[test]
-    fn unavailable_selectors_are_reported_not_fabricated() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-
-        let empty_turn = execute_structcopy(&mut app, Some("turn 1 stdout"));
-        assert!(empty_turn.is_error);
-        assert!(
-            empty_turn
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("unavailable"),
-            "{:?}",
-            empty_turn.message
-        );
-
-        let empty_plan = execute_structcopy(&mut app, Some("plan stdout"));
-        assert!(empty_plan.is_error);
-        assert!(
-            empty_plan
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("unavailable"),
-            "{:?}",
-            empty_plan.message
-        );
-
-        seed_transcript(&mut app);
-        let out_of_range = execute_structcopy(&mut app, Some("turn 99 stdout"));
-        assert!(out_of_range.is_error);
-        assert!(
-            out_of_range
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("unavailable"),
-            "{:?}",
-            out_of_range.message
-        );
-
-        let missing_tool = execute_structcopy(&mut app, Some("tool call-nope stdout"));
-        assert!(missing_tool.is_error);
-        assert!(
-            missing_tool
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("unavailable"),
-            "{:?}",
-            missing_tool.message
-        );
-
-        for bad in [
-            None,
-            Some(""),
-            Some("turn 0"),
-            Some("turn x"),
-            Some("turn -1"),
-            Some("turn 99999999999999999999999999"),
-            Some("plan extra"),
-            Some("tool"),
-            Some("workflow"),
-            Some("stdout"),
-            Some("   "),
-        ] {
-            let result = execute_structcopy(&mut app, bad);
-            assert!(result.is_error, "{bad:?}: {:?}", result.message);
-        }
-    }
-
-    #[test]
-    fn command_feedback_uses_the_active_locale() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.ui_locale = Locale::ZhHans;
-
-        let invalid = execute_structcopy(&mut app, Some("unknown"));
-        assert!(invalid.is_error);
-        let expected = tr(Locale::ZhHans, MessageId::CmdStructcopyUsageError)
-            .replace("{usage}", COMMAND_INFO.usage);
-        assert!(
-            invalid
-                .message
-                .as_deref()
-                .is_some_and(|message| message.ends_with(&expected)),
-            "{:?}",
-            invalid.message
-        );
-
-        let unavailable = execute_structcopy(&mut app, Some("plan stdout"));
-        assert!(unavailable.is_error);
-        let expected = tr(Locale::ZhHans, MessageId::CmdStructcopyUnavailable).replace(
-            "{kind}",
-            &tr(Locale::ZhHans, MessageId::CmdStructcopyKindPlan),
-        );
-        assert!(
-            unavailable
-                .message
-                .as_deref()
-                .is_some_and(|message| message.ends_with(&expected)),
-            "{:?}",
-            unavailable.message
-        );
-    }
-
-    /// An unavailable selector is never echoed. An available selector is
-    /// scrubbed and bounded in both the receipt and copied object.
-    #[test]
-    fn hostile_selectors_are_redacted_and_bounded_everywhere() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        let workspace = tmpdir.path().to_string_lossy().into_owned();
-        seed_transcript(&mut app);
-
-        // Unavailable selector: no attacker-influenced bytes are echoed.
-        let hostile = format!(
-            "\u{1b}[31mred\u{1b}[0m-Bearer-abcdef1234567890-https://u:p@evil.test/x?k=v#f-{workspace}-{}",
-            "A".repeat(4096)
-        );
-        let result = execute_structcopy(&mut app, Some(&format!("tool {hostile} stdout")));
-        assert!(result.is_error);
-        let message = result.message.as_deref().unwrap_or_default();
-        assert!(message.len() < 400, "status message unbounded: {message}");
-        for forbidden in [
-            "\u{1b}[31m",
-            "abcdef1234567890",
-            "u:p@evil.test",
-            "k=v",
-            workspace.as_str(),
-        ] {
-            assert!(
-                !message.contains(forbidden),
-                "leaked {forbidden:?}: {message}"
-            );
-        }
-        assert!(!message.contains('\n'), "status label must be one line");
-        assert!(message.contains("unavailable"), "{message}");
-
-        // Receipt path: a long but *available* selector is bounded too.
-        let long_id = format!("call-{}", "z".repeat(4096));
-        app.api_messages[1].content.push(ContentBlock::ToolUse {
-            id: long_id.clone(),
-            name: "exec_command".to_string(),
-            input: json!({}),
-            caller: None,
-            thought_signature: None,
-        });
-        let json = stdout_json(&execute_structcopy(
-            &mut app,
-            Some(&format!("tool {long_id} stdout")),
-        ));
-        let value = parsed(&json);
-        let selector = value["receipt"]["selector"].as_str().expect("selector");
-        assert!(
-            selector.len() <= MAX_SELECTOR_BYTES,
-            "selector {} bytes exceeds the {MAX_SELECTOR_BYTES}-byte cap",
-            selector.len()
-        );
-        assert!(selector.ends_with('…'), "{selector}");
-
-        // Composer selectors cannot contain a whitespace-delimited `Bearer`
-        // header, so delimiter-shaped bearer tokens are scrubbed too.
-        for bearer_id in [
-            "call-Bearer-abcdef1234567890",
-            "call-Bearer=zyxwvutsrqponmlk",
-        ] {
-            app.api_messages[1].content.push(ContentBlock::ToolUse {
-                id: bearer_id.to_string(),
-                name: "exec_command".to_string(),
-                input: json!({}),
-                caller: None,
-                thought_signature: None,
-            });
-            let json = stdout_json(&execute_structcopy(
-                &mut app,
-                Some(&format!("tool {bearer_id} stdout")),
-            ));
-            assert!(!json.contains("abcdef1234567890"), "{json}");
-            assert!(!json.contains("zyxwvutsrqponmlk"), "{json}");
-            assert!(json.contains(BEARER_REDACTION_MARKER), "{json}");
-        }
-    }
-
-    /// Object keys are attacker-influenced too (a model can name a tool-input
-    /// field anything). Keys must be sanitized, bounded, and de-collided
-    /// deterministically without dropping a value.
-    #[test]
-    fn hostile_object_keys_are_scrubbed_bounded_and_deduped_deterministically() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        let workspace = tmpdir.path().to_string_lossy().into_owned();
-
-        // Three keys that collapse onto the same bounded form, one key with
-        // ANSI + newlines, and one key carrying a workspace path.
-        let long_a = format!("k{}A", "x".repeat(MAX_KEY_BYTES));
-        let long_b = format!("k{}B", "x".repeat(MAX_KEY_BYTES));
-        let long_c = format!("k{}C", "x".repeat(MAX_KEY_BYTES));
-        let input = json!({
-            long_a.clone(): 1,
-            long_b.clone(): 2,
-            long_c.clone(): 3,
-            "\u{1b}[31mansi\u{1b}[0m\nkey": 4,
-            format!("at {workspace}/src"): 5,
-        });
-        app.api_messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call-keys".to_string(),
-                name: "exec_command".to_string(),
-                input,
-                caller: None,
-                thought_signature: None,
-            }],
-        }];
-
-        let first = stdout_json(&execute_structcopy(&mut app, Some("tool call-keys stdout")));
-        let second = stdout_json(&execute_structcopy(&mut app, Some("tool call-keys stdout")));
-        assert_eq!(
-            first, second,
-            "key collision handling must be deterministic"
-        );
-
-        let value = parsed(&first);
-        let object = value["object"]["input"].as_object().expect("input");
-        // No value is lost to a collision.
-        assert_eq!(object.len(), 5, "{object:?}");
-        let mut values: Vec<u64> = object
-            .values()
-            .map(|item| item.as_u64().expect("number"))
-            .collect();
-        values.sort_unstable();
-        assert_eq!(values, vec![1, 2, 3, 4, 5]);
-
-        for key in object.keys() {
-            assert!(
-                key.len() <= MAX_KEY_BYTES,
-                "key {} bytes exceeds the {MAX_KEY_BYTES}-byte cap",
-                key.len()
-            );
-            assert!(!key.contains('\u{1b}'), "ANSI survived in key {key:?}");
-            assert!(!key.contains('\n'), "newline survived in key {key:?}");
-            assert!(!key.contains(&workspace), "workspace path in key {key:?}");
-        }
-        assert!(
-            object.keys().any(|key| key.contains("<workspace>")),
-            "{object:?}"
-        );
-
-        let counts = &value["receipt"]["counts"];
-        assert_eq!(
-            counts["object_keys_original"],
-            counts["object_keys_retained"]
-        );
-        assert_eq!(counts["object_keys_truncated"], json!(3));
-        assert!(
-            counts["object_keys_deduped"].as_u64().expect("deduped") >= 2,
-            "{counts}"
-        );
-        let reasons = value["receipt"]["reasons"].as_array().expect("reasons");
-        assert!(
-            reasons.contains(&json!("object_key_bytes_cap")),
-            "{reasons:?}"
-        );
-        assert!(
-            reasons.contains(&json!("object_key_collision")),
-            "{reasons:?}"
-        );
-    }
-
-    #[test]
-    fn sensitive_keys_are_classified_after_control_and_ansi_normalization() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call-obfuscated-keys".to_string(),
-                name: "exec_command".to_string(),
-                input: json!({
-                    "api\u{1b}[31m_key": "plain-value-that-must-not-leak",
-                    "pass\u{7}word": "another-plain-value-that-must-not-leak",
-                }),
-                caller: None,
-                thought_signature: None,
-            }],
-        }];
-
-        let json = stdout_json(&execute_structcopy(
-            &mut app,
-            Some("tool call-obfuscated-keys stdout"),
-        ));
-        assert!(!json.contains("plain-value-that-must-not-leak"), "{json}");
-        assert!(
-            !json.contains("another-plain-value-that-must-not-leak"),
-            "{json}"
-        );
-        let value = parsed(&json);
-        assert_eq!(
-            value["object"]["input"]["api_key"],
-            json!(SENSITIVE_VALUE_REDACTION_MARKER)
-        );
-        assert_eq!(
-            value["object"]["input"]["password"],
-            json!(SENSITIVE_VALUE_REDACTION_MARKER)
-        );
-    }
-
     /// `unique_object_key` must terminate and preserve every value even when
     /// the key cap leaves no room at all for a base.
     #[test]
@@ -1941,125 +1174,6 @@ mod tests {
         assert_eq!(decimal_width(10), 2);
         assert_eq!(decimal_width(999), 3);
         assert_eq!(decimal_width(1000), 4);
-    }
-
-    #[test]
-    fn collision_suffix_reserve_reports_its_own_truncation() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        let exact = "x".repeat(MAX_KEY_BYTES);
-        let same_after_flatten = format!("{exact}\n");
-        app.api_messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call-reserve".to_string(),
-                name: "exec_command".to_string(),
-                input: json!({exact: 1, same_after_flatten: 2}),
-                caller: None,
-                thought_signature: None,
-            }],
-        }];
-
-        let json = stdout_json(&execute_structcopy(
-            &mut app,
-            Some("tool call-reserve stdout"),
-        ));
-        let value = parsed(&json);
-        let input = value["object"]["input"].as_object().expect("input");
-        assert_eq!(input.len(), 2);
-        assert!(input.keys().all(|key| key.len() <= MAX_KEY_BYTES));
-        let counts = &value["receipt"]["counts"];
-        assert_eq!(counts["object_keys_deduped"], json!(1));
-        assert_eq!(counts["object_keys_truncated"], json!(1));
-        let reasons = value["receipt"]["reasons"].as_array().expect("reasons");
-        assert!(
-            reasons.contains(&json!("object_key_collision")),
-            "{reasons:?}"
-        );
-        assert!(
-            reasons.contains(&json!("object_key_bytes_cap")),
-            "{reasons:?}"
-        );
-    }
-
-    #[test]
-    fn output_is_deterministic_with_recursively_sorted_keys() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-
-        let first = stdout_json(&execute_structcopy(&mut app, Some("tool call-7 stdout")));
-        let second = stdout_json(&execute_structcopy(&mut app, Some("tool call-7 stdout")));
-        assert_eq!(first, second, "output must be byte-for-byte deterministic");
-
-        let value = parsed(&first);
-        let top: Vec<&str> = value
-            .as_object()
-            .expect("object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(top, ["object", "receipt"]);
-        let receipt: Vec<&String> = value["receipt"]
-            .as_object()
-            .expect("receipt")
-            .keys()
-            .collect();
-        let mut sorted = receipt.clone();
-        sorted.sort();
-        assert_eq!(receipt, sorted, "receipt keys must be sorted");
-        let counts: Vec<&String> = value["receipt"]["counts"]
-            .as_object()
-            .expect("counts")
-            .keys()
-            .collect();
-        let mut sorted_counts = counts.clone();
-        sorted_counts.sort();
-        assert_eq!(counts, sorted_counts, "counts keys must be sorted");
-        let object: Vec<&String> = value["object"]
-            .as_object()
-            .expect("object")
-            .keys()
-            .collect();
-        let mut sorted_object = object.clone();
-        sorted_object.sort();
-        assert_eq!(object, sorted_object, "object keys must be sorted");
-    }
-
-    #[test]
-    fn hostile_content_is_redacted_before_serialization() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        let workspace = tmpdir.path().to_string_lossy().into_owned();
-        app.api_messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: format!(
-                    "escaped \\\"api_key\\\": \\\"sk-escapedsecret99\\\"\n\
-                     bearer: Bearer abcdef1234567890\n\
-                     jwt eyJhbGciOiJIUzI1NiIsFAKE.eyJGQUtFIjoiZml4dHVyZSJ9.FAKEFIXTURESIGNATUREnotasecret000\n\
-                     url https://bob:s3cret@example.com/deep?session_token=xyz&ok=1#section\n\
-                     path {workspace}/src/main.rs"
-                ),
-                cache_control: None,
-            }],
-        }];
-
-        let json = stdout_json(&execute_structcopy(&mut app, Some("turn 1 stdout")));
-        for forbidden in [
-            "sk-escapedsecret99",
-            "abcdef1234567890",
-            "eyJhbGciOiJIUzI1NiIs",
-            "s3cret",
-            "session_token=xyz",
-            "section",
-            workspace.as_str(),
-        ] {
-            assert!(!json.contains(forbidden), "leaked {forbidden:?}: {json}");
-        }
-        assert!(json.contains("https://example.com/deep"), "{json}");
-        assert!(json.contains("<workspace>/src/main.rs"), "{json}");
-        assert!(parsed(&json).is_object());
     }
 
     /// URLs do not arrive as tidy whitespace-delimited tokens. Wrapped,
@@ -2149,72 +1263,6 @@ mod tests {
         );
     }
 
-    /// Workspace/home paths retain useful labels. Every other absolute POSIX,
-    /// drive-letter, and UNC path is removed from copied values.
-    #[test]
-    fn path_labels_preserve_known_roots_and_scrub_every_other_absolute_path() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let workspace = tmpdir.path().to_path_buf();
-        let labels = PathLabels::new(&workspace);
-        let literal = workspace.to_string_lossy().into_owned();
-
-        let folded = labels.apply(&format!("open {literal}/src/main.rs now"));
-        assert_eq!(folded, "open <workspace>/src/main.rs now");
-        assert!(!folded.contains(&literal));
-        assert_eq!(
-            scrub_string(&format!("open {literal}/src/main.rs now"), &labels),
-            "open <workspace>/src/main.rs now"
-        );
-
-        // The canonical form folds too (macOS /var -> /private/var).
-        if let Ok(canonical) = workspace.canonicalize() {
-            let canonical = canonical.to_string_lossy().into_owned();
-            let folded = labels.apply(&format!("open {canonical}/src/main.rs"));
-            assert_eq!(folded, "open <workspace>/src/main.rs");
-        }
-
-        // Repeated occurrences all fold, not just the first.
-        let folded = labels.apply(&format!("{literal}/a and {literal}/b"));
-        assert_eq!(folded, "<workspace>/a and <workspace>/b");
-
-        // Prefix folding itself only handles known roots; the composed scrub
-        // removes every foreign absolute path before serialization.
-        let foreign = "/opt/other/place/file.txt";
-        assert_eq!(labels.apply(foreign), foreign);
-        assert_eq!(scrub_string(foreign, &labels), PATH_OMISSION_MARKER);
-        assert_eq!(
-            scrub_string(r"C:\Users\customer\secret.txt", &labels),
-            PATH_OMISSION_MARKER
-        );
-        assert_eq!(
-            scrub_string(r"\\server\private\customer.txt", &labels),
-            PATH_OMISSION_MARKER
-        );
-        let spaced = scrub_string(
-            "open /Volumes/Client Name/private file.txt then continue\nsecond line",
-            &labels,
-        );
-        assert_eq!(spaced, format!("open {PATH_OMISSION_MARKER}\nsecond line"));
-
-        // A workspace nested inside $HOME folds to <workspace>, not <home>.
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = home.to_string_lossy().into_owned();
-            if home.len() > 3 {
-                let nested = PathLabels::new(Path::new(&format!("{home}/nested/ws")));
-                let folded = nested.apply(&format!("{home}/nested/ws/src"));
-                assert_eq!(folded, "<workspace>/src");
-                assert_eq!(
-                    nested.apply(&format!("{home}/elsewhere")),
-                    "<home>/elsewhere"
-                );
-                assert_eq!(
-                    scrub_string(&format!("{home}/elsewhere/file.rs"), &nested),
-                    "<home>/elsewhere/file.rs"
-                );
-            }
-        }
-    }
-
     #[test]
     fn path_labels_require_component_boundaries_and_preserve_repeated_roots() {
         let labels = PathLabels {
@@ -2256,611 +1304,199 @@ mod tests {
         }
     }
 
-    #[test]
-    fn absolute_paths_are_scrubbed_from_values_keys_and_selectors() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        let call_id = "call=/opt/customer/private-id";
-        app.api_messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: call_id.to_string(),
-                name: "exec_command".to_string(),
-                input: json!({
-                    "/Volumes/ClientSecret/source.rs": "open C:\\Users\\customer\\secret.txt",
-                    "unc": r"\\server\private\customer.txt",
-                }),
-                caller: None,
-                thought_signature: None,
-            }],
-        }];
-
-        let json = stdout_json(&execute_structcopy(
-            &mut app,
-            Some(&format!("tool {call_id} stdout")),
-        ));
-        for forbidden in [
-            "/opt/customer/private-id",
-            "/Volumes/ClientSecret/source.rs",
-            r"C:\Users\customer\secret.txt",
-            r"\\server\private\customer.txt",
-            "ClientSecret",
-            "customer",
-        ] {
-            assert!(!json.contains(forbidden), "leaked {forbidden:?}: {json}");
-        }
-        assert!(json.contains(PATH_OMISSION_MARKER), "{json}");
+    struct RecordingCopy {
+        events: std::cell::RefCell<Vec<String>>,
+        error: Option<StructcopyError>,
+        transport: Result<StructcopyTransport, String>,
     }
-
-    #[test]
-    fn string_bytes_cap_truncates_grapheme_safely() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "emoji cluster test: 👨‍👩‍👧‍👦🏳️‍🌈 repeated many times over".repeat(20),
-                cache_control: None,
-            }],
-        }];
-        let caps = Caps {
-            max_string_bytes: 40,
-            ..DEFAULT_CAPS
-        };
-        let json = render_copy(&app, &CopyKind::Turn(1), &caps).expect("render");
-        let value = parsed(&json);
-        let text = value["object"]["content"][0]["text"]
-            .as_str()
-            .expect("text");
-        assert!(text.ends_with('…'), "{text}");
-        assert!(text.len() <= 40, "{} bytes", text.len());
-        assert_eq!(value["receipt"]["counts"]["strings_truncated"], json!(1));
-        assert_eq!(value["receipt"]["reasons"], json!(["string_bytes_cap"]));
-        let original = value["receipt"]["counts"]["string_bytes_original"]
-            .as_u64()
-            .expect("original");
-        let retained = value["receipt"]["counts"]["string_bytes_retained"]
-            .as_u64()
-            .expect("retained");
-        assert!(original > retained);
-    }
-
-    /// A cap below the ellipsis's own 3 bytes has no representable
-    /// "truncated" form. It must stay in-bounds and stay honest rather than
-    /// panic, overflow, or emit partial content.
-    #[test]
-    fn string_cap_below_the_ellipsis_is_safe() {
-        for max_bytes in 0..=4usize {
-            for text in ["", "a", "ab", "abc", "abcd", "é", "👨‍👩‍👧‍👦", "héllo wörld"]
-            {
-                let (out, truncated) = truncate_string_grapheme_safe(text, max_bytes);
-                assert!(
-                    out.len() <= max_bytes.max(text.len()),
-                    "cap {max_bytes} text {text:?} -> {out:?}"
-                );
-                if text.len() <= max_bytes {
-                    assert!(!truncated);
-                    assert_eq!(out, text);
-                } else {
-                    assert!(truncated, "cap {max_bytes} text {text:?}");
-                    assert!(
-                        out.len() <= max_bytes,
-                        "cap {max_bytes} text {text:?} -> {} bytes",
-                        out.len()
-                    );
-                    if max_bytes < 3 {
-                        assert!(
-                            out.is_empty(),
-                            "no partial content may escape below the marker size: {out:?}"
-                        );
-                    } else {
-                        assert!(out.ends_with('…'), "cap {max_bytes} -> {out:?}");
-                    }
-                }
-                assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    impl RecordingCopy {
+        fn new() -> Self {
+            Self {
+                events: Default::default(),
+                error: None,
+                transport: Ok(StructcopyTransport::Native),
             }
         }
-
-        // End to end: the whole pipeline survives a sub-ellipsis cap and the
-        // receipt still reports the truncation.
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "a longer body that cannot fit".to_string(),
-                cache_control: None,
-            }],
-        }];
-        let caps = Caps {
-            max_string_bytes: 1,
-            ..DEFAULT_CAPS
-        };
-        let json = render_copy(&app, &CopyKind::Turn(1), &caps).expect("render");
-        let value = parsed(&json);
-        assert_eq!(value["object"]["content"][0]["text"], json!(""));
-        assert!(
-            value["receipt"]["counts"]["strings_truncated"]
-                .as_u64()
-                .expect("truncated")
-                >= 1
-        );
-    }
-
-    #[test]
-    fn array_items_cap_counts_original_and_retained_exactly() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let app = test_app(&tmpdir);
-        {
-            let mut state = app.plan_state.try_lock().expect("plan lock");
-            state.update(UpdatePlanArgs {
-                plan: (0..10)
-                    .map(|index| PlanItemArg {
-                        step: format!("step {index}"),
-                        status: StepStatus::Pending,
-                    })
-                    .collect(),
-                ..Default::default()
-            });
+        fn observe(&self, event: String) -> Result<(), StructcopyError> {
+            self.events.borrow_mut().push(event);
+            self.error.clone().map_or(Ok(()), Err)
         }
-        let caps = Caps {
-            max_array_items: 3,
-            ..DEFAULT_CAPS
-        };
-        let json = render_copy(&app, &CopyKind::Plan, &caps).expect("render");
-        let value = parsed(&json);
-        assert_eq!(value["object"]["items"].as_array().expect("items").len(), 3);
-        assert_eq!(
-            value["receipt"]["counts"]["array_items_original"],
-            json!(10)
-        );
-        assert_eq!(value["receipt"]["counts"]["array_items_retained"], json!(3));
-        assert_eq!(value["receipt"]["reasons"], json!(["array_items_cap"]));
     }
-
-    #[test]
-    fn depth_cap_omits_deep_subtrees() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call-deep".to_string(),
-                name: "exec_command".to_string(),
-                input: json!({"a": {"b": {"c": {"d": {"e": "too deep"}}}}}),
-                caller: None,
-                thought_signature: None,
-            }],
-        }];
-        let caps = Caps {
-            max_depth: 3,
-            ..DEFAULT_CAPS
-        };
-        let json =
-            render_copy(&app, &CopyKind::Tool("call-deep".to_string()), &caps).expect("render");
-        let value = parsed(&json);
-        assert!(json.contains(DEPTH_OMISSION_MARKER), "{json}");
-        assert!(!json.contains("too deep"), "{json}");
-        let omissions = value["receipt"]["counts"]["depth_omissions"]
-            .as_u64()
-            .expect("omissions");
-        assert!(omissions >= 1, "{omissions}");
-        assert!(
-            value["receipt"]["reasons"]
-                .as_array()
-                .expect("reasons")
-                .contains(&json!("depth_cap"))
-        );
-    }
-
-    /// The original counts describe the full redacted tree; the retained
-    /// counts describe exactly what was emitted, marker strings included.
-    /// Both must be checkable against the artifact itself.
-    #[test]
-    fn counts_stay_exact_across_a_depth_omission() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        // Two strings and two array items live below the depth cut, plus one
-        // string and one array item above it.
-        app.api_messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call-counts".to_string(),
-                name: "exec_command".to_string(),
-                input: json!({
-                    "shallow": ["kept"],
-                    "deep": {"one": {"two": ["cut-a", "cut-b"]}},
-                }),
-                caller: None,
-                thought_signature: None,
-            }],
-        }];
-        let caps = Caps {
-            max_depth: 3,
-            ..DEFAULT_CAPS
-        };
-        let json =
-            render_copy(&app, &CopyKind::Tool("call-counts".to_string()), &caps).expect("render");
-        let value = parsed(&json);
-        let counts = &value["receipt"]["counts"];
-
-        // Independently recount the emitted object and compare.
-        let mut emitted = BoundStats::default();
-        collect_original_counts(&value["object"], &mut emitted);
-        assert_eq!(
-            counts["strings_retained"].as_u64().expect("retained"),
-            emitted.strings_total,
-            "retained string count must match the emitted artifact: {json}"
-        );
-        assert_eq!(
-            counts["string_bytes_retained"]
-                .as_u64()
-                .expect("retained bytes"),
-            emitted.string_bytes_original,
-            "retained bytes must include the depth marker: {json}"
-        );
-        assert_eq!(
-            counts["array_items_retained"].as_u64().expect("items"),
-            emitted.array_items_original,
-            "{json}"
-        );
-
-        // Originals cover the *whole* tree, including the omitted subtree.
-        assert!(
-            counts["strings_total"].as_u64().expect("total")
-                > counts["strings_retained"].as_u64().expect("retained"),
-            "originals must count strings under the depth cut: {counts}"
-        );
-        assert!(
-            counts["array_items_original"].as_u64().expect("original")
-                > counts["array_items_retained"].as_u64().expect("retained"),
-            "originals must count array items under the depth cut: {counts}"
-        );
-        assert_eq!(counts["depth_omissions"], json!(1));
-        assert!(
-            counts["object_keys_original"]
-                .as_u64()
-                .expect("original keys")
-                > counts["object_keys_retained"]
-                    .as_u64()
-                    .expect("retained keys"),
-            "keys under the depth cut must be original-only: {counts}"
-        );
-    }
-
-    #[test]
-    fn omitted_key_transformations_do_not_claim_emitted_reasons() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        let long_a = format!("{}A", "private-key-name-".repeat(32));
-        let long_b = format!("{}B", "private-key-name-".repeat(32));
-        app.api_messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call-deep-keys".to_string(),
-                name: "exec_command".to_string(),
-                input: json!({"deep": {"one": {long_a: 1, long_b: 2}}}),
-                caller: None,
-                thought_signature: None,
-            }],
-        }];
-        let caps = Caps {
-            max_depth: 3,
-            ..DEFAULT_CAPS
-        };
-        let json = render_copy(&app, &CopyKind::Tool("call-deep-keys".to_string()), &caps)
-            .expect("render");
-        let value = parsed(&json);
-        let counts = &value["receipt"]["counts"];
-        assert!(
-            counts["object_keys_original"].as_u64().expect("original")
-                > counts["object_keys_retained"].as_u64().expect("retained"),
-            "{counts}"
-        );
-        assert_eq!(counts["object_keys_truncated"], json!(0));
-        assert_eq!(counts["object_keys_deduped"], json!(0));
-        let reasons = value["receipt"]["reasons"].as_array().expect("reasons");
-        assert!(
-            !reasons.contains(&json!("object_key_bytes_cap")),
-            "{reasons:?}"
-        );
-        assert!(
-            !reasons.contains(&json!("object_key_collision")),
-            "{reasons:?}"
-        );
-    }
-
-    #[test]
-    fn output_bytes_cap_omits_payload_then_fails_closed() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        {
-            let mut state = app.plan_state.try_lock().expect("plan lock");
-            state.update(UpdatePlanArgs {
-                title: Some("large plan".to_string()),
-                plan: (0..60)
-                    .map(|index| PlanItemArg {
-                        step: format!("step {index}: {}", "padding ".repeat(40)),
-                        status: StepStatus::Pending,
-                    })
-                    .collect(),
-                ..Default::default()
-            });
+    impl CommandSessionStructcopyContext for RecordingCopy {
+        fn transcript_item(&self, index: usize) -> Result<StructcopyTranscript, StructcopyError> {
+            self.observe(format!("turn:{index}"))?;
+            Ok(StructcopyTranscript {
+                index,
+                role: "user".into(),
+                content: StructcopyContent::Visible(vec![StructcopyBlock::Text("visible".into())]),
+            })
         }
+        fn tool_pair(&self, id: &str) -> Result<StructcopyToolPair, StructcopyError> {
+            self.observe(format!("tool:{id}"))?;
+            Ok(StructcopyToolPair {
+                name: "fetch".into(),
+                input: json!({"api_key":"private"}),
+                result: None,
+            })
+        }
+        fn plan_snapshot(&self) -> Result<StructcopyPlan, StructcopyError> {
+            self.observe("plan".into())?;
+            Ok(StructcopyPlan {
+                title: Some("plan".into()),
+                ..Default::default()
+            })
+        }
+        fn workflow_projection(&self, id: &str) -> Result<StructcopyWorkflow, StructcopyError> {
+            self.observe(format!("workflow:{id}"))?;
+            Err(StructcopyError::Unavailable)
+        }
+        fn path_roots(&self) -> StructcopyPathRoots {
+            self.events.borrow_mut().push("roots".into());
+            StructcopyPathRoots {
+                workspace: "/work".into(),
+                canonical_workspace: None,
+                home: None,
+            }
+        }
+        fn write_clipboard(&self, text: &str) -> Result<StructcopyTransport, String> {
+            let payload: Value =
+                serde_json::from_str(text).expect("only rendered JSON may reach clipboard");
+            assert_eq!(payload["receipt"]["schema"], SCHEMA_ID);
+            assert!(!text.contains("private"));
+            self.events.borrow_mut().push("clipboard".into());
+            self.transport.clone()
+        }
+    }
+    struct Labels;
+    impl CommandPresentationContext for Labels {
+        fn translate(&self, key: &str, _: &[(&str, &str)]) -> Result<String, String> {
+            Ok(key.into())
+        }
+    }
 
-        // Tight byte cap: payload must be omitted while the receipt survives.
-        let caps = Caps {
-            max_output_bytes: 2 * 1024,
-            ..DEFAULT_CAPS
-        };
-        let json = render_copy(&app, &CopyKind::Plan, &caps).expect("render");
-        assert!(json.len() <= 2 * 1024, "{} bytes", json.len());
-        let value = parsed(&json);
-        assert_eq!(value["object"], Value::Null);
-        let reasons = value["receipt"]["reasons"].as_array().expect("reasons");
-        assert!(
-            reasons.contains(&json!("payload_omitted_output_bytes_cap")),
-            "{reasons:?}"
-        );
-        // Nothing was emitted, so no retained counter and no bounding reason
-        // may claim otherwise.
-        for retained in [
-            "array_items_retained",
-            "string_bytes_retained",
-            "strings_retained",
-            "strings_truncated",
-            "depth_omissions",
-            "object_keys_retained",
-            "object_keys_truncated",
-            "object_keys_deduped",
+    #[test]
+    fn structcopy_portable_selects_one_observation_and_writes_only_after_rendering() {
+        for (args, selected) in [
+            ("turn +1", "turn:1"),
+            ("tool call-id", "tool:call-id"),
+            ("plan", "plan"),
         ] {
+            for stdout in [false, true] {
+                let copy = RecordingCopy::new();
+                let args = format!("{args}{}", if stdout { " STDOUT" } else { "" });
+                let result = execute_portable(&copy, &Labels, Some(&args), &DEFAULT_CAPS).unwrap();
+                assert!(!result.is_error);
+                assert!(result.action.is_none());
+                let mut expected = vec![selected, "roots"];
+                if stdout {
+                    assert!(serde_json::from_str::<Value>(&result.message.unwrap()).is_ok());
+                } else {
+                    expected.push("clipboard");
+                    assert_eq!(
+                        result.message.as_deref(),
+                        Some("cmd_structcopy_clipboard_accepted")
+                    );
+                }
+                assert_eq!(*copy.events.borrow(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn structcopy_portable_rejections_never_write_clipboard() {
+        for args in [
+            None,
+            Some(""),
+            Some("turn 0"),
+            Some("TURN 1"),
+            Some("plan extra"),
+            Some("tool"),
+            Some("workflow"),
+            Some("stdout plan"),
+        ] {
+            let copy = RecordingCopy::new();
+            assert!(execute_portable(&copy, &Labels, args, &DEFAULT_CAPS).is_err());
+            assert!(copy.events.borrow().is_empty());
+        }
+        for error in [
+            StructcopyError::Unavailable,
+            StructcopyError::Busy,
+            StructcopyError::Preparation("broken".into()),
+        ] {
+            let mut copy = RecordingCopy::new();
+            copy.error = Some(error);
+            assert!(execute_portable(&copy, &Labels, Some("plan"), &DEFAULT_CAPS).is_err());
+            assert_eq!(*copy.events.borrow(), ["plan"]);
+        }
+        let copy = RecordingCopy::new();
+        assert!(execute_portable(&copy, &Labels, Some("workflow missing"), &DEFAULT_CAPS).is_err());
+        assert_eq!(*copy.events.borrow(), ["workflow:missing"]);
+        let copy = RecordingCopy::new();
+        assert!(
+            execute_portable(
+                &copy,
+                &Labels,
+                Some("turn 1"),
+                &Caps {
+                    max_output_bytes: 1,
+                    ..DEFAULT_CAPS
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*copy.events.borrow(), ["turn:1", "roots"]);
+    }
+
+    #[test]
+    fn structcopy_portable_transport_receipts_and_missing_facets_are_honest() {
+        for (transport, key, error) in [
+            (
+                Ok(StructcopyTransport::TerminalQueued),
+                "cmd_structcopy_clipboard_queued",
+                false,
+            ),
+            (
+                Err("clipboard unavailable".into()),
+                "cmd_structcopy_clipboard_failed",
+                true,
+            ),
+        ] {
+            let mut copy = RecordingCopy::new();
+            copy.transport = transport;
+            let result = execute_structcopy(
+                CommandContexts::empty()
+                    .with_structcopy(&mut copy)
+                    .with_presentation(&mut Labels),
+                Some("plan"),
+            );
+            assert_eq!(result.is_error, error);
+            assert!(result.action.is_none());
             assert_eq!(
-                value["receipt"]["counts"][retained],
-                json!(0),
-                "{retained} must be zero when nothing was emitted: {json}"
+                result.message,
+                Some(if error {
+                    format!("Error: {key}")
+                } else {
+                    key.into()
+                })
             );
+            assert_eq!(*copy.events.borrow(), ["plan", "roots", "clipboard"]);
         }
-        assert_eq!(reasons.len(), 1, "{reasons:?}");
-        assert_eq!(
-            value["receipt"]["counts"]["array_items_original"],
-            json!(60)
+        let mut copy = RecordingCopy::new();
+        assert!(execute_structcopy(CommandContexts::empty(), Some("plan")).is_error);
+        assert!(
+            execute_structcopy(
+                CommandContexts::empty().with_presentation(&mut Labels),
+                Some("plan")
+            )
+            .is_error
         );
         assert!(
-            value["receipt"]["counts"]["object_keys_original"]
-                .as_u64()
-                .expect("original keys")
-                > 0
+            execute_structcopy(
+                CommandContexts::empty().with_structcopy(&mut copy),
+                Some("plan")
+            )
+            .is_error
         );
-
-        // Below the metadata floor the command fails closed and emits nothing.
-        let tiny = Caps {
-            max_output_bytes: 64,
-            ..DEFAULT_CAPS
-        };
-        let err = render_copy(&app, &CopyKind::Plan, &tiny).expect_err("must fail closed");
-        assert!(err.contains("refusing to emit"), "{err}");
-        let result = execute_structcopy(&mut app, Some("plan stdout"));
-        assert!(!result.is_error, "default caps fit: {:?}", result.message);
-    }
-
-    /// When the byte cap forces tighter caps than the declared contract, the
-    /// receipt must say so instead of advertising caps that never ran.
-    #[test]
-    fn receipt_reports_the_caps_that_actually_ran() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        {
-            let mut state = app.plan_state.try_lock().expect("plan lock");
-            state.update(UpdatePlanArgs {
-                title: Some("padded plan".to_string()),
-                plan: (0..40)
-                    .map(|index| PlanItemArg {
-                        step: format!("step {index}: {}", "padding ".repeat(30)),
-                        status: StepStatus::Pending,
-                    })
-                    .collect(),
-                ..Default::default()
-            });
-        }
-        let caps = Caps {
-            max_output_bytes: 6 * 1024,
-            ..DEFAULT_CAPS
-        };
-        let json = render_copy(&app, &CopyKind::Plan, &caps).expect("render");
-        let value = parsed(&json);
-        assert_eq!(
-            value["receipt"]["caps"]["max_output_bytes"],
-            json!(6 * 1024)
-        );
-        let applied = &value["receipt"]["applied_caps"];
-        assert!(
-            applied["max_array_items"].as_u64().expect("items")
-                <= DEFAULT_CAPS.max_array_items as u64
-        );
-        if applied != &value["receipt"]["caps"] {
-            assert!(
-                value["receipt"]["reasons"]
-                    .as_array()
-                    .expect("reasons")
-                    .contains(&json!("caps_tightened_output_bytes_cap")),
-                "{json}"
-            );
-        }
-
-        // The unconstrained case declares no tightening.
-        let json = stdout_json(&execute_structcopy(&mut app, Some("plan stdout")));
-        let value = parsed(&json);
-        assert_eq!(value["receipt"]["applied_caps"], value["receipt"]["caps"]);
-        assert!(
-            !value["receipt"]["reasons"]
-                .as_array()
-                .expect("reasons")
-                .contains(&json!("caps_tightened_output_bytes_cap"))
-        );
-    }
-
-    #[test]
-    fn clipboard_is_default_and_stdout_is_explicit() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-
-        // Default: clipboard target; the payload never appears in the message.
-        let default = execute_structcopy(&mut app, Some("turn 1"));
-        assert!(!default.is_error, "{:?}", default.message);
-        let message = default.message.as_deref().unwrap_or_default();
-        assert!(message.contains("handed to the clipboard"), "{message}");
-        // The receipt must not overclaim delivery.
-        assert!(
-            !message.contains("copied to the local clipboard"),
-            "{message}"
-        );
-        assert!(!message.contains("\"receipt\""), "{message}");
-        let payload = app
-            .clipboard
-            .last_written_text()
-            .expect("clipboard payload");
-        assert!(payload.contains("\"receipt\""));
-
-        // Explicit stdout: payload in the message, clipboard untouched.
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-        let stdout = execute_structcopy(&mut app, Some("turn 1 stdout"));
-        assert!(
-            stdout
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("\"receipt\"")
-        );
-        assert!(app.clipboard.last_written_text().is_none());
-    }
-
-    /// The terminal-client path queues a background write; the message must
-    /// not claim the copy landed, and must not claim a transport the session
-    /// does not have.
-    #[test]
-    fn terminal_client_receipt_says_queued_not_delivered() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-        app.clipboard = ClipboardHandler::for_test(true, false);
-        assert!(app.clipboard.requires_terminal_paste());
-
-        let result = execute_structcopy(&mut app, Some("turn 1"));
-        assert!(!result.is_error, "{:?}", result.message);
-        let message = result.message.as_deref().unwrap_or_default();
-        assert!(message.contains("queued"), "{message}");
-        assert!(message.contains("not confirmed"), "{message}");
-        assert!(
-            !message.contains("copied to"),
-            "must not claim delivery: {message}"
-        );
-    }
-
-    #[test]
-    fn clipboard_failure_is_honest_and_suggests_stdout() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-        app.clipboard = ClipboardHandler::unavailable_for_test(false);
-
-        let failed = execute_structcopy(&mut app, Some("turn 1"));
-        assert!(failed.is_error);
-        let message = failed.message.as_deref().unwrap_or_default();
-        assert!(message.contains("Nothing was written"), "{message}");
-        assert!(message.contains("stdout"), "{message}");
-        assert!(app.clipboard.last_written_text().is_none());
-    }
-
-    #[test]
-    fn copy_does_not_mutate_session_state() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let mut app = test_app(&tmpdir);
-        seed_transcript(&mut app);
-        {
-            let mut state = app.plan_state.try_lock().expect("plan lock");
-            state.update(UpdatePlanArgs {
-                title: Some("immutable".to_string()),
-                ..Default::default()
-            });
-        }
-        let plan_before = app.plan_state.try_lock().expect("plan lock").snapshot();
-        let messages_before = app.api_messages.clone();
-        let history_before = app.history.len();
-        let work_before = app.work_state_snapshot().expect("Work snapshot");
-
-        for arg in [
-            "turn 1 stdout",
-            "turn 2",
-            "tool call-7 stdout",
-            "plan stdout",
-            "turn 99 stdout",
-            "tool call-nope stdout",
-            "workflow nope stdout",
-        ] {
-            let _ = execute_structcopy(&mut app, Some(arg));
-        }
-
-        assert_eq!(app.api_messages, messages_before);
-        assert_eq!(app.history.len(), history_before);
-        assert_eq!(
-            app.plan_state.try_lock().expect("plan lock").snapshot(),
-            plan_before
-        );
-        assert_eq!(
-            app.work_state_snapshot().expect("Work snapshot after copy"),
-            work_before,
-            "structcopy must not mutate Work"
-        );
-    }
-
-    #[test]
-    fn structcopy_is_registered_human_only_and_absent_from_model_catalog() {
-        // Registered as a human slash command.
-        assert!(
-            crate::commands::command_infos()
-                .iter()
-                .any(|info| info.name == "structcopy"),
-            "structcopy must be a registered slash command"
-        );
-
-        // Never a model-visible tool: neither in the native tool catalog nor
-        // in the legacy tool registry surface sent to providers.
-        assert!(
-            !crate::core::engine::default_active_native_tool_names().contains(&"structcopy"),
-            "structcopy must not be a native tool"
-        );
-        let tmpdir = TempDir::new().expect("tempdir");
-        let context = crate::tools::spec::ToolContext::new(tmpdir.path().to_path_buf());
-        let registry = crate::tools::ToolRegistryBuilder::new()
-            .with_file_tools()
-            .with_read_only_file_tools()
-            .with_shell_tools()
-            .with_search_tools()
-            .with_git_tools()
-            .with_git_history_tools()
-            .with_diagnostics_tool()
-            .with_skill_tools()
-            .with_validation_tools()
-            .with_project_tools()
-            .with_test_runner_tool()
-            .with_tool_result_retrieval_tool()
-            .with_web_tools()
-            .with_finance_tool()
-            .build(context);
-        let names: Vec<String> = registry
-            .to_api_tools()
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect();
-        assert!(
-            !names.is_empty(),
-            "builder surface must register model tools for this contract to be meaningful"
-        );
-        assert!(
-            !names.iter().any(|name| name.contains("structcopy")),
-            "no model tool may reference structcopy: {names:?}"
-        );
+        assert!(copy.events.borrow().is_empty());
     }
 }

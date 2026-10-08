@@ -18,7 +18,7 @@
  * "Plan · Work · Operate", "Ask · Auto-Review · Full Access",
  * "TUI · exec · web · API", "Codewhale", "GitHub", "Issues",
  * `npm install -g codewhale`, `cargo test --locked`, `codewhale exec`,
- * package-manager proper nouns, mirror names, and `/codewhale-tui.webp`.
+ * package-manager proper nouns, mirror names, and captured media paths.
  */
 
 export interface ChromeDict {
@@ -31,21 +31,13 @@ export interface ChromeDict {
   navContribute: string;
 
   /**
-   * Bilingual secondary nav labels — the small companion label the
-   * newspaper masthead sets beside each primary link.
-   *
-   * The English edition uses the Han seal pair (文档 / 指引 / …) as an
-   * editorial device; every other locale supplies its OWN pairing (native
-   * primary, short English secondary). Never hardcode Han characters at a
-   * call site — a locale that wants no second label still needs a value
-   * here, because empty strings are rejected by dictionaries.test.ts.
+   * The primary strip: Product / Models / Plugins / Docs. The
+   * older six (Start, Install, FAQ, Community, Contribute) stay in the
+   * dictionary for the compact sheet's second group and the footer.
    */
-  navDocsSecondary: string;
-  navStartSecondary: string;
-  navInstallSecondary: string;
-  navFaqSecondary: string;
-  navCommunitySecondary: string;
-  navContributeSecondary: string;
+  navProduct: string;
+  navModels: string;
+  navPlugins: string;
 
   /**
    * Skip-to-content link rendered before the nav in app/[locale]/layout.tsx.
@@ -62,70 +54,18 @@ export interface ChromeDict {
   /** Mobile-menu and masthead call to action, e.g. "Install →". */
   installCta: string;
 
-  /** Header account links to the Codewhale app (app.codewhale.net). */
+  /**
+   * The header's one identity door to the Codewhale app (app.codewhale.net).
+   * Account creation is offered on the sign-in page, not beside it.
+   */
   authSignIn: string;
-  authRegister: string;
-  /** aria-label for the header account link group. */
-  authGroupAria: string;
 
-  /** Wordmark seal glyph beside the masthead brand (components/seal.tsx). */
-  wordmarkSeal: string;
-  /** Wordmark strapline under the brand, e.g. "any model, on your machine". */
-  wordmarkTag: string;
-
-  /** Masthead issue line, e.g. "Issue {date}". */
-  issueLabel: string;
   /**
    * BCP 47 tag used for the masthead weekday via `toLocaleDateString` — not
    * rendered copy, but per-locale, so it belongs beside it. Without this the
    * masthead date renders in English for every non-Chinese locale.
    */
   dateLocale: string;
-
-  /** aria-label on the star-count link, e.g. "GitHub stars". */
-  starsAria: string;
-  /** Star-badge label when the live count is unavailable. */
-  githubFallback: string;
-
-  /** Live-ticker seal label (components/ticker.tsx). */
-  tickerLiveLabel: string;
-  /** Live-ticker mono tag beside the seal label, e.g. "LIVE". */
-  tickerLiveTag: string;
-
-  /**
-   * Ticker event verbs — the chrome around the repository's own record.
-   * Pull-request titles, issue titles, release tags, and contributor handles
-   * are CONTENT and stay verbatim in every locale; these verbs are copy and
-   * must be translated.
-   *
-   * `tickerReleased` covers `state: "published"`, and `tickerOpened` covers
-   * both a newly filed issue and an open pull request. There is deliberately
-   * no draft verb: the strip reports events, and a draft pull request is one
-   * its author has marked not-ready (components/ticker.tsx `EVENT_STATES`).
-   */
-  tickerMerged: string;
-  tickerOpened: string;
-  tickerClosed: string;
-  tickerReleased: string;
-  /**
-   * Mark shown when GitHub itself reports the author as a
-   * FIRST_TIME_CONTRIBUTOR — the warmest item on the strip, and never our
-   * inference. Keep it short; it sits inline in a scrolling mono line.
-   */
-  tickerFirstContribution: string;
-  /**
-   * By-line template carrying a `{handle}` token, e.g. "by {handle}". The
-   * handle is typeset in its own element, so a locale may place it anywhere
-   * (or make it the whole value, as ja/ko do with an honorific suffix).
-   */
-  tickerBy: string;
-  /** aria-label for the ticker's group landmark. */
-  tickerAria: string;
-
-  /** Reasoning trace title-bar label, e.g. "reasoning trace". */
-  traceLabel: string;
-  /** aria-label for the reasoning trace scene tablist. */
-  traceTabsAria: string;
 
   /** Mobile-menu toggle labels. */
   menuOpen: string;
@@ -153,8 +93,6 @@ export interface ChromeDict {
   footerIssues: string;
   footerContribute: string;
   footerLicense: string;
-  /** Footer link to the pricing page, e.g. "Pricing". */
-  footerPricing: string;
   /** Footer link to the terms route, e.g. "Terms". */
   footerTerms: string;
   /** Footer link to the privacy route, e.g. "Privacy". */
@@ -177,7 +115,8 @@ export interface ChromeDict {
   /**
    * Visible badge marking a partial locale pack in the switcher, e.g.
    * "(partial)" — honest scope signal, per the localization quality
-   * contract. Keep it short.
+   * contract. Keep it short. The switcher shows it, brackets stripped, as
+   * the heading of the group that lists partial packs.
    */
   partialBadge: string;
 }
@@ -185,109 +124,85 @@ export interface ChromeDict {
 export interface HomeDict {
   /**
    * `<title>` and meta description for the locale home route, consumed by
-   * `generateMetadata` in app/[locale]/layout.tsx. These were the last
-   * inline EN/ZH pair on the required slice; per-locale metadata is the
-   * whole point of routing a locale, so it lives in the dictionary.
+   * `generateMetadata` in app/[locale]/layout.tsx.
    */
   metaTitle: string;
   metaDescription: string;
 
-  /** Hero pill, e.g. "Open source · Any model · Runs in your terminal". */
-  kicker: string;
-  heroTitleA: string;
-  heroTitleB: string;
+  /** A complete headline that wraps naturally in each locale. */
+  heroTitle: string;
   /**
    * Hero lede. Carries a `{brand}` token so the brand can be typeset in its
    * own span wherever the sentence needs it — the page splits on the token
    * instead of concatenating fragments around it.
    */
   heroIntro: string;
-  install: string;
-  docs: string;
-  copy: string;
-  copied: string;
+  /** Primary action → /install, e.g. "Get Codewhale". */
+  getCodewhale: string;
+  /** Accessible name for the hero install command and its platform choice. */
+  heroInstallAria: string;
+  /** Secondary action → /product, e.g. "Explore the product". */
+  exploreProduct: string;
 
-  /** Eyebrow above the one-line install block, e.g. "one-line install". */
-  installEyebrow: string;
-  /** Install prerequisite line, e.g. "needs Node 18+ — no Rust toolchain". */
-  installRequirement: string;
-  /** Link to the other install methods, e.g. "other ways →". */
-  installOtherWays: string;
+  /** Screenshot caption, first item of the dot chain, e.g. "Terminal preview". */
+  shotPreview: string;
+  /** Screenshot caption, build item with a `{version}` token. */
+  shotBuild: string;
+  /** Screenshot alt text for the current media manifest capture. */
+  screenshotAlt: string;
 
   /** "Latest release {tag}" */
   latestRelease: string;
   releaseUnavailable: string;
-  /** "Current source" / "Source candidate" — prepended to `v{version}:`. */
+  /** "Source" / "Unreleased" — prepended to `v{version}`. */
   currentSource: string;
   sourceCandidate: string;
-  /** "{count} provider routes" */
-  providerRoutes: string;
-  /** "published release" / "source candidate" — the source-state label. */
+  /** "released" / "unreleased" — the machine-readable source-state label. */
   publishedRelease: string;
   figcaptionSourceCandidate: string;
+  /** Running head of the terminal chapter ("01 / Your terminal"). */
+  chapterTerminal: string;
+  /** Title of the terminal chapter, above the live capture. */
+  chapterTerminalTitle: string;
 
-  /** Screenshot toolbar label, e.g. "Current session". */
-  shotSession: string;
-  /** Screenshot alt text for /codewhale-tui.webp. */
-  screenshotAlt: string;
-  /** Screenshot figcaption. */
-  figcaption: string;
+  /** What a person gains: heading, lede, and three [title, body] columns. */
+  gainHeading: string;
+  gainLede: string;
+  gain: [string, string][];
 
-  proofHeading: string;
-  proofBody: string;
+  /** Running head of the models chapter ("02 / Your models"). */
+  chapterModels: string;
+  modelsHeading: string;
+  modelsBody: string;
+  /** Three [route kind, description] rows. */
+  modelsFacts: [string, string][];
+  modelsLink: string;
 
-  /** Section seal glyph for the "see how it decides" band. */
-  sealDecides: string;
-  decidesEyebrow: string;
-  decidesHeading: string;
-  decidesLede: string;
-
-  /** Section seal glyph for the workflow band. */
-  sealWorkflow: string;
-  workflowHeading: string;
-  /** Four [title, description] steps. */
-  workflow: [string, string][];
-  receiptAria: string;
-  /**
-   * Right-hand column of the example receipt. The verbs (inspect / act /
-   * verify / report), `$ codewhale exec …`, and `cargo test --locked` stay
-   * code-owned literals in the JSX per docs/VOICE.md.
-   */
-  receiptInspect: string;
-  receiptAct: string;
-  receiptReport: string;
-
-  /** Section seal glyph for the getting-started band. */
-  sealStart: string;
   startHeading: string;
   startLede: string;
   startGuideLink: string;
   startVocabularyLink: string;
 
-  /** Section seal glyph for the boundaries band. */
-  sealBoundaries: string;
-  boundariesHeadingA: string;
-  boundariesHeadingB: string;
-  boundariesBody: string;
-  hostedGatewayLocal: string;
-  planActOperateDesc: string;
-  askAutoReviewDesc: string;
-  tuiExecWebDesc: string;
+  /** Running head of the availability chapter ("04 / Where it runs"). */
+  chapterAvailability: string;
+  availabilityHeading: string;
+  availabilityLede: string;
+  availability: [string, string, string, string?][];
+  availabilityNote: string;
+  accountLink: string;
 
-  /** Section seal glyph for the surfaces band. */
-  sealSurfaces: string;
   surfacesHeading: string;
   /** Five [name, description] surfaces. */
   surfaces: [string, string][];
   runtimeLink: string;
 
   installBandHeading: string;
+  copy: string;
+  copied: string;
   binaries: string;
   chinaMirrors: string;
   installGuideLink: string;
 
-  /** Section seal glyph for the community band. */
-  sealCommunity: string;
   communityHeading: string;
   communityBody: string;
   communityLinksAria: string;
@@ -332,10 +247,9 @@ export interface DocsShellDict {
   heroTitle: string;
   heroLead: string;
   installCta: string;
-  sourceDocsCta: string;
 
   // --- release truth band (docs layout; facts + CHANGELOG.md) ---
-  /** Eyebrow over the band, e.g. "Release truth". */
+  /** Eyebrow over the band, e.g. "Release". */
   releaseLabel: string;
   /** "Latest release {tag} · {date}" — date already formatted per locale. */
   releasePublished: string;
@@ -361,6 +275,8 @@ export interface DocsShellDict {
   webGuideTag: string;
   /** Row tag for a GitHub source document. */
   sourceDocTag: string;
+  /** Per-row disclosure that reveals the repository files a topic comes from. */
+  sourceDetails: string;
   emptyTitle: string;
   emptyBody: string;
   emptyCta: string;
@@ -382,6 +298,21 @@ export interface DocsShellDict {
   helpFaq: string;
   helpDiscord: string;
   helpIssue: string;
+
+  // --- docs page bodies (app/[locale]/docs/_components/doc-article.tsx) ---
+  /** Heading over each page's closing "where to go next" links. */
+  nextHeading: string;
+  /** Word (with its punctuation) that marks an aside, so it reads without color. */
+  noteLabel: string;
+  /** Accessible name of a page's table of contents. */
+  onThisPage: string;
+
+  // --- session recording panel (components/session-media.tsx) ---
+  /** Shown in place of a recording that has not been made yet. */
+  mediaPendingNote: string;
+  mediaPlanLink: string;
+  mediaGifFallback: string;
+  mediaTranscript: string;
 }
 
 /**
@@ -399,10 +330,13 @@ export interface StatesDict {
   retry: string;
   reload: string;
   homeLink: string;
-  /** The 404 plate's primary action: the docs index, which the body names. */
+  /** Documentation recovery link on the 404 page. */
   docsIndexLink: string;
   notFoundTitle: string;
   notFoundBody: string;
+  notFoundHomeLink: string;
+  /** Alt text for the 404 poster (public/codwhale-404.webp). */
+  notFoundPosterAlt: string;
   /**
    * A data-bearing page whose source was not asked (build-time prerender)
    * or refused (rate limit, outage). Distinct from `empty`, which asserts
@@ -426,104 +360,62 @@ export interface StatesDict {
   lastChecked: string;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Docs page bodies                                                   */
+/* ------------------------------------------------------------------ */
+
 /**
- * `app/[locale]/docs/computers/page.tsx` — cloud computers and dispatch.
- * Every claim traces to docs/DAYTONA_CLOUD_DISPATCH.md and
- * docs/CODEWHALE_AGENT.md; commands stay code-owned literals in the page.
+ * One content block on a docs page. Strings are prose: `code` in backticks
+ * is typeset as inline code and `[label](/docs/x)` becomes a locale-aware
+ * link (see `app/[locale]/docs/_components/doc-article.tsx`). Commands in
+ * `code` blocks are shown verbatim and must match the engine source.
  */
-export interface DocsComputersDict {
-  metaTitle: string;
-  metaDescription: string;
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  proposeTitle: string;
-  proposeLead: string;
-  jobsLead: string;
-  remotesTitle: string;
-  remotesLead: string;
-  /** `[remote name, forge]` rows of the explicit-forge table. */
-  remotes: [string, string][];
-  enableTitle: string;
-  enableLead: string;
-  /** `[step, detail]` rows. */
-  enableSteps: [string, string][];
-  cliNote: string;
-  rulesTitle: string;
-  /** `[situation, outcome]` rows of the fail-closed table. */
-  rules: [string, string][];
-  membershipTitle: string;
-  membershipLead: string;
-  leftoverTitle: string;
-  /** `[item, note]` rows. */
-  leftover: [string, string][];
-  sourceNote: string;
+export type DocsBlock =
+  | { p: string }
+  /** A copyable command or config block; `lang` labels it (e.g. "Terminal"). */
+  | { code: string; lang?: string }
+  /** A `[term, detail]` table; `codeTerms` sets the term column as code. */
+  | { rows: readonly (readonly [string, string])[]; codeTerms?: boolean }
+  /** Numbered steps, in order. */
+  | { steps: readonly string[] }
+  /** An unordered list. */
+  | { list: readonly string[] }
+  /** A short aside: a limit, a caution, or something not built yet. */
+  | { note: string };
+
+export interface DocsSection {
+  /** Stable anchor id. */
+  id: string;
+  title: string;
+  blocks: readonly DocsBlock[];
 }
 
 /**
- * `app/[locale]/docs/auth/page.tsx` — account, sign-in, and key storage.
- * Claims trace to docs/CONFIGURATION.md, docs/CODEWHALE_AGENT.md, and
- * docs/PROVIDERS.md.
+ * The one shape every task page in `/docs` uses: what this page helps you
+ * do (title + lede), how (sections), and where to go next.
  */
-export interface DocsAuthDict {
+export interface DocsPageDict {
   metaTitle: string;
   metaDescription: string;
+  /** Body-copy typography for this locale (CJK needs looser leading). */
   bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  /** `[credential, role]` rows. */
-  credentials: [string, string][];
-  providerTitle: string;
-  providerLead: string;
-  accountTitle: string;
-  accountLead: string;
-  /** `[command, effect]` rows. */
-  accountCommands: [string, string][];
-  storageTitle: string;
-  storageLead: string;
-  vaultTitle: string;
-  vaultLead: string;
-  portableTitle: string;
-  portableLead: string;
-  appTitle: string;
-  appLead: string;
-  appSignIn: string;
-  appRegister: string;
+  title: string;
+  /** What the reader can do here and why — two sentences at most. */
+  lede: string;
+  sections: readonly DocsSection[];
+  /** Where to go next; `href` is locale-relative. */
+  next: readonly { href: string; label: string; note: string }[];
+  /** Maintainer pointer, kept out of the rendered copy. */
   sourceNote: string;
 }
 
-/**
- * `app/[locale]/docs/trust/page.tsx` — security and trust reference.
- * Claims trace to docs/SANDBOX.md, docs/AUTHORIZATION_ORDER.md,
- * docs/TELEMETRY.md, and docs/public-surface-facts.json.
- */
-export interface DocsTrustDict {
-  metaTitle: string;
-  metaDescription: string;
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  boundaryTitle: string;
-  /** `[boundary, statement]` rows. */
-  boundaries: [string, string][];
-  approvalTitle: string;
-  approvalLead: string;
-  sandboxTitle: string;
-  sandboxLead: string;
-  /** `[platform, behaviour]` rows. */
-  sandboxes: [string, string][];
-  sandboxNote: string;
-  telemetryTitle: string;
-  telemetryLead: string;
-  /** `[fact, detail]` rows. */
-  telemetry: [string, string][];
-  auditTitle: string;
-  auditLead: string;
-  reportTitle: string;
-  reportLead: string;
-  reportCta: string;
-  sourceNote: string;
-}
+export type DocsReviewDict = DocsPageDict;
+
+export type DocsComputersDict = DocsPageDict;
+
+export type DocsAuthDict = DocsPageDict;
+
+export type DocsTrustDict = DocsPageDict;
 
 /** `app/[locale]/changelog/page.tsx` — version-aware release record. */
 export interface ChangelogDict {
@@ -554,218 +446,282 @@ export interface ChangelogDict {
   emptyBody: string;
 }
 
-/**
- * `app/[locale]/docs/hooks/page.tsx`.
- *
- * `configIntro` carries three `{token}` placeholders for the literal
- * `[[hooks.hooks]]`, `/hooks` and `[hooks].enabled` spans the page typesets
- * as inline `<code>`. They stay out of the prose because they are config
- * syntax rather than copy, and the token-parity half of `check-locales.mjs`
- * then guards the sentence for free.
- */
-export interface DocsHooksDict {
+export interface LegalTermsDict {
   metaTitle: string;
   metaDescription: string;
-  /** Body-copy typography for this locale (CJK needs looser leading). */
+  kicker: string;
+  title: string;
+  /** "Effective and last updated {date}." — zh also says the English text binds. */
+  updated: string;
+  privacyLink: string;
+  homeLink: string;
+}
+
+export interface LegalPrivacyDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  title: string;
+  /** Same template as `LegalTermsDict.updated`. */
+  updated: string;
+  termsLink: string;
+  homeLink: string;
+}
+
+export interface DigestDict {
+  metaTitle: string;
+  metaDescription: string;
+  /** Heading shown with the empty state. */
+  emptyTitle: string;
+  emptyBody: string;
+  title: string;
+  lead: string;
+}
+
+/** `app/[locale]/feed/page.tsx`. */
+export interface FeedDict {
+  metaTitle: string;
+  metaDescription: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  /** `{repo}` is where the page typesets the repository link. */
+  lede: string;
+  pulls: string;
+  issues: string;
+  /** Items in a column; `{count}` is filled at render time. */
+  shownCount: string;
+  openIssue: string;
+  openPull: string;
+  startDiscussion: string;
+}
+
+/** `app/[locale]/community/page.tsx`. */
+export interface CommunityDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  lede: string;
+  fileIssue: string;
+  browsePulls: string;
+  readGuide: string;
+  pathsTitle: string;
+  pathsScope: string;
+  recordTitle: string;
+  recordScope: string;
+  creditTitle: string;
+  /** Credit scope once the source version is the published release. */
+  creditScope: string;
+  /** Credit scope while the source version is ahead of the published release. */
+  creditScopeUnreleased: string;
+  /** Credit heading for the published release; `{version}` is filled at render time. */
+  creditLabel: string;
+  /** Credit heading while the source version is unreleased; `{version}` is filled at render time. */
+  creditLabelUnreleased: string;
+  mergedTitle: string;
+  helpersTitle: string;
+  fullRecord: string;
+}
+
+/** `app/[locale]/faq/page.tsx` and its `components/faq-search.tsx`. */
+export interface FaqDict {
+  metaTitle: string;
+  metaDescription: string;
+  eyebrow: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lead: string;
+  notCovered: string;
+  openIssue: string;
+  searchPlaceholder: string;
+  searchLabel: string;
+  searchClear: string;
+  /** `{matched}`, `{total}` and `{query}` are filled at render time. */
+  searchMatches: string;
+  /** `{query}` is filled at render time. */
+  searchNoMatches: string;
+  /** Extra classes on each answer. Empty in both locales today: CJK leading lives in `.prose` (primitives.css). */
+  answerClassName: string;
+  sourcesLabel: string;
+  noResultsTitle: string;
+  noResultsBody: string;
+}
+
+/** `app/[locale]/roadmap/page.tsx`. */
+export interface RoadmapDict {
+  metaTitle: string;
+  metaDescription: string;
+  eyebrow: string;
+  /** Page H1. */
+  title: string;
+  introduction: string;
+  sectionTitle: string;
+  browseIssues: string;
+  /** Track size; `{count}` is filled at render time. */
+  trackCount: string;
+  /** Track size when it is exactly one. */
+  trackCountOne: string;
+  contributeTitle: string;
+  contributeBody: string;
+  issuesDetail: string;
+  discussionsDetail: string;
+  pullsDetail: string;
+}
+
+/** `app/[locale]/docs/vocabulary/page.tsx`. */
+export interface DocsVocabularyDict {
+  metaTitle: string;
+  metaDescription: string;
+  /** Classes on every body paragraph; zh loosens leading and tracking. */
   bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  configIntro: string;
-  /** Lifecycle events as `[name, detail]`, in the order the page lists them. */
-  events: [string, string][];
-  projectTitle: string;
-  projectLead: string;
+  /** Page H1. */
+  title: string;
+  lead: string;
+  executionHeading: string;
+  controlHeading: string;
+  controlLead: string;
+  routeHeading: string;
+  advisoryHeading: string;
+  measurementHeading: string;
+  leaderboardNote: string;
+  /** Maintainer pointer, carried in a hidden `data-source-note`. */
   sourceNote: string;
 }
 
-/** `app/[locale]/docs/troubleshooting/page.tsx`. */
-export interface DocsTroubleshootingDict {
+/** `app/[locale]/contribute/page.tsx`. */
+export interface ContributeDict {
   metaTitle: string;
   metaDescription: string;
-  /** Body-copy typography for this locale (CJK needs looser leading). */
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  /** Triage entries as `[name, detail]`, in the order the page lists them. */
-  incidents: [string, string][];
-  dockerTitle: string;
-  dockerLead: string;
-  dockerToolboxNote: string;
-  sourceNote: string;
-}
-
-/** `app/[locale]/docs/configuration/page.tsx`. */
-export interface DocsConfigurationDict {
-  metaTitle: string;
-  metaDescription: string;
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  auditLead: string;
-  overlayTitle: string;
-  overlayLead: string;
-  overlayLimits: string;
-  credentialsTitle: string;
-  credentialsLead: string;
-  legacyTitle: string;
-  legacyLead: string;
-  sourceNote: string;
-}
-
-/**
- * `app/[locale]/docs/constitution/page.tsx`.
- *
- * `overviewLead` carries three `{token}` placeholders and `authorityNote` one
- * more. Per `docs/VOICE.md` — keep commands, key names and paths as code-owned
- * placeholders — the literals themselves live in the page, along with the
- * en/zh badge pair on each principle row, which is a fixed bilingual glyph
- * rather than copy.
- */
-export interface DocsConstitutionDict {
-  metaTitle: string;
-  metaDescription: string;
-  /** Body-copy typography for this locale (CJK needs looser leading). */
-  bodyClassName: string;
-  overviewTitle: string;
-  /** Opposite-language echo the heading prints beside the title. */
-  overviewTitleAside: string;
-  overviewLead: string;
-  /** Three `[key, detail]` rows; the key selects the page's badge pair. */
-  principles: [string, string][];
-  authorityNote: string;
-  /** Link text inside `authorityNote`'s `{configDocs}` slot. */
-  configDocsLabel: string;
-  sourceNote: string;
-}
-
-/** `app/[locale]/docs/fleet/page.tsx` (the `DocsFleetDict` name is internal compatibility). */
-export interface DocsFleetDict {
-  metaTitle: string;
-  metaDescription: string;
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  runTitle: string;
-  runLead: string;
-  statusLead: string;
-  profilesTitle: string;
-  profilesLead: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  lede: string;
+  fileIssue: string;
+  browsePulls: string;
+  fullGuide: string;
+  pathsTitle: string;
   workflowTitle: string;
-  workflowLead: string;
-  workflowLimits: string;
-  sourceNote: string;
+  reviewTitle: string;
+  reviewScope: string;
+  devTitle: string;
+  devScope: string;
 }
 
-/** `app/[locale]/docs/mcp/page.tsx`. */
-export interface DocsMcpDict {
+/** `app/[locale]/constitution/page.tsx` and its `components/thinking-trace.tsx`. */
+export interface ConstitutionDict {
   metaTitle: string;
   metaDescription: string;
-  /** Body-copy typography for this locale (CJK needs looser leading). */
-  bodyClassName: string;
-  overviewLead: string;
-  overviewConfig: string;
-  setupTitle: string;
-  setupLead: string;
-  setupReload: string;
-  authTitle: string;
-  authLead: string;
-  toolsTitle: string;
-  toolsLead: string;
-  toolsTrust: string;
-  serverTitle: string;
-  serverLead: string;
-  sourceNote: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lede: string;
+  /** Status label on the setup callout. */
+  since: string;
+  sinceBody: string;
+  rankTitle: string;
+  rankScope: string;
+  boundaryTitle: string;
+  boundaryBody: string;
+  traceTitle: string;
+  traceScope: string;
+  /** The label every traced scene carries: these are illustrations, not transcripts. */
+  illustration: string;
+  install: string;
+  configuration: string;
 }
 
-/** `app/[locale]/docs/modes/page.tsx`. */
-export interface DocsModesDict {
+/** `app/[locale]/runtime/page.tsx`. */
+export interface RuntimeDict {
   metaTitle: string;
   metaDescription: string;
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  modes: [string, string][];
-  switchingTitle: string;
-  switchingLead: string;
-  switchingCommandLead: string;
-  permissionsTitle: string;
-  permissionsLead: string;
-  postures: [string, string][];
-  sourceNote: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lede: string;
+  integrationsTitle: string;
+  /** Status label on an experimental integration. */
+  experimental: string;
+  trustTitle: string;
+  factsTitle: string;
+  version: string;
+  toolCount: string;
+  sandboxBackends: string;
+  /** Summary of the maintainer-facing disclosure (crates, source revision). */
+  details: string;
+  sourceRevision: string;
+  docsLead: string;
+  runtimeApiDoc: string;
+  mcpDoc: string;
 }
 
-/**
- * `app/[locale]/docs/runtime-api/page.tsx`.
- *
- * Only `securityLead` is tokenized. The command names elsewhere on the page
- * are set as prose rather than `<code>`, so they stay inside the sentences
- * exactly as the `isZh` ternaries had them.
- */
-export interface DocsRuntimeApiDict {
-  metaTitle: string;
-  metaDescription: string;
-  /** Body-copy typography for this locale (CJK needs looser leading). */
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  /** Seven `[key, detail]` rows; the key selects the page's command literal. */
-  entries: [string, string][];
-  stdioTitle: string;
-  stdioLead: string;
-  interruptNote: string;
-  securityTitle: string;
-  securityLead: string;
-  sourceNote: string;
-}
+export type DocsHooksDict = DocsPageDict;
 
-export interface DocsSandboxDict {
-  metaTitle: string;
-  metaDescription: string;
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  /** Four `[name, detail]` rows; the name is also the row's key. */
-  platforms: [string, string][];
-  policiesTitle: string;
-  policiesLead: string;
-  diagnosticsTitle: string;
-  diagnosticsLead: string;
-  diagnosticsLimits: string;
-  sourceNote: string;
-}
+export type DocsTroubleshootingDict = DocsPageDict;
 
-/** `app/[locale]/docs/subagents/page.tsx`. */
-export interface DocsSubagentsDict {
-  metaTitle: string;
-  metaDescription: string;
-  /** Body-copy typography for this locale (CJK needs looser leading). */
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  overviewFleetNote: string;
-  /** Eight `[key, detail]` rows; the key names the page's role literal. */
-  roles: [string, string][];
-  forkTitle: string;
-  forkLead: string;
-  worktreeTitle: string;
-  worktreeLead: string;
-  capacityTitle: string;
-  capacityLead: string;
-  sourceNote: string;
-}
+export type DocsConfigurationDict = DocsPageDict;
 
-export interface DocsWebDict {
+export type DocsFleetDict = DocsPageDict;
+
+export type DocsMcpDict = DocsPageDict;
+
+export type DocsModesDict = DocsPageDict;
+
+export type DocsRuntimeApiDict = DocsPageDict;
+
+export type DocsSandboxDict = DocsPageDict;
+
+export type DocsSubagentsDict = DocsPageDict;
+
+export type DocsWebDict = DocsPageDict;
+
+export type DocsWorkDict = DocsPageDict;
+
+/** Copy for `app/[locale]/computer-use/page.tsx` and the install page's Computer Use section. */
+export interface ComputerUseDict {
   metaTitle: string;
   metaDescription: string;
-  bodyClassName: string;
-  overviewTitle: string;
-  overviewLead: string;
-  overviewBody: string;
-  authTitle: string;
-  authLead: string;
-  localTitle: string;
-  localLead: string;
-  troubleshootingTitle: string;
-  troubleshootingLead: string;
-  sourceNote: string;
+  title: string;
+  lead: string;
+  publisher: string;
+  /** Primary button: the notarized disk image when the release carries one, else the archive. */
+  download: string;
+  /** Secondary link to the archive the in-app updater consumes. */
+  downloadZip: string;
+  requirements: string;
+  included: string;
+  pendingTitle: string;
+  pendingBody: string;
+  unavailableTitle: string;
+  unavailableBody: string;
+  releases: string;
+  receipt: string;
+  setup: string;
+  /** Four numbered setup steps, rendered in order. */
+  steps: { title: string; body: string }[];
+  controlsTitle: string;
+  controlsBody: string;
+  updateTitle: string;
+  updateBody: string;
+  help: string;
+  notes: string;
+  demo: string;
+  source: string;
+  platforms: string;
 }

@@ -1,0 +1,7 @@
+command: /cache
+is_error: false
+message:
+Cache history: no turns recorded yet.
+
+Supported providers report `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` on API turns. Run a turn and try /cache again.
+action: <none>

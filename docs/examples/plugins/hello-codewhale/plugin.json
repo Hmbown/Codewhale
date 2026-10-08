@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "hello-codewhale",
+  "version": "0.1.0",
+  "description": "A minimal, explicitly invoked greeting skill."
+}

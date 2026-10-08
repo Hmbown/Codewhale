@@ -105,21 +105,56 @@ resolve_bin() {
 
 stdio_probe() {
     log "=== app-server stdio probe (no model tokens) ==="
-    local tmp out
-    tmp="$(mktemp -d)"
-    # Throwaway config keeps the probe hermetic: no real keys read, state.db and
-    # events.jsonl land in the temp dir.
-    : >"$tmp/config.toml"
+    local out
+    # Keep the canonical home short for macOS Unix sockets, and resolve /tmp's
+    # symlink before the credential store's no-follow directory walk.
+    if ! out="$(python3 - "$BIN" "${SMOKE_STDIO_TIMEOUT:-20}" <<'PY'
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
 
-    out="$(printf '%s\n' \
-        '{"jsonrpc":"2.0","id":1,"method":"healthz"}' \
-        '{"jsonrpc":"2.0","id":2,"method":"capabilities"}' \
-        '{"jsonrpc":"2.0","id":3,"method":"app/capabilities"}' \
-        '{"jsonrpc":"2.0","id":4,"method":"prompt/capabilities"}' \
-        '{"jsonrpc":"2.0","id":5,"method":"thread/capabilities"}' \
-        '{"jsonrpc":"2.0","id":6,"method":"shutdown"}' \
-        | "$BIN" app-server --stdio --config "$tmp/config.toml" 2>/dev/null || true)"
-    rm -rf "$tmp"
+binary = str(Path(sys.argv[1]).resolve())
+with tempfile.TemporaryDirectory(prefix="cw-", dir="/tmp") as temporary:
+    root = Path(temporary).resolve()
+    home = root / "home"
+    home.mkdir(mode=0o700)
+    config = root / "config.toml"
+    config.write_text("telemetry = false\n")
+    env = {key: os.environ[key] for key in ("PATH", "USER", "SYSTEMROOT") if key in os.environ}
+    env.update(HOME=str(home), CODEWHALE_HOME=str(home), TMPDIR=str(root), CODEWHALE_NO_UPDATE_CHECK="1")
+    requests = "".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": method}) + "\n"
+        for i, method in enumerate(("healthz", "capabilities", "app/capabilities",
+            "prompt/capabilities", "thread/capabilities", "shutdown"), 1))
+    process = subprocess.Popen([binary, "app-server", "--stdio", "--config", str(config)],
+        cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, _ = process.communicate(requests.encode(), timeout=float(sys.argv[2]))
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        print("app-server stdio did not shut down within the probe deadline", file=sys.stderr)
+        sys.exit(1)
+    if process.returncode:
+        print(f"app-server stdio exited with status {process.returncode}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        replies = [json.loads(line) for line in stdout.splitlines()]
+        if {reply.get("id") for reply in replies if "result" in reply} != set(range(1, 7)):
+            raise ValueError("missing successful response")
+    except (ValueError, AttributeError):
+        print("app-server stdio did not return six successful JSON-RPC responses", file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.buffer.write(stdout)
+PY
+)"; then
+        fail "app-server stdio responses and graceful shutdown"
+        return
+    fi
 
     if [[ -z "$out" ]]; then
         fail "app-server --stdio produced no output"

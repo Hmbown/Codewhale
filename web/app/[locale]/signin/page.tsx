@@ -1,16 +1,15 @@
+import { ACCOUNT_ENTRY_COPY } from "@/lib/content/account-entry";
+import { pickText } from "@/lib/i18n/dictionaries";
 import { PublicAccountEntry } from "@/components/public-account-entry";
 import { buildPageMetadata } from "@/lib/page-meta";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
   return buildPageMetadata({
     path: "/signin",
     locale,
-    title: isZh ? "登录 · Codewhale" : "Sign in · Codewhale",
-    description: isZh
-      ? "登录 Codewhale 账户以同步工作、使用云代理和恢复会话。本机开源命令行不需要账户。"
-      : "Sign in to a Codewhale account for sync, cloud agents, and recovery. The local open-source CLI does not require an account.",
+    title: pickText(ACCOUNT_ENTRY_COPY.signIn.metaTitle, locale),
+    description: pickText(ACCOUNT_ENTRY_COPY.metaDescription, locale),
   });
 }
 

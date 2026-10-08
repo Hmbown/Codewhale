@@ -13,13 +13,12 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
 };
 
-use crate::deepseek_theme::Theme;
-use crate::palette;
 use crate::tui::menu_style;
 use crate::tui::ui_text::truncate_line_to_width;
+use codewhale_palette as palette;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -536,19 +535,31 @@ pub fn render_file_tree(
         }
     }
 
-    // Use the same theme as the sidebar for consistent styling.
-    let theme = Theme::for_palette_mode(mode);
+    // Pane chrome is the four-mode whale/light/grayscale/solarized ink; the
+    // backend remap carries the dark tokens into community presets exactly as
+    // it does for every other raw `palette` paint in this file. The pane floor
+    // is the one slot those base themes never lifted into `UiTheme`: the dark
+    // shells paint the raw ink field (remapped onto the live surface at draw
+    // time), the light and grey shells paint their panel tint.
+    let chrome = palette::UiTheme::for_mode(mode);
+    let pane_bg = match mode {
+        palette::PaletteMode::Dark => palette::WHALE_BG,
+        palette::PaletteMode::Light => palette::LIGHT_PANEL,
+        palette::PaletteMode::Grayscale | palette::PaletteMode::SolarizedLight => chrome.panel_bg,
+    };
+    // Horizontal padding only: `Padding::uniform(1)` ate two rows of a
+    // compact pane and left zero rows for content (#63 follow-up).
     let section = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .title(Line::from(Span::styled(
                 " Files ",
-                Style::default().fg(theme.section_title_color).bold(),
+                Style::default().fg(chrome.accent_primary).bold(),
             )))
-            .borders(theme.section_borders)
-            .border_type(theme.section_border_type)
-            .border_style(Style::default().fg(theme.section_border_color))
-            .style(Style::default().bg(theme.section_bg))
-            .padding(theme.section_padding),
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(chrome.border))
+            .style(Style::default().bg(pane_bg))
+            .padding(Padding::horizontal(1)),
     );
 
     f.render_widget(section, area);

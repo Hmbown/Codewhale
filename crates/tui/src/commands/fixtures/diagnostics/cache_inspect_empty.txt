@@ -1,0 +1,15 @@
+command: /cache inspect
+is_error: false
+message:
+Cache Inspect
+Full prompt text is not printed. Hashes are SHA-256 of each rendered layer.
+Base static prefix hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Full request prefix hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Tool catalog hash: (no tools registered)
+Static base prefix stability: no previous request
+First divergence from previous request: unavailable
+Warmup status: no previous warmup (current key: d08e1f3d9781)
+Estimated reusable tokens: ~0
+
+
+action: <none>

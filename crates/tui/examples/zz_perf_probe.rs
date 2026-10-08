@@ -1,12 +1,5 @@
-mod models {
-    pub use codewhale_core::request::{ContentBlock, Message};
-    pub use codewhale_core::role::Role;
-}
-#[path = "../src/session_tree.rs"]
-#[allow(dead_code)] // The probe intentionally exercises only the journal hot paths.
-mod session_tree;
-
-use models::Message;
+use codewhale_models::Message;
+use codewhale_runtime::session_tree;
 use serde::{Deserialize, Serialize};
 use session_tree::SessionJournal;
 use std::io::Write;

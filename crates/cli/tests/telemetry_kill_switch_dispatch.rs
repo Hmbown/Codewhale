@@ -27,7 +27,7 @@ fn env_off_beats_cli_on_end_to_end() {
     let on = dispatch_and_read_telemetry(None);
     let dry_run = on
         .dry_run
-        .expect("`--telemetry true` must write the dry-run sink");
+        .expect("current consent plus `--telemetry true` must write the dry-run sink");
     assert!(
         dry_run.contains("\"event\":\"session_start\"")
             && dry_run.contains("\"event\":\"session_end\""),
@@ -45,7 +45,7 @@ fn env_off_beats_cli_on_end_to_end() {
 /// network latency. The next interactive session owns delivery.
 #[test]
 fn short_cli_exit_persists_without_network_delivery() {
-    let evidence = dispatch_and_read_telemetry_with_endpoint(None, None);
+    let evidence = dispatch_and_read_telemetry_with_endpoint(None, None, None, false);
     let pending = evidence
         .pending
         .expect("short CLI must seal its pending telemetry before process exit");
@@ -71,10 +71,10 @@ fn an_unparseable_telemetry_env_value_keeps_the_in_process_runtime_off() {
     );
 }
 
-/// Re-enabling through the documented settings command must clear a decline
-/// recorded by the former opt-in notice as well as the config-file floor.
+/// An explicit durable enable uses the Settings transition to clear old no.
+/// The optional versioned compatibility command still rejects old versions.
 #[test]
-fn config_set_true_reenables_a_historical_decline() {
+fn config_set_true_reenables_a_historical_decline_through_settings() {
     let fixture = TempDir::new().expect("fixture root");
     let home = fixture.path().join("home");
     let codewhale_home = fixture.path().join("codewhale-home");
@@ -91,24 +91,37 @@ fn config_set_true_reenables_a_historical_decline() {
         .expect("write historical decline");
 
     let config_path = fixture.path().join("config.toml");
-    fs::write(&config_path, "telemetry = false\n").expect("write config");
+    fs::write(&config_path, "telemetry_endpoint = \"\"\n").expect("write config");
 
-    let output = Command::new(codewhale_binary())
-        .current_dir(&workspace)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").expect("PATH"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("CODEWHALE_HOME", &codewhale_home)
-        .env("CODEWHALE_SECRET_BACKEND", "file")
-        .args([
-            "--config",
-            config_path.to_str().expect("config path"),
-            "config",
-            "set",
-            "telemetry",
-            "true",
-        ])
+    let command = || {
+        let mut command = Command::new(codewhale_binary());
+        command
+            .current_dir(&workspace)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("PATH"))
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("CODEWHALE_HOME", &codewhale_home)
+            .env("CODEWHALE_SECRET_BACKEND", "file")
+            .arg("--config")
+            .arg(&config_path);
+        command
+    };
+    let before = fs::read(&state_path).unwrap();
+    let declined = command()
+        .env("CODEWHALE_TELEMETRY", "true")
+        .args(["--telemetry", "true", "features", "list"])
+        .output()
+        .expect("run with a historical sidecar-only decline");
+    assert!(declined.status.success());
+    assert!(!codewhale_home.join("telemetry").exists());
+    assert_eq!(
+        fs::read(&state_path).unwrap(),
+        before,
+        "default-on and run-scoped on must preserve the old explicit no"
+    );
+    let output = command()
+        .args(["config", "set", "telemetry", "true"])
         .output()
         .expect("run config set");
     assert!(
@@ -125,23 +138,95 @@ fn config_set_true_reenables_a_historical_decline() {
     let state = SetupState::load_from(&state_path).expect("read setup state");
     assert!(state.telemetry_accepted(TELEMETRY_NOTICE_VERSION));
     assert!(!state.telemetry_opted_out());
+
+    let outdated = command()
+        .args(["config", "telemetry", "--accept-notice", "3"])
+        .output()
+        .expect("attempt outdated consent");
+    assert!(!outdated.status.success());
+    assert!(
+        !SetupState::load_from(&state_path)
+            .expect("read enabled state")
+            .telemetry_opted_out()
+    );
+
+    let accepted = command()
+        .args([
+            "config",
+            "telemetry",
+            "--accept-notice",
+            TELEMETRY_NOTICE_VERSION,
+        ])
+        .output()
+        .expect("accept current notice");
+    assert!(
+        accepted.status.success(),
+        "current notice acceptance failed: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let state = SetupState::load_from(&state_path).expect("read accepted state");
+    assert!(state.telemetry_accepted(TELEMETRY_NOTICE_VERSION));
+    assert!(!state.telemetry_opted_out());
+}
+
+#[test]
+fn missing_preference_defaults_on_without_inventing_acceptance() {
+    for version in [None, Some("1"), Some("4")] {
+        let evidence = dispatch_and_read_telemetry_with_endpoint(None, Some(""), version, false);
+        let batch: serde_json::Value = serde_json::from_str(
+            evidence
+                .dry_run
+                .as_ref()
+                .expect("default-on writes dry run")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(batch["schema_version"], 3);
+        assert_eq!(batch["notice_version"], 5);
+        assert!(batch.get("consent_version").is_none());
+        let state = evidence.setup.expect("disclosure display marker");
+        assert_eq!(
+            state.telemetry_notice_shown_for.as_deref(),
+            Some(TELEMETRY_NOTICE_VERSION)
+        );
+        assert_eq!(state.telemetry_notice_decided_for.as_deref(), version);
+        assert!(!state.telemetry_accepted(TELEMETRY_NOTICE_VERSION));
+        assert!(evidence.stderr.contains("on by default"));
+        assert!(evidence.stderr.contains("Codewhale and PostHog"));
+        assert!(
+            evidence
+                .stderr
+                .contains("codewhale config set telemetry false")
+        );
+    }
 }
 
 struct DispatchEvidence {
     telemetry_dir_exists: bool,
     dry_run: Option<String>,
     pending: Option<String>,
+    setup: Option<SetupState>,
+    stderr: String,
 }
 
 /// Run the real dispatcher into a keyless in-process command and report the
 /// telemetry state it actually left behind.
 fn dispatch_and_read_telemetry(telemetry_env: Option<&str>) -> DispatchEvidence {
-    dispatch_and_read_telemetry_with_endpoint(telemetry_env, Some(""))
+    dispatch_and_read_telemetry_with_endpoint(
+        telemetry_env,
+        Some(""),
+        Some(TELEMETRY_NOTICE_VERSION),
+        true,
+    )
 }
 
 fn dispatch_and_read_telemetry_with_endpoint(
     telemetry_env: Option<&str>,
     endpoint: Option<&str>,
+    consent_version: Option<&str>,
+    cli_on: bool,
 ) -> DispatchEvidence {
     let fixture = TempDir::new().expect("fixture root");
     let home = fixture.path().join("home");
@@ -151,8 +236,16 @@ fn dispatch_and_read_telemetry_with_endpoint(
         fs::create_dir_all(dir).expect("create fixture dir");
     }
 
+    if let Some(version) = consent_version {
+        let mut state = SetupState::default();
+        state.record_telemetry_notice(version, true);
+        state
+            .save_to(&codewhale_home.join("setup_state.json"))
+            .expect("write fixture consent");
+    }
+
     let config_path = fixture.path().join("config.toml");
-    let mut config = "telemetry = true\n".to_string();
+    let mut config = String::new();
     if let Some(endpoint) = endpoint {
         config.push_str(&format!("telemetry_endpoint = {endpoint:?}\n"));
     }
@@ -172,8 +265,11 @@ fn dispatch_and_read_telemetry_with_endpoint(
             "https://example.invalid/releases",
         )
         .arg("--config")
-        .arg(&config_path)
-        .args(["--telemetry", "true", "features", "list"]);
+        .arg(&config_path);
+    if cli_on {
+        command.args(["--telemetry", "true"]);
+    }
+    command.args(["features", "list"]);
     if let Some(value) = telemetry_env {
         command.env("CODEWHALE_TELEMETRY", value);
     }
@@ -206,6 +302,8 @@ fn dispatch_and_read_telemetry_with_endpoint(
         telemetry_dir_exists: telemetry_dir.exists(),
         dry_run,
         pending,
+        setup: SetupState::load_from(&codewhale_home.join("setup_state.json")),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }
 

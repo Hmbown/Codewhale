@@ -1,10 +1,10 @@
-//! `/setup` command. `/setup fleet` opens the saved-fleet readiness step.
+//! `/setup` command. `/setup fleet` opens the fleet readiness step.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
 #[cfg(test)]
-use crate::config::ApiProvider;
-use crate::localization::MessageId;
+use crate::config::ProviderKind;
 use crate::tui::app::{App, AppAction};
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 use codewhale_config::SetupStep;
@@ -91,7 +91,7 @@ impl RegisterCommand for SetupCmd {
                 })
             }
             Some(other) => CommandResult::error(format!(
-                "Unknown /setup target '{other}'. Try `/setup fleet` to configure saved Fleets, or \
+                "Unknown /setup target '{other}'. Try `/setup fleet` to configure saved teams, or \
                  `/setup` to open the full setup wizard."
             )),
         }
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             result.action,
             Some(AppAction::OpenProviderSetup {
-                provider: Some(ApiProvider::Anthropic)
+                provider: Some(ProviderKind::Anthropic.as_str().into())
             })
         );
         assert!(result.message.is_none());
@@ -261,18 +261,18 @@ mod tests {
     }
 
     #[test]
-    fn setup_provider_agnes_opens_unpublished_template() {
+    fn setup_provider_agnes_rejects_retired_template_name() {
         let mut app = test_app();
 
         let result = SetupCmd::execute(&mut app, Some("provider agnes"));
 
-        assert_eq!(
-            result.action,
-            Some(AppAction::OpenTemplateSetup {
-                template_id: "agnes".to_string(),
-            })
+        assert!(result.action.is_none());
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Unknown provider 'agnes'"))
         );
-        assert!(result.message.is_none());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! existing owners — the merged Models.dev catalog (via
 //! [`crate::provider_lake::catalog_offering_for_model`], provider-aware, with
 //! bundled/live/override layers) first, then the seeded
-//! [`crate::model_registry`] facts for ids no catalog row covers (custom
+//! reviewed intrinsic facts for ids no catalog row covers (custom
 //! providers, local models). No second model catalog is introduced here.
 //!
 //! Honesty rules: unknown facts are omitted rather than guessed, an explicit
@@ -16,9 +16,9 @@
 use codewhale_config::catalog::CatalogSource;
 use codewhale_config::route::{CapabilityState, RouteCapabilities, RouteLimits};
 
-use crate::config::ApiProvider;
-use crate::model_registry::{self, ModelMetadata};
-use crate::tui::model_picker::format_picker_context_window;
+use crate::config::ProviderKind;
+use crate::utils::format_context_window;
+use codewhale_config::catalog::reviewed::IntrinsicModel;
 
 /// Resolved capability badges for one Fleet route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,8 +69,8 @@ pub fn resolve_route_capability_badges(
             });
         }
     }
-    let meta = model_registry::lookup(model)?;
-    let badges = badges_from_registry(&meta);
+    let meta = codewhale_config::catalog::reviewed::intrinsic_model(model)?;
+    let badges = badges_from_intrinsic(&meta);
     (!badges.is_empty()).then_some(RouteCapabilityBadges {
         badges,
         provenance: "registry",
@@ -89,16 +89,15 @@ fn effective_model(model: &str) -> Option<&str> {
 
 /// Accept only exact canonical built-in provider ids. Display labels and named
 /// custom table keys must not inherit a built-in catalog by similarity.
-fn exact_builtin_provider(provider_id: &str) -> Option<ApiProvider> {
-    ApiProvider::parse(provider_id).filter(|provider| provider.as_str() == provider_id)
+fn exact_builtin_provider(provider_id: &str) -> Option<ProviderKind> {
+    ProviderKind::parse(provider_id).filter(|provider| provider.as_str() == provider_id)
 }
 
 const fn catalog_provenance(source: &CatalogSource) -> &'static str {
     match source {
         CatalogSource::Bundled | CatalogSource::CodewhaleBundled { .. } => "bundled catalog",
-        CatalogSource::Live { .. }
-        | CatalogSource::ModelsDevLive { .. }
-        | CatalogSource::CodewhaleLive { .. } => "live catalog",
+        CatalogSource::Live { .. } | CatalogSource::ModelsDevLive { .. } => "live catalog",
+        CatalogSource::CloudFacts { .. } => "signed cloud facts",
         CatalogSource::ConfigOverride | CatalogSource::UserOverride => "override",
     }
 }
@@ -108,10 +107,10 @@ const fn catalog_provenance(source: &CatalogSource) -> &'static str {
 fn badges_from_route(limits: &RouteLimits, capabilities: &RouteCapabilities) -> Vec<String> {
     let mut badges = Vec::new();
     if let Some(context) = limits.context_tokens {
-        badges.push(format!("{} ctx", format_picker_context_window(context)));
+        badges.push(format!("{} ctx", format_context_window(context)));
     }
     if let Some(output) = limits.output_tokens {
-        badges.push(format!("{} out", format_picker_context_window(output)));
+        badges.push(format!("{} out", format_context_window(output)));
     }
     push_state_badge(&mut badges, capabilities.native_tool_calls, "tools");
     push_state_badge(&mut badges, capabilities.reasoning, "reasoning");
@@ -119,24 +118,18 @@ fn badges_from_route(limits: &RouteLimits, capabilities: &RouteCapabilities) -> 
     badges
 }
 
-/// Badges from seeded registry facts. The registry has no tool/vision facts,
+/// Badges from reviewed intrinsic facts. The registry has no tool/vision facts,
 /// and its `supports_reasoning: false` is a heuristic default rather than a
 /// sourced denial, so only a positive reasoning fact is shown.
-fn badges_from_registry(meta: &ModelMetadata) -> Vec<String> {
+fn badges_from_intrinsic(meta: &IntrinsicModel) -> Vec<String> {
     let mut badges = Vec::new();
     if let Some(context) = meta.context_window {
-        badges.push(format!(
-            "{} ctx",
-            format_picker_context_window(u64::from(context))
-        ));
+        badges.push(format!("{} ctx", format_context_window(u64::from(context))));
     }
-    if let Some(output) = meta.max_output {
-        badges.push(format!(
-            "{} out",
-            format_picker_context_window(u64::from(output))
-        ));
+    if let Some(output) = meta.generation_default.or(meta.max_output) {
+        badges.push(format!("{} out", format_context_window(u64::from(output))));
     }
-    if meta.supports_reasoning {
+    if meta.reasoning == Some(true) {
         badges.push("reasoning".to_string());
     }
     badges
@@ -168,8 +161,9 @@ mod tests {
         assert!(badges.badges.contains(&"384K out".to_string()));
         assert!(badges.badges.contains(&"tools".to_string()));
         assert!(badges.badges.contains(&"reasoning".to_string()));
-        // Text-only modalities are an explicit sourced fact, not an unknown.
-        assert!(badges.badges.contains(&"no vision".to_string()));
+        // The offline seed's text-only row is not a refusal (#6396): the seed
+        // lags providers, so it may say "vision" but never "no vision".
+        assert!(!badges.badges.contains(&"no vision".to_string()));
         assert!(
             badges.provenance.contains("catalog"),
             "catalog facts must carry catalog provenance, got {}",
@@ -249,9 +243,9 @@ mod tests {
 
     #[test]
     fn token_labels_match_picker_vocabulary() {
-        assert_eq!(format_picker_context_window(1_000_000), "1M");
-        assert_eq!(format_picker_context_window(1_050_000), "1.05M");
-        assert_eq!(format_picker_context_window(262_144), "262K");
-        assert_eq!(format_picker_context_window(500), "500");
+        assert_eq!(format_context_window(1_000_000), "1M");
+        assert_eq!(format_context_window(1_050_000), "1.05M");
+        assert_eq!(format_context_window(262_144), "262K");
+        assert_eq!(format_context_window(500), "500");
     }
 }

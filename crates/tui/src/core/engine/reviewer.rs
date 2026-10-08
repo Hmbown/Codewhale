@@ -13,15 +13,15 @@
 use std::time::Duration;
 
 use crate::core::model_client::ModelClient;
-use crate::models::Role;
-use crate::models::{
-    ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage,
-    is_incomplete_stop_reason,
-};
 use crate::tools::spec::ToolError;
 use crate::tui::auto_review::{
     AutoReviewAction, DEFAULT_GUARDIAN_POLICY, ReviewerRiskLevel, ReviewerVerdict,
     parse_reviewer_verdict,
+};
+use codewhale_models::Role;
+use codewhale_models::{
+    ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage,
+    is_incomplete_stop_reason,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -74,7 +74,7 @@ impl ReviewerOutcome {
                 "Auto-Review guardian denied tool '{tool_name}': {reason}. Do not work around this denial; find a materially safer path or stop."
             ))),
             Self::Unavailable { reason } => Err(ToolError::permission_denied(format!(
-                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). Switch to Ask to review this call yourself."
+                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). To run it, the person can switch Permissions to Full Access, or to Ask where a prompt can be answered."
             ))),
             Self::Cancelled => Err(ToolError::cancelled(
                 "Auto-Review guardian request cancelled",
@@ -146,7 +146,7 @@ pub(crate) async fn consult_reviewer(
         _ = cancel_token.cancelled() => {
             return ReviewerResult::finish(ReviewerOutcome::Cancelled, None);
         }
-        response = tokio::time::timeout(REVIEWER_TIMEOUT, client.create_message(request)) => response,
+        response = tokio::time::timeout(REVIEWER_TIMEOUT, client.create_message_uncached(request)) => response,
     };
     let response = match response {
         Err(_) => return ReviewerResult::unavailable("the reviewer timed out", None),
@@ -221,6 +221,53 @@ mod tests {
             stop_sequence: None,
             container: None,
             usage,
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_rechecks_identical_calls_instead_of_reusing_a_cached_allow() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::client::CodewhaleClient::new(
+            &crate::config::Config {
+                ..Default::default()
+            }
+            .with_legacy_root(
+                Some("test-guardian-cache-key".to_string()),
+                Some(server.uri()),
+            ),
+        )
+        .unwrap();
+        for (decision, risk) in [("allow", "low"), ("deny", "high")] {
+            server.reset().await;
+            let verdict = serde_json::json!({
+                "decision": decision,
+                "risk_level": risk,
+                "reason": "current authorization evidence",
+            });
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "guardian-fresh",
+                    "object": "chat.completion",
+                    "model": "deepseek-v4-pro",
+                    "choices": [{"index": 0, "message": {
+                        "role": "assistant", "content": verdict.to_string(),
+                    }, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12},
+                })))
+                .mount(&server)
+                .await;
+            let result = consult_reviewer(
+                &client,
+                "the same proposed call under current policy",
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(result.outcome.audit_decision(), decision);
+            assert_eq!(result.usage.unwrap().output_tokens, 3);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
     }
 

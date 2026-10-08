@@ -101,8 +101,14 @@ def validate_order(
         raise ValidationError(f"workspace packages have mixed versions: {rendered}")
 
     workspace_by_name = {package["name"]: package for package in packages}
+    # `cargo metadata` renders `publish = false` as an empty registry list.
+    # Such a crate cannot be published, so demanding it appear in the publish
+    # order is a contradiction: `crates.sh` drives `cargo publish`, which would
+    # refuse it. Vendored, workspace-internal crates live here.
     release_names = sorted(
-        name for name in workspace_by_name if name.startswith("codewhale-")
+        name
+        for name, package in workspace_by_name.items()
+        if name.startswith("codewhale-") and package.get("publish") != []
     )
     ordered_set = set(ordered_crates)
     missing = sorted(set(release_names) - ordered_set)

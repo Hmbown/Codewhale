@@ -67,14 +67,16 @@ install_binary() {
   # path (SIGKILL on exec, no output). Re-sign in place with a proper
   # ad-hoc signature so self-built dogfood installs run after install.
   if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
-    codesign --force --sign - "${tmp}" >/dev/null 2>&1 || {
+    # One explicit identity keeps aliases byte-identical after signing.
+    # Otherwise codesign derives different identifiers from their filenames.
+    codesign --force --identifier codewhale --sign - "${tmp}" >/dev/null 2>&1 || {
       echo "WARN: codesign failed for ${tmp}; binary may be killed by AMFI after install" >&2
     }
   fi
   mv -f "${tmp}" "${dst}"
   # Re-sign the final path as well — some macOS versions re-evaluate on rename.
   if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
-    codesign --force --sign - "${dst}" >/dev/null 2>&1 || true
+    codesign --force --identifier codewhale --sign - "${dst}" >/dev/null 2>&1 || true
   fi
   cmp -s "${src}" "${dst}" || {
     # cmp can fail after codesign rewrote the code signature; verify exec instead.
@@ -128,6 +130,10 @@ path_cli="$(verify_fresh_shell_binary codewhale)"
 path_shim="$(verify_fresh_shell_binary codew)"
 installed_cli_sha="$(shasum -a 256 "${path_cli}" | awk '{print $1}')"
 installed_shim_sha="$(shasum -a 256 "${path_shim}" | awk '{print $1}')"
+if [[ "${installed_cli_sha}" != "${installed_shim_sha}" ]]; then
+  echo "ERROR: installed codewhale and codew differ; no successful identity receipt written" >&2
+  exit 1
+fi
 
 default_receipt_root="${HOME}/.codewhale/dogfood-receipts"
 if [[ -d "/Volumes/VIXinSSD/CW/backups" ]]; then

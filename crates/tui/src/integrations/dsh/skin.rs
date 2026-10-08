@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
-use crate::palette::{
+use codewhale_palette::{
     LIGHT_PANEL, LIGHT_SURFACE, LIGHT_UI_THEME, UI_THEME, UiTheme, WHALE_BG, WHALE_CHROME,
     WHALE_COMPOSER, WHALE_PANEL, hex_rgb_string,
 };

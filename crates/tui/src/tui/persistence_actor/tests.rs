@@ -3,8 +3,8 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-use crate::models::Role;
-use crate::models::{ContentBlock, Message};
+use codewhale_models::Role;
+use codewhale_models::{ContentBlock, Message};
 
 const BACKLOG_RECEIPT_PATH_ENV: &str = "CODEWHALE_TEST_PERSISTENCE_BACKLOG_RECEIPT_PATH";
 const BACKLOG_SOURCE_SHA_ENV: &str = "CODEWHALE_TEST_PERSISTENCE_BACKLOG_SOURCE_SHA";
@@ -129,10 +129,7 @@ fn backlog_session(workspace: &std::path::Path, index: usize) -> SavedSession {
     session
 }
 
-fn retained_request_payload_bytes(request: &PersistRequest) -> usize {
-    let PersistRequest::SessionSnapshot(session) = request else {
-        panic!("backlog fixture retained an unexpected request variant")
-    };
+fn retained_session_payload_bytes(session: &SavedSession) -> usize {
     serde_json::to_vec(session)
         .expect("retained measurement session must serialize")
         .len()
@@ -146,14 +143,24 @@ fn saved_session_version(session: &SavedSession) -> Option<usize> {
         .and_then(|value| value.parse::<usize>().ok())
 }
 
+/// Measure what the seam still owns for a consumer that has never polled:
+/// with sender-side coalescing that is the latest-wins pending state (one
+/// entry per session), plus the serialized bytes of each entry — the same
+/// estimator the pre-coalescing receipt used per queued request.
 fn drain_retained_requests(receiver: &mut PersistRequestReceiver) -> (usize, usize, Option<usize>) {
+    let pending = receiver.take_pending();
+    assert!(
+        pending.checkpoints.is_empty()
+            && pending.checkpoint_clears.is_empty()
+            && pending.completed_commits.is_empty()
+            && pending.offline_queue.is_empty(),
+        "backlog fixture retained an unexpected request variant"
+    );
     let mut retained_queued_requests = 0;
     let mut estimated_retained_payload_bytes = 0;
-    let mut pending = PendingState::default();
-    while let Ok(request) = receiver.try_recv() {
+    for session in pending.sessions.values() {
         retained_queued_requests += 1;
-        estimated_retained_payload_bytes += retained_request_payload_bytes(&request);
-        assert!(matches!(pending.absorb(request), Control::Continue));
+        estimated_retained_payload_bytes += retained_session_payload_bytes(session);
     }
     let applied_version = pending
         .sessions
@@ -278,16 +285,19 @@ fn persistence_backlog_receipt_contract_keeps_required_fields() {
 fn applied_version_follows_production_drain_order_instead_of_numeric_maximum() {
     let tmp = tempfile::tempdir().expect("isolated measurement workspace");
     let (tx, mut receiver) = persistence_request_channel();
-    tx.send(PersistRequest::SessionSnapshot(backlog_session(
-        tmp.path(),
-        BACKLOG_EXPECTED_APPLIED_VERSION,
-    )))
-    .expect("send final version first");
-    tx.send(PersistRequest::SessionSnapshot(backlog_session(
-        tmp.path(),
-        BACKLOG_EXPECTED_APPLIED_VERSION - 1,
-    )))
-    .expect("send stale version last");
+    let handle = PersistActorHandle { tx };
+    assert!(
+        handle.try_send(PersistRequest::SessionSnapshot(backlog_session(
+            tmp.path(),
+            BACKLOG_EXPECTED_APPLIED_VERSION,
+        )))
+    );
+    assert!(
+        handle.try_send(PersistRequest::SessionSnapshot(backlog_session(
+            tmp.path(),
+            BACKLOG_EXPECTED_APPLIED_VERSION - 1,
+        )))
+    );
 
     let (_, _, applied_version) = drain_retained_requests(&mut receiver);
     assert_eq!(

@@ -14,15 +14,11 @@ export const chrome: ChromeDict = {
   navCommunity: "Comunidade",
   navContribute: "Contribuir",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
+  navProduct: "Produto",
+  navModels: "Modelos",
+  navPlugins: "Plugins",
 
   skipToContent: "Pular para o conteúdo principal",
-
 
   navPrimaryAria: "Navegação principal",
   navHomeAria: "Início do Codewhale",
@@ -30,30 +26,8 @@ export const chrome: ChromeDict = {
   installCta: "Instalar →",
 
   authSignIn: "Entrar",
-  authRegister: "Criar conta",
-  authGroupAria: "Conta",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "qualquer modelo, na sua máquina",
-
-  issueLabel: "Edição {date}",
   dateLocale: "pt-BR",
-
-  starsAria: "Estrelas no GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "Ao vivo",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "mesclado",
-  tickerOpened: "aberto",
-  tickerClosed: "fechado",
-  tickerReleased: "lançado",
-  tickerFirstContribution: "primeira contribuição",
-  tickerBy: "por {handle}",
-  tickerAria: "Atividade recente do repositório",
-
-  traceLabel: "rastro de raciocínio",
-  traceTabsAria: "Trechos da sessão",
 
   menuOpen: "Abrir menu",
   menuClose: "Fechar menu",
@@ -61,11 +35,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "claro",
   themeDark: "escuro",
-  themeAria: "Tema da documentação: {mode} (clique para alternar)",
-  themeTitle: "Tema da documentação · auto / claro / escuro",
+  themeAria: "Tema: {mode} (clique para alternar)",
+  themeTitle: "Tema · auto / claro / escuro",
 
   footerTagline:
-    "O Codewhale mergulha fundo para você não precisar — documentação, código-fonte e comunidade do runtime de código aberto.",
+    "Edite código, execute testes e revise alterações com os modelos que você escolher.",
   footerProduct: "Produto",
   footerProject: "Projeto",
   footerDocs: "Documentação",
@@ -77,7 +51,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "Contribuir",
   footerLicense: "Licença MIT",
-  footerPricing: "Preços",
   footerTerms: "Termos de serviço",
   footerPrivacy: "Privacidade",
   footerChangelog: "Registro de alterações",

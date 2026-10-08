@@ -6,7 +6,7 @@ name: Sync to CNB
 #
 # Triggers:
 #   * push to main              → mirrors that commit to CNB main
-#   * tag matching v*           → mirrors that tag to CNB
+#   * successful Release job   → mirrors the published tag to CNB
 #   * release work branches     → mirrors release-candidate refs for CNB preflight
 #   * fix/rebrand branches      → mirrors first-party heavy Linux CI refs
 #   * Tencent release branches  → mirrors Feishu/Lighthouse setup branches
@@ -32,14 +32,29 @@ on:
       - 'rebrand/*'
       - 'work/v*-feishu-*'
       - 'work/v*-lighthouse*'
-    tags: ['v*']
   workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+    secrets:
+      CNB_GIT_TOKEN:
+        required: true
 
-# Serialize runs so the back-to-back main-push + tag-push from auto-tag.yml
-# don't race each other rebasing onto CNB. cancel-in-progress: false so
-# every commit actually arrives — we'd rather queue than drop.
+# Serialize runs per ref. One global group was wrong: with
+# cancel-in-progress: false GitHub still keeps only ONE pending run per group
+# and cancels it when a newer one queues, so a release tag sync waiting behind
+# a main push was dropped by the next branch push. Keyed by ref, each tag gets
+# its own group (never superseded), and a pending branch sync is only ever
+# replaced by a newer push of the same branch, whose force-push supersedes it.
+# The main and tag pushes from auto-tag.yml write different CNB refs, so
+# running them concurrently cannot conflict.
 concurrency:
-  group: cnb-sync
+  group: cnb-sync-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -48,14 +63,19 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Push triggering ref to CNB
         env:
           CNB_TOKEN: ${{ secrets.CNB_GIT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -95,12 +115,19 @@ jobs:
             return 1
           }
 
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-            # Release tags may be repointed while rebuilding a failed
-            # publish attempt. CNB is a one-way mirror, so force the tag
-            # there to match GitHub instead of failing on "already exists".
-            push_with_retry "tag ${TAG}" "+refs/tags/${TAG}:refs/tags/${TAG}"
+          if [[ -n "${RELEASE_TAG}" || "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${RELEASE_TAG:-${GITHUB_REF#refs/tags/}}"
+            # The tag starts CNB's public release pipeline. Require the
+            # canonical release even for a manual recovery dispatch.
+            if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+                [[ "$(git rev-parse 'HEAD^{commit}')" != "${SOURCE_SHA}" ]]; then
+              echo "::error::CNB release source does not match the frozen tag input." >&2
+              exit 1
+            fi
+            ./scripts/release/verify-remote-tag.sh \
+              "https://github.com/${GITHUB_REPOSITORY}.git" "${TAG}" "${SOURCE_SHA}"
+            node scripts/release/verify-release-inventory.js --manifest "${GITHUB_REPOSITORY}" "${TAG}"
+            push_with_retry "tag ${TAG}" "refs/tags/${TAG}:refs/tags/${TAG}"
           elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
             # Plain --force. The CNB mirror is one-way by design —
             # nothing else pushes to it, so there's no contributor work

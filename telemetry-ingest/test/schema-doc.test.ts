@@ -31,6 +31,8 @@ import {
   LIBCS,
   MAX_BODY_BYTES,
   OSES,
+  PRODUCT_COUNTER_FIELDS,
+  OPERATIONS_FIELDS,
   SCHEMA_VERSION,
   SESSION_SOURCES,
   SURFACES,
@@ -172,6 +174,15 @@ describe("the doc and the validator publish the same fields", () => {
     );
   });
 
+  it("agrees on aggregate product and operations fields", () => {
+    expect([...documentedKeys(BLOCKS[5])].sort()).toEqual(
+      [...EVENT_FIELDS.product_usage, ...PRODUCT_COUNTER_FIELDS].sort(),
+    );
+    expect([...documentedKeys(BLOCKS[6])].sort()).toEqual(
+      ["event", ...OPERATIONS_FIELDS].sort(),
+    );
+  });
+
   it("agrees on the counters table, field for field", () => {
     const rows = tableAfter(DOC, "**`counters`** — closed field set");
     expect(rows.map(([name]) => name)).toEqual([...COUNTER_FIELDS]);
@@ -220,7 +231,7 @@ describe("the doc and the validator publish the same limits", () => {
     const match = DOC.match(/`SCHEMA_VERSION\s*=\s*(\d+)`/);
     expect(match).not.toBeNull();
     expect(Number((match as RegExpMatchArray)[1])).toBe(SCHEMA_VERSION);
-    expect(goldenBatch().schema_version).toBe(SCHEMA_VERSION);
+    expect(goldenBatch().schema_version).toBe(1); // preserved legacy golden
   });
 
   it("agrees on the per-batch caps", () => {

@@ -1,0 +1,6 @@
+{
+  "description": "DeepSeek chat: reasoning_content deltas before content, finish_reason stop with usage carrying prompt-cache hit/miss and reasoning tokens.",
+  "route": "deepseek",
+  "model": "deepseek-v4-pro",
+  "reasoning_effort": "high"
+}

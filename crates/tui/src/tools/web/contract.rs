@@ -30,6 +30,7 @@ pub(crate) enum BackendId {
     Baidu,
     Volcengine,
     Sofya,
+    Serply,
 }
 
 impl BackendId {
@@ -47,6 +48,7 @@ impl BackendId {
             Self::Baidu => "baidu",
             Self::Volcengine => "volcengine",
             Self::Sofya => "sofya",
+            Self::Serply => "serply",
         }
     }
 }
@@ -63,7 +65,6 @@ pub(crate) enum Recency {
 
 impl Recency {
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn days(self) -> u16 {
         match self {
             Self::Day => 1,
@@ -178,14 +179,33 @@ impl QueryKnob {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum DegradedReason {
-    BackendUnavailable { backend: BackendId },
-    NoUsableResults { backend: BackendId },
-    BackendFallback { from: BackendId, to: BackendId },
-    ChallengeDetected { backend: BackendId },
-    ScrapeFallback { from: BackendId, to: BackendId },
-    KnobIgnored { knob: QueryKnob },
-    PostFiltered { knob: QueryKnob },
+    BackendUnavailable {
+        backend: BackendId,
+    },
+    NoUsableResults {
+        backend: BackendId,
+    },
+    BackendFallback {
+        from: BackendId,
+        to: BackendId,
+    },
+    ChallengeDetected {
+        backend: BackendId,
+    },
+    ScrapeFallback {
+        from: BackendId,
+        to: BackendId,
+    },
+    KnobIgnored {
+        knob: QueryKnob,
+    },
+    PostFiltered {
+        knob: QueryKnob,
+    },
     SynthesizedResults,
+    /// The provider stopped a native search answer at its output limit, so
+    /// the answer is incomplete (#6508).
+    AnswerCutByProvider,
 }
 
 impl DegradedReason {
@@ -220,8 +240,21 @@ impl DegradedReason {
             Self::SynthesizedResults => {
                 "results were synthesized by a model-backed search response".to_string()
             }
+            Self::AnswerCutByProvider => {
+                "the provider stopped the search answer at its output limit; the answer is incomplete"
+                    .to_string()
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapturedSearchEntry {
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) snippet: Option<String>,
+    pub(crate) published: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

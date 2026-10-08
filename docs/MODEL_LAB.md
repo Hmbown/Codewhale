@@ -125,16 +125,15 @@ Planned scope:
 
 Implemented authoring foundation:
 
-- Provider-neutral `WorkflowSearchSpec` validation and deterministic freeze
-  receipts for an experimental-search option within Workflow. The freeze binds
-  the baseline, requested and resolved model names, public evidence, and
-  evaluator identity before candidate admission.
 - The best-of-N Workflow starter can generate 2–16 structured, independent
   worktree candidates with cache-stable shared instructions and a read-only
   review. This is generation/review evidence, not runtime-owned hard-gate proof.
 
 Planned scope:
 
+- A frozen experimental-search spec that binds the baseline, requested and
+  resolved model names, public evidence, and evaluator identity before
+  candidate admission (see [Workflow Experimental Search](WORKFLOW_EXPERIMENTAL_SEARCH.md)).
 - Reproducible task suites for coding, review, docs, release checks, and
   long-context workflows.
 - Side-by-side route comparisons where the exact model, provider, thinking

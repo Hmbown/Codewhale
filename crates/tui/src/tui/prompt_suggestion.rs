@@ -11,7 +11,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::core::events::TurnRoute;
 use crate::route_receipt::{TurnRouteReceipt, endpoint_identity};
 
@@ -35,7 +35,7 @@ pub struct SuggestionRouteAuthority {
 
 impl SuggestionRouteAuthority {
     #[must_use]
-    pub fn provider(&self) -> ApiProvider {
+    pub fn provider(&self) -> ProviderKind {
         self.receipt.provider()
     }
 
@@ -59,8 +59,9 @@ impl SuggestionRouteAuthority {
 
     /// Whether a live re-resolution still lands on the same endpoint and the
     /// same credential generation.
-    fn authorizes(&self, base_url: &str, api_key: &str) -> bool {
+    fn authorizes(&self, base_url: &str, api_key: &str, openrouter_vendor: Option<&str>) -> bool {
         self.receipt.matches_live_route(base_url, api_key)
+            && self.receipt.openrouter_vendor() == openrouter_vendor
     }
 
     #[cfg(test)]
@@ -77,7 +78,7 @@ impl SuggestionRouteAuthority {
 /// redirect the background request.
 #[derive(Clone, Copy)]
 pub struct SuggestionRouteSnapshot<'a> {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     /// Exact configured route key (`TurnRoute::provider_identity`).
     pub provider_identity: &'a str,
     /// Exact wire model the completed turn actually used.
@@ -115,6 +116,7 @@ pub struct SuggestionRouteCredentials {
     pub base_url: String,
     /// Wire model the resolver arrived at. Must equal the snapshot model.
     pub model: String,
+    pub openrouter_vendor: Option<String>,
 }
 
 /// Redacted: an API key must never reach a log line, panic message, or test
@@ -136,6 +138,7 @@ pub struct SuggestionLaunch {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    pub openrouter_vendor: Option<String>,
 }
 
 /// Redacted: see [`SuggestionRouteCredentials`].
@@ -155,7 +158,7 @@ impl fmt::Debug for SuggestionLaunch {
 /// Gate on wire protocol, not a vendor enum: Anthropic Messages and the
 /// OpenAI Responses API are different request shapes and stay out.
 #[must_use]
-pub fn route_is_supported_suggestion_provider(provider: ApiProvider) -> bool {
+pub fn route_is_supported_suggestion_provider(provider: ProviderKind) -> bool {
     crate::client::provider_speaks_chat_completions(provider)
 }
 
@@ -168,29 +171,26 @@ pub fn route_is_supported_suggestion_provider(provider: ApiProvider) -> bool {
 /// different provider kind, yields `None`.
 ///
 /// The returned `base_url` is the **resolved route candidate's** endpoint, not
-/// `Config::deepseek_base_url()`. Those two are not the same string: the config
+/// `Config::active_route_base_url()`. Those two are not the same string: the config
 /// accessor is one input to candidate resolution, and the candidate endpoint is
-/// what `DeepSeekClient::from_candidate` binds the transport to and therefore
+/// what `CodewhaleClient::from_candidate` binds the transport to and therefore
 /// what `Event::TurnComplete` reports back. Comparing anything else here would
 /// compare a turn's actual endpoint against a differently-canonicalized value
 /// and fail closed on routes that never changed.
 fn resolve_credentials_for_identity(
     config: &Config,
-    provider: ApiProvider,
-    provider_identity: &str,
+    identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> Option<SuggestionRouteCredentials> {
     // Belt and braces: callers already gated, but this function must never
     // read credentials for a wire this helper does not speak.
+    let provider = identity.provider;
     if !route_is_supported_suggestion_provider(provider) {
         return None;
     }
-    let identity = config.resolve_provider_identity(provider_identity).ok()?;
-    if identity.provider != provider {
-        return None;
-    }
+    config.verify_provider_identity(identity).ok()?;
     let resolved =
-        crate::route_runtime::resolve_runtime_route_for_identity(config, &identity, Some(model))
+        crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
             .ok()?;
     if resolved.identity.provider != provider {
         return None;
@@ -201,17 +201,18 @@ fn resolve_credentials_for_identity(
     // instead of silently bypassing it with the canonical path.
     if resolved
         .config
-        .provider_config_for(provider)
+        .provider_config_for(&resolved.identity)
         .and_then(|route| route.path_suffix.as_ref())
         .is_some()
     {
         return None;
     }
-    let api_key = resolved.config.deepseek_api_key().ok()?;
+    let api_key = resolved.config.active_route_api_key().ok()?;
     Some(SuggestionRouteCredentials {
         api_key,
         base_url: resolved.candidate.endpoint().base_url.clone(),
         model: resolved.model.clone(),
+        openrouter_vendor: resolved.config.openrouter_vendor().ok()?,
     })
 }
 
@@ -328,7 +329,11 @@ where
     // Both are checked against the receipt in one step, over the raw endpoint
     // and raw credential, so a mutation hidden behind identical redaction (URL
     // userinfo, a query token) is still a mismatch.
-    if !authority.authorizes(&credentials.base_url, &credentials.api_key) {
+    if !authority.authorizes(
+        &credentials.base_url,
+        &credentials.api_key,
+        credentials.openrouter_vendor.as_deref(),
+    ) {
         return None;
     }
 
@@ -341,6 +346,7 @@ where
         api_key: credentials.api_key,
         base_url: credentials.base_url,
         model: model.to_string(),
+        openrouter_vendor: credentials.openrouter_vendor,
     })
 }
 
@@ -362,8 +368,7 @@ pub fn plan_suggestion_launch_with_config(
         |route| {
             resolve_credentials_for_identity(
                 config,
-                route.provider,
-                route.provider_identity.trim(),
+                route.authority.receipt.admitted_identity(),
                 route.model.trim(),
             )
         },
@@ -386,15 +391,16 @@ pub async fn generate_suggestion(
     base_url: &str,
     model: &str,
     recent_messages: &str,
+    openrouter_vendor: Option<&str>,
 ) -> Option<String> {
     // Suggestions are model output derived from the just-completed
     // interactive transcript. They therefore participate in the same
     // attached CWC run even though this narrow adapter owns a raw reqwest
-    // client instead of a `DeepSeekClient`. Retain the permit through decode
+    // client instead of a `CodewhaleClient`. Retain the permit through decode
     // so Runtime Chat cannot overlap or project a second inference lifecycle.
     let _inference = crate::client::acquire_remote_control_inference_participant().await;
     let client = suggestion_client();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [
             {
@@ -417,6 +423,7 @@ pub async fn generate_suggestion(
         "temperature": 0.3,
         "stream": false
     });
+    crate::client::apply_openrouter_vendor(&mut body, openrouter_vendor);
 
     let url = crate::client::api_url(base_url, "chat/completions");
     // Never log the raw request URL: a base URL can carry credentials in its
@@ -466,7 +473,7 @@ pub async fn generate_suggestion(
 }
 
 /// Extract the first text line from a single message.
-fn message_summary(m: &crate::models::Message) -> Option<String> {
+fn message_summary(m: &codewhale_models::Message) -> Option<String> {
     let role = match m.role.as_str() {
         "user" => "User",
         "assistant" => "Assistant",
@@ -476,7 +483,7 @@ fn message_summary(m: &crate::models::Message) -> Option<String> {
         .content
         .iter()
         .filter_map(|block| match block {
-            crate::models::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            codewhale_models::ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -499,7 +506,7 @@ fn message_summary(m: &crate::models::Message) -> Option<String> {
 
 /// Build a one-line-per-message summary of recent conversation context.
 /// Takes the last N messages, skipping tool-only messages.
-pub fn summarize_recent_messages(messages: &[crate::models::Message], limit: usize) -> String {
+pub fn summarize_recent_messages(messages: &[codewhale_models::Message], limit: usize) -> String {
     let start = messages.len().saturating_sub(limit);
     messages[start..]
         .iter()
@@ -513,7 +520,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        ApiProvider, Config, SuggestionRouteAuthority, SuggestionRouteCredentials,
+        Config, ProviderKind, SuggestionRouteAuthority, SuggestionRouteCredentials,
         SuggestionRouteSnapshot, TurnRoute, TurnRouteReceipt, capture_route_authority,
         endpoint_identity, generate_suggestion, plan_suggestion_launch,
         plan_suggestion_launch_with_config, resolve_credentials_for_identity,
@@ -525,6 +532,42 @@ mod tests {
 
     const DEEPSEEK_BASE: &str = "https://api.deepseek.com/v1";
     const DEEPSEEK_KEY: &str = "sk-deepseek-secret";
+
+    #[tokio::test]
+    async fn suggestion_request_preserves_openrouter_vendor_pin() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "What should we do next?" } }]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        for vendor in [Some("chutes/region-fixture"), None] {
+            assert!(
+                generate_suggestion(
+                    "fixture-key",
+                    &format!("{}/v1", server.uri()),
+                    "fixture/model",
+                    "User: hello",
+                    vendor,
+                )
+                .await
+                .is_some()
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let pinned: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            pinned["provider"],
+            serde_json::json!({"order": ["chutes/region-fixture"], "allow_fallbacks": false})
+        );
+        let unpinned: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(unpinned.get("provider").is_none());
+    }
 
     #[tokio::test]
     async fn suggestion_inference_waits_for_runtime_chat_ownership() {
@@ -546,6 +589,7 @@ mod tests {
                 &base_url,
                 "deepseek-v4-flash",
                 "User: hello\nAssistant: hi",
+                None,
             )
             .await
         });
@@ -570,12 +614,12 @@ mod tests {
     /// asked about so a test can prove it was never consulted at all.
     struct RecordingResolver {
         /// Credentials keyed by exact `(provider, provider_identity)`.
-        available: Vec<(ApiProvider, &'static str, SuggestionRouteCredentials)>,
-        asked: RefCell<Vec<(ApiProvider, String)>>,
+        available: Vec<(ProviderKind, &'static str, SuggestionRouteCredentials)>,
+        asked: RefCell<Vec<(ProviderKind, String)>>,
     }
 
     impl RecordingResolver {
-        fn new(available: Vec<(ApiProvider, &'static str, SuggestionRouteCredentials)>) -> Self {
+        fn new(available: Vec<(ProviderKind, &'static str, SuggestionRouteCredentials)>) -> Self {
             Self {
                 available,
                 asked: RefCell::new(Vec::new()),
@@ -597,7 +641,7 @@ mod tests {
                 .map(|(_, _, credentials)| credentials.clone())
         }
 
-        fn asked(&self) -> Vec<(ApiProvider, String)> {
+        fn asked(&self) -> Vec<(ProviderKind, String)> {
             self.asked.borrow().clone()
         }
     }
@@ -607,6 +651,7 @@ mod tests {
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             model: model.to_string(),
+            openrouter_vendor: None,
         }
     }
 
@@ -616,7 +661,7 @@ mod tests {
 
     /// A receipt as the engine would have minted it from the installed client.
     fn receipt(
-        provider: ApiProvider,
+        provider: ProviderKind,
         identity: &str,
         model: &str,
         base_url: &str,
@@ -630,7 +675,7 @@ mod tests {
     /// Bypasses the provider gate so the unsupported-provider tests below can
     /// prove the *later* gates also hold, not just the first one.
     fn route_authority(
-        provider: ApiProvider,
+        provider: ProviderKind,
         identity: &str,
         model: &str,
         base_url: &str,
@@ -643,7 +688,7 @@ mod tests {
 
     fn deepseek_authority(model: &str) -> SuggestionRouteAuthority {
         route_authority(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             model,
             DEEPSEEK_BASE,
@@ -652,7 +697,7 @@ mod tests {
     }
 
     fn snapshot<'a>(
-        provider: ApiProvider,
+        provider: ProviderKind,
         identity: &'a str,
         model: &'a str,
         authority: &'a SuggestionRouteAuthority,
@@ -669,7 +714,7 @@ mod tests {
     #[test]
     fn deepseek_route_uses_its_exact_wire_model_and_base_url() {
         let resolver = RecordingResolver::new(vec![(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             deepseek_credentials("deepseek-reasoner"),
         )]);
@@ -679,7 +724,7 @@ mod tests {
             true,
             2,
             Some(snapshot(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek",
                 "deepseek-reasoner",
                 &authority,
@@ -698,15 +743,15 @@ mod tests {
         // A Chat Completions key exists and would resolve fine — the gate must
         // run before the resolver is ever consulted.
         let resolver = RecordingResolver::new(vec![(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             deepseek_credentials("deepseek-chat"),
         )]);
         for (provider, identity, model) in [
-            (ApiProvider::Anthropic, "anthropic", "claude-sonnet-4"),
-            (ApiProvider::OpenaiCodex, "openai-codex", "gpt-5.4"),
+            (ProviderKind::Anthropic, "anthropic", "claude-sonnet-4"),
+            (ProviderKind::OpenaiCodex, "openai-codex", "gpt-5.4"),
             (
-                ApiProvider::DeepseekAnthropic,
+                ProviderKind::DeepseekAnthropic,
                 "deepseek-anthropic",
                 "deepseek-chat",
             ),
@@ -735,35 +780,35 @@ mod tests {
     fn chat_completions_routes_launch_with_their_own_credentials() {
         for (provider, identity, model, base, key) in [
             (
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek",
                 "deepseek-chat",
                 DEEPSEEK_BASE,
                 DEEPSEEK_KEY,
             ),
             (
-                ApiProvider::Openai,
+                ProviderKind::Openai,
                 "openai",
                 "gpt-5.6",
                 "https://api.openai.com/v1",
                 "sk-openai",
             ),
             (
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "openrouter",
                 "some/model",
                 "https://openrouter.ai/api/v1",
                 "sk-or",
             ),
             (
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 "lm-studio",
                 "local-model",
                 "http://127.0.0.1:1234/v1",
                 "lm-key",
             ),
             (
-                ApiProvider::Zai,
+                ProviderKind::Zai,
                 "zai",
                 "GLM-5.3",
                 "https://api.z.ai/api/paas/v4",
@@ -801,7 +846,7 @@ mod tests {
                 true,
                 2,
                 Some(snapshot(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     "deepseek",
                     "deepseek-chat",
                     &authority
@@ -822,7 +867,7 @@ mod tests {
                     true,
                     2,
                     Some(snapshot(
-                        ApiProvider::Deepseek,
+                        ProviderKind::Deepseek,
                         "deepseek",
                         "deepseek-chat",
                         &authority
@@ -843,18 +888,18 @@ mod tests {
         const CN_BASE: &str = "https://api.deepseek.cn/v1";
         let resolver = RecordingResolver::new(vec![
             (
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek",
                 deepseek_credentials("deepseek-chat"),
             ),
             (
-                ApiProvider::DeepseekCN,
+                ProviderKind::Deepseek,
                 "deepseek-cn",
                 credentials("sk-cn", CN_BASE, "deepseek-chat"),
             ),
         ]);
         let authority = route_authority(
-            ApiProvider::DeepseekCN,
+            ProviderKind::Deepseek,
             "deepseek-cn",
             "deepseek-chat",
             CN_BASE,
@@ -865,7 +910,7 @@ mod tests {
             true,
             4,
             Some(SuggestionRouteSnapshot {
-                provider: ApiProvider::DeepseekCN,
+                provider: ProviderKind::Deepseek,
                 provider_identity: "deepseek-cn",
                 model: "deepseek-chat",
                 authority: &authority,
@@ -879,7 +924,7 @@ mod tests {
         assert_eq!(launch.api_key, "sk-cn");
         assert_eq!(
             resolver.asked(),
-            vec![(ApiProvider::DeepseekCN, "deepseek-cn".to_string())],
+            vec![(ProviderKind::Deepseek, "deepseek-cn".to_string())],
             "only the completed route identity may be inspected"
         );
     }
@@ -893,7 +938,7 @@ mod tests {
                 true,
                 2,
                 Some(snapshot(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     "deepseek",
                     "deepseek-reasoner",
                     &authority
@@ -917,7 +962,7 @@ mod tests {
                 true,
                 2,
                 Some(snapshot(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     "deepseek",
                     "deepseek-chat",
                     &authority
@@ -938,7 +983,7 @@ mod tests {
                 true,
                 2,
                 Some(snapshot(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     "deepseek",
                     "deepseek-chat",
                     &authority
@@ -964,14 +1009,14 @@ mod tests {
         assert_eq!(endpoint_identity(ORIGINAL), endpoint_identity(ROTATED));
 
         let authority = route_authority(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "deepseek-chat",
             ORIGINAL,
             DEEPSEEK_KEY,
         );
         let route = SuggestionRouteSnapshot {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek",
             model: "deepseek-chat",
             authority: &authority,
@@ -1002,7 +1047,7 @@ mod tests {
         let authority = deepseek_authority("deepseek-chat");
         for actual_base_url in [None, Some("https://exfil.example.com/v1"), Some("  ")] {
             let route = SuggestionRouteSnapshot {
-                provider: ApiProvider::Deepseek,
+                provider: ProviderKind::Deepseek,
                 provider_identity: "deepseek",
                 model: "deepseek-chat",
                 authority: &authority,
@@ -1019,7 +1064,7 @@ mod tests {
 
         // A trailing-slash-only difference is the same endpoint.
         let route = SuggestionRouteSnapshot {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek",
             model: "deepseek-chat",
             authority: &authority,
@@ -1039,14 +1084,14 @@ mod tests {
         // Authority belongs to deepseek-cn; the completed snapshot claims
         // deepseek. Broken provenance must never dispatch.
         let cn = route_authority(
-            ApiProvider::DeepseekCN,
+            ProviderKind::Deepseek,
             "deepseek-cn",
             "deepseek-chat",
             "https://api.deepseek.cn/v1",
             "sk-cn",
         );
         let route = SuggestionRouteSnapshot {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek",
             model: "deepseek-chat",
             authority: &cn,
@@ -1064,13 +1109,13 @@ mod tests {
     #[test]
     fn missing_route_snapshot_or_disabled_gates_produce_no_request() {
         let resolver = RecordingResolver::new(vec![(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             deepseek_credentials("deepseek-chat"),
         )]);
         let authority = deepseek_authority("deepseek-chat");
         let route = snapshot(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "deepseek-chat",
             &authority,
@@ -1092,7 +1137,7 @@ mod tests {
         );
         // Empty identity is malformed provenance, not a legacy root route.
         let empty_identity = route_authority(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "  ",
             "deepseek-chat",
             DEEPSEEK_BASE,
@@ -1104,7 +1149,7 @@ mod tests {
                 true,
                 4,
                 Some(snapshot(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     "  ",
                     "deepseek-chat",
                     &empty_identity
@@ -1115,7 +1160,7 @@ mod tests {
         );
         // Empty model.
         let empty_model = route_authority(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "",
             DEEPSEEK_BASE,
@@ -1127,7 +1172,7 @@ mod tests {
                 true,
                 4,
                 Some(snapshot(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     "deepseek",
                     "",
                     &empty_model
@@ -1162,14 +1207,14 @@ mod tests {
 
         let credentials = credentials(DEEPSEEK_KEY, &secret_base, "deepseek-chat");
         let authority = route_authority(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "deepseek-chat",
             &secret_base,
             DEEPSEEK_KEY,
         );
         let route = SuggestionRouteSnapshot {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek",
             model: "deepseek-chat",
             authority: &authority,
@@ -1267,6 +1312,50 @@ mod tests {
         config
     }
 
+    #[test]
+    fn suggestion_vendor_pin_rotation_or_invalid_config_fails_closed() {
+        let _env = seal_deepseek_env();
+        let mut config = Config {
+            provider: Some("openrouter".to_string()),
+            providers: Some(ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    api_key: Some("fixture-openrouter-key".to_string()),
+                    base_url: Some("http://127.0.0.1:18080/v1".to_string()),
+                    model: Some("fixture/model".to_string()),
+                    vendor: Some("chutes/region-fixture".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let client = crate::client::CodewhaleClient::new(&config).unwrap();
+        let authority =
+            SuggestionRouteAuthority::from_receipt_for_test(client.turn_route_receipt());
+        let route = SuggestionRouteSnapshot {
+            provider: ProviderKind::Openrouter,
+            provider_identity: "openrouter",
+            model: authority.model(),
+            authority: &authority,
+            actual_base_url: Some(client.base_url()),
+        };
+        let launch = plan_suggestion_launch_with_config(&config, true, true, 2, Some(route))
+            .expect("unchanged OpenRouter pin remains authorized");
+        assert_eq!(
+            launch.openrouter_vendor.as_deref(),
+            Some("chutes/region-fixture")
+        );
+
+        for changed_vendor in [Some("another-vendor"), None, Some("bad vendor")] {
+            config.providers.as_mut().unwrap().openrouter.vendor =
+                changed_vendor.map(str::to_string);
+            assert!(
+                plan_suggestion_launch_with_config(&config, true, true, 2, Some(route)).is_none(),
+                "changed, removed, or invalid vendor must not broaden the completed turn's route"
+            );
+        }
+    }
+
     /// Build the completed-turn route the engine would have reported, using the
     /// same resolution the engine performs. This keeps the tests correct even
     /// if a model selector normalizes to a different wire id.
@@ -1289,14 +1378,16 @@ mod tests {
             .validate()
             .expect("test config must preflight a deepseek client");
         TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model,
             auto_model: false,
-            receipt: Some(validated.client.turn_route_receipt("deepseek")),
+            receipt: Some(validated.client.turn_route_receipt()),
             billing: Some(crate::core::events::RouteBillingEnvelope {
                 billing_surface: None,
                 endpoint_fingerprint: None,
+                openrouter_vendor: None,
+                provider_live_pricing: None,
                 billing_mode: crate::cost_status::RouteBillingMode::Unknown,
                 dispatched_at: chrono::Utc::now(),
             }),
@@ -1308,15 +1399,18 @@ mod tests {
     /// The endpoint `Event::TurnComplete` would report for this config.
     ///
     /// Deliberately derived from the production resolver rather than written
-    /// as a literal: `Config::deepseek_base_url()` canonicalizes DeepSeek hosts
+    /// as a literal: `Config::active_route_base_url()` canonicalizes DeepSeek hosts
     /// (it strips a trailing `/v1`), and the transport is bound to the resolved
     /// candidate's endpoint, so a hand-written literal is a different string
     /// than the one the client actually uses.
     fn deepseek_actual_base_url(config: &Config, route: &TurnRoute) -> String {
         resolve_credentials_for_identity(
             config,
-            route.provider,
-            &route.provider_identity,
+            route
+                .receipt
+                .as_ref()
+                .expect("test receipt")
+                .admitted_identity(),
             &route.model,
         )
         .expect("test config must resolve the deepseek route")
@@ -1331,14 +1425,13 @@ mod tests {
     fn route_mismatch_report(config: &Config, snapshot: &SuggestionRouteSnapshot<'_>) -> String {
         let resolved = resolve_credentials_for_identity(
             config,
-            snapshot.provider,
-            snapshot.provider_identity.trim(),
+            snapshot.authority.receipt.admitted_identity(),
             snapshot.model.trim(),
         );
         let credential_matches = resolved.as_ref().map(|credentials| {
             snapshot
                 .authority
-                .authorizes(&credentials.base_url, &credentials.api_key)
+                .authorizes(&credentials.base_url, &credentials.api_key, None)
         });
         format!(
             "snapshot={snapshot:?}, resolved={resolved:?}, \
@@ -1432,8 +1525,11 @@ mod tests {
         assert!(
             resolve_credentials_for_identity(
                 &config,
-                route.provider,
-                &route.provider_identity,
+                route
+                    .receipt
+                    .as_ref()
+                    .expect("test receipt")
+                    .admitted_identity(),
                 &route.model,
             )
             .is_none(),
@@ -1478,11 +1574,11 @@ mod tests {
             authority.endpoint_identity()
         );
         assert!(
-            !authority.authorizes(BASE_B, KEY_B),
+            !authority.authorizes(BASE_B, KEY_B, None),
             "route B must not be authorized by route A's receipt"
         );
         assert!(
-            authority.authorizes(&actual_base_url, KEY_A),
+            authority.authorizes(&actual_base_url, KEY_A, None),
             "route A must still authorize itself"
         );
 
@@ -1620,10 +1716,10 @@ mod tests {
         let config = deepseek_config(DEEPSEEK_KEY, DEEPSEEK_BASE);
 
         for (provider, identity, model) in [
-            (ApiProvider::Anthropic, "anthropic", "claude-sonnet-4"),
-            (ApiProvider::OpenaiCodex, "openai-codex", "gpt-5.4"),
+            (ProviderKind::Anthropic, "anthropic", "claude-sonnet-4"),
+            (ProviderKind::OpenaiCodex, "openai-codex", "gpt-5.4"),
             (
-                ApiProvider::DeepseekAnthropic,
+                ProviderKind::DeepseekAnthropic,
                 "deepseek-anthropic",
                 "deepseek-chat",
             ),
@@ -1643,6 +1739,8 @@ mod tests {
                 billing: Some(crate::core::events::RouteBillingEnvelope {
                     billing_surface: None,
                     endpoint_fingerprint: None,
+                    openrouter_vendor: None,
+                    provider_live_pricing: None,
                     billing_mode: crate::cost_status::RouteBillingMode::Unknown,
                     dispatched_at: chrono::Utc::now(),
                 }),
@@ -1660,8 +1758,7 @@ mod tests {
         assert!(
             resolve_credentials_for_identity(
                 &config,
-                ApiProvider::DeepseekAnthropic,
-                "deepseek-anthropic",
+                &(config).test_identity_for_kind(ProviderKind::DeepseekAnthropic),
                 "deepseek-chat",
             )
             .is_none(),
@@ -1689,7 +1786,7 @@ mod tests {
         // Same provider and identity, different wire model than the event's
         // own route: the chain is broken, not merely stale.
         route.receipt = Some(receipt(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "some-other-model",
             DEEPSEEK_BASE,
@@ -1698,7 +1795,7 @@ mod tests {
         assert!(capture_route_authority(&route).is_none());
 
         route.receipt = Some(receipt(
-            ApiProvider::DeepseekCN,
+            ProviderKind::Deepseek,
             "deepseek-cn",
             &route.model,
             DEEPSEEK_BASE,

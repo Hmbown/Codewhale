@@ -11,8 +11,9 @@ use crate::{
     leaf_is_write_capable, leaf_wants_worktree,
 };
 
-/// Default soft token budget from product config (`[workflow].default_token_budget`).
-/// Plans requesting more than this are treated as high-budget.
+/// Fallback high-budget flag threshold for approval display when a caller
+/// does not thread `[workflow].default_token_budget` through. Display-only:
+/// it never caps a run.
 pub const DEFAULT_HIGH_BUDGET_THRESHOLD: u64 = 120_000;
 
 /// Options that refine elevation assessment beyond the IR itself.
@@ -20,7 +21,8 @@ pub const DEFAULT_HIGH_BUDGET_THRESHOLD: u64 = 120_000;
 pub struct ElevationOptions {
     /// Token budget declared on the tool call (may outrank `spec.budget`).
     pub token_budget: Option<u64>,
-    /// Threshold above which a token budget is considered high.
+    /// Threshold above which a token budget is considered high. `0` disables
+    /// the flag — with no configured baseline there is nothing to exceed.
     pub high_budget_threshold: u64,
     /// Whether the parent session currently allows writes.
     pub parent_allows_write: bool,
@@ -143,7 +145,8 @@ pub fn assess_workflow_elevation(
         .token_budget
         .or(spec.budget.max_tokens)
         .filter(|n| *n > 0);
-    let high_budget = effective_tokens.is_some_and(|n| n > options.high_budget_threshold);
+    let high_budget = options.high_budget_threshold > 0
+        && effective_tokens.is_some_and(|n| n > options.high_budget_threshold);
 
     let broader_authority =
         (!options.parent_allows_write && writes) || (!options.parent_allows_network && network);
@@ -547,6 +550,7 @@ mod tests {
             mode,
             isolation: IsolationMode::Auto,
             file_scope: Vec::new(),
+            cwd: None,
             depends_on_results: Vec::new(),
             budget: BudgetSpec::default(),
             permissions: PermissionSpec::default(),

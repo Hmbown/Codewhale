@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use colored::Colorize;
 
-use crate::palette;
+use codewhale_palette as palette;
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static VERBOSE_SNAPSHOT: AtomicBool = AtomicBool::new(false);

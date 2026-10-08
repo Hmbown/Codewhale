@@ -1,0 +1,45 @@
+{
+  "hooks": [
+    {
+      "env": {
+        "CODEWHALE_SESSION_ID": "<HOOK_SESSION>",
+        "CODEWHALE_TOOL_CALL_ID": "call_hook_rewrite",
+        "DEEPSEEK_MODE": "Agent",
+        "DEEPSEEK_MODEL": "deepseek-v4-pro",
+        "DEEPSEEK_SESSION_ID": "<HOOK_SESSION>",
+        "DEEPSEEK_TOOL_ARGS": "{\"command\":\"cargo test\"}",
+        "DEEPSEEK_TOOL_CALL_ID": "call_hook_rewrite",
+        "DEEPSEEK_TOOL_NAME": "Bash",
+        "DEEPSEEK_WORKSPACE": "<WORKSPACE>"
+      },
+      "name": "rewrite",
+      "ran": true,
+      "stdin": ""
+    },
+    {
+      "env": {
+        "CODEWHALE_SESSION_ID": "<HOOK_SESSION>",
+        "CODEWHALE_TOOL_CALL_ID": "call_hook_rewrite",
+        "DEEPSEEK_MODE": "Agent",
+        "DEEPSEEK_MODEL": "deepseek-v4-pro",
+        "DEEPSEEK_SESSION_ID": "<HOOK_SESSION>",
+        "DEEPSEEK_TOOL_ARGS": "{\"command\":\"cargo test\"}",
+        "DEEPSEEK_TOOL_CALL_ID": "call_hook_rewrite",
+        "DEEPSEEK_TOOL_NAME": "Bash",
+        "DEEPSEEK_WORKSPACE": "<WORKSPACE>"
+      },
+      "name": "ask",
+      "ran": true,
+      "stdin": ""
+    }
+  ],
+  "outcome": {
+    "admit": {
+      "additional_context": "lockfile enforced\nCI is the gate",
+      "requires_approval": true,
+      "updated_input": {
+        "command": "cargo test --locked"
+      }
+    }
+  }
+}

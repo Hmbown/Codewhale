@@ -334,9 +334,10 @@ fn clear_stash_at(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
-    let entries = load_stash_from(path);
-    let count = entries.len();
-    if count == 0 {
+    let count = load_stash_from(path).len();
+    // Clear means the file is empty afterwards, not that no *valid* draft was
+    // found: malformed-only lines are still stashed text on disk (U01-m3).
+    if count == 0 && fs::metadata(path)?.len() == 0 {
         return Ok(0);
     }
     crate::utils::write_atomic(path, b"")?;
@@ -466,6 +467,16 @@ this is not json
         let (_tmp, path) = temp_stash_path();
         std::fs::write(&path, "").unwrap();
         assert_eq!(clear_stash_at(&path).unwrap(), 0);
+    }
+
+    /// U01-m3: a file holding only unparseable lines still holds stashed
+    /// text; `/stash clear` must leave it empty, not report success over it.
+    #[test]
+    fn clear_empties_a_file_of_malformed_lines() {
+        let (_tmp, path) = temp_stash_path();
+        std::fs::write(&path, "not json\n{\"ts\":1}\n").unwrap();
+        assert_eq!(clear_stash_at(&path).unwrap(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
     }
 
     #[test]

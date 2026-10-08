@@ -5,7 +5,7 @@ const release090 = {
   tag: "v0.9.0",
   version: "0.9.0",
   publishedAt: "2026-07-16T20:05:39Z",
-  url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+  url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.0",
 };
 
 function snapshot(overrides: Partial<RepoFacts> = {}): RepoFacts {
@@ -17,6 +17,16 @@ function snapshot(overrides: Partial<RepoFacts> = {}): RepoFacts {
     crates: ["cli", "tui"],
     sandboxBackends: ["seatbelt (macOS)"],
     providers: [{ id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" }],
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        provider: "DeepSeek",
+        contextWindow: 1000000,
+        maxOutput: 128000,
+        reasoning: true,
+        addedAt: "2026-07-01",
+      },
+    ],
     defaultModel: "deepseek-v4-pro",
     nodeEngines: ">=18",
     toolCount: 66,
@@ -95,7 +105,7 @@ describe("resolveFacts", () => {
         tag: "v0.9.1",
         version: "0.9.1",
         publishedAt: "2026-07-22T01:00:00Z",
-        url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.1",
+        url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.1",
       },
     });
 

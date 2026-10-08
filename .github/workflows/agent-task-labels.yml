@@ -11,6 +11,7 @@ permissions:
 jobs:
   labels:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Add area hints to agent tasks
         uses: actions/github-script@v9

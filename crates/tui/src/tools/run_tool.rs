@@ -90,6 +90,10 @@ impl ToolSpec for RunTool {
                     "type": "boolean",
                     "description": "Include --all-features for cargo test (action=tests)"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory, relative to the workspace, to run the tests or gates in. Must exist inside the workspace."
+                },
                 "profile": {
                     "type": "string",
                     "enum": ["auto", "rust", "node", "python", "go"],
@@ -149,6 +153,7 @@ impl ToolSpec for RunTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        crate::core::engine::tool_catalog::enforce_tool_denial(context, self.name(), &input)?;
         let action = self.required_action(&input)?;
         let input = self.strip_action(input)?;
 

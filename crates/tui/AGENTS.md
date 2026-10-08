@@ -11,7 +11,7 @@ Read the repository guidance first.
   (`infoline.rs`, row 2); the roster and to-do in the work surface; receipts,
   the active row and the phase in the transcript. Key hints come from the
   `shell_key_routing` binding table, never from a string literal.
-- Status-bar ink goes through `palette::grammar` (`docs/design/STATUS_BAR_COLOR_GRAMMAR.md`).
+- Status-bar ink goes through `codewhale_palette::grammar` (`docs/design/STATUS_BAR_COLOR_GRAMMAR.md`).
   Do not invent an eighth semantic or spend Failure red on non-failure chrome.
 - Derive state from typed enums such as `ShellPhase` and `OceanTreatment`.
   Renderers must not infer state from English strings or invent lifecycle state.
@@ -44,7 +44,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 Use both or the workspace gate only when the risk genuinely spans both.
 `scripts/dev-test.sh <area|path> [filter]` prints and runs the fastest
 targeted invocation for a source path (for example
-`scripts/dev-test.sh crates/tui/src/elapsed.rs`). It uses `cargo nextest
+`scripts/dev-test.sh crates/runtime/src/elapsed.rs`). It uses `cargo nextest
 run` when nextest is installed (`CODEWHALE_DEV_NEXTEST=0` forces libtest)
 and applies `scripts/dev-cache.sh` so a new worktree gets an isolated
 Cargo build-dir. For PTY

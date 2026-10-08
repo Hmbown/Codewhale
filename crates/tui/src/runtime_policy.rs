@@ -7,13 +7,28 @@
 
 use anyhow::{Result, bail};
 
-use crate::tui::app::AppMode;
-use crate::tui::approval::ApprovalMode;
+use codewhale_config::AppMode;
+use codewhale_execpolicy::ApprovalMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RuntimePolicyProjection {
     pub(crate) mode: AppMode,
     pub(crate) permission: ApprovalMode,
+}
+
+/// The wire spelling of one approval posture: what a thread or task request
+/// names in its `permission_posture` field.
+///
+/// `Never` is a managed-policy value the product surface does not carry, so it
+/// reads as Ask — exactly as [`RuntimePolicyProjection::permission_wire`] has
+/// always spelled it.
+#[must_use]
+pub(crate) fn approval_wire(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Auto => "auto_review",
+        ApprovalMode::Bypass => "full_access",
+        ApprovalMode::Suggest | ApprovalMode::Never => "ask",
+    }
 }
 
 impl RuntimePolicyProjection {
@@ -30,7 +45,7 @@ impl RuntimePolicyProjection {
             .and_then(ApprovalMode::from_config_value)
             .filter(|permission| *permission != ApprovalMode::Never)
             .unwrap_or_else(|| {
-                if legacy_yolo_alias(mode) || auto_approve {
+                if AppMode::is_legacy_bypass_alias(mode) || auto_approve {
                     ApprovalMode::Bypass
                 } else {
                     ApprovalMode::Suggest
@@ -58,7 +73,7 @@ impl RuntimePolicyProjection {
                     "unsupported permission posture {value:?}; expected ask, auto-review, or full-access"
                 )
             })?,
-            None if legacy_yolo_alias(mode) || auto_approve.unwrap_or(false) => ApprovalMode::Bypass,
+            None if AppMode::is_legacy_bypass_alias(mode) || auto_approve.unwrap_or(false) => ApprovalMode::Bypass,
             None => ApprovalMode::Suggest,
         };
         if permission == ApprovalMode::Never {
@@ -77,12 +92,7 @@ impl RuntimePolicyProjection {
 
     #[must_use]
     pub(crate) fn permission_wire(self) -> &'static str {
-        match self.permission {
-            ApprovalMode::Suggest => "ask",
-            ApprovalMode::Auto => "auto_review",
-            ApprovalMode::Bypass => "full_access",
-            ApprovalMode::Never => "ask",
-        }
+        approval_wire(self.permission)
     }
 
     #[must_use]
@@ -99,20 +109,18 @@ pub(crate) fn parse_runtime_mode(value: &str) -> Option<AppMode> {
     }
 }
 
-/// Legacy mode spellings that carried the Full Access posture. `AppMode::
-/// parse` folds them to Agent; the posture is re-derived from the raw wire
-/// value so old persisted shapes keep their permission meaning.
-#[must_use]
-fn legacy_yolo_alias(mode: &str) -> bool {
-    matches!(
-        mode.trim().to_ascii_lowercase().as_str(),
-        "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_wire_spells_every_product_posture() {
+        assert_eq!(approval_wire(ApprovalMode::Suggest), "ask");
+        assert_eq!(approval_wire(ApprovalMode::Auto), "auto_review");
+        assert_eq!(approval_wire(ApprovalMode::Bypass), "full_access");
+        // `Never` is a managed-policy value the product surface does not carry.
+        assert_eq!(approval_wire(ApprovalMode::Never), "ask");
+    }
 
     #[test]
     fn legacy_inputs_project_to_current_mode_and_permission_wires() {

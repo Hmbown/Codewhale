@@ -13,13 +13,16 @@ pub struct KeywordCandidate<'a> {
     pub keywords: &'a [String],
 }
 
-/// Return the index of the single candidate whose keyword matches `draft`.
+/// Return the candidate index and exact term that matched `draft`.
 ///
 /// Returns `None` when `draft` has fewer than 3 characters or nothing matches.
 /// Longer keywords take precedence; a keyword matches only when the occurrence
 /// is flanked by ASCII word boundaries.
-pub fn match_plugin_keyword(draft: &str, candidates: &[KeywordCandidate<'_>]) -> Option<usize> {
-    if draft.chars().count() < 3 {
+pub fn match_plugin_keyword(
+    draft: &str,
+    candidates: &[KeywordCandidate<'_>],
+) -> Option<(usize, String)> {
+    if draft.trim_start().starts_with('/') || draft.chars().count() < 3 {
         return None;
     }
     let draft_lc = draft.to_ascii_lowercase();
@@ -36,27 +39,78 @@ pub fn match_plugin_keyword(draft: &str, candidates: &[KeywordCandidate<'_>]) ->
     pairs
         .iter()
         .find(|(keyword, _)| keyword_matches(haystack, keyword.as_bytes()))
-        .map(|(_, idx)| *idx)
+        .map(|(keyword, idx)| (*idx, keyword.clone()))
 }
 
 fn effective_keywords(candidate: &KeywordCandidate<'_>) -> Vec<String> {
     let mut keywords = Vec::new();
     for keyword in candidate.keywords {
         let normalized = keyword.trim().to_ascii_lowercase();
-        if !normalized.is_empty() {
+        if is_matchable_term(&normalized) {
             keywords.push(normalized);
         }
     }
     for domain in candidate.domains {
-        if let Some(normalized) = normalize_domain(domain) {
+        // A homepage on a code-hosting platform names where the plugin
+        // *lives*, not what it is; matching it would make every github-hosted
+        // plugin fire on any "github" mention. Everything else matches on
+        // declared data, which the host does not second-guess.
+        if let Some(normalized) = normalize_domain(domain)
+            && is_matchable_term(&normalized)
+            && !matches!(
+                normalized.as_str(),
+                "github.com" | "gitlab.com" | "bitbucket.org"
+            )
+        {
             keywords.push(normalized);
         }
     }
     let name = candidate.name.trim().to_ascii_lowercase();
-    if !name.is_empty() {
+    if is_matchable_term(&name) {
         keywords.push(name);
     }
     keywords
+}
+
+/// Generic words that never trigger a proactive plugin offer (0.10.1 plugin
+/// offering policy, rule 6). Everyday requests like "fix the accessibility of
+/// the login form" or "take a screenshot" are not evidence that the user needs
+/// an integration.
+///
+/// The marketplace repo's `scripts/check-marketplace.mjs` carries the same
+/// list as `STOPLIST` and rejects a manifest keyword on it, so a catalog
+/// author finds out at review time instead of the term silently never
+/// matching here. Change both together; kept sorted so the two diff cleanly.
+pub(crate) const GENERIC_TERM_STOPLIST: &[&str] = &[
+    "accessibility",
+    "automation",
+    "browser",
+    "browsers",
+    "chrome",
+    "codebase",
+    "docs",
+    "documentation",
+    "extension",
+    "extensions",
+    "screenshot",
+    "screenshots",
+    "web",
+    "website",
+    "wiki",
+];
+
+/// Admissibility for a match term: long enough to be a word, free of control
+/// characters, and not a generic word from [`GENERIC_TERM_STOPLIST`].
+///
+/// Everything else a catalog author declares stays matchable (`mcp`, `agent`,
+/// `model`, …): the stoplist is a short shared list, not a per-host judgment.
+/// The remaining noise controls are the send-time toast's shared tips switch
+/// and per-session budget, and per-plugin dismissal. There is no score
+/// threshold on the proactive path (see `recommend.rs`).
+fn is_matchable_term(term: &str) -> bool {
+    term.chars().count() >= 3
+        && !term.chars().any(char::is_control)
+        && !GENERIC_TERM_STOPLIST.contains(&term)
 }
 
 pub(crate) fn normalize_domain(domain: &str) -> Option<String> {
@@ -104,6 +158,28 @@ fn is_word(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Existing selection tests assert the index; the receipt test below also
+    // checks the matched term carried through to the UI.
+    fn match_plugin_keyword(draft: &str, candidates: &[KeywordCandidate<'_>]) -> Option<usize> {
+        super::match_plugin_keyword(draft, candidates).map(|(index, _)| index)
+    }
+
+    #[test]
+    fn match_receipt_names_the_exact_trigger() {
+        let keywords = vec!["finance".to_string(), "mcp".to_string()];
+        let candidates = [candidate("kimi-datasource", &[], &keywords)];
+        assert_eq!(
+            super::match_plugin_keyword("help with finance", &candidates),
+            Some((0, "finance".into()))
+        );
+        // Declared terms are the catalog author's call (#6290 rework): `mcp`
+        // matches when declared, and the receipt names it.
+        assert_eq!(
+            super::match_plugin_keyword("help with mcp", &candidates),
+            Some((0, "mcp".into()))
+        );
+    }
 
     fn candidate<'a>(
         name: &'a str,
@@ -180,5 +256,91 @@ mod tests {
         let git = vec!["git".to_string()];
         let candidates = [candidate("git", &[], &git)];
         assert_eq!(match_plugin_keyword("git", &candidates), Some(0));
+    }
+
+    #[test]
+    fn declared_vocabulary_matches_and_only_mechanics_filter_terms() {
+        // Declared keywords are the catalog author's call (#6290 rework):
+        // `mcp`, `agent`, `model`, … match when declared. The remaining
+        // filters are mechanical (>= 3 characters, no control characters),
+        // the shared generic-term stoplist, the `/`-command guard, and the
+        // code-hosting homepage exclusion.
+        let words = [
+            "mcp", "plugin", "skill", "agent", "tool", "code", "data", "model", "session",
+        ];
+        let keywords = words
+            .iter()
+            .map(|word| word.to_string())
+            .collect::<Vec<_>>();
+        let candidates = [candidate("mcp", &[], &keywords)];
+        for word in words {
+            assert_eq!(
+                match_plugin_keyword(&format!("please help with {word}"), &candidates),
+                Some(0),
+                "{word}"
+            );
+        }
+        // Two-character terms stay out on the mechanical floor.
+        let short_keywords = vec!["go".to_string()];
+        let short = [candidate("git", &[], &short_keywords)];
+        assert_eq!(match_plugin_keyword("go", &short), None);
+
+        let shared_host = vec!["https://github.com/example/plugin".to_string()];
+        let candidates = [candidate("supabase", &shared_host, &[])];
+        assert_eq!(
+            match_plugin_keyword("open github.com/example/repo", &candidates),
+            None
+        );
+        for command in ["/mcp", "  /plugin show supabase", "/skills supabase"] {
+            assert_eq!(match_plugin_keyword(command, &candidates), None);
+        }
+        assert_eq!(
+            match_plugin_keyword("add supabase auth", &candidates),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn generic_terms_never_match_even_when_declared() {
+        // Policy rule 6: "improve accessibility" and "take a screenshot" are
+        // ordinary requests, not evidence the user wants an integration.
+        let keywords = GENERIC_TERM_STOPLIST
+            .iter()
+            .map(|word| word.to_string())
+            .collect::<Vec<_>>();
+        let candidates = [candidate("computer-use", &[], &keywords)];
+        for draft in [
+            "improve accessibility",
+            "take a screenshot",
+            "fix the accessibility of the login form",
+            "open the browser and check the web page",
+            "update the docs and the wiki",
+        ] {
+            assert_eq!(match_plugin_keyword(draft, &candidates), None, "{draft}");
+        }
+        // A plugin named with a generic word is not matchable by that name.
+        let none: Vec<String> = Vec::new();
+        let named = [candidate("browser", &[], &none)];
+        assert_eq!(match_plugin_keyword("open the browser", &named), None);
+        // A specific term on the same plugin still matches.
+        let specific = vec!["accessibility".to_string(), "computer use".to_string()];
+        let candidates = [candidate("computer-use", &[], &specific)];
+        assert_eq!(
+            match_plugin_keyword("let computer use drive the app", &candidates),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn stoplist_is_sorted_lowercase_and_unique() {
+        let mut sorted = GENERIC_TERM_STOPLIST.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, GENERIC_TERM_STOPLIST);
+        assert!(
+            GENERIC_TERM_STOPLIST
+                .iter()
+                .all(|term| *term == term.to_ascii_lowercase())
+        );
     }
 }

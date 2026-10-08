@@ -83,7 +83,7 @@ impl PluginDiscoveryContext {
         Arc::new(Self {
             state_path: user_plugins_dir.join("state.json"),
             user_plugins_dir,
-            builtin_plugin_dirs: Arc::from([]),
+            builtin_plugin_dirs: super::builtin::materialized_dirs().into(),
             host_environment: Arc::new(HostEnvironment::capture()),
         })
     }
@@ -111,10 +111,15 @@ impl PluginDiscoveryContext {
             builtin_plugin_dirs: self.builtin_plugin_dirs.to_vec(),
             state_path: self.state_path.clone(),
         };
-        Arc::new(super::discovery::discover_with_context(
-            &config,
-            Arc::clone(self),
-        ))
+        let mut registry = super::discovery::discover_with_context(&config, Arc::clone(self));
+        // An upgrade re-roots the built-ins; keep their review (K4).
+        registry.carry_forward_builtin_trust();
+        // Only after carry-forward: retiring superseded built-in records is
+        // safe once this build holds its own. Unit tests call the collector
+        // directly so that no test ever mutates a home implicitly.
+        #[cfg(not(test))]
+        registry.collect_garbage_at_startup();
+        Arc::new(registry)
     }
 
     #[must_use]

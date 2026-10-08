@@ -2,6 +2,7 @@
 
 import { useEffect } from "react";
 import { ErrorRoute } from "@/components/route-state";
+import { recordUsage } from "@/components/usage-counting";
 
 /**
  * Route-level error boundary for every locale page. `reset` re-renders the
@@ -19,6 +20,8 @@ export default function Error({
 }) {
   useEffect(() => {
     console.error(error);
+    // Counted as one error shown; the message and digest never leave.
+    recordUsage("error_shown");
   }, [error]);
 
   return (

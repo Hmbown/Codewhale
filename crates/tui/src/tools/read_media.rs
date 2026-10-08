@@ -15,6 +15,9 @@
 //! ladder result fits the budget the tool fails closed — nothing is sent —
 //! with the exact conversion command to retry with.
 
+#[cfg(test)]
+use image::ImageReader;
+#[cfg(test)]
 use std::io::Cursor;
 
 use async_trait::async_trait;
@@ -23,7 +26,7 @@ use codewhale_config::route::CapabilityState;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
 use image::imageops::FilterType;
-use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder, ImageReader, Limits};
+use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -35,14 +38,7 @@ use super::spec::{
 /// Maximum source image size before decoding (20 MiB).
 pub const MAX_SOURCE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
-/// Maximum width or height admitted for an input image (8192 px).
-pub const MAX_IMAGE_DIMENSION: u32 = 8192;
-
-/// Maximum total pixels admitted before decoding is aborted (~33.5 megapixels).
-pub const MAX_IMAGE_PIXELS: u64 = 33_554_432;
-
-/// Memory allocation limit for image decoding (64 MiB).
-pub const MAX_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+use crate::image_attach::decode_and_guard_image;
 
 /// Maximum inline image payload admitted on the wire (5 MiB).
 pub const MAX_WIRE_IMAGE_BYTES: usize = crate::image_attach::MAX_IMAGE_BYTES;
@@ -329,7 +325,7 @@ pub(crate) async fn execute_read_media(
             // Read-back fallback for tool-owned stored originals: the store
             // only holds image bytes that already passed the guards above,
             // named by content hash, so admitting it widens nothing.
-            match context
+            let stored = context
                 .runtime
                 .media_originals_dir
                 .as_deref()
@@ -339,8 +335,20 @@ pub(crate) async fn execute_read_media(
                         &context.workspace,
                         dir,
                     )
-                }) {
+                });
+            match stored {
                 Some(path) => path,
+                // An image the user attached from outside the workspace
+                // (a dropped screenshot in a temp directory) stays viewable.
+                None if matches!(primary_err, ToolError::PathEscape { .. }) => {
+                    crate::tools::file::user_attached_image_read_path(
+                        context,
+                        path_str,
+                        "read_media",
+                    )
+                    .await?
+                    .ok_or(primary_err)?
+                }
                 None => return Err(primary_err),
             }
         }
@@ -643,7 +651,8 @@ fn process_media_file(
     };
 
     // 6. Bounded decoding with decompression-bomb guards
-    let (processed_image, orig_width, orig_height) = decode_and_guard_image(&raw_bytes)?;
+    let (processed_image, orig_width, orig_height) = decode_and_guard_image(&raw_bytes)
+        .map_err(|error| ToolError::execution_failed(format!("read_media: {error}")))?;
 
     // 7. Apply crop if requested
     let (cropped_image, crop_applied) = if let Some(crop) = crop_region {
@@ -729,55 +738,6 @@ fn process_media_file(
         encoded_bytes,
         original_path,
     })
-}
-
-fn decode_and_guard_image(bytes: &[u8]) -> Result<(DynamicImage, u32, u32), ToolError> {
-    let mut reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| {
-            ToolError::execution_failed(format!("read_media: failed to detect format: {e}"))
-        })?;
-
-    let mut limits = Limits::default();
-    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    reader.limits(limits);
-
-    // Read header/dimensions first
-    let (width, height) = reader.into_dimensions().map_err(|e| {
-        ToolError::execution_failed(format!(
-            "read_media: decompression bomb guard or invalid header detected: {e}"
-        ))
-    })?;
-
-    let total_pixels = (width as u64) * (height as u64);
-    if total_pixels > MAX_IMAGE_PIXELS
-        || width > MAX_IMAGE_DIMENSION
-        || height > MAX_IMAGE_DIMENSION
-    {
-        return Err(ToolError::execution_failed(format!(
-            "read_media: decompression bomb guard triggered: image dimensions ({width}x{height}, {total_pixels} pixels) exceed safe limits (max {MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION} / {MAX_IMAGE_PIXELS} pixels). Please downscale or crop the image first."
-        )));
-    }
-
-    // Decode full dynamic image with limits
-    let mut decode_reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| {
-            ToolError::execution_failed(format!("read_media: failed to read image: {e}"))
-        })?;
-    let mut decode_limits = Limits::default();
-    decode_limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
-    decode_limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    decode_limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    decode_reader.limits(decode_limits);
-
-    let dynamic_img = decode_reader.decode().map_err(|e| {
-        ToolError::execution_failed(format!("read_media: failed to decode image: {e}"))
-    })?;
-
-    Ok((dynamic_img, width, height))
 }
 
 /// How the encoding ladder should treat an image's content.
@@ -1021,6 +981,25 @@ fn encode_within_budget(
     Err(over_budget_error(path, budget, smallest))
 }
 
+/// Fit `image` to `max_edge` and encode it within `budget` on the same ladder
+/// `read_media` delivers with. Attach-time ingest (`image_attach`) shares it,
+/// so a pasted Retina screenshot is normalized exactly like a tool read.
+pub(crate) fn fit_and_encode(
+    image: &DynamicImage,
+    max_edge: u32,
+    budget: usize,
+    path: &std::path::Path,
+) -> Result<(Vec<u8>, &'static str), ToolError> {
+    let (width, height) = image.dimensions();
+    let fitted = if width.max(height) > max_edge {
+        image.resize(max_edge, max_edge, FilterType::Lanczos3)
+    } else {
+        image.clone()
+    };
+    let outcome = encode_within_budget(&fitted, classify_image(&fitted), budget, path)?;
+    Ok((outcome.bytes, outcome.mime))
+}
+
 /// Fail-closed error naming the exact conversion recipe to retry with.
 fn over_budget_error(
     path: &std::path::Path,
@@ -1062,7 +1041,7 @@ fn human_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Role;
+    use codewhale_models::Role;
     use image::ImageFormat;
     use tempfile::tempdir;
 
@@ -1522,9 +1501,10 @@ mod tests {
 
         // 3. Check Chat Completions provider request body wiring
         let messages = vec![
-            crate::models::Message {
+            codewhale_models::Message {
                 role: Role::Assistant,
-                content: vec![crate::models::ContentBlock::ToolUse {
+                content: vec![codewhale_models::ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call_read_media".to_string(),
                     name: "read_media".to_string(),
                     input: json!({ "path": "wire.png" }),
@@ -1532,9 +1512,10 @@ mod tests {
                     thought_signature: None,
                 }],
             },
-            crate::models::Message {
+            codewhale_models::Message {
                 role: Role::User,
-                content: vec![crate::models::ContentBlock::ToolResult {
+                content: vec![codewhale_models::ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_read_media".to_string(),
                     content: rich.content.clone(),
                     is_error: None,

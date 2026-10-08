@@ -7,38 +7,48 @@ import { middleware } from "../middleware";
  * custom domains, so without a canonical-host redirect the whole site is
  * reachable — and indexable — twice.
  */
-function request(url: string, host: string, headers: Record<string, string> = {}) {
+function request(url: string, host: string, headers: Record<string, string> = {}, method = "GET") {
   return new NextRequest(new URL(url), {
+    method,
     headers: new Headers({ host, ...headers }),
   });
 }
 
 describe("canonical host", () => {
-  it("301s www to the apex, preserving path and query", () => {
+  it("permanently redirects www to the apex, preserving path and query", () => {
     const res = middleware(
       request("https://www.codewhale.net/en/docs/hooks?x=1", "www.codewhale.net"),
     );
-    expect(res.status).toBe(301);
+    expect(res.status).toBe(308);
     expect(res.headers.get("location")).toBe("https://codewhale.net/en/docs/hooks?x=1");
   });
 
   it("redirects assets and API routes too, so a moved document stops pulling from www", () => {
     for (const path of ["/_next/static/chunk.js", "/api/curated", "/opengraph-image"]) {
       const res = middleware(request(`https://www.codewhale.net${path}`, "www.codewhale.net"));
-      expect(res.status, path).toBe(301);
+      expect(res.status, path).toBe(308);
+      expect(res.headers.get("location"), path).toBe(`https://codewhale.net${path}`);
+    }
+  });
+
+  it("keeps an admin form POST a POST across the host move", () => {
+    // A 301 lets clients replay a POST as a body-less GET (#6561 W01-07).
+    for (const path of ["/api/admin/login", "/api/admin/post"]) {
+      const res = middleware(request(`https://www.codewhale.net${path}`, "www.codewhale.net", {}, "POST"));
+      expect(res.status, path).toBe(308);
       expect(res.headers.get("location"), path).toBe(`https://codewhale.net${path}`);
     }
   });
 
   it("leaves the apex host alone", () => {
     const res = middleware(request("https://codewhale.net/en", "codewhale.net"));
-    expect(res.status).not.toBe(301);
+    expect(res.status).not.toBe(308);
   });
 
   it("leaves localhost and preview hosts alone", () => {
     for (const host of ["localhost:3000", "codewhale-web.pages.dev"]) {
       const res = middleware(request("https://example.test/en", host));
-      expect(res.status, host).not.toBe(301);
+      expect(res.status, host).not.toBe(308);
     }
   });
 
@@ -144,6 +154,37 @@ describe("locale prefix", () => {
   it("settles after one canonicalizing redirect", () => {
     const res = middleware(request("https://codewhale.net/pt-BR/install", "codewhale.net"));
     expect(res.status).not.toBe(308);
+    expect(res.headers.get("location")).toBeNull();
+  });
+});
+
+describe("install aliases (M2, UX-13)", () => {
+  it("sends bare /download, /desktop and /pricing to install in one hop", () => {
+    for (const path of ["/download", "/desktop", "/pricing"]) {
+      const res = middleware(
+        request(`https://codewhale.net${path}?ref=x`, "codewhale.net", {
+          "accept-language": "ja,en;q=0.8",
+        }),
+      );
+      expect(res.status, path).toBe(307);
+      expect(res.headers.get("location"), path).toBe("https://codewhale.net/ja/install?ref=x");
+    }
+  });
+
+  it("keeps an existing locale, folding miscased prefixes in the same hop", () => {
+    for (const [path, want] of [
+      ["/zh/download", "/zh/install"],
+      ["/en/pricing", "/en/install"],
+      ["/pt-br/desktop", "/pt-BR/install"],
+    ]) {
+      const res = middleware(request(`https://codewhale.net${path}`, "codewhale.net"));
+      expect(res.status, path).toBe(307);
+      expect(res.headers.get("location"), path).toBe(`https://codewhale.net${want}`);
+    }
+  });
+
+  it("leaves deeper paths that merely start with an alias alone", () => {
+    const res = middleware(request("https://codewhale.net/en/docs/pricing", "codewhale.net"));
     expect(res.headers.get("location")).toBeNull();
   });
 });

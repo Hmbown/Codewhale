@@ -1,0 +1,23 @@
+{
+  "description": "OpenAI Chat Completions: two parallel tool calls, the first with arguments split across deltas; finish_reason tool_calls; usage in a trailing choices-empty chunk; [DONE]. 5-byte transport chunks.",
+  "route": "openai",
+  "model": "gpt-4.1",
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "chunk_bytes": 5
+}

@@ -1,0 +1,173 @@
+{
+  "/balance": {
+    "message": null,
+    "action": {
+      "type": "FetchBalance"
+    },
+    "is_error": false
+  },
+  "/tokens": {
+    "message": "Token Usage:\n ─────────────────────────────\n Active context:        ~48 / 1000000 (0.0%)\n Last API input:        not reported (turn telemetry; may count repeated prefix across tool rounds)\n Last API output:       not reported\n Cache hit/miss:        not reported (telemetry/cost only)\n Cumulative tokens:     0 (session usage telemetry)\n Priced amount:         unknown\n API messages:          0\n Chat messages:         0\n Model:                 deepseek-v4-pro\nCache-write (cache-creation) tokens this session: not reported. Billed above the input rate where the provider publishes a write premium; see /cache for the per-turn breakdown.\n\nThis is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.\nCovered: 0 of 0 money-metered turn(s) priced.",
+    "action": null,
+    "is_error": false
+  },
+  "/cost": {
+    "message": "Session Cost:\n ─────────────────────────────\n Estimated total: unknown\n\n No turn has an authoritative price in the selected currency.\n\nThis is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.\nCovered: 0 of 0 money-metered turn(s) priced.",
+    "action": null,
+    "is_error": false
+  },
+  "/cache": {
+    "message": "Cache history: no turns recorded yet.\n\nSupported providers report `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` on API turns. Run a turn and try /cache again.",
+    "action": null,
+    "is_error": false
+  },
+  "/cache 0": {
+    "message": "Cache history: no turns recorded yet.\n\nSupported providers report `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` on API turns. Run a turn and try /cache again.",
+    "action": null,
+    "is_error": false
+  },
+  "/cache stats": {
+    "message": "Cache Stats\n\n── Prefix Stability\n  Stability: unknown (no checks recorded yet)\n  Run a turn first to collect prefix stability data.\n\n── Prefix Fingerprint\n  Pinned hash: unavailable\n  Run a turn first, or use /cache inspect.\n\n── Cache Hit Rate\n  No turn telemetry recorded yet.\n",
+    "action": null,
+    "is_error": false
+  },
+  "/cache zones": {
+    "message": "Cache Zones (#2264 three-zone contract)\n\n── PinnedPrefix (system + tools, frozen baseline)\n  Status:    unavailable (not yet frozen)\n  Run a turn first to freeze the baseline.\n\n── AppendLog (conversation history, append-only)\n  Status:      wired — backs the engine session history\n  Messages:    0\n  History msgs: 0\n\n── TurnScratch (per-turn ephemeral data)\n  Status:      not wired — type scaffolding, unused by requests\n\n── Contract Status\n  PinnedPrefix: not frozen\n  AppendLog:    wired (session history)\n  TurnScratch:  not wired\n",
+    "action": null,
+    "is_error": false
+  },
+  "/cache inspect --verbose --json": {
+    "message": "cache inspect: --json and --verbose cannot be combined",
+    "action": null,
+    "is_error": false
+  },
+  "/cache warmup": {
+    "message": null,
+    "action": {
+      "type": "CacheWarmup"
+    },
+    "is_error": false
+  },
+  "/cache nonsense": {
+    "message": "Error: Unknown /cache argument `nonsense`. Usage: /cache [count|inspect [--verbose|--json]|stats|zones|warmup]",
+    "action": null,
+    "is_error": true
+  },
+  "/preview-request": {
+    "message": null,
+    "action": {
+      "type": "PreviewOutboundRequest",
+      "json": false,
+      "base_prompt_only": false,
+      "hypothetical_prompt": null
+    },
+    "is_error": false
+  },
+  "/dryrun json": {
+    "message": null,
+    "action": {
+      "type": "PreviewOutboundRequest",
+      "json": true,
+      "base_prompt_only": false,
+      "hypothetical_prompt": null
+    },
+    "is_error": false
+  },
+  "/preview_request --base-prompt": {
+    "message": null,
+    "action": {
+      "type": "PreviewOutboundRequest",
+      "json": false,
+      "base_prompt_only": true,
+      "hypothetical_prompt": null
+    },
+    "is_error": false
+  },
+  "/preview-request --json --prompt  keep  trailing   ": {
+    "message": null,
+    "action": {
+      "type": "PreviewOutboundRequest",
+      "json": true,
+      "base_prompt_only": false,
+      "hypothetical_prompt": " keep  trailing   "
+    },
+    "is_error": false
+  },
+  "/preview-request --base-prompt --json": {
+    "message": "`base-prompt` cannot be combined with JSON. Usage: /preview-request [json] [--prompt <text>] | base-prompt  (flags first; --prompt takes the rest)",
+    "action": null,
+    "is_error": false
+  },
+  "/preview-request --prompt": {
+    "message": "`--prompt` needs text after it. Usage: /preview-request [json] [--prompt <text>] | base-prompt  (flags first; --prompt takes the rest)",
+    "action": null,
+    "is_error": false
+  },
+  "/tools": {
+    "message": "Tool request snapshot unavailable — no model request has been captured for the latest turn.",
+    "action": null,
+    "is_error": false
+  },
+  "/tool-studio invalid": {
+    "message": "Tool request snapshot unavailable — no model request has been captured for the latest turn.",
+    "action": null,
+    "is_error": false
+  },
+  "/system": {
+    "message": "System Prompt (ACT mode):\n─────────────────────────────\n(no system prompt)",
+    "action": null,
+    "is_error": false
+  },
+  "/xitong": {
+    "message": "System Prompt (ACT mode):\n─────────────────────────────\n(no system prompt)",
+    "action": null,
+    "is_error": false
+  },
+  "/context": {
+    "message": null,
+    "action": {
+      "type": "OpenContextInspector"
+    },
+    "is_error": false
+  },
+  "/ctx nonsense": {
+    "message": "Error: Unknown /context subcommand: nonsense. Use report, json, prompt-json, or summary.",
+    "action": null,
+    "is_error": true
+  },
+  "/system:text": {
+    "message": "System Prompt (ACT mode):\n─────────────────────────────\nExample policy",
+    "action": null,
+    "is_error": false
+  },
+  "/system:utf8_boundary": {
+    "message": "System Prompt (ACT mode):\n─────────────────────────────\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...\n\n(truncated, 504 chars total)",
+    "action": null,
+    "is_error": false
+  },
+  "balance_unsupported": {
+    "message": "Balance check is not supported for OpenAI Codex (ChatGPT) yet. Check the provider dashboard for account balance details.",
+    "action": null,
+    "is_error": false
+  },
+  "tokens_reported_telemetry": {
+    "message": "Token Usage:\n ─────────────────────────────\n Active context:        ~48 / 1000000 (0.0%)\n Last API input:        100 (turn telemetry; may count repeated prefix across tool rounds)\n Last API output:       25\n Cache hit/miss:        70 hit / 30 miss (telemetry/cost only)\n Cumulative tokens:     1234 (session usage telemetry)\n Priced amount:         unknown\n API messages:          0\n Chat messages:         0\n Model:                 deepseek-v4-pro\nCache-write (cache-creation) tokens this session: 250. Billed above the input rate where the provider publishes a write premium; see /cache for the per-turn breakdown.\n\nThis is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.\nCovered: 0 of 0 money-metered turn(s) priced.",
+    "action": null,
+    "is_error": false
+  },
+  "cost_priced_zero": {
+    "message": "Session Cost:\n ─────────────────────────────\n Estimated total: $0.0000\n\n Based on audited provider-reported usage and published rates.\n\nBreakdown (components sum to the total above):\n  Parent turns: $0.0000\n\nThis is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.\nCovered: 1 of 1 money-metered turn(s) priced.",
+    "action": null,
+    "is_error": false
+  },
+  "cost_legacy_unknown": {
+    "message": "Session Cost:\n ─────────────────────────────\n Estimated total: unknown\n\n No turn has an authoritative price in the selected currency.\n\nThis is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.\nCoverage: unknown. This session was saved before per-turn pricing coverage was recorded, so how much of the total above is accounted for cannot be established.",
+    "action": null,
+    "is_error": false
+  },
+  "system_blocks": {
+    "message": "System Prompt (ACT mode):\n─────────────────────────────\nFirst block\n\n---\n\nSecond block",
+    "action": null,
+    "is_error": false
+  }
+}

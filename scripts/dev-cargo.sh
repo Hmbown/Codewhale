@@ -1,12 +1,14 @@
 #!/bin/sh
 # Run cargo with the portable Codewhale cache topology applied.
 #
-#   scripts/dev-cargo.sh test -p codewhale-config --lib --locked
+#   scripts/dev-cargo.sh check -p codewhale-config --lib --locked
 #   scripts/dev-cargo.sh --status
 #   scripts/dev-cargo.sh --self-check
 #
 # This is the everyday compile entry point. It does not change product
-# behavior. See scripts/dev-cache.sh and docs/BUILD_PERFORMANCE.md.
+# behavior. Use scripts/dev-test.sh <area> for tests under the shared temporary
+# HOME boundary. Arbitrary Cargo commands here do not isolate product config.
+# See scripts/dev-cache.sh and docs/BUILD_PERFORMANCE.md.
 set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)

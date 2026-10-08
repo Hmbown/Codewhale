@@ -29,12 +29,17 @@ use crate::fleet::store::{
     FleetEntry, FleetScope, SelectedFleet, delete_fleet, list_fleets, migrate_legacy_roster,
     selected_fleet, set_selected,
 };
-use crate::palette;
 use crate::tui::app::App;
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
 };
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette as palette;
+
+/// Rows one PageUp/PageDown travels. Pages clamp at the ends per the shared
+/// vocabulary instead of wrapping (#6290).
+const FLEET_LIST_PAGE: usize = 10;
 
 /// What the host should do after this view acted on the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +75,14 @@ pub struct FleetListView {
     hovered_row: Cell<Option<usize>>,
     fleet_config: codewhale_config::FleetConfigToml,
     workspace: PathBuf,
+    /// UI locale, for the one hint whose wording changes with the entry path.
+    locale: Locale,
+    /// True when the Fleet roster is parked directly underneath on the view
+    /// stack (#5954), i.e. this list was opened with `f` from the roster.
+    /// `Esc` pops one view either way — the flag only decides whether the
+    /// footer promises `back` or `close`. Direct entry (`/fleet list`)
+    /// leaves it false, so `Esc` closes as before.
+    back_to_fleet_roster: bool,
 }
 
 impl FleetListView {
@@ -93,7 +106,17 @@ impl FleetListView {
             hovered_row: Cell::new(None),
             fleet_config: config.fleet_config(),
             workspace,
+            locale: app.ui_locale,
+            back_to_fleet_roster: false,
         }
+    }
+
+    /// Mark this list as pushed on top of the Fleet roster (#5954), so the
+    /// footer says `back` rather than `close`.
+    #[must_use]
+    pub fn over_fleet_roster(mut self) -> Self {
+        self.back_to_fleet_roster = true;
+        self
     }
 
     fn selected_entry(&self) -> Option<&FleetEntry> {
@@ -111,6 +134,23 @@ impl FleetListView {
         }
         self.row = crate::tui::list_nav::wrap_index(self.row, rows, delta);
         self.hovered_row.set(None);
+    }
+
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Steps wrap; pages travel [`FLEET_LIST_PAGE`]
+    /// rows and clamp. The list is single-column, so the region axis is a
+    /// no-op.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        let len = self.entries.len();
+        if len == 0 {
+            return false;
+        }
+        let Some(next) = crate::tui::list_nav::apply(self.row, len, FLEET_LIST_PAGE, motion) else {
+            return false;
+        };
+        self.row = next;
+        self.hovered_row.set(None);
+        true
     }
 
     fn hit_row(&self, mouse: MouseEvent) -> Option<usize> {
@@ -135,7 +175,13 @@ impl FleetListView {
         if self.banner_visible() {
             hints.push(ActionHint::new("m", "migrate"));
         }
-        hints.push(ActionHint::new("Esc", "close"));
+        // The hint has to name what `Esc` actually does: pop back to the
+        // parked roster, or close the window at the root (#5954).
+        hints.push(if self.back_to_fleet_roster {
+            ActionHint::new("Esc", tr(self.locale, MessageId::SetupActionBack))
+        } else {
+            ActionHint::new("Esc", "close")
+        });
         hints
     }
 
@@ -150,7 +196,7 @@ impl FleetListView {
         match set_selected(&entry.name, scope, &self.workspace) {
             Ok(path) => Some(FleetListOutcome::Done {
                 message: format!(
-                    "Selected Fleet `{}` ({}) — wrote {}",
+                    "Selected Team `{}` ({}) — wrote {}",
                     entry.name,
                     scope.long_label(),
                     path.display()
@@ -170,7 +216,7 @@ impl FleetListView {
         match delete_fleet(&name, scope, &self.workspace) {
             Ok(path) => Some(FleetListOutcome::Done {
                 message: format!(
-                    "Deleted Fleet `{name}` ({}) — removed {}",
+                    "Deleted Team `{name}` ({}) — removed {}",
                     scope.label(),
                     path.display()
                 ),
@@ -208,12 +254,10 @@ impl ModalView for FleetListView {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_row(-1);
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_row(1);
+            // Movement keys come from the shared vocabulary (#6290), j/k
+            // aliases included — this surface captures no text. Pages are new
+            // here; they used to do nothing.
+            _ if crate::tui::list_nav::motion(&key).is_some_and(|m| self.apply_motion(m)) => {
                 ViewAction::None
             }
             KeyCode::Enter => {
@@ -222,11 +266,11 @@ impl ModalView for FleetListView {
                 };
                 if entry.legacy {
                     return ViewAction::Emit(ViewEvent::OpenTextPager {
-                        title: format!("Fleet `{}` — legacy format", entry.name),
+                        title: format!("Team `{}` — legacy format", entry.name),
                         content: format!(
-                            "This Fleet file predates the named-Fleet format ({}).\n\n\
+                            "This team file predates the named-team format ({}).\n\n\
                              It is listed so nothing you saved disappears, but it is \
-                             read-only here. To edit it, create a new Fleet and copy \
+                             read-only here. To edit it, create a new team and copy \
                              the settings you want; legacy files are never migrated \
                              silently.\n\nParse error: {}",
                             entry.path.display(),
@@ -259,7 +303,7 @@ impl ModalView for FleetListView {
                 ) {
                     Ok(receipt) => {
                         let mut content = format!(
-                            "Migrated {} legacy role profiles into Fleet `Default` \
+                            "Migrated {} legacy role profiles into Team `Default` \
                              (user-global) — wrote {}\n\n",
                             receipt.rows.len(),
                             receipt.saved_to.display()
@@ -279,13 +323,13 @@ impl ModalView for FleetListView {
                         }
                         content.push_str(
                             "\nLegacy profile files were left untouched — they are no \
-                             longer live configuration once a Fleet is selected.",
+                             longer live configuration once a team is selected.",
                         );
                         if let Ok(path) =
                             set_selected("Default", FleetScope::Personal, &self.workspace)
                         {
                             content.push_str(&format!(
-                                "\n\nFleet `Default` is now your user-global default — wrote {}.",
+                                "\n\nTeam `Default` is now your user-global default — wrote {}.",
                                 path.display()
                             ));
                         }
@@ -300,16 +344,6 @@ impl ModalView for FleetListView {
                     }),
                 }
             }
-            KeyCode::Home => {
-                self.row = 0;
-                self.hovered_row.set(None);
-                ViewAction::None
-            }
-            KeyCode::End => {
-                self.row = self.entries.len().saturating_sub(1);
-                self.hovered_row.set(None);
-                ViewAction::None
-            }
             _ => ViewAction::None,
         }
     }
@@ -318,6 +352,15 @@ impl ModalView for FleetListView {
         match mouse.kind {
             MouseEventKind::Moved => {
                 self.hovered_row.set(self.hit_row(mouse));
+                ViewAction::None
+            }
+            // The wheel moves this list, not the transcript behind it.
+            MouseEventKind::ScrollUp => {
+                self.move_row(-1);
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_row(1);
                 ViewAction::None
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -351,16 +394,16 @@ impl ModalView for FleetListView {
         // Header: name + selected summary.
         let selected_line = match &self.selected {
             Some(sel) => format!("Selected: `{}` ({})", sel.name, sel.scope.label()),
-            None => "No Fleet selected — built-in team".to_string(),
+            None => "No team selected — built-in team".to_string(),
         };
         let mut header = vec![
             Line::from(vec![
                 Span::styled(
-                    "─ Saved Fleets ",
+                    "─ Saved Teams ",
                     Style::default().fg(palette::WHALE_ACTION).bold(),
                 ),
                 Span::styled(
-                    "· pick which named Fleet the session uses",
+                    "· pick which named team the session uses",
                     Style::default().fg(palette::TEXT_MUTED),
                 ),
             ]),
@@ -397,7 +440,7 @@ impl FleetListView {
         if self.entries.is_empty() {
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    "  No saved Fleets yet.",
+                    "  No saved teams yet.",
                     Style::default().fg(palette::TEXT_MUTED),
                 ),
                 Span::styled(
@@ -410,14 +453,30 @@ impl FleetListView {
             return;
         }
 
-        let rows_visible = usize::from(area.height).max(1);
-        let scroll = self.row.saturating_sub(rows_visible.saturating_sub(1));
+        // Entries paint two rows (name + summary), one while a delete is
+        // armed. Scroll and fit by painted rows, not entry count, so the
+        // selected entry is always fully on screen.
+        let height = usize::from(area.height).max(1);
+        let entry_height = |idx: usize| {
+            if self.pending_delete == Some(idx) {
+                1
+            } else {
+                2
+            }
+        };
+        let row = self.row.min(self.entries.len() - 1);
+        let mut scroll = row;
+        let mut used = entry_height(row);
+        while scroll > 0 && used + entry_height(scroll - 1) <= height {
+            scroll -= 1;
+            used += entry_height(scroll);
+        }
 
         let mut lines = Vec::new();
         let mut hitboxes = Vec::new();
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if idx < scroll || idx >= scroll + rows_visible {
-                continue;
+        for (idx, entry) in self.entries.iter().enumerate().skip(scroll) {
+            if !lines.is_empty() && lines.len() + entry_height(idx) > height {
+                break;
             }
             let selected = idx == self.row;
             let is_selected_fleet = self
@@ -525,7 +584,11 @@ impl FleetListView {
                 };
                 format!(
                     "Coordinator: {coordinator} · members: {}",
-                    fleet.members.len()
+                    fleet
+                        .members
+                        .iter()
+                        .filter(|member| !member.shortlist)
+                        .count()
                 )
             }
             Err(err) => format!("unreadable: {err}"),
@@ -609,6 +672,88 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    /// #5954: roster → `f` → saved teams → `Esc` returns to the roster, and
+    /// the footer promises `back` rather than `close` while it will.
+    #[test]
+    fn saved_teams_opened_from_the_roster_returns_there_on_esc() {
+        let ws = tempfile::TempDir::new().expect("ws");
+        save_in(ws.path(), FleetScope::Workspace, "alpha");
+        let app = app_in(ws.path().to_path_buf());
+        let config = Config::default();
+
+        let mut stack = crate::tui::views::ViewStack::new();
+        stack.push(crate::tui::views::fleet_roster::FleetRosterView::new(
+            &app, &config,
+        ));
+        let events = stack.handle_key(key(KeyCode::Char('f')));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ViewEvent::FleetRosterOpenFleetsRequested]
+            ),
+            "{events:?}"
+        );
+        assert_eq!(
+            stack.top_kind(),
+            Some(ModalKind::FleetRoster),
+            "the roster must survive the forward jump"
+        );
+
+        // What ui/handlers.rs does with that event.
+        stack.push(FleetListView::new(&app, &config).over_fleet_roster());
+        assert_eq!(stack.top_kind(), Some(ModalKind::FleetList));
+
+        stack.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            stack.top_kind(),
+            Some(ModalKind::FleetRoster),
+            "Esc in saved teams must return to the roster, not close the window"
+        );
+    }
+
+    /// #5954: `/fleet list` is the root of its own stack, so `Esc` closes.
+    #[test]
+    fn saved_teams_opened_directly_closes_on_esc() {
+        let ws = tempfile::TempDir::new().expect("ws");
+        let mut stack = crate::tui::views::ViewStack::new();
+        stack.push(FleetListView::new(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+        ));
+        stack.handle_key(key(KeyCode::Esc));
+        assert!(stack.is_empty(), "direct entry must close on Esc");
+    }
+
+    /// #5954: the hint names what `Esc` actually does in each entry path.
+    #[test]
+    fn saved_teams_esc_hint_matches_the_entry_path() {
+        let ws = tempfile::TempDir::new().expect("ws");
+        save_in(ws.path(), FleetScope::Workspace, "alpha");
+        let app = app_in(ws.path().to_path_buf());
+        let config = Config::default();
+
+        // `footer_hints` is the only source the footer paints from, so
+        // asserting it is asserting what the user reads.
+        let esc_label = |view: &FleetListView| {
+            view.footer_hints()
+                .into_iter()
+                .find(|hint| hint.key == "Esc")
+                .map(|hint| hint.label.into_owned())
+                .expect("Esc hint")
+        };
+
+        assert_eq!(
+            esc_label(&FleetListView::new(&app, &config)),
+            "close",
+            "direct entry must still promise close"
+        );
+        assert_eq!(
+            esc_label(&FleetListView::new(&app, &config).over_fleet_roster()),
+            "back",
+            "over the roster the hint must promise back"
+        );
     }
 
     #[test]
@@ -737,7 +882,7 @@ mod tests {
         let ViewAction::EmitAndClose(ViewEvent::FleetStoreChanged { message }) = action else {
             panic!("expected FleetStoreChanged, got {action:?}");
         };
-        assert!(message.contains("Deleted Fleet `Temp Fleet`"), "{message}");
+        assert!(message.contains("Deleted Team `Temp Fleet`"), "{message}");
         assert!(list_fleets(ws.path()).is_empty());
     }
 
@@ -780,21 +925,18 @@ mod tests {
     #[test]
     fn legacy_entry_opens_a_pager_instead_of_editing() {
         let _lock = crate::test_support::lock_test_env();
-        let prev = std::env::var_os("CODEWHALE_HOME");
-        // SAFETY: serialised by lock_test_env.
-        unsafe { std::env::set_var("CODEWHALE_HOME", sealed_home()) };
+        let home = tempfile::TempDir::new().expect("personal home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let ws = tempfile::TempDir::new().unwrap();
 
         // A legacy exact fleet file (workflow schema) in the personal dir.
-        std::fs::create_dir_all(sealed_home().join("fleets")).unwrap();
-        std::fs::write(
-            sealed_home().join("fleets/stopship.toml"),
-            r#"schema = "exact"
+        std::fs::create_dir_all(home.path().join("fleets")).unwrap();
+        let legacy_path = home.path().join("fleets/stopship.toml");
+        let legacy_source = r#"schema = "exact"
 schema_revision = 1
 name = "stopship"
-members = []"#,
-        )
-        .unwrap();
+members = []"#;
+        std::fs::write(&legacy_path, legacy_source).unwrap();
 
         let mut view = FleetListView::new(&app_in(ws.path().to_path_buf()), &Config::default());
         let idx = view
@@ -805,22 +947,22 @@ members = []"#,
         view.row = idx;
         let entry = view.selected_entry().expect("legacy entry listed");
         assert!(entry.legacy);
+        assert_eq!(entry.scope, FleetScope::Personal);
+        assert_eq!(entry.path, legacy_path);
 
         let action = view.handle_key(key(KeyCode::Enter));
         let ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) = action else {
             panic!("legacy entry must open a read-only pager: {action:?}");
         };
-        assert_eq!(title, "Fleet `stopship` — legacy format");
-        assert!(content.contains("This Fleet file predates the named-Fleet format"));
-        assert!(content.contains("create a new Fleet"));
+        assert_eq!(title, "Team `stopship` — legacy format");
+        assert!(content.contains("This team file predates the named-team format"));
+        assert!(content.contains("create a new team"));
 
-        // SAFETY: serialised by lock_test_env.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CODEWHALE_HOME", v),
-                None => std::env::remove_var("CODEWHALE_HOME"),
-            }
-        }
+        assert_eq!(
+            std::fs::read_to_string(&legacy_path).unwrap(),
+            legacy_source
+        );
+        assert!(crate::fleet::store::selected_fleet(ws.path()).is_none());
     }
 
     #[test]
@@ -859,10 +1001,10 @@ provider = "deepseek"
             panic!("migration must open the receipt pager: {action:?}");
         };
         assert_eq!(title, "Legacy migration receipt");
-        assert!(content.contains("Fleet `Default`"));
-        assert!(content.contains("once a Fleet is selected"));
+        assert!(content.contains("Team `Default`"));
+        assert!(content.contains("once a team is selected"));
 
-        // The Default Fleet now exists and is the user-global selection.
+        // The Default team now exists and is the user-global selection.
         let entries = list_fleets(ws.path());
         assert!(
             entries.iter().any(|e| e.name == "Default" && !e.legacy),
@@ -951,8 +1093,41 @@ provider = "deepseek"
         view.render(area, &mut hovered_buf);
         assert_eq!(
             hovered_buf[(second.x, second.y)].bg,
-            crate::palette::SURFACE_ELEVATED,
+            codewhale_palette::SURFACE_ELEVATED,
             "hovered entry must show the shared hover band"
         );
+    }
+
+    /// U09-m5: entries paint two rows (name + summary). Scrolling by entry
+    /// count pushed the selected bottom entry below the list; every painted
+    /// entry, the selected one included, must fit inside the list area.
+    #[test]
+    fn selected_entry_stays_on_screen_when_entries_are_two_rows() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::TempDir::new().unwrap();
+        for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo"] {
+            save_in(ws.path(), FleetScope::Workspace, name);
+        }
+        let mut view = FleetListView::new(&app_in(ws.path().to_path_buf()), &Config::default());
+        assert_eq!(view.entries.len(), 5);
+        let area = Rect::new(0, 0, 80, 4);
+        for row in 0..view.entries.len() {
+            view.row = row;
+            let mut buf = Buffer::empty(area);
+            view.render_rows(area, &mut buf);
+            let hitboxes = view.row_hitboxes.borrow();
+            assert!(
+                hitboxes.iter().any(|(_, idx)| *idx == row),
+                "row {row} not painted: {hitboxes:?}"
+            );
+            assert!(
+                hitboxes
+                    .iter()
+                    .all(|(rect, _)| rect.bottom() <= area.bottom()),
+                "row {row}: {hitboxes:?}"
+            );
+        }
     }
 }

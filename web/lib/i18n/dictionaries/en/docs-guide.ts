@@ -1,22 +1,21 @@
 import type { DocsGuideDict } from "../types";
 
 /**
- * English reference dictionary for the docs "Getting started" page.
- * Copy moved verbatim from `app/[locale]/docs/guide/page.tsx` — any wording
- * change belongs in its own commit, never mixed into a structural move.
+ * English reference dictionary for `/docs/guide` ("Start your first task").
+ * The four steps themselves live in `web/lib/content/getting-started.ts`,
+ * shared with the homepage.
  */
 export const docsGuide: DocsGuideDict = {
-  metaTitle: "Getting started · Codewhale Docs",
+  metaTitle: "Start your first task · Codewhale Docs",
   metaDescription:
-    "The full path from install to your ideal fleet: install, a first keyless session, provider connection, and fleet setup.",
+    "Install Codewhale, connect a model, and give it a task in your project. Add a Fleet later if you want several models and roles.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Getting started",
+  overviewTitle: "Start your first task",
   overviewLead:
-    "Four steps from one install command to a fleet set up for your work.",
+    "Four steps take you from nothing installed to a finished first task. Each step links to the page with the details; the Fleet step is optional.",
   sessionTitle: "Watch a real session",
-  sessionLead:
-    "A recording of a real session will go here. There is no recording yet, so nothing is shown.",
-  nextTitle: "Where next",
+  sessionLead: "Follow a task from the first request to the finished result.",
+  nextTitle: "Next",
   sourceNote:
-    "Source documents: docs/GUIDE.md, docs/KEYBINDINGS.md · Step copy lives in web/lib/content/getting-started.ts; update docs-map.ts when changing.",
+    "Source documents: docs/GUIDE.md, docs/INSTALL.md, docs/KEYBINDINGS.md · Update docs-map.ts when changing.",
 };

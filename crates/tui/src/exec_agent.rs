@@ -8,19 +8,284 @@
 //! keeps the dispatch site and tests resolving unchanged.
 
 use super::*;
+use crate::core::ops::TurnSpec;
 
 /// Resolve the headless `exec` model-step ceiling.
 ///
-/// R1: omitting `--max-turns` no longer means `u32::MAX`. A non-interactive
-/// run has nobody watching it, so its default bound is the same finite
-/// ceiling the interactive engine uses. Clap already rejects `--max-turns
-/// 0`, so no "0 means unlimited" sentinel can reach here; an explicit value
-/// is still clamped to the documented finite range.
+/// Omission leaves model steps uncapped. Clap rejects `--max-turns 0`;
+/// explicit positive values retain the documented finite range.
 pub(crate) fn exec_max_steps(max_turns: Option<u32>) -> u32 {
-    crate::core::engine::turn_budget::resolve_max_model_steps(max_turns.or(Some(
-        crate::core::engine::turn_budget::DEFAULT_EXEC_MAX_TURNS,
-    )))
+    crate::core::engine::turn_budget::resolve_max_model_steps(max_turns)
 }
+
+/// Model-step ceiling for a plain (zero-tool) `exec` run without
+/// `--max-turns`. Its only extra steps are output-limit continuations, which
+/// have no progress signal of their own; without this a model stuck at the
+/// output limit would be re-asked, with growing history, until the turn wall
+/// clock (#6510 review).
+pub(crate) const ONE_SHOT_DEFAULT_MAX_STEPS: u32 = 8;
+
+/// Default-denied tools for headless `exec`, on top of the operator's own
+/// `--disallowed-tools` flag.
+///
+/// A headless run has no responder for `request_user_input`, so offering the
+/// tool can only stall the run until the turn wall clock, or forever with
+/// `[tools] user_input_timeout_seconds = 0`. Withholding it is the default
+/// form of the operator workaround (`--disallowed-tools request_user_input`):
+/// the model reports the tool absent and finishes instead of parking. This
+/// stays unconditional: there is no channel on which a one-shot CLI run
+/// could answer, so advertising the tool cannot work.
+pub(crate) fn exec_disallowed_tools(disallowed_tools: Option<Vec<String>>) -> Option<Vec<String>> {
+    use crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME;
+    let mut disallowed = disallowed_tools.unwrap_or_default();
+    if !disallowed
+        .iter()
+        .any(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME)
+    {
+        disallowed.push(REQUEST_USER_INPUT_NAME.to_string());
+    }
+    Some(disallowed)
+}
+
+type ExecSettlementProbe = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<crate::core::ops::SubAgentSettlement>> + Send>,
+>;
+
+/// Read the existing Engine stream through the one-shot host's final boundary.
+/// Successful parent receipts remain pending while admitted children or their
+/// completion inbox can still produce another normal Engine turn. This owns
+/// only the deferred output receipt, never child execution or a turn loop.
+pub(crate) struct ExecAgentEvents {
+    handle: crate::core::engine::EngineHandle,
+    deadline: tokio::time::Instant,
+    terminal: Option<crate::core::events::Event>,
+    probe: Option<ExecSettlementProbe>,
+    next_probe_at: tokio::time::Instant,
+    in_flight_usage: codewhale_models::Usage,
+}
+
+impl ExecAgentEvents {
+    pub(crate) fn new(handle: crate::core::engine::EngineHandle, deadline: Instant) -> Self {
+        Self {
+            handle,
+            deadline: deadline.into(),
+            terminal: None,
+            probe: None,
+            next_probe_at: tokio::time::Instant::now(),
+            in_flight_usage: codewhale_models::Usage::default(),
+        }
+    }
+
+    fn stop_settlement(
+        &mut self,
+        status: crate::core::events::TurnOutcomeStatus,
+        error: String,
+    ) -> crate::core::events::Event {
+        use crate::core::events::Event;
+        self.handle
+            .cancel_with_reason(crate::core::engine::CancelReason::External);
+        // Cancellation is out of band; shutdown remains in the existing
+        // Engine mailbox so it also cancels detached session children.
+        let _ = self.handle.try_send(crate::core::ops::Op::Shutdown);
+        self.probe = None;
+        let mut terminal = self.terminal.take().expect("pending parent receipt");
+        if let Event::TurnComplete {
+            status: terminal_status,
+            error: terminal_error,
+            usage,
+            parent_route_usage,
+            routed_usage_dropped_records,
+            ..
+        } = &mut terminal
+        {
+            *terminal_status = status;
+            *terminal_error = Some(error);
+            crate::core::turn::add_usage_to(usage, &self.in_flight_usage);
+            crate::core::turn::add_usage_to(parent_route_usage, &self.in_flight_usage);
+            // The host cannot prove usage settlement after abandoning the
+            // inbox. Keep reported usage and explicitly mark coverage partial.
+            *routed_usage_dropped_records = routed_usage_dropped_records.saturating_add(1);
+        }
+        self.in_flight_usage = codewhale_models::Usage::default();
+        terminal
+    }
+
+    pub(crate) async fn next(&mut self) -> Option<crate::core::events::Event> {
+        use crate::core::events::{Event, TurnOutcomeStatus};
+        // Keep the streamed event on the stack instead of allocating another
+        // box for every token merely to equalize the two small control arms.
+        #[allow(clippy::large_enum_variant)]
+        enum Input {
+            Event(Option<Event>),
+            Probe(Result<crate::core::ops::SubAgentSettlement>),
+            Poll,
+        }
+        loop {
+            if matches!(
+                self.terminal,
+                Some(Event::TurnComplete { status, .. }) if status != TurnOutcomeStatus::Completed
+            ) {
+                return self.terminal.take();
+            }
+            let settling = self.terminal.is_some();
+            if settling && self.handle.is_cancelled() {
+                return Some(self.stop_settlement(
+                    TurnOutcomeStatus::Interrupted,
+                    "Headless exec cancelled while settling children; recorded usage is partial."
+                        .to_string(),
+                ));
+            }
+            if settling && tokio::time::Instant::now() >= self.deadline {
+                return Some(self.stop_settlement(
+                    TurnOutcomeStatus::Failed,
+                    "Headless exec wall-clock budget exhausted while settling children; recorded usage is partial."
+                        .to_string(),
+                ));
+            }
+            if settling && self.probe.is_none() && tokio::time::Instant::now() >= self.next_probe_at
+            {
+                let handle = self.handle.clone();
+                self.probe = Some(Box::pin(
+                    async move { handle.get_subagent_settlement().await },
+                ));
+            }
+            let probing = self.probe.is_some();
+            let wake_at = self.deadline.min(if probing {
+                tokio::time::Instant::now() + Duration::from_millis(250)
+            } else {
+                self.next_probe_at
+            });
+            let input = {
+                let mut events = self.handle.rx_event.write().await;
+                tokio::select! {
+                    biased;
+                    // Drain queued SessionUpdated/TurnComplete events before
+                    // accepting the later actor-owned idle receipt.
+                    event = events.recv() => Input::Event(event),
+                    result = async { self.probe.as_mut().expect("active probe").await }, if probing => Input::Probe(result),
+                    () = tokio::time::sleep_until(wake_at), if settling => Input::Poll,
+                }
+            };
+            match input {
+                Input::Poll => {}
+                Input::Probe(Ok(snapshot)) if snapshot.is_settled() => {
+                    self.probe = None;
+                    return self.terminal.take();
+                }
+                Input::Probe(Ok(_)) => {
+                    self.probe = None;
+                    self.next_probe_at = tokio::time::Instant::now() + Duration::from_millis(250);
+                }
+                Input::Probe(Err(error)) => {
+                    return Some(self.stop_settlement(
+                        TurnOutcomeStatus::Failed,
+                        format!(
+                            "Cannot verify child settlement: {error}; recorded usage is partial."
+                        ),
+                    ));
+                }
+                Input::Event(None) if settling => {
+                    return Some(self.stop_settlement(
+                        TurnOutcomeStatus::Failed,
+                        "Engine event channel closed before child settlement; recorded usage is partial."
+                            .to_string(),
+                    ));
+                }
+                Input::Event(None) => return None,
+                Input::Event(Some(mut event)) => {
+                    match &mut event {
+                        Event::TurnComplete {
+                            usage,
+                            parent_route_usage,
+                            routed_usage_dropped_records,
+                            status,
+                            error,
+                            ..
+                        } => {
+                            if let Some(Event::TurnComplete {
+                                usage: prior_usage,
+                                parent_route_usage: prior_parent_usage,
+                                routed_usage_dropped_records: prior_dropped,
+                                ..
+                            }) = self.terminal.take()
+                            {
+                                crate::core::turn::add_usage_to(usage, &prior_usage);
+                                crate::core::turn::add_usage_to(
+                                    parent_route_usage,
+                                    &prior_parent_usage,
+                                );
+                                *routed_usage_dropped_records =
+                                    routed_usage_dropped_records.saturating_add(prior_dropped);
+                            }
+                            self.in_flight_usage = codewhale_models::Usage::default();
+                            if *status == TurnOutcomeStatus::Completed && error.is_none() {
+                                self.terminal = Some(event);
+                                self.next_probe_at = tokio::time::Instant::now();
+                                continue;
+                            }
+                        }
+                        Event::TurnUsage { usage, .. } => {
+                            crate::core::turn::add_usage_to(&mut self.in_flight_usage, usage);
+                        }
+                        Event::Error { envelope, .. }
+                            if settling && exec_error_event_is_fatal(envelope) =>
+                        {
+                            let terminal = self.stop_settlement(
+                                TurnOutcomeStatus::Failed,
+                                format!(
+                                    "{}; child settlement stopped and recorded usage is partial.",
+                                    envelope.message
+                                ),
+                            );
+                            self.terminal = Some(terminal);
+                        }
+                        _ => {}
+                    }
+                    return Some(event);
+                }
+            }
+        }
+    }
+}
+
+/// Attach the durable automation store headless `exec` inspects.
+///
+/// Headless exec builds its catalog from the same tool surface the TUI and the
+/// Runtime host do, so it advertises `automation` and `send_later` whether or
+/// not the store behind them is attached. Left unattached, every call failed
+/// "AutomationManager is not attached" — the tool was real and the service was
+/// missing. This opens the same store those two hosts open: a shared directory
+/// guarded per transaction by its own file locks (`AutomationManager::open`),
+/// so it adds no second store, no scheduler, and no second scheduling
+/// authority.
+///
+/// What exec deliberately does not take is the Runtime's task-execution lease.
+/// That lease is exclusive (`TaskExecutionLease::new`) and a one-shot host must
+/// neither contend with it nor recover work from the process that holds it. So
+/// the manager returned here is *unbound*: inspection works, and everything
+/// that would promise dispatch is refused by the tool's own admission check
+/// (`tools::automation::require_dispatch_owner`) rather than persisting a
+/// schedule nothing would honor.
+///
+/// Fleet worker subprocesses get nothing, keeping the narrowed envelope they
+/// were launched with alongside the empty plugin registry and disabled
+/// subagents. A store that cannot be opened is reported, never swallowed:
+/// both other hosts fail startup on it, so exec does too instead of
+/// advertising an automation surface it silently cannot serve.
+pub(crate) fn exec_automation_services(
+    fleet_authority_active: bool,
+) -> Result<Option<crate::automation_manager::SharedAutomationManager>> {
+    if fleet_authority_active {
+        return Ok(None);
+    }
+    let service = crate::automation_manager::AutomationManager::default_location()
+        .context("open the automation store for headless exec")?;
+    Ok(Some(std::sync::Arc::new(tokio::sync::Mutex::new(service))))
+}
+
+/// Printed to stderr when a tool-less one-shot `exec` answer contained
+/// tool-call markup that the engine stripped from the visible output.
+pub(crate) const ONE_SHOT_TOOL_CALL_NOTICE: &str = "codewhale exec: the model tried to call a tool, but this run offers none, so the tool call was removed from the answer. Re-run with --auto (or --allowed-tools) to let it use tools.";
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_exec_agent(
@@ -43,7 +308,12 @@ pub(crate) async fn run_exec_agent(
     disallowed_tools: Option<Vec<String>>,
     append_system_prompt: Option<String>,
     tool_authority_json: Option<String>,
+    exec_hooks_enabled: bool,
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
+    // #6510: plain `exec` (no tool-surface flag). The caller passes an empty
+    // allowlist; this also skips workspace snapshots, LSP and the automation
+    // store, and writes the one-shot `--json` receipt shape.
+    one_shot: bool,
 ) -> Result<()> {
     use crate::compaction::CompactionConfig;
     use crate::core::engine::{EngineConfig, spawn_engine};
@@ -51,15 +321,22 @@ pub(crate) async fn run_exec_agent(
     use crate::core::ops::Op;
     use crate::tools::plan::new_shared_plan_state;
     use crate::tools::todo::new_shared_todo_list;
-    use crate::tui::app::AppMode;
+    use codewhale_config::AppMode;
+    use codewhale_execpolicy::ApprovalMode;
+
+    ignore_sigpipe_for_headless_exec();
+
+    // Withhold `request_user_input`; a headless run has no responder.
+    let disallowed_tools = exec_disallowed_tools(disallowed_tools);
 
     // Headless exec registers the model-facing notify tool too. Project the
     // final merged config before tool setup so `off`, quiet/category gates,
     // and explicit `always` are truthful outside the interactive TUI. With no
     // focus-reporting channel, fail closed to focused; only explicit `always`
     // may authorize a headless desktop notification.
-    crate::tui::notifications::set_terminal_focused(true);
-    let _ = crate::tui::notifications::settings(config);
+    let terminal = crate::host_terminal::host();
+    terminal.set_terminal_focused(true);
+    terminal.apply_notification_settings(&config.notifications_config());
 
     validate_exec_tool_authority_resume(tool_authority_json.as_deref(), resume_session.is_some())?;
     let fleet_authority = tool_authority_json
@@ -79,21 +356,45 @@ pub(crate) async fn run_exec_agent(
         crate::tools::spec::install_process_tool_authority(envelope).map_err(anyhow::Error::msg)?;
     }
 
+    let fleet_capture = match (
+        std::env::var("CODEWHALE_FLEET_CAPTURE_ID").ok(),
+        std::env::var_os("CODEWHALE_FLEET_CAPTURE_DIR"),
+    ) {
+        (Some(id), Some(dir)) => {
+            uuid::Uuid::parse_str(&id).context("invalid Fleet session capture id")?;
+            anyhow::ensure!(
+                resume_session.is_none(),
+                "Fleet capture cannot resume a session"
+            );
+            let manager = SessionManager::new(PathBuf::from(dir))?;
+            match manager.load_session(&id) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                _ => anyhow::bail!("Fleet session capture id is already in use or unavailable"),
+            }
+            Some((id, manager))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("incomplete Fleet session capture destination"),
+    };
+
     let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
-    let execution_config = config_for_cli_route(config, &route);
+    let execution_config = config_for_cli_route(config, &route)?;
     let auto_model = route.auto_model;
-    let effective_provider = route.provider;
+    let effective_identity = execution_config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
+    let effective_provider = effective_identity.provider;
     let effective_model = route.model;
-    let validated_route = crate::route_runtime::resolve_runtime_route(
+    let validated_route = crate::route_runtime::resolve_runtime_route_for_identity(
         &execution_config,
-        effective_provider,
+        &effective_identity,
         Some(&effective_model),
     )
     .map_err(anyhow::Error::msg)?
-    .validate()
+    .validate_for(crate::route_runtime::RouteErrorSurface::Headless)
     .map_err(anyhow::Error::msg)?;
-    let effective_provider_name = validated_route.identity.key.clone();
-    let effective_provider_id = validated_route.identity.exact_id.clone();
+    let effective_identity = validated_route.identity.clone();
+    let effective_provider_name = effective_identity.key.to_string();
     let (effective_provider_kind, effective_stream_provider_id) =
         exec_stream_provider_route(&validated_route.identity);
     let route_source = if auto_model {
@@ -109,10 +410,14 @@ pub(crate) async fn run_exec_agent(
     let sandbox_posture = explicit_sandbox.unwrap_or("configured_default").to_string();
     let active_route_limits =
         crate::route_budget::known_route_limits(validated_route.candidate.limits());
-    let max_subagents = if max_subagents == config.max_subagents_for_provider(config.api_provider())
-    {
+    let max_subagents = if max_subagents
+        == config.max_subagents_for_provider(
+            &config
+                .active_provider_identity()
+                .map_err(anyhow::Error::msg)?,
+        ) {
         execution_config
-            .max_subagents_for_provider(effective_provider)
+            .max_subagents_for_provider(&effective_identity)
             .clamp(1, MAX_SUBAGENTS)
     } else {
         max_subagents
@@ -125,10 +430,10 @@ pub(crate) async fn run_exec_agent(
     // receipt claimed no Auto was in play.
     let reasoning_effort_auto = route.auto_controls_reasoning;
     // Resolve Auto against this run's prompt at the CLI boundary, exactly like
-    // `run_one_shot`/`run_one_shot_json` and the interactive launch path do,
-    // so the tier the engine (and the receipt below) sees is concrete.
+    // the interactive launch path does, so the tier the engine (and the
+    // receipt below) sees is concrete.
     let effective_reasoning_effort = route.reasoning_effort.and_then(|effort| {
-        cli_reasoning_effort_value_for_prompt(&execution_config, &effective_model, effort, prompt)
+        cli_reasoning_effort_value_for_prompt(&execution_config, &effective_model, effort)
     });
 
     let settings = crate::settings::Settings::load().unwrap_or_default();
@@ -155,12 +460,14 @@ pub(crate) async fn run_exec_agent(
             active_route_limits,
             settings.auto_compact_threshold_percent,
         ),
+        summary_instructions: execution_config.compaction_summary_instructions(),
+        retained_user_message_tokens: execution_config.compaction_retained_user_message_tokens(),
         ..Default::default()
     };
 
     let network_policy = exec_network_policy(&execution_config, outer_network_access);
 
-    let lsp_config = (!fleet_authority_active)
+    let lsp_config = (!fleet_authority_active && !one_shot)
         .then(|| {
             execution_config
                 .lsp
@@ -183,6 +490,25 @@ pub(crate) async fn run_exec_agent(
     } else {
         plugin_registry
     };
+    // `exec --hooks` (#6099) is the operator's explicit opt-in: headless runs
+    // fire no hooks by default. When armed, the executor is the same one the
+    // TUI builds — global config, reviewed plugin snapshots, then trusted
+    // project `.codewhale/hooks.toml` — so `tool_call_before` can still deny
+    // and `shell_env` still applies. It is shared with the engine config, the
+    // turn's SendMessage op (which re-installs it into the engine), and the
+    // tool runtime services. Fleet workers never opt in: the narrowed
+    // authority envelope does not carry the operator's hook set into a child.
+    let exec_hook_executor = (exec_hooks_enabled && !fleet_authority_active).then(|| {
+        let hooks_config = crate::hooks::HooksConfig::load_with_project_and_plugins(
+            execution_config.hooks_config(),
+            &workspace,
+            Some(engine_plugin_registry.as_ref()),
+        );
+        std::sync::Arc::new(crate::hooks::HookExecutor::new(
+            hooks_config,
+            workspace.clone(),
+        ))
+    });
     let exec_allow_shell = crate::tools::spec::fleet_exec_shell_enabled(
         fleet_authority_active,
         outer_shell_authority,
@@ -195,10 +521,13 @@ pub(crate) async fn run_exec_agent(
         && explicit_sandbox
             .is_some_and(|sandbox| sandbox.eq_ignore_ascii_case("danger-full-access"));
     let exec_shell_manager = crate::tools::shell::new_shared_shell_manager(workspace.clone());
+    let exec_automations = exec_automation_services(fleet_authority_active || one_shot)?;
     let runtime_services = crate::tools::spec::RuntimeToolServices {
         shell_manager: Some(exec_shell_manager.clone()),
         persist_services_enabled,
+        automations: exec_automations,
         media_originals_dir: crate::media_originals::default_store_dir(),
+        hook_executor: exec_hook_executor.clone(),
         ..crate::tools::spec::RuntimeToolServices::default()
     };
 
@@ -206,7 +535,7 @@ pub(crate) async fn run_exec_agent(
         model: effective_model.clone(),
         active_route_limits,
         workspace: workspace.clone(),
-        session_id: None,
+        session_id: fleet_capture.as_ref().map(|(id, _)| id.clone()),
         subagent_state_root: None,
         plugin_registry: Some(std::sync::Arc::clone(&engine_plugin_registry)),
         allow_shell: exec_allow_shell,
@@ -218,7 +547,9 @@ pub(crate) async fn run_exec_agent(
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         skills_dir: execution_config.skills_dir(),
-        skills_scan_codewhale_only: execution_config.skills_config().scan_codewhale_only(),
+        skills_discovery_mode: crate::skills::SkillDiscoveryMode::from_config(
+            &execution_config.skills_config(),
+        ),
         instructions: {
             let mut instrs: Vec<crate::prompts::InstructionSource> = execution_config
                 .instructions_paths()
@@ -238,11 +569,11 @@ pub(crate) async fn run_exec_agent(
         max_steps: max_turns,
         max_subagents,
         max_admitted_subagents: execution_config
-            .max_admitted_subagents_for_provider(effective_provider)
+            .max_admitted_subagents_for_provider(&effective_identity)
             .max(max_subagents),
-        launch_concurrency: execution_config.launch_concurrency_for_provider(effective_provider),
+        launch_concurrency: execution_config.launch_concurrency_for_provider(&effective_identity),
         subagents_enabled: !fleet_authority_active
-            && execution_config.subagents_enabled_for_provider(effective_provider),
+            && execution_config.subagents_enabled_for_provider(&effective_identity),
         features: engine_features,
         auto_review_policy: execution_config.auto_review_policy(),
         compaction: compaction.clone(),
@@ -252,16 +583,18 @@ pub(crate) async fn run_exec_agent(
         max_spawn_depth: if fleet_authority_active {
             0
         } else {
-            execution_config.subagent_max_spawn_depth_for_provider(effective_provider)
+            execution_config.subagent_max_spawn_depth_for_provider(&effective_identity)
         },
-        subagent_token_budget: execution_config
-            .subagent_token_budget_for_provider(effective_provider),
         network_policy,
-        snapshots_enabled: !fleet_authority_active && execution_config.snapshots_config().enabled,
+        snapshots_enabled: !fleet_authority_active
+            && !one_shot
+            && execution_config.snapshots_config().enabled,
         snapshots_max_workspace_bytes: execution_config
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
+        // No host here records snapshot receipts.
+        record_restore_points: false,
         lsp_config,
         runtime_services,
         subagent_model_overrides: execution_config.subagent_model_overrides(),
@@ -271,7 +604,7 @@ pub(crate) async fn run_exec_agent(
             Some(engine_plugin_registry.as_ref()),
         )),
         subagent_api_timeout: std::time::Duration::from_secs(
-            execution_config.subagent_api_timeout_secs_for_provider(effective_provider),
+            execution_config.subagent_api_timeout_secs_for_provider(&effective_identity),
         ),
         stream_chunk_timeout: std::time::Duration::from_secs(
             execution_config.stream_chunk_timeout_secs(),
@@ -279,10 +612,12 @@ pub(crate) async fn run_exec_agent(
         turn_wall_clock: execution_config.turn_wall_clock(),
         stream_max_content_bytes: execution_config.stream_max_content_bytes(),
         stream_max_duration: execution_config.stream_max_duration(),
+        stream_retry_limits: execution_config.stream_retry_limits(),
+        stream_open_timeout: execution_config.stream_open_timeout(),
         subagent_heartbeat_timeout: std::time::Duration::from_secs(
-            execution_config.subagent_heartbeat_timeout_secs_for_provider(effective_provider),
+            execution_config.subagent_heartbeat_timeout_secs_for_provider(&effective_identity),
         ),
-        prefer_bwrap: execution_config.prefer_bwrap.unwrap_or(false),
+        prefer_bwrap: execution_config.prefers_bwrap(),
         bwrap_extensions: crate::sandbox::BwrapMountExtensions {
             read_only_roots: execution_config.bwrap_ro_roots.clone(),
             device_roots: execution_config.bwrap_dev_roots.clone(),
@@ -298,11 +633,18 @@ pub(crate) async fn run_exec_agent(
         goal_status: crate::tools::goal::GoalStatus::Active,
         goal_max_continuations: execution_config.goal_max_continuations(),
         goal_continuation_delay_seconds: execution_config.goal_continuation_delay_seconds(),
+        goal_enforce_token_budget: execution_config.goal_enforce_token_budget(),
+        reasoning_only_max_reprompts: execution_config.reasoning_only_max_reprompts(),
+        reasoning_only_reprompt_message: Some(
+            execution_config
+                .reasoning_only_reprompt_message()
+                .to_string(),
+        ),
         allowed_tools: allowed_tools.clone(),
         disallowed_tools: disallowed_tools.clone(),
         max_tool_calls,
-        hook_executor: None,
-        locale_tag: crate::localization::resolve_locale(&settings.locale)
+        hook_executor: exec_hook_executor.clone(),
+        locale_tag: codewhale_localization::resolve_locale(&settings.locale)
             .tag()
             .to_string(),
         workshop: {
@@ -316,6 +658,7 @@ pub(crate) async fn run_exec_agent(
             .search
             .as_ref()
             .and_then(|s| s.api_key.clone()),
+        search_native: execution_config.search_native(),
         search_base_url: execution_config
             .search
             .as_ref()
@@ -325,6 +668,9 @@ pub(crate) async fn run_exec_agent(
         } else {
             execution_config.tools_always_load()
         },
+        user_input_limits: execution_config.user_input_limits(),
+        user_input_timeout: execution_config.user_input_timeout(),
+        goal_max_steps: None,
         tools: if fleet_authority_active {
             None
         } else {
@@ -345,12 +691,61 @@ pub(crate) async fn run_exec_agent(
     // The Full Access posture travels in the op's auto_approve/approval_mode
     // fields; modes no longer carry permission.
     let mode = AppMode::Agent;
+    let turn_approval_mode = if auto_approve {
+        ApprovalMode::Bypass
+    } else {
+        execution_config
+            .approval_policy
+            .as_deref()
+            .and_then(ApprovalMode::from_config_value)
+            .unwrap_or_default()
+    };
+    // A restricted posture that resolves to no enforcing sandbox must reach
+    // the person running exec, not only the model's posture line: policy-only
+    // is accepted (read-only already fails closed in the shell tool), but it
+    // is never silent. Mirrors the enforcement detection in `Engine::new`.
+    let turn_sandbox_policy = crate::core::authority::sandbox_policy_for_turn(
+        mode,
+        turn_approval_mode,
+        execution_config.sandbox_mode.as_deref(),
+        &workspace,
+        crate::core::authority::SandboxNetworkAccess::from_config(
+            execution_config.sandbox_network_access,
+        ),
+    );
+    let enforcement_unavailable = crate::sandbox::backend::SandboxKind::parse(
+        execution_config
+            .sandbox_backend
+            .as_deref()
+            .unwrap_or("none"),
+    )
+    .is_none()
+        && crate::sandbox::get_platform_sandbox_with_bwrap_preference(
+            execution_config.prefers_bwrap(),
+        )
+        .is_none();
+    if enforcement_unavailable && turn_sandbox_policy.should_sandbox() {
+        eprintln!(
+            "warning: {} — shell commands will run unrestricted",
+            turn_sandbox_policy.posture_label_with_enforcement(
+                crate::sandbox::policy::SandboxEnforcement::Unavailable,
+            )
+        );
+    }
 
     let resuming_session = resume_session.is_some();
     let mut loaded_session_id = None;
     if let Some(saved) = resume_session {
         let saved_id = saved.metadata.id.clone();
-        if saved.metadata.workspace != workspace && output_format == ExecOutputFormat::Text {
+        let saved_workspace = tokio::fs::canonicalize(&saved.metadata.workspace)
+            .await
+            .unwrap_or_else(|_| saved.metadata.workspace.clone());
+        let launch_workspace = tokio::fs::canonicalize(&workspace)
+            .await
+            .unwrap_or_else(|_| workspace.clone());
+        if !paths_equal_for_config(&saved_workspace, &launch_workspace)
+            && output_format == ExecOutputFormat::Text
+        {
             eprintln!(
                 "Warning: session {} was created in a different workspace ({}). Resuming anyway.",
                 truncate_id(&saved_id),
@@ -395,17 +790,21 @@ pub(crate) async fn run_exec_agent(
     let exec_turn_started_at = Instant::now();
 
     engine_handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
+            max_output_tokens: None,
             content: prompt.to_string(),
+            images: Vec::new(),
             mode,
             route: Box::new(validated_route.into_resolved()),
             compaction: Box::new(compaction.clone()),
+            initial_routed_usage: Box::default(),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
             allowed_tools: allowed_tools.clone(),
             dynamic_tools: Vec::new(),
-            hook_executor: None,
+            hook_executor: exec_hook_executor.clone(),
             reasoning_effort: effective_reasoning_effort,
             reasoning_effort_auto,
             auto_model,
@@ -413,18 +812,12 @@ pub(crate) async fn run_exec_agent(
             trust_mode,
             auto_approve,
             translation_enabled: false,
-            approval_mode: if auto_approve {
-                crate::tui::approval::ApprovalMode::Bypass
-            } else {
-                execution_config
-                    .approval_policy
-                    .as_deref()
-                    .and_then(crate::tui::approval::ApprovalMode::from_config_value)
-                    .unwrap_or_default()
-            },
+            approval_mode: turn_approval_mode,
             verbosity: execution_config.verbosity.clone(),
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
-        })
+            // Headless exec does not correlate submissions.
+            submission_id: None,
+        }))
         .await?;
 
     // Lifecycle outbox: the clean headless turn-start boundary. `exec` has
@@ -446,7 +839,7 @@ pub(crate) async fn run_exec_agent(
     });
 
     let mut summary = ExecSummary {
-        mode: "agent".to_string(),
+        mode: if one_shot { "one-shot" } else { "agent" }.to_string(),
         provider: effective_provider_name.clone(),
         model: effective_model.clone(),
         prompt: prompt.to_string(),
@@ -460,24 +853,31 @@ pub(crate) async fn run_exec_agent(
     let mut last_error_category = None;
     let mut reported_sandbox_contract = false;
 
-    let should_persist_session = resuming_session || output_format == ExecOutputFormat::StreamJson;
+    let mut should_persist_session =
+        resuming_session || output_format == ExecOutputFormat::StreamJson;
     let mut latest_session_id = loaded_session_id;
-    let mut latest_messages: Vec<Message> = Vec::new();
+    let mut latest_messages: Arc<Vec<Message>> = Arc::new(Vec::new());
     let mut latest_system_prompt: Option<SystemPrompt> = None;
     let mut latest_model = effective_model;
     let mut latest_workspace = workspace.clone();
     let mut tool_starts: HashMap<String, (Instant, String)> = HashMap::new();
     let mut turn_usage_seq: u32 = 0;
+    // None means no actual terminal request snapshot was observed. A known
+    // zero must remain distinguishable from that missing receipt.
+    let mut observed_retry_count = None;
+    let mut settled_usage: Option<codewhale_models::Usage> = None;
 
-    let mut stdout = io::stdout();
     let mut ends_with_newline = false;
+    // One absolute host deadline includes every autonomous child fan-in turn;
+    // child-specific shorter deadlines remain enforced by their runtime.
+    // The default wall clock is unbounded (`Duration::MAX`); a century
+    // stands in for "never" without overflowing `Instant`.
+    let exec_deadline = exec_turn_started_at
+        .checked_add(execution_config.turn_wall_clock())
+        .unwrap_or_else(|| exec_turn_started_at + Duration::from_secs(100 * 365 * 86_400));
+    let mut events = ExecAgentEvents::new(engine_handle.clone(), exec_deadline);
     loop {
-        let event = {
-            let mut rx = engine_handle.rx_event.write().await;
-            rx.recv().await
-        };
-
-        let Some(event) = event else {
+        let Some(event) = events.next().await else {
             break;
         };
 
@@ -487,8 +887,7 @@ pub(crate) async fn run_exec_agent(
                 if output_format == ExecOutputFormat::StreamJson {
                     emit_exec_stream_event(&ExecStreamEvent::Content { content })?;
                 } else if !json_output {
-                    print!("{content}");
-                    stdout.flush()?;
+                    write_exec_stdout(&content)?;
                 }
                 ends_with_newline = summary.output.ends_with('\n');
             }
@@ -497,7 +896,7 @@ pub(crate) async fn run_exec_agent(
                     && !json_output
                     && !ends_with_newline =>
             {
-                println!();
+                write_exec_stdout("\n")?;
             }
             Event::ThinkingDelta { .. } => {
                 // Exec stream-json intentionally omits reasoning deltas; the
@@ -517,7 +916,9 @@ pub(crate) async fn run_exec_agent(
                     )
                 );
             }
-            Event::ToolCallStarted { id, name, input } => {
+            Event::ToolCallStarted {
+                id, name, input, ..
+            } => {
                 let started_at = chrono::Utc::now().to_rfc3339();
                 tool_starts.insert(id.clone(), (Instant::now(), started_at.clone()));
                 if output_format == ExecOutputFormat::StreamJson {
@@ -648,11 +1049,18 @@ pub(crate) async fn run_exec_agent(
             {
                 eprintln!("sub-agent {id}: {status}");
             }
-            Event::AgentComplete { id, result, .. }
-                if output_format == ExecOutputFormat::Text && !json_output =>
-            {
+            Event::AgentComplete {
+                id,
+                result,
+                outcome,
+                ..
+            } if output_format == ExecOutputFormat::Text && !json_output => {
                 eprintln!(
-                    "sub-agent {id} completed: {}",
+                    "sub-agent {id} {}: {}",
+                    outcome
+                        .as_ref()
+                        .map(crate::tools::subagent::subagent_status_name)
+                        .unwrap_or("settled (outcome unconfirmed)"),
                     summarize_tool_output(&result)
                 );
             }
@@ -680,12 +1088,24 @@ pub(crate) async fn run_exec_agent(
             {
                 emit_exec_stream_event(&ExecStreamEvent::WorkflowEvent { run_id, event })?;
             }
-            Event::ApprovalRequired { id, .. } => {
-                if auto_approve {
-                    let _ = engine_handle.approve_tool_call(id).await;
+            // Headless runs have no person at the prompt: the run's flags
+            // (the posture) answer every request.
+            Event::ApprovalRequired {
+                id,
+                approval_force_prompt,
+                ..
+            } => {
+                // An exact user decision (including extension-sourced shell
+                // and network calls) cannot be supplied by a headless posture.
+                if auto_approve && !approval_force_prompt {
+                    let _ = engine_handle
+                        .approve_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
+                        .await;
                 } else {
                     approval_required = true;
-                    let _ = engine_handle.deny_tool_call(id).await;
+                    let _ = engine_handle
+                        .deny_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
+                        .await;
                 }
             }
             Event::ElevationRequired {
@@ -696,7 +1116,13 @@ pub(crate) async fn run_exec_agent(
             } => {
                 if can_elevate_sandbox {
                     let policy = crate::sandbox::SandboxPolicy::DangerFullAccess;
-                    let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
+                    let _ = engine_handle
+                        .retry_tool_with_policy_by(
+                            tool_id,
+                            policy,
+                            crate::approval_log::ApprovalDecider::Posture,
+                        )
+                        .await;
                 } else {
                     sandbox_denied = true;
                     approval_required = true;
@@ -720,7 +1146,9 @@ pub(crate) async fn run_exec_agent(
                             outcome: "approval_required".to_string(),
                         })?;
                     }
-                    let _ = engine_handle.deny_tool_call(tool_id).await;
+                    let _ = engine_handle
+                        .deny_tool_call_by(tool_id, crate::approval_log::ApprovalDecider::Posture)
+                        .await;
                 }
             }
             Event::Error {
@@ -773,6 +1201,7 @@ pub(crate) async fn run_exec_agent(
                 ..
             } => {
                 let (terminal_status, terminal_error) = (status, error);
+                settled_usage = Some(usage.clone());
                 #[cfg(unix)]
                 let (mut terminal_status, mut terminal_error) = (terminal_status, terminal_error);
                 if matches!(
@@ -900,13 +1329,14 @@ pub(crate) async fn run_exec_agent(
                         &latest_messages,
                         &latest_model,
                         PersistedProviderRoute {
-                            kind: effective_provider.as_str(),
-                            id: effective_provider_id.as_deref(),
+                            kind: effective_identity.persisted_kind(),
+                            id: effective_identity.persisted_id(),
                         },
                         &latest_workspace,
                         &latest_system_prompt,
                         latest_session_id.as_deref(),
                         u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
+                        fleet_capture.as_ref().map(|(_, manager)| manager),
                     ) {
                         Ok(id) => {
                             if output_format == ExecOutputFormat::Text && !json_output {
@@ -918,16 +1348,17 @@ pub(crate) async fn run_exec_agent(
                             if output_format == ExecOutputFormat::Text && !json_output {
                                 eprintln!("warning: failed to save exec session: {err}");
                             }
-                            latest_session_id.clone()
+                            None
                         }
                     }
                 } else {
-                    latest_session_id.clone()
+                    None
                 };
                 if output_format == ExecOutputFormat::StreamJson {
                     if let Some(id) = saved_session_id.as_ref() {
                         emit_exec_stream_event(&ExecStreamEvent::SessionCapture {
                             content: exec_stream_session_ref(id),
+                            saved_session_id: id.clone(),
                         })?;
                     }
                     // Resolved output ceiling and its provenance, surfaced so a
@@ -945,6 +1376,15 @@ pub(crate) async fn run_exec_agent(
                             &latest_model,
                         )
                         .as_str();
+                    // The deliverable is the final assistant reply of the
+                    // session, not the cumulative stream output: a
+                    // multi-step turn streams pre-tool commentary first,
+                    // and that commentary is not part of the answer.
+                    let final_answer = exec_stream_final_answer_text(
+                        &latest_messages,
+                        !summary.output.trim().is_empty(),
+                    )
+                    .unwrap_or_default();
                     emit_exec_stream_event(&ExecStreamEvent::Metadata {
                         meta: Box::new(ExecStreamMeta {
                             receipt_kind: "terminal",
@@ -964,7 +1404,7 @@ pub(crate) async fn run_exec_agent(
                             ),
                             duration_ms: u64::try_from(exec_started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX),
-                            retry_count: None,
+                            retry_count: observed_retry_count,
                             approval_posture: approval_posture.clone(),
                             sandbox_posture: sandbox_posture.clone(),
                             binary_sha256: binary_sha256.clone(),
@@ -979,7 +1419,10 @@ pub(crate) async fn run_exec_agent(
                                 &latest_messages,
                                 latest_system_prompt.as_ref(),
                             ),
-                            visible_final_answer_chars: summary.output.chars().count(),
+                            visible_final_answer_chars: final_answer.chars().count(),
+                            visible_final_answer_excerpt: exec_stream_final_answer_excerpt(
+                                &final_answer,
+                            ),
                             resume_command: saved_session_id
                                 .as_deref()
                                 .map(exec_stream_resume_hint)
@@ -998,8 +1441,15 @@ pub(crate) async fn run_exec_agent(
                     })?;
                     emit_exec_stream_event(&ExecStreamEvent::Done)?;
                 }
-                let _ = engine_handle.send(Op::Shutdown).await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), engine_handle.send(Op::Shutdown))
+                        .await;
                 break;
+            }
+            Event::CompactionStarted { .. } => {
+                // The Engine writes recovery artifacts under its session ID.
+                // Keep the owning session discoverable even in text output.
+                should_persist_session = true;
             }
             Event::SessionUpdated {
                 session_id,
@@ -1014,6 +1464,15 @@ pub(crate) async fn run_exec_agent(
                 latest_model = model;
                 latest_workspace = workspace;
             }
+            // A tool-less one-shot run has no tool channel, so a model that
+            // still tries to call a tool writes the call as text. The engine
+            // strips that markup from the answer; say why the answer is short
+            // and how to give the model tools, instead of exiting on nothing.
+            Event::Status { message }
+                if one_shot && message == crate::core::engine::FAKE_WRAPPER_NOTICE =>
+            {
+                eprintln!("{ONE_SHOT_TOOL_CALL_NOTICE}");
+            }
             // #3027: surface the engine's max-steps notice in text mode so a
             // --max-turns run that stops early says why instead of going quiet.
             Event::Status { message }
@@ -1022,6 +1481,19 @@ pub(crate) async fn run_exec_agent(
                     && message.contains("Maximum model steps") =>
             {
                 eprintln!("{message}");
+            }
+            Event::ToolRequestSnapshot { snapshot } => {
+                observed_retry_count =
+                    accumulate_exec_retry_count(observed_retry_count, snapshot.terminal.as_ref());
+            }
+            Event::Status { message } => {
+                if let Some(receipt) = exec_retry_status(&message) {
+                    if output_format == ExecOutputFormat::StreamJson {
+                        emit_exec_stream_event(&receipt)?;
+                    } else if output_format == ExecOutputFormat::Text && !json_output {
+                        eprintln!("{message}");
+                    }
+                }
             }
             _ => {}
         }
@@ -1071,8 +1543,18 @@ pub(crate) async fn run_exec_agent(
         }
     }
 
+    // Drain the terminal receipt before either returning or taking the explicit
+    // retryable-failure process exit below. Outbox failures cannot change the
+    // authoritative turn outcome.
+    if let Err(error) = lifecycle_outbox.flush(Duration::from_secs(2)).await {
+        tracing::warn!(target: "lifecycle_outbox", %error, "exec lifecycle outbox did not drain before exit");
+    }
+
+    if one_shot {
+        summary.record_one_shot_outcome(settled_usage);
+    }
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&summary)?);
+        write_exec_stdout(&format!("{}\n", serde_json::to_string_pretty(&summary)?))?;
     }
 
     if let Some(error) = summary.error.as_ref()
@@ -1084,6 +1566,9 @@ pub(crate) async fn run_exec_agent(
         // the process level without parsing the stream. Genuine failures
         // keep the historical `bail!` → exit 1 path.
         let exit_code = exec_failure_exit_code(summary.error_category.as_deref());
+        // The final line always carries the message: automation greps it and
+        // a caller may keep only the last stderr line, even when the stream
+        // already printed the same error above.
         if exit_code != 1 {
             eprintln!("Error: exec turn failed: {error}");
             let _ = io::stdout().flush();
@@ -1101,4 +1586,407 @@ pub(crate) async fn run_exec_agent(
     }
 
     Ok(())
+}
+
+fn exec_retry_status(message: &str) -> Option<ExecStreamEvent> {
+    crate::core::events::is_retry_status_receipt(message).then(|| ExecStreamEvent::Status {
+        message: message.to_string(),
+    })
+}
+
+fn accumulate_exec_retry_count(
+    previous: Option<u32>,
+    terminal: Option<&crate::tool_inspection::TurnStopDiagnostics>,
+) -> Option<u32> {
+    let Some(terminal) = terminal.filter(|facts| facts.status.is_some()) else {
+        return previous;
+    };
+    let retries = terminal
+        .transport_retries
+        .saturating_add(terminal.transparent_stream_retries)
+        .saturating_add(terminal.stream_resumes)
+        .saturating_add(terminal.empty_stop_retries)
+        .saturating_add(terminal.reasoning_only_reprompts);
+    Some(previous.unwrap_or(0).saturating_add(retries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecAgentEvents, exec_automation_services, exec_disallowed_tools};
+
+    use crate::core::engine::mock_engine_handle;
+    use crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME;
+    use crate::core::events::{Event, TurnOutcomeStatus};
+    use crate::core::ops::{Op, SubAgentSettlement};
+    use codewhale_models::Usage;
+    use std::time::{Duration, Instant};
+
+    fn completed_parent(input_tokens: u32) -> Event {
+        let usage = Usage {
+            input_tokens,
+            ..Usage::default()
+        };
+        Event::TurnComplete {
+            usage: usage.clone(),
+            parent_route_usage: usage,
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        }
+    }
+
+    async fn reply_to_probe(
+        operations: &mut tokio::sync::mpsc::Receiver<Op>,
+        snapshot: SubAgentSettlement,
+    ) {
+        let Op::GetSubAgentSettlement { tx } = operations.recv().await.expect("host probe") else {
+            panic!("host must not shut down while child work remains");
+        };
+        tx.lock().unwrap().take().unwrap().send(snapshot).unwrap();
+    }
+
+    #[test]
+    fn headless_exec_withholds_request_user_input_without_a_responder() {
+        // No responder exists on a one-shot CLI run, so the tool is
+        // withheld by default rather than offered and stalled on.
+        let disallowed = exec_disallowed_tools(None).expect("withhold list");
+        assert!(
+            disallowed
+                .iter()
+                .any(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME),
+            "request_user_input must be withheld by default: {disallowed:?}"
+        );
+        // An operator-passed entry is kept exactly once, not duplicated.
+        let disallowed = exec_disallowed_tools(Some(vec![REQUEST_USER_INPUT_NAME.to_string()]))
+            .expect("withhold list");
+        assert_eq!(
+            disallowed
+                .iter()
+                .filter(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_success_waits_for_children_workflow_phases_and_parent_fan_in() {
+        let mut engine = mock_engine_handle();
+        let mut events = ExecAgentEvents::new(
+            engine.handle.clone(),
+            Instant::now() + Duration::from_secs(3),
+        );
+        engine.tx_event.send(completed_parent(11)).await.unwrap();
+        let actor = async {
+            reply_to_probe(
+                &mut engine.rx_op,
+                SubAgentSettlement {
+                    running_children: 1,
+                    running_workflows: 1,
+                    pending_completions: 0,
+                },
+            )
+            .await;
+            reply_to_probe(
+                &mut engine.rx_op,
+                SubAgentSettlement {
+                    running_children: 0,
+                    running_workflows: 1,
+                    pending_completions: 0,
+                },
+            )
+            .await;
+            reply_to_probe(
+                &mut engine.rx_op,
+                SubAgentSettlement {
+                    running_children: 0,
+                    running_workflows: 0,
+                    pending_completions: 1,
+                },
+            )
+            .await;
+            engine
+                .tx_event
+                .send(Event::MessageDelta {
+                    content: "child findings reviewed".into(),
+                    index: 0,
+                })
+                .await
+                .unwrap();
+            engine.tx_event.send(completed_parent(7)).await.unwrap();
+            reply_to_probe(&mut engine.rx_op, SubAgentSettlement::default()).await;
+        };
+        let host = async {
+            assert!(
+                matches!(events.next().await, Some(Event::MessageDelta { content, .. }) if content == "child findings reviewed")
+            );
+            let Some(Event::TurnComplete { usage, status, .. }) = events.next().await else {
+                panic!("settled parent receipt")
+            };
+            assert_eq!(status, TurnOutcomeStatus::Completed);
+            assert_eq!(
+                usage.input_tokens, 18,
+                "both parent turns are accounted once"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(4), async { tokio::join!(actor, host) })
+            .await
+            .unwrap();
+        assert!(
+            !engine.handle.is_cancelled(),
+            "ordinary success must not cancel children"
+        );
+        assert!(
+            engine.rx_op.try_recv().is_err(),
+            "the event reader does not send early Shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_child_settlement_deadline_bounds_a_stalled_engine_probe() {
+        let mut engine = mock_engine_handle();
+        let mut events = ExecAgentEvents::new(
+            engine.handle.clone(),
+            Instant::now() + Duration::from_millis(30),
+        );
+        engine.tx_event.send(completed_parent(13)).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .unwrap();
+        let Some(Event::TurnComplete {
+            status,
+            error,
+            usage,
+            routed_usage_dropped_records,
+            ..
+        }) = event
+        else {
+            panic!("bounded failure receipt")
+        };
+        assert_eq!(status, TurnOutcomeStatus::Failed);
+        assert!(error.unwrap().contains("wall-clock budget exhausted"));
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(routed_usage_dropped_records, 1);
+        assert!(engine.handle.is_cancelled());
+        let mut shutdown = false;
+        while let Ok(op) = engine.rx_op.try_recv() {
+            shutdown |= matches!(op, Op::Shutdown);
+        }
+        assert!(shutdown, "shutdown must also cancel detached session tasks");
+    }
+
+    #[tokio::test]
+    async fn headless_failed_or_interrupted_parent_skips_child_settlement() {
+        for terminal_status in [TurnOutcomeStatus::Failed, TurnOutcomeStatus::Interrupted] {
+            let mut engine = mock_engine_handle();
+            let mut events = ExecAgentEvents::new(
+                engine.handle.clone(),
+                Instant::now() + Duration::from_secs(30),
+            );
+            let mut terminal = completed_parent(3);
+            if let Event::TurnComplete { status, .. } = &mut terminal {
+                *status = terminal_status;
+            }
+            engine.tx_event.send(terminal).await.unwrap();
+            assert!(
+                matches!(events.next().await, Some(Event::TurnComplete { status, .. }) if status == terminal_status)
+            );
+            assert!(
+                engine.rx_op.try_recv().is_err(),
+                "failure cannot admit another settling turn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_fatal_fan_in_error_cancels_before_releasing_terminal_receipt() {
+        let engine = mock_engine_handle();
+        let mut events = ExecAgentEvents::new(
+            engine.handle.clone(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        engine.tx_event.send(completed_parent(5)).await.unwrap();
+        engine
+            .tx_event
+            .send(Event::error(crate::error_taxonomy::ErrorEnvelope::fatal(
+                "fan-in route unavailable",
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(events.next().await, Some(Event::Error { .. })));
+        assert!(engine.handle.is_cancelled());
+        assert!(
+            matches!(events.next().await, Some(Event::TurnComplete { status: TurnOutcomeStatus::Failed, error: Some(error), .. }) if error.contains("fan-in route unavailable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_cancel_during_child_wait_returns_interrupted() {
+        let mut engine = mock_engine_handle();
+        let mut events = ExecAgentEvents::new(
+            engine.handle.clone(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        engine.tx_event.send(completed_parent(5)).await.unwrap();
+        let cancel = async {
+            reply_to_probe(
+                &mut engine.rx_op,
+                SubAgentSettlement {
+                    running_children: 1,
+                    running_workflows: 0,
+                    pending_completions: 0,
+                },
+            )
+            .await;
+            engine.handle.cancel();
+        };
+        let host = async {
+            assert!(matches!(
+                events.next().await,
+                Some(Event::TurnComplete {
+                    status: TurnOutcomeStatus::Interrupted,
+                    ..
+                })
+            ));
+        };
+        tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(cancel, host) })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn headless_closed_engine_cannot_reuse_an_earlier_success_receipt() {
+        let mut engine = mock_engine_handle();
+        let mut events = ExecAgentEvents::new(
+            engine.handle.clone(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        engine.tx_event.send(completed_parent(5)).await.unwrap();
+        engine.close_event_stream();
+        assert!(
+            matches!(events.next().await, Some(Event::TurnComplete { status: TurnOutcomeStatus::Failed, error: Some(error), .. }) if error.contains("channel closed"))
+        );
+    }
+
+    /// The reproduced defect: headless exec advertised `automation` while
+    /// attaching no store, so every call — including the read-only `list` and
+    /// `read` — failed "AutomationManager is not attached". Exec must attach
+    /// the same durable store the TUI and the Runtime open.
+    #[test]
+    fn headless_exec_attaches_the_shared_automation_store() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // SAFETY: serialised by lock_test_env.
+        unsafe {
+            std::env::set_var("CODEWHALE_AUTOMATIONS_DIR", tmp.path());
+        }
+        let attached = exec_automation_services(false).expect("open store");
+        // SAFETY: cleanup under the same lock.
+        unsafe {
+            std::env::remove_var("CODEWHALE_AUTOMATIONS_DIR");
+        }
+        let attached = attached.expect("exec attaches the automation store");
+        let manager = attached.blocking_lock();
+        // Reads work against the shared store...
+        assert!(
+            manager.list_automations().is_ok(),
+            "an attached store must serve inspection"
+        );
+        // ...while the exec host stays outside the Runtime's exclusive
+        // task-execution lease, so it claims no dispatch ownership.
+        assert!(
+            manager.execution_scope().is_none(),
+            "a one-shot host must not claim an execution scope"
+        );
+    }
+
+    /// A Fleet worker keeps the narrowed envelope it was launched with.
+    #[test]
+    fn fleet_workers_get_no_automation_store() {
+        assert!(
+            exec_automation_services(true)
+                .expect("no store to open")
+                .is_none()
+        );
+    }
+
+    /// A store that cannot be opened is reported, not swallowed into a silent
+    /// "not attached" at the first tool call.
+    #[test]
+    fn an_unopenable_store_fails_loudly() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        // A regular file cannot host the store's directories.
+        let blocked = tmp.path().join("automations");
+        // SAFETY: serialised by lock_test_env.
+        unsafe {
+            std::env::set_var("CODEWHALE_AUTOMATIONS_DIR", &blocked);
+        }
+        let result = exec_automation_services(false);
+        // SAFETY: cleanup under the same lock.
+        unsafe {
+            std::env::remove_var("CODEWHALE_AUTOMATIONS_DIR");
+        }
+        let err = result.expect_err("opening the store must fail");
+        assert!(
+            format!("{err:#}").contains("automation store for headless exec"),
+            "the failure must name what could not be opened: {err:#}"
+        );
+    }
+
+    #[test]
+    fn exec_retry_receipts_keep_the_existing_jsonl_schema_and_text() {
+        for message in [
+            "Retry attempt: transport 1/2; upstream 503; waiting 0.00s",
+            "Retry recovery: transport request recovered after 1 retries",
+            "Retry exhaustion: stream-resume stopped after 2 retries; stream interrupted",
+            "Retry stopped: transparent stream completion was not observed",
+        ] {
+            let event = super::exec_retry_status(message).expect("retry-only projection");
+            let value = crate::exec_stream_value(&event).unwrap();
+            assert_eq!(value["type"], "status");
+            assert_eq!(value["message"], message);
+            assert_eq!(value["schema"], "codewhale.exec-stream");
+            assert_eq!(value["schema_version"], 1);
+        }
+        assert!(super::exec_retry_status("Executing tools sequentially").is_none());
+        assert!(super::exec_retry_status("Goal set; starting goal work.").is_none());
+    }
+
+    #[test]
+    fn exec_retry_count_requires_terminal_facts_and_keeps_unknown_distinct_from_zero() {
+        use crate::tool_inspection::TurnStopDiagnostics;
+        assert_eq!(super::accumulate_exec_retry_count(None, None), None);
+        assert_eq!(
+            super::accumulate_exec_retry_count(None, Some(&TurnStopDiagnostics::default())),
+            None
+        );
+        let zero = TurnStopDiagnostics {
+            status: Some(TurnOutcomeStatus::Completed),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::accumulate_exec_retry_count(None, Some(&zero)),
+            Some(0)
+        );
+        let retries = TurnStopDiagnostics {
+            status: Some(TurnOutcomeStatus::Failed),
+            transport_retries: 2,
+            stream_resumes: 3,
+            transparent_stream_retries: 1,
+            empty_stop_retries: 1,
+            reasoning_only_reprompts: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::accumulate_exec_retry_count(Some(0), Some(&retries)),
+            Some(9)
+        );
+        assert_eq!(super::accumulate_exec_retry_count(Some(9), None), Some(9));
+        assert_eq!(
+            super::accumulate_exec_retry_count(Some(u32::MAX), Some(&retries)),
+            Some(u32::MAX)
+        );
+    }
 }

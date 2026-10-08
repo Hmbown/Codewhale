@@ -1,5 +1,7 @@
 # Rebrand: DeepSeek TUI → Codewhale
 
+> 阅读简体中文版：[zh_hans/REBRAND.md](zh_hans/REBRAND.md)。
+
 Starting with **v0.8.41**, this project ships under a new name: `codewhale`.
 
 This document explains what changed, what didn't, and how to migrate. None of the
@@ -70,14 +72,14 @@ Anything that targets the DeepSeek provider API stays exactly as it was:
   `api.deepseeki.com` is not an official DeepSeek endpoint; it is only
   still accepted in URL heuristics for existing configs and is not
   offered as a fallback (#1079).
-- **GitHub repository URL**: `https://github.com/Hmbown/CodeWhale`.
+- **GitHub repository URL**: `https://github.com/codewhale-hq/CodeWhale`.
   The old `Hmbown/DeepSeek-TUI` URL redirects there during the transition.
 - **Homebrew tap and formula**: the formula is `codewhale`. The tap GitHub
   repo is still `Hmbown/homebrew-deepseek-tui` until it is renamed;
   `brew tap Hmbown/deepseek-tui && brew install codewhale` is the current
   path. The legacy `deepseek-tui` formula remains a deprecated alias for
   one overlap release.
-- **Docker image**: `ghcr.io/hmbown/codewhale`.
+- **Docker image**: `ghcr.io/codewhale-hq/codewhale`.
 
 ## Deprecation shims (removed in v0.9.0)
 
@@ -138,7 +140,7 @@ to `npm install -g codewhale`.
 
 ### Homebrew
 
-**Current published state (v0.9.10; workspace source candidate v0.9.11):** The
+**Historical migration state as of v0.9.13 (published 2026-09-14):** The
 formula is `codewhale`. New installs:
 
 ```bash
@@ -148,7 +150,7 @@ brew upgrade codewhale
 ```
 
 The tap GitHub repo is still `Hmbown/homebrew-deepseek-tui` until it is
-renamed to `Hmbown/homebrew-codewhale` (then `brew tap Hmbown/codewhale`
+renamed to `Hmbown/homebrew-codewhale` (then `brew tap codewhale-hq/codewhale`
 works; the old tap name keeps working through GitHub's redirect). The
 legacy `deepseek-tui` formula remains a deprecated alias for this overlap
 release so existing `brew upgrade deepseek-tui` crontabs keep working.
@@ -242,7 +244,7 @@ to Codewhale; the official DeepSeek provider, model IDs, env vars, and
 ## Reporting issues with the rename
 
 If your install broke during the migration, please open an issue at
-<https://github.com/Hmbown/CodeWhale/issues> and include:
+<https://github.com/codewhale-hq/CodeWhale/issues> and include:
 
 - The output of `codewhale --version` (or `deepseek --version` if you're
   still on the shim).

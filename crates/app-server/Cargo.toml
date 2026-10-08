@@ -15,17 +15,15 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-codewhale-agent = { path = "../agent", version = "0.9.11" }
-codewhale-config = { path = "../config", version = "0.9.11" }
-codewhale-core = { path = "../core", version = "0.9.11" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.9.11" }
-codewhale-hooks = { path = "../hooks", version = "0.9.11" }
-codewhale-mcp = { path = "../mcp", version = "0.9.11" }
-codewhale-paths = { path = "../paths", version = "0.9.11" }
-codewhale-protocol = { path = "../protocol", version = "0.9.11" }
-codewhale-release = { path = "../release", version = "0.9.11" }
-codewhale-state = { path = "../state", version = "0.9.11" }
-codewhale-tools = { path = "../tools", version = "0.9.11" }
+chrono.workspace = true
+codewhale-agent = { path = "../agent", version = "0.10.1" }
+codewhale-config = { path = "../config", version = "0.10.1" }
+codewhale-core = { path = "../core", version = "0.10.1" }
+codewhale-hooks = { path = "../hooks", version = "0.10.1" }
+codewhale-paths = { path = "../paths", version = "0.10.1" }
+codewhale-protocol = { path = "../protocol", version = "0.10.1" }
+codewhale-release = { path = "../release", version = "0.10.1" }
+codewhale-state = { path = "../state", version = "0.10.1" }
 serde.workspace = true
 serde_json.workspace = true
 rustls.workspace = true
@@ -37,5 +35,10 @@ reqwest = { workspace = true, features = ["json"] }
 uuid.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true
 tower = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+sha2.workspace = true
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Pipes"] }

@@ -1,0 +1,12 @@
+data: {"id":"conf-ds","object":"chat.completion.chunk","created":1760000000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":""},"finish_reason":null}]}
+
+data: {"id":"conf-ds","object":"chat.completion.chunk","created":1760000000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"reasoning_content":"Compare the two numbers. "},"finish_reason":null}]}
+
+data: {"id":"conf-ds","object":"chat.completion.chunk","created":1760000000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"reasoning_content":"9.11 < 9.9."},"finish_reason":null}]}
+
+data: {"id":"conf-ds","object":"chat.completion.chunk","created":1760000000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"9.9 is larger."},"finish_reason":null}]}
+
+data: {"id":"conf-ds","object":"chat.completion.chunk","created":1760000000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":30,"total_tokens":50,"prompt_cache_hit_tokens":12,"prompt_cache_miss_tokens":8,"completion_tokens_details":{"reasoning_tokens":22}}}
+
+data: [DONE]
+

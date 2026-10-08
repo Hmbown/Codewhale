@@ -103,17 +103,15 @@ fn append_at(app: &mut App, entry_idx: usize, text: &str, now: Instant) {
 /// Build the spinner-decorated placeholder shown in the thinking entry
 /// while a translation is in flight (`Thinking… (1.2s |)`).
 fn translation_placeholder_spinner_frame(app: &App, elapsed: f32) -> &'static str {
-    let animated_frame = match (elapsed.mul_add(2.0, 0.0) as usize) % 4 {
-        0 => "|",
-        1 => "/",
-        2 => "-",
-        _ => "\\",
-    };
+    let elapsed = std::time::Duration::try_from_secs_f32(elapsed.max(0.0))
+        .unwrap_or(std::time::Duration::MAX);
+    let animated_frame =
+        codewhale_ratatui::spin::frame(elapsed, codewhale_ratatui::MotionMode::Full, true);
     app.motion_policy().spinner_glyph(animated_frame, true)
 }
 
 pub(super) fn translation_placeholder_frame(app: &App) -> String {
-    let base = crate::localization::thinking_translation_placeholder(app.ui_locale);
+    let base = codewhale_localization::thinking_translation_placeholder(app.ui_locale);
     let elapsed = app
         .thinking_started_at
         .or(app.turn_started_at)
@@ -126,7 +124,7 @@ pub(super) fn translation_placeholder_frame(app: &App) -> String {
 /// If the given entry is empty or still showing the translation
 /// placeholder prefix, replace it with the latest animated frame.
 pub(super) fn set_placeholder(app: &mut App, entry_idx: usize) {
-    let base = crate::localization::thinking_translation_placeholder(app.ui_locale);
+    let base = codewhale_localization::thinking_translation_placeholder(app.ui_locale);
     let next = translation_placeholder_frame(app);
     let mutated = if let Some(active) = app.active_cell.as_mut()
         && let Some(HistoryCell::Thinking { content, .. }) = active.entry_mut(entry_idx)
@@ -157,7 +155,7 @@ pub(super) fn animate_pending_translation(app: &mut App, translation_pending: bo
     if !translation_pending && !thinking_streaming {
         return false;
     }
-    let base = crate::localization::thinking_translation_placeholder(app.ui_locale);
+    let base = codewhale_localization::thinking_translation_placeholder(app.ui_locale);
     let next = translation_placeholder_frame(app);
 
     if let Some(active) = app.active_cell.as_mut() {
@@ -322,12 +320,12 @@ mod tests {
         let mut app = test_app();
         app.low_motion = false;
         app.fancy_animations = true;
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "|");
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "/");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), ">");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "\\");
 
         app.low_motion = true;
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "⣤");
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "⣤");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "●");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "●");
 
         app.low_motion = false;
         app.fancy_animations = false;

@@ -114,6 +114,109 @@ pub fn run_editor_raw(seed: &str) -> io::Result<EditorOutcome> {
     }
 }
 
+/// Append the file (and optional line) arguments in the spelling `program`
+/// understands.
+///
+/// Every caller that opens a real file goes through here so the three paths
+/// cannot drift on how a line number is spelled. Without a line this is exactly
+/// `cmd.arg(path)`, which is what it has always been.
+///
+/// `file_stem` rather than the whole program name, so an absolute path and a
+/// Windows `.exe` suffix both still match. An editor we do not recognize gets
+/// the bare path: opening the right file at the wrong line beats a spurious
+/// argument the editor treats as a second file to open.
+fn push_target_args(cmd: &mut Command, program: &str, path: &std::path::Path, line: Option<u32>) {
+    let Some(line) = line else {
+        cmd.arg(path);
+        return;
+    };
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+
+    match stem.as_str() {
+        // The vi family and the editors that copied its `+N` convention.
+        "vi" | "vim" | "nvim" | "view" | "gvim" | "nano" | "pico" | "emacs" | "emacsclient"
+        | "kak" | "micro" | "joe" => {
+            cmd.arg(format!("+{line}"));
+            cmd.arg(path);
+        }
+        // VS Code and its forks need an explicit flag before `file:line`.
+        "code" | "code-insiders" | "codium" | "vscodium" | "cursor" | "windsurf" => {
+            cmd.arg("--goto");
+            cmd.arg(format!("{}:{line}", path.display()));
+        }
+        // Sublime, Zed and JetBrains launchers all take `file:line` directly.
+        "subl" | "sublime_text" | "zed" | "idea" | "pycharm" | "goland" | "clion" | "rustrover"
+        | "webstorm" => {
+            cmd.arg(format!("{}:{line}", path.display()));
+        }
+        _ => {
+            cmd.arg(path);
+        }
+    }
+}
+
+/// Run the external editor on a real file, in place.
+///
+/// Unlike [`run_editor_raw`] there is no temp file and no seed: the file on
+/// disk *is* the document, so a `hooks.toml` the user edits stays edited even
+/// if the editor exits non-zero. The outcome only reports whether the bytes
+/// moved, which is what the caller needs in order to decide whether to reload.
+pub fn run_editor_on_path(path: &std::path::Path, line: Option<u32>) -> io::Result<EditorOutcome> {
+    let before = fs::read_to_string(path).unwrap_or_default();
+
+    let raw = resolve_editor();
+    let parts = match split_command(&raw) {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(EditorOutcome::Cancelled),
+    };
+    let mut cmd = Command::new(&parts[0]);
+    if parts.len() > 1 {
+        cmd.args(&parts[1..]);
+    }
+    push_target_args(&mut cmd, &parts[0], path, line);
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(_) => return Ok(EditorOutcome::Cancelled),
+    };
+
+    let after = fs::read_to_string(path).unwrap_or_default();
+    if after == before {
+        // A non-zero exit with no change is the editor being quit; a
+        // non-zero exit that *did* change the file still changed the file.
+        return Ok(if status.success() {
+            EditorOutcome::Unchanged
+        } else {
+            EditorOutcome::Cancelled
+        });
+    }
+    Ok(EditorOutcome::Edited(after))
+}
+
+/// Suspend the TUI, run the external editor on `path`, then re-enter it.
+///
+/// The suspend/resume dance is [`spawn_editor_for_input`]'s, factored so the
+/// composer and a file editor cannot drift on terminal-mode restoration.
+pub(crate) fn spawn_editor_for_path(
+    terminal: &mut Terminal<ColorCompatBackend<Stdout>>,
+    use_alt_screen: bool,
+    use_mouse_capture: bool,
+    use_bracketed_paste: bool,
+    path: &std::path::Path,
+    line: Option<u32>,
+) -> io::Result<EditorOutcome> {
+    with_suspended_tui(
+        terminal,
+        use_alt_screen,
+        use_mouse_capture,
+        use_bracketed_paste,
+        || run_editor_on_path(path, line),
+    )
+}
+
 /// Suspend the TUI, run the external editor on `current`, then re-enter the
 /// TUI. Returns the new composer text iff the user saved changes.
 ///
@@ -126,6 +229,38 @@ pub(crate) fn spawn_editor_for_input(
     use_bracketed_paste: bool,
     current: &str,
 ) -> io::Result<EditorOutcome> {
+    with_suspended_tui(
+        terminal,
+        use_alt_screen,
+        use_mouse_capture,
+        use_bracketed_paste,
+        || run_editor_raw(current),
+    )
+}
+
+/// Hand the terminal to a child, run `body`, and restore the TUI.
+///
+/// Restoration is best-effort and runs on every path, including a `body` that
+/// failed: leaving raw mode or the alt screen wrong is worse than the error
+/// being reported.
+fn with_suspended_tui(
+    terminal: &mut Terminal<ColorCompatBackend<Stdout>>,
+    use_alt_screen: bool,
+    use_mouse_capture: bool,
+    use_bracketed_paste: bool,
+    body: impl FnOnce() -> io::Result<EditorOutcome>,
+) -> io::Result<EditorOutcome> {
+    // 0. Stop reading the tty.
+    // #6165: suspending crossterm state is not enough. The input pump runs on
+    // its own thread and keeps calling `event::read()` whatever mode the
+    // terminal is in, so a child launched without this pause competes with
+    // Codewhale for every keystroke — the editor cannot be quit and the
+    // fragments land in the composer. Pausing here, rather than at each call
+    // site, is what makes `/hooks edit` and the composer editor correct by
+    // the same construction. Fail closed: a pump that will not stop means the
+    // handoff would reproduce the defect, so the editor does not run.
+    let input_pause = crate::tui::ui::pause_terminal_input_for_child()?;
+
     // 1. Suspend.
     // Focus reporting is about to be disabled. Fail closed to the quiet state
     // so a stale FocusLost cannot authorize a surprise notification while an
@@ -146,8 +281,8 @@ pub(crate) fn spawn_editor_for_input(
         let _ = super::ui::leave_alt_screen(terminal.backend_mut());
     }
 
-    // 2. Run the editor (synchronous; inherits stdio).
-    let result = run_editor_raw(current);
+    // 2. Run the child (synchronous; inherits stdio).
+    let result = body();
 
     // 3. Resume — best-effort restoration regardless of `result`.
     let _ = enable_raw_mode();
@@ -165,6 +300,9 @@ pub(crate) fn spawn_editor_for_input(
     // Force a full repaint so a SIGWINCH during the edit doesn't leave the
     // viewport stale.
     let _ = terminal.clear();
+
+    // 4. Take the tty back, after the modes it reads under are restored.
+    drop(input_pause);
 
     result
 }
@@ -200,51 +338,100 @@ fn disable_mouse_capture_for_child<W: Write>(writer: &mut W) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::Mutex;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
 
-    /// Serialize tests that mutate process-global env vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// The file on disk is the document: a `hooks.toml` the user edits stays
+    /// edited, and the outcome only reports whether the bytes moved.
+    #[test]
+    #[cfg(unix)]
+    fn editing_a_path_in_place_reports_only_whether_the_bytes_moved() {
+        let _lock = lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.toml");
+        fs::write(&path, "# seed\n").unwrap();
 
-    struct EnvGuard {
-        keys: Vec<(&'static str, Option<OsString>)>,
-    }
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            let saved: Vec<_> = keys.iter().map(|k| (*k, env::var_os(k))).collect();
-            Self { keys: saved }
+        // An editor that saves nothing.
+        let _visual = EnvVarGuard::set("VISUAL", "true");
+        let _editor = EnvVarGuard::remove("EDITOR");
+        assert_eq!(
+            run_editor_on_path(&path, None).unwrap(),
+            EditorOutcome::Unchanged,
+            "an editor that changes nothing must not trigger a reload"
+        );
+
+        // An editor that appends a line.
+        let script = dir.path().join("append.sh");
+        fs::write(&script, "#!/bin/sh\nprintf 'x\\n' >> \"$1\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        // Shadow rather than reassign: both guards live, and drop order
+        // restores the original value last.
+        let _visual_script = EnvVarGuard::set("VISUAL", &script);
+        match run_editor_on_path(&path, None).unwrap() {
+            EditorOutcome::Edited(text) => assert!(text.contains("# seed") && text.contains('x')),
+            other => panic!("expected Edited, got {other:?}"),
         }
+        assert!(
+            fs::read_to_string(&path).unwrap().contains('x'),
+            "the edit belongs to the real file, not a temp copy"
+        );
     }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.keys {
-                match v {
-                    Some(val) => unsafe { env::set_var(k, val) },
-                    None => unsafe { env::remove_var(k) },
-                }
-            }
-        }
+
+    /// The line argument is spelled per editor family, and an unknown editor
+    /// gets the bare path rather than an argument it would treat as a file.
+    #[test]
+    fn push_target_args_spells_the_line_per_editor_family() {
+        use std::ffi::OsStr;
+
+        let path = std::path::Path::new("/w/src/main.rs");
+        let args_for = |program: &str, line: Option<u32>| -> Vec<String> {
+            let mut cmd = Command::new(program);
+            push_target_args(&mut cmd, program, path, line);
+            cmd.get_args()
+                .map(OsStr::to_string_lossy)
+                .map(|s| s.into_owned())
+                .collect()
+        };
+
+        // No line: byte-identical to the historical `cmd.arg(path)`.
+        assert_eq!(args_for("vim", None), vec!["/w/src/main.rs"]);
+        assert_eq!(args_for("code", None), vec!["/w/src/main.rs"]);
+
+        // vi family, including an absolute path and a .exe suffix.
+        assert_eq!(args_for("vim", Some(12)), vec!["+12", "/w/src/main.rs"]);
+        assert_eq!(args_for("nano", Some(3)), vec!["+3", "/w/src/main.rs"]);
+        assert_eq!(
+            args_for("/usr/bin/nvim", Some(9)),
+            vec!["+9", "/w/src/main.rs"]
+        );
+        // `.exe` is stripped by `file_stem` on every platform. A backslashed
+        // Windows *path* only splits on Windows, so it is not asserted here.
+        assert_eq!(args_for("vim.exe", Some(5)), vec!["+5", "/w/src/main.rs"]);
+
+        // VS Code and forks need the flag; Zed/Sublime/JetBrains take file:line.
+        assert_eq!(
+            args_for("code", Some(42)),
+            vec!["--goto", "/w/src/main.rs:42"]
+        );
+        assert_eq!(args_for("zed", Some(42)), vec!["/w/src/main.rs:42"]);
+
+        // Unknown editor: open the right file, never an invented argument.
+        assert_eq!(args_for("my-editor", Some(42)), vec!["/w/src/main.rs"]);
     }
 
     #[test]
     fn resolve_editor_prefers_visual_over_editor() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::set_var("VISUAL", "vis-cmd");
-            env::set_var("EDITOR", "ed-cmd");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::set("VISUAL", "vis-cmd");
+        let _editor = EnvVarGuard::set("EDITOR", "ed-cmd");
         assert_eq!(resolve_editor(), "vis-cmd");
     }
 
     #[test]
     fn resolve_editor_falls_back_to_vi() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::remove_var("EDITOR");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::remove("EDITOR");
         assert_eq!(resolve_editor(), "vi");
     }
 
@@ -252,12 +439,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_editor_unchanged_when_editor_is_noop() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", "true");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", "true");
         let out = run_editor_raw("seed text").expect("editor ok");
         assert_eq!(out, EditorOutcome::Unchanged);
     }
@@ -266,12 +450,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_editor_cancelled_on_nonzero_exit() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", "false");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", "false");
         let out = run_editor_raw("seed").expect("call ok");
         assert_eq!(out, EditorOutcome::Cancelled);
     }
@@ -280,12 +461,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_editor_cancelled_when_editor_missing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", "/nonexistent/codewhale-test-editor");
-        }
+        let _lock = lock_test_env();
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", "/nonexistent/codewhale-test-editor");
         let out = run_editor_raw("seed").expect("call ok");
         assert_eq!(out, EditorOutcome::Cancelled);
     }
@@ -296,8 +474,7 @@ mod tests {
     fn run_editor_returns_edited_contents() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
+        let _lock = lock_test_env();
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("ed.sh");
         fs::write(&script, "#!/bin/sh\nprintf 'edited body' > \"$1\"\n").unwrap();
@@ -305,10 +482,8 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
 
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", script.to_string_lossy().to_string());
-        }
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", &script);
         let out = run_editor_raw("seed body").expect("editor ok");
         assert_eq!(out, EditorOutcome::Edited("edited body".to_string()));
     }
@@ -321,8 +496,7 @@ mod tests {
     fn run_editor_cleans_up_temp_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _g = EnvGuard::new(&["VISUAL", "EDITOR"]);
+        let _lock = lock_test_env();
         let dir = tempfile::tempdir().unwrap();
         let path_capture = dir.path().join("capture.txt");
         let script = dir.path().join("ed.sh");
@@ -338,10 +512,8 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
 
-        unsafe {
-            env::remove_var("VISUAL");
-            env::set_var("EDITOR", script.to_string_lossy().to_string());
-        }
+        let _visual = EnvVarGuard::remove("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", &script);
         let _ = run_editor_raw("seed").expect("editor ok");
 
         let captured = fs::read_to_string(&path_capture).expect("captured path");

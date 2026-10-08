@@ -10,7 +10,7 @@ Global key chords are not yet user-configurable — tracked for a future release
 
 | Chord                | Action                                                        |
 |----------------------|---------------------------------------------------------------|
-| `F1` or `Ctrl-/`     | Toggle the help overlay                                       |
+| `/help`, `F1` or `Ctrl-/` | Toggle the help overlay. `/help` is what the chrome advertises: it is the one route every terminal delivers, where `F1` is eaten by tmux and some emulators and `Ctrl-/` encoding varies |
 | `F2`                 | Toggle the typed Settings editor                              |
 | `F3`                 | Open the provider/model picker (same as `/provider`)          |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
@@ -27,6 +27,8 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `Ctrl-Alt-O`         | Open the whole-turn Turn Inspector, regardless of composer contents |
 | `Alt-V` / `Option-V` (macOS) | Open the details pager for the selected, visible, or most recent tool/sub-agent card; terminals that emit the legacy Option-V glyph are also handled |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | Toggle the file tree in the workbar                   |
+| `Ctrl-]` or `Ctrl-Tab` | Cycle the work dock: TODO → Agents → Jobs → Background. `Ctrl-]` is the portable chord — `Ctrl-Tab` only arrives under the kitty keyboard protocol |
+| `Ctrl-Shift-Tab`     | Cycle the work dock backwards                                  |
 | `Alt-G` / `Alt-Shift-G` | Scroll transcript to top / bottom when the composer is empty |
 | `Alt-1`-`Alt-8`      | Dispatch Hotbar slots 1-8 when no modal or inline picker is open |
 | `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` | Select the workbar panel: Tasks / Agents / Context / Files |
@@ -34,7 +36,7 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `Alt-L`              | Open the pager for the last message (composer empty)             |
 | `Alt-P` / `Alt-A` / `Alt-Y` | Jump to Plan / Work, or request Full Access (`Alt-Y` is the legacy permission channel — Work + Full Access — not a separate mode; it honors a locked approval policy) |
 | `Ctrl-X` (Activity workbar) | Cancel all running background shell jobs                  |
-| `Esc`                | Close topmost modal · cancel slash menu · dismiss toast        |
+| `Esc`                | Close topmost modal · cancel slash menu · dismiss toast. During a compact that is serving an in-flight turn, Esc stops the turn (the compact is collateral). |
 
 ## Composer
 
@@ -60,8 +62,9 @@ Editing the message you're about to send.
 | `Ctrl-Shift-U`           | Run `/update install` from the keyboard: check for and install the latest Codewhale release without leaving the TUI. Managed installs (Homebrew/npm/cargo) keep their package-manager gate; when already current the updater's "Already up to date." result is shown and nothing changes |
 | Mouse drag                  | Select composer text; click moves the cursor            |
 | `Cmd-V` / `Ctrl-Shift-V`    | Terminal-local paste (arrives as bracketed paste when supported) |
-| `Ctrl-V`                    | Direct clipboard paste in a local or forwarded graphical session |
+| `Ctrl-V`                    | Direct graphical clipboard paste; rich composer content becomes Markdown |
 | `Ctrl-Y`                    | Yank (paste) from kill buffer                           |
+| `Ctrl-X`                    | Cut the selection. The text is deleted only when a native clipboard confirmed the copy; over SSH or tmux, where only the terminal clipboard (OSC 52) takes it and never confirms, the text is copied and kept |
 | `↑` / `↓`                   | Cycle composer history (also selects popup/attachment items) |
 | `Shift-↑` / `Shift-↓`       | Browse conversation history                              |
 | `Ctrl-P` / `Ctrl-N`         | Navigate slash-command menu entries; `Ctrl-P` opens the file picker when the menu is empty |
@@ -70,6 +73,16 @@ Editing the message you're about to send.
 | `Tab`                       | Slash-command / `@`-mention completion (popup-aware)    |
 | `Ctrl-Shift-O` / `F4`       | Open the composer draft in `$VISUAL` / `$EDITOR`; F4 works when the terminal cannot distinguish Ctrl-Shift-O from Ctrl-O |
 | `! command`                 | Run a shell command through normal approval, sandbox, and output surfaces |
+
+Direct composer paste preserves headings, lists, links, tables and code from
+HTML clipboard content. Plain text stays literal, and configuration fields
+always paste literal text. SSH without a forwarded graphical display uses the
+terminal's text paste. Copying a whole answer preserves its original Markdown,
+without terminal wrapping or decorative rails; the destination app decides how
+to render it. Transcript drag selections copy the same way by default:
+Markdown source, whole cells joined with blank lines (see the Transcript
+section below), with `tui.selection_copy_markdown = false` restoring rendered
+text. Empty or oversized HTML falls back to plain text.
 
 Set `composer_multiline_mode = true` to swap the portable `Enter` and
 `Shift-Enter` behaviors: `Enter` inserts a newline and `Shift-Enter` sends.
@@ -146,22 +159,36 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 
 | Chord                | Action                                              |
 |----------------------|-----------------------------------------------------|
-| `↑` / `↓` / `j` / `k`| Scroll one line (v0.8.13+: bare arrows also scroll when composer empty) |
-| `Alt-↑` / `Alt-↓`    | Scroll transcript (alternative)                         |
+| `↑` / `↓`            | Scroll one line (bare arrows scroll when the composer is empty) |
+| `Alt-↑` / `Alt-↓`    | Scroll transcript (works with a draft in the composer)  |
 | `PgUp` / `PgDn`      | Scroll one page                                    |
-| `Home` / `g`         | Jump to top                                         |
-| `End` / `G`          | Jump to bottom                                     |
+| `Alt-G` / `Alt-Shift-G` | Jump to top / bottom                            |
 | `Ctrl-Home` / `Ctrl-End` | Jump to top / bottom (also works from the composer)  |
 | `Alt-[` / `Alt-]`    | Jump between tool output blocks                     |
 | `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds) |
 | `Esc`                | Return focus to composer                           |
-| `y`                  | Copy the focused transcript block content          |
-| `Y`                  | Copy the focused transcript block with metadata    |
+| `Ctrl-Y`             | With an empty composer, copy the focused transcript cell |
+| `Alt-V`              | Open raw detail for the focused tool or message    |
+| `Ctrl-O`             | Open reasoning detail for the focused turn         |
 | `Enter`              | Open the focused transcript block fullscreen       |
-| `r`                  | Open the focused block's raw markdown/detail view  |
 | Mouse drag           | Select transcript text in Codewhale                |
 | `Ctrl-C`             | Copy an active Codewhale selection                 |
 | `Cmd-click` (macOS) / `Ctrl-click` (Linux/Windows) | Open an OSC 8 link in a supporting terminal (terminal-owned) |
+
+Bare printable keys are never transcript shortcuts. Under TUI-DOG-002 a
+printable character always belongs to the composer — `j`, `k`, `g`, `G`, `y`,
+`Y`, `r`, `v`, and `l` type themselves in every focus state, including
+transcript selection. Earlier revisions of this table documented them as
+navigation; they were never wired, and the help catalog has a test
+(`transcript_navigation_catalog_does_not_advertise_bare_typing_keys`) that
+keeps them out.
+
+Releasing a drag selection, or pressing `Ctrl-C` with one active, copies the
+intersected cells as Markdown source by default: each selected cell is
+serialized the same way `Ctrl-Y` and `/copy` serialize it, partial
+intersections round out to whole cells, cells join with blank lines, and the
+toast names the copied cell count. Set `[tui] selection_copy_markdown = false`
+to copy the rendered text as displayed instead.
 
 For terminal-native selection, hold `Shift` while dragging (terminal support
 varies), then use the terminal's own copy command: usually `Cmd-C` on macOS or
@@ -169,6 +196,22 @@ varies), then use the terminal's own copy command: usually `Cmd-C` on macOS or
 terminal and are intentionally separate from Codewhale's `Ctrl-C` selection
 binding. Over SSH, Codewhale sends copy requests back through OSC 52, or via
 tmux's `load-buffer -w` path when running inside tmux.
+
+## Pointer (mouse)
+
+The mouse is a first-class input. Every row here is wired in
+`crates/tui/src/tui/mouse_ui.rs`.
+
+| Gesture              | Action                                              |
+|----------------------|-----------------------------------------------------|
+| Wheel up / down      | Scroll the transcript; over the composer, move the cursor a line at a time |
+| Click                | Activate the row, chip, or tool block under the pointer |
+| Drag                 | Select transcript text, or drag the scrollbar       |
+| Right click          | Act on what is under the pointer: copy, paste, open details or a `file:line` in your editor, focus or stop an agent. Letters and digits shown in the menu run their row. A stop is confirmed in place: the first Enter or click arms it, and Enter or a click after the double-click window runs it. A letter only arms it, and the second click of a double-click is ignored |
+
+Hover feedback follows the same rule: anything that responds to a click
+highlights under the pointer. A row that highlights but does nothing, or acts
+without highlighting first, is a bug worth reporting.
 
 ## Work bar (after `Alt-W` claims focus)
 
@@ -212,6 +255,39 @@ Archive (`e`) is undestructive and needs no confirmation: the session stays on
 disk and stays loadable, it just leaves the default list and stops being an
 auto-resume candidate. Press `e` again to bring it back. Delete (`d`) is the
 destructive one and keeps its confirmation.
+
+## Question sheet (`request_user_input`)
+
+When the model asks a question, a **bottom-anchored sheet** opens over the
+transcript. The conversation stays visible above it. The sheet grows with the
+question and options; if they still do not fit, it scrolls so the highlighted
+option and any typed custom response stay on screen. Resize is not required to
+reveal content.
+
+| Chord | Action |
+|-------|--------|
+| `↑` / `↓` / `k` / `j` | Move the highlight |
+| `1`–`9` | Quick-pick that option |
+| `Enter` | Confirm the highlight (or enter custom-response typing) |
+| `Space` | Toggle a multi-select option |
+| `←` / `h` | Previous question — change that answer. Esc is not back; it cancels the whole request. |
+| `Esc` | Cancel the whole question request |
+| `PageUp` / `PageDown` | Scroll the transcript while keeping the sheet open |
+| `Home` / `End` | Go to the start / latest part of the transcript |
+| `Alt+↑` / `Alt+↓` | Scroll the transcript three lines |
+| Mouse wheel above the sheet | Scroll the transcript; side work surfaces keep their own input |
+| Mouse wheel over the sheet | Browse the question content without changing the answer or highlight |
+
+While the question sheet is open, `Ctrl+↑` / `Ctrl+↓` and `Shift+↑` / `Shift+↓`
+also scroll the transcript three lines. Plain arrows continue to move the option
+highlight.
+
+After wheel browsing, option navigation or typing brings the highlighted option
+or custom-response text back into view. Transcript scroll keys work in both
+option selection and custom-response typing.
+
+**Custom response.** Every question includes an "Other" row. Enter it, type,
+then `Enter` to submit or `Esc` to return to the options without sending.
 
 ## Approval modal (when a tool requests approval)
 

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createServer } from "node:http";
 import test from "node:test";
 import {
   CodeWhaleRuntimeClient,
@@ -51,6 +53,65 @@ test("listFleetRuns calls the Runtime API with bearer auth", async () => {
   assert.equal(fetch.calls[0].url, "http://127.0.0.1:7878/v1/fleet/runs");
   assert.equal(fetch.calls[0].init.method, "GET");
   assert.equal(fetch.calls[0].init.headers.get("authorization"), "Bearer token-1");
+  assert.equal(fetch.calls[0].init.redirect, "error");
+});
+
+test("fleet event paths cannot send runtime credentials outside the configured origin", async () => {
+  const fetch = fakeFetch(() => jsonResponse({ events: [] }));
+  const client = createRuntimeClient({ baseUrl: "http://127.0.0.1:7878/", token: "fixture-token", fetch });
+  for (const path of [
+    "https://example.invalid/events", "//example.invalid/events", "\\\\example.invalid/events",
+    "http://127.0.0.1:7879/events", "https://127.0.0.1:7878/events",
+    "data:application/json,%7B%7D", "file:///tmp/events", "http://user:password@127.0.0.1:7878/events",
+  ]) {
+    await assert.rejects(client.fleetEvents("run-1", { path }).next(), /configured HTTP\(S\) origin/);
+  }
+  assert.equal(fetch.calls.length, 0, "no rejected destination reaches fetch");
+});
+
+test("fleet event paths preserve safe relative and same-origin URL semantics", async () => {
+  const fetch = fakeFetch(() => jsonResponse({ events: [] }));
+  const client = createRuntimeClient({ baseUrl: "http://127.0.0.1:7878/runtime/", token: "fixture-token", fetch });
+  for (const path of ["events", "/events", "http://127.0.0.1:7878/events", "//127.0.0.1:7878/events"]) {
+    assert.deepEqual(await client.fleetEvents("run-1", { path, after: "cursor/a", limit: 5 }).next(), { value: undefined, done: true });
+  }
+  assert.deepEqual(fetch.calls.map(({ url }) => new URL(url).pathname), ["/runtime/events", "/events", "/events", "/events"]);
+  for (const { url, init } of fetch.calls) {
+    assert.equal(new URL(url).searchParams.get("after"), "cursor/a");
+    assert.equal(new URL(url).searchParams.get("limit"), "5");
+    assert.equal(init.headers.get("authorization"), "Bearer fixture-token");
+    assert.equal(init.redirect, "error");
+  }
+});
+
+test("authenticated runtime GET and POST reject actual redirects before a second request", async (t) => {
+  const escaped = [];
+  const destination = createServer((req, res) => {
+    escaped.push({ url: req.url, authorization: req.headers.authorization });
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  destination.listen(0, "127.0.0.1");
+  await once(destination, "listening");
+  t.after(() => new Promise(resolve => { destination.close(resolve); destination.closeAllConnections(); }));
+  const received = [];
+  const source = createServer((req, res) => {
+    received.push({ method: req.method, url: req.url, authorization: req.headers.authorization });
+    if (req.url !== "/v1/fleet/runs") {
+      escaped.push({ url: req.url, authorization: req.headers.authorization });
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      return;
+    }
+    res.writeHead(307, { location: req.method === "GET" ? "/unexpected" : `http://127.0.0.1:${destination.address().port}/unexpected` }).end();
+  });
+  source.listen(0, "127.0.0.1");
+  await once(source, "listening");
+  t.after(() => new Promise(resolve => { source.close(resolve); source.closeAllConnections(); }));
+  const client = createRuntimeClient({ baseUrl: `http://127.0.0.1:${source.address().port}`, token: "fixture-token" });
+  await assert.rejects(client.listFleetRuns(), TypeError);
+  await assert.rejects(client.createFleetRun({ name: "local-only" }), TypeError);
+  assert.deepEqual(received.map(({ method }) => method), ["GET", "POST"]);
+  assert.ok(received.every(({ authorization }) => authorization === "Bearer fixture-token"));
+  assert.deepEqual(escaped, [], "neither a same-origin nor an off-origin redirect is followed");
 });
 
 test("worker and run actions use POST endpoints", async () => {

@@ -51,14 +51,39 @@ impl FleetSearchRoot {
 }
 
 /// Split `origin/name` into its parts. A bare name yields `(None, name)`.
-fn split_qualified_fleet_name(name: &str) -> (Option<&str>, &str) {
+///
+/// The bare part becomes a `<name>.toml` file name, so it is validated here
+/// with [`validate_fleet_file_stem`] before any caller touches the disk.
+pub fn split_qualified_fleet_name(name: &str) -> Result<(Option<&str>, &str), NamedFleetError> {
     let trimmed = name.trim();
-    match trimmed.split_once('/') {
+    let (origin, bare) = match trimmed.split_once('/') {
         Some((origin, bare)) if !origin.trim().is_empty() && !bare.trim().is_empty() => {
             (Some(origin.trim()), bare.trim())
         }
         _ => (None, trimmed),
+    };
+    validate_fleet_file_stem(bare)?;
+    Ok((origin, bare))
+}
+
+/// A fleet or router name is one file name inside a `fleets/`-style
+/// directory: non-empty, a single normal path component, and free of path
+/// separators, drive prefixes and NUL. Anything else is refused before a
+/// path is built from it.
+pub fn validate_fleet_file_stem(stem: &str) -> Result<(), NamedFleetError> {
+    let single_component = matches!(
+        Path::new(stem).components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    );
+    if stem.is_empty()
+        || stem == "."
+        || stem == ".."
+        || stem.contains(['/', '\\', ':', '\0'])
+        || !single_component
+    {
+        return Err(NamedFleetError::InvalidName);
     }
+    Ok(())
 }
 
 /// Parsed named fleet file.
@@ -75,6 +100,13 @@ pub struct NamedFleet {
 pub enum NamedFleetError {
     #[error("fleet file not found: {0}")]
     NotFound(String),
+    /// Carries no text from the rejected name, so the refusal cannot echo a
+    /// path back.
+    #[error(
+        "invalid fleet name: use a plain name (optionally `origin/name`) without path \
+         separators or `..`"
+    )]
+    InvalidName,
     #[error("failed to read fleet file {path}: {message}")]
     Io { path: String, message: String },
     #[error("failed to parse fleet file {path}: {message}")]
@@ -130,7 +162,11 @@ impl FleetDocument {
             Some(other) => {
                 return Err(NamedFleetError::Parse {
                     path: "<memory>".into(),
-                    message: format!("unknown fleet schema `{other}`; expected `exact`"),
+                    message: format!(
+                        "unknown fleet schema `{other}`; expected `exact` or a saved Fleet \
+                         (`schema = \"fleet\"`, loaded from `.codewhale/fleets/` or \
+                         `$CODEWHALE_HOME/fleets/`)"
+                    ),
                 });
             }
             None => FleetSchema::Legacy(parse_named_fleet(text)?),
@@ -191,7 +227,7 @@ impl FleetDocument {
         name: &str,
         search_roots: &[FleetSearchRoot],
     ) -> Result<(Self, QualifiedFleetId), NamedFleetError> {
-        let (requested_origin, bare_name) = split_qualified_fleet_name(name);
+        let (requested_origin, bare_name) = split_qualified_fleet_name(name)?;
         let file_name = format!("{bare_name}.toml");
 
         let mut candidates: Vec<(&FleetSearchRoot, PathBuf)> = Vec::new();
@@ -327,6 +363,34 @@ impl FleetDocument {
         self.source.as_deref()
     }
 
+    /// An exact document frozen from a saved v2 Fleet at Workflow start.
+    ///
+    /// `frozen_text` is the exact-schema rendering of the saved Fleet with every
+    /// route and reasoning request resolved; it goes through the same exact
+    /// parser as a hand-written file, and [`Self::source_hash`] covers those
+    /// frozen bytes — what actually runs — while [`Self::source_path`] names the
+    /// saved Fleet file it came from.
+    pub fn from_frozen_saved_fleet(
+        frozen_text: &str,
+        source: &Path,
+    ) -> Result<Self, NamedFleetError> {
+        if declared_schema_kind(frozen_text).as_deref() != Some(EXACT_FLEET_SCHEMA_KIND) {
+            return Err(NamedFleetError::Parse {
+                path: source.display().to_string(),
+                message: "a frozen saved Fleet must be in the exact schema".to_string(),
+            });
+        }
+        let mut document = Self::parse(frozen_text).map_err(|error| match error {
+            NamedFleetError::Exact { source: inner, .. } => NamedFleetError::Exact {
+                fleet: source.display().to_string(),
+                source: inner,
+            },
+            other => other,
+        })?;
+        document.source = Some(source.to_path_buf());
+        Ok(document)
+    }
+
     /// Build a document around an already-constructed exact roster.
     ///
     /// Test-only, and deliberately so: it is how a roster that never passed
@@ -353,8 +417,8 @@ pub(crate) fn content_hash(text: &str) -> String {
     sha256_label(text.as_bytes())
 }
 
-/// `sha256:<hex>` over arbitrary bytes. Mirrors the hex helper in `replay.rs`
-/// rather than relying on a digest `LowerHex` impl.
+/// `sha256:<hex>` over arbitrary bytes, written out by hand rather than
+/// relying on a digest `LowerHex` impl.
 pub(crate) fn sha256_label(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -470,6 +534,7 @@ pub fn load_named_fleet(
     name: &str,
     search_roots: &[PathBuf],
 ) -> Result<NamedFleet, NamedFleetError> {
+    validate_fleet_file_stem(name)?;
     let file_name = format!("{name}.toml");
     for root in search_roots {
         let path = root.join("fleets").join(&file_name);
@@ -560,6 +625,48 @@ release_lead = "manager"
         assert_eq!(fleet.resolve("reviewer").unwrap(), "reviewer");
         assert_eq!(fleet.resolve("test").unwrap(), "verifier");
         assert_eq!(fleet.resolve("release_lead").unwrap(), "manager");
+    }
+
+    #[test]
+    fn fleet_names_cannot_leave_the_fleets_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join("fleets")).expect("fleets dir");
+        let planted = STOPSHIP_TOML.replace("\"stopship\"", "\"outside\"");
+        // Reachable by `workspace/../../outside` and by an absolute name.
+        std::fs::write(tmp.path().join("outside.toml"), &planted).expect("outside");
+        // Reachable by a bare `../outside` from `ws/fleets`.
+        std::fs::write(ws.join("outside.toml"), &planted).expect("sibling");
+        let roots = vec![FleetSearchRoot::new("workspace", &ws)];
+        let absolute = tmp.path().join("outside");
+        let absolute = absolute.to_string_lossy();
+
+        for name in [
+            "workspace/../../outside",
+            "workspace/../outside",
+            absolute.as_ref(),
+            "workspace/sub/outside",
+            "..",
+            "",
+        ] {
+            let err = FleetDocument::load_by_name(name, &roots).expect_err(name);
+            assert!(
+                matches!(err, NamedFleetError::InvalidName),
+                "{name}: expected InvalidName, got {err:?}"
+            );
+            assert!(
+                !err.to_string()
+                    .contains(tmp.path().to_string_lossy().as_ref())
+            );
+        }
+        let err = load_named_fleet("../outside", std::slice::from_ref(&ws)).expect_err("legacy");
+        assert!(matches!(err, NamedFleetError::InvalidName), "{err:?}");
+
+        // A plain name still loads.
+        std::fs::write(ws.join("fleets").join("stopship.toml"), STOPSHIP_TOML).expect("fleet");
+        FleetDocument::load_by_name("stopship", &roots).expect("plain name");
+        FleetDocument::load_by_name("workspace/stopship", &roots).expect("qualified name");
+        load_named_fleet("stopship", std::slice::from_ref(&ws)).expect("legacy plain name");
     }
 
     #[test]
@@ -679,5 +786,37 @@ model = "glm-5-turbo"
             .join("..");
         let fleet = load_named_fleet("stopship", &[root]).expect("load workspace fleet");
         fleet.validate_stopship_roles().unwrap();
+    }
+
+    #[test]
+    fn a_frozen_saved_fleet_is_exact_and_names_its_source_file() {
+        let source = Path::new("/saved/.codewhale/fleets/release.toml");
+        let frozen = "schema = \"exact\"\nschema_revision = 1\nname = \"release\"\n\n\
+                      [[members]]\nid = \"builder\"\nrole = \"implement\"\n\
+                      provider = \"zai\"\nmodel = \"glm-5\"\nreasoning = \"high\"\n";
+        let document = FleetDocument::from_frozen_saved_fleet(frozen, source).expect("frozen");
+        assert!(document.exact().is_some());
+        assert_eq!(document.source_path(), Some(source));
+        assert_eq!(document.source_hash(), content_hash(frozen));
+
+        // Anything that is not the exact schema is refused, never parsed as a
+        // legacy role map.
+        let error = FleetDocument::from_frozen_saved_fleet(
+            "name = \"release\"\n[roles]\nimplement = \"builder\"\n",
+            source,
+        )
+        .expect_err("legacy text is not a frozen snapshot");
+        assert!(error.to_string().contains("exact schema"), "{error}");
+    }
+
+    #[test]
+    fn a_saved_fleet_schema_is_named_in_the_unknown_schema_error() {
+        let error = FleetDocument::parse("schema = \"fleet\"\nname = \"x\"\n").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("expected `exact` or a saved Fleet"),
+            "{message}"
+        );
+        assert!(message.contains(".codewhale/fleets/"), "{message}");
     }
 }

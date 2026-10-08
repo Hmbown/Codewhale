@@ -28,7 +28,7 @@
 
 use std::path::Path;
 
-use crate::models::{SystemBlock, SystemPrompt};
+use codewhale_models::{SystemBlock, SystemPrompt};
 
 /// Pager title for the preview surface.
 pub const PREVIEW_TITLE: &str = "Effective Base Prompt";

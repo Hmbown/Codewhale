@@ -1,0 +1,12 @@
+command: /cost
+is_error: false
+message:
+Session Cost:
+ ─────────────────────────────
+ Estimated total: unknown
+
+ No turn has an authoritative price in the selected currency.
+
+This is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.
+Covered: 0 of 0 money-metered turn(s) priced.
+action: <none>

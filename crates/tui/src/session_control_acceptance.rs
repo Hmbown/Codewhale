@@ -15,14 +15,14 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::models::Role;
-use crate::models::{ContentBlock, Message};
 use crate::session_manager::{
     SavedSession, SessionListFilter, SessionManager, SessionMutator,
     create_saved_session_with_id_and_mode,
 };
 use crate::session_projection::{SessionQuery, SessionSortMode, project_sessions};
 use crate::session_resume::{AutoResumeDecision, ResumeRequest, decide_auto_resume};
+use codewhale_models::Role;
+use codewhale_models::{ContentBlock, Message};
 
 /// Which issue's acceptance list a row comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,10 +561,15 @@ mod tests {
         // asserted the results matched, which proves nothing. This one drives
         // the *actual picker* — its filtering, its sort cycling, its workspace
         // scope — and compares against the API's projection of the same store.
-        let _lock = crate::test_support::lock_test_env();
+        //
+        // The store is a private directory, not `default_location()` behind a
+        // redirected `CODEWHALE_HOME`: that redirect is process-global, and a
+        // concurrent test resolving the store without the env barrier could
+        // observe it mid-test and write sessions into this fixture between the
+        // two listings (#5929). The picker is fed the same list through
+        // `new_with_sessions`, so both sides still see one store snapshot.
         let tmp = TempDir::new().expect("tempdir");
-        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
-        let manager = SessionManager::default_location().expect("manager");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
         let workspace = tmp.path().join("workspace");
         let other = tmp.path().join("other");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -580,9 +585,10 @@ mod tests {
         }
         let all = manager.list_sessions().expect("list");
 
-        let mut picker = crate::tui::session_picker::SessionPickerView::new(
+        let mut picker = crate::tui::session_picker::SessionPickerView::new_with_sessions(
             &workspace,
-            crate::localization::Locale::En,
+            codewhale_localization::Locale::En,
+            all.clone(),
         );
 
         assert_eq!(
@@ -898,7 +904,7 @@ mod tests {
             for forbidden in [
                 "reqwest",
                 "llm_client",
-                "ApiProvider",
+                "ProviderKind",
                 "http://",
                 "https://",
             ] {

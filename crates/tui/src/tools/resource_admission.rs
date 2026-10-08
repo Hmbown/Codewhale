@@ -123,22 +123,70 @@ pub(crate) fn infer_command_expense(command: &str) -> CommandExpense {
     }
 }
 
+/// Commands that run another command from their arguments. The classifier
+/// looks through them (#6560 D01-11): `sudo cargo build`, `timeout 600
+/// cargo test`, `xargs cargo check` and `bash -c "cargo build"` compile
+/// exactly like the bare command and need the same permit. This is resource
+/// admission, not a security boundary: shell policy still judges the whole
+/// command.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "sudo",
+    "doas",
+    "env",
+    "nice",
+    "nohup",
+    "time",
+    "timeout",
+    "gtimeout",
+    "xargs",
+    "command",
+    "exec",
+    "stdbuf",
+    "ionice",
+    "caffeinate",
+    "watch",
+    "eval",
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+];
+
 fn segment_is_heavy(segment: &str) -> bool {
     let tokens: Vec<String> = segment
         .split_whitespace()
-        .map(|token| token.trim_matches(['"', '\'']).to_string())
+        .map(|token| {
+            token
+                .trim_matches(['"', '\'', '(', ')', '{', '}', '`', '$'])
+                .to_string()
+        })
         .collect();
-    let Some(index) = tokens
+    let stem = |token: &str| {
+        Path::new(token)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    let Some(mut index) = tokens
         .iter()
-        .position(|token| !token.contains('=') && token != "env")
+        .position(|token| !token.is_empty() && !token.contains('=') && token != "env")
     else {
         return false;
     };
-    let executable = Path::new(&tokens[index])
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    if COMMAND_WRAPPERS.contains(&stem(&tokens[index]).as_str()) {
+        // Wrapper options and their values (`-u user`, `600`, `-n1`) sit
+        // between the wrapper and the wrapped command; take the first
+        // compiler that follows.
+        let Some(offset) = tokens[index + 1..]
+            .iter()
+            .position(|token| matches!(stem(token).as_str(), "cargo" | "rustc"))
+        else {
+            return false;
+        };
+        index += 1 + offset;
+    }
+    let executable = stem(&tokens[index]);
     if !matches!(executable.as_str(), "cargo" | "rustc") {
         return false;
     }
@@ -179,7 +227,8 @@ async fn acquire_heavy_command_permit_at(
     cancel: Option<&CancellationToken>,
     probe: &dyn MemoryProbe,
 ) -> Result<HeavyCommandPermit> {
-    std::fs::create_dir_all(root)
+    tokio::fs::create_dir_all(root)
+        .await
         .with_context(|| format!("creating resource admission directory {}", root.display()))?;
     let started = Instant::now();
 
@@ -439,6 +488,16 @@ mod tests {
             "cargo clippy --all-targets",
             "/usr/bin/rustc src/main.rs",
             "printf ok && cargo rustc -- --emit=metadata",
+            // #6560 D01-11: wrappers run the same compilation.
+            "sudo cargo build --release",
+            "sudo -u builder cargo test",
+            "timeout 600 cargo test --workspace",
+            "nice -n 10 cargo check",
+            "bash -c \"cargo build\"",
+            "sh -c 'cargo clippy --all-targets'",
+            "git ls-files | xargs cargo check",
+            "(cargo build)",
+            "env RUSTFLAGS=-Dwarnings nohup cargo build",
         ] {
             assert_eq!(
                 infer_command_expense(command),
@@ -451,6 +510,10 @@ mod tests {
             "cargo metadata",
             "git status",
             "echo cargo test",
+            "sudo cargo fmt",
+            "timeout 5 git status",
+            "bash -c \"ls\"",
+            "xargs rm",
         ] {
             assert_eq!(
                 infer_command_expense(command),

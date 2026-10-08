@@ -1,5 +1,8 @@
 # MCP (External Tool Servers)
 
+In the terminal, `/mcp` (also `/mcps`) opens **Extensions → MCP**. Enter opens the selected server’s recovery action or read-only details. An empty inventory offers server suggestions; browsing them installs nothing. Explicit subcommands such as `/mcp status`, `/mcp doctor`, `/mcp login`, and `/mcp add` retain their existing behavior.
+
+
 > 阅读简体中文版：[zh_hans/MCP.md](zh_hans/MCP.md)
 
 codewhale can load additional tools via MCP (Model Context Protocol). MCP servers can be local stdio processes that the TUI starts, or remote URL-based servers that speak Streamable HTTP with legacy SSE fallback.
@@ -15,6 +18,13 @@ Server mode note:
 - `codewhale serve --http` runs the runtime HTTP/SSE API (separate mode).
 - `codewhale mcp-server` is an equivalent stdio entrypoint on the same
   consolidated runtime.
+
+In 0.10.1, the old child-server aggregation proxy is removed. `mcp-server`
+now uses the same native tool server as `serve --mcp`; it does not launch the
+legacy `mcp.server_definitions` list. Saved definitions are left intact. Configure
+external servers in `mcp.json` for the existing MCP client, or connect to those
+servers directly from your external client. Native server write tools remain
+withheld unless the operator explicitly permits them in its server configuration.
 
 ## Setup wizard vs manual MCP setup (#3407)
 
@@ -94,6 +104,12 @@ codewhale mcp remove <name>
 codewhale mcp validate
 ```
 
+`codewhale mcp logout <name>` (and `/mcp logout`) clears locally stored
+OAuth credentials only — the provider may keep its standing grant. The next
+login forces the consent screen, so the authorized account/workspace can
+change; to sever the grant remotely, revoke the app from the provider's
+account settings.
+
 ## In-TUI Manager
 
 Inside the interactive TUI, `/mcp` opens a compact manager for the resolved
@@ -138,7 +154,7 @@ diagnostic surfaces:
 | --- | --- | --- | --- | --- |
 | Chrome DevTools | MCP server (stdio) | `npx -y chrome-devtools-mcp@1.7.0` (`npx.cmd` on Windows) | [Official ChromeDevTools project](https://github.com/ChromeDevTools/chrome-devtools-mcp) | npm may download the pinned package when the user restarts MCP. |
 | Playwright | MCP server (stdio) | `npx -y @playwright/mcp@0.0.79 --isolated` (`npx.cmd` on Windows) | [Official Microsoft project](https://github.com/microsoft/playwright-mcp) | `--isolated` starts a fresh browser profile; npm may download the pinned package only after an explicit restart. |
-| Cua Computer Use | MCP server (stdio) | `cua-driver mcp`; Driver `0.20.0` reviewed for this release | [Official Cua project](https://github.com/trycua/cua); preview integration | The signed driver and OS permissions are separate, explicit installs. `/mcp add recommended cua` only writes config and never installs or grants either. |
+| Computer Use | First-party plugin (MCP + skill) | Ships in the binary as the `computer-use` plugin | Codewhale; enable through `/plugin` or the Extensions marketplace | This is the only computer-use integration Codewhale recommends. Third-party desktop-control MCPs are not listed here. |
 | Browser Use | Skill plus separately installed Python runtime | Skill/runtime release `0.13.8` | [Official browser-use project](https://github.com/browser-use/browser-use) | Optional companion: not an MCP server. Codewhale does not auto-run the upstream Skill installer or install its browser/runtime dependencies. |
 | Anthropic Sandbox Runtime | Sandbox adapter companion | `@anthropic-ai/sandbox-runtime@0.0.73` | [Official anthropic-experimental project](https://github.com/anthropic-experimental/sandbox-runtime); beta | Documentation-only adapter candidate in v0.9.10: not an MCP server and not an active Codewhale plugin adapter. It does not replace Codewhale's sandbox policy. |
 
@@ -170,6 +186,40 @@ previous live pool intact and says so.
 Headless surfaces are the exception: the `ConfigReload` app-server request does
 **not** refresh MCP connections, so a headless runtime still needs a restart
 after MCP config changes.
+
+## Remote network authority
+
+Direct HTTP/SSE requests to public hostnames validate every DNS answer and pin
+connections to a public address. This also applies to configured servers,
+redirects, and OAuth HTTP requests. The configured network allow/deny policy
+applies to login and token refresh as well as MCP tool requests.
+
+A configured `localhost` name or private IP literal explicitly permits that
+local endpoint. For a private DNS name, opt in on the server configuration:
+
+```json
+{
+  "mcpServers": {
+    "internal": {
+      "url": "https://mcp.internal.example/mcp",
+      "allow_private_network": true
+    }
+  }
+}
+```
+
+`allow_private_network` defaults to false. This exception applies only to the
+configured origin (scheme, host, and port); it does not authorize a different
+redirect or OAuth origin. Servers added by the model during a session cannot
+use this exception, even if their configuration contains the flag.
+
+Operator-configured servers continue to honor `HTTP_PROXY`, `HTTPS_PROXY`, and
+`NO_PROXY`. When a proxy is selected for the configured origin, destination DNS
+resolution and private-network filtering are delegated to that operator-chosen
+proxy; a local DNS pin cannot constrain a proxy's own resolution. A `NO_PROXY`
+match uses the direct guarded connection instead. Model-added servers,
+reviewed plugin remotes, and secondary redirect/OAuth origins do not inherit
+ambient proxy authority.
 
 ## Remote HTTP Auth
 
@@ -335,8 +385,8 @@ The CLI also exposes helper tools when MCP is enabled:
 ```json
 {
   "timeouts": {
-    "connect_timeout": 10,
-    "execute_timeout": 60,
+    "connect_timeout": 30,
+    "execute_timeout": 1800,
     "read_timeout": 120
   },
   "servers": {
@@ -429,6 +479,33 @@ codewhale mcp validate
 codewhale mcp tools codewhale
 ```
 
+## Connection Lifecycle
+
+Session boot is lazy (#6033): a configured server is not spawned until
+something asks for it — a turn whose `allowed_tools`/`tools.always_load`
+selection covers its `mcp_<server>_*` names, a model call that resolves to
+one of its tools, or an explicit `/mcp retry <name>`. Servers marked
+`required` still connect eagerly at boot so their failure surfaces before the
+first turn. A configured-but-unstarted server shows as `configured`, never
+`connecting`; the connecting label only describes handshakes actually in
+flight.
+
+An MCP-focused `tool_search` is also explicit discovery intent: search a
+configured server name (for example `engram`), an exact `mcp_<server>_...`
+name, or use `{"query":"mcp_.*","match":"regex"}`. The current turn's
+allow/deny ceiling filters the configured servers before a batch of at most
+eight connects; the existing five-second wait and cancellation remain in
+force. General searches do not boot all optional servers. Only actual
+`tools/list` schemas enter the deferred catalogue; failed, disabled, or
+revoked servers do not acquire fabricated tools. Narrow a broad search by
+server name when more than eight configured servers match.
+
+`codewhale mcp connect`, `validate`, and `tools` inspect their own process's
+pool. They do not attach transports to a running TUI or exec session. Use
+in-session discovery or explicit tool selection. In the TUI,
+`/mcp retry <name>` connects through the current session's pool;
+`/mcp reload` re-reads its MCP configuration.
+
 ## Server Fields
 
 Per-server settings:
@@ -436,13 +513,19 @@ Per-server settings:
 - `command` (string, required)
 - `args` (array of strings, optional)
 - `env` (object, optional)
-- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional)
+- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional). A per-server value overrides the global `timeouts` block, and each budget is independent of the others:
+  - `connect_timeout` (default 30) covers spawn, `initialize` and the first `tools/list`, so a cold `uvx`/`npx` package download counts against it.
+  - `execute_timeout` (default 1800) is the budget for each `tools/call` and `prompts/get`. An explicit shorter value is respected, and `read_timeout` never cuts a running tool short.
+  - `read_timeout` (default 120) bounds each reply wait during the handshake and tool discovery, and is the budget for `resources/read`.
+  - A request that runs out of budget fails with a timeout. The connection is kept, and a reply that arrives later is discarded instead of being handed to another call. Interrupting the turn stops the wait at once, but Codewhale does not send `notifications/cancelled` yet, so a server that handles one request at a time finishes the abandoned call before it answers the next one.
+  - Streamable HTTP servers return the reply inside the POST itself; the request's own budget bounds that POST too. A request that expires while still sending closes the connection, which is rebuilt before the next call.
 - `disabled` (bool, optional)
 - `enabled` (bool, optional, default `true`)
 - `required` (bool, optional): startup/connect validation fails if this server cannot initialize.
 - `enabled_tools` (array, optional): allowlist of tool names for this server.
 - `disabled_tools` (array, optional): denylist applied after `enabled_tools`.
 - `url` (string, optional): Streamable HTTP endpoint for a remote MCP server.
+- `allow_private_network` (boolean, default false): operator opt-in for private DNS addresses on this configured origin; ignored for model-added servers.
 - `transport` (string, optional): set to `"sse"` for legacy SSE endpoints.
 - `headers` (object, optional): literal HTTP headers for URL-based servers.
 - `env_headers` or `env_http_headers` (object, optional): header names mapped to environment variable names.

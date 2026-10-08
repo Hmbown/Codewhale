@@ -1,5 +1,7 @@
 # Workroom Architecture
 
+> 阅读简体中文版：[zh_hans/WORKROOM_ARCHITECTURE.md](zh_hans/WORKROOM_ARCHITECTURE.md)。
+
 ## Purpose
 
 Workrooms are Codewhale's chat-native abstraction for durable, addressable

@@ -1,0 +1,17 @@
+command: /cache stats
+is_error: false
+message:
+Cache Stats
+
+── Prefix Stability
+  Stability: unknown (no checks recorded yet)
+  Run a turn first to collect prefix stability data.
+
+── Prefix Fingerprint
+  Pinned hash: unavailable
+  Run a turn first, or use /cache inspect.
+
+── Cache Hit Rate
+  No turn telemetry recorded yet.
+
+action: <none>

@@ -131,6 +131,18 @@ pub fn lane_registry_root() -> Result<PathBuf> {
     Ok(codewhale_config::codewhale_home()?.join(LANES_SUBDIR))
 }
 
+/// A lane id names files under the registry root, so it must be a plain
+/// name: ASCII letters, digits, `-` and `_` only.
+fn checked_lane_id(id: &str) -> Result<()> {
+    let plain = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    anyhow::ensure!(plain, "invalid lane id {id:?}");
+    Ok(())
+}
+
 /// Persist and load lane records.
 #[derive(Debug, Clone)]
 pub struct LaneRegistry {
@@ -170,15 +182,39 @@ impl LaneRegistry {
     }
 
     pub fn save(&self, record: &LaneRecord) -> Result<()> {
+        checked_lane_id(&record.id)?;
         let path = self.record_path(&record.id);
         let json = serde_json::to_string_pretty(record).context("serialize lane record")?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+        // A fresh, exclusively created temporary: a predictable name could be
+        // pre-placed as a link and written through.
+        let tmp = self.root.join(format!(
+            ".{}.{}.{}.tmp",
+            record.id,
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("write {}", tmp.display()));
+        }
+        if let Err(error) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("rename {}", path.display()));
+        }
         Ok(())
     }
 
     pub fn load(&self, id: &str) -> Result<LaneRecord> {
+        checked_lane_id(id)?;
         let path = self.record_path(id);
         let text = fs::read_to_string(&path)
             .with_context(|| format!("read lane record {}", path.display()))?;
@@ -569,5 +605,47 @@ mod tests {
         let loaded = reg.load(&record.id).unwrap();
         assert_eq!(loaded.status, LaneStatus::Running);
         assert_eq!(loaded.lifecycle_seq, 2);
+    }
+
+    #[test]
+    fn ids_that_are_not_plain_names_are_refused() {
+        let dir = tempdir().unwrap();
+        let reg = LaneRegistry::open(dir.path().join("lanes")).unwrap();
+        std::fs::write(dir.path().join("outside.json"), "{}").unwrap();
+
+        for id in ["../outside", "a/b", "", "lane 1", "lane.json"] {
+            assert!(reg.load(id).is_err(), "{id:?} must be refused");
+        }
+        let mut record = reg
+            .create_pending(None, None, None, None, RuntimeBackendKind::Tmux, None)
+            .unwrap();
+        record.id = "../outside".into();
+        assert!(reg.save(&record).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("outside.json")).unwrap(),
+            "{}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_write_through_a_planted_temporary_link() {
+        let dir = tempdir().unwrap();
+        let reg = LaneRegistry::open(dir.path().join("lanes")).unwrap();
+        let record = reg
+            .create_pending(None, None, None, None, RuntimeBackendKind::Tmux, None)
+            .unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            reg.record_path(&record.id).with_extension("json.tmp"),
+        )
+        .unwrap();
+
+        reg.save(&record).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(reg.load(&record.id).unwrap().id, record.id);
     }
 }

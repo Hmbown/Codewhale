@@ -15,15 +15,19 @@
 //! exact reqwest decode failure from the bench artifacts.
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+#[path = "../support/qa_harness/mod.rs"]
+mod qa_harness;
 
 const MODEL: &str = "stream-drop-test";
 /// The server claims a body far larger than it delivers on a "drop" response,
@@ -35,7 +39,7 @@ const CLAIMED_DROP_BODY_LEN: usize = 1_048_576;
 async fn headless_exec_recovers_from_mid_stream_drop() {
     let workspace = TempDir::new().expect("workspace");
     let home = TempDir::new().expect("home");
-    let (base_url, chat_posts, _server) = start_flaky_server(1).await;
+    let (base_url, chat_posts, _requests, _server) = start_flaky_server(1, Duration::ZERO).await;
 
     let output = run_exec(workspace.path(), home.path(), &base_url);
 
@@ -73,7 +77,8 @@ async fn headless_exec_exits_ex_tempfail_after_drop_budget_exhausted() {
     let home = TempDir::new().expect("home");
     // More drops than the engine can consume: initial attempt +
     // MAX_STREAM_RETRIES (3) resumes, then the turn must fail.
-    let (base_url, chat_posts, _server) = start_flaky_server(usize::MAX).await;
+    let (base_url, chat_posts, _requests, _server) =
+        start_flaky_server(usize::MAX, Duration::ZERO).await;
 
     let output = run_exec(workspace.path(), home.path(), &base_url);
 
@@ -116,6 +121,209 @@ async fn headless_exec_exits_ex_tempfail_after_drop_budget_exhausted() {
     );
 }
 
+/// #5769's later report: the NEXT manually submitted turn, with no approval,
+/// must reach the real dispatcher and survive its UI watchdog after a loss.
+#[cfg(all(unix, feature = "long-running-tests"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_next_manual_turn_completes_after_exhausted_partial_sse_drop() {
+    use qa_harness::harness::{Harness, make_sealed_workspace};
+
+    const FIRST: &str = "R4_FIRST_MANUAL";
+    const SECOND: &str = "R4_NEXT_MANUAL";
+    // Deliberately cross the current 30-second dispatch watchdog using wall
+    // time. The request is admitted, but its HTTP response is still pending.
+    const HEALTHY_RESPONSE_DELAY: Duration = Duration::from_secs(35);
+    const WAIT: Duration = Duration::from_secs(60);
+    let workspace = make_sealed_workspace().expect("sealed workspace");
+    let (base_url, chat_posts, requests, server) =
+        start_flaky_server(4, HEALTHY_RESPONSE_DELAY).await;
+    let outbox = workspace.home().join("turn-receipts.jsonl");
+    std::fs::write(workspace.home().join(".codewhale/.onboarded"), "").expect("onboarding receipt");
+    let trust = workspace.workspace().join(".deepseek");
+    std::fs::create_dir_all(&trust).expect("trust directory");
+    std::fs::write(trust.join("trusted"), "").expect("workspace trust");
+    let config = format!(
+        r#"provider = "loopback"
+prompt_suggestion = false
+allow_shell = false
+[providers.loopback]
+kind = "openai-compatible"
+base_url = {base_url}
+api_key = "synthetic-loopback-key"
+model = "{MODEL}"
+[retry]
+enabled = false
+[notifications]
+method = "off"
+completion_sound = "off"
+[lifecycle_outbox]
+path = {outbox}
+"#,
+        base_url = json!(base_url),
+        outbox = json!(outbox),
+    );
+    std::fs::write(workspace.home().join(".codewhale/config.toml"), config)
+        .expect("loopback TUI configuration");
+    let mut tui = Harness::builder(Harness::codewhale_binary())
+        .cwd(workspace.workspace())
+        .clear_env()
+        .seal_home(workspace.home())
+        .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
+        .env("CODEWHALE_NO_UPDATE_CHECK", "1")
+        .env("CODEWHALE_TELEMETRY", "0")
+        .env("NO_ANIMATIONS", "1")
+        .args([
+            "--workspace",
+            workspace.workspace().to_str().expect("workspace UTF-8"),
+            "--no-project-config",
+            "--fresh",
+        ])
+        .size(40, 120)
+        .spawn()
+        .expect("start the real TUI");
+    let pid = tui.pid().expect("TUI PID");
+    tui.wait_for_text("Type a message", WAIT)
+        .expect("ready composer");
+    tui.type_line(FIRST).expect("first manual submission");
+    wait_for_tui_turn_ends(&mut tui, &outbox, 1, WAIT);
+    let first_events = read_tui_outbox(&outbox);
+    let first = first_events
+        .iter()
+        .find(|event| event["event"] == "turn_end")
+        .expect("first terminal UI receipt");
+    assert_eq!(first["kind"], "turn.failed", "{first:#}");
+    assert!(
+        first["payload"]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("Provider stream connection dropped")),
+        "the first UI turn must exhaust an actual partial SSE loss: {first:#}"
+    );
+    // The lifecycle outbox contains a bounded user-facing error, not the
+    // underlying reqwest chain. The server's partial SSE body and the exact
+    // request count prove the real transport loss and exhausted retry budget.
+    assert_eq!(chat_posts.load(Ordering::SeqCst), 4);
+
+    // No restart, continuation, event injection, approval answer, or queue
+    // admission: type into the same running composer after its failed receipt.
+    let submitted = std::time::Instant::now();
+    tui.type_line(SECOND).expect("next manual submission");
+    wait_for_tui_turn_ends(&mut tui, &outbox, 2, WAIT);
+    assert!(submitted.elapsed() >= HEALTHY_RESPONSE_DELAY);
+    tui.wait_for_text("recovered after retry", WAIT)
+        .expect("second answer reaches the actual UI");
+    // Completion is proved by the lifecycle receipt below. The composer
+    // intentionally omits the old transient "turn completed" chrome; prove
+    // that the actual UI is ready and still accepts an unsent edit instead.
+    tui.wait_for(
+        |frame| frame.contains("recovered after retry") && frame.contains("Type a message"),
+        WAIT,
+    )
+    .expect("completed answer and ready composer reach the actual UI");
+    const UNSENT: &str = "R4_UNSENT_RECOVERY_CHECK";
+    tui.paste(UNSENT).expect("edit the recovered composer");
+    tui.wait_for(|frame| frame.row(frame.cursor().0).contains(UNSENT), WAIT)
+        .expect("the same composer remains editable after completion");
+    assert_eq!(tui.pid(), Some(pid));
+    let events = read_tui_outbox(&outbox);
+    let starts = events
+        .iter()
+        .filter(|event| event["event"] == "turn_start")
+        .collect::<Vec<_>>();
+    let ends = events
+        .iter()
+        .filter(|event| event["event"] == "turn_end")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2, "two real TUI dispatches: {events:#?}");
+    assert_eq!(ends.len(), 2, "two real TUI completions: {events:#?}");
+    assert_eq!(ends[1]["kind"], "turn.completed");
+    assert!(ends[1]["payload"]["error"].is_null());
+    let session = ends[0]["thread_id"].as_str().expect("TUI session identity");
+    assert!(!session.is_empty());
+    assert!(
+        starts
+            .iter()
+            .chain(&ends)
+            .all(|event| event["thread_id"] == session)
+    );
+    assert!(ends.iter().all(|event| event["turn_id"].is_string()));
+    assert_ne!(ends[0]["turn_id"], ends[1]["turn_id"]);
+    assert!(events.iter().all(|event| {
+        !event["event"].as_str().unwrap().contains("approval")
+            && !event["event"].as_str().unwrap().contains("user_input")
+    }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5, "four failed attempts then one new turn");
+    let final_messages = requests.last().unwrap()["messages"].as_array().unwrap();
+    let users = final_messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 2, "no synthetic continuation user turns");
+    assert!(users[0]["content"].to_string().contains(FIRST));
+    assert!(users[1]["content"].to_string().contains(SECOND));
+    assert!(
+        final_messages
+            .iter()
+            .all(|message| message["role"] != "tool")
+    );
+    assert!(requests.iter().all(|request| request["stream"] == true));
+    drop(requests);
+    tui.shutdown();
+    server.abort();
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn read_tui_outbox(path: &Path) -> Vec<Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("read TUI lifecycle receipt: {error}"),
+    };
+    // A concurrent append can expose an unfinished last line. Only complete
+    // records count as receipts; a malformed complete record is a failure.
+    text.split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .map(|line| serde_json::from_str(line).expect("complete TUI outbox record"))
+        .collect()
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn wait_for_tui_turn_ends(
+    tui: &mut qa_harness::harness::Harness,
+    outbox: &Path,
+    count: usize,
+    timeout: Duration,
+) {
+    tui.wait_for(
+        |frame| {
+            for unexpected in [
+                "Turn dispatch timed out",
+                "engine may have stopped",
+                "Approval required",
+                "engine session id diverged",
+            ] {
+                assert!(
+                    !frame.contains(unexpected),
+                    "{unexpected}: {}",
+                    frame.text()
+                );
+            }
+            read_tui_outbox(outbox)
+                .iter()
+                .filter(|event| event["event"] == "turn_end")
+                .count()
+                >= count
+        },
+        timeout,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "UI did not finish turn {count}: {error}\n{}",
+            tui.diagnostics()
+        )
+    });
+}
+
 /// Extract the terminal `metadata` event from the stream-json stdout.
 fn terminal_metadata(stdout: &str) -> Value {
     let line = stdout
@@ -132,13 +340,21 @@ fn terminal_metadata(stdout: &str) -> Value {
 /// and a counter of chat-completion POSTs.
 async fn start_flaky_server(
     drops: usize,
-) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    healthy_response_delay: Duration,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind flaky server");
     let addr = listener.local_addr().expect("flaky server addr");
     let chat_posts = Arc::new(AtomicUsize::new(0));
     let server_posts = Arc::clone(&chat_posts);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
     let task = tokio::spawn(async move {
         loop {
             let (mut socket, _) = match listener.accept().await {
@@ -161,6 +377,11 @@ async fn start_flaky_server(
                 .await;
                 continue;
             }
+            let body = request.split_once("\r\n\r\n").expect("request body").1;
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(body).expect("chat request JSON"));
             let call = server_posts.fetch_add(1, Ordering::SeqCst) + 1;
             if call <= drops {
                 // Partial SSE (one real content chunk), then the socket
@@ -174,6 +395,7 @@ async fn start_flaky_server(
                 );
                 write_all(&mut socket, &format!("{head}{partial}")).await;
             } else {
+                tokio::time::sleep(healthy_response_delay).await;
                 let body = [
                     sse_chunk(json!({"id":"final","object":"chat.completion.chunk","model":MODEL,"choices":[{"index":0,"delta":{"content":"recovered after retry"},"finish_reason":null}]})),
                     sse_chunk(json!({"id":"final","object":"chat.completion.chunk","model":MODEL,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":2,"total_tokens":22}})),
@@ -184,7 +406,7 @@ async fn start_flaky_server(
             }
         }
     });
-    (format!("http://{addr}/v1"), chat_posts, task)
+    (format!("http://{addr}/v1"), chat_posts, requests, task)
 }
 
 /// Read one HTTP request (headers plus the content-length body, when any).
@@ -214,14 +436,19 @@ async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<String>
                 .and_then(|value| value.trim().parse::<usize>().ok())
         })
         .unwrap_or(0);
-    while buffer.len() < header_end + content_length {
+    let request_len = header_end.checked_add(content_length)?;
+    if request_len > 1 << 20 {
+        return None;
+    }
+    while buffer.len() < request_len {
         let read = socket.read(&mut chunk).await.ok()?;
         if read == 0 {
-            break;
+            return None;
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
-    Some(headers)
+    buffer.truncate(request_len);
+    String::from_utf8(buffer).ok()
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -258,7 +485,7 @@ fn run_exec(workspace: &Path, home: &Path, base_url: &str) -> std::process::Outp
         "allow_shell = true\n\n[retry]\nenabled = false\n",
     )
     .expect("headless test config");
-    let mut command = Command::new(binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace)
@@ -289,14 +516,6 @@ fn run_exec(workspace: &Path, home: &Path, base_url: &str) -> std::process::Outp
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     run_with_timeout(command, Duration::from_secs(45))
-}
-
-fn binary() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_codewhale-tui")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/codewhale-tui")
-        })
 }
 
 fn preserve_host_env(command: &mut Command) {

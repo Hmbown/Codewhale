@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "dirty-dispose",
+  "version": "0.1.0",
+  "description": "Test fixture: an asynchronous disposer that never finishes.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": { "path": "index.mjs" }
+    }
+  }
+}

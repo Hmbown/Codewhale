@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::ProviderKind;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -36,6 +38,37 @@ use super::roster::FleetRoster;
 pub const FLEET_SCHEMA_KIND: &str = "fleet";
 pub const FLEET_SCHEMA_REVISION: u32 = 2;
 const MAX_MEMBER_DISPLAY_NAME_CHARS: usize = 80;
+const MAX_FLEET_NAME_CHARS: usize = 120;
+const MAX_MEMBER_ID_CHARS: usize = 64;
+const MAX_MEMBER_ROLE_CHARS: usize = 80;
+const MAX_ROUTE_FIELD_CHARS: usize = 256;
+const MAX_MEMBER_INSTRUCTIONS_CHARS: usize = 32 * 1024;
+const MAX_FLEET_DESCRIPTION_CHARS: usize = 32 * 1024;
+
+/// A value that reaches selectors, receipts, and terminal rendering: printable
+/// and bounded. `multiline` admits newlines and tabs (instruction overlays)
+/// but no other control characters.
+fn validate_text(
+    what: &str,
+    value: &str,
+    max_chars: usize,
+    multiline: bool,
+) -> Result<(), FleetStoreError> {
+    let printable = value
+        .chars()
+        .all(|ch| !ch.is_control() || (multiline && matches!(ch, '\n' | '\r' | '\t')));
+    if !printable || value.chars().count() > max_chars {
+        return Err(FleetStoreError::Invalid(format!(
+            "{what} must be printable {} no longer than {max_chars} characters",
+            if multiline {
+                "text"
+            } else {
+                "single-line text"
+            }
+        )));
+    }
+    Ok(())
+}
 
 /// The directory name used by both roots (next to `agents/` for legacy
 /// profiles). Also used by the workflow crate for its own legacy/exact files;
@@ -132,7 +165,11 @@ pub struct FleetMember {
     /// to deserialize unchanged.
     #[serde(default, alias = "name", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Role label; defaults to `id` when absent.
+    /// A role-less model choice, not an executable roster member. Omitted
+    /// in legacy files, whose role/id interpretation stays unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shortlist: bool,
+    /// Role label; defaults to `id` when absent on a non-shortlist member.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub role: String,
     /// Exact model pin. Absent with `provider` absent = inherit the session
@@ -155,6 +192,54 @@ pub struct FleetMember {
     /// [`MemberCapability::VOCABULARY`] at parse.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
+}
+
+impl FleetMember {
+    /// The role this member fills: `role`, or `id` when the document left
+    /// the role field off. A shortlisted model has no role.
+    #[must_use]
+    pub fn role_label(&self) -> &str {
+        if self.shortlist {
+            return "";
+        }
+        let role = self.role.trim();
+        if role.is_empty() {
+            self.id.trim()
+        } else {
+            role
+        }
+    }
+
+    /// A row that was a model pin promoted to a member: no role, and an id
+    /// that is just the model's slug. Such rows are not members.
+    #[must_use]
+    pub fn is_bare_model_pin(&self) -> bool {
+        !self.shortlist
+            && self.role.trim().is_empty()
+            && self
+                .model
+                .as_deref()
+                .is_some_and(|model| self.id.trim().starts_with(slugify(model).as_str()))
+    }
+}
+
+/// Provider kinds have documented aliases; named custom routes have exact
+/// keys. Treating every provider name as case-insensitive merges distinct
+/// endpoints before the configured route binder can resolve them.
+pub(crate) fn provider_ids_match(saved: &str, requested: &str) -> bool {
+    saved.trim() == requested.trim()
+        || ProviderKind::parse(saved)
+            .filter(|provider| *provider != ProviderKind::Custom)
+            .is_some_and(|provider| Some(provider) == ProviderKind::parse(requested))
+}
+
+/// The member pins exactly `provider`/`model`.
+pub(crate) fn member_pins(member: &FleetMember, provider: &str, model: &str) -> bool {
+    member
+        .provider
+        .as_deref()
+        .is_some_and(|p| provider_ids_match(p, provider))
+        && member.model.as_deref().is_some_and(|id| id == model)
 }
 
 /// The saved named Fleet document (compatibility `schema = "fleet"`, revision 2).
@@ -232,6 +317,35 @@ impl FleetFile {
                 "fleet name must not be empty".to_string(),
             ));
         }
+        // The stored name, not its trimmed view: a control character before
+        // or after the name reaches selectors and terminal rendering too.
+        validate_text("fleet name", &self.name, MAX_FLEET_NAME_CHARS, false)?;
+        if let Some(description) = self.description.as_deref() {
+            validate_text(
+                "fleet description",
+                description,
+                MAX_FLEET_DESCRIPTION_CHARS,
+                true,
+            )?;
+        }
+        // The operator route flows into every inheriting member's route, so
+        // it is bounded exactly like a member's pin.
+        if let Some(operator) = &self.operator {
+            for (field, value) in [
+                ("provider", Some(operator.provider.as_str())),
+                ("model", Some(operator.model.as_str())),
+                ("reasoning", operator.reasoning.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    validate_text(
+                        &format!("operator {field}"),
+                        value,
+                        MAX_ROUTE_FIELD_CHARS,
+                        false,
+                    )?;
+                }
+            }
+        }
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for member in &self.members {
             let member_id = member.id.trim();
@@ -239,6 +353,56 @@ impl FleetFile {
                 return Err(FleetStoreError::Invalid(
                     "member id must not be empty".to_string(),
                 ));
+            }
+            // The id is dispatch identity: exact, not merely equal once trimmed.
+            if member_id != member.id {
+                return Err(FleetStoreError::Invalid(format!(
+                    "member id {:?} must not carry leading or trailing whitespace",
+                    member.id
+                )));
+            }
+            validate_text("member id", member_id, MAX_MEMBER_ID_CHARS, false)?;
+            let fields = [
+                (
+                    "role",
+                    Some(member.role.as_str()),
+                    MAX_MEMBER_ROLE_CHARS,
+                    false,
+                ),
+                (
+                    "provider",
+                    member.provider.as_deref(),
+                    MAX_ROUTE_FIELD_CHARS,
+                    false,
+                ),
+                (
+                    "model",
+                    member.model.as_deref(),
+                    MAX_ROUTE_FIELD_CHARS,
+                    false,
+                ),
+                (
+                    "reasoning",
+                    member.reasoning.as_deref(),
+                    MAX_ROUTE_FIELD_CHARS,
+                    false,
+                ),
+                (
+                    "instructions",
+                    member.instructions.as_deref(),
+                    MAX_MEMBER_INSTRUCTIONS_CHARS,
+                    true,
+                ),
+            ];
+            for (field, value, max_chars, multiline) in fields {
+                if let Some(value) = value {
+                    validate_text(
+                        &format!("member `{member_id}` {field}"),
+                        value,
+                        max_chars,
+                        multiline,
+                    )?;
+                }
             }
             let member_key = member_id.to_ascii_lowercase();
             if let Some(existing) = seen.insert(member_key, member.id.clone()) {
@@ -279,6 +443,38 @@ impl FleetFile {
                 }
                 _ => {}
             }
+            if member.shortlist
+                && (!member.role.trim().is_empty()
+                    || member
+                        .provider
+                        .as_deref()
+                        .is_none_or(|id| id.trim().is_empty())
+                    || member
+                        .model
+                        .as_deref()
+                        .is_none_or(|id| id.trim().is_empty()))
+            {
+                return Err(FleetStoreError::Invalid(format!(
+                    "shortlisted member `{}` must have no role and pin both provider and model",
+                    member.id,
+                )));
+            }
+            if member.shortlist
+                && (member
+                    .reasoning
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || member
+                        .instructions
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    || !member.requires.is_empty())
+            {
+                return Err(FleetStoreError::Invalid(format!(
+                    "shortlisted member `{}` cannot set role reasoning, instructions, or capability requirements",
+                    member.id,
+                )));
+            }
             for requirement in &member.requires {
                 if MemberCapability::parse(requirement).is_none() {
                     return Err(FleetStoreError::Invalid(format!(
@@ -302,8 +498,26 @@ impl FleetFile {
 
     /// Parse a v2 fleet document from TOML text.
     pub fn parse(text: &str) -> Result<Self, FleetStoreError> {
-        let fleet: Self = toml::from_str(text)
+        let mut fleet: Self = toml::from_str(text)
             .map_err(|e| FleetStoreError::Invalid(format!("invalid fleet TOML: {e}")))?;
+        // Compat (0.9.12): every model the user ever selected was enrolled
+        // as a role-less member with a slug id. Roles are the members; drop
+        // those rows on read so the roster reads as roles again. The next
+        // save writes the clean document.
+        fleet.members.retain(|member| !member.is_bare_model_pin());
+        // #6037: a member pinned to the fleet's own operator route resolves
+        // to that route either way; the pin only stops it following when the
+        // operator moves (a vendor retiring the id, an operator switching
+        // models). Read the redundant pin as the inheritance it always meant.
+        // Shortlist rows keep their pin — it is their entire content.
+        if let Some(operator) = &fleet.operator {
+            for member in &mut fleet.members {
+                if !member.shortlist && member_pins(member, &operator.provider, &operator.model) {
+                    member.provider = None;
+                    member.model = None;
+                }
+            }
+        }
         fleet.validate()?;
         Ok(fleet)
     }
@@ -315,13 +529,14 @@ impl FleetFile {
         slugify(&self.name)
     }
 
-    /// Look up a member by role id.
+    /// Look up an executable member by role id. Shortlisted model ids never
+    /// select a role, even when they happen to match one.
     #[must_use]
     pub fn member(&self, id: &str) -> Option<&FleetMember> {
         let id = id.trim();
         self.members
             .iter()
-            .find(|member| member.id.trim().eq_ignore_ascii_case(id))
+            .find(|member| !member.shortlist && member.id.trim().eq_ignore_ascii_case(id))
     }
 
     /// Whether the roster contains a scout member (the fast exploratory role).
@@ -375,6 +590,10 @@ pub struct SelectedFleet {
 }
 
 fn personal_fleets_dir() -> Result<PathBuf, FleetStoreError> {
+    #[cfg(test)]
+    if !crate::test_support::guarded_environment_provides_state_paths() {
+        return Ok(crate::test_support::unsealed_test_state_root().join(FLEET_DIR));
+    }
     codewhale_config::codewhale_home()
         .map(|home| home.join(FLEET_DIR))
         .map_err(|e| FleetStoreError::Io {
@@ -393,11 +612,29 @@ fn ensure_fleets_dir(scope: FleetScope, workspace: &Path) -> Result<PathBuf, Fle
         FleetScope::Personal => personal_fleets_dir()?,
         FleetScope::Workspace => workspace_fleets_dir(workspace),
     };
+    reject_linked_workspace_dir(scope, workspace, &dir)?;
     fs::create_dir_all(&dir).map_err(|e| FleetStoreError::Io {
         path: dir.display().to_string(),
         message: e.to_string(),
     })?;
     Ok(dir)
+}
+
+/// A workspace's `.codewhale/fleets` is repository content: refuse it when it,
+/// or `.codewhale`, is a link, so saving, selecting or deleting a Fleet cannot
+/// reach outside the workspace. The personal directory is the user's own.
+fn reject_linked_workspace_dir(
+    scope: FleetScope,
+    workspace: &Path,
+    dir: &Path,
+) -> Result<(), FleetStoreError> {
+    if scope != FleetScope::Workspace {
+        return Ok(());
+    }
+    super::files::reject_linked_path(workspace, dir).map_err(|e| FleetStoreError::Io {
+        path: dir.display().to_string(),
+        message: e.to_string(),
+    })
 }
 
 /// List every named Fleet across both scopes, personal first. A file that is
@@ -470,11 +707,50 @@ fn collect_entries(dir: &Path, scope: FleetScope, out: &mut Vec<FleetEntry>) {
     }
 }
 
+/// Every v2 Fleet file that answers to `name`, personal first.
+///
+/// Only files that declare `schema = "fleet"` count. The personal `fleets/`
+/// directory is shared with the workflow crate's legacy/exact files, and a
+/// file in another schema is a different Fleet form, not a v2 Fleet that
+/// failed to parse — the caller that owns that form reports on it.
+pub(crate) fn v2_fleet_candidates(name: &str, workspace: &Path) -> Vec<(FleetScope, PathBuf)> {
+    let file_name = format!("{}.toml", slugify(name.trim()));
+    let mut found = Vec::new();
+    let personal = personal_fleets_dir().ok().map(|dir| dir.join(&file_name));
+    let workspace = Some(workspace_fleets_dir(workspace).join(&file_name));
+    for (scope, path) in [
+        (FleetScope::Personal, personal),
+        (FleetScope::Workspace, workspace),
+    ] {
+        if let Some(path) = path
+            && path.is_file()
+            && declares_v2_schema(&path)
+        {
+            found.push((scope, path));
+        }
+    }
+    found
+}
+
+/// The `schema` a Fleet file declares, normalized to lowercase. `None` when
+/// the file cannot be read; `Some(None)` when it is readable but declares no
+/// schema (or is not valid TOML).
+pub(crate) fn read_declared_schema(path: &Path) -> Option<Option<String>> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| codewhale_workflow::fleet_exact::declared_schema_kind(&text))
+}
+
+/// Whether a file declares the v2 `schema = "fleet"`. Unreadable or
+/// malformed TOML is not a v2 declaration.
+pub(crate) fn declares_v2_schema(path: &Path) -> bool {
+    read_declared_schema(path).flatten().as_deref() == Some(FLEET_SCHEMA_KIND)
+}
+
 /// Load a v2 Fleet by name. Ambiguity between the two scopes is an error that
-/// names both origins — the caller (UI) resolves it by asking for a scope.
-/// (Kept for the qualified-name flow and the ambiguity tests; the list/detail
-/// UI resolves by scope via load_fleet_in_scope.)
-#[allow(dead_code)]
+/// names both origins — the caller resolves it by asking for a scope. A file
+/// under the same name in another schema (legacy/exact) is not a v2 hit.
+/// Used by `workflow(fleet:)` through `fleet::exact::load_fleet_document`.
 pub fn load_fleet(
     name: &str,
     workspace: &Path,
@@ -483,17 +759,7 @@ pub fn load_fleet(
     if name.is_empty() {
         return Err(FleetStoreError::NotFound("<empty name>".to_string()));
     }
-    let mut found: Vec<(FleetScope, PathBuf)> = Vec::new();
-    if let Ok(dir) = personal_fleets_dir() {
-        let path = dir.join(format!("{}.toml", slugify(name)));
-        if path.is_file() {
-            found.push((FleetScope::Personal, path));
-        }
-    }
-    let ws_path = workspace_fleets_dir(workspace).join(format!("{}.toml", slugify(name)));
-    if ws_path.is_file() {
-        found.push((FleetScope::Workspace, ws_path));
-    }
+    let mut found = v2_fleet_candidates(name, workspace);
     if found.len() > 1 {
         return Err(FleetStoreError::Ambiguous(
             name.to_string(),
@@ -549,7 +815,6 @@ pub fn load_fleet_in_scope(
 /// Load a v2 Fleet from a specific path (used by the editor on the currently
 /// open entry, so the saved scope is exact). API surface for the path-based
 /// editor flows; currently exercised by tests.
-#[allow(dead_code)]
 pub fn load_fleet_at(path: &Path) -> Result<(FleetFile, FleetScope), FleetStoreError> {
     let text = fs::read_to_string(path).map_err(|e| FleetStoreError::Io {
         path: path.display().to_string(),
@@ -577,18 +842,44 @@ pub fn save_fleet(
     fleet.validate()?;
     let dir = ensure_fleets_dir(scope, workspace)?;
     let path = dir.join(format!("{}.toml", fleet.file_slug()));
-    if path.is_file()
-        && let Ok(text) = fs::read_to_string(&path)
-        && let Ok(existing) = FleetFile::parse(&text)
-        && existing.name != fleet.name
-    {
-        return Err(FleetStoreError::NameTaken {
-            name: fleet.name.clone(),
+    if path.is_file() {
+        // Only a readable v2 Fleet of this same name may be replaced. Any
+        // other non-empty file at this slug (a legacy roster or exact fleet,
+        // a Fleet from a newer build, a Fleet mid-edit that no longer parses)
+        // is left unchanged.
+        let text = fs::read_to_string(&path).map_err(|e| FleetStoreError::Io {
             path: path.display().to_string(),
-        });
+            message: e.to_string(),
+        })?;
+        if !text.trim().is_empty() {
+            match FleetFile::parse(&text) {
+                Ok(existing) if existing.name == fleet.name => {}
+                Ok(_) => {
+                    return Err(FleetStoreError::NameTaken {
+                        name: fleet.name.clone(),
+                        path: path.display().to_string(),
+                    });
+                }
+                Err(parse_error) => {
+                    let reason = if codewhale_workflow::fleet_exact::declared_schema_kind(&text)
+                        .as_deref()
+                        == Some(FLEET_SCHEMA_KIND)
+                    {
+                        format!("is a Fleet file this build cannot read ({parse_error})")
+                    } else {
+                        "holds another fleet file (a legacy roster or exact fleet)".to_string()
+                    };
+                    return Err(FleetStoreError::Invalid(format!(
+                        "{} {reason}; it was left unchanged. Fix or move that file, or save `{}` under another name",
+                        path.display(),
+                        fleet.name
+                    )));
+                }
+            }
+        }
     }
     let rendered = fleet.render_toml()?;
-    atomic_write(&path, rendered.as_bytes())?;
+    write_scoped(scope, workspace, &path, rendered.as_bytes())?;
     Ok(path)
 }
 
@@ -602,6 +893,7 @@ pub fn delete_fleet(
         FleetScope::Personal => personal_fleets_dir()?,
         FleetScope::Workspace => workspace_fleets_dir(workspace),
     };
+    reject_linked_workspace_dir(scope, workspace, &dir)?;
     let path = dir.join(format!("{}.toml", slugify(name)));
     if !path.is_file() {
         return Err(FleetStoreError::NotFound(name.to_string()));
@@ -733,7 +1025,7 @@ pub fn set_selected(
         )));
     }
     let selected = dir.join(SELECTED_FILE);
-    atomic_write(&selected, name.as_bytes())?;
+    write_scoped(scope, workspace, &selected, name.as_bytes())?;
     Ok(selected)
 }
 
@@ -743,28 +1035,52 @@ fn clear_selection_if_matching(scope: FleetScope, workspace: &Path, name: &str) 
         FleetScope::Workspace => Some(workspace_fleets_dir(workspace)),
     };
     let Some(dir) = dir else { return };
+    if reject_linked_workspace_dir(scope, workspace, &dir).is_err() {
+        return;
+    }
     let selected = dir.join(SELECTED_FILE);
     if read_selection(&dir).as_deref() == Some(name.trim()) {
         let _ = fs::remove_file(selected);
     }
 }
 
+/// Write a Fleet or selection file for `scope`. A workspace file goes through
+/// the pinned no-follow writer (parents created without following a link, the
+/// final name replaced, never written through); the personal scope is the
+/// user's own directory and keeps the plain atomic write.
+fn write_scoped(
+    scope: FleetScope,
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), FleetStoreError> {
+    if scope != FleetScope::Workspace {
+        return atomic_write(path, bytes);
+    }
+    let io_error = |e: std::io::Error| FleetStoreError::Io {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    };
+    let relative = path
+        .strip_prefix(workspace)
+        .map_err(|_| FleetStoreError::Io {
+            path: path.display().to_string(),
+            message: "a workspace Fleet file must stay within the workspace".to_string(),
+        })?;
+    super::files::WorkspaceFile::open_shared(workspace, relative, true)
+        .and_then(|file| file.replace(bytes))
+        .map_err(io_error)
+}
+
 /// Atomic write: temp file in the same directory, then rename. A failed write
 /// never leaves a half-written Fleet or selection.
+/// Each write gets its own temp file, so two concurrent savers can never
+/// interleave bytes into one shared temp and publish a mixed file.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FleetStoreError> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).map_err(|e| FleetStoreError::Io {
-        path: tmp.display().to_string(),
+    crate::utils::write_atomic_workspace(path, bytes).map_err(|e| FleetStoreError::Io {
+        path: path.display().to_string(),
         message: e.to_string(),
-    })?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(FleetStoreError::Io {
-            path: path.display().to_string(),
-            message: e.to_string(),
-        });
-    }
-    Ok(())
+    })
 }
 
 /// One row of the migration receipt: how a legacy role profile maps into the
@@ -858,6 +1174,7 @@ pub fn migrate_legacy_roster(
         fleet.members.push(FleetMember {
             id: member.id.clone(),
             display_name: member.display_name.clone(),
+            shortlist: false,
             role: profile.role.name.clone(),
             model,
             provider,
@@ -904,31 +1221,148 @@ mod tests {
         })
     }
 
-    struct EnvGuard {
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialised by lock_test_env held by the caller.
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("CODEWHALE_HOME", v),
-                    None => std::env::remove_var("CODEWHALE_HOME"),
-                }
-            }
-        }
-    }
-
     /// Point CODEWHALE_HOME at a sealed temp dir. Caller must hold
     /// `lock_test_env`.
-    fn set_sealed_home() -> EnvGuard {
-        let prev = std::env::var_os("CODEWHALE_HOME");
-        // SAFETY: serialised by lock_test_env held by the caller.
-        unsafe {
-            std::env::set_var("CODEWHALE_HOME", sealed_home());
+    fn set_sealed_home() -> crate::test_support::EnvVarGuard {
+        crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", sealed_home())
+    }
+
+    /// A workspace's `.codewhale/fleets` is repository content. Saving,
+    /// selecting and deleting refuse it when it is a link, and a link at the
+    /// Fleet's own file name is replaced rather than written through.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_fleet_writes_never_follow_links_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+        let _lock = crate::test_support::lock_test_env();
+        let _home = set_sealed_home();
+        let outside = tempfile::tempdir().unwrap();
+
+        // `.codewhale/fleets` linked: save, select and delete are all refused.
+        let linked = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(linked.path().join(".codewhale")).unwrap();
+        symlink(
+            outside.path(),
+            linked.path().join(".codewhale").join(FLEET_DIR),
+        )
+        .unwrap();
+        let fleet = sample_fleet();
+        assert!(save_fleet(&fleet, FleetScope::Workspace, linked.path()).is_err());
+        assert!(set_selected("DeepSeek Flash", FleetScope::Workspace, linked.path()).is_err());
+        assert!(delete_fleet("DeepSeek Flash", FleetScope::Workspace, linked.path()).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        // A link at the Fleet's file name is replaced, never written through.
+        let plain = tempfile::tempdir().unwrap();
+        let dir = plain.path().join(".codewhale").join(FLEET_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = outside.path().join("victim.toml");
+        std::fs::write(&victim, "keep me").unwrap();
+        symlink(&victim, dir.join(format!("{}.toml", fleet.file_slug()))).unwrap();
+        let saved = save_fleet(&fleet, FleetScope::Workspace, plain.path());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        if let Ok(path) = saved {
+            assert!(
+                !std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
         }
-        EnvGuard { prev }
+    }
+
+    #[test]
+    fn declared_schema_separates_unreadable_from_undeclared() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = dir.path().join("v2.toml");
+        std::fs::write(&v2, "name = \"a\"\nschema = \" Fleet \"\n").unwrap();
+        let legacy = dir.path().join("legacy.toml");
+        std::fs::write(&legacy, "name = \"b\"\n[roles]\nscout = \"scout\"\n").unwrap();
+        let malformed = dir.path().join("bad.toml");
+        std::fs::write(&malformed, "schema = [").unwrap();
+        let missing = dir.path().join("missing.toml");
+
+        assert!(
+            declares_v2_schema(&v2),
+            "case and whitespace are normalized"
+        );
+        assert_eq!(read_declared_schema(&legacy), Some(None));
+        assert_eq!(read_declared_schema(&malformed), Some(None));
+        assert_eq!(read_declared_schema(&missing), None);
+        assert!(!declares_v2_schema(&legacy));
+        assert!(!declares_v2_schema(&malformed));
+        assert!(!declares_v2_schema(&missing));
+    }
+
+    #[test]
+    fn unsealed_personal_routes_ignore_ambient_home() {
+        const PROBE: &str = "CODEWHALE_TEST_AMBIENT_FLEET_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            let workspace = tempfile::tempdir().unwrap();
+            for hold_env_lock in [false, true] {
+                let _lock = hold_env_lock.then(crate::test_support::lock_test_env);
+                let root = crate::test_support::unsealed_test_state_root();
+                assert_eq!(personal_fleets_dir().unwrap(), root.join(FLEET_DIR));
+                assert_eq!(
+                    crate::fleet::profile::personal_agent_profile_dir().unwrap(),
+                    root.join("agents")
+                );
+                assert!(resolve_selected_fleet(workspace.path()).unwrap().is_none());
+                assert!(list_fleets(workspace.path()).is_empty());
+                let roster = crate::fleet::identity::load_effective_roster(
+                    &Default::default(),
+                    workspace.path(),
+                    None,
+                );
+                assert!(roster.load_error().is_none());
+                assert!(roster.members().iter().all(|member| {
+                    member.origin == crate::fleet::roster::ProfileOrigin::BuiltIn
+                }));
+            }
+            return;
+        }
+
+        // A fresh process inherits populated operator state, without earning
+        // the explicit EnvVarGuard seal used by deliberate path fixtures.
+        let ambient = tempfile::tempdir().unwrap();
+        let state = ambient.path().join(".codewhale");
+        let fleets = state.join(FLEET_DIR);
+        std::fs::create_dir_all(&fleets).unwrap();
+        let fleet = sample_fleet();
+        let fleet_path = fleets.join(format!("{}.toml", fleet.file_slug()));
+        let contents = fleet.render_toml().unwrap();
+        std::fs::write(&fleet_path, &contents).unwrap();
+        std::fs::write(fleets.join(SELECTED_FILE), &fleet.name).unwrap();
+        for explicit_override in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "fleet::store::tests::unsealed_personal_routes_ignore_ambient_home",
+                    "--test-threads=1",
+                ])
+                .env(PROBE, "1")
+                .env("HOME", ambient.path())
+                .env("USERPROFILE", ambient.path())
+                .env_remove("CODEWHALE_HOME")
+                .env_remove("CODEWHALE_CONFIG_PATH")
+                .env_remove("DEEPSEEK_CONFIG_PATH");
+            if explicit_override {
+                command.env("CODEWHALE_HOME", &state);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "ambient route probe failed (override={explicit_override})\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(std::fs::read_to_string(fleet_path).unwrap(), contents);
+        assert_eq!(
+            std::fs::read_to_string(fleets.join(SELECTED_FILE)).unwrap(),
+            fleet.name
+        );
     }
 
     fn sample_fleet() -> FleetFile {
@@ -942,6 +1376,7 @@ mod tests {
             .with_member(FleetMember {
                 id: "scout".to_string(),
                 display_name: Some("Flash Scout".to_string()),
+                shortlist: false,
                 role: "scout".to_string(),
                 provider: None,
                 model: None,
@@ -952,6 +1387,7 @@ mod tests {
             .with_member(FleetMember {
                 id: "builder".to_string(),
                 display_name: None,
+                shortlist: false,
                 role: "builder".to_string(),
                 provider: Some("deepseek".to_string()),
                 model: Some("deepseek-v4-pro".to_string()),
@@ -1017,6 +1453,55 @@ mod tests {
             "{err}"
         );
 
+        // Identity and route values are bounded and control-free too; only
+        // the instruction overlay may span lines.
+        let mut fleet = sample_fleet();
+        fleet.members[0].id = "scout\u{1b}[2J".to_string();
+        let err = fleet.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("member id must be printable"),
+            "{err}"
+        );
+        let mut fleet = sample_fleet();
+        fleet.members[0].id = "x".repeat(MAX_MEMBER_ID_CHARS + 1);
+        assert!(fleet.validate().is_err());
+        let mut fleet = sample_fleet();
+        fleet.members[0].id = format!("{} ", fleet.members[0].id);
+        assert!(
+            fleet.validate().is_err(),
+            "an untrimmed id is not its trimmed twin"
+        );
+        let mut fleet = sample_fleet();
+        fleet.name = "Team\u{7}".to_string();
+        assert!(fleet.validate().is_err());
+        // F01-04: the rest of the document's free text is bounded too.
+        let mut fleet = sample_fleet();
+        fleet.name = "Team\n".to_string();
+        assert!(
+            fleet.validate().is_err(),
+            "a trailing control is still a control"
+        );
+        let mut fleet = sample_fleet();
+        fleet.description = Some("about\u{7}".to_string());
+        assert!(fleet.validate().is_err());
+        fleet.description = Some("line one\nline two".to_string());
+        fleet.validate().expect("a description may span lines");
+        fleet.description = Some("x".repeat(MAX_FLEET_DESCRIPTION_CHARS + 1));
+        assert!(fleet.validate().is_err());
+        let mut fleet = sample_fleet();
+        fleet.operator = Some(FleetOperator {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4\u{1b}[2J".to_string(),
+            reasoning: None,
+        });
+        let err = fleet.validate().unwrap_err();
+        assert!(err.to_string().contains("operator model"), "{err}");
+        let mut fleet = sample_fleet();
+        fleet.members[0].instructions = Some("line one\nline two\ttabbed".to_string());
+        fleet.validate().expect("instructions may span lines");
+        fleet.members[0].instructions = Some("x".repeat(MAX_MEMBER_INSTRUCTIONS_CHARS + 1));
+        assert!(fleet.validate().is_err());
+
         // Lone provider / lone model: never silently reinterpreted.
         let mut fleet = sample_fleet();
         fleet.members[0].provider = Some("deepseek".to_string());
@@ -1045,6 +1530,66 @@ mod tests {
     }
 
     #[test]
+    fn member_pin_matching_the_operator_route_reads_as_inheritance() {
+        // #6037: a role member pinned to the fleet's own operator route
+        // resolves to that route either way — the pin only stops it
+        // following when the operator moves. Parse drops the redundant pin;
+        // a different-route pin and a shortlist row keep theirs.
+        let fleet = FleetFile::parse(
+            r#"schema = "fleet"
+schema_revision = 2
+name = "Inherit"
+
+[operator]
+provider = "openrouter"
+model = "z-ai/glm-5.3"
+
+[[members]]
+id = "planner"
+role = "planner"
+provider = "openrouter"
+model = "z-ai/glm-5.3"
+
+[[members]]
+id = "builder"
+role = "builder"
+provider = "openrouter"
+model = "z-ai/glm-5.3-pro"
+
+[[members]]
+id = "choice"
+shortlist = true
+provider = "openrouter"
+model = "z-ai/glm-5.3"
+"#,
+        )
+        .expect("parse");
+        let planner = fleet.member("planner").expect("planner member");
+        assert_eq!(planner.provider, None);
+        assert_eq!(planner.model, None);
+        let builder = fleet.member("builder").expect("builder member");
+        assert_eq!(builder.provider.as_deref(), Some("openrouter"));
+        assert_eq!(builder.model.as_deref(), Some("z-ai/glm-5.3-pro"));
+        let choice = fleet
+            .members
+            .iter()
+            .find(|member| member.shortlist)
+            .expect("shortlist row");
+        assert_eq!(choice.provider.as_deref(), Some("openrouter"));
+        assert_eq!(choice.model.as_deref(), Some("z-ai/glm-5.3"));
+        // The listing still attributes the inherited role to the route it runs.
+        let models = crate::fleet::members::models_of(&fleet);
+        assert_eq!(models[0].model, "z-ai/glm-5.3");
+        assert_eq!(models[0].roles, ["operator", "planner"]);
+        assert_eq!(models[1].roles, ["builder"]);
+        // The cleaned document round-trips: inherit stays inherit.
+        assert_eq!(
+            FleetFile::parse(&fleet.render_toml().expect("render")).expect("reparse"),
+            fleet
+        );
+    }
+
+    #[test]
     fn render_parse_round_trip_preserves_every_field() {
         let fleet = sample_fleet();
         let text = fleet.render_toml().expect("render");
@@ -1054,6 +1599,105 @@ mod tests {
         assert!(text.contains("schema_revision = 2"));
         assert!(text.contains("display_name = \"Flash Scout\""));
         assert!(text.contains("deepseek-v4-flash"));
+        assert!(
+            !text.contains("shortlist"),
+            "legacy members do not gain a marker"
+        );
+    }
+
+    #[test]
+    fn marked_shortlist_round_trips_without_becoming_a_role_or_legacy_bare_pin() {
+        let fleet = FleetFile::parse(
+            r#"schema = "fleet"
+schema_revision = 2
+name = "Shortlist"
+
+[[members]]
+id = "scout"
+shortlist = true
+provider = "fixture-provider"
+model = "scout"
+"#,
+        )
+        .expect("explicitly marked model survives legacy bare-pin migration");
+        assert_eq!(fleet.members.len(), 1);
+        let choice = &fleet.members[0];
+        assert!(choice.shortlist);
+        assert_eq!(choice.provider.as_deref(), Some("fixture-provider"));
+        assert_eq!(choice.model.as_deref(), Some("scout"));
+        assert!(choice.role_label().is_empty());
+        assert!(
+            !fleet.has_scout(),
+            "a model named scout cannot select the scout role"
+        );
+        assert!(fleet.member("scout").is_none());
+        let models = crate::fleet::members::models_of(&fleet);
+        assert_eq!(models.len(), 1);
+        assert!(models[0].roles.is_empty());
+        let text = fleet.render_toml().expect("serialize marker");
+        assert!(text.contains("shortlist = true"));
+        assert!(!text.contains("role ="));
+        assert_eq!(FleetFile::parse(&text).expect("reload marker"), fleet);
+    }
+
+    #[test]
+    fn shortlist_marker_rejects_roles_inheritance_and_incomplete_routes() {
+        for (role, provider, model) in [
+            ("scout", Some("deepseek"), Some("deepseek-v4-flash")),
+            ("", None, None),
+            ("", None, Some("deepseek-v4-flash")),
+            ("", Some("deepseek"), None),
+            ("", Some("  "), Some("deepseek-v4-flash")),
+            ("", Some("deepseek"), Some("  ")),
+        ] {
+            let member: FleetMember = serde_json::from_value(serde_json::json!({
+                "id": "choice", "shortlist": true, "role": role,
+                "provider": provider, "model": model,
+            }))
+            .expect("typed fixture");
+            let mut fleet = FleetFile::new("Malformed shortlist".into(), None).unwrap();
+            fleet.members.push(member);
+            assert!(
+                fleet.validate().is_err(),
+                "accepted invalid marker: {fleet:?}"
+            );
+            assert!(
+                fleet.render_toml().is_err(),
+                "render accepted invalid marker"
+            );
+            let text = toml::to_string(&fleet).expect("unchecked fixture serialization");
+            assert!(
+                FleetFile::parse(&text).is_err(),
+                "parse accepted invalid marker: {text}"
+            );
+        }
+
+        for metadata in [
+            serde_json::json!({"reasoning": "high"}),
+            serde_json::json!({"instructions": "Review the changes."}),
+            serde_json::json!({"requires": ["vision"]}),
+        ] {
+            let mut row = serde_json::json!({
+                "id": "choice", "shortlist": true,
+                "provider": "deepseek", "model": "deepseek-v4-flash",
+            });
+            row.as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            let mut fleet = FleetFile::new("Malformed shortlist".into(), None).unwrap();
+            fleet.members.push(serde_json::from_value(row).unwrap());
+            let text = toml::to_string(&fleet).expect("unchecked metadata fixture");
+            for error in [
+                fleet.validate().unwrap_err(),
+                fleet.render_toml().unwrap_err(),
+                FleetFile::parse(&text).unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().contains("cannot set role reasoning"),
+                    "metadata was not rejected as role-only: {error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1211,6 +1855,67 @@ members = []"#;
         other.members = fleet.members.clone();
         let err = save_fleet(&other, FleetScope::Workspace, ws.path()).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_a_legacy_fleet_file_of_the_same_slug() {
+        let _lock = crate::test_support::lock_test_env();
+        let ws = tempfile::TempDir::new().unwrap();
+        let dir = ws.path().join(".codewhale/fleets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_path = dir.join("default.toml");
+        let legacy = "[roles.builder]\nmodel = \"deepseek-v4-flash\"\n";
+        std::fs::write(&legacy_path, legacy).unwrap();
+
+        let fleet = FleetFile::new("Default".to_string(), None).unwrap();
+        let err = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap_err();
+        assert!(err.to_string().contains("left unchanged"), "{err}");
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), legacy);
+
+        // A saved v2 Fleet of the same name is still updated in place.
+        std::fs::remove_file(&legacy_path).unwrap();
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).expect("first save");
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).expect("re-save");
+    }
+
+    #[test]
+    fn save_leaves_an_unreadable_fleet_file_of_the_same_slug_unchanged() {
+        let _lock = crate::test_support::lock_test_env();
+        let ws = tempfile::TempDir::new().unwrap();
+        let dir = ws.path().join(".codewhale/fleets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("default.toml");
+        let fleet = FleetFile::new("Default".to_string(), None).unwrap();
+
+        for existing in [
+            // Written by a newer build.
+            "schema = \"fleet\"\nschema_revision = 3\nname = \"Default\"\n",
+            // The schema declaration other readers normalize.
+            "schema = \"Fleet\"\nschema_revision = 2\nname = \"Default\"\n",
+            // A v2 Fleet the user is mid-edit on.
+            "schema = \"fleet\"\nschema_revision = 2\nname = \"Default\"\nmembers = [\n",
+        ] {
+            std::fs::write(&path, existing).unwrap();
+            let err = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("left unchanged"), "{message}");
+            assert!(!message.contains("migrate"), "{message}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+        }
+        let declared = "schema = \"fleet\"\nschema_revision = 3\nname = \"Default\"\n";
+        std::fs::write(&path, declared).unwrap();
+        let message = save_fleet(&fleet, FleetScope::Workspace, ws.path())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("cannot read"), "{message}");
+
+        // An empty placeholder is not a Fleet worth keeping.
+        std::fs::write(&path, "").unwrap();
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).expect("replace empty file");
+        assert!(
+            load_fleet_at(&path).is_ok(),
+            "the saved Fleet must read back"
+        );
     }
 
     #[test]

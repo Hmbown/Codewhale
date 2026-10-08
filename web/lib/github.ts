@@ -1,6 +1,7 @@
+import { OUTBOUND_TIMEOUT_MS } from "./bounded-body";
 import type { FeedItem, RepoStats } from "./types";
 
-const REPO = process.env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+const REPO = process.env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
 const GH = "https://api.github.com";
 const MIN_KNOWN_CONTRIBUTORS = 141;
 
@@ -34,12 +35,12 @@ export async function fetchRepoStats(token?: string): Promise<RepoStats> {
   }
 
   const [repoRes, contribRes, releaseRes] = await Promise.all([
-    fetch(`${GH}/repos/${REPO}`, { headers: headers(token), next: { revalidate: 1800 } }),
+    fetch(`${GH}/repos/${REPO}`, { headers: headers(token), signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS), next: { revalidate: 1800 } }),
     fetch(`${GH}/repos/${REPO}/contributors?per_page=1&anon=true`, {
-      headers: headers(token),
+      headers: headers(token), signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
       next: { revalidate: 3600 },
     }),
-    fetch(`${GH}/repos/${REPO}/releases/latest`, { headers: headers(token), next: { revalidate: 3600 } }),
+    fetch(`${GH}/repos/${REPO}/releases/latest`, { headers: headers(token), signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS), next: { revalidate: 3600 } }),
   ]);
 
   const repo = repoRes.ok ? await repoRes.json().catch(() => null) : null;
@@ -52,7 +53,7 @@ export async function fetchRepoStats(token?: string): Promise<RepoStats> {
   // Open PRs: cheapest path is the search API.
   const prRes = await fetch(
     `${GH}/search/issues?q=${encodeURIComponent(`repo:${REPO} is:pr is:open`)}&per_page=1`,
-    { headers: headers(token), next: { revalidate: 1800 } }
+    { headers: headers(token), signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS), next: { revalidate: 1800 } }
   );
   const prJson = prRes.ok ? ((await prRes.json().catch(() => null)) as { total_count?: number } | null) : null;
   const openPulls = typeof prJson?.total_count === "number" ? prJson.total_count : 0;
@@ -209,14 +210,14 @@ export async function loadFeed(token?: string, limit = 30): Promise<FeedLoad> {
   const [issuesRes, pullsRes, releasesRes] = await Promise.all([
     fetch(
       `${GH}/repos/${REPO}/issues?state=all&per_page=${limit}&sort=updated&direction=desc`,
-      { headers: headers(token), next: { revalidate: 600 } }
+      { headers: headers(token), signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS), next: { revalidate: 600 } }
     ),
     fetch(
       `${GH}/repos/${REPO}/pulls?state=all&per_page=${limit}&sort=updated&direction=desc`,
-      { headers: headers(token), next: { revalidate: 600 } }
+      { headers: headers(token), signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS), next: { revalidate: 600 } }
     ),
     fetch(`${GH}/repos/${REPO}/releases?per_page=${RELEASE_WINDOW}`, {
-      headers: headers(token),
+      headers: headers(token), signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
       next: { revalidate: 3600 },
     }),
   ]);

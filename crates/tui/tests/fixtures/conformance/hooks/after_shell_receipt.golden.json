@@ -1,0 +1,59 @@
+{
+  "hooks": [
+    {
+      "env": {
+        "CODEWHALE_SESSION_ID": "<HOOK_SESSION>",
+        "CODEWHALE_TOOL_CALL_ID": "call_hook_after",
+        "DEEPSEEK_SESSION_ID": "<HOOK_SESSION>",
+        "DEEPSEEK_TOOL_CALL_ID": "call_hook_after",
+        "DEEPSEEK_TOOL_EXECUTION_RECEIPT": "{\"schema_version\":1,\"scope\":\"local\",\"state\":\"completed\",\"command\":\"echo hello\",\"cwd\":\"/conformance/workspace\",\"exit_code\":0,\"output_kind\":\"separate\",\"stdout\":\"hello\\n\",\"stderr\":\"\",\"stdout_truncated\":false,\"stderr_truncated\":false}",
+        "DEEPSEEK_TOOL_EXIT_CODE": "0",
+        "DEEPSEEK_TOOL_NAME": "exec_shell",
+        "DEEPSEEK_TOOL_RESULT": "hello\n",
+        "DEEPSEEK_TOOL_STATUS": "completed",
+        "DEEPSEEK_TOOL_SUCCESS": "true",
+        "DEEPSEEK_WORKSPACE": "<WORKSPACE>"
+      },
+      "name": "observer",
+      "ran": true,
+      "stdin": {
+        "event": "tool_call_after",
+        "execution_receipt": {
+          "command": "echo hello",
+          "command_truncated": false,
+          "completion": "completed",
+          "cwd": "/conformance/workspace",
+          "cwd_truncated": false,
+          "execution": "started",
+          "exit_code": 0,
+          "output_mode": "separate",
+          "schema_version": 1,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "hello\n",
+          "stdout_truncated": false
+        },
+        "schema_version": 1,
+        "session_id": "<HOOK_SESSION>",
+        "session_id_truncated": false,
+        "tool_call_id": "call_hook_after",
+        "tool_call_id_truncated": false,
+        "tool_name": "exec_shell",
+        "tool_name_truncated": false
+      }
+    }
+  ],
+  "outcome": {
+    "observers": [
+      {
+        "background": false,
+        "error": null,
+        "exit_code": 0,
+        "name": "observer",
+        "stderr": "",
+        "stdout": "observed\n",
+        "success": true
+      }
+    ]
+  }
+}

@@ -1,131 +1,256 @@
+//! `/resume` command — portable handler over the session-control facet.
+//!
+//! The handler owns route selection and the exact per-route messages/actions;
+//! filesystem, manager, parser, and picker machinery stay behind the facet's
+//! `resolve_resume_source` / `import_session_file` / `open_resume_picker`
+//! delegates (transition blocking is checked before any picker or I/O).
+
 use super::CommandResult;
-use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
-use crate::tui::app::App;
-use crate::tui::session_picker::SessionPickerView;
-use std::path::PathBuf;
-pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+use codewhale_command_contract::facets::{CommandSessionControlContext, ResumeSource};
+use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
+use codewhale_command_contract::metadata::{
+    CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
+};
+
+pub(in crate::commands) struct ResumeCmd;
+
+pub(in crate::commands) const CONTRACT_INFO: ContractInfo = ContractInfo {
     name: "resume",
     aliases: &["r"],
     usage: "/resume [session_id|path/to/export.json]",
-    description_id: MessageId::CmdResumeDescription,
+    description_key: "cmd_resume_description",
 };
-pub(in crate::commands) struct ResumeCmd;
-impl RegisterCommand for ResumeCmd {
-    fn info() -> &'static CommandInfo {
-        &COMMAND_INFO
+
+impl ContractRegisterCommand<CommandResult> for ResumeCmd {
+    fn info() -> &'static ContractInfo {
+        &CONTRACT_INFO
     }
-    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        resume(app, arg)
+    fn handler() -> CommandHandler<CommandResult> {
+        CommandHandler::Contextual {
+            capabilities: codewhale_command_contract::handler::CommandCapabilities::SESSION_CONTROL,
+            handler: resume_contextual,
+        }
     }
 }
-fn resume(app: &mut App, arg: Option<&str>) -> CommandResult {
-    if app.session_transition_blocked() {
+
+pub(in crate::commands) fn resume_contextual(
+    contexts: CommandContexts<'_>,
+    arg: Option<&str>,
+) -> CommandResult {
+    let mut parts = contexts.into_parts();
+    let Some(control) = parts.control.as_deref_mut() else {
+        return CommandResult::error("Command capability unavailable: session_control".to_string());
+    };
+    resume_portable(control, arg)
+}
+
+pub(in crate::commands) fn resume_portable(
+    control: &mut dyn CommandSessionControlContext,
+    arg: Option<&str>,
+) -> CommandResult {
+    if control.transition_blocked() {
         return CommandResult::error(
             "Cannot resume while runtime work is active. Wait for the turn to finish, or cancel it first.",
         );
     }
     let Some(raw) = arg.map(str::trim).filter(|s| !s.is_empty()) else {
-        app.view_stack
-            .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+        control.open_resume_picker();
         return CommandResult::ok();
     };
-    let path = PathBuf::from(raw);
-    if path.is_file() || raw.ends_with(".json") && std::path::Path::new(raw).exists() {
-        return import_foreign(app, &path);
-    }
-    let ws_path = app.workspace.join(raw);
-    if ws_path.is_file() {
-        return import_foreign(app, &ws_path);
-    }
-    let manager = match crate::session_manager::SessionManager::default_location() {
-        Ok(m) => m,
-        Err(e) => return CommandResult::error(format!("could not open sessions directory: {e}")),
-    };
-    let session = manager
-        .load_session(raw)
-        .or_else(|_| manager.load_session_by_prefix(raw));
-    match session {
-        Ok(sess) => {
-            let path = manager
-                .sessions_dir()
-                .join(format!("{}.json", sess.metadata.id));
-            if path.exists() {
-                return CommandResult::action(crate::tui::app::AppAction::LoadSession(path));
-            }
-            CommandResult::message(format!(
-                "Resuming session {} ({})",
-                crate::session_manager::truncate_id(&sess.metadata.id),
-                sess.metadata.title
-            ))
-        }
-        Err(e) => {
-            if let Ok(container) = crate::session_tree::SessionImportContainer::from_json(raw) {
-                return import_container(app, container);
-            }
-            CommandResult::error(format!(
-                "Cannot resume '{raw}': {e}\nUse `/resume` without args to pick, or pass a session id, or a path to an exported session JSON."
-            ))
-        }
+    match control.resolve_resume_source(raw) {
+        Ok(ResumeSource::File(path)) => match control.import_session_file(path) {
+            Ok(receipt) => CommandResult::with_message_and_action(
+                format!(
+                    "Imported foreign session as {} ({} entries, leaf {})",
+                    receipt.truncated_id, receipt.entry_count, receipt.leaf_display
+                ),
+                codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
+            ),
+            Err(error) => CommandResult::error(error),
+        },
+        Ok(ResumeSource::Imported(receipt)) => CommandResult::with_message_and_action(
+            format!(
+                "Imported foreign session as {} ({} entries, leaf {})",
+                receipt.truncated_id, receipt.entry_count, receipt.leaf_display
+            ),
+            codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
+        ),
+        Ok(ResumeSource::Session {
+            load_path,
+            truncated_id,
+            title,
+        }) => match load_path {
+            Some(path) => CommandResult::action(
+                codewhale_command_contract::outcome::SessionAction::LoadSession(path),
+            ),
+            None => CommandResult::message(format!("Resuming session {truncated_id} ({title})")),
+        },
+        Ok(ResumeSource::NotFound { raw, error }) => CommandResult::error(format!(
+            "Cannot resume '{raw}': {error}\nUse `/resume` without args to pick, or pass a session id, or a path to an exported session JSON."
+        )),
+        Err(error) => CommandResult::error(error),
     }
 }
-fn import_foreign(app: &mut App, path: &PathBuf) -> CommandResult {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            return CommandResult::error(format!(
-                "failed to read import file {}: {e}",
-                path.display()
-            ));
-        }
-    };
-    if let Ok(container) = crate::session_tree::SessionImportContainer::from_json(&content) {
-        return import_container(app, container);
+
+#[cfg(test)]
+mod tests {
+    use super::super::control_test_support::message;
+    use super::*;
+    use codewhale_command_contract::facets::ResumeImportReceipt;
+    use std::path::PathBuf;
+
+    fn control_fake() -> super::super::control_test_support::FakeControl {
+        super::super::control_test_support::FakeControl::default()
     }
-    if let Ok(foreign) = serde_json::from_str::<crate::session_manager::SavedSession>(&content) {
-        let container = foreign.export_container("foreign");
-        return import_container(app, container);
+
+    #[test]
+    fn resume_transition_blocking_wins_before_any_route() {
+        let mut fake = control_fake();
+        fake.blocked = true;
+        let result = resume_portable(&mut fake, Some("anything"));
+        assert!(result.is_error);
+        assert_eq!(
+            message(&result),
+            "Cannot resume while runtime work is active. Wait for the turn to finish, or cancel it first."
+        );
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["transition_blocked"],
+            "the gate executes exactly once before route work"
+        );
     }
-    CommandResult::error(format!(
-        "File {} is not a recognized session export",
-        path.display()
-    ))
-}
-fn import_container(
-    app: &mut App,
-    container: crate::session_tree::SessionImportContainer,
-) -> CommandResult {
-    let manager = match crate::session_manager::SessionManager::default_location() {
-        Ok(m) => m,
-        Err(e) => return CommandResult::error(format!("could not open sessions directory: {e}")),
-    };
-    let model = app.model.clone();
-    let workspace = app.workspace.clone();
-    let imported =
-        match crate::session_manager::SavedSession::import_foreign(container, workspace, model) {
-            Ok(s) => s,
-            Err(e) => return CommandResult::error(format!("foreign import failed: {e}")),
-        };
-    let new_id = imported.metadata.id.clone();
-    if let Err(e) = manager.save_session(&imported) {
-        return CommandResult::error(format!("imported session could not be saved: {e}"));
+
+    #[test]
+    fn resume_bare_opens_the_picker() {
+        let mut fake = control_fake();
+        let result = resume_portable(&mut fake, None);
+        assert!(!result.is_error);
+        assert!(result.action.is_none());
+        assert!(result.message.is_none());
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["transition_blocked", "open_resume_picker"]
+        );
     }
-    app.current_session_id = Some(new_id.clone());
-    app.current_session_metadata = Some(imported.metadata.clone());
-    app.api_messages = imported.messages.clone();
-    app.view_stack.push(SessionPickerView::new_selecting(
-        &app.workspace,
-        app.ui_locale,
-        &new_id,
-    ));
-    CommandResult::message(format!(
-        "Imported foreign session as {} ({} entries, leaf {})",
-        crate::session_manager::truncate_id(&new_id),
-        imported
-            .journal
-            .as_ref()
-            .map(|j| j.entries.len())
-            .unwrap_or(0),
-        imported.leaf_id.as_deref().unwrap_or("(none)")
-    ))
+
+    #[test]
+    fn resume_file_and_import_routes_compose_exact_receipts() {
+        let mut fake = control_fake();
+        fake.resume = Some(Ok(ResumeSource::File(PathBuf::from("/tmp/import.json"))));
+        fake.import = Some(Ok(ResumeImportReceipt {
+            truncated_id: "imp-9".to_string(),
+            entry_count: 12,
+            leaf_display: "leaf-3".to_string(),
+            sync: super::super::lifecycle_test_support::sync_payload("imp-9"),
+        }));
+        let result = resume_portable(&mut fake, Some("/tmp/import.json"));
+        assert!(!result.is_error);
+        assert_eq!(
+            message(&result),
+            "Imported foreign session as imp-9 (12 entries, leaf leaf-3)"
+        );
+        // The engine must adopt the imported conversation; a message-only
+        // result would leave it on the previous session.
+        assert!(
+            matches!(
+                result.action,
+                Some(codewhale_command_contract::outcome::SessionAction::SyncSession(codewhale_command_contract::facets::SessionSyncPayload { ref session_id, .. }))
+                if session_id.as_deref() == Some("imp-9")
+            ),
+            "{result:?}"
+        );
+
+        let mut fake = control_fake();
+        fake.resume = Some(Ok(ResumeSource::File(PathBuf::from("/tmp/x.json"))));
+        fake.import = Some(Err(
+            "File x.json is not a recognized session export".to_string()
+        ));
+        let result = resume_portable(&mut fake, Some("/tmp/x.json"));
+        assert!(result.is_error);
+        assert_eq!(
+            message(&result),
+            "File x.json is not a recognized session export"
+        );
+
+        let mut fake = control_fake();
+        fake.resume = Some(Ok(ResumeSource::Imported(ResumeImportReceipt {
+            truncated_id: "c-1".to_string(),
+            entry_count: 0,
+            leaf_display: "(none)".to_string(),
+            sync: super::super::lifecycle_test_support::sync_payload("c-1"),
+        })));
+        let result = resume_portable(&mut fake, Some("inline-json"));
+        assert_eq!(
+            message(&result),
+            "Imported foreign session as c-1 (0 entries, leaf (none))"
+        );
+        assert!(
+            matches!(
+                result.action,
+                Some(codewhale_command_contract::outcome::SessionAction::SyncSession(codewhale_command_contract::facets::SessionSyncPayload { ref session_id, .. }))
+                if session_id.as_deref() == Some("c-1")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn resume_session_and_not_found_routes_are_exact() {
+        let mut fake = control_fake();
+        fake.resume = Some(Ok(ResumeSource::Session {
+            load_path: Some(PathBuf::from("/tmp/sessions/abc123.json")),
+            truncated_id: "abc123".to_string(),
+            title: "Control Session".to_string(),
+        }));
+        let result = resume_portable(&mut fake, Some("abc123"));
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.action,
+            Some(codewhale_command_contract::outcome::SessionAction::LoadSession(path)) if path == *"/tmp/sessions/abc123.json"
+        ));
+
+        let mut fake = control_fake();
+        fake.resume = Some(Ok(ResumeSource::Session {
+            load_path: None,
+            truncated_id: "abc123".to_string(),
+            title: "Control Session".to_string(),
+        }));
+        let result = resume_portable(&mut fake, Some("abc123"));
+        assert_eq!(
+            message(&result),
+            "Resuming session abc123 (Control Session)"
+        );
+
+        let mut fake = control_fake();
+        fake.resume = Some(Ok(ResumeSource::NotFound {
+            raw: "nope".to_string(),
+            error: "no such session".to_string(),
+        }));
+        let result = resume_portable(&mut fake, Some("nope"));
+        assert!(result.is_error);
+        assert_eq!(
+            message(&result),
+            "Cannot resume 'nope': no such session\nUse `/resume` without args to pick, or pass a session id, or a path to an exported session JSON."
+        );
+    }
+
+    #[test]
+    fn resume_host_lookup_errors_pass_through() {
+        let mut fake = control_fake();
+        fake.resume = Some(Err("could not open sessions directory: boom".to_string()));
+        let result = resume_portable(&mut fake, Some("abc"));
+        assert!(result.is_error);
+        assert_eq!(message(&result), "could not open sessions directory: boom");
+    }
+
+    #[test]
+    fn resume_missing_control_authority_fails_safely() {
+        let contexts = codewhale_command_contract::handler::CommandContexts::empty();
+        let result = resume_contextual(contexts, None);
+        assert!(result.is_error);
+        assert_eq!(
+            message(&result),
+            "Command capability unavailable: session_control"
+        );
+    }
 }

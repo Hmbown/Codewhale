@@ -11,7 +11,7 @@
 //! - [`FleetRole`]: the closed 8-role set, parsing, and canonical labels.
 //! - Per-role posture: [`role_requires_read_only_shell`],
 //!   [`effective_runtime_profile_for_role`], [`fleet_effective_permissions`].
-//! - The tool deny lists + [`is_posture_denial`] + [`ChildAuthority`]: how a
+//! - The tool deny lists + [`ChildAuthority`]: how a
 //!   role posture becomes the concrete child surface (allowlist, deny list,
 //!   write authority, delegation budget, fingerprint).
 //!
@@ -40,9 +40,11 @@ pub(crate) const FLEET_ROLE_SCHEMA_VALUES: [&str; 8] = [
     "custom",
 ];
 
-/// Role aliases accepted by `normalize_role_alias`. Kept in sync with the
-/// match arms below so every input that `FleetRole::from_str` accepts also
-/// resolves to a canonical role (avoids the dual-validation rejection in #2649).
+/// Human-readable hint listing every token [`FleetRole::from_str`] accepts,
+/// for spawn-time error messages. Keep in sync with
+/// [`migrate_legacy_role_token`] and the `from_str` match arms; those two are
+/// the only role parser (#2649 was a second table in the spawn tool drifting
+/// from this set).
 pub(crate) const VALID_ROLE_ALIASES: &str = "general; explore; planner; reviewer; implement; test; advisor; custom \
      (legacy aliases remain accepted: worker; scout; builder; verifier; consultant; default; general-purpose; general_purpose; exploration; explorer; plan; planning; awaiter; review; code-review; code_review; implementer; implementation; verify; verification; validator; tester; oracle)";
 
@@ -257,7 +259,7 @@ pub(crate) const NETWORK_TOOL_DENYLIST: &[&str] = &[
     // they document intent and because two of them (`fetch_url`,
     // `wait_for_dev_server`) are not matched by either glob.
     //
-    // The child registry's action seam (`SubAgentToolRegistry::is_action_allowed`)
+    // The captured ChildGrant action ceiling enforced by Core's tool registry
     // lets a network-denied child keep exactly `Web{search, fetch}` past the
     // denied aliases, and the URL-input guard refuses a URL-addressed
     // `fetch` at dispatch, so the reach stays closed.
@@ -304,12 +306,15 @@ pub(crate) const NETWORK_TOOL_DENYLIST: &[&str] = &[
 
 /// The deny-list entry that stands for "this child has no network".
 ///
-/// The deny list *is* how `network_tool = false` reaches a child registry
-/// (through `worker_profile.denied_tools`), so posture is read back off the
-/// list rather than carried as a second field that could disagree with it.
-/// `fetch_url` is the sentinel because every network denial installs it and no
-/// narrower deny list does — the `web_*` / `web.*` globs deliberately do not
-/// match it, which is why it is spelled out above.
+/// The deny list is how `network_tool = false` reaches a child across the
+/// durable-Fleet and `codewhale exec` boundaries (through
+/// `worker_profile.denied_tools` / `context.disallowed_tools`). `fetch_url` is
+/// the sentinel because every network denial installs it and no narrower deny
+/// list does — the `web_*` / `web.*` globs deliberately do not match it,
+/// which is why it is spelled out above. The in-process child reads its
+/// network axis off the resolved grant, which folds this sentinel in at
+/// resolve time — so the transport denial and the semantic answer can never
+/// disagree.
 pub(crate) const NETWORK_DENIAL_SENTINEL: &str = "fetch_url";
 
 /// Tool names that mutate the workspace directly.
@@ -385,10 +390,11 @@ pub(crate) const RAW_SHELL_DENYLIST: &[&str] = &[
 /// raw-shell denial installs it and no narrower deny list does.
 ///
 /// Read by the tests that assert the raw-shell denial actually landed. It is
-/// deliberately *not* what the execution envelope consults for shell
-/// authority — see [`SHELL_AUTHORITY_SENTINEL`] for why those are two
-/// different questions.
-#[allow(dead_code)]
+/// deliberately *not* what decides a child's shell authority — that question
+/// is answered by the resolved grant's `shell` axis, which distinguishes
+/// "no process surface" from "bounded verification surface" by grant field
+/// rather than by a sentinel name.
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const RAW_SHELL_SENTINEL: &str = "exec_shell";
 
 /// The built-in verification surface: the workspace's own configured checks.
@@ -405,11 +411,13 @@ pub(crate) const VERIFICATION_SURFACE_DENYLIST: &[&str] = &["Run", "run_tests", 
 /// Distinct from [`RAW_SHELL_SENTINEL`], and the distinction is the point.
 /// `exec_shell` is installed whenever the *raw* shell is removed, which
 /// includes the write-denied verifier that still holds shell authority — so
-/// reading shell authority off it reports every verifier as shell-less and
-/// takes the verification surface away from the one role that exists to use
-/// it. `run_tests` is installed only when the shell *ceiling* itself is
-/// narrower than `full`, which is exactly the posture that has no authority to
-/// start a process.
+/// reading shell authority off it would take the verification surface away
+/// from the one role that exists to use it. `run_tests` is installed only
+/// when the shell *ceiling* itself is narrower than `full`, which is exactly
+/// the posture that has no authority to start a process. The grant folds
+/// this sentinel into its `shell` axis at resolve time: `Verify`/`Full`
+/// collapse to `None`, while `Inspect` — classifier-bounded evidence reads,
+/// not process-start authority — survives.
 pub(crate) const SHELL_AUTHORITY_SENTINEL: &str = "run_tests";
 
 /// Execution primitives that are **not** spelled as shell.
@@ -442,16 +450,10 @@ pub(crate) const NON_SHELL_EXECUTION_DENYLIST: &[&str] = &[
     "start_mcp_server",
 ];
 
-/// Whether a deny rule was installed by an **enforced posture** rather than by
-/// operator preference.
-///
-/// `inherit_disallowed_tools: false` exists so a child can start from a clean
-/// surface instead of the session's `--disallowed-tools` taste. It must not be
-/// able to drop a rule that expresses a *ceiling*: a Fleet member clamped to
-/// `network_tool = false` that spawns a grandchild with
-/// `inherit_disallowed_tools: false` would otherwise hand that grandchild the
-/// network back, which is a child widening its parent's envelope by asking
-/// politely.
+/// Whether a deny rule belongs to an enforced role posture. Operator and
+/// ancestor denials are also immutable; this identifies posture rules for
+/// authority diagnostics and tests, not a child opt-out exception.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn is_posture_denial(rule: &str) -> bool {
     [
@@ -652,12 +654,78 @@ impl ChildAuthority {
     }
 }
 
+/// Org-chart aliases for Fleet **member** role labels: roster slot names and
+/// coordination titles that select a runtime posture but are not part of the
+/// model-facing spawn vocabulary.
+///
+/// Deliberately *not* folded into [`migrate_legacy_role_token`]. That table
+/// feeds [`FleetRole::from_str`], which is also the closed vocabulary the
+/// `agent` tool validates its `type` against, and — decisively — the test the
+/// spawn parser uses to decide whether a `role` string is a posture alias or a
+/// roster profile key. Teaching `from_str` about `manager` or `smoke-runner`
+/// would stop those names resolving as roster members there. So the aliases
+/// live here, one step out, and reach exactly the one consumer that wants
+/// them: [`runtime_role_for_member`].
+///
+/// Every entry maps to the posture the durable Fleet driver already gave it,
+/// so folding them in only ever *narrows* the exact driver (which previously
+/// dropped all of these into write-capable `custom`); none of them widens
+/// authority on either path.
+fn member_role_alias(token: &str) -> Option<FleetRole> {
+    match token {
+        // Coordination happens through delegation, which needs the full
+        // General surface (#fleet-roster cutover (v0.8.67)). The operator is
+        // the helm of the overall work (it assigns managers to Workflows);
+        // the manager is the middle manager of one Workflow. Both coordinate,
+        // so both get the General surface — explicitly, not by fall-through.
+        "manager" | "coordinator" | "operator" => Some(FleetRole::Worker),
+        // Synthesis is read-only (planner posture: network reads and
+        // read-only probes, never workspace writes). It must never fall
+        // through to General's full-write posture (#fleet-roster cutover
+        // (v0.8.67)).
+        "synthesizer" | "summarizer" | "reducer" => Some(FleetRole::Planner),
+        // Documented Fleet task role spellings (`docs/FLEET.md`).
+        "smoke-runner" => Some(FleetRole::Verifier),
+        "read-only" => Some(FleetRole::Scout),
+        _ => None,
+    }
+}
+
 /// Map the Fleet's open semantic role label onto Runtime's closed role policy.
-/// Unknown labels remain useful identity (`auditor`, `research-lead`, …) but
-/// execute under Runtime `custom`, whose capabilities still intersect with the
-/// live parent.
+///
+/// **This is the only name → posture mapper.** Both Fleet drivers resolve
+/// through it: the exact/named-Fleet driver via
+/// [`ChildAuthority::from_runtime_role`], and the durable driver via
+/// `worker_runtime::roster_member_agent_type` and the task-role call sites.
+/// A second table anywhere is the defect this function exists to prevent —
+/// before #5575 the durable driver carried its own alias list, so the same
+/// string (`synthesizer`, `smoke-runner`, `read-only`) resolved to a
+/// read-only posture on one driver and to write-capable `custom` on the other.
+///
+/// Resolution order, and nothing else:
+/// 1. an empty label means *unspecified*, which is the documented general
+///    default a Fleet task without a `role` has always had;
+/// 2. [`FleetRole::from_str`] — the declared closed vocabulary plus its
+///    documented legacy aliases ([`VALID_ROLE_ALIASES`]);
+/// 3. [`member_role_alias`] — the org-chart/slot spellings above;
+/// 4. **fail closed.**
+///
+/// Step 4 is the privilege boundary. An unrecognized label is still useful
+/// identity (`auditor`, `release-lead`, …) and keeps its name on every receipt
+/// via [`public_role_label`], but a name nobody declared must not be able to
+/// hand a worker write authority. It therefore executes on the narrowest
+/// posture that can still do useful work — `explore`: no workspace writes, no
+/// raw shell, network reads and classifier-bounded `Bash` inspection. An
+/// operator who genuinely wants "inherit whatever the parent has" spells that
+/// `custom`, which is a declared role and resolves at step 2.
 pub(crate) fn runtime_role_for_member(role: &str) -> FleetRole {
-    FleetRole::from_str(role).unwrap_or(FleetRole::Custom)
+    let token = role.trim().to_ascii_lowercase();
+    if token.is_empty() {
+        return FleetRole::Worker;
+    }
+    FleetRole::from_str(&token)
+        .or_else(|| member_role_alias(&token))
+        .unwrap_or(FleetRole::Scout)
 }
 
 fn runtime_permission_ceiling(role: &FleetRole) -> PermissionCeiling {
@@ -675,7 +743,7 @@ fn runtime_permission_ceiling(role: &FleetRole) -> PermissionCeiling {
         write: profile.permissions.write,
         network_tool: profile.permissions.network,
         shell,
-        delegation_depth: profile.max_spawn_depth,
+        delegation_depth: profile.remaining_spawn_depth(),
         tools,
     }
 }

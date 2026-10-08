@@ -2,14 +2,45 @@
 //!
 //! Provider deltas arrive as dozens of tiny SSE chunks. This module buffers
 //! them without mutating the visible transcript ([`StreamBuffer`]) and bounds
-//! how often that buffer is flushed ([`StreamDisplayClock`]), so a burst of
-//! deltas becomes one history mutation per display beat.
+//! both how often that buffer is flushed ([`StreamDisplayClock`]) and how much
+//! each beat may uncover ([`reveal_budget`]), so the pace a reader sees is set
+//! by the clock rather than by how the provider happened to chunk its output.
 //!
-//! Deltas are *input*, never animation timing. A commit beat flushes
-//! everything received since the previous beat: there is no per-grapheme
-//! typewriter and no adaptive drain policy. A two-gear "adaptive chunking"
-//! policy lived here until v0.9.4; it could never emit anything other than
-//! "drain everything available", so it was deleted rather than wired up.
+//! Deltas are *input*, never animation timing. A commit beat reveals a bounded
+//! slice at [`REVEAL_PER_SECOND`], so the pace a reader sees is the same
+//! whatever shape the provider's chunks arrive in. There is still no
+//! per-grapheme typewriter and no adaptive drain policy. A two-gear "adaptive
+//! chunking" policy lived here until v0.9.4; it could never emit anything other
+//! than "drain everything available", so it was deleted rather than wired up.
+//! What replaced it is not that policy: it takes a measured slice per beat
+//! instead of deciding between two gears.
+//!
+//! Buffering never changes what the model emitted. `accumulated_text` and
+//! `accumulated_thinking` always track the full raw stream, so anything
+//! building API messages or retrying sees the whole receipt regardless of how
+//! much of it is currently visible.
+//!
+//! # Known limitations
+//!
+//! - **Latency is backlog over rate, not a fixed window.** The ceiling caps how
+//!   fast bytes become visible, so a receipt larger than one beat's slice takes
+//!   `backlog / REVEAL_PER_SECOND` to finish. A 4 KiB burst takes about 1.7 s to
+//!   uncover. That is the deliberate trade (even pace over minimum latency) and
+//!   it is not configurable.
+//! - **A receipt that lands after a long pause is shown whole.** A pause
+//!   longer than the beat interval leaves the next beat due immediately, and
+//!   finalization takes a [`StreamDisplayClock::flush_now`] forced beat that
+//!   drains everything buffered, bypassing pacing entirely — so very large
+//!   receipts still land in one step.
+//! - **Tool output does not pass through here.** It is unbuffered and has no
+//!   pacing of its own.
+//! - **Catch-up is staged, not wired.** [`CATCH_UP_QUEUE_DEPTH`] and
+//!   [`CATCH_UP_OLDEST_AGE`] exist and are tested, but every production drain
+//!   site calls `note_delta` with a queue depth of 1, so catch-up never fires.
+//!   See the honesty note in `docs/MOTION_CONTRACT.md`.
+//! - **Nothing measures this.** There is no benchmark and no budget for reveal
+//!   throughput or visible latency; the numbers in the commit that introduced
+//!   paced reveal came from a throwaway harness. See the runtime-perf-gate gap.
 //!
 //! Newline-boundary safety (never showing a half-written code fence) is owned
 //! by the incremental markdown parser downstream — see
@@ -40,6 +71,29 @@ pub const CATCH_UP_QUEUE_DEPTH: usize = 160;
 /// Oldest-chunk age that pulls the display clock forward (catch-up).
 /// Staged alongside [`CATCH_UP_QUEUE_DEPTH`].
 pub const CATCH_UP_OLDEST_AGE: Duration = Duration::from_millis(1_200);
+
+/// Ceiling on how fast received text may become visible, in bytes per second.
+///
+/// This is the pace the reader sees. At the display clock's beat it is also the
+/// size of one step, so the visible text advances by roughly the same amount
+/// every beat instead of in provider-sized chunks.
+///
+/// Set several times a fast model's own output rate (a brisk stream is a few
+/// hundred bytes per second): ordinary streaming is then limited by when the
+/// bytes arrive, not by this ceiling, and receives no artificial delay. The
+/// ceiling only spreads a burst that lands ahead of that rate.
+pub const REVEAL_PER_SECOND: usize = 2_400;
+
+/// How many bytes may become visible on a beat that is `interval` long, given
+/// `backlog` bytes waiting.
+#[must_use]
+pub fn reveal_budget(interval: Duration, backlog: usize) -> usize {
+    if backlog == 0 {
+        return 0;
+    }
+    let per_beat = (REVEAL_PER_SECOND as u128 * interval.as_nanos() / 1_000_000_000) as usize;
+    per_beat.max(1).min(backlog)
+}
 
 /// Frame-clock gate for stream display commits.
 ///
@@ -164,6 +218,12 @@ impl StreamDisplayClock {
         self.catch_up_count = 0;
     }
 
+    /// The configured beat length, so a caller can size work per beat.
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
     /// Number of commit beats consumed since the last reset (observability).
     #[cfg(test)]
     pub fn commit_count(&self) -> u64 {
@@ -182,10 +242,9 @@ impl StreamDisplayClock {
 /// Buffers raw provider deltas between display-clock beats.
 ///
 /// One buffer per active block (assistant / thinking). Tool output is
-/// unbuffered and bypasses this path entirely. A commit beat takes everything
-/// received since the previous beat, so the visible text follows the upstream
-/// delta cadence and the clock only bounds how often the transcript is
-/// mutated.
+/// unbuffered and bypasses this path entirely. Each commit beat takes a
+/// bounded slice ([`StreamBuffer::take_up_to`]) so the visible text advances
+/// at a steady rate rather than in provider-sized steps.
 #[derive(Debug, Default, Clone)]
 pub struct StreamBuffer {
     pending: String,
@@ -204,6 +263,41 @@ impl StreamBuffer {
     /// Whether any text is waiting for the next commit beat.
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// Take at most `budget` bytes, leaving the rest for a later beat.
+    ///
+    /// The cut lands on a grapheme boundary: slicing through a cluster would
+    /// flash a broken glyph for one beat. A budget too small to hold the next
+    /// cluster still takes that cluster whole, so a drain can never stall.
+    pub fn take_up_to(&mut self, budget: usize) -> String {
+        use unicode_segmentation::UnicodeSegmentation;
+        if budget >= self.pending.len() {
+            return std::mem::take(&mut self.pending);
+        }
+        let mut end = budget.min(self.pending.len());
+        while end > 0 && !self.pending.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end > 0 {
+            end = self
+                .pending
+                .grapheme_indices(true)
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= end)
+                .last()
+                .unwrap_or(0);
+        }
+        if end == 0 {
+            end = self.pending.graphemes(true).next().map_or(0, str::len);
+        }
+        let rest = self.pending.split_off(end);
+        std::mem::replace(&mut self.pending, rest)
+    }
+
+    /// Bytes waiting for a later beat.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     /// Take everything buffered since the previous beat.
@@ -286,13 +380,22 @@ impl StreamingState {
         }
     }
 
-    /// Run one commit beat and return the text to flush to the transcript.
-    /// Empty when nothing arrived since the previous beat.
-    pub fn commit_text(&mut self, index: usize) -> String {
+    /// Run one commit beat and return the text to flush to the transcript,
+    /// taking at most `budget` bytes. Empty when nothing arrived since the
+    /// previous beat or the budget admits none.
+    pub fn commit_text(&mut self, index: usize, budget: usize) -> String {
         match self.blocks.get_mut(index) {
-            Some(Some(block)) => block.buffer.take(),
+            Some(Some(block)) => block.buffer.take_up_to(budget),
             _ => String::new(),
         }
+    }
+
+    /// Bytes waiting in a block's buffer.
+    pub fn pending_len(&self, index: usize) -> usize {
+        self.blocks
+            .get(index)
+            .and_then(|b| b.as_ref())
+            .map_or(0, |b| b.buffer.pending_len())
     }
 
     /// Whether a block holds text waiting to be flushed by the next commit
@@ -349,7 +452,7 @@ mod tests {
         state.start_text(0);
         state.push_content(0, "hello world");
 
-        assert_eq!(state.commit_text(0), "hello world");
+        assert_eq!(state.commit_text(0, usize::MAX), "hello world");
         assert!(!state.has_pending_stream_text(0));
     }
 
@@ -359,7 +462,7 @@ mod tests {
         state.start_thinking(0);
         state.push_content(0, "thinking deeply");
 
-        assert_eq!(state.commit_text(0), "thinking deeply");
+        assert_eq!(state.commit_text(0, usize::MAX), "thinking deeply");
         assert!(!state.has_pending_stream_text(0));
     }
 
@@ -372,9 +475,9 @@ mod tests {
 
         let burst = "abcdefghijklmnopqrstuvwxyz".repeat(8);
         state.push_content(0, &burst);
-        assert_eq!(state.commit_text(0), burst);
+        assert_eq!(state.commit_text(0, usize::MAX), burst);
         // Second beat with nothing new is empty, not a replay.
-        assert_eq!(state.commit_text(0), "");
+        assert_eq!(state.commit_text(0, usize::MAX), "");
     }
 
     #[test]
@@ -382,7 +485,7 @@ mod tests {
         let mut state = StreamingState::new();
         state.start_text(0);
         state.push_content(0, "e\u{301}x");
-        assert_eq!(state.commit_text(0), "e\u{301}x");
+        assert_eq!(state.commit_text(0, usize::MAX), "e\u{301}x");
     }
 
     #[test]
@@ -400,7 +503,7 @@ mod tests {
         let mut state = StreamingState::new();
         state.start_text(0);
         state.push_content(0, "abc");
-        assert_eq!(state.commit_text(0), "abc");
+        assert_eq!(state.commit_text(0, usize::MAX), "abc");
         assert_eq!(state.finalize_block_text(0), "");
     }
 
@@ -428,7 +531,7 @@ mod tests {
             state.push_content(0, &chunk);
         }
 
-        let first_flush = state.commit_text(0);
+        let first_flush = state.commit_text(0, usize::MAX);
         assert_eq!(first_flush, expected);
         assert_eq!(state.finalize_block_text(0), "");
     }
@@ -550,4 +653,66 @@ mod tests {
         // Same interval as full motion — not a slower artificial typewriter.
         assert_eq!(clock.commit_count(), 2);
     }
+
+    #[test]
+    fn reveal_budget_is_a_steady_step_and_always_progresses() {
+        let interval = DEFAULT_STREAM_COMMIT_INTERVAL;
+        let full = reveal_budget(interval, usize::MAX);
+        assert_eq!(full, REVEAL_PER_SECOND * 16 / 1000);
+        // A backlog smaller than one step is taken whole, so a small receipt
+        // is never slowed down by the ceiling.
+        assert_eq!(reveal_budget(interval, 3), 3);
+        // Nothing waiting means nothing to reveal.
+        assert_eq!(reveal_budget(interval, 0), 0);
+        // A budget too small to hold a character still admits progress.
+        assert!(reveal_budget(Duration::from_nanos(1), 10_000) >= 1);
+    }
+
+    #[test]
+    fn a_burst_is_spread_across_beats_instead_of_landing_at_once() {
+        // The defect this guards: the whole buffer used to move to the
+        // transcript on the first beat, so the reader saw provider-sized jumps.
+        let interval = DEFAULT_STREAM_COMMIT_INTERVAL;
+        let burst = "x".repeat(2_000);
+        let mut state = StreamingState::default();
+        state.start_text(0);
+        state.push_content(0, &burst);
+
+        let step = reveal_budget(interval, state.pending_len(0));
+        assert!(
+            step < burst.len() / 4,
+            "one beat took {step} of {} bytes",
+            burst.len()
+        );
+
+        let mut revealed = String::new();
+        for beat in 0..200 {
+            let budget = reveal_budget(interval, state.pending_len(0));
+            let taken = state.commit_text(0, budget);
+            assert!(taken.len() <= budget, "beat {beat} overspent its budget");
+            revealed.push_str(&taken);
+            if !state.has_pending_stream_text(0) {
+                break;
+            }
+        }
+        assert_eq!(revealed, burst, "every byte must arrive, in order");
+    }
+
+    #[test]
+    fn take_up_to_never_splits_a_character_and_always_progresses() {
+        let mut buffer = StreamBuffer::new();
+        buffer.push_delta("a👩🏽‍💻b");
+        // A budget that cannot hold the emoji still yields it whole rather
+        // than stalling the drain forever.
+        assert_eq!(buffer.take_up_to(1), "a");
+        assert_eq!(buffer.take_up_to(1), "👩🏽‍💻");
+        assert!(buffer.has_pending());
+        assert_eq!(buffer.take_up_to(usize::MAX), "b");
+        assert!(!buffer.has_pending());
+    }
 }
+
+/// Runtime performance gate for the reveal path (#6193 first slice).
+#[cfg(test)]
+#[path = "tests/perf_gate.rs"]
+mod perf_gate;

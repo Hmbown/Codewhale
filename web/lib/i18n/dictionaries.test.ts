@@ -1,42 +1,72 @@
+import { existsSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DICTIONARY_LOCALES,
   EN_CHROME,
   EN_DOCS_GUIDE,
-  EN_DOCS_CONSTITUTION,
   EN_DOCS_HOOKS,
   EN_DOCS_MCP,
   EN_DOCS_RUNTIME_API,
   EN_DOCS_SANDBOX,
   EN_DOCS_SUBAGENTS,
   EN_DOCS_WEB,
+  EN_DOCS_WORK,
   EN_DOCS_COMPUTERS,
   EN_DOCS_AUTH,
   EN_DOCS_TRUST,
+  EN_DOCS_REVIEW,
+  EN_DOCS_VOCABULARY,
+  EN_COMPUTER_USE,
   EN_CHANGELOG,
   EN_DOCS_SHELL,
   EN_DOCS_TROUBLESHOOTING,
+  EN_DIGEST,
+  EN_FEED,
+  EN_COMMUNITY,
+  EN_FAQ,
   EN_HOME,
+  EN_LEGAL_PRIVACY,
+  EN_LEGAL_TERMS,
+  EN_ROADMAP,
+  EN_CONTRIBUTE,
+  EN_CONSTITUTION,
+  EN_RUNTIME,
   fill,
   getChrome,
   getDocsGuide,
-  getDocsConstitution,
   getDocsHooks,
   getDocsMcp,
   getDocsRuntimeApi,
   getDocsSandbox,
   getDocsSubagents,
   getDocsWeb,
+  getDocsWork,
   getDocsComputers,
   getDocsAuth,
   getDocsTrust,
+  getComputerUse,
   getChangelog,
   getDocsShell,
   getDocsTroubleshooting,
+  getDocsConfiguration,
+  getDocsFleet,
+  getDocsModes,
+  getDocsReview,
+  getDocsVocabulary,
+  getDigest,
+  getFeed,
+  getCommunity,
+  getFaq,
   getHome,
+  getLegalPrivacy,
+  getLegalTerms,
+  getRoadmap,
+  getContribute,
+  getConstitution,
+  getRuntime,
   pickText,
+  pickTextLocale,
   splitToken,
-  splitTokens,
 } from "./dictionaries";
 import { locales, partialLocales } from "./config";
 import type { ChromeDict, HomeDict } from "./dictionaries/types";
@@ -47,29 +77,17 @@ import type { ChromeDict, HomeDict } from "./dictionaries/types";
  * missing translation.
  */
 const NON_PROSE_KEYS = new Set([
-  "wordmarkSeal",
   "dateLocale",
-  "githubFallback",
-  "tickerLiveTag",
-  "sealDecides",
-  "sealWorkflow",
-  "sealStart",
-  "sealBoundaries",
-  "sealSurfaces",
-  "sealCommunity",
 ]);
 
 /** Chrome keys that are real sentences/labels and must be translated. */
 const CHROME_PROSE_KEYS = [
   "skipToContent",
   "navDocs",
+  "navProduct",
   "navCommunity",
   "navPrimaryAria",
   "navHomeAria",
-  "wordmarkTag",
-  "starsAria",
-  "traceLabel",
-  "traceTabsAria",
   "menuOpen",
   "menuClose",
   "themeAria",
@@ -83,15 +101,6 @@ const CHROME_PROSE_KEYS = [
   "switcherLabel",
   "switcherSwitchTo",
   "partialBadge",
-  // Ticker chrome. The repository's own record (titles, handles, tags) stays
-  // verbatim, but the verbs the strip prints around it are copy.
-  "tickerMerged",
-  "tickerOpened",
-  "tickerClosed",
-  "tickerReleased",
-  "tickerFirstContribution",
-  "tickerBy",
-  "tickerAria",
 ] as const satisfies readonly (keyof ChromeDict)[];
 
 /**
@@ -108,32 +117,27 @@ const CHROME_LOANWORDS: Record<string, readonly string[]> = {
 const HOME_PROSE_KEYS = [
   "metaTitle",
   "metaDescription",
-  "kicker",
-  "heroTitleA",
-  "heroTitleB",
+  "heroTitle",
   "heroIntro",
-  "installEyebrow",
-  "installRequirement",
-  "installOtherWays",
-  "shotSession",
+  "getCodewhale",
+  "heroInstallAria",
+  "exploreProduct",
+  "shotPreview",
+  "shotBuild",
   "screenshotAlt",
-  "figcaption",
-  "proofHeading",
-  "proofBody",
-  "decidesEyebrow",
-  "decidesHeading",
-  "decidesLede",
-  "workflowHeading",
-  "receiptAria",
-  "receiptInspect",
-  "receiptAct",
-  "receiptReport",
+  "gainHeading",
+  "gainLede",
+  "modelsHeading",
+  "modelsBody",
+  "modelsLink",
   "startHeading",
   "startLede",
   "startGuideLink",
   "startVocabularyLink",
-  "boundariesBody",
-  "hostedGatewayLocal",
+  "availabilityHeading",
+  "availabilityLede",
+  "availabilityNote",
+  "accountLink",
   "surfacesHeading",
   "runtimeLink",
   "installBandHeading",
@@ -153,9 +157,10 @@ function flattenStrings(dict: object): Record<string, string> {
     if (typeof value === "string") {
       out[key] = value;
     } else if (Array.isArray(value)) {
-      value.forEach((pair, i) => {
-        out[`${key}[${i}][0]`] = pair[0];
-        out[`${key}[${i}][1]`] = pair[1];
+      value.forEach((row: string[], i: number) => {
+        row.forEach((cell, j) => {
+          out[`${key}[${i}][${j}]`] = cell;
+        });
       });
     }
   }
@@ -261,16 +266,28 @@ describe("website dictionaries", () => {
     for (const [label, get, reference] of [
       ["docs-hooks", getDocsHooks, EN_DOCS_HOOKS],
       ["docs-troubleshooting", getDocsTroubleshooting, EN_DOCS_TROUBLESHOOTING],
-      ["docs-constitution", getDocsConstitution, EN_DOCS_CONSTITUTION],
       ["docs-runtime-api", getDocsRuntimeApi, EN_DOCS_RUNTIME_API],
       ["docs-sandbox", getDocsSandbox, EN_DOCS_SANDBOX],
       ["docs-subagents", getDocsSubagents, EN_DOCS_SUBAGENTS],
       ["docs-mcp", getDocsMcp, EN_DOCS_MCP],
       ["docs-web", getDocsWeb, EN_DOCS_WEB],
+      ["docs-work", getDocsWork, EN_DOCS_WORK],
       ["docs-computers", getDocsComputers, EN_DOCS_COMPUTERS],
       ["docs-auth", getDocsAuth, EN_DOCS_AUTH],
       ["docs-trust", getDocsTrust, EN_DOCS_TRUST],
+      ["docs-review", getDocsReview, EN_DOCS_REVIEW],
+      ["docs-vocabulary", getDocsVocabulary, EN_DOCS_VOCABULARY],
       ["changelog", getChangelog, EN_CHANGELOG],
+      ["legal-terms", getLegalTerms, EN_LEGAL_TERMS],
+      ["legal-privacy", getLegalPrivacy, EN_LEGAL_PRIVACY],
+      ["digest", getDigest, EN_DIGEST],
+      ["feed", getFeed, EN_FEED],
+      ["community", getCommunity, EN_COMMUNITY],
+      ["faq", getFaq, EN_FAQ],
+      ["roadmap", getRoadmap, EN_ROADMAP],
+      ["contribute", getContribute, EN_CONTRIBUTE],
+      ["constitution", getConstitution, EN_CONSTITUTION],
+      ["runtime", getRuntime, EN_RUNTIME],
     ] as const) {
       const enKeys = Object.keys(reference).sort();
       for (const locale of [...DICTIONARY_LOCALES, "fr", "und"]) {
@@ -288,167 +305,83 @@ describe("website dictionaries", () => {
     }
   });
 
-  it("keeps the docs page lists structurally aligned", () => {
+  it("ships the Computer Use page dictionary for every routed locale", () => {
+    const enKeys = Object.keys(EN_COMPUTER_USE).sort();
     for (const locale of [...DICTIONARY_LOCALES, "und"]) {
-      expect(getDocsHooks(locale).events, `${locale} hook events`).toHaveLength(4);
-      expect(
-        getDocsTroubleshooting(locale).incidents,
-        `${locale} triage entries`,
-      ).toHaveLength(5);
-      expect(
-        getDocsConstitution(locale).principles.map(([key]) => key),
-        `${locale} constitution principles`,
-      ).toEqual(["userGlobal", "repoLocal", "runtime"]);
-      expect(
-        getDocsRuntimeApi(locale).entries.map(([key]) => key),
-        `${locale} runtime entries`,
-      ).toEqual(["http", "mobile", "stdio", "web", "doctor", "acp", "exec"]);
-      // The platform rows are keyed by their own translated name rather than a
-      // code-owned key, so only the count is comparable across locales.
-      expect(getDocsSandbox(locale).platforms, `${locale} sandbox platforms`).toHaveLength(4);
-      // Role names are identifiers the page owns, so the keys are comparable
-      // across locales rather than only the count.
-      expect(
-        getDocsSubagents(locale).roles.map(([key]) => key),
-        `${locale} subagent roles`,
-      ).toEqual([
-        "worker",
-        "scout",
-        "planner",
-        "reviewer",
-        "builder",
-        "verifier",
-        "consultant",
-        "custom",
-      ]);
+      expect(Object.keys(getComputerUse(locale)).sort(), `${locale} computer-use keys`).toEqual(enKeys);
+      expect(getComputerUse(locale).steps, `${locale} computer-use steps`).toHaveLength(4);
     }
+    // The download page is translated for every routed locale, not passed
+    // through: each dictionary locale resolves its own object with its own
+    // primary-button label; only an unknown locale gets the English reference.
+    for (const locale of DICTIONARY_LOCALES) {
+      expect(getComputerUse(locale), `${locale} computer-use`).not.toBe(EN_COMPUTER_USE);
+      expect(getComputerUse(locale).download, `${locale} computer-use download`).not.toBe(EN_COMPUTER_USE.download);
+    }
+    expect(getComputerUse("und")).toBe(EN_COMPUTER_USE);
   });
 
-  it("carries every code-span token through the hooks intro for splitTokens()", () => {
-    for (const locale of [...DICTIONARY_LOCALES, "und"]) {
-      const parts = splitTokens(getDocsHooks(locale).configIntro);
-      const tokens = parts.flatMap((part) => ("token" in part ? [part.token] : []));
-      expect(tokens, `${locale} configIntro tokens`).toEqual([
-        "hooksTable",
-        "hooksCommand",
-        "enabledKey",
-      ]);
+  it("keeps every docs task page aligned between English and Chinese", () => {
+    const routeExists = (href: string) =>
+      existsSync(new URL(`../../app/[locale]${href.split("#")[0]}/page.tsx`, import.meta.url));
+    const internalLinks = (text: string) =>
+      [...text.matchAll(/\]\((\/[^)\s]*)\)/g)].map((m) => m[1]);
+    for (const [label, get] of [
+      ["docs-auth", getDocsAuth],
+      ["docs-computers", getDocsComputers],
+      ["docs-configuration", getDocsConfiguration],
+      ["docs-fleet", getDocsFleet],
+      ["docs-hooks", getDocsHooks],
+      ["docs-mcp", getDocsMcp],
+      ["docs-modes", getDocsModes],
+      ["docs-review", getDocsReview],
+      ["docs-runtime-api", getDocsRuntimeApi],
+      ["docs-sandbox", getDocsSandbox],
+      ["docs-subagents", getDocsSubagents],
+      ["docs-troubleshooting", getDocsTroubleshooting],
+      ["docs-trust", getDocsTrust],
+      ["docs-web", getDocsWeb],
+      ["docs-work", getDocsWork],
+    ] as const) {
+      const en = get("en");
+      const zh = get("zh");
+      expect(zh, label).not.toBe(en);
+      // Same sections, in the same order, with the same block shapes.
+      expect(zh.sections.map((x) => x.id), label).toEqual(en.sections.map((x) => x.id));
+      en.sections.forEach((section, i) => {
+        const other = zh.sections[i].blocks;
+        expect(other.map((b) => Object.keys(b)[0]), `${label}#${section.id}`).toEqual(
+          section.blocks.map((b) => Object.keys(b)[0]),
+        );
+        section.blocks.forEach((block, j) => {
+          const peer = other[j];
+          // Commands are shown verbatim: a translation never edits one.
+          if ("code" in block && "code" in peer) {
+            expect(peer.code, `${label}#${section.id} code`).toBe(block.code);
+          }
+          if ("rows" in block && "rows" in peer) {
+            expect(peer.rows.length, `${label}#${section.id} rows`).toBe(block.rows.length);
+            if (block.codeTerms) {
+              expect(peer.rows.map(([term]) => term)).toEqual(block.rows.map(([term]) => term));
+            }
+          }
+          if ("steps" in block && "steps" in peer) {
+            expect(peer.steps.length, `${label}#${section.id} steps`).toBe(block.steps.length);
+          }
+          if ("list" in block && "list" in peer) {
+            expect(peer.list.length, `${label}#${section.id} list`).toBe(block.list.length);
+          }
+        });
+      });
+      expect(zh.next.map((n) => n.href), label).toEqual(en.next.map((n) => n.href));
+      // Every internal link — inline or "next" — lands on a real page.
+      for (const dict of [en, zh]) {
+        const text = JSON.stringify(dict.sections);
+        for (const href of [...internalLinks(text), ...dict.next.map((n) => n.href)]) {
+          expect(routeExists(href), `${label}: ${href}`).toBe(true);
+        }
+      }
     }
-  });
-
-  it("carries every code-span token through the constitution and runtime-api copy", () => {
-    const tokensOf = (template: string) =>
-      splitTokens(template).flatMap((part) => ("token" in part ? [part.token] : []));
-    for (const locale of [...DICTIONARY_LOCALES, "und"]) {
-      const constitution = getDocsConstitution(locale);
-      expect(tokensOf(constitution.overviewLead), `${locale} overviewLead`).toEqual([
-        "constitutionCommand",
-        "homeConfig",
-        "repoConfig",
-      ]);
-      // Exactly one link slot, so the translated label is never concatenated
-      // onto a fragment the call site owns.
-      expect(tokensOf(constitution.authorityNote), `${locale} authorityNote`).toEqual([
-        "configDocs",
-      ]);
-      expect(tokensOf(getDocsRuntimeApi(locale).securityLead), `${locale} securityLead`).toEqual([
-        "authToken",
-        "runtimeTokenEnv",
-        "legacyTokenEnv",
-        "insecureFlag",
-        "mobileFlag",
-      ]);
-    }
-  });
-
-  it("carries every code-span token through the subagents and mcp copy", () => {
-    const tokensOf = (template: string) =>
-      splitTokens(template).flatMap((part) => ("token" in part ? [part.token] : []));
-    for (const locale of [...DICTIONARY_LOCALES, "und"]) {
-      const subagents = getDocsSubagents(locale);
-      expect(tokensOf(subagents.forkLead), `${locale} forkLead`).toEqual([
-        "agentTool",
-        "forkContext",
-      ]);
-      expect(tokensOf(subagents.worktreeLead), `${locale} worktreeLead`).toEqual([
-        "worktreeFlag",
-        "branchPattern",
-        "worktreeDir",
-        "writeAuthority",
-        "writeRoots",
-        "exactFiles",
-        "coordinationContracts",
-      ]);
-      const mcp = getDocsMcp(locale);
-      expect(tokensOf(mcp.overviewConfig), `${locale} mcp overviewConfig`).toEqual([
-        "configPath",
-        "legacyConfigPath",
-        "configPathOption",
-        "configEnvVar",
-        "serversKey",
-      ]);
-      expect(tokensOf(mcp.setupLead), `${locale} mcp setupLead`).toEqual([
-        "initCommand",
-        "mcpCommand",
-      ]);
-      expect(tokensOf(mcp.toolsLead), `${locale} mcp toolsLead`).toEqual([
-        "toolNamePattern",
-        "gitServer",
-        "statusTool",
-        "gitStatusTool",
-      ]);
-      expect(tokensOf(mcp.serverLead), `${locale} mcp serverLead`).toEqual([
-        "serveMcp",
-        "mcpServerCommand",
-        "addSelfCommand",
-        "serveHttp",
-      ]);
-    }
-  });
-
-  it("carries every code-span token through the sandbox and web copy", () => {
-    const tokensOf = (template: string) =>
-      splitTokens(template).flatMap((part) => ("token" in part ? [part.token] : []));
-    for (const locale of [...DICTIONARY_LOCALES, "und"]) {
-      // Two of these repeat, and the order is the sentence's, so this is a
-      // stricter check than check-locales.mjs, which compares token sets.
-      expect(tokensOf(getDocsSandbox(locale).policiesLead), `${locale} policiesLead`).toEqual([
-        "sandboxMode",
-        "readOnly",
-        "workspaceWrite",
-        "dangerFullAccess",
-        "externalSandbox",
-        "dangerFullAccess",
-        "externalSandbox",
-      ]);
-      const web = getDocsWeb(locale);
-      expect(tokensOf(web.overviewLead), `${locale} web overviewLead`).toEqual([
-        "webCommand",
-        "loopbackHost",
-        "defaultUrl",
-        "portExample",
-      ]);
-      expect(tokensOf(web.localLead), `${locale} localLead`).toEqual([
-        "webCommand",
-        "portFlag",
-        "hostFlag",
-        "mobileCommand",
-        "httpFlag",
-      ]);
-    }
-  });
-
-  it("splitTokens interleaves literal text and token names in template order", () => {
-    expect(splitTokens("a {one} b {two}")).toEqual([
-      { text: "a " },
-      { token: "one" },
-      { text: " b " },
-      { token: "two" },
-    ]);
-    // A template with no token is one literal run, and an empty run between
-    // adjacent tokens is dropped rather than rendered as an empty node.
-    expect(splitTokens("plain")).toEqual([{ text: "plain" }]);
-    expect(splitTokens("{one}{two}")).toEqual([{ token: "one" }, { token: "two" }]);
   });
 
   it("pickText selects the locale side of legacy { en, zh } pairs", () => {
@@ -456,17 +389,31 @@ describe("website dictionaries", () => {
     expect(pickText(pair, "zh")).toBe("中文");
     expect(pickText(pair, "en")).toBe("English");
     expect(pickText(pair, "ja"), "non-zh locales read the English side").toBe("English");
+    expect(pickTextLocale("zh")).toBe("zh");
+    for (const locale of ["en", "ja", "ar"]) expect(pickTextLocale(locale)).toBe("en");
   });
 
-  it("keeps workflow and surface lists structurally aligned", () => {
+  it("keeps the gain, models, availability, and surface lists structurally aligned", () => {
     for (const locale of DICTIONARY_LOCALES) {
       const home = getHome(locale);
-      expect(home.workflow, `${locale} workflow`).toHaveLength(4);
+      expect(home.gain, `${locale} gain`).toHaveLength(3);
+      expect(home.modelsFacts, `${locale} modelsFacts`).toHaveLength(3);
+      expect(home.availability, `${locale} availability`).toHaveLength(5);
       expect(home.surfaces, `${locale} surfaces`).toHaveLength(5);
-      for (const pair of [...home.workflow, ...home.surfaces]) {
-        expect(pair[0].length, `${locale} empty title`).toBeGreaterThan(0);
-        expect(pair[1].length, `${locale} empty description`).toBeGreaterThan(0);
+      for (const row of [...home.gain, ...home.modelsFacts, ...home.availability, ...home.surfaces]) {
+        for (const cell of row) {
+          if (cell === undefined) continue;
+          expect(cell.length, `${locale} empty cell`).toBeGreaterThan(0);
+        }
       }
+    }
+  });
+
+  it("links the community VS Code GUI to its Marketplace listing in every locale", () => {
+    const marketplace = "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode";
+    for (const locale of ["en", ...DICTIONARY_LOCALES]) {
+      const row = getHome(locale).availability.find(([surface]) => surface.startsWith("CodeWhale GUI"));
+      expect(row?.[3], `${locale} GUI Marketplace link`).toBe(marketplace);
     }
   });
 
@@ -526,7 +473,7 @@ describe("website dictionaries", () => {
     }
     // Chinese resolves to its OWN dictionary, not the English reference.
     expect(chrome.navDocs).not.toBe(EN_CHROME.navDocs);
-    expect(home.heroTitleA).not.toBe(EN_HOME.heroTitleA);
+    expect(home.heroTitle).not.toBe(EN_HOME.heroTitle);
   });
 
   it("leaves no unmarked English prose in any non-English dictionary", () => {
@@ -574,15 +521,13 @@ describe("website dictionaries", () => {
     }
   });
 
-  it("carries the {handle} token through every ticker by-line", () => {
-    // components/ticker.tsx splits on the token so the handle is typeset in
-    // its own element. A locale that drops it would print a by-line with no
-    // contributor in it — the opposite of the point.
-    for (const locale of ["en", ...DICTIONARY_LOCALES]) {
-      const byLine = getChrome(locale).tickerBy;
-      expect(byLine, `${locale} tickerBy`).toContain("{handle}");
-      const parts = splitToken(byLine, "handle");
-      expect(parts.length, `${locale} tickerBy split`).toBe(2);
+  it("carries {date} through both legal pages' effective-date line", () => {
+    // The date used to sit in the JSX between two translated fragments. Now
+    // it is a fill() token, so a translation that drops it would ship a legal
+    // page that no longer says when it took effect.
+    for (const locale of ["en", "zh"]) {
+      expect(getLegalTerms(locale).updated, `${locale} legal-terms`).toContain("{date}");
+      expect(getLegalPrivacy(locale).updated, `${locale} legal-privacy`).toContain("{date}");
     }
   });
 

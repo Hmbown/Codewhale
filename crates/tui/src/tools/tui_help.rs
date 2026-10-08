@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::commands::{self, user_registry};
-use crate::localization::{Locale, tr};
 use crate::tui::keybindings::KEYBINDINGS;
+use codewhale_localization::{Locale, tr};
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -120,7 +120,7 @@ impl ToolSpec for TuiHelpTool {
 /// `load_read_only` keeps the lookup free of the legacy-settings migration
 /// write that `Settings::load` performs.
 fn ui_locale() -> Locale {
-    crate::localization::resolve_locale(
+    codewhale_localization::resolve_locale(
         &crate::settings::Settings::load_read_only()
             .unwrap_or_default()
             .locale,
@@ -209,6 +209,8 @@ fn builtin_entry(info: &'static commands::traits::CommandInfo, locale: Locale) -
 fn all_commands(locale: Locale, workspace: &Path) -> Vec<CommandEntry> {
     let mut entries: Vec<CommandEntry> = commands::command_infos()
         .into_iter()
+        // Unlisted commands still run when typed; help does not teach them.
+        .filter(|info| !info.is_unlisted())
         .map(|info| builtin_entry(info, locale))
         .collect();
     entries.extend(user_commands(workspace));

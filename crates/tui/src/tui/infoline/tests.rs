@@ -9,12 +9,12 @@ use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 use unicode_width::UnicodeWidthStr;
 
 use super::{InfoLine, InfoSegment, InfoSegmentId, context_meter_hitbox, infoline_hitboxes};
-use crate::palette::{ChromeInk, UI_THEME, UiTheme};
+use codewhale_palette::{ChromeInk, UI_THEME, UiTheme};
 
 /// The hint the live shell advertises, from the one binding module that owns
 /// it — a fixture string here would let chrome and routing drift apart.
 fn help_hint() -> String {
-    crate::tui::shell_key_routing::info_help_hint(crate::localization::Locale::En)
+    crate::tui::shell_key_routing::info_help_hint(codewhale_localization::Locale::En)
 }
 
 const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
@@ -174,16 +174,15 @@ fn infoline_is_model_context_and_metrics_only() {
     }
     let work = render_row(&UI_THEME, 160, &work_segments());
     assert!(
-        work.starts_with("deepseek-v4 · ctx 61% · $0.42 · ttft 400ms · 38 tok/s · ↓ 1.2K  "),
+        work.starts_with("deepseek-v4   ctx 61%   $0.42   ttft 400ms   38 tok/s   ↓ 1.2K  "),
         "{work:?}"
     );
-    assert!(work.trim_end().ends_with("Ctrl+/ help"), "{work:?}");
+    assert!(work.trim_end().ends_with("/help"), "{work:?}");
 }
 
-/// Declared shed order: `tok/s`, `ttft`, `↓ tokens`, the help hint, then
-/// the cost. The model and `ctx NN%` are the floor at every width.
+/// Secondary counts and help yield before performance readings and cost. The model and `ctx NN%` are the floor at every width.
 #[test]
-fn infoline_sheds_rate_then_ttft_then_tokens_then_help_then_cost() {
+fn infoline_sheds_tokens_then_help_then_rate_then_ttft_then_cost() {
     let segments = work_segments();
     // The narrowest row that still shows a thing. A thing that sheds earlier
     // needs a wider row to survive, so these strictly decrease down the
@@ -200,7 +199,7 @@ fn infoline_sheds_rate_then_ttft_then_tokens_then_help_then_cost() {
     let help = narrowest_showing("help");
     let cost = narrowest_showing("$0.42");
     assert!(
-        rate > ttft && ttft > tokens && tokens > help && help > cost,
+        tokens > help && help > rate && rate > ttft && ttft > cost,
         "shed order broke: rate@{rate} ttft@{ttft} tokens@{tokens} help@{help} cost@{cost}"
     );
     for w in 24..=180u16 {
@@ -212,12 +211,122 @@ fn infoline_sheds_rate_then_ttft_then_tokens_then_help_then_cost() {
     }
 }
 
+/// `tui.metrics_line = "compact"` (#5950) is the row after its first shed
+/// rungs, at any width: output counts and help are gone before width is
+/// consulted; selected TTFT/rate survive when they fit. Hitboxes follow the same
+/// pass so a click still lands on what painted.
+#[test]
+fn infoline_compact_keeps_performance_readings_without_extra_rows() {
+    let segments = work_segments();
+    let hint = help_hint();
+    let compact_row = |width: u16| -> (String, Vec<InfoSegmentId>) {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut ids = Vec::new();
+        terminal
+            .draw(|frame| {
+                let info = InfoLine::new(&UI_THEME, &hint, &segments).compact(true);
+                ids = infoline_hitboxes(&info, frame.area())
+                    .into_iter()
+                    .map(|hitbox| hitbox.id)
+                    .collect();
+                use ratatui::widgets::Widget;
+                Widget::render(info, frame.area(), frame.buffer_mut());
+            })
+            .expect("draw");
+        let row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>();
+        (row, ids)
+    };
+    let (wide, ids) = compact_row(160);
+    assert_eq!(
+        wide.trim_end(),
+        "deepseek-v4   ctx 61%   $0.42   ttft 400ms   38 tok/s",
+        "compact keeps performance, route, context and price: {wide:?}"
+    );
+    assert_eq!(
+        ids,
+        vec![
+            InfoSegmentId::Model,
+            InfoSegmentId::Context,
+            InfoSegmentId::Cost,
+            InfoSegmentId::Ttft,
+            InfoSegmentId::Rate,
+        ]
+    );
+    for w in 24..=180u16 {
+        let (row, _) = compact_row(w);
+        for gone in ["1.2K", "help"] {
+            assert!(
+                !row.contains(gone),
+                "{w}: compact never paints {gone}: {row:?}"
+            );
+        }
+        assert!(
+            row.contains("deepseek-v4") && row.contains("ctx 61%"),
+            "{w}: the floor still never sheds: {row:?}"
+        );
+    }
+    // The full row at the same width is the row the user had before.
+    assert!(render_row(&UI_THEME, 160, &segments).contains("tok/s"));
+
+    // Cache survives compact and is the first performance reading to shed
+    // when the row is narrow (#6565).
+    let mut with_cache = segments.clone();
+    with_cache.insert(
+        3,
+        InfoSegment::new(
+            InfoSegmentId::Cache,
+            "cache",
+            "85%",
+            ChromeInk::MetadataValue,
+        ),
+    );
+    let wide_cache = render_row_compact(160, &with_cache);
+    assert!(wide_cache.contains("cache 85%"), "{wide_cache:?}");
+    assert!(
+        !wide_cache.contains("1.2K") && !wide_cache.contains("help"),
+        "{wide_cache:?}"
+    );
+    let narrow_cache = render_row_compact(40, &with_cache);
+    assert!(!narrow_cache.contains("cache"), "{narrow_cache:?}");
+    assert!(
+        narrow_cache.contains("deepseek-v4") && narrow_cache.contains("ctx 61%"),
+        "{narrow_cache:?}"
+    );
+}
+
+fn render_row_compact(width: u16, segments: &[InfoSegment]) -> String {
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let hint = help_hint();
+            let info = InfoLine::new(&UI_THEME, &hint, segments).compact(true);
+            use ratatui::widgets::Widget;
+            Widget::render(info, frame.area(), frame.buffer_mut());
+        })
+        .expect("draw");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol().to_string())
+        .collect()
+}
+
 /// At the 80% cap the context reading takes the error token — the caller
 /// picks the ink, and the row paints it on both the label and the value.
 #[test]
 fn infoline_context_takes_the_error_token_at_eighty() {
     let theme = &UI_THEME;
-    let failure = crate::palette::grammar::chrome_style(theme, ChromeInk::Failure)
+    let failure = codewhale_palette::grammar::chrome_style(theme, ChromeInk::Failure)
         .fg
         .expect("failure ink has a colour");
     for (pct, expect_failure) in [(79u8, false), (80, true), (99, true)] {
@@ -235,20 +344,23 @@ fn infoline_context_takes_the_error_token_at_eighty() {
     }
 }
 
-/// The hint must name a chord that actually opens help in this shell. `F1`
-/// is eaten by tmux and several emulators, and bare `?` is composer text.
+/// The hint must name a route that actually opens help in this shell. `F1`
+/// is eaten by tmux and several emulators, bare `?` is composer text, and how
+/// a terminal encodes `Ctrl+/` varies enough that printing it was a promise
+/// the product could not keep. `/help` reaches the same view through the
+/// composer in every terminal.
 #[test]
-fn infoline_help_hint_names_a_chord_that_opens_help() {
+fn infoline_help_hint_names_a_route_that_opens_help() {
     let hint = help_hint();
-    assert!(hint.ends_with(" help"), "{hint}");
+    assert_eq!(hint, "/help", "a slash command names itself: {hint}");
     assert!(!hint.contains("F1"), "terminals eat F1: {hint}");
     assert!(!hint.starts_with('?'), "bare ? is composer text: {hint}");
-    let chord = hint.split_whitespace().next().unwrap();
+    // The chord stays accepted for the terminals that do deliver it; it is
+    // only no longer what chrome promises.
     let key = crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('/'),
         crossterm::event::KeyModifiers::CONTROL,
     );
-    assert_eq!(chord, "Ctrl+/");
     assert!(crate::tui::shell_key_routing::is_help_shortcut(&key));
     let row = render_row(&UI_THEME, 120, &work_segments());
     assert!(row.trim_end().ends_with(&hint), "pinned right: {row:?}");
@@ -393,4 +505,182 @@ fn infoline_context_hover_brightens_only_the_context_reading() {
     assert_eq!(plain[(0, 0)], hovered[(0, 0)]);
     let cost_x = u16::try_from(row.find("$0.42").unwrap()).unwrap();
     assert_eq!(plain[(cost_x, 0)], hovered[(cost_x, 0)]);
+}
+
+#[test]
+fn infoline_preserves_every_live_chrome_ink_and_untouched_host_style() {
+    use ratatui::style::{Color, Modifier, Style};
+    let theme = UiTheme {
+        status_working: Color::Rgb(1, 2, 3),
+        permission_ask: Color::Rgb(2, 3, 4),
+        permission_auto_review: Color::Rgb(3, 4, 5),
+        permission_full_access: Color::Rgb(4, 5, 6),
+        accent_action: Color::Rgb(5, 6, 7),
+        warning: Color::Rgb(6, 7, 8),
+        accent_primary: Color::Rgb(7, 8, 9),
+        text_soft: Color::Rgb(8, 9, 10),
+        text_muted: Color::Rgb(9, 10, 11),
+        text_hint: Color::Rgb(10, 11, 12),
+        text_dim: Color::Rgb(11, 12, 13),
+        error_fg: Color::Rgb(12, 13, 14),
+        ..UI_THEME
+    };
+    for ink in [
+        ChromeInk::Outcome,
+        ChromeInk::PermissionAsk,
+        ChromeInk::PermissionAutoReview,
+        ChromeInk::PermissionFullAccess,
+        ChromeInk::Waiting,
+        ChromeInk::Attention,
+        ChromeInk::Active,
+        ChromeInk::PolicyAct,
+        ChromeInk::PolicyPlan,
+        ChromeInk::PolicyOperate,
+        ChromeInk::Identity,
+        ChromeInk::Info,
+        ChromeInk::MetadataValue,
+        ChromeInk::Metadata,
+        ChromeInk::MetadataHint,
+        ChromeInk::MetadataDim,
+        ChromeInk::Failure,
+    ] {
+        let segments = [InfoSegment::new(
+            InfoSegmentId::Model,
+            "reading",
+            "value",
+            ink,
+        )];
+        let area = Rect::new(3, 2, 32, 2);
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 40, 5));
+        let existing = Style::default()
+            .fg(super::source_theme(false)
+                .color(codewhale_ratatui::Role::Primary)
+                .unwrap())
+            .bg(Color::Rgb(30, 40, 50))
+            .add_modifier(Modifier::ITALIC);
+        buf.set_style(buf.area, existing);
+        let before = buf.clone();
+        let info = InfoLine::new(&theme, "/help", &segments).hovered(Some(InfoSegmentId::Model));
+        ratatui::widgets::Widget::render(info, area, &mut buf);
+        let label_ink = if matches!(ink, ChromeInk::Failure | ChromeInk::Attention) {
+            ink
+        } else {
+            ChromeInk::Metadata
+        };
+        assert_eq!(buf[(3, 2)].fg, label_ink.color(&theme), "{ink:?}: label");
+        for x in 11..16 {
+            let cell = &buf[(x, 2)];
+            assert_eq!(cell.fg, ink.color(&theme), "{ink:?}: value");
+            assert_eq!(cell.bg, Color::Rgb(30, 40, 50), "host owns the ground");
+            assert!(
+                cell.modifier
+                    .contains(Modifier::ITALIC | Modifier::BOLD | Modifier::UNDERLINED)
+            );
+        }
+        assert_eq!(
+            buf[(30, 2)].fg,
+            theme.text_hint,
+            "help uses its own live slot"
+        );
+        for position in [(0, 2), (16, 2), (20, 2), (3, 3), (39, 4)] {
+            assert_eq!(
+                buf[position], before[position],
+                "{ink:?}: untouched {position:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn infoline_cjk_and_combining_text_keep_projected_pointer_geometry_when_clipped() {
+    use ratatui::style::{Color, Style};
+    let segments = [
+        InfoSegment::new(
+            InfoSegmentId::Model,
+            "",
+            "模型-e\u{301}↓",
+            ChromeInk::Identity,
+        ),
+        InfoSegment::new(InfoSegmentId::Context, "上下文", "61%", ChromeInk::Info),
+    ];
+    for ascii in [false, true] {
+        for width in 0..=40 {
+            let area = Rect::new(3, 2, width, 1);
+            let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 46, 4));
+            buf.set_style(buf.area, Style::default().bg(Color::Rgb(30, 40, 50)));
+            let before = buf.clone();
+            let info = InfoLine::new(&UI_THEME, "", &segments).ascii_safe(ascii);
+            let hitboxes = infoline_hitboxes(&info, area);
+            let context = context_meter_hitbox(&info, area);
+            ratatui::widgets::Widget::render(info, area, &mut buf);
+            assert_eq!(buf[(2, 2)], before[(2, 2)], "left clipping");
+            assert_eq!(
+                buf[(area.right(), 2)],
+                before[(area.right(), 2)],
+                "right clipping"
+            );
+            assert_eq!(buf[(3, 3)], before[(3, 3)], "the row never wraps");
+            for (index, hitbox) in hitboxes.iter().enumerate() {
+                assert!(hitbox.area.x >= area.x && hitbox.area.right() <= area.right());
+                assert_eq!(hitbox.area.y, area.y);
+                assert_eq!(hitbox.area.height, 1);
+                if index > 0 {
+                    assert!(hitboxes[index - 1].area.right() <= hitbox.area.x);
+                }
+            }
+            if width >= 7 {
+                assert_eq!(hitboxes[0].area, Rect::new(3, 2, 7, 1));
+                assert_eq!(buf[(3, 2)].symbol(), "模");
+                assert_eq!(buf[(5, 2)].symbol(), "型");
+                assert_eq!(buf[(8, 2)].symbol(), "e\u{301}");
+                assert_eq!(buf[(9, 2)].symbol(), if ascii { "v" } else { "↓" });
+            }
+            if width >= 20 {
+                assert_eq!(context, Some(Rect::new(13, 2, 10, 1)));
+                assert_eq!(buf[(13, 2)].symbol(), "上");
+                assert_eq!(buf[(15, 2)].symbol(), "下");
+                assert_eq!(buf[(17, 2)].symbol(), "文");
+                assert_eq!(buf[(20, 2)].symbol(), "6");
+            }
+        }
+    }
+}
+
+#[test]
+fn infoline_sanitizes_hidden_controls_before_painting_and_pointer_measurement() {
+    let segments = [
+        InfoSegment::new(
+            InfoSegmentId::Model,
+            "",
+            "model\u{202e}",
+            ChromeInk::Identity,
+        ),
+        InfoSegment::new(
+            InfoSegmentId::Context,
+            "ct\0x",
+            "6\u{1b}1%",
+            ChromeInk::Info,
+        ),
+        InfoSegment::new(
+            InfoSegmentId::OutputTokens,
+            "↓",
+            "1.2K",
+            ChromeInk::MetadataValue,
+        ),
+    ];
+    let area = Rect::new(0, 0, 60, 1);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    let info = InfoLine::new(&UI_THEME, "", &segments).ascii_safe(true);
+    let hitboxes = infoline_hitboxes(&info, area);
+    ratatui::widgets::Widget::render(info, area, &mut buf);
+    let row: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+    assert_eq!(row.trim_end(), "model   ctx 61%   v 1.2K");
+    assert_eq!(
+        hitboxes.iter().map(|hit| hit.area).collect::<Vec<_>>(),
+        [
+            Rect::new(0, 0, 5, 1),
+            Rect::new(8, 0, 7, 1),
+            Rect::new(18, 0, 6, 1),
+        ]
+    );
 }

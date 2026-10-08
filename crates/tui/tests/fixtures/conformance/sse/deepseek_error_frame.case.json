@@ -1,0 +1,6 @@
+{
+  "description": "DeepSeek chat: a chunk-level `error` object mid-stream, then more frames. Pins how the adapter surfaces the error frame and what it yields after it (#3014).",
+  "route": "deepseek",
+  "model": "deepseek-v4-pro",
+  "reasoning_effort": "off"
+}

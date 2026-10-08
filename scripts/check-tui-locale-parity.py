@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-LOCALES_DIR = ROOT / "crates" / "tui" / "locales"
+LOCALES_DIR = ROOT / "crates" / "localization" / "locales"
 REFERENCE = "en"
 
 # Packs that ship deliberately incomplete, with English fallback for the
@@ -40,10 +40,19 @@ PARTIAL_PACKS: dict[str, str] = {}
 PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
 
+def unique_keys(pairs: list[tuple[str, str]]) -> dict:
+    data = {}
+    for key, value in pairs:
+        if key in data:
+            raise ValueError(f"duplicate key: {key}")
+        data[key] = value
+    return data
+
+
 def load_pack(path: Path) -> dict:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_keys)
+    except (OSError, ValueError) as exc:
         print(f"[tui-locale-parity] FAIL — {path.name}: unreadable JSON: {exc}")
         sys.exit(1)
     if not isinstance(data, dict) or not all(

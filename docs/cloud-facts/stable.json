@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "channel": "stable",
+  "facts_version": 1,
+  "applies_to": ">=0.9.0, <1.0.0",
+  "models": [],
+  "provider_defaults": {},
+  "release": {
+    "latest": "0.10.1",
+    "yanked": [],
+    "min_supported": null,
+    "notice": null,
+    "release_url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.1"
+  },
+  "announcements": [],
+  "_meta": {
+    "role": "Unsigned authoring source. No published channel or deployment is claimed.",
+    "base_url_rule": "Only static public HTTPS endpoints accepted by cloud_facts::scope::base_url_allowed; endpoint migration is not consumed."
+  }
+}

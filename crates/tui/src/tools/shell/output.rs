@@ -218,6 +218,53 @@ impl BoundedOutputAccumulator {
         self.total_bytes
     }
 
+    /// Decoded output appended after `cursor` (a previous `total_bytes`), for
+    /// incremental readers such as `wait`. The second value counts bytes of
+    /// that range the memory bound already discarded; the complete output is
+    /// still in the spill file.
+    pub(super) fn delta_since(&self, cursor: usize) -> io::Result<(String, usize)> {
+        if let Some(error) = self.stream_error.as_ref() {
+            return Err(io::Error::other(error.clone()));
+        }
+        let new_bytes = self.total_bytes.saturating_sub(cursor);
+        let available = new_bytes.min(self.tail.len());
+        let mut bytes = self
+            .tail
+            .range(self.tail.len() - available..)
+            .copied()
+            .collect::<Vec<_>>();
+        // A cursor is always a character boundary; a clipped tail's front may
+        // not be, so drop any continuation bytes it starts with.
+        let partial = bytes
+            .iter()
+            .take_while(|byte| (**byte & 0xC0) == 0x80)
+            .count();
+        bytes.drain(..partial);
+        let omitted = new_bytes - available + partial;
+        Ok((String::from_utf8_lossy(&bytes).into_owned(), omitted))
+    }
+
+    /// First line of a delta that lost `omitted` bytes to the memory bound:
+    /// how many, and where the complete output is (or why it is not kept).
+    pub(super) fn omitted_notice(&self, omitted: usize) -> String {
+        let location = self
+            .full_output_path
+            .as_deref()
+            .or_else(|| self.temp.as_ref().map(tempfile::NamedTempFile::path));
+        match (location, self.spill_unavailable.as_deref()) {
+            (Some(path), _) => format!(
+                "[{omitted} bytes of earlier output not retained in memory. Full output: {}]\n",
+                path.display()
+            ),
+            (None, Some(reason)) => format!(
+                "[{omitted} bytes of earlier output not retained in memory. Full output was not persisted: {reason}]\n"
+            ),
+            (None, None) => {
+                format!("[{omitted} bytes of earlier output not retained in memory]\n")
+            }
+        }
+    }
+
     pub(super) fn snapshot(&mut self, finalize: bool) -> io::Result<BoundedOutputSnapshot> {
         if let Some(error) = self.stream_error.as_ref() {
             return Err(io::Error::other(error.clone()));
@@ -562,9 +609,9 @@ pub(super) fn tail_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOUNDED_OUTPUT_MAX_BYTES, BOUNDED_OUTPUT_MAX_LINES, BoundedOutputAccumulator,
-        RAW_STREAM_MAX_BYTES, RawOutputBuffer, SharedRawOutput, tail_from_buffer,
-        take_delta_from_buffer,
+        BOUNDED_OUTPUT_MAX_BYTES, BOUNDED_OUTPUT_MAX_LINES, BOUNDED_OUTPUT_RETAIN_BYTES,
+        BoundedOutputAccumulator, RAW_STREAM_MAX_BYTES, RawOutputBuffer, SharedRawOutput,
+        tail_from_buffer, take_delta_from_buffer,
     };
     use std::sync::{Arc, Mutex};
 
@@ -776,6 +823,58 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read full output"), raw);
         drop(output);
         std::fs::remove_file(path).expect("remove full output");
+    }
+
+    #[test]
+    fn bounded_output_delta_since_returns_only_new_bytes() {
+        let mut output = BoundedOutputAccumulator::new_in(None);
+        output.append(b"first\n").expect("append");
+        let cursor = output.total_bytes();
+        assert_eq!(output.delta_since(0).expect("delta").0, "first\n");
+        output.append(b"second\n").expect("append");
+        assert_eq!(
+            output.delta_since(cursor).expect("delta"),
+            ("second\n".to_string(), 0)
+        );
+        assert_eq!(
+            output.delta_since(output.total_bytes()).expect("delta"),
+            (String::new(), 0)
+        );
+
+        // Past the memory bound: the dropped span is counted, and a clipped
+        // multi-byte character at the front is not emitted as garbage.
+        let mut output = BoundedOutputAccumulator::new_in(None);
+        // One ASCII byte first puts the retained tail's front mid-character.
+        output.append(b"a").expect("append");
+        output
+            .append("é".repeat(BOUNDED_OUTPUT_MAX_BYTES).as_bytes())
+            .expect("append");
+        let total = output.total_bytes();
+        let (delta, omitted) = output.delta_since(0).expect("delta");
+        assert!(!delta.contains('\u{FFFD}'));
+        assert_eq!(delta.len() + omitted, total);
+        assert!(delta.len() <= BOUNDED_OUTPUT_RETAIN_BYTES);
+    }
+
+    /// The notice for dropped delta bytes says where the full output is.
+    #[test]
+    fn bounded_output_omitted_notice_points_at_the_spill_file() {
+        let output = BoundedOutputAccumulator::new_in(None);
+        let spill = output
+            .temp
+            .as_ref()
+            .expect("spill file")
+            .path()
+            .display()
+            .to_string();
+        let notice = output.omitted_notice(42);
+        assert!(notice.starts_with("[42 bytes"), "{notice}");
+        assert!(notice.contains(&spill), "{notice}");
+
+        let missing = tempfile::tempdir().expect("tempdir").path().join("gone");
+        let unspilled = BoundedOutputAccumulator::new_in(Some(&missing));
+        let notice = unspilled.omitted_notice(7);
+        assert!(notice.contains("not persisted"), "{notice}");
     }
 
     #[test]

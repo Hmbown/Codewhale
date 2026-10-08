@@ -1,12 +1,14 @@
 # HarmonyOS and OpenHarmony
 
+> 阅读简体中文版：[zh_hans/HarmonyOS.md](zh_hans/HarmonyOS.md)。
+
 This page covers Codewhale on HarmonyOS PC and OpenHarmony cross-build setups.
 
 ## Support Tier
 
 | Target | Codewhale tier | CI coverage | Distribution |
 | --- | --- | --- | --- |
-| HarmonyOS PC with a glibc-compatible userspace | Tier 1 Linux ARM64 runtime | Covered by the Linux ARM64 release build | npm and release binaries |
+| HarmonyOS PC with a glibc-compatible userspace | Tier 1 Linux ARM64 runtime | Covered by the Linux ARM64 release build | GitHub release binaries; npm secondary |
 | `aarch64-unknown-linux-ohos` (OpenHarmony) | Tier 2 cross-build target | `codewhale-tui` is checked with a real OpenHarmony native SDK/sysroot | Build from source; no prebuilt release asset |
 
 Tier 2 means every relevant source change is compile-checked, but maintainers do
@@ -17,16 +19,22 @@ that could report false success.
 
 ## Running On HarmonyOS PC
 
-HarmonyOS PC can use the normal Linux ARM64 package when its userspace is
-glibc-compatible:
+HarmonyOS PC can use the Linux ARM64 release when its userspace is compatible.
+For a new installation in a Linux environment, use the official GitHub installer:
 
 ```bash
-npm i -g codewhale
-codewhale --version
+curl -fsSL https://codewhale.net/install.sh | sh
+"$HOME/.local/bin/codewhale" --version
 ```
 
-You can also download `codewhale-linux-arm64` and `codew-linux-arm64` from the
-GitHub Releases page and place both binaries on `PATH`. The
+The [published v0.9.11 release](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
+includes `codewhale-linux-arm64` and `codew-linux-arm64`; asset availability does
+not establish compatibility with every HarmonyOS device. See
+[Linux ARM64 portability](INSTALL.md#linux-arm64-portability) for release-specific
+requirements and the Cargo fallback. For an existing direct install, use
+`codewhale update`. For an occupied directory or a package-managed install, use
+[the fresh-directory migration](INSTALL.md#migrating-from-npm-cargo-or-another-installation).
+npm remains a secondary packaging route. The
 `codewhale-tui-linux-arm64` filename is retained only for legacy updater
 compatibility and is not a third command.
 

@@ -1,0 +1,22 @@
+{
+  "description": "Anthropic Messages: a text block then a tool_use block whose input arrives as partial JSON deltas; stop_reason tool_use.",
+  "route": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ]
+}

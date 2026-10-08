@@ -29,12 +29,14 @@
 
 #[cfg(test)]
 use crate::config::ApprovalDefaultSelection;
-use crate::localization::{Locale, MessageId, tr};
+use crate::tools::approval_summary::{
+    delegated_authority_fields, param_preview, truncate_string_value,
+};
 use crate::tools::canonical_action::canonical_action_alias;
 use codewhale_config::ToolAskRule;
+use codewhale_localization::{Locale, MessageId, tr};
 use serde_json::Value;
 use std::path::Path;
-#[cfg(test)]
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -75,11 +77,6 @@ pub use policy::{
     get_tool_category_for_call,
 };
 
-/// Determines when tool executions require user approval. Defined in
-/// codewhale-execpolicy (next to `AskForApproval`); re-exported here so
-/// `crate::tui::approval::ApprovalMode` keeps working.
-pub use codewhale_execpolicy::ApprovalMode;
-
 /// User's decision for a pending approval
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDecision {
@@ -93,6 +90,17 @@ pub enum ReviewDecision {
     Abort,
 }
 
+/// The agent a child approval card belongs to (approvals C1). `None` on the
+/// parent's own cards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalOwner {
+    pub agent_id: String,
+    /// Stable user-facing agent label (`App::ensure_agent_label`).
+    pub label: String,
+    /// Fleet role label, when the roster knows the agent yet.
+    pub role: Option<String>,
+}
+
 /// Request for user approval of a tool execution
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
@@ -102,6 +110,12 @@ pub struct ApprovalRequest {
     pub tool_name: String,
     /// Human-readable tool description from the engine
     pub description: String,
+    /// One plain sentence naming what the call does ("Search the web for
+    /// 'espresso'", "Write notes/espresso.md"), built from the tool name and
+    /// its arguments only (E6). The card leads with it.
+    pub summary: String,
+    /// Workspace the call runs in; card paths are shown relative to it.
+    pub workspace: PathBuf,
     /// Tool category
     pub category: ToolCategory,
     /// Stakes-based routing for the compact approval card
@@ -123,6 +137,8 @@ pub struct ApprovalRequest {
     pub persistent_ask_rules: Vec<ToolAskRule>,
     /// Exact repo-scoped allow rules available for safe approval requests.
     pub persistent_allow_rules: Vec<ToolAskRule>,
+    /// The agent that raised this request, when it is a child's card.
+    pub owner: Option<ApprovalOwner>,
 }
 
 /// Key approval details rendered prominently in the approval card.
@@ -203,6 +219,12 @@ impl ApprovalRequest {
             id: id.to_string(),
             tool_name: tool_name.to_string(),
             description: description.to_string(),
+            summary: crate::tools::approval_summary::approval_summary(
+                tool_name,
+                params,
+                Some(workspace),
+            ),
+            workspace: workspace.to_path_buf(),
             category,
             risk,
             impacts: build_impact_summary(semantic_tool_name, category, params),
@@ -219,6 +241,7 @@ impl ApprovalRequest {
             }),
             persistent_ask_rules,
             persistent_allow_rules,
+            owner: None,
         }
     }
 
@@ -228,11 +251,27 @@ impl ApprovalRequest {
         serde_json::to_string(&truncated).unwrap_or_else(|_| truncated.to_string())
     }
 
+    /// The plain summary in `locale` (E6, experience mark 4): the same
+    /// sentence the English card leads with, translated around the verbatim
+    /// command, path or query.
+    #[must_use]
+    pub fn summary_for_locale(&self, locale: Locale) -> String {
+        if locale == Locale::En {
+            return self.summary.clone();
+        }
+        crate::tools::approval_summary::approval_summary_in(
+            locale,
+            &self.tool_name,
+            &self.params,
+            Some(&self.workspace),
+        )
+    }
+
     pub fn description_for_locale(&self, locale: Locale) -> String {
         match locale {
             Locale::ZhHans => localized_description_zh_hans(self.category),
             _ if self.category == ToolCategory::Shell => {
-                "Review the Bash command before it runs.".to_string()
+                "Review the command before it runs.".to_string()
             }
             _ => self.description.clone(),
         }
@@ -292,6 +331,9 @@ impl ApprovalRequest {
         build_prominent_details(semantic_tool_name, self.category, &self.params)
             .into_iter()
             .map(|mut detail| {
+                if matches!(detail.label.as_str(), "File" | "Path" | "Dir") {
+                    detail.value = workspace_relative(&detail.value, &self.workspace);
+                }
                 let is_preview = detail.label == "Preview";
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
                 if is_preview && let Some(lines) = detail.shell_lines.as_mut() {
@@ -307,41 +349,25 @@ impl ApprovalRequest {
     }
 }
 
+/// Show `value` relative to `workspace` when it is an absolute path inside
+/// it, so the card never spends a row on the workspace prefix.
+fn workspace_relative(value: &str, workspace: &Path) -> String {
+    let path = Path::new(value);
+    if workspace.as_os_str().is_empty() || !path.is_absolute() {
+        return value.to_string();
+    }
+    match path.strip_prefix(workspace) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => value.to_string(),
+    }
+}
+
+pub use crate::mcp::connected_app_server;
+
 fn description_is_repo_law_prompt(description: &str) -> bool {
     description.starts_with("Repo law holds this write:")
         && description.contains(".codewhale/constitution.json")
-}
-
-fn param_preview(params: &Value, keys: &[&str], max_len: usize) -> Option<String> {
-    let Value::Object(map) = params else {
-        return None;
-    };
-
-    for key in keys {
-        let Some(value) = map.get(*key) else {
-            continue;
-        };
-        match value {
-            Value::String(text) => return Some(truncate_string_value(text, max_len)),
-            Value::Number(number) => return Some(number.to_string()),
-            Value::Bool(flag) => return Some(flag.to_string()),
-            Value::Array(items) if !items.is_empty() => {
-                let preview = items
-                    .iter()
-                    .take(3)
-                    .map(|item| match item {
-                        Value::String(text) => truncate_string_value(text, max_len / 2),
-                        other => truncate_string_value(&other.to_string(), max_len / 2),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Some(truncate_string_value(&preview, max_len));
-            }
-            other => return Some(truncate_string_value(&other.to_string(), max_len)),
-        }
-    }
-
-    None
 }
 
 fn mcp_target_hint(tool_name: &str) -> Option<String> {
@@ -354,7 +380,7 @@ fn mcp_target_hint(tool_name: &str) -> Option<String> {
 }
 
 fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value) -> Vec<String> {
-    match category {
+    let mut impacts = match category {
         ToolCategory::Safe => {
             let mut impacts = vec!["Read-only operation.".to_string()];
             if let Some(path) = param_preview(params, &["path", "ref_id", "uri"], 72) {
@@ -371,7 +397,7 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
             impacts
         }
         ToolCategory::Shell => {
-            vec!["Executes a Bash command in your workspace.".to_string()]
+            vec!["Runs a shell command in your workspace.".to_string()]
         }
         ToolCategory::Network => {
             let mut impacts = vec!["May reach network services or remote content.".to_string()];
@@ -384,17 +410,17 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
         }
         ToolCategory::McpRead => {
             let mut impacts =
-                vec!["Reads from an MCP server without an obvious local write.".to_string()];
+                vec!["Reads from a connected app without an obvious local write.".to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
-                impacts.push(format!("MCP target: {target}"));
+                impacts.push(format!("Connected app: {target}"));
             }
             impacts
         }
         ToolCategory::McpAction => {
             let mut impacts =
-                vec!["Calls an MCP server action that may have side effects.".to_string()];
+                vec!["Uses a connected app action that may have side effects.".to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
-                impacts.push(format!("MCP target: {target}"));
+                impacts.push(format!("Connected app: {target}"));
             }
             impacts
         }
@@ -405,11 +431,11 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
         }
         ToolCategory::Agent => {
             let mut impacts = vec![
-                "Starts or inspects a child agent task; the child's own tool gates still apply."
+                "Starts or checks on an agent; the agent still asks for its own approvals."
                     .to_string(),
             ];
             if let Some(kind) = param_preview(params, &["type"], 40) {
-                impacts.push(format!("Child type: {kind}"));
+                impacts.push(format!("Agent type: {kind}"));
             }
             impacts
         }
@@ -426,7 +452,9 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
             }
             impacts
         }
-    }
+    };
+    impacts.extend(delegated_authority_impacts(tool_name, params, false));
+    impacts
 }
 
 fn localized_description_zh_hans(category: ToolCategory) -> String {
@@ -449,7 +477,7 @@ fn build_impact_summary_zh_hans(
     params: &Value,
 ) -> Vec<String> {
     let locale = Locale::ZhHans;
-    match category {
+    let mut impacts = match category {
         ToolCategory::Safe => {
             let mut impacts = vec![tr(locale, MessageId::ApprovalImpactSafe).to_string()];
             if let Some(path) = param_preview(params, &["path", "ref_id", "uri"], 72) {
@@ -479,14 +507,14 @@ fn build_impact_summary_zh_hans(
         ToolCategory::McpRead => {
             let mut impacts = vec![tr(locale, MessageId::ApprovalImpactMcpRead).to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
-                impacts.push(format!("MCP 目标：{target}"));
+                impacts.push(format!("已连接应用：{target}"));
             }
             impacts
         }
         ToolCategory::McpAction => {
             let mut impacts = vec![tr(locale, MessageId::ApprovalImpactMcpAction).to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
-                impacts.push(format!("MCP 目标：{target}"));
+                impacts.push(format!("已连接应用：{target}"));
             }
             impacts
         }
@@ -508,7 +536,19 @@ fn build_impact_summary_zh_hans(
             }
             impacts
         }
-    }
+    };
+    impacts.extend(delegated_authority_impacts(tool_name, params, true));
+    impacts
+}
+
+/// Tools that hand work to a later, unattended run (a durable task or a
+/// scheduled automation) and can ask for authority of their own.
+fn delegated_authority_impacts(tool_name: &str, params: &Value, zh: bool) -> Vec<String> {
+    let separator = if zh { "：" } else { ": " };
+    delegated_authority_fields(tool_name, params, zh)
+        .into_iter()
+        .map(|(label, value)| format!("{label}{separator}{value}"))
+        .collect()
 }
 
 fn build_prominent_details(
@@ -516,7 +556,14 @@ fn build_prominent_details(
     category: ToolCategory,
     params: &Value,
 ) -> Vec<ApprovalDetail> {
-    let mut details = Vec::new();
+    let mut details: Vec<ApprovalDetail> = delegated_authority_fields(tool_name, params, false)
+        .into_iter()
+        .map(|(label, value)| ApprovalDetail {
+            label,
+            value,
+            shell_lines: None,
+        })
+        .collect();
     match category {
         ToolCategory::Shell => {
             if let Some(command) = param_text(params, &["command", "cmd"]) {
@@ -648,14 +695,6 @@ fn truncate_params_value(value: &Value, max_len: usize) -> Value {
             }
         }
     }
-}
-
-fn truncate_string_value(value: &str, max_len: usize) -> String {
-    if value.chars().count() <= max_len {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(max_len).collect();
-    format!("{truncated}...")
 }
 
 // ============================================================================

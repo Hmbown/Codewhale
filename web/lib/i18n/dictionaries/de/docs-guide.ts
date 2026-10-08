@@ -7,15 +7,15 @@ import type { DocsGuideDict } from "../types";
 export const docsGuide: DocsGuideDict = {
   metaTitle: "Erste Schritte · Codewhale-Dokumentation",
   metaDescription:
-    "Der komplette Weg von der Installation bis zu deiner idealen fleet: Installation, eine erste schlüssellose Sitzung, Provider-Anbindung und fleet-Setup.",
+    "Installiere Codewhale, verbinde ein Modell und starte deine erste Aufgabe. Füge eine Fleet hinzu, wenn du eine Auswahl an Modellen und Rollen zusammenstellen möchtest.",
   bodyClassName: "text-ink-soft leading-relaxed",
   overviewTitle: "Erste Schritte",
   overviewLead:
-    "Vier Schritte von einem Installationsbefehl bis zur einsatzbereiten fleet.",
+    "Installiere Codewhale, verbinde dein Modell und gib ihm eine Aufgabe. Die Einrichtung von Fleet ist optional.",
   sessionTitle: "Eine echte Sitzung ansehen",
   sessionLead:
-    "Hier erscheint die Aufnahme einer echten Sitzung. Es gibt noch keine Aufnahme, daher wird nichts angezeigt.",
+    "Verfolge eine Aufgabe von der ersten Anfrage bis zum fertigen Ergebnis.",
   nextTitle: "Wie geht es weiter",
   sourceNote:
-    "Quelldokumente: docs/GUIDE.md, docs/KEYBINDINGS.md · Der Schritttext lebt in web/lib/content/getting-started.ts; bei Änderungen docs-map.ts mitpflegen.",
+    "Weitere Details findest du im Benutzerhandbuch und bei den Tastenkombinationen in der Dokumentation.",
 };

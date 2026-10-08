@@ -1,0 +1,23 @@
+command: /cache zones
+is_error: false
+message:
+Cache Zones (#2264 three-zone contract)
+
+── PinnedPrefix (system + tools, frozen baseline)
+  Status:    unavailable (not yet frozen)
+  Run a turn first to freeze the baseline.
+
+── AppendLog (conversation history, append-only)
+  Status:      wired — backs the engine session history
+  Messages:    0
+  History msgs: 0
+
+── TurnScratch (per-turn ephemeral data)
+  Status:      not wired — type scaffolding, unused by requests
+
+── Contract Status
+  PinnedPrefix: not frozen
+  AppendLog:    wired (session history)
+  TurnScratch:  not wired
+
+action: <none>

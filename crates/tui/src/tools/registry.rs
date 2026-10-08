@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use codewhale_protocol::runtime::DynamicToolSpec;
 use serde_json::Value;
 
-use crate::client::DeepSeekClient;
-use crate::models::Tool;
+use crate::client::CodewhaleClient;
 use crate::tools::goal::SharedGoalState;
+use codewhale_models::Tool;
 
 use super::schema_canonicalize;
 use super::schema_sanitize;
@@ -38,6 +38,15 @@ pub struct ToolRegistry {
     api_cache: OnceLock<Vec<Tool>>,
 }
 
+/// The one sentence naming a `[tools.overrides]` entry that D4 refused, shared
+/// by the runtime log and the engine's user-facing status line.
+pub(crate) fn override_refusal_notice(tool_name: &str) -> String {
+    format!(
+        "Refused [tools.overrides.{name}]: a script or command override cannot replace the built-in tool '{name}', which stays active. Set type = \"disabled\" to turn it off, or key the override by a new tool name.",
+        name = crate::safe_label::SafeLabel::identifier(tool_name)
+    )
+}
+
 impl ToolRegistry {
     /// Create a new empty registry with the given context.
     #[must_use]
@@ -52,9 +61,14 @@ impl ToolRegistry {
     /// Register a tool in the registry.
     pub fn register(&mut self, tool: Arc<dyn ToolSpec>) {
         let name = tool.name().to_string();
-        if self.tools.insert(name.clone(), tool).is_some() {
-            tracing::warn!("Overwriting existing tool: {}", name);
+        if let Some(previous) = self.tools.get(&name) {
+            tracing::warn!(
+                previous_origin = ?previous.registration_origin(),
+                replacement_origin = ?tool.registration_origin(),
+                "Overwriting existing tool: {}", crate::safe_label::SafeLabel::identifier(&name)
+            );
         }
+        self.tools.insert(name, tool);
         self.invalidate_api_cache();
     }
 
@@ -105,10 +119,20 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
 
+        crate::extension_host::validate_caller_plugins(self.context.plugin_registry.as_deref())
+            .map_err(ToolError::not_available)?;
+        let child = self.admit_child_call(name, &input, &self.context).await?;
         enforce_tool_authority(name, &input, tool.as_ref(), &self.context)?;
-        tool.execute_rich(input, &self.context)
+        let rich = tool
+            .execute_rich(input, &self.context)
             .await
-            .map(crate::image_attach::bound_rich_tool_result)
+            .map(crate::image_attach::bound_rich_tool_result)?;
+        if rich.result.success
+            && let Some((authority, writes)) = child
+        {
+            authority.record_settled_writes(writes).await;
+        }
+        Ok(rich)
     }
 
     pub(crate) async fn execute_rich_full_with_context(
@@ -122,93 +146,97 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
 
         let ctx = context_override.unwrap_or(&self.context);
+        crate::extension_host::validate_caller_plugins(ctx.plugin_registry.as_deref())
+            .map_err(ToolError::not_available)?;
+        let child = self.admit_child_call(name, &input, ctx).await?;
         enforce_tool_authority(name, &input, tool.as_ref(), ctx)?;
         let mut rich = crate::image_attach::bound_rich_tool_result(
             tool.execute_rich(input.clone(), ctx).await?,
         );
+        if rich.result.success
+            && let Some((authority, writes)) = child
+        {
+            authority.record_settled_writes(writes).await;
+        }
         let result = &mut rich.result;
 
-        // Adaptive evidence routing (#4619) is storage-free here because this
-        // layer does not own a call id. The engine/subagent completion boundary
-        // publishes the exact artifact. Classic workshop previews remain an
-        // explicit local rollback path.
-        let raw_bypass = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        if let Some(router) = ctx.large_output_router.as_ref() {
-            use crate::tools::large_output_router::{
-                EvidenceRouting, LargeOutputRouter, RouteDecision, classic_output_routing_enabled,
-            };
-            if !classic_output_routing_enabled() {
-                let (estimated_routing, estimated_tokens, threshold) =
-                    router.evidence_routing(name, result, raw_bypass);
-                let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
-                if let Some(object) = metadata.as_object_mut() {
-                    // A tool that self-bounds its output behind its own
-                    // recovery contract (e.g. read_file's `next_start_line`
-                    // paging) declares its routing itself; the size estimate
-                    // must not override that and double-wrap the result.
-                    let routing = object
-                        .get("evidence_routing")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value::<EvidenceRouting>(value).ok())
-                        .unwrap_or(estimated_routing);
-                    object.insert(
-                        "evidence_routing".to_string(),
-                        serde_json::to_value(routing)
-                            .unwrap_or_else(|_| serde_json::json!("inline")),
-                    );
-                    object.insert(
-                        "evidence_estimated_tokens".to_string(),
-                        estimated_tokens.into(),
-                    );
-                    object.insert("evidence_threshold_tokens".to_string(), threshold.into());
-                }
-                return Ok(rich);
-            }
-            match router.route(name, result, raw_bypass) {
-                RouteDecision::PassThrough => {}
-                RouteDecision::Synthesise {
-                    estimated_tokens,
-                    threshold,
-                } => {
-                    // Store the raw output in the workshop variable store.
-                    if let Some(vars_arc) = ctx.workshop_vars.as_ref() {
-                        let mut vars = vars_arc.lock().await;
-                        vars.store_raw(name, &result.content);
-                    }
-
-                    // Build a terse synthesis using the same model the registry
-                    // was constructed for (workshop Flash model). For now we
-                    // produce a structured header + truncated preview without
-                    // a live API call so the engine stays dependency-free at
-                    // the registry layer. A follow-up can wire in the Flash
-                    // client when the async LLM call is safe here.
-                    let preview_chars = 1_200usize;
-                    let preview: String = result.content.chars().take(preview_chars).collect();
-                    let ellipsis = if result.content.chars().count() > preview_chars {
-                        "\n… [output truncated — full text in workshop variable `last_tool_result`]"
-                    } else {
-                        ""
-                    };
-                    let synthesis = format!("{preview}{ellipsis}");
-                    let wrapped = LargeOutputRouter::wrap_synthesis(
-                        name,
-                        &synthesis,
-                        estimated_tokens,
-                        threshold,
-                    );
-                    tracing::debug!(
-                        tool = name,
-                        estimated_tokens,
-                        threshold,
-                        "large-output routed through workshop"
-                    );
-                    return Ok(RichToolResult::plain(ToolResult::success(wrapped)));
-                }
+        // Adaptive evidence routing (#4619) is an explicit opt-in
+        // (`CODEWHALE_ADAPTIVE_OUTPUT_ROUTING`) and is storage-free here
+        // because this layer does not own a call id. The engine/subagent
+        // completion boundary publishes the exact artifact. Under the default
+        // classic lane nothing happens at this layer — the same boundary owns
+        // the bounded spillover preview.
+        if crate::tools::large_output_router::adaptive_output_routing_enabled()
+            && let Some(router) = ctx.large_output_router.as_ref()
+        {
+            use crate::tools::large_output_router::EvidenceRouting;
+            let (estimated_routing, estimated_tokens, threshold) =
+                router.evidence_routing(name, result);
+            let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = metadata.as_object_mut() {
+                // A tool that self-bounds its output behind its own
+                // recovery contract (e.g. read_file's `next_start_line`
+                // paging) declares its routing itself; the size estimate
+                // must not override that and double-wrap the result.
+                let routing = object
+                    .get("evidence_routing")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<EvidenceRouting>(value).ok())
+                    .unwrap_or(estimated_routing);
+                object.insert(
+                    "evidence_routing".to_string(),
+                    serde_json::to_value(routing).unwrap_or_else(|_| serde_json::json!("inline")),
+                );
+                object.insert(
+                    "evidence_estimated_tokens".to_string(),
+                    estimated_tokens.into(),
+                );
+                object.insert("evidence_threshold_tokens".to_string(), threshold.into());
             }
         }
 
         Ok(rich)
+    }
+
+    pub(crate) async fn admit_child_call(
+        &self,
+        name: &str,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<Option<(Arc<super::subagent::engine::ChildAuthority>, Vec<String>)>, ToolError>
+    {
+        let child = self
+            .context
+            .child_host
+            .as_ref()
+            .or(context.child_host.as_ref());
+        let Some(child) = child else {
+            return Ok(None);
+        };
+        if self
+            .context
+            .child_host
+            .as_ref()
+            .zip(context.child_host.as_ref())
+            .is_some_and(|(expected, actual)| !Arc::ptr_eq(expected, actual))
+        {
+            return Err(ToolError::permission_denied(
+                "child context cannot replace its captured grant",
+            ));
+        }
+        child.validate_context(context)?;
+        let writes = child
+            .validate_claim(self, name, input)
+            .await
+            .map_err(super::subagent::engine::ChildAuthority::typed_error)?;
+        // Claim lookup may wait; current caller liveness and immutable child ceiling are rechecked before effects.
+        child.validate_context(context)?;
+        crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
+            .map_err(ToolError::not_available)?;
+        child
+            .validate(self, name, input)
+            .map_err(super::subagent::engine::ChildAuthority::typed_error)?;
+        Ok(Some((child.clone(), writes)))
     }
 
     /// Get the current tool context.
@@ -273,7 +301,17 @@ impl ToolRegistry {
                 Tool {
                     tool_type: None,
                     name: tool.name().to_string(),
-                    description: tool.description().to_string(),
+                    description: if evidence_only
+                        && matches!(tool.name(), "bash" | "Bash" | "exec_shell")
+                    {
+                        format!(
+                            "{} {}",
+                            tool.description(),
+                            codewhale_execpolicy::command_safety::readonly_command_help()
+                        )
+                    } else {
+                        tool.description().to_string()
+                    },
                     input_schema: schema,
                     allowed_callers: Some(vec!["direct".to_string()]),
                     defer_loading: Some(tool.defer_loading()),
@@ -294,7 +332,7 @@ impl ToolRegistry {
     pub fn to_api_tools_with_cache(&self, enable_cache: bool) -> Vec<Tool> {
         let mut tools = self.to_api_tools();
         if enable_cache && let Some(last) = tools.last_mut() {
-            last.cache_control = Some(crate::models::CacheControl {
+            last.cache_control = Some(codewhale_models::CacheControl {
                 cache_type: "ephemeral".to_string(),
             });
         }
@@ -397,15 +435,42 @@ impl ToolRegistry {
     /// Apply config.toml tool overrides to this registry.
     ///
     /// For each entry in `overrides`:
-    /// - `Disabled` removes the tool.
-    /// - `Script` / `Command` replaces the tool with the user's implementation.
+    /// - `Disabled` removes the tool, built-ins included.
+    /// - `Script` / `Command` registers the user's implementation under a name
+    ///   no built-in owns: a new tool, or a replacement for a drop-in plugin
+    ///   script of that name.
+    /// - `Script` / `Command` keyed by a name in `builtin_names` is refused and
+    ///   the built-in stays active: script tools cannot shadow built-ins (D4,
+    ///   CURRENT_DECISIONS §26).
+    ///
+    /// Returns the refused override names so the engine can name each one to
+    /// the user ([`override_refusal_notice`]); the runtime log records every
+    /// refusal. `/plugin` does not list `[tools.overrides]` entries, so it
+    /// cannot show them there.
     ///
     /// `plugin_dir` is used as the base for relative script paths.
+    #[cfg(test)]
     pub fn apply_overrides(
         &mut self,
         overrides: &std::collections::HashMap<String, crate::config::ToolOverride>,
         plugin_dir: &Path,
-    ) {
+        builtin_names: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        self.apply_overrides_with_executor(
+            overrides,
+            plugin_dir,
+            builtin_names,
+            crate::tools::plugin::PluginExecutor::for_engine(),
+        )
+    }
+    pub(crate) fn apply_overrides_with_executor(
+        &mut self,
+        overrides: &std::collections::HashMap<String, crate::config::ToolOverride>,
+        plugin_dir: &Path,
+        builtin_names: &std::collections::HashSet<String>,
+        executor: crate::tools::plugin::PluginExecutor,
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
         for (tool_name, override_cfg) in overrides {
             match override_cfg {
                 crate::config::ToolOverride::Disabled => {
@@ -415,10 +480,19 @@ impl ToolRegistry {
                         tracing::warn!("Cannot disable tool '{}': not registered", tool_name);
                     }
                 }
+                _ if builtin_names.contains(tool_name) => {
+                    tracing::error!("{}", override_refusal_notice(tool_name));
+                    refused.push(tool_name.clone());
+                }
                 _ => {
                     // Script and Command overrides create replacement tools.
-                    use crate::tools::plugin::tool_from_override;
-                    match tool_from_override(tool_name, override_cfg, plugin_dir) {
+                    use crate::tools::plugin::tool_from_override_with_executor;
+                    match tool_from_override_with_executor(
+                        tool_name,
+                        override_cfg,
+                        plugin_dir,
+                        executor.clone(),
+                    ) {
                         Some(replacement) => {
                             self.register(replacement);
                             tracing::info!("Tool '{}' replaced via config override", tool_name);
@@ -440,14 +514,26 @@ impl ToolRegistry {
                 }
             }
         }
+        refused
     }
 
     /// Load and register plugin tools from a directory.
     ///
     /// Each script with valid frontmatter (`# name:`, `# description:`, etc.)
-    /// becomes a registered `ScriptPluginTool`. Tools whose name matches an
-    /// already-registered tool will overwrite it.
+    /// becomes a registered `ScriptPluginTool`. Name collisions are refused:
+    /// a script tool never replaces a registered tool.
+    #[cfg(test)]
     pub fn load_plugins(&mut self, plugin_dir: &Path) {
+        self.load_plugins_with_executor(
+            plugin_dir,
+            crate::tools::plugin::PluginExecutor::for_engine(),
+        );
+    }
+    pub(crate) fn load_plugins_with_executor(
+        &mut self,
+        plugin_dir: &Path,
+        executor: crate::tools::plugin::PluginExecutor,
+    ) {
         if !plugin_dir.exists() {
             tracing::debug!(
                 "Plugin directory {} does not exist, skipping",
@@ -455,10 +541,20 @@ impl ToolRegistry {
             );
             return;
         }
-        let plugins = crate::tools::plugin::load_plugin_tools(plugin_dir);
-        let count = plugins.len();
+        let plugins = crate::tools::plugin::load_plugin_tools_with_executor(plugin_dir, executor);
+        let mut count = 0;
         for tool in plugins {
+            if let Some(previous) = self.get(tool.name()) {
+                tracing::error!(
+                    previous_origin = ?previous.registration_origin(),
+                    plugin_origin = ?tool.registration_origin(),
+                    "Cannot load plugin tool '{}': name is already registered; script tools cannot replace a registered tool, so give the script its own name",
+                    crate::safe_label::SafeLabel::identifier(tool.name())
+                );
+                continue;
+            }
             self.register(tool);
+            count += 1;
         }
         if count > 0 {
             tracing::info!(
@@ -505,12 +601,24 @@ fn project_readonly_evidence_schema(name: &str, schema: &mut Value) {
     if name == "Run" {
         // The shared classifier remains authoritative for `args`; the schema
         // removes the only field that can name verifier programs.
-        if let Some(properties) = schema["properties"].as_object_mut() {
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             properties.remove("commands");
         }
         return;
     }
-    let Some(actions) = schema["properties"]["action"]["enum"].as_array_mut() else {
+    // Probe with `pointer_mut`, never `schema["properties"]["action"]["enum"]`:
+    // serde_json's IndexMut auto-vivifies missing keys by inserting Null, so
+    // the old probe left `properties.action = {"enum": null}` inside schemas
+    // that have no action property (e.g. lowercase `bash`). Strict
+    // OpenAI-compatible validators then reject the whole request with
+    // `Invalid schema for function 'bash': null is not of type "array"`
+    // (observed on Fleet read-only workers; see registry tests).
+    // The same probe idiom lives in `tools/subagent` (grep `pointer_mut(
+    // "/properties/action/enum")`); keep the two sites greppable as one.
+    let Some(actions) = schema
+        .pointer_mut("/properties/action/enum")
+        .and_then(Value::as_array_mut)
+    else {
         return;
     };
     match name {
@@ -528,12 +636,70 @@ fn project_readonly_evidence_schema(name: &str, schema: &mut Value) {
     }
 }
 
-fn enforce_tool_authority(
+pub(crate) fn enforce_tool_authority(
     name: &str,
     input: &Value,
     tool: &dyn ToolSpec,
     context: &ToolContext,
 ) -> Result<(), ToolError> {
+    crate::core::engine::tool_catalog::enforce_tool_denial(context, name, input)?;
+    if let Some(mode) = context.acp_host {
+        let canonical = super::canonical_action::canonical_action_alias(name, input);
+        if matches!(name, "bash" | "Bash" | "exec_shell") || canonical.starts_with("exec_shell") {
+            let prepared = tool.prepare(input.clone(), context)?;
+            if context.shell_policy == crate::worker_profile::ShellPolicy::None
+                || prepared
+                    .input
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("run")
+                    != "run"
+                || prepared.starts_detached
+                || prepared.input.get("interactive").and_then(Value::as_bool) == Some(true)
+                || prepared.input.get("persist").and_then(Value::as_bool) == Some(true)
+                || prepared
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(super::shell::foreground_command_requests_detach)
+            {
+                return Err(ToolError::permission_denied(
+                    "ACP supports only admitted foreground shell commands; stateful and detached execution is unavailable",
+                ));
+            }
+        }
+        // The transport has no controls for these lifecycles. A fabricated
+        // tool name or alias cannot turn catalog omission into authority.
+        if !matches!(
+            tool.name(),
+            "read"
+                | "write"
+                | "edit"
+                | "File"
+                | "read_file"
+                | "write_file"
+                | "edit_file"
+                | "list_dir"
+                | "file_search"
+                | "grep_files"
+                | "Git"
+                | "apply_patch"
+                | "bash"
+                | "Bash"
+        ) {
+            return Err(ToolError::not_available(format!(
+                "{name} is outside the ACP foreground tool profile"
+            )));
+        }
+        if mode == codewhale_config::AppMode::Plan
+            && !tool.prepare(input.clone(), context)?.read_only
+        {
+            return Err(ToolError::permission_denied(
+                "ACP Plan mode permits only read-only calls",
+            ));
+        }
+    }
+
     let Some(authority) = context.tool_authority.as_ref() else {
         return Ok(());
     };
@@ -556,29 +722,53 @@ fn enforce_tool_authority(
     }
     let capabilities = tool.capabilities();
     if matches!(name, "bash" | "Bash" | "exec_shell") {
-        if tool.is_read_only_for(input) {
-            if authority.shell != crate::tools::spec::ToolShellAuthority::ReadOnly {
-                return Err(ToolError::permission_denied(format!(
+        // One authority (#6015): a durable worker's shell is judged by the
+        // same agent read-only grammar and input normalization as in-session
+        // agents (`agent_readonly_bash_verdict`), and `BashTool::execute`
+        // applies it again under the clamped `ShellPolicy::ReadOnly`. The
+        // parent's parallel/approval classification (`is_read_only_for`) is
+        // not an authority here.
+        let verdict = super::shell::agent_readonly_bash_verdict(input);
+        if authority.shell != crate::tools::spec::ToolShellAuthority::ReadOnly {
+            return Err(ToolError::permission_denied(if verdict.is_ok() {
+                format!(
                     "worker '{}' cannot run {name}: its machine-readable authority envelope does not grant read-only shell access",
                     authority.owner
-                )));
-            }
-            let networked_read = input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(crate::command_safety::is_github_readonly_command);
-            if networked_read && authority.network_access != Some(true) {
-                return Err(ToolError::permission_denied(format!(
-                    "worker '{}' cannot use read-only GitHub CLI access: its machine-readable authority envelope does not grant network access",
-                    authority.owner
-                )));
-            }
-            return Ok(());
+                )
+            } else {
+                format!(
+                    "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+                    authority.owner,
+                    codewhale_execpolicy::command_safety::readonly_command_help()
+                )
+            }));
         }
-        return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
-        )));
+        if let Err(rejection) = verdict {
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' cannot run {name}: {}",
+                authority.owner,
+                super::shell::readonly_refusal(
+                    &rejection,
+                    super::shell::readonly_enforced_lane_available(context)
+                )
+            )));
+        }
+        let hosts = input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(codewhale_execpolicy::command_safety::readonly_network_reads)
+            .unwrap_or_default()
+            .into_iter()
+            .map(codewhale_execpolicy::command_safety::NetworkRead::host)
+            .collect::<Vec<_>>();
+        if !hosts.is_empty() && authority.network_access != Some(true) {
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' cannot use read-only network access to {}: its machine-readable authority envelope does not grant network access",
+                authority.owner,
+                hosts.join(", ")
+            )));
+        }
+        return Ok(());
     }
     if name == "Run" {
         if bounded_verifier {
@@ -592,13 +782,14 @@ fn enforce_tool_authority(
                 return Ok(());
             }
             return Err(ToolError::permission_denied(format!(
-                "worker '{}' cannot run unbounded verification arguments or commands",
+                "worker '{}' cannot run unbounded verification arguments or commands. Re-run the default gate instead: drop `commands` (run_verifiers) and any flag that can redirect what runs (run_tests `args` may only select tests), and report the blocked probe to the parent rather than working around it.",
                 authority.owner
             )));
         }
         return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+            authority.owner,
+            codewhale_execpolicy::command_safety::readonly_command_help()
         )));
     }
     if name == "Git" || name.starts_with("git_") || name == "review" {
@@ -695,6 +886,14 @@ pub struct AgentToolSurfaceOptions {
     /// Register the agent-callable `verify` self-critique tool (#4196).
     /// Gated by `Feature::Verify` (`[features] verify_tool`), default on.
     pub verify_tool_enabled: bool,
+    /// `request_user_input` payload ceilings from `[tools]` (#5949). Carried on
+    /// the surface options so model-spawned children inherit the parent's
+    /// configured limits instead of silently falling back to the defaults.
+    pub user_input_limits: super::user_input::UserInputLimits,
+    /// Register `request_plugin_install`. The engine turns this off outside
+    /// the interactive TUI and when contextual tips are off (0.10.1 plugin
+    /// offering policy, rules 3 and 11); children inherit the parent's value.
+    pub request_plugin_install_enabled: bool,
 }
 
 impl AgentToolSurfaceOptions {
@@ -709,6 +908,8 @@ impl AgentToolSurfaceOptions {
             speech_output_dir: None,
             goal_state: None,
             verify_tool_enabled: true,
+            user_input_limits: super::user_input::UserInputLimits::default(),
+            request_plugin_install_enabled: true,
         }
     }
 }
@@ -723,16 +924,53 @@ impl ToolRegistryBuilder {
     /// Add a custom tool.
     #[must_use]
     pub fn with_tool(mut self, tool: Arc<dyn ToolSpec>) -> Self {
-        self.tools.push(tool);
+        // A later builder step that supplies an existing name is an intended
+        // upgrade (`with_patch_tools` swaps the default `File` for the
+        // patch-capable one), so replace in place. `ToolRegistry::register`
+        // keeps warning about the collisions that are not planned (#5934).
+        let name = tool.name().to_string();
+        if let Some(slot) = self
+            .tools
+            .iter_mut()
+            .find(|existing| existing.name() == name)
+        {
+            *slot = tool;
+        } else {
+            self.tools.push(tool);
+        }
         self
     }
 
+    /// Add client-executed runtime tools. A dynamic tool never replaces a
+    /// tool already in the builder (#6559 D04-10): `with_tool` treats a
+    /// repeated name as a planned upgrade, which let a client's `exec_shell`
+    /// or `read` silently take over the builtin handler and its approval
+    /// policy. The model-facing name is the bare `name`, so a second dynamic
+    /// tool with the same name in another namespace is refused the same way.
+    /// Both refusals are logged with the two origins.
+    ///
+    /// Known limitation: the refusal reaches the log, not the runtime client
+    /// that sent the spec; rejecting it at the API boundary, and exposing a
+    /// namespaced model-facing name, are protocol changes.
     #[must_use]
     pub fn with_dynamic_tools(mut self, dynamic_tools: &[DynamicToolSpec]) -> Self {
-        for tool in dynamic_tools {
-            self = self.with_tool(Arc::new(super::dynamic::RuntimeDynamicTool::new(
-                tool.clone(),
-            )));
+        for spec in dynamic_tools {
+            let tool: Arc<dyn ToolSpec> =
+                Arc::new(super::dynamic::RuntimeDynamicTool::new(spec.clone()));
+            if let Some(existing) = self
+                .tools
+                .iter()
+                .find(|existing| existing.name() == tool.name())
+            {
+                tracing::warn!(
+                    existing_origin = ?existing.registration_origin(),
+                    refused_origin = ?tool.registration_origin(),
+                    "Refusing runtime dynamic tool that collides with a registered tool: {}",
+                    crate::safe_label::SafeLabel::identifier(tool.name())
+                );
+                continue;
+            }
+            self.tools.push(tool);
         }
         self
     }
@@ -757,7 +995,7 @@ impl ToolRegistryBuilder {
 
     /// Include only read-only file tools (read, list).
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_read_only_file_tools(self) -> Self {
         use super::file::{ListDirTool, ReadFileTool};
         use super::file_tool::FileTool;
@@ -865,7 +1103,9 @@ impl ToolRegistryBuilder {
     /// sees a binary it can't actually use.
     #[must_use]
     pub fn with_pandoc_tools(self) -> Self {
-        if crate::dependencies::resolve_pandoc().is_some() {
+        if crate::dependencies::host_tool_available("pandoc_convert", || {
+            crate::dependencies::resolve_pandoc().is_some()
+        }) {
             use super::pandoc::PandocConvertTool;
             self.with_tool(Arc::new(PandocConvertTool))
         } else {
@@ -878,7 +1118,7 @@ impl ToolRegistryBuilder {
     /// Tesseract when installed.
     #[must_use]
     pub fn with_image_ocr_tools(self) -> Self {
-        if super::image_ocr::ocr_available() {
+        if crate::dependencies::host_tool_available("image_ocr", super::image_ocr::ocr_available) {
             use super::image_ocr::ImageOcrTool;
             self.with_tool(Arc::new(ImageOcrTool))
         } else {
@@ -1014,7 +1254,7 @@ impl ToolRegistryBuilder {
     pub fn with_vision_tools(
         self,
         config: crate::config::VisionModelConfig,
-        route_client: Option<DeepSeekClient>,
+        route_client: Option<CodewhaleClient>,
     ) -> Self {
         use crate::vision::tools::ImageAnalyzeTool;
         self.with_tool(Arc::new(ImageAnalyzeTool::new_with_route_client(
@@ -1023,11 +1263,14 @@ impl ToolRegistryBuilder {
         )))
     }
 
-    /// Include request_user_input tool.
+    /// Include request_user_input tool under the session's configured payload
+    /// ceilings (`[tools] user_input_max_questions` / `user_input_max_options`,
+    /// #5949). The limits ride the tool instance so the validator, the JSON
+    /// schema, and the model-visible description cannot drift apart.
     #[must_use]
-    pub fn with_user_input_tool(self) -> Self {
+    pub fn with_user_input_tool(self, limits: super::user_input::UserInputLimits) -> Self {
         use super::user_input::RequestUserInputTool;
-        self.with_tool(Arc::new(RequestUserInputTool))
+        self.with_tool(Arc::new(RequestUserInputTool::new(limits)))
     }
 
     /// Include patch tools (`apply_patch`).
@@ -1048,11 +1291,12 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(RevertTurnTool))
     }
 
-    /// Include Xiaomi MiMo speech/TTS tools (`speech`, `tts`).
+    /// Include the speech/TTS tool: `speech` is model-visible, `tts` is a
+    /// hidden compat alias for saved-transcript replay (#5941).
     #[must_use]
     pub fn with_speech_tools(
         self,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         output_dir: Option<PathBuf>,
     ) -> Self {
         use super::speech::SpeechTool;
@@ -1061,16 +1305,14 @@ impl ToolRegistryBuilder {
             client.clone(),
             output_dir.clone(),
         )))
-        .with_tool(Arc::new(SpeechTool::new("tts", client, output_dir)))
+        .with_tool(Arc::new(SpeechTool::alias("tts", client, output_dir)))
     }
 
     /// Include the canonical persistent RLM session tool.
     #[must_use]
-    pub fn with_rlm_tool(self, client: Option<DeepSeekClient>, root_model: String) -> Self {
+    pub fn with_rlm_tool(self) -> Self {
         use super::rlm::RlmTool;
-        self.with_tool(Arc::new(
-            RlmTool::new("rlm", client).with_root_model(root_model),
-        ))
+        self.with_tool(Arc::new(RlmTool::new(super::rlm::RLM_TOOL_NAME)))
     }
 
     /// Include the persistent, project-scoped continual-harness controller.
@@ -1090,7 +1332,7 @@ impl ToolRegistryBuilder {
 
     /// Include the review tool.
     #[must_use]
-    pub fn with_review_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn with_review_tool(self, client: Option<CodewhaleClient>, model: String) -> Self {
         use super::review::ReviewTool;
         self.with_tool(Arc::new(ReviewTool::new(client, model)))
     }
@@ -1099,7 +1341,7 @@ impl ToolRegistryBuilder {
     /// critic runs at elevated reasoning (default `Max`) independent of the
     /// session tier and is given no tools, so it cannot recurse into `verify`.
     #[must_use]
-    pub fn with_verify_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn with_verify_tool(self, client: Option<CodewhaleClient>, model: String) -> Self {
         use super::verify::VerifyTool;
         self.with_tool(Arc::new(VerifyTool::new(client, model)))
     }
@@ -1113,7 +1355,7 @@ impl ToolRegistryBuilder {
 
     /// Include the FIM (Fill-in-the-Middle) edit tool.
     #[must_use]
-    pub fn with_fim_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn with_fim_tool(self, client: Option<CodewhaleClient>, model: String) -> Self {
         use super::fim::FimEditTool;
         self.with_tool(Arc::new(FimEditTool::new(client, model)))
     }
@@ -1134,6 +1376,15 @@ impl ToolRegistryBuilder {
         use super::native_memory::{MemoryGetTool, MemorySearchTool};
         self.with_tool(Arc::new(MemorySearchTool))
             .with_tool(Arc::new(MemoryGetTool))
+    }
+
+    /// Include the prior-session recall tools (#5715). Always-on: they are
+    /// read-only and workspace-scoped, so there is no opt-in to honor.
+    #[must_use]
+    pub fn with_session_recall_tools(self) -> Self {
+        use super::session::{SessionGetTool, SessionSearchTool};
+        self.with_tool(Arc::new(SessionSearchTool))
+            .with_tool(Arc::new(SessionGetTool))
     }
 
     /// Include the model-facing LSP intelligence tools. They reuse the
@@ -1181,8 +1432,10 @@ impl ToolRegistryBuilder {
         // Snapshot the current tool list from the pool (non-blocking).
         // The adapter lazily resolves at execution time via the pool.
         if let Ok(pool) = mcp_pool.try_lock() {
+            let tool_servers = pool.resolved_tool_servers();
             for (name, tool) in pool.all_tools() {
                 let adapter = Arc::new(McpToolAdapter {
+                    server_name: tool_servers.get(&name).cloned(),
                     name: name.clone(),
                     tool: tool.clone(),
                     pool: mcp_pool.clone(),
@@ -1234,12 +1487,16 @@ impl ToolRegistryBuilder {
 
     /// Include all agent tools under a typed shell policy.
     #[must_use]
-    pub fn with_agent_tools_policy(self, shell_policy: crate::worker_profile::ShellPolicy) -> Self {
+    pub fn with_agent_tools_policy(
+        self,
+        shell_policy: crate::worker_profile::ShellPolicy,
+        user_input_limits: super::user_input::UserInputLimits,
+    ) -> Self {
         let builder = self
             .with_file_tools()
             .with_note_tool()
             .with_search_tools()
-            .with_user_input_tool()
+            .with_user_input_tool(user_input_limits)
             .with_git_tools()
             .with_git_history_tools()
             .with_diagnostics_tool()
@@ -1272,7 +1529,7 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn with_agent_runtime_surface(
         self,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         model: String,
         options: AgentToolSurfaceOptions,
         todo_list: super::todo::SharedTodoList,
@@ -1283,14 +1540,19 @@ impl ToolRegistryBuilder {
         let verify_client = client.clone();
         let verify_model = model.clone();
         let mut builder = self
-            .with_agent_tools_policy(options.shell_policy)
+            .with_agent_tools_policy(options.shell_policy, options.user_input_limits)
             .with_todo_tool(todo_list)
             .with_plan_tool(plan_state)
             .with_review_tool(client.clone(), model.clone())
-            .with_rlm_tool(client.clone(), model.clone())
+            .with_rlm_tool()
             .with_harness_tool()
-            .with_fim_tool(client, model)
-            .with_speech_tools(speech_client, options.speech_output_dir.clone());
+            .with_fim_tool(client, model);
+
+        // No client means no speech provider to call: do not advertise a
+        // capability the session cannot deliver (#5941).
+        if speech_client.is_some() {
+            builder = builder.with_speech_tools(speech_client, options.speech_output_dir.clone());
+        }
 
         if options.verify_tool_enabled {
             builder = builder.with_verify_tool(verify_client, verify_model);
@@ -1311,9 +1573,11 @@ impl ToolRegistryBuilder {
             builder = builder.with_vision_tools(vision_config, vision_client);
         }
 
-        builder
-            .with_notify_tool()
-            .with_request_plugin_install_tool()
+        builder = builder.with_notify_tool();
+        if options.request_plugin_install_enabled {
+            builder = builder.with_request_plugin_install_tool();
+        }
+        builder.with_session_recall_tools()
     }
 
     /// Include the full child-inherited Agent surface under resolved
@@ -1322,7 +1586,7 @@ impl ToolRegistryBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn with_full_agent_surface_options(
         self,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         model: String,
         manager: super::subagent::SharedSubAgentManager,
         runtime: super::subagent::SubAgentRuntime,
@@ -1386,13 +1650,6 @@ impl ToolRegistryBuilder {
         use super::subagent::AgentTool;
         use super::subagent::register_coordination_tools;
         use super::workflow::WorkflowTool;
-        use super::workflow_trigger::soft_auto_policy_is_linked;
-
-        // Keep soft-auto trigger policy linked in release builds (#4127).
-        debug_assert!(
-            soft_auto_policy_is_linked(),
-            "workflow soft-auto policy must stay linked"
-        );
 
         let builder = self
             .with_tool(Arc::new(WorkflowTool::new(
@@ -1409,8 +1666,17 @@ impl ToolRegistryBuilder {
     /// Build the registry with the given context.
     #[must_use]
     pub fn build(self, context: ToolContext) -> ToolRegistry {
+        // A route known to be text-only cannot see what `read_media` returns,
+        // so it is not offered there (`image_ocr` remains for text in images).
+        let blind = context.route_capabilities.image_input
+            == codewhale_config::route::CapabilityState::Unsupported;
         let mut registry = ToolRegistry::new(context);
-        registry.register_all(self.tools);
+        registry.register_all(
+            self.tools
+                .into_iter()
+                .filter(|tool| !(blind && tool.name() == "read_media"))
+                .collect(),
+        );
         registry
     }
 }
@@ -1441,6 +1707,8 @@ fn to_snake_case(s: &str) -> String {
 /// unified `ToolRegistry` alongside native tools (§5.B).
 struct McpToolAdapter {
     name: String,
+    /// Diagnostic snapshot from the pool's exact route projection.
+    server_name: Option<String>,
     tool: crate::mcp::McpTool,
     pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
 }
@@ -1460,6 +1728,23 @@ fn is_mcp_read_helper(name: &str) -> bool {
 impl ToolSpec for McpToolAdapter {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn registration_origin(&self) -> std::borrow::Cow<'_, str> {
+        use crate::safe_label::SafeLabel;
+        match &self.server_name {
+            Some(server) => format!(
+                "MCP server {}, tool {}",
+                SafeLabel::identifier(server),
+                SafeLabel::identifier(&self.tool.name)
+            )
+            .into(),
+            None => format!(
+                "MCP tool {} (server unknown)",
+                SafeLabel::identifier(&self.name)
+            )
+            .into(),
+        }
     }
 
     fn description(&self) -> &str {
@@ -1504,11 +1789,22 @@ impl ToolSpec for McpToolAdapter {
     async fn execute_rich(
         &self,
         input: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<RichToolResult, ToolError> {
         let mut pool = self.pool.lock().await;
+        if let Some(plugins) = context.plugin_registry.as_ref() {
+            pool.bind_caller_plugins(Arc::clone(plugins))
+                .map_err(|error| ToolError::not_available(error.to_string()))?;
+        }
+        pool.validate_native_caller(context.plugin_registry.as_deref())
+            .map_err(|error| ToolError::not_available(error.to_string()))?;
         let result = pool
-            .call_tool(&self.name, input)
+            .call_tool_with_disallowed(
+                &self.name,
+                input,
+                &context.disallowed_tools,
+                context.human_decision.as_ref(),
+            )
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
         Ok(mcp_result_to_bounded_rich_tool_result(result))
@@ -1596,10 +1892,12 @@ pub(crate) fn mcp_result_to_bounded_rich_tool_result(result: Value) -> RichToolR
 pub(super) fn mcp_tool_adapter_for_test(name: &str) -> Arc<dyn ToolSpec> {
     Arc::new(McpToolAdapter {
         name: name.to_string(),
+        server_name: None,
         tool: crate::mcp::McpTool {
             name: name.to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
         },
         pool: Arc::new(tokio::sync::Mutex::new(crate::mcp::McpPool::new(
             crate::mcp::McpConfig::default(),

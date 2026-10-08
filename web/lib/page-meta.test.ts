@@ -26,6 +26,7 @@ describe("page metadata", () => {
     ["ru", "/faq", "FAQ · Codewhale", "en_US", "en"],
     ["uk", "/faq", "FAQ · Codewhale", "en_US", "en"],
     ["pt-BR", "/install", "Install · Codewhale", "en_US", "en"],
+    ["zh", "/install", "安装 · Codewhale", "en_US", "en"],
     ["ja", "/", "Codewhale", "ja_JP", "ja"],
   ])(
     "builds canonical, hreflang, Open Graph, and Twitter fields for %s%s",
@@ -70,12 +71,11 @@ describe("page metadata", () => {
   it("advertises only genuine page-body translations", () => {
     for (const [path, locale, expectedLocales, expectedCanonical] of [
       ["/", "ja", locales, `${SITE_URL}/ja`],
-      [
-        "/docs/guide",
-        "fr",
-        ["en", "zh", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"],
-        `${SITE_URL}/fr/docs/guide`,
-      ],
+      // The guide's steps (its body) ship en/zh only; a French overview
+      // dictionary does not make the page a French translation.
+      ["/docs/guide", "fr", ["en", "zh"], `${SITE_URL}/en/docs/guide`],
+      // /computer-use renders only from its per-locale dictionary.
+      ["/computer-use", "ja", locales, `${SITE_URL}/ja/computer-use`],
       [
         "/docs/guide",
         "ja",
@@ -83,6 +83,7 @@ describe("page metadata", () => {
         `${SITE_URL}/en/docs/guide`,
       ],
       ["/docs", "ja", ["en", "zh"], `${SITE_URL}/en/docs`],
+      ["/install", "zh", ["en"], `${SITE_URL}/en/install`],
     ] as const) {
       const metadata = buildPageMetadata({
         path,
@@ -100,7 +101,7 @@ describe("page metadata", () => {
     const brand = new RegExp(`\\b${SITE_NAME}\\b`, "gi");
     const ogImage = readFileSync(new URL("../app/opengraph-image.tsx", import.meta.url), "utf8");
 
-    expect(IDENTITY_PHRASE).toBe("Codewhale dives into the deep so you don't have to.");
+    expect(IDENTITY_PHRASE.startsWith(`${SITE_NAME} — `)).toBe(true);
     expect(OG_ALT).toBe(IDENTITY_PHRASE);
     expect(OG_ALT.match(brand)).toHaveLength(1);
     expect(ogImage).toContain("{IDENTITY_PHRASE}");
@@ -112,7 +113,6 @@ describe("page metadata", () => {
       ["faq", "/faq"],
       ["feed", "/feed"],
       ["roadmap", "/roadmap"],
-      ["pricing", "/pricing"],
       ["legal/terms", "/legal/terms"],
       ["legal/privacy", "/legal/privacy"],
     ]) {
@@ -124,5 +124,16 @@ describe("page metadata", () => {
       expect(source, route).toContain("return buildPageMetadata({");
       expect(source, route).toContain(`path: "${path}"`);
     }
+  });
+
+  it("omits robots by default and passes an explicit noindex through", () => {
+    const base = { path: "/digest", locale: "en", title: "Digest · Codewhale", description: "d" };
+    expect(buildPageMetadata(base)).not.toHaveProperty("robots");
+
+    const noindex = buildPageMetadata({ ...base, robots: { index: false, follow: true } });
+    expect(noindex.robots).toEqual({ index: false, follow: true });
+    // Canonical and social fields are unchanged by the robots option.
+    expect(noindex.alternates).toEqual(buildPageMetadata(base).alternates);
+    expect(noindex.openGraph).toEqual(buildPageMetadata(base).openGraph);
   });
 });

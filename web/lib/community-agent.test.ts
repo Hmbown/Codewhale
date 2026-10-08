@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { validateSession } from "./community-agent";
+import { logUsage, validateSession } from "./community-agent";
 
 describe("validateSession", () => {
   let mockKV: {
@@ -79,5 +79,22 @@ describe("validateSession", () => {
     const result = await validateSession(kv, sid);
     expect(result).toBe(true);
     expect(mockKV.get).toHaveBeenCalledWith(SESSION_PREFIX + sid);
+  });
+});
+
+describe("logUsage", () => {
+  it("keeps every call when cron tasks log at the same time", async () => {
+    // A KV whose reads resolve before either write lands, as overlapping
+    // Worker invocations see it.
+    const store = new Map<string, string>();
+    const kv = {
+      get: async (key: string) => { await new Promise((resolve) => setTimeout(resolve, 5)); return store.get(key) ?? null; },
+      put: async (key: string, value: string) => { await new Promise((resolve) => setTimeout(resolve, 5)); store.set(key, value); },
+    } as unknown as Parameters<typeof logUsage>[0];
+    await Promise.all([logUsage(kv, 100, 10), logUsage(kv, 200, 20), logUsage(kv, 300, 30)]);
+    const records = [...store.values()].map((value) => JSON.parse(value) as { calls: number; inputTokens: number });
+    expect(records.reduce((sum, record) => sum + record.calls, 0)).toBe(3);
+    expect(records.reduce((sum, record) => sum + record.inputTokens, 0)).toBe(600);
+    expect([...store.keys()].every((key) => key.startsWith(`usage:${new Date().toISOString().slice(0, 10)}`))).toBe(true);
   });
 });

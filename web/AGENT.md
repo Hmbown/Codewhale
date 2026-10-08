@@ -1,6 +1,6 @@
 # Community Assistant Agent
 
-The community assistant is a set of Cloudflare Cron Triggers that call `deepseek-v4-flash` to draft triage comments, PR reviews, stale-issue nudges, duplicate suggestions, and weekly digests. **It never posts to GitHub directly.** Every output is a draft staged in Workers KV for maintainer review.
+The community assistant is a set of Cloudflare Cron Triggers that call `deepseek-flash` to draft triage comments, PR reviews, stale-issue nudges, duplicate suggestions, and weekly digests. **It never posts to GitHub directly.** Every output is a draft staged in Workers KV for maintainer review.
 
 ## Architecture
 
@@ -26,8 +26,21 @@ suffix over the finding's full identity, max 80 chars — so unchanged findings
 dedup and changed findings land as new drafts. Semantic-drift model output is
 validated and capped (10 drafts/run) before any KV writes.
 
-Usage logged to:
-  usage:<YYYY-MM-DD>
+Before sending a GitHub post, the action records its target/text identity in the
+existing durable claim object and KV. Read or write failures post nothing.
+The durable receipt survives lease expiry; retries with changed text or target
+are refused while unresolved. Reconciliation searches up to ten pages under
+one 30-second deadline and a per-page byte cap; an incomplete search posts
+nothing. The KV fallback has eventual-consistency limits; deployment of the
+existing durable binding still needs its own receipt.
+
+A post whose GitHub outcome was unknown (network error, 5xx, 408, 429) leaves
+  draft-post-unknown:<type>:<id>              (until resolved; the next post of that
+                                               draft first looks on GitHub for
+                                               the earlier attempt's post)
+
+Usage logged to (one record per model call; sum the day's prefix):
+  usage:<YYYY-MM-DD>:<timestamp>:<uuid>
 ```
 
 ## Cron schedule
@@ -56,19 +69,22 @@ All drafts follow these rules:
 
 - Each cron invocation caps at ~30k input tokens and ~2k output tokens.
 - Issue/PR bodies are truncated to 1000–4000 chars before sending to the model.
-- Deduplication: `hasFreshDraft` checks if a draft already exists that's newer than the item's `updated_at`. Skips if so.
-- Token usage is logged to `usage:<YYYY-MM-DD>` KV keys (retained 90 days).
+- Deduplication: the existing `DRAFT_CLAIM_LOCK` authority serializes each cron task before source reads or model calls (45-minute crash lease, then a two-minute propagation hold). Missing KV or lock bindings skip generation before spending. Inside the claim, `hasFreshDraft` skips drafts newer than the item's `updated_at`.
+- Token usage is logged as one `usage:<YYYY-MM-DD>:…` KV record per model call
+  (retained 90 days); list the day's prefix and sum `calls`/`inputTokens`/
+  `outputTokens`. Records are append-only because KV has no atomic increment.
 - If `DEEPSEEK_API_KEY` is missing or the API errors, the cron returns 200 with `{ skipped: true, reason }` — never crashes, never retry-loops.
 
 ## Maintainer review surface
 
-Access at `/admin?token=<MAINTAINER_TOKEN>`.
+Open `/en/admin` (or `/zh/admin`) and enter `MAINTAINER_TOKEN` in the login
+form. The form posts to `/api/admin/login`; the token never goes in the URL.
 
 - Lists all pending drafts with source link, draft body, and three actions:
   - **Post as comment** — calls GitHub REST API using `MAINTAINER_GITHUB_PAT`
   - **Edit & post** — opens a textarea for editing before posting
   - **Discard** — removes the draft from KV
-- The auth token is set via `MAINTAINER_TOKEN` env var. Access sets an `mt` cookie for the session.
+- The auth token is set via `MAINTAINER_TOKEN` env var. A successful login sets an httpOnly `mt_sid` session cookie that lasts 24 hours.
 - **Nothing posts to GitHub without an explicit maintainer click.**
 
 ## Environment variables

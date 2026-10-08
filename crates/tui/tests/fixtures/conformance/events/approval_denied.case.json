@@ -1,0 +1,151 @@
+{
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "approval_mode": "suggest",
+  "auto_approve": false,
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "workspace_files": {
+    "README.md": "conformance fixture\n"
+  },
+  "description": "A mutating shell call that needs approval under `suggest`; the host denies it. The command never runs, the model sees the denial as the tool result, and the turn continues to a final answer.",
+  "user_message": "Create denied.txt with touch.",
+  "provider_script": [
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_shell",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 120,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "call_touch",
+            "name": "Bash",
+            "input": {}
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"command\":\"touch denied.txt\"}"
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 150,
+            "output_tokens": 15
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "type": "message_start",
+          "message": {
+            "id": "msg_shell_answer",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "deepseek-v4-pro",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 200,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "text",
+            "text": ""
+          }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "Understood, I did not create it."
+          }
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "end_turn"
+          },
+          "usage": {
+            "input_tokens": 200,
+            "output_tokens": 6
+          }
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    }
+  ],
+  "driver": [
+    {
+      "when": {
+        "event": "approval_required"
+      },
+      "action": "deny"
+    }
+  ],
+  "invariants": [
+    {
+      "workspace_file_absent": "denied.txt"
+    },
+    {
+      "max_model_requests": 2
+    }
+  ]
+}

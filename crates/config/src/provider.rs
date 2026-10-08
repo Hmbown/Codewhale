@@ -5,38 +5,13 @@
 //! providers; `ConfigToml::resolve_runtime_options` now mints the executable
 //! route through `RouteResolver` (Phase 1). Auth/key resolution stays here.
 
-use super::{
-    DEFAULT_ANTIGRAVITY_BASE_URL, DEFAULT_ANTIGRAVITY_MODEL, DEFAULT_ARCEE_BASE_URL,
-    DEFAULT_ARCEE_MODEL, DEFAULT_ATLASCLOUD_BASE_URL, DEFAULT_ATLASCLOUD_MODEL,
-    DEFAULT_CONCENTRATE_BASE_URL, DEFAULT_CONCENTRATE_MODEL, DEFAULT_DEEPINFRA_BASE_URL,
-    DEFAULT_DEEPINFRA_MODEL, DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL, DEFAULT_DEEPSEEK_ANTHROPIC_MODEL,
-    DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_EDENAI_BASE_URL,
-    DEFAULT_EDENAI_MODEL, DEFAULT_FIREWORKS_BASE_URL, DEFAULT_FIREWORKS_MODEL,
-    DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL, DEFAULT_HUGGINGFACE_BASE_URL,
-    DEFAULT_HUGGINGFACE_MODEL, DEFAULT_LONGCAT_BASE_URL, DEFAULT_LONGCAT_MODEL,
-    DEFAULT_META_BASE_URL, DEFAULT_META_MODEL, DEFAULT_MINIMAX_ANTHROPIC_BASE_URL,
-    DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_MODEL, DEFAULT_MISTRAL_BASE_URL,
-    DEFAULT_MISTRAL_MODEL, DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
-    DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL, DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL,
-    DEFAULT_MOONSHOT_BASE_URL, DEFAULT_MOONSHOT_MODEL, DEFAULT_NOVITA_BASE_URL,
-    DEFAULT_NOVITA_MODEL, DEFAULT_NVIDIA_NIM_BASE_URL, DEFAULT_NVIDIA_NIM_MODEL,
-    DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_CLOUD_BASE_URL, DEFAULT_OLLAMA_CLOUD_MODEL,
-    DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_CODEX_BASE_URL,
-    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENCODE_GO_BASE_URL,
-    DEFAULT_OPENCODE_GO_MODEL, DEFAULT_OPENCODE_ZEN_BASE_URL, DEFAULT_OPENCODE_ZEN_MODEL,
-    DEFAULT_OPENMODEL_BASE_URL, DEFAULT_OPENMODEL_MODEL, DEFAULT_OPENROUTER_BASE_URL,
-    DEFAULT_OPENROUTER_MODEL, DEFAULT_ORCAROUTER_BASE_URL, DEFAULT_ORCAROUTER_MODEL,
-    DEFAULT_QIANFAN_BASE_URL, DEFAULT_QIANFAN_MODEL, DEFAULT_SAKANA_BASE_URL, DEFAULT_SAKANA_MODEL,
-    DEFAULT_SGLANG_BASE_URL, DEFAULT_SGLANG_MODEL, DEFAULT_SILICONFLOW_BASE_URL,
-    DEFAULT_SILICONFLOW_CN_BASE_URL, DEFAULT_SILICONFLOW_MODEL, DEFAULT_STEPFUN_BASE_URL,
-    DEFAULT_STEPFUN_MODEL, DEFAULT_TELECOMJS_BASE_URL, DEFAULT_TELECOMJS_MODEL,
-    DEFAULT_TOGETHER_BASE_URL, DEFAULT_TOGETHER_MODEL, DEFAULT_VLLM_BASE_URL, DEFAULT_VLLM_MODEL,
-    DEFAULT_VOLCENGINE_BASE_URL, DEFAULT_VOLCENGINE_MODEL, DEFAULT_WANJIE_ARK_BASE_URL,
-    DEFAULT_WANJIE_ARK_MODEL, DEFAULT_XAI_BASE_URL, DEFAULT_XAI_MODEL,
-    DEFAULT_XIAOMI_MIMO_BASE_URL, DEFAULT_XIAOMI_MIMO_MODEL, DEFAULT_ZAI_BASE_URL,
-    DEFAULT_ZAI_MODEL, MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL,
-    MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL, ProviderKind,
+use crate::ProviderKind;
+pub use crate::descriptors::defaults::{
+    CODEWHALE_API_BASE_ENV, CODEWHALE_API_KEY_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+    OLLAMA_CLOUD_API_KEY_URL, OLLAMA_CLOUD_BASE_URL, OPENAI_DEFAULT_MODEL,
 };
+use crate::descriptors::{self, BuiltinProviderDescriptor};
+use std::sync::OnceLock;
 
 /// Wire protocol spoken by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -135,24 +110,33 @@ pub struct CredentialHelp {
     pub guidance: &'static str,
 }
 
-/// Kimi Code's membership-plan key console.
+/// Resolve the Codewhale API base URL from the environment.
 ///
-/// This is intentionally distinct from Moonshot's direct API console.  The
-/// route-specific helper below owns the choice so a configured Kimi Code route
-/// is never described as a generic Moonshot route.
-pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str = "https://www.kimi.com/code/console";
+/// Returns `None` when the variable is unset, empty, or names an origin this
+/// route refuses to send a `cwc_key_…` bearer to. A bearer token has no replay
+/// protection, so cleartext is allowed only on loopback — the same rule the
+/// account control plane applies to `CODEWHALE_CLOUD_API_BASE`.
+#[must_use]
+pub fn codewhale_api_base_from_env() -> Option<String> {
+    let raw = std::env::var(CODEWHALE_API_BASE_ENV).ok()?;
+    codewhale_api_base(&raw)
+}
 
-/// Ollama's account page for creating API keys used by the hosted API.
-pub const OLLAMA_CLOUD_API_KEY_URL: &str = "https://ollama.com/settings/keys";
-
-/// Ollama Cloud's exact OpenAI-compatible API base URL.
-pub const OLLAMA_CLOUD_BASE_URL: &str = DEFAULT_OLLAMA_CLOUD_BASE_URL;
-
-/// OpenAI's default model for its first-party API endpoint.
-///
-/// Public consumers should use this provider-owned value instead of copying
-/// the default into another configuration layer.
-pub const OPENAI_DEFAULT_MODEL: &str = DEFAULT_OPENAI_MODEL;
+/// Validate one candidate Codewhale API base URL. See [`codewhale_api_base_from_env`].
+#[must_use]
+pub fn codewhale_api_base(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (scheme, host, has_credentials) = crate::device_code::url_scheme_and_host(trimmed).ok()?;
+    if has_credentials {
+        return None;
+    }
+    let allowed =
+        scheme == "https" || (scheme == "http" && crate::device_code::is_loopback_host(&host));
+    allowed.then(|| trimmed.to_string())
+}
 
 /// Static metadata for a built-in model provider.
 pub trait Provider: Send + Sync {
@@ -206,273 +190,7 @@ pub trait Provider: Send + Sync {
 /// inherit a default endpoint's console.
 #[must_use]
 pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
-    use CredentialAcquisition::{ApiKey, ApiKeyOrOAuth, Configuration, LocalOptional, OAuth};
-
-    match kind {
-        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://platform.deepseek.com/api_keys"),
-            docs_url: Some("https://api-docs.deepseek.com/"),
-            guidance: "Create an API key in the DeepSeek platform console.",
-        },
-        ProviderKind::NvidiaNim => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://build.nvidia.com/settings/api-keys"),
-            docs_url: Some("https://build.nvidia.com/explore/discover"),
-            guidance: "Create an NVIDIA NIM key in the NVIDIA build console.",
-        },
-        ProviderKind::Openai => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://platform.openai.com/api-keys"),
-            docs_url: Some("https://platform.openai.com/docs/api-reference"),
-            guidance: "Create an OpenAI API key, or configure the credential for your compatible endpoint.",
-        },
-        ProviderKind::Atlascloud => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://atlascloud.ai/docs/en/api-keys"),
-            docs_url: Some("https://atlascloud.ai/docs/en/api-keys"),
-            guidance: "Follow Atlas Cloud's API Keys guide to create a credential.",
-        },
-        ProviderKind::WanjieArk => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://docs.wanjiedata.com/maas/maas-openapi-v1.html"),
-            docs_url: Some("https://docs.wanjiedata.com/maas/maas-openapi-v1.html"),
-            guidance: "Follow Wanjie MaaS's APIKEY guide to create a credential.",
-        },
-        ProviderKind::Volcengine => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://console.volcengine.com/ark/apiKey"),
-            docs_url: Some("https://www.volcengine.com/docs/82379/1541594"),
-            guidance: "Create a Volcengine Ark API key in the Ark console.",
-        },
-        ProviderKind::Openrouter => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://openrouter.ai/settings/keys"),
-            docs_url: Some("https://openrouter.ai/docs/api/reference/authentication"),
-            guidance: "Create an OpenRouter key from account settings.",
-        },
-        ProviderKind::Orcarouter => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://www.orcarouter.ai"),
-            docs_url: Some("https://www.orcarouter.ai"),
-            guidance: "Create an OrcaRouter API key from the OrcaRouter dashboard.",
-        },
-        ProviderKind::XiaomiMimo => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://platform.xiaomimimo.com/token-plan"),
-            docs_url: Some("https://mimo.mi.com/docs/en-US/tokenplan/Token%20Plan/subscription"),
-            guidance: "Create a Xiaomi MiMo Token Plan or pay-as-you-go key and keep its matching base URL.",
-        },
-        ProviderKind::Novita => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://novita.ai/en/settings/key-management"),
-            docs_url: Some("https://novita.ai/docs/guides/quickstart"),
-            guidance: "Create a Novita key in account Key Management.",
-        },
-        ProviderKind::Fireworks => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://fireworks.ai/api-keys"),
-            docs_url: Some("https://docs.fireworks.ai/getting-started/quickstart"),
-            guidance: "Create a Fireworks API key before configuring the provider.",
-        },
-        ProviderKind::Siliconflow => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://cloud.siliconflow.com/account/ak"),
-            docs_url: Some("https://docs.siliconflow.com/en/userguide/quickstart"),
-            guidance: "Use the global SiliconFlow console for the global endpoint.",
-        },
-        ProviderKind::SiliconflowCN => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://cloud.siliconflow.cn/account/ak"),
-            docs_url: Some("https://docs.siliconflow.cn/en/userguide/quickstart"),
-            guidance: "Use the China SiliconFlow console for the China endpoint.",
-        },
-        ProviderKind::Arcee => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://docs.arcee.ai/other/create-your-first-api-key"),
-            docs_url: Some("https://docs.arcee.ai/other/create-your-first-api-key"),
-            guidance: "Follow Arcee's API key guide to create a credential.",
-        },
-        ProviderKind::Moonshot => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://platform.kimi.ai/console/api-keys"),
-            docs_url: Some("https://platform.kimi.ai/docs/overview"),
-            guidance: "For Moonshot's default direct API route, sign in to Kimi API Platform and create and copy an API key. A configured Kimi Code route uses a separate membership-plan console and never imports Kimi CLI credentials; first-class Kimi OAuth is not available.",
-        },
-        ProviderKind::Sglang => CredentialHelp {
-            acquisition: LocalOptional,
-            credential_url: None,
-            docs_url: Some("https://docs.sglang.ai/"),
-            guidance: "Self-hosted SGLang is keyless by default; configure a key only if your server requires one.",
-        },
-        ProviderKind::Vllm => CredentialHelp {
-            acquisition: LocalOptional,
-            credential_url: None,
-            docs_url: Some("https://docs.vllm.ai/en/stable/serving/openai_compatible_server/"),
-            guidance: "Self-hosted vLLM is keyless by default; configure a key only if your server requires one.",
-        },
-        ProviderKind::Ollama => CredentialHelp {
-            acquisition: LocalOptional,
-            credential_url: None,
-            docs_url: Some("https://docs.ollama.com/api"),
-            guidance: "Local Ollama is keyless by default; configure a key only if your server requires one.",
-        },
-        ProviderKind::OllamaCloud => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some(OLLAMA_CLOUD_API_KEY_URL),
-            docs_url: Some("https://docs.ollama.com/api/authentication"),
-            guidance: "Ollama Cloud requires an API key. Save it for the ollama-cloud provider, set OLLAMA_CLOUD_API_KEY for Pi compatibility, or set Ollama's official OLLAMA_API_KEY.",
-        },
-        ProviderKind::Huggingface => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://huggingface.co/settings/tokens"),
-            docs_url: Some("https://huggingface.co/docs/hub/en/security-tokens"),
-            guidance: "Create a scoped Hugging Face access token.",
-        },
-        ProviderKind::Together => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://api.together.ai/settings/api-keys"),
-            docs_url: Some("https://docs.together.ai/docs/api-keys-authentication"),
-            guidance: "Create a Together API key from account settings.",
-        },
-        ProviderKind::Qianfan => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://console.bce.baidu.com/iam/#/iam/accesslist"),
-            docs_url: Some("https://cloud.baidu.com/doc/qianfan/index.html"),
-            guidance: "Create Baidu Qianfan credentials in the Baidu Cloud console.",
-        },
-        ProviderKind::OpenaiCodex => CredentialHelp {
-            acquisition: OAuth,
-            credential_url: None,
-            docs_url: Some("https://developers.openai.com/codex/"),
-            guidance: "Sign in with ChatGPT via `codewhale auth chatgpt` (subscription billing, Codewhale-owned tokens). The openai API-key route is a different billing owner. Codex CLI import remains an explicit alternative after `codex login` plus `codewhale auth external-consent`.",
-        },
-        ProviderKind::Anthropic => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://console.anthropic.com/settings/keys"),
-            docs_url: Some("https://docs.anthropic.com/en/api/overview"),
-            guidance: "Create an Anthropic API key in the Anthropic Console.",
-        },
-        ProviderKind::Openmodel => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://console.openmodel.ai/"),
-            docs_url: Some("https://docs.openmodel.ai/en/docs/getting-started/authentication"),
-            guidance: "Create an API key in the OpenModel console, then follow the authentication guide.",
-        },
-        ProviderKind::Zai => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://z.ai/model-api"),
-            docs_url: Some("https://docs.z.ai/api-reference/introduction"),
-            guidance: "Create or manage a Z.ai API key from the Model API page.",
-        },
-        ProviderKind::Stepfun => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://platform.stepfun.ai/"),
-            docs_url: Some("https://platform.stepfun.ai/docs/en/quickstart/overview"),
-            guidance: "Open Account Management, then Interface Keys, in the StepFun console.",
-        },
-        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some(
-                "https://platform.minimax.io/user-center/basic-information/interface-key",
-            ),
-            docs_url: Some("https://platform.minimax.io/docs/api-reference/api-overview"),
-            guidance: "Create a MiniMax API key or subscription-plan key in the user center.",
-        },
-        ProviderKind::Deepinfra => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://deepinfra.com/dash/api_keys"),
-            docs_url: Some("https://docs.deepinfra.com/quickstart"),
-            guidance: "Create a DeepInfra API key from the dashboard.",
-        },
-        ProviderKind::Sakana => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://console.sakana.ai/api-keys"),
-            docs_url: Some("https://console.sakana.ai/get-started"),
-            guidance: "Create a Sakana AI key in the console and copy it when shown.",
-        },
-        ProviderKind::LongCat => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://longcat.chat/platform"),
-            docs_url: Some("https://longcat.chat/platform"),
-            guidance: "Sign up on the LongCat platform and create an API key.",
-        },
-        ProviderKind::OpencodeGo => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://opencode.ai/zen/"),
-            docs_url: Some("https://opencode.ai/docs/go/"),
-            guidance: "Create or copy an OpenCode Go subscription key from OpenCode Zen.",
-        },
-        ProviderKind::OpencodeZen => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://opencode.ai/zen/"),
-            docs_url: Some("https://opencode.ai/docs/zen/"),
-            guidance: "Create or copy an OpenCode Zen API key from OpenCode Zen.",
-        },
-        ProviderKind::Meta => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://developer.meta.com/ai/"),
-            docs_url: Some("https://developer.meta.com/ai/resources/blog/build-with-muse-spark/"),
-            guidance: "Use the Meta developer portal to obtain Model API access and a key.",
-        },
-        ProviderKind::Xai => CredentialHelp {
-            acquisition: ApiKeyOrOAuth,
-            credential_url: Some("https://console.x.ai/"),
-            docs_url: None,
-            guidance: "Use an xAI Console API key or Codewhale's native device login. Reading an existing Grok CLI file requires explicit provider-scoped read-only consent.",
-        },
-        ProviderKind::Mistral => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://console.mistral.ai/api-keys"),
-            docs_url: Some("https://docs.mistral.ai/"),
-            guidance: "Create a Mistral API key in the Mistral Console (la Plateforme).",
-        },
-        ProviderKind::Telecomjs => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://aigw.telecomjs.com/"),
-            docs_url: None,
-            guidance: "Create a TelecomJS TokenHub API key, then use the provider's live model catalog to discover the models available to that key.",
-        },
-        ProviderKind::Edenai => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://app.edenai.run/settings/api-keys"),
-            docs_url: Some("https://www.edenai.co/docs"),
-            guidance: "Create an Eden AI API key from the Eden AI dashboard, then select models by their provider/model namespaced id.",
-        },
-        ProviderKind::Concentrate => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://concentrate.ai/"),
-            docs_url: Some("https://concentrate.ai/docs/api-reference/introduction"),
-            guidance: "Create a Universal API key in the Concentrate dashboard (API Keys → Create API Key). Codewhale sends it only to the Concentrate base URL and never stores or forwards it elsewhere.",
-        },
-        ProviderKind::ModelstudioTokenPlan
-        | ProviderKind::ModelstudioTokenPlanAnthropic
-        | ProviderKind::ModelstudioCodingPlan
-        | ProviderKind::ModelstudioCodingPlanAnthropic => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://bailian.console.aliyun.com/"),
-            docs_url: Some("https://www.alibabacloud.com/help/en/model-studio/"),
-            guidance: "Sign in to Alibaba Cloud Model Studio (Bailian console), create or copy an API key, and select the plan endpoint matching your subscription (Token Plan or Coding Plan).",
-        },
-        ProviderKind::Antigravity => CredentialHelp {
-            acquisition: OAuth,
-            credential_url: None,
-            docs_url: Some("https://antigravity.google/docs/cli/reference"),
-            guidance: "Sign in with the official agy CLI (1.1.13). Codewhale can read that login's token read-only from the exact pinned state.vscdb after `codewhale auth external-consent`; it never writes or refreshes it. An ANTIGRAVITY_API_KEY or AGY_ADC_AUTH in the process wins over the file.",
-        },
-        ProviderKind::Google => CredentialHelp {
-            acquisition: ApiKey,
-            credential_url: Some("https://aistudio.google.com/apikey"),
-            docs_url: Some("https://ai.google.dev/gemini-api/docs/openai"),
-            guidance: "Create a Google AI Studio API key. Codewhale uses the official Gemini OpenAI-compatible endpoint and never reads Google OAuth files.",
-        },
-        ProviderKind::Custom => CredentialHelp {
-            acquisition: Configuration,
-            credential_url: None,
-            docs_url: None,
-            guidance: "Set this custom provider's base_url and api_key_env or api_key in configuration; no canonical vendor credential page exists.",
-        },
-    }
+    descriptors::builtin_provider_descriptor(kind).credential_help
 }
 
 fn is_exact_https_route(base_url: &str, expected_authority: &str, expected_path: &str) -> bool {
@@ -556,13 +274,20 @@ pub fn is_exact_xai_platform_route(kind: ProviderKind, base_url: &str) -> bool {
 /// Completions endpoints.
 ///
 /// Z.ai-only request fields must not leak to compatible gateways merely
-/// because they expose the same model id. Both the Coding Plan and general
-/// platform endpoints are first-party; neighboring paths remain distinct.
+/// because they expose the same model id. Both api.z.ai products (Coding
+/// Plan and general platform) and BigModel's general platform endpoint are
+/// first-party: `open.bigmodel.cn/api/paas/v4` is the same open platform
+/// whose docs prescribe the same `thinking` / `reasoning_effort` dialect
+/// (including the forced-thinking GLM-5.3 family), and the bundled catalog
+/// already lists it as the Z.ai catalog API. Neighboring paths — including
+/// BigModel's `/preview` — remain distinct, mirroring the web-search and
+/// official-endpoint families.
 #[must_use]
 pub fn is_exact_zai_chat_route(kind: ProviderKind, base_url: &str) -> bool {
     kind == ProviderKind::Zai
         && (is_exact_https_route(base_url, "api.z.ai", "api/coding/paas/v4")
-            || is_exact_https_route(base_url, "api.z.ai", "api/paas/v4"))
+            || is_exact_https_route(base_url, "api.z.ai", "api/paas/v4")
+            || is_exact_https_route(base_url, "open.bigmodel.cn", "api/paas/v4"))
 }
 
 /// Whether a configured route is one of MiniMax's exact first-party OpenAI
@@ -590,6 +315,18 @@ pub fn is_exact_minimax_anthropic_route(kind: ProviderKind, base_url: &str) -> b
             || is_exact_https_route(base_url, "api.minimaxi.com", "anthropic"))
 }
 
+/// Whether a configured route is exactly CSDN 星图's official OpenAI-compatible
+/// platform endpoint.
+///
+/// Coding Plan keys and general marketplace keys share this one endpoint, so
+/// the URL proves neither product — only that the route is first-party.
+/// Neighboring paths, HTTP downgrades, and lookalike hosts must not inherit
+/// CSDN billing or wire semantics.
+#[must_use]
+pub fn is_exact_csdn_platform_route(kind: ProviderKind, base_url: &str) -> bool {
+    kind == ProviderKind::Csdn && is_exact_https_route(base_url, "ai.csdn.net", "api/model/v1")
+}
+
 /// Return credential help for one concrete provider route.
 ///
 /// This protects non-UI callers such as diagnostics and command surfaces from
@@ -598,1237 +335,64 @@ pub fn is_exact_minimax_anthropic_route(kind: ProviderKind, base_url: &str) -> b
 #[must_use]
 pub fn credential_help_for_route(kind: ProviderKind, base_url: &str) -> CredentialHelp {
     if is_exact_ollama_cloud_route(kind, base_url) {
-        return CredentialHelp {
-            acquisition: CredentialAcquisition::ApiKey,
-            credential_url: Some(OLLAMA_CLOUD_API_KEY_URL),
-            docs_url: Some("https://docs.ollama.com/api/authentication"),
-            guidance: "Ollama Cloud requires an API key. Create one in Ollama account settings, then save it for the ollama-cloud provider, set OLLAMA_CLOUD_API_KEY for Pi compatibility, or set Ollama's official OLLAMA_API_KEY.",
-        };
+        return descriptors::OLLAMA_CLOUD_CREDENTIAL_HELP;
     }
-
     if is_exact_kimi_code_route(kind, base_url) {
-        return CredentialHelp {
-            acquisition: CredentialAcquisition::ApiKey,
-            credential_url: Some(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL),
-            docs_url: None,
-            guidance: "Create a Kimi Code membership-plan API key in the Kimi Code console. This route uses api.kimi.com/coding/v1; Codewhale does not import Kimi CLI credentials.",
-        };
+        return descriptors::KIMI_CODE_CREDENTIAL_HELP;
     }
-
     credential_help(kind)
 }
 
-macro_rules! provider {
-    (
-        $struct_name:ident,
-        $kind:ident,
-        $id:literal,
-        $display_name:literal,
-        $base_url:ident,
-        $model:ident,
-        [$($env_var:literal),* $(,)?],
-        $config_key:literal,
-        aliases: [$($alias:literal),* $(,)?]
-    ) => {
-        /// Zero-sized metadata entry for this built-in provider.
-        pub struct $struct_name;
-
-        impl Provider for $struct_name {
-            fn id(&self) -> &'static str {
-                $id
-            }
-
-            fn kind(&self) -> ProviderKind {
-                ProviderKind::$kind
-            }
-
-            fn display_name(&self) -> &'static str {
-                $display_name
-            }
-
-            fn default_base_url(&self) -> &'static str {
-                $base_url
-            }
-
-            fn default_model(&self) -> &'static str {
-                $model
-            }
-
-            fn env_vars(&self) -> &'static [&'static str] {
-                &[$($env_var),*]
-            }
-
-            fn provider_config_key(&self) -> &'static str {
-                $config_key
-            }
-
-            fn aliases(&self) -> &'static [&'static str] {
-                &[$($alias),*]
-            }
-        }
-    };
+impl Provider for BuiltinProviderDescriptor {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn display_name(&self) -> &'static str {
+        self.label
+    }
+    fn default_base_url(&self) -> &'static str {
+        self.base_url
+    }
+    fn default_model(&self) -> &'static str {
+        self.default_model
+    }
+    fn env_vars(&self) -> &'static [&'static str] {
+        self.env_vars
+    }
+    fn provider_config_key(&self) -> &'static str {
+        self.config_key
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        self.aliases
+    }
+    fn wire_policy(&self) -> WirePolicy {
+        self.wire_policy
+    }
+    fn credential_help(&self) -> CredentialHelp {
+        self.credential_help
+    }
 }
 
-/// Official DeepSeek route.
+static PROVIDER_REGISTRY: OnceLock<Vec<&'static dyn Provider>> = OnceLock::new();
+
+/// Return all built-in and legacy provider metadata entries.
 ///
-/// DeepSeek-V4-Flash-0731 is served over the Responses API while V4 Pro
-/// remains on Chat Completions until DeepSeek enables Responses support for
-/// it. Keep this provider model-aware so selecting Flash changes the actual
-/// wire contract instead of only changing the `model` string.
-pub struct Deepseek;
-
-impl Provider for Deepseek {
-    fn id(&self) -> &'static str {
-        "deepseek"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Deepseek
-    }
-
-    fn display_name(&self) -> &'static str {
-        "DeepSeek"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_DEEPSEEK_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_DEEPSEEK_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["DEEPSEEK_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "deepseek"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &[
-            "deep-seek",
-            "deepseek-cn",
-            "deepseek_china",
-            "deepseekcn",
-            "deepseek-china",
-            // Dialect is wire=anthropic on this provider, not a second catalog row.
-            "deepseek-anthropic",
-            "deepseek_anthropic",
-            "deepseek-claude",
-            "deepseek_claude",
-        ]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::ModelAware
-    }
-}
-
-/// Opt-in DeepSeek route that speaks the Anthropic Messages wire protocol.
-///
-/// Legacy kind kept for serde; parse/catalog collapse onto [`Deepseek`].
-pub struct DeepseekAnthropic;
-
-impl Provider for DeepseekAnthropic {
-    fn id(&self) -> &'static str {
-        "deepseek-anthropic"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::DeepseekAnthropic
-    }
-
-    fn display_name(&self) -> &'static str {
-        // Legacy dialect kind — catalog surface is "DeepSeek" with wire=anthropic.
-        "DeepSeek"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_DEEPSEEK_ANTHROPIC_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["DEEPSEEK_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "deepseek_anthropic"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::AnthropicMessages)
-    }
-}
-provider!(
-    NvidiaNim,
-    NvidiaNim,
-    "nvidia-nim",
-    "NVIDIA NIM",
-    DEFAULT_NVIDIA_NIM_BASE_URL,
-    DEFAULT_NVIDIA_NIM_MODEL,
-    // DEEPSEEK_API_KEY was listed here as a third fallback and silently
-    // transmitted a DeepSeek credential to NVIDIA's endpoint when a user
-    // with that variable exported switched providers. Removed (#5588);
-    // the legacy root api_key compatibility path stays DeepSeek-scoped.
-    ["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
-    "nvidia_nim",
-    aliases: ["nvidia", "nvidia_nim", "nim"]
-);
-provider!(
-    Openai,
-    Openai,
-    "openai",
-    "OpenAI-compatible",
-    DEFAULT_OPENAI_BASE_URL,
-    DEFAULT_OPENAI_MODEL,
-    ["OPENAI_API_KEY"],
-    "openai",
-    aliases: ["open-ai"]
-);
-provider!(
-    Atlascloud,
-    Atlascloud,
-    "atlascloud",
-    "AtlasCloud",
-    DEFAULT_ATLASCLOUD_BASE_URL,
-    DEFAULT_ATLASCLOUD_MODEL,
-    ["ATLASCLOUD_API_KEY"],
-    "atlascloud",
-    aliases: ["atlas-cloud", "atlas_cloud", "atlas"]
-);
-provider!(
-    WanjieArk,
-    WanjieArk,
-    "wanjie-ark",
-    "Wanjie Ark",
-    DEFAULT_WANJIE_ARK_BASE_URL,
-    DEFAULT_WANJIE_ARK_MODEL,
-    [
-        "WANJIE_ARK_API_KEY",
-        "WANJIE_API_KEY",
-        "WANJIE_MAAS_API_KEY"
-    ],
-    "wanjie_ark",
-    aliases: ["wanjie", "wanjie_ark", "ark-wanjie", "ark_wanjie", "wanjieark", "wanjie-maas", "wanjie_maas", "wanjiemaas"]
-);
-provider!(
-    Volcengine,
-    Volcengine,
-    "volcengine",
-    "Volcengine Ark",
-    DEFAULT_VOLCENGINE_BASE_URL,
-    DEFAULT_VOLCENGINE_MODEL,
-    [
-        "VOLCENGINE_API_KEY",
-        "VOLCENGINE_ARK_API_KEY",
-        "ARK_API_KEY"
-    ],
-    "volcengine",
-    aliases: ["volcengine-ark", "volcengine_ark", "ark", "volc-ark", "volcengineark"]
-);
-provider!(
-    Openrouter,
-    Openrouter,
-    "openrouter",
-    "OpenRouter",
-    DEFAULT_OPENROUTER_BASE_URL,
-    DEFAULT_OPENROUTER_MODEL,
-    ["OPENROUTER_API_KEY"],
-    "openrouter",
-    aliases: ["open_router"]
-);
-provider!(
-    Orcarouter,
-    Orcarouter,
-    "orcarouter",
-    "OrcaRouter",
-    DEFAULT_ORCAROUTER_BASE_URL,
-    DEFAULT_ORCAROUTER_MODEL,
-    ["ORCAROUTER_API_KEY"],
-    "orcarouter",
-    aliases: ["orca_router"]
-);
-provider!(
-    XiaomiMimo,
-    XiaomiMimo,
-    "xiaomi-mimo",
-    "Xiaomi MiMo",
-    DEFAULT_XIAOMI_MIMO_BASE_URL,
-    DEFAULT_XIAOMI_MIMO_MODEL,
-    [
-        "XIAOMI_MIMO_TOKEN_PLAN_API_KEY",
-        "MIMO_TOKEN_PLAN_API_KEY",
-        "XIAOMI_MIMO_API_KEY",
-        "XIAOMI_API_KEY",
-        "MIMO_API_KEY",
-    ],
-    "xiaomi_mimo",
-    aliases: ["xiaomi_mimo", "xiaomimimo", "mimo", "xiaomi"]
-);
-provider!(
-    Novita,
-    Novita,
-    "novita",
-    "Novita AI",
-    DEFAULT_NOVITA_BASE_URL,
-    DEFAULT_NOVITA_MODEL,
-    ["NOVITA_API_KEY"],
-    "novita",
-    // `novita-ai` is the id Models.dev publishes for this provider; without it a
-    // live/full Models.dev catalog row keyed `novita-ai` would fail to normalize
-    // onto ProviderKind::Novita (Refs #4186).
-    aliases: ["novita-ai", "novita_ai"]
-);
-provider!(
-    Fireworks,
-    Fireworks,
-    "fireworks",
-    "Fireworks AI",
-    DEFAULT_FIREWORKS_BASE_URL,
-    DEFAULT_FIREWORKS_MODEL,
-    ["FIREWORKS_API_KEY"],
-    "fireworks",
-    aliases: ["fireworks-ai"]
-);
-provider!(
-    Siliconflow,
-    Siliconflow,
-    "siliconflow",
-    "SiliconFlow",
-    DEFAULT_SILICONFLOW_BASE_URL,
-    DEFAULT_SILICONFLOW_MODEL,
-    ["SILICONFLOW_API_KEY"],
-    "siliconflow",
-    aliases: ["silicon-flow", "silicon_flow"]
-);
-provider!(
-    SiliconflowCN,
-    SiliconflowCN,
-    "siliconflow-CN",
-    "SiliconFlow (China)",
-    DEFAULT_SILICONFLOW_CN_BASE_URL,
-    DEFAULT_SILICONFLOW_MODEL,
-    ["SILICONFLOW_API_KEY"],
-    "siliconflow_cn",
-    aliases: [
-        "silicon-flow-cn",
-        "silicon-flow-CN",
-        "silicon_flow_cn",
-        "silicon_flow_CN",
-        "siliconflow-china",
-    ]
-);
-provider!(
-    Arcee,
-    Arcee,
-    "arcee",
-    "Arcee AI",
-    DEFAULT_ARCEE_BASE_URL,
-    DEFAULT_ARCEE_MODEL,
-    ["ARCEE_API_KEY"],
-    "arcee",
-    aliases: ["arcee-ai", "arcee_ai"]
-);
-provider!(
-    Moonshot,
-    Moonshot,
-    "moonshot",
-    "Moonshot/Kimi",
-    DEFAULT_MOONSHOT_BASE_URL,
-    DEFAULT_MOONSHOT_MODEL,
-    ["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-    "moonshot",
-    // `moonshotai` is the id Models.dev publishes for Moonshot/Kimi; without
-    // it a live/full Models.dev catalog row keyed `moonshotai` would fail to
-    // normalize onto ProviderKind::Moonshot (Refs #4186).
-    aliases: ["moonshot-ai", "moonshotai", "moonshot_ai", "kimi", "kimi-k2"]
-);
-provider!(
-    Sglang,
-    Sglang,
-    "sglang",
-    "SGLang",
-    DEFAULT_SGLANG_BASE_URL,
-    DEFAULT_SGLANG_MODEL,
-    ["SGLANG_API_KEY"],
-    "sglang",
-    aliases: ["sg-lang"]
-);
-provider!(
-    Vllm,
-    Vllm,
-    "vllm",
-    "vLLM",
-    DEFAULT_VLLM_BASE_URL,
-    DEFAULT_VLLM_MODEL,
-    ["VLLM_API_KEY"],
-    "vllm",
-    aliases: ["v-llm"]
-);
-provider!(
-    Ollama,
-    Ollama,
-    "ollama",
-    "Ollama",
-    DEFAULT_OLLAMA_BASE_URL,
-    DEFAULT_OLLAMA_MODEL,
-    ["OLLAMA_API_KEY"],
-    "ollama",
-    aliases: ["ollama-local"]
-);
-provider!(
-    OllamaCloud,
-    OllamaCloud,
-    "ollama-cloud",
-    "Ollama Cloud",
-    DEFAULT_OLLAMA_CLOUD_BASE_URL,
-    DEFAULT_OLLAMA_CLOUD_MODEL,
-    ["OLLAMA_CLOUD_API_KEY", "OLLAMA_API_KEY"],
-    "ollama_cloud",
-    aliases: ["ollama_cloud"]
-);
-provider!(
-    Huggingface,
-    Huggingface,
-    "huggingface",
-    "Hugging Face",
-    DEFAULT_HUGGINGFACE_BASE_URL,
-    DEFAULT_HUGGINGFACE_MODEL,
-    ["HUGGINGFACE_API_KEY", "HF_TOKEN"],
-    "huggingface",
-    aliases: ["hugging-face", "hugging_face", "hf"]
-);
-provider!(
-    Together,
-    Together,
-    "together",
-    "Together AI",
-    DEFAULT_TOGETHER_BASE_URL,
-    DEFAULT_TOGETHER_MODEL,
-    ["TOGETHER_API_KEY"],
-    "together",
-    // `togetherai` (no separator) is the id Models.dev publishes for Together;
-    // the hyphen/underscore spellings are legacy config aliases. All three must
-    // normalize onto ProviderKind::Together so live-catalog rows keyed
-    // `togetherai` resolve to the right kind (Refs #4186).
-    aliases: ["together-ai", "together_ai", "togetherai"]
-);
-provider!(
-    Qianfan,
-    Qianfan,
-    "qianfan",
-    "Baidu Qianfan",
-    DEFAULT_QIANFAN_BASE_URL,
-    DEFAULT_QIANFAN_MODEL,
-    ["QIANFAN_API_KEY", "BAIDU_QIANFAN_API_KEY"],
-    "qianfan",
-    aliases: ["baidu-qianfan", "baidu_qianfan", "baidu"]
-);
-provider!(
-    Mistral,
-    Mistral,
-    "mistral",
-    "Mistral AI",
-    DEFAULT_MISTRAL_BASE_URL,
-    DEFAULT_MISTRAL_MODEL,
-    ["MISTRAL_API_KEY"],
-    "mistral",
-    aliases: ["mistral-ai", "mistral_ai", "mistralai", "la-plateforme", "la_plateforme"]
-);
-
-provider!(
-    Antigravity,
-    Antigravity,
-    "antigravity",
-    "Google Antigravity",
-    DEFAULT_ANTIGRAVITY_BASE_URL,
-    DEFAULT_ANTIGRAVITY_MODEL,
-    ["ANTIGRAVITY_API_KEY"],
-    "antigravity",
-    aliases: ["agy"]
-);
-
-provider!(
-    Google,
-    Google,
-    "google",
-    "Google Gemini",
-    DEFAULT_GOOGLE_BASE_URL,
-    DEFAULT_GOOGLE_MODEL,
-    ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
-    "google",
-    aliases: ["google-gemini", "google_gemini", "gemini", "google-ai", "google_ai", "ai-studio", "aistudio"]
-);
-
-/// OpenAI Codex / ChatGPT OAuth provider using the Responses API.
-pub struct OpenaiCodex;
-
-impl Provider for OpenaiCodex {
-    fn id(&self) -> &'static str {
-        "openai-codex"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenaiCodex
-    }
-
-    fn display_name(&self) -> &'static str {
-        "OpenAI Codex (ChatGPT)"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_OPENAI_CODEX_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_OPENAI_CODEX_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "openai_codex"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &[
-            "openai_codex",
-            "openaicodex",
-            "codex",
-            "chatgpt",
-            "chatgpt-codex",
-            "chatgpt_codex",
-            "chatgptcodex",
-        ]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::Responses)
-    }
-}
-
-/// Native Anthropic Messages API provider (#3014).
-pub struct Anthropic;
-
-impl Provider for Anthropic {
-    fn id(&self) -> &'static str {
-        "anthropic"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Anthropic
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Anthropic"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        crate::DEFAULT_ANTHROPIC_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        crate::DEFAULT_ANTHROPIC_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["ANTHROPIC_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "anthropic"
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::AnthropicMessages)
-    }
-}
-
-/// OpenModel Anthropic-compatible Messages API provider.
-pub struct Openmodel;
-
-impl Provider for Openmodel {
-    fn id(&self) -> &'static str {
-        "openmodel"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Openmodel
-    }
-
-    fn display_name(&self) -> &'static str {
-        "OpenModel"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_OPENMODEL_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_OPENMODEL_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["OPENMODEL_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "openmodel"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &["open-model", "open_model"]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::AnthropicMessages)
-    }
-}
-
-provider!(
-    Zai,
-    Zai,
-    "zai",
-    "Zhipu AI / Z.ai",
-    DEFAULT_ZAI_BASE_URL,
-    DEFAULT_ZAI_MODEL,
-    ["ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPU_API_KEY", "GLM_API_KEY"],
-    "zai",
-    aliases: ["z-ai", "z_ai", "z.ai", "zhipu", "zhipuai", "bigmodel", "big-model"]
-);
-
-provider!(
-    Stepfun,
-    Stepfun,
-    "stepfun",
-    "StepFun / StepFlash",
-    DEFAULT_STEPFUN_BASE_URL,
-    DEFAULT_STEPFUN_MODEL,
-    ["STEPFUN_API_KEY", "STEP_API_KEY"],
-    "stepfun",
-    aliases: ["step-fun", "step_fun", "stepflash", "step-flash", "step_flash"]
-);
-
-provider!(
-    Minimax,
-    Minimax,
-    "minimax",
-    "MiniMax",
-    DEFAULT_MINIMAX_BASE_URL,
-    DEFAULT_MINIMAX_MODEL,
-    ["MINIMAX_API_KEY"],
-    "minimax",
-    // Anthropic dialect is wire=anthropic on this provider, not a second row.
-    aliases: ["mini-max", "mini_max", "minimax-anthropic", "minimax_anthropic", "mini-max-anthropic", "mini_max_anthropic"]
-);
-
-/// MiniMax route that speaks the Anthropic Messages wire protocol.
-pub struct MinimaxAnthropic;
-
-impl Provider for MinimaxAnthropic {
-    fn id(&self) -> &'static str {
-        "minimax-anthropic"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::MinimaxAnthropic
-    }
-
-    fn display_name(&self) -> &'static str {
-        // Legacy dialect kind — catalog surface is "MiniMax" with wire=anthropic.
-        "MiniMax"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_MINIMAX_ANTHROPIC_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_MINIMAX_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["MINIMAX_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "minimax_anthropic"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::AnthropicMessages)
-    }
-}
-
-provider!(
-    Deepinfra,
-    Deepinfra,
-    "deepinfra",
-    "DeepInfra",
-    DEFAULT_DEEPINFRA_BASE_URL,
-    DEFAULT_DEEPINFRA_MODEL,
-    ["DEEPINFRA_API_KEY", "DEEPINFRA_TOKEN"],
-    "deepinfra",
-    aliases: ["deep-infra", "deep_infra"]
-);
-
-provider!(
-    Sakana,
-    Sakana,
-    "sakana",
-    "Sakana AI (Fugu)",
-    DEFAULT_SAKANA_BASE_URL,
-    DEFAULT_SAKANA_MODEL,
-    ["FUGU_API_KEY", "SAKANA_API_KEY"],
-    "sakana",
-    aliases: ["sakana-ai", "sakana_ai", "fugu"]
-);
-
-provider!(
-    LongCat,
-    LongCat,
-    "longcat",
-    "Meituan LongCat",
-    DEFAULT_LONGCAT_BASE_URL,
-    DEFAULT_LONGCAT_MODEL,
-    ["LONGCAT_API_KEY"],
-    "longcat",
-    aliases: ["long-cat", "meituan-longcat", "meituan"]
-);
-
-provider!(
-    OpencodeGo,
-    OpencodeGo,
-    "opencode-go",
-    "OpenCode Go",
-    DEFAULT_OPENCODE_GO_BASE_URL,
-    DEFAULT_OPENCODE_GO_MODEL,
-    ["OPENCODE_GO_API_KEY"],
-    "opencode_go",
-    aliases: ["opencode_go", "opencodego"]
-);
-
-/// OpenCode Zen gateway with a model-scoped wire protocol.
-pub struct OpencodeZen;
-
-impl Provider for OpencodeZen {
-    fn id(&self) -> &'static str {
-        "opencode-zen"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpencodeZen
-    }
-
-    fn display_name(&self) -> &'static str {
-        "OpenCode Zen"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_OPENCODE_ZEN_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_OPENCODE_ZEN_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["OPENCODE_ZEN_API_KEY", "OPENCODE_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "opencode_zen"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &["opencode_zen", "opencodezen", "zen", "opencode"]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::ModelAware
-    }
-}
-
-provider!(
-    Meta,
-    Meta,
-    "meta",
-    "Meta Model API",
-    DEFAULT_META_BASE_URL,
-    DEFAULT_META_MODEL,
-    ["META_MODEL_API_KEY", "MODEL_API_KEY"],
-    "meta",
-    aliases: [
-        "meta-ai",
-        "meta_ai",
-        "meta-model-api",
-        "meta_model_api",
-        "muse",
-        "muse-spark"
-    ]
-);
-
-provider!(
-    Xai,
-    Xai,
-    "xai",
-    "xAI",
-    DEFAULT_XAI_BASE_URL,
-    DEFAULT_XAI_MODEL,
-    ["XAI_API_KEY"],
-    "xai",
-    aliases: ["x-ai", "x_ai", "grok"]
-);
-
-provider!(
-    Telecomjs,
-    Telecomjs,
-    "telecomjs",
-    "TelecomJS TokenHub",
-    DEFAULT_TELECOMJS_BASE_URL,
-    DEFAULT_TELECOMJS_MODEL,
-    ["TELECOMJS_API_KEY"],
-    "telecomjs",
-    aliases: ["telecom-js", "telecom_js", "telecomjs-cn", "tokenhub"]
-);
-provider!(
-    Edenai,
-    Edenai,
-    "edenai",
-    "Eden AI",
-    DEFAULT_EDENAI_BASE_URL,
-    DEFAULT_EDENAI_MODEL,
-    ["EDENAI_API_KEY"],
-    "edenai",
-    aliases: ["eden-ai", "eden_ai"]
-);
-
-/// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
-///
-/// `provider!()` fixes every macro provider on Chat Completions. Concentrate
-/// documents the Responses API as its production surface ("For production
-/// use, we recommend using the Responses API"), so it carries a fixed
-/// Responses wire policy here instead. Contract:
-/// <https://concentrate.ai/docs/api-reference/introduction>. Commercial
-/// boundary: its Terms of Service forbid resale, white-label, and
-/// service-bureau use without written consent, so this route is BYOK only —
-/// the user's own key, their own bill, no Codewhale fee or managed default.
-pub struct Concentrate;
-
-impl Provider for Concentrate {
-    fn id(&self) -> &'static str {
-        "concentrate"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Concentrate
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Concentrate"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_CONCENTRATE_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_CONCENTRATE_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["CONCENTRATE_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "concentrate"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &["concentrate-ai", "concentrate_ai", "concentrateai"]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::Responses)
-    }
-}
-
-/// Alibaba Cloud Model Studio — Token Plan (OpenAI-compatible Chat Completions).
-///
-/// Token Plan Personal and Team share the same regional endpoint. The default
-/// region is Asia-Pacific (Singapore); official docs list the same URL for
-/// both personal and team plans.
-pub struct ModelstudioTokenPlan;
-
-impl Provider for ModelstudioTokenPlan {
-    fn id(&self) -> &'static str {
-        "modelstudio-token-plan"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::ModelstudioTokenPlan
-    }
-
-    fn display_name(&self) -> &'static str {
-        // One vendor row. Plan (token vs coding) is `mode` / base_url; wire
-        // dialect (OpenAI vs Anthropic Messages) is `wire` — never separate
-        // catalog identities (same product rule as Z.ai / Xiaomi for plans).
-        "Alibaba Cloud Model Studio"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "modelstudio_token_plan"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        // Plan and dialect aliases collapse onto this primary identity.
-        // Config fields: mode = token-plan|coding-plan, wire = openai|anthropic.
-        &[
-            "modelstudio-token-plan",
-            "modelstudio_token_plan",
-            "modelstudio",
-            "alibaba-token-plan",
-            "dashscope-token-plan",
-            "alibaba",
-            "dashscope",
-            // Legacy plan/dialect kinds — keep resolving so old configs and
-            // CLI flags do not break; they no longer appear as catalog rows.
-            "modelstudio-coding-plan",
-            "modelstudio_coding_plan",
-            "alibaba-coding-plan",
-            "dashscope-coding-plan",
-            "modelstudio-token-plan-anthropic",
-            "modelstudio_token_plan_anthropic",
-            "alibaba-token-plan-anthropic",
-            "modelstudio-coding-plan-anthropic",
-            "modelstudio_coding_plan_anthropic",
-            "alibaba-coding-plan-anthropic",
-        ]
-    }
-}
-
-/// Legacy Model Studio Anthropic dialect kind.
-///
-/// Kept for serde / provider_for_kind only. Catalog surface and parse aliases
-/// collapse onto [`ModelstudioTokenPlan`] with `wire = "anthropic"`.
-pub struct ModelstudioTokenPlanAnthropic;
-
-impl Provider for ModelstudioTokenPlanAnthropic {
-    fn id(&self) -> &'static str {
-        "modelstudio-token-plan-anthropic"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::ModelstudioTokenPlanAnthropic
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Alibaba Cloud Model Studio"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "modelstudio_token_plan_anthropic"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        // Empty: aliases live on the primary so parse collapses to it.
-        &[]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::AnthropicMessages)
-    }
-}
-
-/// Legacy Model Studio Coding Plan kind (OpenAI wire).
-///
-/// Catalog/parse collapse onto [`ModelstudioTokenPlan`] with `mode = "coding-plan"`.
-pub struct ModelstudioCodingPlan;
-
-impl Provider for ModelstudioCodingPlan {
-    fn id(&self) -> &'static str {
-        "modelstudio-coding-plan"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::ModelstudioCodingPlan
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Alibaba Cloud Model Studio"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "modelstudio_coding_plan"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
-
-/// Legacy Model Studio Coding Plan Anthropic dialect kind.
-pub struct ModelstudioCodingPlanAnthropic;
-
-impl Provider for ModelstudioCodingPlanAnthropic {
-    fn id(&self) -> &'static str {
-        "modelstudio-coding-plan-anthropic"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::ModelstudioCodingPlanAnthropic
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Alibaba Cloud Model Studio"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL
-    }
-
-    fn default_model(&self) -> &'static str {
-        DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "modelstudio_coding_plan_anthropic"
-    }
-
-    fn aliases(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        WirePolicy::Fixed(WireFormat::AnthropicMessages)
-    }
-}
-
-/// User-defined OpenAI-compatible endpoint (#1519).
-///
-/// A single dynamic provider identity for arbitrary `[providers.<name>]
-/// kind="openai-compatible"` config entries. Unlike the built-in providers it
-/// carries no real default base URL/model/env var: the concrete endpoint, model
-/// id, and auth env var all arrive from the named `[providers.<name>]` config
-/// table at route time. The placeholder base URL/model here exist only so the
-/// descriptor stays well-formed (non-empty) for conformance; runtime routing
-/// always supplies a `base_url_override` and a wire model id, so these
-/// placeholders are never used to reach the network.
-pub struct Custom;
-
-impl Provider for Custom {
-    fn id(&self) -> &'static str {
-        "custom"
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Custom
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Custom (OpenAI-compatible)"
-    }
-
-    fn default_base_url(&self) -> &'static str {
-        // Placeholder only; the real endpoint comes from the named config table
-        // via the route's base_url_override. Loopback so a misconfigured custom
-        // provider fails closed locally rather than reaching a public host.
-        "http://localhost/v1"
-    }
-
-    fn default_model(&self) -> &'static str {
-        // Placeholder only; the real model id comes from config and is preserved
-        // verbatim as the wire model id.
-        "custom-model"
-    }
-
-    fn env_vars(&self) -> &'static [&'static str] {
-        // No built-in env var: the auth env var is named per-entry via
-        // `[providers.<name>] api_key_env = "..."`.
-        &[]
-    }
-
-    fn provider_config_key(&self) -> &'static str {
-        "custom"
-    }
-
-    fn wire_policy(&self) -> WirePolicy {
-        // Static default remains Chat Completions for backward compatibility.
-        // Per-config `wire = "responses" | "anthropic" | "chat"` overrides are
-        // honored in `crates/tui/src/client.rs::provider_wire_format_for_config`
-        // and `crates/tui/src/config.rs::provider_capability`, which read
-        // `ProviderConfig::wire` for the `Custom` catalog identity. This keeps
-        // the `Provider` trait `Fixed` while giving custom endpoints the same
-        // three-way switch (`responses` / `anthropic` / `chat`) as built-ins.
-        WirePolicy::Fixed(WireFormat::ChatCompletions)
-    }
-}
-
-static DEEPSEEK: Deepseek = Deepseek;
-static DEEPSEEK_ANTHROPIC: DeepseekAnthropic = DeepseekAnthropic;
-static NVIDIA_NIM: NvidiaNim = NvidiaNim;
-static OPENAI: Openai = Openai;
-static ATLASCLOUD: Atlascloud = Atlascloud;
-static WANJIE_ARK: WanjieArk = WanjieArk;
-static VOLCENGINE: Volcengine = Volcengine;
-static OPENROUTER: Openrouter = Openrouter;
-static ORCAROUTER: Orcarouter = Orcarouter;
-static XIAOMI_MIMO: XiaomiMimo = XiaomiMimo;
-static NOVITA: Novita = Novita;
-static FIREWORKS: Fireworks = Fireworks;
-static SILICONFLOW: Siliconflow = Siliconflow;
-static SILICONFLOW_CN: SiliconflowCN = SiliconflowCN;
-static ARCEE: Arcee = Arcee;
-static MOONSHOT: Moonshot = Moonshot;
-static SGLANG: Sglang = Sglang;
-static VLLM: Vllm = Vllm;
-static OLLAMA: Ollama = Ollama;
-static OLLAMA_CLOUD: OllamaCloud = OllamaCloud;
-static HUGGINGFACE: Huggingface = Huggingface;
-static TOGETHER: Together = Together;
-static QIANFAN: Qianfan = Qianfan;
-static OPENAI_CODEX: OpenaiCodex = OpenaiCodex;
-static ANTHROPIC: Anthropic = Anthropic;
-static OPENMODEL: Openmodel = Openmodel;
-static ZAI: Zai = Zai;
-static STEPFUN: Stepfun = Stepfun;
-static MINIMAX: Minimax = Minimax;
-static MINIMAX_ANTHROPIC: MinimaxAnthropic = MinimaxAnthropic;
-static DEEPINFRA: Deepinfra = Deepinfra;
-static SAKANA: Sakana = Sakana;
-static LONGCAT: LongCat = LongCat;
-static OPENCODE_GO: OpencodeGo = OpencodeGo;
-static OPENCODE_ZEN: OpencodeZen = OpencodeZen;
-static META: Meta = Meta;
-static XAI: Xai = Xai;
-static MISTRAL: Mistral = Mistral;
-static ANTIGRAVITY: Antigravity = Antigravity;
-static TELECOMJS: Telecomjs = Telecomjs;
-static EDENAI: Edenai = Edenai;
-static CONCENTRATE: Concentrate = Concentrate;
-static MODELSTUDIO_TOKEN_PLAN: ModelstudioTokenPlan = ModelstudioTokenPlan;
-static MODELSTUDIO_TOKEN_PLAN_ANTHROPIC: ModelstudioTokenPlanAnthropic =
-    ModelstudioTokenPlanAnthropic;
-static MODELSTUDIO_CODING_PLAN: ModelstudioCodingPlan = ModelstudioCodingPlan;
-static MODELSTUDIO_CODING_PLAN_ANTHROPIC: ModelstudioCodingPlanAnthropic =
-    ModelstudioCodingPlanAnthropic;
-static CUSTOM: Custom = Custom;
-
-static PROVIDER_REGISTRY: [&dyn Provider; 48] = [
-    &DEEPSEEK,
-    &DEEPSEEK_ANTHROPIC,
-    &NVIDIA_NIM,
-    &OPENAI,
-    &ATLASCLOUD,
-    &WANJIE_ARK,
-    &VOLCENGINE,
-    &OPENROUTER,
-    &ORCAROUTER,
-    &XIAOMI_MIMO,
-    &NOVITA,
-    &FIREWORKS,
-    &SILICONFLOW,
-    &ARCEE,
-    &SILICONFLOW_CN,
-    &MOONSHOT,
-    &SGLANG,
-    &VLLM,
-    &OLLAMA,
-    &OLLAMA_CLOUD,
-    &HUGGINGFACE,
-    &TOGETHER,
-    &QIANFAN,
-    &OPENAI_CODEX,
-    &ANTHROPIC,
-    &OPENMODEL,
-    &ZAI,
-    &STEPFUN,
-    &MINIMAX,
-    &MINIMAX_ANTHROPIC,
-    &DEEPINFRA,
-    &SAKANA,
-    &LONGCAT,
-    &OPENCODE_GO,
-    &OPENCODE_ZEN,
-    &META,
-    &XAI,
-    &MISTRAL,
-    &TELECOMJS,
-    &EDENAI,
-    &CONCENTRATE,
-    &MODELSTUDIO_TOKEN_PLAN,
-    &MODELSTUDIO_TOKEN_PLAN_ANTHROPIC,
-    &MODELSTUDIO_CODING_PLAN,
-    &MODELSTUDIO_CODING_PLAN_ANTHROPIC,
-    &Google,
-    &ANTIGRAVITY,
-    &CUSTOM,
-];
-
-/// Return all built-in provider metadata entries in `ProviderKind::ALL` order.
-///
-/// This insertion order is the stable order used for internal parsing and
-/// default selection. It is intentionally NOT the order user-facing UI should
-/// render; for browsing/picker surfaces use [`providers_sorted_for_display`].
+/// The full registry retains legacy entries needed to read old configuration.
+/// It is intentionally NOT a user-facing provider list; for browsing/picker
+/// surfaces use [`providers_sorted_for_display`].
 #[must_use]
 pub fn all_providers() -> &'static [&'static dyn Provider] {
-    &PROVIDER_REGISTRY
+    PROVIDER_REGISTRY
+        .get_or_init(|| {
+            descriptors::BUILTIN_DESCRIPTORS
+                .iter()
+                .map(|row| row as &dyn Provider)
+                .collect()
+        })
+        .as_slice()
 }
 
 /// Return all built-in providers ordered for user-facing display.
@@ -1839,16 +403,22 @@ pub fn all_providers() -> &'static [&'static dyn Provider] {
 /// happens to sit first in [`ProviderKind::ALL`] (historically DeepSeek). The
 /// ordering policy intentionally differs from internal parsing/default order:
 ///
-/// - [`all_providers`] / [`ProviderKind::ALL`] — stable order for internal
-///   matching, parsing, and default selection. Do not reorder.
+/// - [`all_providers`] — full compatibility registry for internal identity
+///   matching, including legacy entries.
+/// - [`ProviderKind::ALL`] — stable selectable catalog order. Do not reorder.
 /// - [`providers_sorted_for_display`] — neutral alphabetical order for UI
-///   browsing. DeepSeek stays present and searchable but is not hard-coded
-///   first; a caller may still highlight/pin the active provider separately.
+///   browsing, with legacy tombstones omitted. DeepSeek stays present and
+///   searchable but is not hard-coded first; a caller may still highlight/pin
+///   the active provider separately.
 ///
 /// Returns an owned `Vec` because the sorted order is computed, not static.
 #[must_use]
 pub fn providers_sorted_for_display() -> Vec<&'static dyn Provider> {
-    let mut providers = all_providers().to_vec();
+    let mut providers: Vec<_> = all_providers()
+        .iter()
+        .copied()
+        .filter(|provider| !descriptors::builtin_provider_descriptor(provider.kind()).retired)
+        .collect();
     providers.sort_by(|a, b| {
         a.display_name()
             .to_ascii_lowercase()
@@ -1876,16 +446,13 @@ pub fn resolve_provider(id_or_alias: &str) -> Option<&'static dyn Provider> {
 /// Return metadata for a known provider kind.
 #[must_use]
 pub fn provider_for_kind(kind: ProviderKind) -> &'static dyn Provider {
-    PROVIDER_REGISTRY
-        .iter()
-        .find(|p| p.kind() == kind)
-        .copied()
-        .expect("ProviderKind variant missing from PROVIDER_REGISTRY")
+    descriptors::builtin_provider_descriptor(kind)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::descriptors::defaults::*;
 
     #[test]
     fn credential_help_covers_every_provider_without_guessing_non_key_urls() {
@@ -2091,6 +658,11 @@ mod tests {
             "https://api.z.ai/api/coding/paas/v4",
             "https://api.z.ai/api/paas/v4/",
             "HTTPS://API.Z.AI/api/paas/v4",
+            // BigModel's general platform endpoint is the same first-party
+            // open platform; authority case stays insignificant.
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://open.bigmodel.cn/api/paas/v4/",
+            "HTTPS://OPEN.BIGMODEL.CN/api/paas/v4",
         ] {
             assert!(is_exact_zai_chat_route(ProviderKind::Zai, route), "{route}");
         }
@@ -2102,6 +674,13 @@ mod tests {
             "https://api.z.ai/api/paas/v4#fragment",
             "https://api.z.ai/api/paas/v4//",
             "https://api.z.ai/api/paas/v4/chat/completions",
+            // BigModel neighbors: the undocumented coding path and the
+            // preview product stay fail-closed, like the official-endpoint
+            // and web-search families.
+            "https://open.bigmodel.cn/api/paas/v4/preview",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+            "http://open.bigmodel.cn/api/paas/v4",
+            "https://open.bigmodel.cn/API/paas/v4",
             "https://gateway.example/v1",
         ] {
             assert!(
@@ -2112,6 +691,10 @@ mod tests {
         assert!(!is_exact_zai_chat_route(
             ProviderKind::Openai,
             DEFAULT_ZAI_BASE_URL
+        ));
+        assert!(!is_exact_zai_chat_route(
+            ProviderKind::Openai,
+            "https://open.bigmodel.cn/api/paas/v4"
         ));
     }
 
@@ -2220,6 +803,26 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_registry_entry_is_a_non_runnable_legacy_tombstone() {
+        let legacy = provider_for_kind(ProviderKind::Antigravity);
+        assert_eq!(legacy.id(), "antigravity");
+        assert!(legacy.env_vars().is_empty());
+        assert!(legacy.default_base_url().ends_with(".invalid"));
+        assert_eq!(legacy.default_model(), "legacy-antigravity-disabled");
+
+        let help = legacy.credential_help();
+        assert_eq!(help.acquisition, CredentialAcquisition::Configuration);
+        assert_eq!(help.credential_url, None);
+        assert_eq!(help.docs_url, None);
+        assert!(
+            help.guidance
+                .contains("codewhale auth clear --provider antigravity")
+        );
+        assert!(help.guidance.contains("provider `google`"));
+        assert!(help.guidance.contains("GEMINI_API_KEY"));
+    }
+
+    #[test]
     fn live_verified_console_replacements_do_not_regress_to_404_links() {
         let openmodel = provider_for_kind(ProviderKind::Openmodel).credential_help();
         assert_eq!(
@@ -2280,7 +883,7 @@ mod tests {
     #[test]
     fn display_order_differs_from_internal_all_order() {
         // The whole point of the helper is that UI ordering is NOT the
-        // internal ProviderKind::ALL / all_providers() insertion order.
+        // internal compatibility-registry insertion order.
         let display_ids: Vec<&str> = providers_sorted_for_display()
             .iter()
             .map(|p| p.id())
@@ -2294,12 +897,25 @@ mod tests {
 
     #[test]
     fn display_order_is_complete_and_unique() {
-        // No provider is dropped or duplicated by the sort.
+        // Every selectable provider is retained exactly once; legacy
+        // configuration tombstones stay in the internal registry only.
         let display = providers_sorted_for_display();
         assert_eq!(
             display.len(),
-            all_providers().len(),
-            "display order must include every built-in provider"
+            all_providers().len() - 1,
+            "display order must include every selectable built-in provider"
+        );
+        assert!(
+            all_providers()
+                .iter()
+                .any(|provider| provider.kind() == ProviderKind::Antigravity),
+            "legacy config identity must remain in the internal registry"
+        );
+        assert!(
+            display
+                .iter()
+                .all(|provider| provider.kind() != ProviderKind::Antigravity),
+            "legacy Antigravity tombstone must not appear in provider pickers"
         );
         let mut ids: Vec<&str> = display.iter().map(|p| p.id()).collect();
         ids.sort_unstable();

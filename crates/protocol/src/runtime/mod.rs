@@ -7,6 +7,20 @@ use serde_json::Value;
 pub const RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 pub const RUNTIME_API_VERSION: &str = "1.0";
 
+/// Maximum JSON input (including base64 expansion) for an image turn.
+pub const MAX_RUNTIME_IMAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RUNTIME_IMAGES: usize = 10;
+pub const MAX_RUNTIME_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RUNTIME_IMAGE_TOTAL_BYTES: usize = 5 * 1024 * 1024;
+
+/// Inline bytes only: neither host paths nor remote URLs confer attachment authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeImageInput {
+    pub mime: String,
+    pub data_base64: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeEventEnvelope {
     #[serde(default = "default_runtime_event_envelope_schema_version")]
@@ -39,14 +53,34 @@ fn default_runtime_event_envelope_schema_version() -> u32 {
 /// All fields are required on serialization so clients can rely on the shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
+    /// Device client tokens have immutable watch/drive intent. Watch cannot
+    /// mutate Runtime state, acquire control, or forward display input.
+    #[serde(default)]
+    pub client_token_intents: bool,
     #[serde(default)]
     pub account_session: bool,
     pub threads: bool,
+    /// Explicit per-thread shell opt-in is checked against loaded policy and
+    /// cannot broaden a conversation while it has an active turn.
+    #[serde(default)]
+    pub thread_shell_consent: bool,
     pub turns: bool,
     /// `POST /v1/threads/{id}/turns` accepts a durable, thread-scoped
     /// `operation_key` and returns the original turn for exact retries.
     #[serde(default)]
     pub turn_operation_idempotency: bool,
+    /// Read-only exact accepted-turn lookup by thread and operation key.
+    #[serde(default)]
+    pub turn_operation_lookup: bool,
+    /// Bounded inline image inputs, persisted and replayed with their turn.
+    #[serde(default)]
+    pub turn_image_inputs: bool,
+    /// Per-turn maxOutputTokens is validated and intersected with the route ceiling.
+    #[serde(default)]
+    pub turn_output_token_limit: bool,
+    /// Account profile snapshots and Engine-owned constitution preview.
+    #[serde(default)]
+    pub profile_constitution: bool,
     pub turn_steer: bool,
     pub turn_interrupt: bool,
     pub event_replay: bool,
@@ -82,6 +116,12 @@ pub struct RuntimeCapabilities {
     /// are available via the HTTP API.
     #[serde(default)]
     pub skill_lifecycle: bool,
+    /// `GET /v1/skills/{name}` returns one skill's full body and routing
+    /// metadata, so a client can compose an activation instruction for its
+    /// next turn. `GET /v1/skills` rows also carry `invocation`, `aliases`,
+    /// and `bundled_tier` routing fields when this flag is set.
+    #[serde(default)]
+    pub skill_detail: bool,
     /// Plugin bundle and marketplace lifecycle operations (list/detail,
     /// install/update/uninstall, trust/enable/disable/revoke, marketplace
     /// add/remove/install) are available via the `/v1/apps/plugins` and
@@ -91,6 +131,24 @@ pub struct RuntimeCapabilities {
     /// Durable, workspace-scoped cross-task Agent Mail endpoints and events.
     #[serde(default)]
     pub agent_mail: bool,
+    /// `GET /v1/terminal/{name}/output` — the resumable byte stream over a
+    /// persistent Engine-owned terminal session, with absolute cursors.
+    #[serde(default)]
+    pub terminal_stream: bool,
+    /// `POST /v1/terminal/{name}/input` — bytes into the live session.
+    #[serde(default)]
+    pub terminal_input: bool,
+    /// `POST /v1/terminal/{name}/resize` — the window the child draws for.
+    #[serde(default)]
+    pub terminal_resize: bool,
+    /// `POST /v1/terminal/{name}/kill` — end the live session.
+    #[serde(default)]
+    pub terminal_kill: bool,
+    /// `GET /v1/threads/{id}/events` puts the durable `seq` on every journal
+    /// frame as the SSE `id:` and resumes from a `Last-Event-ID` header, so a
+    /// browser `EventSource` reconnects without a cursor in the query string.
+    #[serde(default)]
+    pub event_stream_resume: bool,
 }
 
 /// Experimental opt-in flags advertised by `GET /v1/runtime/info`.
@@ -373,10 +431,16 @@ mod tests {
     #[test]
     fn runtime_capabilities_serializes_expected_shape() {
         let caps = RuntimeCapabilities {
+            client_token_intents: true,
+            turn_output_token_limit: false,
+            profile_constitution: false,
             account_session: true,
             threads: true,
+            thread_shell_consent: true,
             turns: true,
             turn_operation_idempotency: true,
+            turn_operation_lookup: true,
+            turn_image_inputs: true,
             turn_steer: true,
             turn_interrupt: true,
             event_replay: true,
@@ -392,14 +456,67 @@ mod tests {
             memory: true,
             mcp_server_management: false,
             skill_lifecycle: false,
+            skill_detail: false,
             plugin_management: false,
             agent_mail: true,
+            terminal_stream: false,
+            terminal_input: false,
+            terminal_resize: false,
+            terminal_kill: false,
+            event_stream_resume: true,
         };
         let value = serde_json::to_value(&caps).unwrap();
         let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("client_token_intents"), Some(&json!(true)));
+        let mut legacy_intents = value.clone();
+        legacy_intents
+            .as_object_mut()
+            .unwrap()
+            .remove("client_token_intents");
+        assert!(
+            !serde_json::from_value::<RuntimeCapabilities>(legacy_intents)
+                .unwrap()
+                .client_token_intents
+        );
         assert_eq!(obj.get("threads").unwrap(), &json!(true));
+        assert_eq!(obj.get("thread_shell_consent"), Some(&json!(true)));
+        assert!(
+            serde_json::from_value::<RuntimeCapabilities>(value.clone())
+                .unwrap()
+                .thread_shell_consent
+        );
+        let mut legacy_shell = value.clone();
+        legacy_shell
+            .as_object_mut()
+            .unwrap()
+            .remove("thread_shell_consent");
+        assert!(
+            !serde_json::from_value::<RuntimeCapabilities>(legacy_shell)
+                .unwrap()
+                .thread_shell_consent
+        );
+
         assert_eq!(obj.get("account_session").unwrap(), &json!(true));
         assert_eq!(obj.get("turn_operation_idempotency").unwrap(), &json!(true));
+        assert_eq!(obj.get("turn_operation_lookup").unwrap(), &json!(true));
+        let mut without_lookup = value.clone();
+        without_lookup
+            .as_object_mut()
+            .unwrap()
+            .remove("turn_operation_lookup");
+        assert!(
+            !serde_json::from_value::<RuntimeCapabilities>(without_lookup)
+                .unwrap()
+                .turn_operation_lookup
+        );
+        assert_eq!(obj.get("turn_image_inputs").unwrap(), &json!(true));
+        let mut legacy = value.clone();
+        legacy.as_object_mut().unwrap().remove("turn_image_inputs");
+        assert!(
+            !serde_json::from_value::<RuntimeCapabilities>(legacy)
+                .unwrap()
+                .turn_image_inputs
+        );
         assert_eq!(obj.get("external_tools").unwrap(), &json!(false));
         assert!(obj.contains_key("worker_runtime"));
         assert_eq!(obj.get("fleet_run_create").unwrap(), &json!(true));

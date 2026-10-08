@@ -10,13 +10,13 @@ use regex::Regex;
 use std::fmt::Write;
 use tokio::sync::mpsc::Sender;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::core::events::Event;
 use crate::fast_hash::{FastHashMap, FastHashSet};
 use crate::llm_client::LlmClient;
-use crate::models::Role;
-use crate::models::{ContentBlock, Message, MessageRequest, Tool};
 use crate::regex_cache::compile_user_regex;
+use codewhale_models::Role;
+use codewhale_models::{ContentBlock, Message, MessageRequest, Tool};
 
 // ── Prompt‑building constants ──────────────────────────────────────────────
 
@@ -43,11 +43,17 @@ replace — Rewrite part of a specific content block using regex substitution.
           {\"op\": \"replace\", \"msg\": 7, \"block\": 0,
            \"pattern\": \"read \\\\d+ files\", \"with\": \"read files\"}
 
+offload — Preserve a complete message in durable session storage and replace it
+          with a compact retrieval handle. Use for long material that may be needed
+          again; retrieve_tool_result can recover exact content later. Example:
+          {\"op\": \"offload\", \"msg\": 3}
+
 ### Pairing rule
 
 Every ToolUse block is paired with its ToolResult. If you remove a message
 containing a tool call, its result will be removed too — and vice versa. You
-do not need to list both.
+do not need to list both. Offload similarly archives the entire paired group,
+including thinking, signatures, media, and tool data; no original blocks are discarded.
 
 ### What to keep
 
@@ -74,6 +80,8 @@ Be conservative. When in doubt, keep the message.
 pub enum PurgeOp {
     /// Remove an entire message (plus its tool-call/result counterpart).
     Remove { msg_id: usize },
+    /// Archive an entire message and its paired tool messages before replacing them with a handle.
+    Offload { msg_id: usize },
     /// Regex-replace within a specific content block.
     Replace {
         msg_id: usize,
@@ -92,6 +100,8 @@ pub struct PurgeResult {
     pub removed_count: usize,
     /// How many replace operations were applied.
     pub replaced_count: usize,
+    /// Messages preserved in a durable session artifact instead of active context.
+    pub offloaded_count: usize,
 }
 
 // ── Event emission helpers ──────────────────────────────────────────────────
@@ -300,6 +310,7 @@ pub fn parse_purge_operations(
             "remove" => {
                 parsed.push(PurgeOp::Remove { msg_id });
             }
+            "offload" => parsed.push(PurgeOp::Offload { msg_id }),
             "replace" => {
                 let block_idx = op
                     .get("block")
@@ -330,7 +341,7 @@ pub fn parse_purge_operations(
             }
             other => {
                 return Err(format!(
-                    "operation[{i}]: unknown op '{other}' (expected 'remove' or 'replace')"
+                    "operation[{i}]: unknown op '{other}' (expected 'remove', 'replace' or 'offload')"
                 ));
             }
         }
@@ -347,7 +358,29 @@ pub fn parse_purge_operations(
 /// from highest index to lowest to keep earlier indices stable. After all
 /// user-requested operations, tool‑call/result pair cascading runs to
 /// prevent orphaned blocks.
-pub fn execute_purge_operations(messages: &[Message], ops: &[PurgeOp]) -> PurgeResult {
+pub fn execute_purge_operations(
+    messages: &[Message],
+    ops: &[PurgeOp],
+    session_id: &str,
+) -> Result<PurgeResult, String> {
+    let mut offloaded: FastHashSet<usize> = ops
+        .iter()
+        .filter_map(|op| {
+            if let PurgeOp::Offload { msg_id } = op {
+                msg_id.checked_sub(1).filter(|idx| *idx < messages.len())
+            } else {
+                None
+            }
+        })
+        .collect();
+    cascade_tool_pair_removals(messages, &mut offloaded);
+    // Publish original, full-fidelity messages before any destructive operation.
+    // Failure leaves the caller's conversation intact, including mixed operations.
+    let mut pointer = if offloaded.is_empty() {
+        None
+    } else {
+        Some(publish_offloaded_context(session_id, messages, &offloaded)?)
+    };
     let mut msgs = messages.to_vec();
     let mut msg_indices_to_remove: FastHashSet<usize> = FastHashSet::default();
     let mut replaced_count = 0usize;
@@ -361,6 +394,7 @@ pub fn execute_purge_operations(messages: &[Message], ops: &[PurgeOp]) -> PurgeR
                     msg_indices_to_remove.insert(idx);
                 }
             }
+            PurgeOp::Offload { .. } => {}
             PurgeOp::Replace {
                 msg_id,
                 block_idx,
@@ -368,7 +402,7 @@ pub fn execute_purge_operations(messages: &[Message], ops: &[PurgeOp]) -> PurgeR
                 with,
             } => {
                 let idx = msg_id.saturating_sub(1);
-                if idx >= msgs.len() {
+                if idx >= msgs.len() || offloaded.contains(&idx) {
                     continue;
                 }
                 if let Some(block) = msgs[idx].content.get_mut(*block_idx) {
@@ -384,46 +418,121 @@ pub fn execute_purge_operations(messages: &[Message], ops: &[PurgeOp]) -> PurgeR
     // Phase 2: cascade removal to tool-call/result counterparts.
     cascade_tool_pair_removals(&msgs, &mut msg_indices_to_remove);
 
-    // Phase 3: sort indices descending and remove.
-    let mut to_remove: Vec<usize> = msg_indices_to_remove.into_iter().collect();
-    to_remove.sort_unstable_by(|a, b| b.cmp(a));
-
-    let removed_count = to_remove.len();
-    for idx in to_remove {
-        msgs.remove(idx);
+    // Archival takes precedence over remove/replace when a paired group overlaps.
+    let removed_count = msg_indices_to_remove.difference(&offloaded).count();
+    let first_offloaded = offloaded.iter().min().copied();
+    let mut retained = Vec::with_capacity(msgs.len());
+    for (idx, msg) in msgs.into_iter().enumerate() {
+        if Some(idx) == first_offloaded
+            && let Some(text) = pointer.take()
+        {
+            retained.push(Message {
+                role: messages[idx].role.clone(),
+                content: vec![ContentBlock::Text {
+                    text,
+                    cache_control: None,
+                }],
+            });
+        }
+        if !offloaded.contains(&idx) && !msg_indices_to_remove.contains(&idx) {
+            retained.push(msg);
+        }
     }
 
-    PurgeResult {
-        messages: msgs,
+    Ok(PurgeResult {
+        messages: retained,
         removed_count,
         replaced_count,
-    }
+        offloaded_count: offloaded.len(),
+    })
+}
+
+fn publish_offloaded_context(
+    session_id: &str,
+    messages: &[Message],
+    selected: &FastHashSet<usize>,
+) -> Result<String, String> {
+    use crate::tools::large_output_router::{
+        EvidenceArtifact, EvidenceRetentionState, publish_evidence_metadata, unix_millis_now,
+    };
+    let archived: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| selected.contains(idx))
+        .map(|(idx, message)| serde_json::json!({"message_id": idx + 1, "message": message}))
+        .collect();
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "messages": archived,
+    }))
+    .map_err(|err| format!("Could not encode offloaded context; history unchanged: {err}"))?;
+    let call_id = format!("purge_{}", uuid::Uuid::new_v4());
+    let handle = crate::artifacts::artifact_id_for_tool_call(&call_id);
+    let metadata = EvidenceArtifact {
+        handle: handle.clone(),
+        digest: crate::hashing::sha256_hex(&bytes),
+        size_bytes: bytes.len().try_into().unwrap_or(u64::MAX),
+        content_type: "application/json".to_string(),
+        tool_name: "purge_context".to_string(),
+        call_id,
+        origin_session: session_id.to_string(),
+        generation: 1,
+        redacted: false,
+        encoding: "utf-8".to_string(),
+        retention_state: EvidenceRetentionState::Live,
+        created_at_unix_ms: unix_millis_now(),
+        // This is the only full copy after offload: retain it with the session.
+        retain_until_unix_ms: u64::MAX,
+        storage_path: crate::artifacts::session_artifact_relative_path(&handle),
+    };
+    publish_evidence_metadata(session_id, &metadata)
+        .and_then(|_| {
+            crate::artifacts::write_session_artifact_immutable(session_id, &handle, &bytes)
+        })
+        .map_err(|err| format!("Could not store offloaded context; history unchanged: {err}"))?;
+    Ok(format!(
+        "[Offloaded context: {} messages preserved exactly in session artifact {handle}, generation 1. \
+         Use retrieve_tool_result with ref={handle}, mode=query/lines to inspect, or mode=bytes for exact recovery. \
+         The archive includes original message IDs and complete content blocks. Retained until this session is deleted.]",
+        selected.len()
+    ))
 }
 
 /// When a message containing a ToolUse or ToolResult is marked for removal,
-/// cascade that removal to its counterpart so the API never sees orphaned
-/// blocks. Runs a fixpoint loop until the remove set is closed under pairing.
+/// cascade that removal to its unambiguous counterpart. Corrupt or ambiguous
+/// identities cannot select another exchange for deletion. Runs a fixpoint
+/// loop until the remove set is closed under proven pairing.
 fn cascade_tool_pair_removals(messages: &[Message], remove_set: &mut FastHashSet<usize>) {
     if remove_set.is_empty() {
         return;
     }
 
-    // Internal transcript IDs and message indices are assigned by the engine,
-    // so this per-purge pairing pass can use the faster non-cryptographic hasher.
-    let mut call_id_to_idx: FastHashMap<String, usize> = FastHashMap::default();
-    let mut result_id_to_idx: FastHashMap<String, usize> = FastHashMap::default();
-
+    // A reused provider ID is not a unique host identity. Ambiguous entries
+    // cannot select another exchange's counterpart for deletion.
+    let mut call_id_to_idx = FastHashMap::default();
+    let mut result_id_to_idx = FastHashMap::default();
     for (idx, msg) in messages.iter().enumerate() {
         for block in &msg.content {
-            match block {
-                ContentBlock::ToolUse { id, .. } => {
-                    call_id_to_idx.insert(id.clone(), idx);
+            let Some(key) = block
+                .tool_call_key()
+                .filter(|key| !key.as_str().trim().is_empty())
+            else {
+                continue;
+            };
+            let (map, provider_id) = match block {
+                ContentBlock::ToolUse { id, .. } | ContentBlock::ServerToolUse { id, .. } => {
+                    (&mut call_id_to_idx, id.as_str())
                 }
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    result_id_to_idx.insert(tool_use_id.clone(), idx);
+                ContentBlock::ToolResult { tool_use_id, .. }
+                | ContentBlock::ToolSearchToolResult { tool_use_id, .. }
+                | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => {
+                    (&mut result_id_to_idx, tool_use_id.as_str())
                 }
-                _ => {}
-            }
+                _ => continue,
+            };
+            map.entry(key)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some((idx, provider_id)));
         }
     }
 
@@ -437,15 +546,35 @@ fn cascade_tool_pair_removals(messages: &[Message], remove_set: &mut FastHashSet
             let msg = &messages[idx];
             for block in &msg.content {
                 match block {
-                    ContentBlock::ToolUse { id, .. } => {
-                        if let Some(&result_idx) = result_id_to_idx.get(id)
+                    ContentBlock::ToolUse { id, .. } | ContentBlock::ServerToolUse { id, .. } => {
+                        if let Some(&(result_idx, provider_id)) = block
+                            .tool_call_key()
+                            .and_then(|key| result_id_to_idx.get(&key))
+                            .and_then(Option::as_ref)
+                            && provider_id == id.as_str()
+                            && block
+                                .tool_call_key()
+                                .and_then(|key| call_id_to_idx.get(&key))
+                                .and_then(Option::as_ref)
+                                .is_some_and(|(call_idx, _)| *call_idx == idx)
                             && remove_set.insert(result_idx)
                         {
                             changed = true;
                         }
                     }
-                    ContentBlock::ToolResult { tool_use_id, .. } => {
-                        if let Some(&call_idx) = call_id_to_idx.get(tool_use_id)
+                    ContentBlock::ToolResult { tool_use_id, .. }
+                    | ContentBlock::ToolSearchToolResult { tool_use_id, .. }
+                    | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => {
+                        if let Some(&(call_idx, provider_id)) = block
+                            .tool_call_key()
+                            .and_then(|key| call_id_to_idx.get(&key))
+                            .and_then(Option::as_ref)
+                            && provider_id == tool_use_id.as_str()
+                            && block
+                                .tool_call_key()
+                                .and_then(|key| result_id_to_idx.get(&key))
+                                .and_then(Option::as_ref)
+                                .is_some_and(|(result_idx, _)| *result_idx == idx)
                             && remove_set.insert(call_idx)
                         {
                             changed = true;
@@ -491,7 +620,7 @@ pub fn build_purge_tool() -> Tool {
     Tool {
         tool_type: None,
         name: "purge_context".to_string(),
-        description: "Remove or condense conversation history to free context window space."
+        description: "Remove, condense, or durably offload conversation history to free context window space."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -501,7 +630,7 @@ pub fn build_purge_tool() -> Tool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "op": {"type": "string", "enum": ["remove", "replace"]},
+                            "op": {"type": "string", "enum": ["remove", "replace", "offload"]},
                             "msg": {"type": "integer"},
                             "block": {"type": "integer"},
                             "pattern": {"type": "string"},
@@ -534,7 +663,8 @@ pub fn build_purge_tool() -> Tool {
 /// and for replacing the session message list with `PurgeResult.messages`.
 pub async fn run_purge(
     client: &impl LlmClient,
-    _provider: ApiProvider,
+    _provider: ProviderKind,
+    session_id: &str,
     messages: &[Message],
     model: &str,
     reasoning_effort: Option<String>,
@@ -581,14 +711,31 @@ pub async fn run_purge(
 
     // Report the route, not just the provider name: the endpoint decides
     // whether this is a metered public API, a plan quota, or a local runtime.
-    crate::cost_status::report_effective_route(cost_scope, &cost_route, &response.usage);
+    // Purge currently has TUI admission only. Freeze that session origin rather
+    // than borrowing a previous Runtime turn's owner from ambient config.
+    let source_id = format!(
+        "purge:{}:{}",
+        cost_route
+            .dispatched_at
+            .timestamp_nanos_opt()
+            .unwrap_or_default(),
+        response.id
+    );
+    crate::cost_status::report_effective_route_for_interactive_origin(
+        cost_scope,
+        session_id,
+        &source_id,
+        &source_id,
+        &cost_route,
+        &response.usage,
+    );
 
     // A truncated response can still carry a complete-looking `purge_context`
     // call; executing it would mutate the session from incomplete output.
-    if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+    if codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
         return Err(format!(
             "Purge model response incomplete: provider stop reason `{}`; no purge was applied.",
-            crate::models::stop_reason_detail(response.stop_reason.as_deref())
+            codewhale_models::stop_reason_detail(response.stop_reason.as_deref())
         ));
     }
 
@@ -606,7 +753,7 @@ pub async fn run_purge(
         Some(input) => {
             let ops = parse_purge_operations(&input, messages.len())
                 .map_err(|e| format!("Purge parse error: {e}"))?;
-            Ok(execute_purge_operations(messages, &ops))
+            execute_purge_operations(messages, &ops, session_id)
         }
         None => Err("Purge: model did not call purge_context tool".to_string()),
     }
@@ -633,6 +780,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -646,12 +794,191 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
                 content_blocks: None,
             }],
         }
+    }
+
+    #[test]
+    fn purge_counterparts_use_execution_identity_without_legacy_fallback() {
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"first","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"first"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"second","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"second","content":"second"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"first","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"first","content":"legacy"}]}
+        ])).unwrap();
+        for (selected, expected) in [(0, vec![0, 1]), (3, vec![2, 3]), (4, vec![4, 5])] {
+            let mut remove = FastHashSet::from_iter([selected]);
+            cascade_tool_pair_removals(&messages, &mut remove);
+            assert_eq!(remove, FastHashSet::from_iter(expected));
+        }
+        let mut ambiguous = messages.clone();
+        ambiguous.push(messages[0].clone());
+        let mut remove = FastHashSet::from_iter([0]);
+        cascade_tool_pair_removals(&ambiguous, &mut remove);
+        assert_eq!(remove, FastHashSet::from_iter([0]));
+    }
+
+    #[test]
+    fn offload_round_trips_full_paired_context_through_the_existing_retrieval_tool() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use crate::tools::spec::{ToolContext, ToolSpec};
+        use crate::tools::tool_result_retrieval::RetrieveToolResultTool;
+        use base64::Engine as _;
+
+        let _env = lock_test_env();
+        let _cost_guard = crate::cost_status::test_scope();
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("explicit-state");
+        let _state = EnvVarGuard::set("CODEWHALE_HOME", &state);
+        let session_id = "purge-owned-session";
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user", "content":[{"type":"text", "text":"Keep the task"}]},
+            {"role":"assistant", "content":[
+                {"type":"thinking", "thinking":"retained reasoning", "signature":"signed-exact"},
+                {"type":"tool_use", "id":"read-original", "name":"read_file", "input":{"path":"old.rs"}, "thought_signature":"google-exact"}
+            ]},
+            {"role":"user", "content":[
+                {"type":"tool_result", "tool_use_id":"read-original", "content":"original-file-data\n".repeat(1000), "content_blocks":[{"type":"image","source":{"data":"Zml4dHVyZQ=="}}]},
+                {"type":"image_url", "image_url":{"url":"data:image/png;base64,Zml4dHVyZQ=="}}
+            ]},
+            {"role":"assistant", "content":[{"type":"text", "text":"Keep the current answer"}]}
+        ])).unwrap();
+        let original = messages.clone();
+        let mock = MockLlmClient::new(vec![]);
+        mock.push_message_response(msg_response_with_tool_call(json!([
+            {"op":"offload", "msg":3}
+        ])));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(run_purge(
+                &mock,
+                ProviderKind::Deepseek,
+                session_id,
+                &messages,
+                "mock",
+                None,
+                4096,
+            ))
+            .unwrap();
+        assert_eq!(messages, original);
+        assert_eq!(result.offloaded_count, 2);
+        assert_eq!(result.removed_count, 0);
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.messages[0], original[0]);
+        assert_eq!(result.messages[2], original[3]);
+        assert!(
+            serde_json::to_vec(&result.messages).unwrap().len()
+                < serde_json::to_vec(&original).unwrap().len()
+        );
+        let pointer = block_content_text(&result.messages[1].content[0]);
+        let handle = pointer
+            .split_whitespace()
+            .find(|part| part.starts_with("art_purge_"))
+            .unwrap()
+            .trim_end_matches(',');
+        let context = ToolContext::new(home.path()).with_state_namespace(session_id);
+        let retrieved = runtime
+            .block_on(RetrieveToolResultTool.execute(
+                json!({"ref":handle,"mode":"bytes","generation":1,"max_bytes":131072}),
+                &context,
+            ))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&retrieved.content).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload["data"].as_str().unwrap())
+            .unwrap();
+        let archive: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let restored: Vec<Message> = archive["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| serde_json::from_value(entry["message"].clone()).unwrap())
+            .collect();
+        assert_eq!(restored, original[1..3]);
+        assert_eq!(archive["messages"][0]["message_id"], 2);
+        assert_eq!(archive["messages"][1]["message_id"], 3);
+        let metadata =
+            crate::tools::large_output_router::read_evidence_metadata(session_id, handle).unwrap();
+        assert_eq!(metadata.retain_until_unix_ms, u64::MAX);
+        let path = state
+            .join("sessions")
+            .join(session_id)
+            .join(&metadata.storage_path);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let other = ToolContext::new(home.path()).with_state_namespace("another-session");
+        assert!(
+            runtime
+                .block_on(
+                    RetrieveToolResultTool.execute(json!({"ref":handle,"mode":"bytes"}), &other)
+                )
+                .is_err()
+        );
+        std::fs::write(path, b"changed fixture").unwrap();
+        assert!(
+            runtime
+                .block_on(
+                    RetrieveToolResultTool.execute(json!({"ref":handle,"mode":"bytes"}), &context)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn offload_closes_server_tool_pairs_and_wins_over_overlapping_destructive_operations() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _env = lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant", "content":[
+                {"type":"server_tool_use", "id":"search", "name":"tool_search", "input":{}},
+                {"type":"server_tool_use", "id":"execute", "name":"code_execution", "input":{}}
+            ]},
+            {"role":"assistant", "content":[{"type":"tool_search_tool_result", "tool_use_id":"search", "content":{"tools":["read"]}}]},
+            {"role":"assistant", "content":[{"type":"code_execution_tool_result", "tool_use_id":"execute", "content":{"output":"exact"}}]},
+            {"role":"user", "content":[{"type":"text", "text":"keep"}]}
+        ])).unwrap();
+        let ops = parse_purge_operations(
+            &json!({"operations":[
+                {"op":"remove", "msg":1}, {"op":"offload", "msg":2},
+                {"op":"replace", "msg":3, "block":0, "pattern":"exact", "with":"lost"}
+            ]}),
+            messages.len(),
+        )
+        .unwrap();
+        let result = execute_purge_operations(&messages, &ops, "server-pairs").unwrap();
+        assert_eq!(result.offloaded_count, 3);
+        assert_eq!(result.removed_count, 0);
+        assert_eq!(result.replaced_count, 0);
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[1], messages[3]);
+    }
+
+    #[test]
+    fn offload_storage_failure_leaves_mixed_purge_history_unchanged() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _env = lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        std::fs::write(home.path().join("sessions"), b"not a directory").unwrap();
+        let messages = vec![msg_text("user", "keep"), msg_text("assistant", "original")];
+        let original = messages.clone();
+        let ops = parse_purge_operations(&json!({"operations":[
+            {"op":"remove", "msg":1}, {"op":"replace", "msg":2, "block":0, "pattern":"original", "with":"lost"}, {"op":"offload", "msg":2}
+        ]}), messages.len()).unwrap();
+        let error = execute_purge_operations(&messages, &ops, "storage-failure").unwrap_err();
+        assert!(error.contains("history unchanged"));
+        assert_eq!(messages, original);
     }
 
     #[test]
@@ -702,7 +1029,7 @@ mod tests {
             msg_text("user", "bye"),
         ];
         let ops = vec![PurgeOp::Remove { msg_id: 2 }];
-        let result = execute_purge_operations(&msgs, &ops);
+        let result = execute_purge_operations(&msgs, &ops, "purge-test").unwrap();
         assert_eq!(result.removed_count, 1);
         assert_eq!(result.messages.len(), 2);
     }
@@ -717,7 +1044,7 @@ mod tests {
             pattern,
             with: "Hi".to_string(),
         }];
-        let result = execute_purge_operations(&msgs, &ops);
+        let result = execute_purge_operations(&msgs, &ops, "purge-test").unwrap();
         assert_eq!(result.replaced_count, 1);
 
         if let ContentBlock::Text { text, .. } = &result.messages[0].content[0] {
@@ -737,7 +1064,7 @@ mod tests {
             msg_tool_result("call_01", "fn main() {}"),
         ];
         let ops = vec![PurgeOp::Remove { msg_id: 2 }]; // remove tool call only
-        let result = execute_purge_operations(&msgs, &ops);
+        let result = execute_purge_operations(&msgs, &ops, "purge-test").unwrap();
         // Both tool call and its result should be gone (cascaded).
         assert_eq!(
             result.removed_count, 2,
@@ -755,7 +1082,7 @@ mod tests {
             msg_tool_result("call_01", "fn main() {}"),
         ];
         let ops = vec![PurgeOp::Remove { msg_id: 3 }]; // remove result only
-        let result = execute_purge_operations(&msgs, &ops);
+        let result = execute_purge_operations(&msgs, &ops, "purge-test").unwrap();
         assert_eq!(
             result.removed_count, 2,
             "tool result + its call should both be removed"
@@ -817,7 +1144,7 @@ mod tests {
     }
 
     use crate::llm_client::mock::MockLlmClient;
-    use crate::models::{MessageResponse, Usage};
+    use codewhale_models::{MessageResponse, Usage};
 
     fn msg_response_with_tool_call(operations: serde_json::Value) -> MessageResponse {
         MessageResponse {
@@ -825,6 +1152,7 @@ mod tests {
             r#type: "message".to_string(),
             role: "assistant".to_string(),
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_purge".to_string(),
                 name: "purge_context".to_string(),
                 input: json!({"operations": operations}),
@@ -858,6 +1186,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_purge_removes_message() {
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let _cost_guard = crate::cost_status::test_scope();
         let mock = MockLlmClient::new(vec![]);
         mock.push_message_response(msg_response_with_tool_call(json!([
@@ -870,9 +1201,17 @@ mod tests {
             msg_text("user", "bye"),
         ];
 
-        let result = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
-            .await
-            .unwrap();
+        let result = run_purge(
+            &mock,
+            ProviderKind::Deepseek,
+            "purge-test",
+            &messages,
+            "mock",
+            None,
+            4096,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.removed_count, 1);
         assert_eq!(result.replaced_count, 0);
         assert_eq!(result.messages.len(), 2);
@@ -897,6 +1236,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_purge_replace_condenses_text() {
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let _cost_guard = crate::cost_status::test_scope();
         let mock = MockLlmClient::new(vec![]);
         mock.push_message_response(msg_response_with_tool_call(json!([
@@ -905,9 +1247,17 @@ mod tests {
 
         let messages = vec![msg_text("assistant", "this is very long and verbose text")];
 
-        let result = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
-            .await
-            .unwrap();
+        let result = run_purge(
+            &mock,
+            ProviderKind::Deepseek,
+            "purge-test",
+            &messages,
+            "mock",
+            None,
+            4096,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.removed_count, 0);
         assert_eq!(result.replaced_count, 1);
 
@@ -923,26 +1273,48 @@ mod tests {
 
     #[tokio::test]
     async fn run_purge_errors_when_no_tool_call() {
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let _cost_guard = crate::cost_status::test_scope();
         let mock = MockLlmClient::new(vec![]);
         mock.push_message_response(msg_response_without_tool_call("nothing to clean up"));
 
         let messages = vec![msg_text("user", "hi")];
-        let err = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
-            .await
-            .unwrap_err();
+        let err = run_purge(
+            &mock,
+            ProviderKind::Deepseek,
+            "purge-test",
+            &messages,
+            "mock",
+            None,
+            4096,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("did not call purge_context"));
     }
 
     #[tokio::test]
     async fn run_purge_errors_on_api_failure() {
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let _cost_guard = crate::cost_status::test_scope();
         // No canned response — MockLlmClient returns an error.
         let mock = MockLlmClient::new(vec![]);
         let messages = vec![msg_text("user", "hi")];
-        let err = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
-            .await
-            .unwrap_err();
+        let err = run_purge(
+            &mock,
+            ProviderKind::Deepseek,
+            "purge-test",
+            &messages,
+            "mock",
+            None,
+            4096,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("Purge API error"));
     }
 }

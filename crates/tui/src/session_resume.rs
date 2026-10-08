@@ -212,8 +212,10 @@ pub fn decide_auto_resume(
     // files cannot turn startup into a long scan.
     for id in candidates.into_iter().take(MAX_AUTO_RESUME_CANDIDATES) {
         // Verify against the real file before trusting it: the listing above
-        // only parsed each session's bounded metadata prefix.
-        let saved = match manager.load_session(&id) {
+        // only parsed each session's bounded metadata prefix. The probe only
+        // needs durable metadata — repair belongs to the resume that follows,
+        // so read the snapshot without running or logging it here.
+        let saved = match manager.load_session_snapshot(&id) {
             Ok(saved) => saved,
             Err(err) => {
                 skipped_unreadable += 1;
@@ -262,26 +264,19 @@ fn candidate_ids(
     sessions: &[crate::session_manager::SessionMetadata],
     workspace: &Path,
 ) -> Vec<String> {
+    // Empty auto-created placeholders are excluded *before* the candidate
+    // cap, the same definition `get_latest_session_for_workspace` applies:
+    // a run of fresh placeholders must not push a real session out of reach.
     let query = crate::session_projection::SessionQuery::default()
         .with_filter(crate::session_manager::SessionListFilter::ActiveOnly)
         .with_sort(crate::session_projection::SessionSortMode::Recent)
         .scoped_to(workspace)
+        .without_empty_auto_created()
         .with_limit(MAX_AUTO_RESUME_CANDIDATES);
     crate::session_projection::select_sessions(sessions, &query)
         .into_iter()
-        .filter(|metadata| !is_empty_placeholder(metadata))
         .map(|metadata| metadata.id.clone())
         .collect()
-}
-
-/// An auto-created, never-used session is not something to resume into.
-/// Mirrors the filter `get_latest_session_for_workspace` applies.
-fn is_empty_placeholder(metadata: &crate::session_manager::SessionMetadata) -> bool {
-    metadata.message_count == 0
-        && metadata
-            .title
-            .trim()
-            .eq_ignore_ascii_case(crate::session_manager::DEFAULT_SESSION_TITLE)
 }
 
 fn plural_sessions(count: usize) -> &'static str {
@@ -300,9 +295,9 @@ fn describe_load_error(err: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Role;
-    use crate::models::{ContentBlock, Message};
     use crate::session_manager::{SavedSession, create_saved_session_with_id_and_mode};
+    use codewhale_models::Role;
+    use codewhale_models::{ContentBlock, Message};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -358,6 +353,45 @@ mod tests {
         assert_eq!(decision, AutoResumeDecision::Disabled);
         assert!(decision.starts_fresh());
         assert_eq!(decision.status_message(), None);
+    }
+
+    #[test]
+    fn fresh_placeholders_do_not_push_a_real_session_past_the_candidate_cap() {
+        let fx = fixture();
+        let mut real = saved("real", &fx.workspace, "Real work");
+        real.metadata.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        fx.manager.save_session(&real).expect("save real session");
+        for index in 0..MAX_AUTO_RESUME_CANDIDATES {
+            let mut placeholder = create_saved_session_with_id_and_mode(
+                format!("placeholder-{index}"),
+                &[],
+                "deepseek-chat",
+                &fx.workspace,
+                0,
+                None,
+                Some("agent"),
+            );
+            placeholder.metadata.title = crate::session_manager::DEFAULT_SESSION_TITLE.to_string();
+            placeholder.metadata.updated_at =
+                chrono::Utc::now() - chrono::Duration::seconds(index as i64);
+            fx.manager
+                .save_session(&placeholder)
+                .expect("save placeholder");
+        }
+        let listed = fx.manager.list_sessions().expect("list");
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|session| crate::session_manager::is_empty_auto_created_session(session))
+                .count(),
+            MAX_AUTO_RESUME_CANDIDATES,
+            "fixture keeps a full cap of newer placeholders"
+        );
+
+        let decision =
+            decide_auto_resume(true, &ResumeRequest::default(), &fx.workspace, &fx.manager);
+
+        assert_eq!(decision.session_id(), Some("real"));
     }
 
     #[test]

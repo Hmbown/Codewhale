@@ -41,6 +41,9 @@ while IFS= read -r -d '' sha &&
   feature_text="${subject}"$'\n'"${body}"
   while IFS= read -r issue; do
     [[ -n "${issue}" ]] || continue
+    case "${issue}" in
+      000 | 1 | 24 | 26 | 1834 | 142352) continue ;;
+    esac
     checked=$((checked + 1))
     found=0
     for notes_file in "${notes_files[@]}"; do

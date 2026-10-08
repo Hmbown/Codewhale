@@ -23,12 +23,9 @@ export const chrome: ChromeDict = {
   navCommunity: "Comunità",
   navContribute: "Contribuisci",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
+  navProduct: "Prodotto",
+  navModels: "Modelli",
+  navPlugins: "Plugin",
 
   skipToContent: "Vai al contenuto principale",
 
@@ -38,30 +35,8 @@ export const chrome: ChromeDict = {
   installCta: "Installa →",
 
   authSignIn: "Accedi",
-  authRegister: "Registrati",
-  authGroupAria: "Account",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "qualsiasi modello, sulla tua macchina",
-
-  issueLabel: "Edizione del {date}",
   dateLocale: "it-IT",
-
-  starsAria: "Stelle GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "In diretta",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "unito",
-  tickerOpened: "aperto",
-  tickerClosed: "chiuso",
-  tickerReleased: "pubblicato",
-  tickerFirstContribution: "prima contribuzione",
-  tickerBy: "di {handle}",
-  tickerAria: "Attività recente del repository",
-
-  traceLabel: "traccia di ragionamento",
-  traceTabsAria: "Stralci di sessione",
 
   menuOpen: "Apri il menu",
   menuClose: "Chiudi il menu",
@@ -69,11 +44,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "chiaro",
   themeDark: "scuro",
-  themeAria: "Tema della documentazione: {mode} (clic per cambiare)",
-  themeTitle: "Tema della documentazione · auto / chiaro / scuro",
+  themeAria: "Tema: {mode} (clic per cambiare)",
+  themeTitle: "Tema · auto / chiaro / scuro",
 
   footerTagline:
-    "Codewhale si tuffa negli abissi al posto tuo — documentazione, sorgente e community per il runtime open source.",
+    "Modifica il codice, esegui i test e rivedi le modifiche con i modelli che scegli.",
   footerProduct: "Prodotto",
   footerProject: "Progetto",
   footerDocs: "Documentazione",
@@ -85,7 +60,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "Contribuisci",
   footerLicense: "Licenza MIT",
-  footerPricing: "Prezzi",
   footerTerms: "Termini di servizio",
   footerPrivacy: "Privacy",
   footerChangelog: "Registro delle modifiche",

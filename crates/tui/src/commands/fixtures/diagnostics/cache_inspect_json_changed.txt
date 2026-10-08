@@ -1,0 +1,51 @@
+command: /cache inspect --json after prefix change
+is_error: false
+message:
+{
+  "base_static_prefix_hash": "268cc80b167cfa7a4ec3d6d64c29c1e6110f43d73c9b0139bb1a4854beb726f5",
+  "full_request_prefix_hash": "268cc80b167cfa7a4ec3d6d64c29c1e6110f43d73c9b0139bb1a4854beb726f5",
+  "tool_catalog_hash": "2b0aecfc0a77764e19495586a64ca757e310f05751be284f751695d300c1a98a",
+  "layers": [
+    {
+      "name": "Global system prefix",
+      "stability": "Static",
+      "char_len": 14,
+      "byte_len": 14,
+      "token_estimate": 3,
+      "sha256": "56ef3f55a01d42fb16ecb09ba0e0eaa39b60e0ff400122a668752f7e6b3dc7ee",
+      "tool_result": null,
+      "turn_meta": null
+    },
+    {
+      "name": "Tool catalog",
+      "stability": "Static",
+      "char_len": 174,
+      "byte_len": 174,
+      "token_estimate": 43,
+      "sha256": "2b0aecfc0a77764e19495586a64ca757e310f05751be284f751695d300c1a98a",
+      "tool_result": null,
+      "turn_meta": null
+    },
+    {
+      "name": "User task",
+      "stability": "Dynamic",
+      "char_len": 12,
+      "byte_len": 12,
+      "token_estimate": 3,
+      "sha256": "4584870aab419b30ba3b57a0541c6093c310df4ad6efb2fdb8b4cdb477424dbf",
+      "tool_result": null,
+      "turn_meta": null
+    }
+  ],
+  "current_warmup_key": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "base_url": "https://api.deepseek.com/beta",
+    "static_prefix_hash": "268cc80b167cfa7a4ec3d6d64c29c1e6110f43d73c9b0139bb1a4854beb726f5",
+    "tool_catalog_hash": "2b0aecfc0a77764e19495586a64ca757e310f05751be284f751695d300c1a98a",
+    "project_pack_hash": "",
+    "skills_hash": ""
+  },
+  "warmup_status": "Warmup status: no previous warmup (current key: 110494f88efc)"
+}
+action: <none>

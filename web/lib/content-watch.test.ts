@@ -6,7 +6,7 @@ vi.mock("./community-agent", async (importOriginal) => {
 });
 
 import { runLinkCheck, runSemanticDrift, watchDraftId } from "./content-watch";
-import { agentChat, draftStorageKey, type AgentDraft } from "./community-agent";
+import { agentChat, deleteDraft, draftStorageKey, markDraftResolved, type AgentDraft } from "./community-agent";
 
 const agentChatMock = agentChat as Mock;
 
@@ -155,6 +155,19 @@ describe("runSemanticDrift draft identity", () => {
 
     expect(second).toEqual({ ok: true, drafted: 0 });
     expect(draftEntries(kv)).toHaveLength(1);
+  });
+
+  it("does not count a finding the maintainer already discarded as drafted", async () => {
+    mockDrifts([finding]);
+    await runSemanticDrift(env());
+    const [[key, draft]] = draftEntries(kv);
+    await markDraftResolved(kv, "semantic-drift", draft.id, "discarded");
+    await deleteDraft(kv, key);
+
+    const second = await runSemanticDrift(env());
+
+    expect(second).toEqual({ ok: true, drafted: 0 });
+    expect(draftEntries(kv)).toHaveLength(0);
   });
 
   it("creates a new draft when the finding's evidence changes", async () => {

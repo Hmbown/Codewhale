@@ -20,11 +20,11 @@ pub const CHECKSUM_MANIFEST_ASSET: &str = "codewhale-artifacts-sha256.txt";
 
 /// GitHub API URL for the single latest stable release.
 pub const LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/Hmbown/CodeWhale/releases/latest";
+    "https://api.github.com/repos/codewhale-hq/CodeWhale/releases/latest";
 
 /// GitHub API URL listing recent releases (up to 100), used to find beta tags.
 pub const RELEASES_URL: &str =
-    "https://api.github.com/repos/Hmbown/CodeWhale/releases?per_page=100";
+    "https://api.github.com/repos/codewhale-hq/CodeWhale/releases?per_page=100";
 
 /// Base URL of the CodeWhale repository on the CNB mirror platform.
 pub const CNB_REPO_URL: &str = "https://cnb.cool/codewhale.net/codewhale";
@@ -42,7 +42,10 @@ pub const DEEPSEEK_RELEASE_BASE_URL_ENV: &str = "DEEPSEEK_RELEASE_BASE_URL";
 pub const CNB_MIRROR_ENV: &str = "CODEWHALE_USE_CNB_MIRROR";
 
 /// Environment variable that pins the update target version.
-pub const UPDATE_VERSION_ENV: &str = "DEEPSEEK_TUI_VERSION";
+pub const UPDATE_VERSION_ENV: &str = "CODEWHALE_VERSION";
+
+/// Pre-rebrand environment variable (alias for [`UPDATE_VERSION_ENV`]).
+pub const LEGACY_TUI_UPDATE_VERSION_ENV: &str = "DEEPSEEK_TUI_VERSION";
 
 /// Legacy environment variable (alias for [`UPDATE_VERSION_ENV`]).
 pub const LEGACY_UPDATE_VERSION_ENV: &str = "DEEPSEEK_VERSION";
@@ -212,13 +215,20 @@ pub fn cnb_release_base_url(version: &str) -> String {
 }
 
 /// Returns the pinned update version from environment variables, or `None`
-/// if neither `DEEPSEEK_TUI_VERSION` nor `DEEPSEEK_VERSION` is set.
+/// if `CODEWHALE_VERSION` and its two legacy aliases are unset or empty.
 pub fn update_version_from_env() -> Option<String> {
-    std::env::var(UPDATE_VERSION_ENV)
-        .ok()
-        .or_else(|| std::env::var(LEGACY_UPDATE_VERSION_ENV).ok())
-        .map(|value| value.trim().trim_start_matches('v').to_string())
-        .filter(|value| !value.is_empty())
+    [
+        UPDATE_VERSION_ENV,
+        LEGACY_TUI_UPDATE_VERSION_ENV,
+        LEGACY_UPDATE_VERSION_ENV,
+    ]
+    .into_iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().trim_start_matches('v').to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 /// Joins a mirror base URL with an asset filename to produce a full download URL.
@@ -240,28 +250,9 @@ pub fn update_network_fallback_hint() -> String {
     )
 }
 
-/// Fetches a release JSON payload from `url` using a blocking HTTP client.
+/// Fetches a release JSON payload from `url` (async).
 ///
 /// `description` is included in error messages to identify the request purpose.
-pub fn fetch_release_json_blocking(url: &str, description: &str) -> Result<String> {
-    let client = platform_blocking_http_client_builder()
-        .user_agent(UPDATE_USER_AGENT)
-        .timeout(RELEASE_METADATA_TIMEOUT)
-        .build()
-        .context("failed to build release check HTTP client")?;
-    let response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .with_context(|| format!("failed to fetch {description} from {url}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .with_context(|| format!("failed to read {description} response from {url}"));
-    release_response_body(status, body, url, description)
-}
-
-/// Async counterpart of [`fetch_release_json_blocking`].
 pub async fn fetch_release_json_async(url: &str, description: &str) -> Result<String> {
     let client = platform_http_client_builder()
         .user_agent(UPDATE_USER_AGENT)
@@ -339,21 +330,6 @@ pub async fn latest_release_tag_async(channel: ReleaseChannel) -> Result<String>
         }
         ReleaseQuery::GitHubReleaseList { url } => {
             let body = fetch_release_json_async(url, "release list").await?;
-            latest_beta_tag_from_release_list_json(&body)
-        }
-    }
-}
-
-/// Blocking counterpart of [`latest_release_tag_async`].
-pub fn latest_release_tag_blocking(channel: ReleaseChannel) -> Result<String> {
-    match resolve_release_query(channel) {
-        ReleaseQuery::Mirror { version, .. } => Ok(format!("v{}", version.trim_start_matches('v'))),
-        ReleaseQuery::GitHubLatest { url } => {
-            let body = fetch_release_json_blocking(url, "latest release")?;
-            latest_tag_from_release_json(&body)
-        }
-        ReleaseQuery::GitHubReleaseList { url } => {
-            let body = fetch_release_json_blocking(url, "release list")?;
             latest_beta_tag_from_release_list_json(&body)
         }
     }
@@ -442,6 +418,7 @@ mod tests {
         DEEPSEEK_RELEASE_BASE_URL_ENV,
         CNB_MIRROR_ENV,
         UPDATE_VERSION_ENV,
+        LEGACY_TUI_UPDATE_VERSION_ENV,
         LEGACY_UPDATE_VERSION_ENV,
     ];
 
@@ -686,6 +663,19 @@ mod tests {
         set_release_env(LEGACY_UPDATE_VERSION_ENV, "");
 
         assert_eq!(update_version_from_env(), None);
+    }
+
+    #[test]
+    fn canonical_version_pin_outranks_both_preserved_legacy_aliases() {
+        let _env = ReleaseEnvGuard::clear();
+        set_release_env("CODEWHALE_VERSION", "v0.9.11");
+        set_release_env("DEEPSEEK_TUI_VERSION", "v0.9.10");
+        set_release_env("DEEPSEEK_VERSION", "v0.9.9");
+        assert_eq!(update_version_from_env().as_deref(), Some("0.9.11"));
+        set_release_env("CODEWHALE_VERSION", " ");
+        assert_eq!(update_version_from_env().as_deref(), Some("0.9.10"));
+        set_release_env("DEEPSEEK_TUI_VERSION", " ");
+        assert_eq!(update_version_from_env().as_deref(), Some("0.9.9"));
     }
 
     #[test]

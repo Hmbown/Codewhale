@@ -1,0 +1,59 @@
+name: Codewhale review
+description: Review a pinned pull request with a checksummed Codewhale release and an explicit outcome receipt.
+inputs:
+  version:
+    description: Exact released CLI tag (vX.Y.Z). Must support review --json.
+    required: true
+  provider:
+    description: codewhale for an account machine key, or an explicit BYOK provider.
+    default: codewhale
+  model:
+    description: Exact model ID. Account mode requires provider/model from the account catalog.
+    required: true
+  github-token:
+    description: GitHub token with contents read and pull-requests write.
+    default: ${{ github.token }}
+  pr-number:
+    description: PR number for workflow_dispatch; pull_request events use the event snapshot.
+  max-chars:
+    description: Maximum diff characters per complete pass.
+    default: '200000'
+  max-passes:
+    description: Maximum number of complete review passes.
+    default: '1'
+  max-output-tokens:
+    description: Optional per-pass output ceiling; at least 8192.
+  timeout-seconds:
+    description: Model and publication deadline, in seconds (30–1200).
+    default: '600'
+  post:
+    description: Publish a COMMENT review; never approve or request changes.
+    default: 'true'
+outputs:
+  outcome:
+    description: reviewed_clean, reviewed_with_findings, incomplete, superseded, not_eligible, configuration_missing, failed, or publication_uncertain.
+    value: ${{ steps.review.outputs.outcome }}
+  receipt:
+    description: Absolute path to the sanitized JSON execution receipt (also written on failures).
+    value: ${{ steps.review.outputs.receipt }}
+  pr-url:
+    description: URL of the pull request, when resolved.
+    value: ${{ steps.review.outputs.pr-url }}
+runs:
+  using: composite
+  steps:
+    - id: review
+      shell: bash
+      env:
+        CW_ACTION_PATH: ${{ github.action_path }}
+        CW_VERSION: ${{ inputs.version }}
+        CW_PROVIDER: ${{ inputs.provider }}
+        CW_MODEL: ${{ inputs.model }}
+        CW_PR_NUMBER: ${{ inputs.pr-number }}
+        CW_MAX_CHARS: ${{ inputs.max-chars }}
+        CW_MAX_PASSES: ${{ inputs.max-passes }}
+        CW_MAX_OUTPUT_TOKENS: ${{ inputs.max-output-tokens }}
+        CW_TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        CW_POST: ${{ inputs.post }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: node "$CW_ACTION_PATH/scripts/github-action/review.mjs"

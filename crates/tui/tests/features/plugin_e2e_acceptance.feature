@@ -16,7 +16,7 @@ Feature: Plugin discovery and listing
     When the plugin scanner discovers plugins
     Then the scanner should report 3 plugins
     And the scanned plugin "greet" should have "Say hello to the user" as description
-    And the scanned plugin "greet" should have "auto" as approval
+    And the scanned plugin "greet" should have "suggest" as approval
     And the scanned plugin "audit" should have "required" as approval
     And the scanned plugin "summarizer" should have "suggest" as approval
     And the scanned plugin "missing-plugin" should not be found

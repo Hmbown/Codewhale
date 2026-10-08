@@ -8,9 +8,9 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::localization::MessageId;
-use crate::palette;
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
+use codewhale_palette as palette;
 
 pub fn lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
@@ -71,8 +71,8 @@ fn body(out: &mut Vec<Line<'static>>, app: &App, id: MessageId, width: usize) {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::localization::Locale;
     use crate::tui::app::TuiOptions;
+    use codewhale_localization::Locale;
     use std::path::PathBuf;
 
     fn test_app_with_locale(locale: Locale) -> App {
@@ -115,8 +115,8 @@ mod tests {
 mod narrow_locale_tests {
     use super::*;
     use crate::config::Config;
-    use crate::localization::{Locale, MessageId, tr};
     use crate::tui::app::TuiOptions;
+    use codewhale_localization::{Locale, MessageId, tr};
     use std::path::PathBuf;
     use unicode_width::UnicodeWidthStr;
 

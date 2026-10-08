@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { getStates } from "@/lib/i18n/dictionaries";
+import { WhalePose, type WhalePoseName } from "./whale-pose";
 
 /**
  * Shared surface states — the one empty / loading / error vocabulary every
@@ -9,8 +10,11 @@ import { getStates } from "@/lib/i18n/dictionaries";
  * Rules:
  *  - An empty state is a statement that nothing exists, never a placeholder
  *    pretending something does. Copy comes from the states dictionary.
- *  - A loading state is announced (`role="status"`) and drawn as neutral
- *    skeleton lines whose shimmer is gated on `prefers-reduced-motion`.
+ *  - The whale's pose says what is going on (rest when there is nothing,
+ *    busy while loading, hmm when something failed); the title says it in
+ *    words, so the pose is decorative.
+ *  - A loading state is announced (`role="status"`) and drawn as still
+ *    skeleton lines plus one spinner that only turns when motion is allowed.
  *  - An error state says what failed and offers exactly one recovery.
  */
 
@@ -25,6 +29,7 @@ function Block({
   compact,
   role,
   live,
+  pose,
   titleAs: Title = "p",
 }: {
   tone: Tone;
@@ -34,6 +39,7 @@ function Block({
   compact?: boolean;
   role?: "status" | "alert";
   live?: "polite" | "assertive";
+  pose: WhalePoseName;
   /** A route-level plate that is the whole page owns its `<h1>`. */
   titleAs?: TitleTag;
 }) {
@@ -44,12 +50,10 @@ function Block({
       aria-live={live}
       data-state={tone}
     >
-      <span className="state-mark" aria-hidden="true" />
-      <div className="state-copy">
-        <Title className="state-title">{title}</Title>
-        {body && <p className="state-body">{body}</p>}
-        {action && <div className="state-actions">{action}</div>}
-      </div>
+      <WhalePose pose={pose} />
+      <Title className="state-title">{title}</Title>
+      {body && <p className="state-body">{body}</p>}
+      {action && <div className="state-actions">{action}</div>}
     </div>
   );
 }
@@ -61,6 +65,7 @@ export function EmptyState({
   action,
   compact,
   titleAs,
+  pose = "rest",
 }: {
   locale: string;
   title?: string;
@@ -68,6 +73,7 @@ export function EmptyState({
   action?: ReactNode;
   compact?: boolean;
   titleAs?: TitleTag;
+  pose?: WhalePoseName;
 }) {
   const t = getStates(locale);
   return (
@@ -78,6 +84,7 @@ export function EmptyState({
       action={action}
       compact={compact}
       titleAs={titleAs}
+      pose={pose}
     />
   );
 }
@@ -100,12 +107,13 @@ export function UnavailableState({
   const t = getStates(locale);
   return (
     <Block
-      tone="error"
+      tone="empty"
       title={t.unavailableTitle}
       body={t.unavailableBody}
       action={action}
       compact={compact}
       role="status"
+      pose="sleep"
     />
   );
 }
@@ -130,14 +138,14 @@ export function LoadingState({
       aria-busy="true"
       data-state="loading"
     >
-      <span className="state-mark" aria-hidden="true" />
-      <div className="state-copy">
-        <p className="state-title">{label ?? t.loadingLabel}</p>
-        <div className="state-skeleton" aria-hidden="true">
-          {Array.from({ length: lines }, (_, i) => (
-            <span key={i} style={{ width: `${88 - i * 14}%` }} />
-          ))}
-        </div>
+      <WhalePose pose="busy" />
+      <p className="state-title">
+        <span className="spinner" aria-hidden="true" /> {label ?? t.loadingLabel}
+      </p>
+      <div className="state-skeleton" aria-hidden="true">
+        {Array.from({ length: lines }, (_, i) => (
+          <span key={i} style={{ width: `${88 - i * 14}%` }} />
+        ))}
       </div>
     </div>
   );
@@ -168,6 +176,7 @@ export function ErrorState({
       compact={compact}
       role="alert"
       titleAs={titleAs}
+      pose="hmm"
     />
   );
 }

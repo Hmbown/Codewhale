@@ -1,0 +1,5 @@
+command: /balance
+is_error: false
+message:
+Balance check is not supported for Ollama yet. Check the provider dashboard for account balance details.
+action: <none>

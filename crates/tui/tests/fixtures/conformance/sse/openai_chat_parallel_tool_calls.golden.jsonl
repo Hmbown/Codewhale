@@ -1,0 +1,12 @@
+{"request":[{"method":"POST","path":"/v1/chat/completions"}]}
+{"type":"message_start","message":{"id":"","type":"message","role":"assistant","content":[],"model":"gpt-4.1","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_paris","name":"get_weather","input":{}}}
+{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}
+{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"Paris\"}"}}
+{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_oslo","name":"get_weather","input":{}}}
+{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Oslo\"}"}}
+{"type":"content_block_stop","index":0}
+{"type":"content_block_stop","index":1}
+{"type":"message_delta","delta":{"stop_reason":"tool_calls","stop_sequence":null}}
+{"type":"message_delta","delta":{"stop_reason":null,"stop_sequence":null},"usage":{"input_tokens":57,"output_tokens":31,"prompt_cache_hit_tokens":32,"prompt_cache_miss_tokens":25}}
+{"type":"message_stop"}

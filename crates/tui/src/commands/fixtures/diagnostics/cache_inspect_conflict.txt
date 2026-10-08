@@ -1,0 +1,5 @@
+command: /cache inspect --json --verbose
+is_error: false
+message:
+cache inspect: --json and --verbose cannot be combined
+action: <none>

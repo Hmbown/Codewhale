@@ -251,7 +251,10 @@ pub(crate) async fn drain_remote_control_events(
                         }
                     }
                     crate::remote_control::RemoteCommand::Approval { gate, approved } => {
-                        let Some(tool_id) = app.remote_control.take_pending_approval(&gate) else {
+                        // Keep the gate pending until the engine takes the
+                        // decision: a failed send leaves it retryable (U03-07).
+                        let Some(tool_id) = app.remote_control.pending_approval_tool_id(&gate)
+                        else {
                             app.remote_control.acknowledge(
                                 &run_id,
                                 seq,
@@ -262,24 +265,38 @@ pub(crate) async fn drain_remote_control_events(
                             continue;
                         };
                         let result = if approved {
-                            engine_handle.approve_tool_call(tool_id).await
+                            engine_handle.approve_tool_call(tool_id.clone()).await
                         } else {
-                            engine_handle.deny_tool_call(tool_id).await
+                            engine_handle.deny_tool_call(tool_id.clone()).await
                         };
                         match result {
                             Ok(()) => {
+                                note_human_decision_delivered(app, &tool_id);
+                                let _ = app.remote_control.take_pending_approval(&gate);
+                                app.retire_action_notices(Some(&tool_id));
                                 // First decision wins: the web answered this
                                 // gate, so dismiss exactly the matching card —
                                 // never an unrelated approval that happens to
                                 // be on top (concurrent approvals, fleet).
-                                if app.view_stack.top_matches_approval_gate(&gate) {
-                                    app.view_stack.pop();
+                                // The card may sit under another view
+                                // (a child's card, a pager): remove it at
+                                // any depth, and forget its pending entry.
+                                if app.view_stack.remove_approval_for_gate(&gate) {
                                     app.needs_redraw = true;
                                 }
-                                app.status_message = Some(format!(
-                                    "Approval decided on the web ({}).",
-                                    if approved { "approved" } else { "denied" }
-                                ));
+                                crate::tui::pending_requests::resolve(app, &tool_id);
+                                let (message_id, level) = if approved {
+                                    (
+                                        MessageId::NotificationWebApproved,
+                                        StatusToastLevel::Success,
+                                    )
+                                } else {
+                                    (MessageId::NotificationWebDenied, StatusToastLevel::Warning)
+                                };
+                                app.push_status_toast_record(
+                                    StatusToast::new(app.tr(message_id), level, Some(5_000))
+                                        .for_event(format!("web-decision:{tool_id}")),
+                                );
                                 app.remote_control
                                     .acknowledge(&run_id, seq, &command, "applied", None);
                             }

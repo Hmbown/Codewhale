@@ -1,0 +1,24 @@
+{
+  "description": "Default interactive posture: Agent mode, suggest approvals, shell allowed, an untrusted workspace with one README.",
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "approval_mode": "suggest",
+  "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "/bin/bash",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
+  },
+  "user_message": "hello",
+  "workspace_files": {
+    "README.md": "conformance fixture\n"
+  }
+}

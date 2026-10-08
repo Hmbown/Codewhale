@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::models::{ContentBlock, Message, SystemPrompt};
 use crate::repl::PythonRuntime;
+use codewhale_models::{ContentBlock, Message, SystemPrompt};
 
 pub type SharedRlmSessionStore = Arc<Mutex<HashMap<String, Arc<Mutex<RlmSession>>>>>;
 
@@ -370,6 +370,7 @@ fn compact_content_block(block: &ContentBlock) -> Value {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             let chars = content.chars().count();
             let large = chars > 2_000;
@@ -459,7 +460,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Role;
+    use codewhale_models::Role;
 
     #[test]
     fn derive_session_name_slugifies_path() {
@@ -525,6 +526,7 @@ mod tests {
             vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_1".to_string(),
                     content: large.clone(),
                     is_error: None,

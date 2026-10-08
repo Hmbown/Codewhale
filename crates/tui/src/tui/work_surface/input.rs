@@ -43,16 +43,25 @@ pub fn enter_agents(app: &mut App) -> bool {
         return false;
     }
     let rows = visible_rows_for_panel(app);
+    // A live strip is proven by the hitboxes it painted this frame. When the
+    // agents view itself was on screen the worker row must be among them;
+    // when another view was up (the dock opens on TODO), any painted row
+    // proves the strip is live and the switch paints the workers next frame.
+    let strip_is_live = !app.work_surface.hitboxes.is_empty();
+    let agents_were_painted = previous_panel == RailPanel::Agents;
     let first_agent = rows
         .iter()
         .find(|row| {
             row.selectable
                 && row.id.0.starts_with("worker:")
-                && app
-                    .work_surface
-                    .hitboxes
-                    .iter()
-                    .any(|hitbox| hitbox.id == row.id)
+                && if agents_were_painted {
+                    app.work_surface
+                        .hitboxes
+                        .iter()
+                        .any(|hitbox| hitbox.id == row.id)
+                } else {
+                    strip_is_live
+                }
         })
         .map(|row| row.id.clone());
     let Some(first_agent) = first_agent else {
@@ -107,9 +116,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
                 .iter()
                 .position(|panel| *panel == app.work_surface.panel)
                 .unwrap_or(0);
+            // Only a bare ←/→ walks the dock tabs. Ctrl/Alt/Super+←/→ are the
+            // composer's word-navigation chords; they fall through below and
+            // return ownership to the composer like printable input.
+            let bare = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
             let next = match key.code {
-                KeyCode::Left => Some((current + tabs.len() - 1) % tabs.len()),
-                KeyCode::Right => Some((current + 1) % tabs.len()),
+                KeyCode::Left if bare => Some((current + tabs.len() - 1) % tabs.len()),
+                KeyCode::Right if bare => Some((current + 1) % tabs.len()),
                 _ => None,
             };
             if let Some(next) = next {
@@ -117,6 +132,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
                 return Some(None);
             }
         }
+    }
+
+    let navigation_chord = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    if (matches!(key.code, KeyCode::Char(_)) && !navigation_chord)
+        || (app.work_surface.focused
+            && navigation_chord
+            && matches!(key.code, KeyCode::Left | KeyCode::Right))
+    {
+        release_focus(app);
+        return None;
     }
 
     // Keyboard and mouse share one row source per panel: Enter on the
@@ -137,15 +164,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
         return None;
     }
 
-    if matches!(key.code, KeyCode::Char(_))
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        release_focus(app);
-        return None;
-    }
-
     // The details chord opens the selected row's own world; the transcript
     // pager owns ⌥V only when no work row is selected.
     if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) {
@@ -161,9 +179,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
 
     let action = match key.code {
         KeyCode::Esc => {
-            if app.work_surface.opened.is_some() {
+            if super::interaction::opened_detail_on_screen(app) {
                 close_opened(app);
             } else {
+                // A stale owner (the row's command opened no view) must not
+                // swallow the Esc the close control advertises.
+                app.work_surface.opened = None;
                 super::interaction::dismiss_dock(app);
             }
             return Some(None);
@@ -472,6 +493,10 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
                 action,
             }
         }
+        // Right-click is the context menu's (`mouse_ui::open_context_menu`
+        // reads the row under the pointer). The catch-all below used to mark
+        // it consumed, so no menu ever opened over the work surface.
+        MouseEventKind::Down(MouseButton::Right) => MouseOutcome::default(),
         _ => MouseOutcome {
             consumed: true,
             action: None,
@@ -528,12 +553,23 @@ fn move_selection(app: &mut App, rows: &[WorkRow], delta: isize) {
     if ids.is_empty() {
         return;
     }
-    let current = app
+    let Some(current) = app
         .work_surface
         .selected
         .as_ref()
         .and_then(|selected| ids.iter().position(|id| id == selected))
-        .unwrap_or_default();
+    else {
+        // Nothing selected — the dock opens this way, and a stale id lands here
+        // too. `unwrap_or_default()` called that row 0, so the first Down moved
+        // to row 1 and the first row could never be reached by pressing Down.
+        // The first move lands on the edge it came from.
+        app.work_surface.selected = Some(if delta.is_negative() {
+            ids[ids.len().saturating_sub(1)].clone()
+        } else {
+            ids[0].clone()
+        });
+        return;
+    };
     let next = if delta.is_negative() {
         current.saturating_sub(delta.unsigned_abs())
     } else {
@@ -551,4 +587,59 @@ fn select_edge(app: &mut App, rows: &[WorkRow], end: bool) {
     } else {
         ids.first().cloned()
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, WorkRow, move_selection};
+    use crate::tui::work_surface::model::{WorkRowId, WorkTone};
+
+    fn row(id: &str) -> WorkRow {
+        WorkRow {
+            id: WorkRowId(id.to_string()),
+            mark: "·",
+            label: id.to_string(),
+            detail: String::new(),
+            tone: WorkTone::Muted,
+            selectable: true,
+            primary_action: None,
+            agent: None,
+        }
+    }
+
+    fn app() -> App {
+        App::new(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            &crate::config::Config::default(),
+        )
+    }
+
+    /// The dock opens with nothing selected (`select_dock_panel` sets
+    /// `selected = None`). Resolving that to index 0 meant the first Down
+    /// landed on the *second* row and the first row could never be reached by
+    /// pressing Down at all. The same path catches a stale id that is no
+    /// longer in the list.
+    #[test]
+    fn first_move_lands_on_the_edge_it_came_from() {
+        let rows = [row("a"), row("b"), row("c")];
+
+        for (start, delta, expected) in [
+            (None, 1isize, "a"),
+            (None, -1, "c"),
+            (Some("gone"), 1, "a"),
+            (Some("gone"), -1, "c"),
+            // An established selection still moves by the delta.
+            (Some("a"), 1, "b"),
+            (Some("b"), -1, "a"),
+        ] {
+            let mut app = app();
+            app.work_surface.selected = start.map(|id| WorkRowId(id.to_string()));
+            move_selection(&mut app, &rows, delta);
+            assert_eq!(
+                app.work_surface.selected.as_ref().map(|id| id.0.as_str()),
+                Some(expected),
+                "start={start:?} delta={delta}"
+            );
+        }
+    }
 }

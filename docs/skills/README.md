@@ -15,4 +15,5 @@ To activate:
   `crates/tui/src/skills/system.rs` to ship it.
 
 Skills: gh-file-issue, gh-compile-issues, gh-assign-issues, gh-find-prs,
-gh-treasure-hunt, gh-close-issues, gh-credit-harvest, codew-release-qa-sweep.
+gh-treasure-hunt, gh-close-issues, gh-credit-harvest, codew-release-qa-sweep,
+contributor-onboarding, feedback.

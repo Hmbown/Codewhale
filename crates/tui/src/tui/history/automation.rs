@@ -11,16 +11,16 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::localization::{Locale, MessageId, tr};
-use crate::palette::ChromeInk;
 use crate::tui::glyphs;
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette::ChromeInk;
 
 /// What happened to the automation or its run. Drives the card's ink; the
 /// visible verb phrase comes from the producer (localized at construction).
 // Slice 1 produces Started / Completed / Failed / Mutated (the `/automation
 // run` receipt and the projection's settled-run receipts); Fired / Coalesced
 // / Missed / Expired arrive with their engine-side producers in Slice 4.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutomationCellKind {
     /// The schedule fired and a run was enqueued.
@@ -31,6 +31,9 @@ pub enum AutomationCellKind {
     Completed,
     /// A run genuinely crashed — the only kind that may wear Failure red.
     Failed,
+    /// A run was canceled by the operator, a cancel timeout or shutdown
+    /// (#6162). Consequential enough to see, never a failure.
+    Canceled,
     /// Missed slots collapsed into a single delivery.
     Coalesced,
     /// A scheduled run was missed while the app was down.
@@ -53,7 +56,7 @@ impl AutomationCellKind {
             Self::Fired | Self::Started => ChromeInk::Active,
             Self::Completed => ChromeInk::Outcome,
             Self::Failed => ChromeInk::Failure,
-            Self::Coalesced | Self::Missed | Self::Expired => ChromeInk::Attention,
+            Self::Canceled | Self::Coalesced | Self::Missed | Self::Expired => ChromeInk::Attention,
             Self::Mutated => ChromeInk::Info,
         }
     }
@@ -68,6 +71,7 @@ impl AutomationCellKind {
             Self::Started => MessageId::AutomationReceiptStarted,
             Self::Completed => MessageId::AutomationReceiptCompleted,
             Self::Failed => MessageId::AutomationRunStatusFailed,
+            Self::Canceled => MessageId::AutomationRunStatusCanceled,
             Self::Coalesced => MessageId::AutomationReceiptCoalesced,
             Self::Missed => MessageId::AutomationReceiptMissed,
             Self::Expired => MessageId::AutomationReceiptExpired,
@@ -138,7 +142,7 @@ impl AutomationCell {
     /// Render the one-line card at `width`. The card never wraps: the detail
     /// segment sheds first, then the name/verb truncate.
     pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let color = self.kind.chrome_ink().color(&crate::palette::UI_THEME);
+        let color = self.kind.chrome_ink().color(&codewhale_palette::UI_THEME);
         let bullet_width = 2usize; // `● ` — the charter's current marker + space
         let budget = usize::from(width).saturating_sub(bullet_width);
         let mut text = self.name.clone();
@@ -146,11 +150,11 @@ impl AutomationCell {
             text.push(' ');
             text.push_str(&self.verb);
         }
-        let text = crate::localization::truncate_to_width(&text, budget);
+        let text = codewhale_localization::truncate_to_width(&text, budget);
         let used = unicode_width::UnicodeWidthStr::width(text.as_str());
         let detail = self.detail.as_deref().and_then(|detail| {
             let remaining = budget.saturating_sub(used + 2);
-            (remaining > 0).then(|| crate::localization::truncate_to_width(detail, remaining))
+            (remaining > 0).then(|| codewhale_localization::truncate_to_width(detail, remaining))
         });
         let mut spans = vec![
             Span::styled(
@@ -162,7 +166,7 @@ impl AutomationCell {
         if let Some(detail) = detail {
             spans.push(Span::styled(
                 format!("  {detail}"),
-                Style::default().fg(crate::palette::TEXT_DIM),
+                Style::default().fg(codewhale_palette::TEXT_DIM),
             ));
         }
         vec![Line::from(spans)]
@@ -197,6 +201,7 @@ mod tests {
         );
         assert_eq!(AutomationCellKind::Failed.chrome_ink(), ChromeInk::Failure);
         for kind in [
+            AutomationCellKind::Canceled,
             AutomationCellKind::Coalesced,
             AutomationCellKind::Missed,
             AutomationCellKind::Expired,
@@ -212,12 +217,13 @@ mod tests {
     /// genuinely crashed run, never a report job.
     #[test]
     fn no_automation_receipt_ink_spends_failure_red_but_the_crashed_run() {
-        for theme_id in crate::palette::SELECTABLE_THEMES {
+        for theme_id in codewhale_palette::SELECTABLE_THEMES {
             let theme = theme_id.ui_theme();
             for kind in [
                 AutomationCellKind::Fired,
                 AutomationCellKind::Started,
                 AutomationCellKind::Completed,
+                AutomationCellKind::Canceled,
                 AutomationCellKind::Coalesced,
                 AutomationCellKind::Missed,
                 AutomationCellKind::Expired,

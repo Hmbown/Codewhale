@@ -13,13 +13,14 @@ contract.
 
 ## Scope
 
-Hooks are a **TUI runtime feature**. Every firing point lives in the
-interactive TUI and in the engine turn loop it drives.
+Hooks fire in the interactive TUI and in the engine turn loop, which the
+Runtime API threads behind the desktop app and web drive as well.
 
 | Surface | Fires hooks |
 | --- | --- |
 | `codewhale` / `codew` interactive TUI | yes |
-| `codewhale exec` (headless one-shot) | no |
+| `codewhale exec` (headless one-shot) | opt-in: `--hooks` fires `tool_call_before` and `shell_env` |
+| Runtime API threads (desktop app, web) | yes: `tool_call_before`, `shell_env`, `tool_call_after`, `on_error`; `GET /v1/hooks` lists the set |
 | the `codewhale` CLI dispatcher and its subcommands | no |
 | app-server / ACP | no |
 | the `workflow` tool and sub-agent *internals* | no — but the TUI fires `subagent_spawn` / `subagent_complete` around them |
@@ -28,6 +29,19 @@ interactive TUI and in the engine turn loop it drives.
 The `crates/hooks` event-sink crate in this repository is an unrelated
 internal mechanism. It shares no configuration, no event names, and no
 contract with the hooks described here.
+
+### `codewhale exec --hooks`
+
+Headless runs fire no hooks by default — a CI job should not start paging an
+on-call rotation merely because a config exists. `codewhale exec --hooks`
+opts the run in. The engine-side events are `tool_call_before` (exit code 2
+still denies the call; `ask` resolves fail-closed because nothing can prompt
+headlessly) and `shell_env`. UI-driven events such as `session_start`,
+`message_submit`, and `turn_end` do not fire — they live in the interactive
+shell, not the turn loop. Fleet worker subprocesses never fire operator
+hooks. Independently of this flag, `permissions.toml` typed rules already
+apply to `exec` — the run drives the same turn loop, and a `deny` blocks in
+every mode.
 
 ## Quick start
 
@@ -55,13 +69,13 @@ default_timeout_secs = 30      # see the timeout note below
 working_dir = "/path/to/dir"   # default: the session workspace
 
 [[hooks.hooks]]
-event = "tool_call_before"     # required; one of the 11 names below
+event = "tool_call_before"     # required; one of the 15 names below
 command = "~/.codewhale/hooks/gate.sh"  # required; `sh -c` on Unix, `cmd /C` on Windows
 name = "gate"                  # optional label for /hooks and log lines
 timeout_secs = 30              # optional, default 30
 background = false             # optional; foreground inside the hook worker
 continue_on_error = true       # optional, default true
-condition = { type = "tool_name", name = "exec_shell" }  # optional
+condition = { type = "tool_name", name = "bash" }  # optional
 ```
 
 `timeout_secs` note, stated as implemented: when `[hooks].default_timeout_secs`
@@ -160,7 +174,7 @@ configured instead (the backend owns its base environment, and your
 | Condition | Matches | Supported on |
 | --- | --- | --- |
 | `{ type = "always" }` | every invocation (also the default when omitted) | every event |
-| `{ type = "tool_name", name = "exec_shell" }` | exact tool name; `*` globs are supported, e.g. `mcp__*` | `tool_call_before`, `tool_call_after`, `shell_env`, `on_error` |
+| `{ type = "tool_name", name = "bash" }` | exact tool name; `*` globs are supported, e.g. `mcp__*`. The shell tool's spellings `bash`, `Bash`, and `exec_shell` are aliases: a condition naming any one matches all three | `tool_call_before`, `tool_call_after`, `shell_env`, `on_error` |
 | `{ type = "tool_category", category = "shell" }` | tool category | `tool_call_before`, `tool_call_after`, `shell_env`, `on_error` |
 | `{ type = "mode", mode = "plan" }` | the context's mode string, case-insensitive | every event **except** `shell_env` |
 | `{ type = "exit_code", code = 1 }` | the exit code the tool actually reported | `tool_call_after`, `on_error` |
@@ -171,7 +185,10 @@ Three rules keep conditions from lying:
 
 - **`exit_code` needs a real exit code.** It matches only when the event
   actually observed a process exit code — `tool_call_after`, or `on_error` for
-  a tool failure, in both cases for a process-backed tool such as `exec_shell`.
+  a tool failure, in both cases for a process-backed tool such as `bash`.
+  A command that exits nonzero reports its code too, even though `bash`
+  returns it as a failed call. A timed-out or killed command usually has no
+  exit code; `DEEPSEEK_TOOL_STATUS` says which it was.
   A tool that reports no exit code never matches an `exit_code` condition; the
   condition is not satisfied by a default, a zero, or a success flag. The value
   is a 64-bit integer, so a Windows crash code such as `3221225477`
@@ -199,28 +216,49 @@ A repository may ship `<workspace>/.codewhale/hooks.toml` using the same shape,
 but only its `[[hooks]]` entries are merged — a project file cannot change
 `enabled`, `default_timeout_secs`, or `working_dir`, which always come from your
 own config. Because hooks are executable configuration, project hooks load
-**only** after the workspace is trusted in user-owned config; session
-`/trust on` alone does not enable them. Trusted project hooks are appended
+**only** after both workspace trust and separate approval of the exact hooks file
+in user-owned config. Use `/hooks review` to inspect the commands and digest,
+then `/hooks approve <digest>` to enable those bytes on the next session. Review
+any scripts the commands call too. A file change requires another approval.
+`/hooks revoke` blocks future and queued launches; it does not stop commands
+already running. Session `/trust on` alone does not enable project hooks.
+Approved project hooks are appended
 after global hooks, so they run last and win `updatedInput` ties. A malformed
 trusted project file logs a warning and Codewhale falls back to global hooks
 only. Validation runs over the merged set, so a rejected project hook is
 reported the same way a rejected global one is.
 
-## The 11 events
+## The 15 events
 
 | Event | Fires | Steering |
 | --- | --- | --- |
 | `session_start` | once, after the engine is up and before the first draw | observer |
 | `session_end` | once, on graceful shutdown | observer |
+| `turn_end` | after a turn completes and post-turn state is updated | observer |
 | `message_submit` | before a submitted message reaches history or the model | **can replace or block the text** |
 | `tool_call_before` | before each tool call executes | **can allow / deny / ask, rewrite input, add context** |
 | `tool_call_after` | after each tool result settles, including completions the transcript does not redraw | observer |
 | `mode_change` | on every applied Plan/Work/Operate transition (`Act` is a compatibility alias for Work) | observer |
 | `on_error` | on transport, capacity, and auth errors, and on tool failures | observer |
-| `turn_end` | after a turn completes and post-turn state is updated | observer |
 | `subagent_spawn` | when a sub-agent starts | observer |
 | `subagent_complete` | when a sub-agent completes, fails, or is cancelled | observer |
 | `shell_env` | immediately before each `exec_shell` invocation | **contributes environment variables** |
+| `session_idle` | when the session settles back to idle after a turn or a wait — no prompt, approval, or continuation outstanding | observer |
+| `session_error` | when a turn ends in a terminal failure; transient tool failures the agent absorbs never fire it | observer |
+| `waiting_for_user` | when the agent starts waiting on you: an approval prompt opens, a `request_user_input` question is presented, or a goal continuation is parked between passes | observer |
+| `session_busy` | when an idle or waiting session begins or resumes work; startup and repeated observations of the same state stay silent | observer |
+
+`waiting_for_user`'s payload carries `reason`: `approval`, `user_input`, or
+`goal_continuation`. All three state events carry `from`/`to` transition fields;
+`session_idle` also carries `last_turn_status` when known, and `session_error` carries
+the bounded terminal `error` text. Busy, idle, and waiting map onto the session
+states the control socket's `status` verb already publishes
+(`idle` / `in_progress` / `waiting`), so a hook and a supervisor never
+disagree about what the session is doing. Hook authors that want opencode's
+grace-period semantics for error alerts should debounce inside the hook —
+`session_error` already excludes absorbed, transient failures, and a turn
+that fails and is retried by the operator fires again only if the retry also
+ends failed.
 
 ### What "observer" means, exactly
 
@@ -271,12 +309,86 @@ rebrand.
 | `DEEPSEEK_TOOL_ARGS` | `tool_call_before`, `shell_env` | tool input JSON preview, capped at 10 000 bytes |
 | `DEEPSEEK_TOOL_RESULT` | `tool_call_after`, `on_error` (tool failures) | truncated at 10 000 bytes |
 | `DEEPSEEK_TOOL_SUCCESS` | `tool_call_after`, `on_error` (tool failures) | `true` / `false` |
-| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` and `on_error` **when the tool reported one** | absent otherwise — never synthesized; 64-bit, so Windows crash codes such as `3221225477` survive |
+| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` and `on_error` **when the tool reported one** | absent otherwise — never synthesized; set for a failing command as well as a passing one; 64-bit, so Windows crash codes such as `3221225477` survive |
+| `DEEPSEEK_TOOL_STATUS` | `tool_call_after` and `on_error` **when a shell tool reported one** | `completed`, `failed`, `timed_out`, `killed`, or `running` (moved to the background); absent for other tools |
+| `DEEPSEEK_TOOL_EXECUTION_RECEIPT` | `tool_call_after` and `on_error` **for a settled, local, foreground shell run** | complete JSON, at most 32 KiB, or absent; see [Execution receipt](#execution-receipt) |
 | `DEEPSEEK_SESSION_COST` | when cost is supplied | USD, six decimal places |
+
+### Execution receipt
+
+`DEEPSEEK_TOOL_EXECUTION_RECEIPT` says what a shell tool (`bash`, `Bash`,
+`exec_shell`) actually ran. The before-hook input is not the same thing: a
+`tool_call_before` hook can rewrite it. The receipt is built from what the
+process manager recorded when it spawned the process, after admission and
+any rewrite.
+
+```json
+{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","state":"completed","scope":"local","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_kind":"separate"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `command` | the admitted shell source handed to the shell, not the shell executable or its argv wrapper |
+| `cwd` | the canonical absolute path of the directory the process started in: symlinks are resolved, so a directory has one spelling whether or not the call passed `cwd`; it is resolved before spawn and that same path is handed to the OS |
+| `state` | `completed` for an observed exit, including a nonzero one; `interrupted` for a signal, kill, cancel, or timeout |
+| `scope` | always `local` in schema 1 |
+| `exit_code` | the observed integer, or `null`; never synthesized from `state` |
+| `stdout`, `stderr` | previews of the tool's retained output, which may already omit early process output; long previews keep their first and last bytes around a `[receipt preview truncated]` marker |
+| `stdout_truncated`, `stderr_truncated` | `true` when the tool's own output capture or the preview dropped bytes |
+| `output_kind` | `separate` for `Bash` / `exec_shell`; `combined` for lowercase `bash`, whose stdout and stderr share one pipe — `stdout` then holds the combined preview and `stderr` is empty |
+
+The rules are conservative:
+
+- **Exact or absent.** `command` and `cwd` are never truncated. If either is
+  over 8 KiB, contains NUL, or the directory is relative, not UTF-8, or cannot
+  resolve before spawn, the receipt is left out. So is a run whose end the shell
+  tool could not observe (the OS wait itself failed): its state is unknown,
+  and the receipt does not guess it. Previews shrink until the serialized JSON fits 32 KiB;
+  if it still cannot fit, the receipt is left out rather than cut.
+- **Absence means nothing.** It implies neither success nor failure. An inherited
+  `DEEPSEEK_TOOL_EXECUTION_RECEIPT` is cleared before applying the current call's context.
+- **Scope.** A receipt is built only while a `tool_call_after` or `on_error`
+  hook is configured, and only for a settled, pipe-backed, unsandboxed, local
+  foreground run. Background launches, a foreground run moved to `/jobs`,
+  PTY (`tty` / `combined_output`) and interactive sessions, OS-sandboxed and
+  external-backend execution, the read-only shell's hardened argv, Windows,
+  a PowerShell shell on any platform (it wraps the source or runs it from a
+  temporary script), and calls refused before execution have none.
+- **Hooks only.** The receipt is not kept in the durable Runtime API item
+  record; that record already carries the tool output.
+- It is set for a failed run as well as a passing one, so `on_error` for a
+  failed shell call carries it too. Every other variable is unchanged.
+
+For `tool_call_after`, the same execution evidence is also delivered as a
+versioned JSON document on stdin, in foreground and background form:
+
+```json
+{"schema_version":1,"event":"tool_call_after","tool_name":"bash","session_id":"session-id","tool_call_id":"call-id","session_id_truncated":false,"tool_call_id_truncated":false,"tool_name_truncated":false,"execution_receipt":{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","command_truncated":false,"cwd_truncated":false,"execution":"started","completion":"completed","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_mode":"combined"}}
+```
+
+The stdin projection leaves the environment receipt above unchanged.
+`completion` is the observed `completed`, `failed`, `killed`, or `timed_out`
+status; a nonzero exit is `failed`. `exit_code` remains a signed 64-bit integer
+or `null`. `output_mode` carries the existing receipt's `output_kind`:
+`separate` or `combined`. With combined output, empty `stderr` does not mean
+the command wrote nothing to stderr.
+
+The complete document is capped at 64 KiB. Correlation identifiers are capped
+at 1,024 UTF-8 bytes plus a truncation marker and carry individual flags;
+missing identifiers are `null`. The shell name is exact. Execution `command`
+and `cwd` retain the exact-or-absent rule above, so their truncation flags are
+always false. Output truncation flags include both capture and preview loss.
+
+Only a native shell call with a valid, settled receipt gets this stdin
+document. Unsupported or unobserved paths get no document, and absence still
+means unknown. Hooks remain observers: their stdout cannot allow, deny, or
+rewrite the completed call, and background hooks are not awaited. `on_error`
+continues to receive the environment receipt only.
 
 **Mode-spelling note.** UI-fired events (`session_start`, `session_end`,
 `message_submit`, `tool_call_after`, `mode_change`, `on_error`, `turn_end`,
-`subagent_*`) set `DEEPSEEK_MODE` to the UI label — `ACT`, `PLAN`, `OPERATE`.
+`subagent_*`, `session_busy`, `session_idle`, `session_error`, `waiting_for_user`)
+set `DEEPSEEK_MODE` to the UI label — `ACT`, `PLAN`, `OPERATE`.
 `tool_call_before` fires inside the engine and uses the engine's own mode
 spelling (`Agent`, `Plan`, `Operate`). `mode` conditions compare
 case-insensitively, so `{ type = "mode", mode = "plan" }` matches both, but a
@@ -450,13 +562,36 @@ condition = { type = "tool_category", category = "shell" }
 
 ## Structured observer payloads
 
-`turn_end`, `subagent_spawn`, and `subagent_complete` receive JSON on stdin in
-addition to the environment variables. Their stdout is ignored. Background
-forms of these events receive the same payload on stdin.
+`turn_end`, `subagent_spawn`, `subagent_complete`, `session_busy`, `session_idle`,
+`session_error`, and `waiting_for_user` receive JSON on stdin in addition to the
+environment variables. Their stdout is ignored. Background forms of these
+events receive the same payload on stdin.
+
+`tool_call_after` also receives JSON on stdin for a settled native shell call
+with a tracked [execution receipt](#execution-receipt), in foreground and
+background form. Other tool calls have no stdin document.
 
 The remaining observer events — `session_start`, `session_end`,
-`tool_call_after`, `mode_change`, `on_error` — receive environment variables
-only, with no stdin payload, in both foreground and background form.
+`mode_change`, `on_error` — receive environment variables only, with no stdin
+payload, in both foreground and background form.
+
+### Session state transitions
+
+The first observed state is recorded silently, whether idle, busy, or waiting.
+Repeating the same state emits nothing. For a turn that pauses for user input
+and then completes, the transition hooks receive these payloads in submission
+order:
+
+| Event | JSON stdin |
+| --- | --- |
+| `session_busy` | `{"from":"idle","to":"in_progress"}` |
+| `waiting_for_user` | `{"from":"in_progress","to":"waiting","reason":"user_input"}` |
+| `session_busy` | `{"from":"waiting","to":"in_progress"}` |
+| `session_idle` | `{"from":"in_progress","to":"idle","last_turn_status":"completed"}` |
+
+The dispatcher has two workers, so command completion order is not guaranteed.
+`session_error` is a separate terminal-failure event, with `status` and `error`
+fields rather than `from` and `to`.
 
 ### `turn_end`
 
@@ -541,7 +676,8 @@ has no effect because later matching hooks always run.
 - For `execute`-path events, `continue_on_error = false` stops later hooks for
   that event; except on `tool_call_before` (above) it does not roll back the
   action that fired them.
-- Structured observer events (`turn_end`, `subagent_*`) always continue to the
+- Structured observer events (`turn_end`, `subagent_*`, `session_busy`,
+  `session_idle`, `session_error`, `waiting_for_user`) always continue to the
   next matching hook.
 - Observer events use a bounded persistent dispatcher. Queue-full and
   dispatcher-unavailable submissions are not retried silently; the TUI keeps
@@ -554,7 +690,7 @@ has no effect because later matching hooks always run.
 
 - Hooks are arbitrary shell commands from your own config; treat
   `~/.codewhale/config.toml` as executable.
-- Project-supplied hooks require an explicit workspace trust decision in
+- Project-supplied hooks require exact-file approval in addition to workspace trust in
   user-owned config.
 - Hook commands inherit Codewhale's own environment. A local `exec_shell` does
   not — see [`shell_env`](#shell_env).

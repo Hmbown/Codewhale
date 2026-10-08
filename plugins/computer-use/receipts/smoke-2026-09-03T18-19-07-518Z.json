@@ -1,0 +1,121 @@
+{
+  "at": "2026-09-03T18:19:07.517Z",
+  "host": "darwin 25.1.0",
+  "results": [
+    {
+      "name": "initialize",
+      "pass": true,
+      "detail": "server=codewhale-cu v0.1.0"
+    },
+    {
+      "name": "tools/list",
+      "pass": true,
+      "detail": "38 tools"
+    },
+    {
+      "name": "schema:required-tools-present",
+      "pass": true,
+      "detail": "all key tools declared"
+    },
+    {
+      "name": "computer_list",
+      "pass": true,
+      "detail": "active=local"
+    },
+    {
+      "name": "computer_register(hdc)",
+      "pass": true,
+      "detail": "{\"id\":\"pad\",\"transport\":\"hdc\",\"label\":\"Harmony device\",\"registeredAt\":\"2026-09-03T18:18:45.017Z\",\"platform\":\"harmonyos\"}"
+    },
+    {
+      "name": "computer_switch",
+      "pass": true,
+      "detail": "active=pad"
+    },
+    {
+      "name": "harmony fail-closed (no hdc device)",
+      "pass": true,
+      "detail": "code=tool_error"
+    },
+    {
+      "name": "switch-by-use (computer:local on screenshot)",
+      "pass": true,
+      "detail": "file=shot-2026-09-03T18-18-45-024Z-7390ee.png"
+    },
+    {
+      "name": "request_access/probe",
+      "pass": true,
+      "detail": "accessibility=granted capture=ok"
+    },
+    {
+      "name": "list_displays",
+      "pass": true,
+      "detail": "{\"index\":1,\"id\":null,\"name\":\"Studio Display\",\"pixels\":{\"w\":2880,\"h\":1620},\"main\":true,\"points\":{\"x\":0,\"y\":0,\"w\":2880,\"h\":1620},\"scale\":1}"
+    },
+    {
+      "name": "list_apps",
+      "pass": true,
+      "detail": "94 apps"
+    },
+    {
+      "name": "get_app_state",
+      "pass": true,
+      "detail": "ZCode: 10 elements, state_id=s-1"
+    },
+    {
+      "name": "cursor_position",
+      "pass": true,
+      "detail": "x=1687 y=1152"
+    },
+    {
+      "name": "screenshot (real file)",
+      "pass": true,
+      "detail": "shot-2026-09-03T18-19-02-100Z-d61aff.png 17205796B scale=1"
+    },
+    {
+      "name": "zoom",
+      "pass": true,
+      "detail": "zoom-29aa9c3d.png 82565B"
+    },
+    {
+      "name": "recording_start",
+      "pass": true,
+      "detail": "id=4b92aee6 mode=undefined pid=34384"
+    },
+    {
+      "name": "recording_status",
+      "pass": true,
+      "detail": "running=true bytes-so-far=0 (screencapture flushes at stop)"
+    },
+    {
+      "name": "recording_stop (real file)",
+      "pass": true,
+      "detail": "rec-4b92aee6.mov + mp4:yes bytes=5483979"
+    },
+    {
+      "name": "recording_list",
+      "pass": true,
+      "detail": "5 artifacts in /var/folders/gc/lw1tgpk97z51d30mcvbhyb400000gn/T/cu-smoke-rec-ZORIEF"
+    },
+    {
+      "name": "unknown tool fails closed",
+      "pass": true,
+      "detail": "code=unknown_tool"
+    },
+    {
+      "name": "stop_computer_control",
+      "pass": true,
+      "detail": ""
+    },
+    {
+      "name": "actions refused after kill switch",
+      "pass": true,
+      "detail": "code=control_stopped"
+    },
+    {
+      "name": "read-only still allowed after kill switch",
+      "pass": true,
+      "detail": ""
+    }
+  ]
+}

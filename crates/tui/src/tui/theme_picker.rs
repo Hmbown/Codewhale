@@ -12,9 +12,9 @@
 //!   `ThemeSelectionUpdated{persist:false}` to restore the exact theme that
 //!   was active when the picker opened.
 //!
-//! The option list is 1:1 with [`SELECTABLE_THEMES`] — one row per theme, no
-//! modifier rows. `underwater` is an ordinary row: the painted ocean field is
-//! the theme, not a treatment beside it.
+//! The option list contains compiled themes followed by valid user overlays.
+//! `underwater` is an ordinary row: the painted ocean field is the theme, not
+//! a treatment beside it.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -28,8 +28,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::localization::{Locale, MessageId, tr};
-use crate::palette::{SELECTABLE_THEMES, ThemeId, UiTheme};
+use crate::settings::DEFAULT_TUI_THEME;
 use crate::tui::menu_style;
 use crate::tui::settings_picker::{
     PickerNavResult, SettingAvailability, SettingOption, SettingValues, SettingsPickerController,
@@ -39,6 +38,8 @@ use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_panel_scroll_rail, render_underwater_surface,
 };
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_palette::{SELECTABLE_THEMES, ThemeId, UiTheme};
 
 pub struct ThemePickerView {
     controller: SettingsPickerController,
@@ -58,6 +59,8 @@ pub struct ThemePickerView {
     last_mouse_selected: Option<usize>,
     /// UI locale captured from the app at construction (#4057 wave 2).
     locale: Locale,
+    /// Valid user overlays loaded once when the picker opens.
+    custom_themes: Vec<codewhale_palette::UserThemeOption>,
 }
 
 impl ThemePickerView {
@@ -73,7 +76,7 @@ impl ThemePickerView {
         background_override: Option<Color>,
     ) -> Self {
         let normalized = original_name.trim().to_ascii_lowercase();
-        let options = theme_options(&normalized);
+        let (options, custom_themes) = theme_options(&normalized);
         let controller = SettingsPickerController::new(options, normalized.clone());
         let opening_cursor = controller.selected_source_index();
         Self {
@@ -85,6 +88,7 @@ impl ThemePickerView {
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
             locale,
+            custom_themes,
         }
     }
 
@@ -104,10 +108,27 @@ impl ThemePickerView {
         ))
     }
 
-    fn current(&self) -> ThemeId {
+    fn selected_theme_name(&self) -> &str {
         self.controller
             .selected_id()
-            .and_then(ThemeId::from_name)
+            .unwrap_or(ThemeId::System.name())
+    }
+
+    fn custom_theme_for(&self, selector: &str) -> Option<UiTheme> {
+        self.custom_themes
+            .iter()
+            .find(|option| option.selector == selector)
+            .map(|option| option.theme)
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> ThemeId {
+        let selected = self.selected_theme_name();
+        self.custom_themes
+            .iter()
+            .find(|option| option.selector == selected)
+            .map(|option| option.base)
+            .or_else(|| ThemeId::from_name(selected))
             .unwrap_or(ThemeId::System)
     }
 
@@ -118,11 +139,17 @@ impl ThemePickerView {
 
     /// Resolve a theme to a `UiTheme`, returning the cached `System`
     /// resolution to avoid repeated env-var reads inside `render`.
-    fn ui_theme_for(&self, id: ThemeId) -> UiTheme {
-        let theme = if matches!(id, ThemeId::System) {
-            self.system_ui_theme
+    fn ui_theme_for_selection(&self, selection: &str) -> UiTheme {
+        let theme = if let Some(custom) = self.custom_theme_for(selection) {
+            custom
+        } else if let Some(id) = ThemeId::from_name(selection) {
+            if matches!(id, ThemeId::System) {
+                self.system_ui_theme
+            } else {
+                id.ui_theme()
+            }
         } else {
-            id.ui_theme()
+            self.system_ui_theme
         };
         self.background_override
             .map_or(theme, |background| theme.with_background_color(background))
@@ -130,16 +157,15 @@ impl ThemePickerView {
 
     fn preview_event(&self) -> ViewAction {
         ViewAction::Emit(ViewEvent::ThemeSelectionUpdated {
-            theme: self.current().name().to_string(),
+            theme: self.selected_theme_name().to_string(),
             persist: false,
         })
     }
 
     fn commit_event(&self) -> ViewAction {
-        // A commit that never moved the cursor must not rewrite settings:
-        // the persisted theme may be a custom:<name> selector this list
-        // cannot express as a row, and re-committing the cursor row would
-        // silently replace it.
+        // A commit that never moved the cursor must preserve the exact
+        // opening selector. This also protects a custom:<name> selector if
+        // its file disappears or becomes invalid while the picker is open.
         if self.controller.selected_source_index() == self.opening_cursor {
             return ViewAction::EmitAndClose(ViewEvent::ThemeSelectionUpdated {
                 theme: self.original_theme_name.clone(),
@@ -147,7 +173,7 @@ impl ThemePickerView {
             });
         }
         ViewAction::EmitAndClose(ViewEvent::ThemeSelectionUpdated {
-            theme: self.current().name().to_string(),
+            theme: self.selected_theme_name().to_string(),
             persist: true,
         })
     }
@@ -179,9 +205,18 @@ impl ThemePickerView {
     }
 }
 
-fn theme_options(current_name: &str) -> Vec<SettingOption> {
+fn theme_options(
+    current_name: &str,
+) -> (Vec<SettingOption>, Vec<codewhale_palette::UserThemeOption>) {
+    theme_options_with_custom(current_name, codewhale_palette::list_user_theme_options())
+}
+
+fn theme_options_with_custom(
+    current_name: &str,
+    custom_themes: Vec<codewhale_palette::UserThemeOption>,
+) -> (Vec<SettingOption>, Vec<codewhale_palette::UserThemeOption>) {
     let current = current_name.trim().to_ascii_lowercase();
-    SELECTABLE_THEMES
+    let mut options = SELECTABLE_THEMES
         .iter()
         .copied()
         .map(|id| {
@@ -192,9 +227,8 @@ fn theme_options(current_name: &str) -> Vec<SettingOption> {
                 .help("Pick a theme with live preview")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    // A reset returns to the underwater default, not a
-                    // detected palette that can repaint it.
-                    Cow::Borrowed("underwater"),
+                    // Reset uses the same default as fresh terminal settings.
+                    Cow::Borrowed(DEFAULT_TUI_THEME),
                     Cow::Borrowed(name),
                 ))
                 .availability(SettingAvailability::Available)
@@ -202,7 +236,35 @@ fn theme_options(current_name: &str) -> Vec<SettingOption> {
                 .prefer_list_when_narrow(true)
                 .build()
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for custom in &custom_themes {
+        let label = custom
+            .selector
+            .strip_prefix(codewhale_palette::USER_THEME_PREFIX)
+            .map_or_else(|| custom.selector.clone(), |slug| format!("Custom: {slug}"));
+        options.push(
+            SettingOption::builder(custom.selector.clone(), label)
+                .summary(format!(
+                    "User overlay · based on {}",
+                    custom.base.display_name()
+                ))
+                .detail(format!(
+                    "User-authored overlay based on {}",
+                    custom.base.display_name()
+                ))
+                .help("Pick a user-authored theme overlay")
+                .values(SettingValues::new(
+                    Cow::Owned(current.clone()),
+                    Cow::Borrowed(DEFAULT_TUI_THEME),
+                    Cow::Owned(custom.selector.clone()),
+                ))
+                .availability(SettingAvailability::Available)
+                .tab("themes")
+                .prefer_list_when_narrow(true)
+                .build(),
+        );
+    }
+    (options, custom_themes)
 }
 
 impl ModalView for ThemePickerView {
@@ -281,8 +343,7 @@ impl ModalView for ThemePickerView {
         // the cursor moves, matching what the background will look like
         // after Enter. We keep the live `surface_bg` (not the shared ink) and
         // the bare `Clear` so the preview backdrop reads as intended.
-        let current = self.current();
-        let live = self.ui_theme_for(current);
+        let live = self.ui_theme_for_selection(self.selected_theme_name());
         let inner =
             render_underwater_surface(area, buf, tr(self.locale, MessageId::ThemeSurfaceTitle));
 
@@ -338,7 +399,6 @@ impl ModalView for ThemePickerView {
                 .options()
                 .get(source_idx)
                 .expect("visible source index must reference an option");
-            let selection = ThemeId::from_name(option.id.as_ref()).unwrap_or(ThemeId::System);
             let is_selected = visible_idx == selected_visible;
             let row_style = if is_selected {
                 menu_style::theme_selected_row_style(&live)
@@ -364,7 +424,7 @@ impl ModalView for ThemePickerView {
             // accent + panel + border colors so the picker doubles as a
             // legend. The underwater row shows its water column; use the
             // cached resolver so `System` doesn't repeat `UiTheme::detect()`.
-            let row_theme = self.ui_theme_for(selection);
+            let row_theme = self.ui_theme_for_selection(option.id.as_ref());
             let swatch_colors = match crate::tui::ocean::OceanRamp::for_theme(&row_theme) {
                 Some(ramp) => [
                     ramp.surface,
@@ -552,11 +612,11 @@ mod tests {
     #[test]
     fn enter_commits_with_persist_true() {
         let mut v = ThemePickerView::new("system".to_string());
-        v.handle_key(key(KeyCode::Char('8'))); // -> CatppuccinMocha
+        v.handle_key(key(KeyCode::Char('9'))); // -> Grayscale
         let action = v.handle_key(key(KeyCode::Enter));
         match action {
             ViewAction::EmitAndClose(ViewEvent::ThemeSelectionUpdated { theme, persist }) => {
-                assert_eq!(theme, ThemeId::CatppuccinMocha.name());
+                assert_eq!(theme, ThemeId::Grayscale.name());
                 assert!(persist);
             }
             other => panic!("expected commit, got {other:?}"),
@@ -574,6 +634,46 @@ mod tests {
             selected_values(&action),
             Some(("custom:midnight", true)),
             "committing without moving the cursor must not replace the persisted selector"
+        );
+    }
+
+    #[test]
+    fn custom_theme_rows_preview_and_commit_their_selector() {
+        let mut custom_theme = ThemeId::Whale.ui_theme();
+        custom_theme.accent_primary = Color::Rgb(0x12, 0x34, 0x56);
+        let custom = codewhale_palette::UserThemeOption {
+            selector: "custom:midnight".to_string(),
+            base: ThemeId::Whale,
+            theme: custom_theme,
+        };
+        let (options, custom_themes) = theme_options_with_custom("custom:midnight", vec![custom]);
+        let controller = SettingsPickerController::new(options, "custom:midnight");
+        let view = ThemePickerView {
+            opening_cursor: controller.selected_source_index(),
+            controller,
+            original_theme_name: "custom:midnight".to_string(),
+            system_ui_theme: UiTheme::detect(),
+            background_override: None,
+            row_hitboxes: RefCell::new(Vec::new()),
+            last_mouse_selected: None,
+            locale: Locale::En,
+            custom_themes,
+        };
+
+        assert_eq!(view.controller.selected_id(), Some("custom:midnight"));
+        assert_eq!(view.current(), ThemeId::Whale);
+        assert_eq!(
+            view.ui_theme_for_selection("custom:midnight")
+                .accent_primary,
+            Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(
+            selected_values(&view.preview_event()),
+            Some(("custom:midnight", false))
+        );
+        assert_eq!(
+            selected_values(&view.commit_event()),
+            Some(("custom:midnight", true))
         );
     }
 
@@ -606,11 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn digit_jumps_to_underwater_and_previews() {
+    fn digit_jumps_to_shoreline_and_previews() {
         let mut v = ThemePickerView::new("system".to_string());
         let action = v.handle_key(key(KeyCode::Char('3')));
-        // Underwater follows System and Terminal.
-        assert_eq!(selected_values(&action), Some(("underwater", false)));
+        // Shoreline follows System and Terminal.
+        assert_eq!(selected_values(&action), Some(("shoreline", false)));
     }
 
     #[test]
@@ -797,188 +897,3 @@ mod tests {
         }
     }
 }
-
-use unicode_width::UnicodeWidthStr as _TidelineWidth;
-
-// ---------------------------------------------------------------------------
-// Tideline theme list (spec §5a "Theme list"): the 14 selectable themes
-// (4 mode rows + 9 presets), the selected row boxed with ✓, and the MOTION
-// (OPTIONAL) toggles. Translation scaffolding in the topbar mold: pure,
-// deterministic, injected selection — Up/Down preview and Enter apply stay
-// the shared settings-picker controller's job at the landing slice; not
-// wired into `ui/frame.rs` (#5698 gate).
-
-/// The 14 themes in display order: 4 mode rows then 10 presets.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub fn tideline_theme_rows() -> Vec<crate::palette::ThemeId> {
-    crate::palette::SELECTABLE_THEMES.to_vec()
-}
-
-/// What the caller owes the theme-list render.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub struct TidelineThemeList<'a> {
-    pub theme: &'a UiTheme,
-    /// Selected row index into the 14-theme display order.
-    pub selected: usize,
-    /// `low_motion` setting (MOTION OPTIONAL toggle 1).
-    pub low_motion: bool,
-    /// `fancy_animations` setting (MOTION OPTIONAL toggle 2).
-    pub fancy_animations: bool,
-    pub ascii_safe: bool,
-}
-
-#[allow(dead_code)] // translation scaffolding: builder methods feed tests + the landing slice
-impl<'a> TidelineThemeList<'a> {
-    #[allow(dead_code)] // translation scaffolding: wired by the landing slice
-    #[must_use]
-    pub fn new(theme: &'a UiTheme, selected: usize) -> Self {
-        Self {
-            theme,
-            selected,
-            low_motion: false,
-            fancy_animations: true,
-            ascii_safe: false,
-        }
-    }
-
-    #[must_use]
-    pub fn motion(mut self, low_motion: bool, fancy_animations: bool) -> Self {
-        self.low_motion = low_motion;
-        self.fancy_animations = fancy_animations;
-        self
-    }
-
-    #[must_use]
-    pub fn ascii_safe(mut self, ascii_safe: bool) -> Self {
-        self.ascii_safe = ascii_safe;
-        self
-    }
-
-    fn sym(&self, glyph: &str) -> String {
-        if !self.ascii_safe {
-            return glyph.to_string();
-        }
-        if let Some(fb) = crate::tui::glyphs::ascii_fallback(glyph) {
-            return fb.to_string();
-        }
-        glyph
-            .chars()
-            .map(|c| {
-                crate::tui::glyphs::ascii_fallback(&c.to_string())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| c.to_string())
-            })
-            .collect()
-    }
-}
-
-fn tput(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
-    buf.set_stringn(x, y, text, _TidelineWidth::width(text), style);
-}
-
-fn tchrome(theme: &UiTheme, ink: crate::palette::ChromeInk) -> Style {
-    crate::palette::chrome_style(theme, ink)
-}
-
-/// Paint the theme list: 14 rows (4 modes + 10 presets) with the selected
-/// row boxed `[ ✓ Name ]`, then the MOTION (OPTIONAL) toggle rows.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub fn render_tideline_theme_list(area: Rect, buf: &mut Buffer, list: &TidelineThemeList<'_>) {
-    if area.width < 8 || area.height < 3 {
-        return;
-    }
-    let theme = list.theme;
-    let rows = tideline_theme_rows();
-    let mut y = area.y;
-    for (index, id) in rows.iter().enumerate() {
-        if y >= area.y + area.height {
-            return;
-        }
-        let selected = list.selected == index;
-        let label = id.display_name();
-        let row = if selected {
-            format!("[ {} {} ]", list.sym("✓"), label)
-        } else {
-            format!("  {label}  ")
-        };
-        let ink = if selected {
-            crate::palette::ChromeInk::Identity
-        } else {
-            crate::palette::ChromeInk::MetadataValue
-        };
-        let mut style = tchrome(theme, ink);
-        if selected {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        tput(buf, area.x, y, &row, style);
-        y += 1;
-    }
-    // MOTION (OPTIONAL)
-    if y < area.y + area.height {
-        tput(
-            buf,
-            area.x,
-            y,
-            "MOTION (OPTIONAL)",
-            tchrome(theme, crate::palette::ChromeInk::MetadataDim).add_modifier(Modifier::BOLD),
-        );
-        y += 1;
-    }
-    for (label, on) in [
-        ("low motion", list.low_motion),
-        ("ambient life", list.fancy_animations),
-    ] {
-        if y >= area.y + area.height {
-            return;
-        }
-        let mark = if on { "◉" } else { "○" };
-        let row = format!("{} {}", list.sym(mark), label);
-        let ink = if on {
-            crate::palette::ChromeInk::Active
-        } else {
-            crate::palette::ChromeInk::MetadataDim
-        };
-        tput(buf, area.x + 1, y, &row, tchrome(theme, ink));
-        y += 1;
-    }
-}
-
-/// Row hitboxes for the theme list (spec §6): 13 theme rects + 2 toggles.
-#[must_use]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub fn tideline_theme_list_hitboxes(area: Rect, _list: &TidelineThemeList<'_>) -> Vec<Rect> {
-    let mut out = Vec::new();
-    if area.width < 8 || area.height < 3 {
-        return out;
-    }
-    let rows = tideline_theme_rows().len();
-    for index in 0..rows {
-        let y = area.y + index as u16;
-        if y >= area.y + area.height {
-            return out;
-        }
-        out.push(Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: 1,
-        });
-    }
-    // Toggle rows follow the MOTION (OPTIONAL) header.
-    let toggle_y = area.y + rows as u16 + 1;
-    for offset in 0..2 {
-        let y = toggle_y + offset;
-        if y < area.y + area.height {
-            out.push(Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            });
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tideline_tests;

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::command_safety::SafetyLevel;
+use codewhale_execpolicy::command_safety::SafetyLevel;
 
 /// Determines execution restrictions for shell commands.
 ///

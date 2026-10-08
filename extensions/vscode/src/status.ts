@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as vscode from "vscode";
 import type { RuntimeState, SnapshotEntry, ThreadSummary } from "./runtime";
 
@@ -185,11 +186,7 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/** CSP nonces must be unguessable; `Math.random()` is not. Matches `chat.ts`. */
 function makeNonce(): string {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let nonce = "";
-  for (let index = 0; index < 32; index += 1) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
+  return crypto.randomBytes(16).toString("hex");
 }

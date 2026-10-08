@@ -1,0 +1,8 @@
+{
+  "description": "Anthropic Messages over HTTP chunked framing; the connection drops mid-event before the terminating chunk. The client sees a transport error, not a clean end.",
+  "route": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "framing": "chunked",
+  "transport_cut": true,
+  "chunk_bytes": 64
+}

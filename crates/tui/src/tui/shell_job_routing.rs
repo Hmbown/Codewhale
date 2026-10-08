@@ -169,7 +169,11 @@ mod tests {
             linked_task_id: Some("task_1".to_string()),
             owner_agent_id: None,
             owner_agent_name: None,
+            origin_tool_call_id: None,
+            origin_turn_id: None,
             owner_session_id: "session-test".to_string(),
+            background: true,
+            finished_at: Some(chrono::Utc::now()),
         }];
         let formatted = format_shell_job_list(&jobs);
         assert!(formatted.contains("Bash jobs (1)"));

@@ -32,6 +32,11 @@ pub const MODELS_DEV_CATALOG_URL: &str = "https://models.dev/catalog.json";
 /// Combined Models.dev catalog payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelsDevCatalog {
+    /// Generated bundled presentation/transport facts; external documents cannot affect the compiled owner.
+    #[serde(default, rename = "_reviewed")]
+    pub reviewed: crate::catalog::reviewed::ReviewedCatalog,
+    #[serde(default, rename = "_meta")]
+    pub meta: BTreeMap<String, serde_json::Value>,
     /// Provider-agnostic model facts, keyed by canonical model id.
     #[serde(default)]
     pub models: BTreeMap<String, ModelsDevModel>,
@@ -69,6 +74,15 @@ impl ModelsDevCatalog {
         wire_model_id: &str,
     ) -> Option<&ModelsDevProviderModel> {
         self.provider(provider_id)?.models.get(wire_model_id.trim())
+    }
+
+    /// Resolve an intrinsic reasoning fact from canonical data or a
+    /// conflict-free explicit `base_model` join. A provider wire spelling
+    /// without that join never becomes an unscoped capability (#6032).
+    /// Missing and conflicting facts remain unknown.
+    #[must_use]
+    pub fn reasoning_support(&self, model_id: &str) -> Option<bool> {
+        crate::catalog::reviewed::intrinsic_model_in(self, model_id).and_then(|row| row.reasoning)
     }
 
     /// Build a route offering from a provider-scoped Models.dev row.
@@ -170,6 +184,23 @@ pub fn image_input_support(modalities: Option<&ModelsDevModalities>) -> Capabili
     ))
 }
 
+/// [`image_input_support`] for a fact from a layer that may be stale.
+///
+/// A low-trust layer (the bundled offline seed) can say image input is
+/// supported, but its text-only rows only mean "not known": the seed lags the
+/// providers it describes, and treating its silence as a refusal would strip
+/// the user's images before the request is sent.
+#[must_use]
+pub fn image_input_support_for(
+    modalities: Option<&ModelsDevModalities>,
+    low_trust: bool,
+) -> CapabilityState {
+    match image_input_support(modalities) {
+        CapabilityState::Unsupported if low_trust => CapabilityState::Unknown,
+        state => state,
+    }
+}
+
 /// Provider-agnostic model facts from `models.json` / `catalog.models`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelsDevModel {
@@ -267,6 +298,25 @@ pub struct ModelsDevProviderModel {
     /// Interleaved reasoning field hints.
     #[serde(default)]
     pub interleaved: Option<ModelsDevInterleaved>,
+    /// Per-model override of the provider's transport (`provider.npm`), used
+    /// when a gateway serves some models over a different wire than its
+    /// provider-level `npm` default (OpenCode Zen, #6705).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ModelsDevModelTransport>,
+    /// Lifecycle marker such as `deprecated` or `beta`; absent for current
+    /// rows. A model-aware gateway's deprecated row is not a routable wire
+    /// fact (#6705).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// A Models.dev model row's `provider` override: the AI SDK package that
+/// serves this model when it differs from the provider default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelsDevModelTransport {
+    /// AI SDK package identifier, such as `@ai-sdk/anthropic`.
+    #[serde(default)]
+    pub npm: Option<String>,
 }
 
 impl ModelsDevProviderModel {
@@ -274,6 +324,14 @@ impl ModelsDevProviderModel {
     #[must_use]
     pub fn supports_text_chat(&self) -> bool {
         supports_text_chat(self.modalities.as_ref())
+    }
+
+    /// True when the catalog marks this offering `deprecated`.
+    #[must_use]
+    pub fn is_deprecated(&self) -> bool {
+        self.status
+            .as_deref()
+            .is_some_and(|status| status.trim().eq_ignore_ascii_case("deprecated"))
     }
 }
 
@@ -602,6 +660,47 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_support_requires_canonical_rows_or_explicit_joins() {
+        let catalog = ModelsDevCatalog::parse_json(GLM_FIXTURE).expect("fixture parses");
+        // The canonical row is intrinsic; the bare wire row has no proven join.
+        assert_eq!(catalog.reasoning_support("zhipuai/glm-5.2"), Some(true));
+        assert_eq!(catalog.reasoning_support("glm-5.2"), None);
+        // Unknown id stays unknown; no prefix or alias inference.
+        assert_eq!(catalog.reasoning_support("glm-5.1"), None);
+        assert_eq!(catalog.reasoning_support("zai/glm-5.2"), None);
+        // Ids must match exactly, not after provider splitting.
+        assert_eq!(catalog.reasoning_support("zhipuai/glm-5.2 "), Some(true));
+    }
+
+    #[test]
+    fn reasoning_support_stays_unknown_on_disagreeing_rows() {
+        let raw = r#"{
+          "providers": {
+            "one": {
+              "models": {
+                "split-fact": { "id": "split-fact", "reasoning": true }
+              }
+            },
+            "two": {
+              "models": {
+                "split-fact": { "id": "split-fact", "reasoning": false }
+              }
+            },
+            "three": {
+              "models": {
+                "silent-fact": { "id": "silent-fact" }
+              }
+            }
+          }
+        }"#;
+        let catalog = ModelsDevCatalog::parse_json(raw).expect("fixture parses");
+        // A row that states nothing is not a vote; one sourced row resolves.
+        assert_eq!(catalog.reasoning_support("silent-fact"), None);
+        // Providers disagreeing on the fact stays unknown — never guessed (#6032).
+        assert_eq!(catalog.reasoning_support("split-fact"), None);
+    }
+
+    #[test]
     fn provider_offerings_emit_chat_rows_and_skip_non_text_outputs() {
         let raw = r#"{
           "providers": {
@@ -699,6 +798,36 @@ mod tests {
             })),
             CapabilityState::Supported
         );
+    }
+
+    #[test]
+    fn low_trust_text_only_rows_never_refuse_images() {
+        let text_only = ModelsDevModalities {
+            input: vec!["text".to_string()],
+            output: vec!["text".to_string()],
+        };
+        let vision = ModelsDevModalities {
+            input: vec!["text".to_string(), "image".to_string()],
+            output: vec!["text".to_string()],
+        };
+        assert_eq!(
+            image_input_support_for(Some(&text_only), true),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            image_input_support_for(Some(&text_only), false),
+            CapabilityState::Unsupported
+        );
+        for low_trust in [true, false] {
+            assert_eq!(
+                image_input_support_for(Some(&vision), low_trust),
+                CapabilityState::Supported
+            );
+            assert_eq!(
+                image_input_support_for(None, low_trust),
+                CapabilityState::Unknown
+            );
+        }
     }
 
     #[test]

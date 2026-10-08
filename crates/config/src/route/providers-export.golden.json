@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "0.9.12",
+  "runtimeVersion": "0.10.1",
   "routes": [
     {
       "id": "anthropic",
@@ -40,24 +40,6 @@
         }
       ],
       "transport": "anthropic-messages"
-    },
-    {
-      "id": "antigravity",
-      "family": "antigravity",
-      "label": "Google Antigravity",
-      "endpoint": "https://cloudcode-pa.googleapis.com/v1internal",
-      "wire": "chat-completions",
-      "defaultModel": "gemini-3-pro-preview",
-      "envVars": [
-        "ANTIGRAVITY_API_KEY"
-      ],
-      "auth": [
-        {
-          "kind": "oauth",
-          "label": "OAuth"
-        }
-      ],
-      "transport": "antigravity"
     },
     {
       "id": "arcee",
@@ -105,6 +87,24 @@
       "transport": "chat-completions"
     },
     {
+      "id": "codewhale",
+      "family": "codewhale",
+      "label": "Codewhale",
+      "endpoint": "https://api.codewhale.net/v1",
+      "wire": "model-aware",
+      "defaultModel": "deepseek/deepseek-v4-pro",
+      "envVars": [
+        "CODEWHALE_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "model-aware"
+    },
+    {
       "id": "concentrate",
       "family": "concentrate",
       "label": "Concentrate",
@@ -121,6 +121,24 @@
         }
       ],
       "transport": "open-ai-responses"
+    },
+    {
+      "id": "csdn",
+      "family": "csdn",
+      "label": "CSDN",
+      "endpoint": "https://ai.csdn.net/api/model/v1",
+      "wire": "chat-completions",
+      "defaultModel": "glm_for_coding",
+      "envVars": [
+        "CSDN_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "chat-completions"
     },
     {
       "id": "custom",
@@ -163,7 +181,7 @@
       "label": "DeepSeek",
       "endpoint": "https://api.deepseek.com/beta",
       "wire": "model-aware",
-      "defaultModel": "deepseek-v4-pro",
+      "defaultModel": "deepseek-flash",
       "envVars": [
         "DEEPSEEK_API_KEY"
       ],
@@ -175,6 +193,11 @@
       ],
       "models": [
         {
+          "id": "deepseek-flash",
+          "canonical": "deepseek-flash",
+          "default": true
+        },
+        {
           "id": "deepseek-v4-flash",
           "canonical": "deepseek-v4-flash"
         },
@@ -184,8 +207,7 @@
         },
         {
           "id": "deepseek-v4-pro",
-          "canonical": "deepseek-v4-pro",
-          "default": true
+          "canonical": "deepseek-v4-pro"
         }
       ],
       "transport": "model-aware"
@@ -196,7 +218,7 @@
       "label": "DeepSeek",
       "endpoint": "https://api.deepseek.com/anthropic",
       "wire": "anthropic-messages",
-      "defaultModel": "deepseek-v4-pro",
+      "defaultModel": "deepseek-flash",
       "envVars": [
         "DEEPSEEK_API_KEY"
       ],
@@ -407,6 +429,24 @@
       "defaultModel": "mistral-code-latest",
       "envVars": [
         "MISTRAL_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "chat-completions"
+    },
+    {
+      "id": "modelscope",
+      "family": "modelscope",
+      "label": "ModelScope",
+      "endpoint": "https://api-inference.modelscope.cn/v1",
+      "wire": "chat-completions",
+      "defaultModel": "Qwen/Qwen3.5-397B-A17B",
+      "envVars": [
+        "MODELSCOPE_API_KEY"
       ],
       "auth": [
         {
@@ -765,7 +805,7 @@
       "id": "openai-codex",
       "family": "openai-codex",
       "label": "OpenAI Codex (ChatGPT)",
-      "endpoint": "https://chatgpt.com/backend-api",
+      "endpoint": "https://api.openai.com/v1",
       "wire": "responses",
       "defaultModel": "gpt-5.6",
       "envVars": [
@@ -785,7 +825,7 @@
       "family": "opencode-go",
       "label": "OpenCode Go",
       "endpoint": "https://opencode.ai/zen/go/v1",
-      "wire": "chat-completions",
+      "wire": "model-aware",
       "defaultModel": "deepseek-v4-pro",
       "envVars": [
         "OPENCODE_GO_API_KEY"
@@ -796,7 +836,7 @@
           "label": "API key"
         }
       ],
-      "transport": "chat-completions"
+      "transport": "model-aware"
     },
     {
       "id": "opencode-zen",
@@ -908,6 +948,10 @@
         {
           "kind": "api-key",
           "label": "API key"
+        },
+        {
+          "kind": "oauth",
+          "label": "OAuth"
         }
       ],
       "transport": "chat-completions"
@@ -1030,6 +1074,21 @@
         {
           "kind": "api-key",
           "label": "API key"
+        }
+      ],
+      "models": [
+        {
+          "id": "step-3.5-flash"
+        },
+        {
+          "id": "step-3.5-flash-2603"
+        },
+        {
+          "id": "step-3.7-flash",
+          "default": true
+        },
+        {
+          "id": "step-5-preview"
         }
       ],
       "transport": "chat-completions"
@@ -1169,6 +1228,9 @@
         {
           "id": "grok-4.6",
           "default": true
+        },
+        {
+          "id": "grok-4.7"
         }
       ],
       "transport": "chat-completions"
@@ -1200,6 +1262,12 @@
         {
           "id": "mimo-v2.5-pro",
           "default": true
+        },
+        {
+          "id": "mimo-v2.6-flash"
+        },
+        {
+          "id": "mimo-v2.6-pro"
         }
       ],
       "transport": "chat-completions"
@@ -1239,6 +1307,24 @@
         },
         {
           "id": "glm-5.1"
+        }
+      ],
+      "transport": "chat-completions"
+    },
+    {
+      "id": "zenmux",
+      "family": "zenmux",
+      "label": "ZenMux",
+      "endpoint": "https://zenmux.ai/api/v1",
+      "wire": "chat-completions",
+      "defaultModel": "deepseek/deepseek-v4.1-flash",
+      "envVars": [
+        "ZENMUX_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
         }
       ],
       "transport": "chat-completions"

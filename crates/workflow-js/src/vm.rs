@@ -15,6 +15,7 @@
 
 use std::cell::Cell;
 use std::env;
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -22,7 +23,9 @@ use std::sync::{Arc, OnceLock};
 use rquickjs::function::{Async, Func};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Promise, Value};
 use serde::Deserialize;
+use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::task::JoinSet;
 
 use crate::driver::{ProgressEvent, TaskCompletion, TaskRequest, WorkflowDriver};
 use crate::error::{TaskError, TaskErrorKind, WorkflowJsError};
@@ -30,7 +33,10 @@ use crate::schema::{
     ReplyDecodeError, SCHEMA_REPAIR_MAX_ATTEMPTS, carried_raw, compile_schema, decode_reply,
     repair_prompt,
 };
-use crate::{PARALLEL_MAX_ITEMS, WORKFLOW_LIFETIME_CAP, normalize_profile};
+use crate::{
+    CODEMODE_MAX_TOOL_CALLS, PARALLEL_MAX_ITEMS, ToolCallRequest, ToolInvoker,
+    WORKFLOW_LIFETIME_CAP, normalize_profile,
+};
 
 const DEFAULT_VM_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const MIN_VM_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
@@ -175,6 +181,32 @@ impl WorkflowVm {
         driver: Arc<dyn WorkflowDriver>,
         cancel: WorkflowRunCancel,
     ) -> Result<serde_json::Value, WorkflowJsError> {
+        self.run_inner(source, args, driver, None, cancel).await
+    }
+
+    /// Run a code-mode script: the same VM, plus the `tools.call()` host
+    /// binding backed by `invoker`. Workflow runs (no invoker) never see the
+    /// binding, so the Workflow sandbox keeps its documented host surface.
+    pub async fn run_tools_script(
+        &self,
+        source: &str,
+        args: serde_json::Value,
+        driver: Arc<dyn WorkflowDriver>,
+        invoker: Arc<dyn ToolInvoker>,
+        cancel: WorkflowRunCancel,
+    ) -> Result<serde_json::Value, WorkflowJsError> {
+        self.run_inner(source, args, driver, Some(invoker), cancel)
+            .await
+    }
+
+    async fn run_inner(
+        &self,
+        source: &str,
+        args: serde_json::Value,
+        driver: Arc<dyn WorkflowDriver>,
+        invoker: Option<Arc<dyn ToolInvoker>>,
+        cancel: WorkflowRunCancel,
+    ) -> Result<serde_json::Value, WorkflowJsError> {
         let args_json = serde_json::to_string(&args)
             .map_err(|err| WorkflowJsError::InvalidArgs(err.to_string()))?;
         let cancel = cancel.0;
@@ -194,6 +226,13 @@ impl WorkflowVm {
         let source = source.to_string();
         let thread_driver = driver.clone();
         let thread_cancel = cancel.clone();
+        let thread_invoker = invoker.clone();
+        // Native admission belongs to the originating host executor. The VM
+        // thread carries only Send requests/replies, never the Child Engine's
+        // Rust future on its bounded interpreter stack.
+        let host_runtime = Handle::try_current().map_err(|_| {
+            WorkflowJsError::VmInit("workflow host Tokio runtime is unavailable".to_string())
+        })?;
         let spawned = std::thread::Builder::new()
             .name("workflow-js-vm".to_string())
             .stack_size(vm_thread_stack_bytes())
@@ -204,7 +243,9 @@ impl WorkflowVm {
                     args_json,
                     thread_driver.clone(),
                     thread_cancel,
+                    thread_invoker,
                     limits,
+                    host_runtime,
                 );
                 // Run teardown: this driver is scoped to one run, so any task
                 // still in flight is unreachable now — cancel the cascade.
@@ -313,13 +354,23 @@ fn vm_thread_main(
     args_json: String,
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     limits: VmLimits,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, WorkflowJsError> {
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| WorkflowJsError::VmInit(format!("failed to build VM reactor: {err}")))?;
-    reactor.block_on(run_in_vm(source, args_json, driver, cancel, limits))
+    reactor.block_on(run_in_vm(
+        source,
+        args_json,
+        driver,
+        cancel,
+        invoker,
+        limits,
+        host_runtime,
+    ))
 }
 
 async fn run_in_vm(
@@ -327,7 +378,9 @@ async fn run_in_vm(
     args_json: String,
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     limits: VmLimits,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, WorkflowJsError> {
     let runtime = AsyncRuntime::new().map_err(|err| WorkflowJsError::VmInit(err.to_string()))?;
     runtime.set_memory_limit(limits.memory_limit_bytes).await;
@@ -343,7 +396,18 @@ async fn run_in_vm(
         .map_err(|err| WorkflowJsError::VmInit(err.to_string()))?;
 
     let result = context
-        .async_with(async |ctx| run_in_ctx(ctx, source, args_json, driver, cancel).await)
+        .async_with(async |ctx| {
+            run_in_ctx(
+                ctx,
+                source,
+                args_json,
+                driver,
+                invoker,
+                cancel,
+                host_runtime,
+            )
+            .await
+        })
         .await;
     drop(context);
     runtime.run_gc().await;
@@ -355,12 +419,26 @@ async fn run_in_ctx(
     source: String,
     args_json: String,
     driver: Arc<dyn WorkflowDriver>,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     cancel: CancelHandle,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, WorkflowJsError> {
-    install_host(&ctx, driver, cancel.clone(), &args_json)?;
+    install_host(
+        &ctx,
+        driver,
+        invoker.clone(),
+        cancel.clone(),
+        &args_json,
+        host_runtime,
+    )?;
     ctx.eval::<(), _>(prelude())
         .catch(&ctx)
         .map_err(|err| WorkflowJsError::VmInit(format!("prelude failed: {err}")))?;
+    if invoker.is_some() {
+        ctx.eval::<(), _>(CODEMODE_PRELUDE)
+            .catch(&ctx)
+            .map_err(|err| WorkflowJsError::VmInit(format!("codemode prelude failed: {err}")))?;
+    }
 
     let desugared = desugar_export_default(&source);
     let wrapped = format!("(async () => {{\n{desugared}\n}})()");
@@ -524,11 +602,159 @@ fn js_value_to_json<'js>(
     }
 }
 
+/// Prelude fragment for code-mode runs only: captures `__codemode_call` into
+/// the frozen `globalThis.tools` surface, then deletes the raw binding.
+/// Workflow runs never eval this, so their documented host surface is
+/// unchanged — `tools` simply does not exist there.
+const CODEMODE_PRELUDE: &str = r#"
+(() => {
+  const hostCall = __codemode_call;
+  globalThis.tools = Object.freeze({
+    call: async (tool, input) => {
+      const envelope = JSON.parse(
+        await hostCall(JSON.stringify({ tool, input: input === undefined ? {} : input }))
+      );
+      if (envelope.error !== undefined) {
+        const err = new Error(envelope.error);
+        err.kind = envelope.error_kind;
+        throw err;
+      }
+      return envelope.result;
+    },
+  });
+  try { delete globalThis.__codemode_call; } catch (_) { /* frozen shape */ }
+})();
+"#;
+
+// Construct and poll native host futures on the captured host executor.
+// JoinSet aborts on drop; explicit cancellation also joins that abort before
+// the VM receives its existing typed cancellation error.
+async fn call_on_host<T, F>(
+    runtime: &Handle,
+    cancel: &CancelHandle,
+    cancel_error: TaskError,
+    call: impl FnOnce() -> F + Send + 'static,
+) -> Result<T, TaskError>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let mut pending = JoinSet::new();
+    let host_cancel = cancel.clone();
+    let host_error = cancel_error.clone();
+    pending.spawn_on(
+        async move {
+            if host_cancel.is_cancelled() {
+                Err(host_error)
+            } else {
+                Ok(call().await)
+            }
+        },
+        runtime,
+    );
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            pending.shutdown().await;
+            Err(cancel_error)
+        }
+        outcome = pending.join_next() => match outcome {
+            Some(Ok(value)) => value,
+            Some(Err(error)) if error.is_panic() => {
+                std::panic::resume_unwind(error.into_panic())
+            }
+            _ => Err(TaskError::new(
+                TaskErrorKind::Driver,
+                "workflow host callback ended without a reply",
+            )),
+        },
+    }
+}
+
+/// The `tools.call()` host call. Infallible at the binding level, like
+/// `task_host`: outcomes return through the `{result}` /
+/// `{error, error_kind}` envelope so the prelude rethrows typed errors.
+/// Gate refusals arrive as admission errors (nothing ran); a nested tool
+/// that ran and failed arrives as an agent error (work failed).
+async fn tools_call_host(
+    call_json: String,
+    invoker: Arc<dyn ToolInvoker>,
+    cancel: CancelHandle,
+    invoked: Rc<Cell<u64>>,
+    host_runtime: Handle,
+) -> String {
+    let outcome = tools_call_host_inner(call_json, invoker, cancel, invoked, host_runtime).await;
+    let envelope = match outcome {
+        Ok(result) => serde_json::json!({ "result": result }),
+        Err(TaskError { kind, message }) => {
+            serde_json::json!({ "error": message, "error_kind": kind.as_str() })
+        }
+    };
+    envelope.to_string()
+}
+
+async fn tools_call_host_inner(
+    call_json: String,
+    invoker: Arc<dyn ToolInvoker>,
+    cancel: CancelHandle,
+    invoked: Rc<Cell<u64>>,
+    host_runtime: Handle,
+) -> Result<serde_json::Value, TaskError> {
+    let admission = |message: String| TaskError::new(TaskErrorKind::Admission, message);
+    let request: ToolCallRequest = serde_json::from_str(&call_json).map_err(|err| {
+        admission(format!(
+            "tools.call(): expected {{\"tool\", \"input\"}} JSON: {err}"
+        ))
+    })?;
+    if request.tool.trim().is_empty() {
+        return Err(admission(
+            "tools.call(): `tool` must be a non-empty string".to_string(),
+        ));
+    }
+    if !request.input.is_object() {
+        return Err(admission(
+            "tools.call(): `input` must be a JSON object".to_string(),
+        ));
+    }
+    if invoked.get() >= CODEMODE_MAX_TOOL_CALLS {
+        return Err(admission(format!(
+            "tools.call(): per-run tool-call cap ({CODEMODE_MAX_TOOL_CALLS}) reached"
+        )));
+    }
+    if cancel.is_cancelled() {
+        return Err(TaskError::new(
+            TaskErrorKind::Cancelled,
+            "tools.call(): run cancelled".to_string(),
+        ));
+    }
+    invoked.set(invoked.get() + 1);
+    let response = call_on_host(
+        &host_runtime,
+        &cancel,
+        TaskError::new(TaskErrorKind::Cancelled, "tools.call(): run cancelled"),
+        move || async move { invoker.invoke(request).await },
+    )
+    .await?
+    .map_err(|err| TaskError::new(TaskErrorKind::from(&err), format!("tools.call(): {err}")))?;
+    if response.ok {
+        Ok(response.result)
+    } else {
+        let message = response
+            .result
+            .as_str()
+            .unwrap_or("tools.call(): tool failed without a message")
+            .to_string();
+        Err(TaskError::new(TaskErrorKind::Agent, message))
+    }
+}
+
 fn install_host(
     ctx: &Ctx<'_>,
     driver: Arc<dyn WorkflowDriver>,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     cancel: CancelHandle,
     args_json: &str,
+    host_runtime: Handle,
 ) -> Result<(), WorkflowJsError> {
     let globals = ctx.globals();
 
@@ -544,6 +770,7 @@ fn install_host(
 
     let task_driver = driver.clone();
     let task_cancel = cancel.clone();
+    let task_runtime = host_runtime.clone();
     globals
         .set(
             "__workflow_task",
@@ -551,10 +778,34 @@ fn install_host(
                 let driver = task_driver.clone();
                 let cancel = task_cancel.clone();
                 let spawned = spawned.clone();
-                async move { task_host(opts_json, driver, cancel, spawned).await }
+                let host_runtime = task_runtime.clone();
+                async move { task_host(opts_json, driver, cancel, spawned, host_runtime).await }
             })),
         )
         .map_err(init_err)?;
+
+    // Code-mode runs only: per-run tool-call counter. Same single-threaded
+    // check+increment discipline as `spawned` above — no await between the
+    // cap check and the increment, so a burst cannot slip past it.
+    if let Some(invoker) = invoker {
+        let invoked = Rc::new(Cell::new(0u64));
+        let call_invoker = invoker.clone();
+        let call_cancel = cancel.clone();
+        globals
+            .set(
+                "__codemode_call",
+                Func::from(Async(move |call_json: String| {
+                    let invoker = call_invoker.clone();
+                    let cancel = call_cancel.clone();
+                    let invoked = invoked.clone();
+                    let host_runtime = host_runtime.clone();
+                    async move {
+                        tools_call_host(call_json, invoker, cancel, invoked, host_runtime).await
+                    }
+                })),
+            )
+            .map_err(init_err)?;
+    }
 
     let log_driver = driver.clone();
     globals
@@ -664,8 +915,9 @@ async fn task_host(
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
     spawned: Rc<Cell<u64>>,
+    host_runtime: Handle,
 ) -> String {
-    let outcome = task_host_inner(opts_json, driver, cancel, spawned).await;
+    let outcome = task_host_inner(opts_json, driver, cancel, spawned, host_runtime).await;
     let envelope = match outcome {
         Ok(value) => serde_json::json!({ "value": value }),
         Err(TaskError { kind, message }) => {
@@ -777,9 +1029,11 @@ async fn task_host_inner(
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
     spawned: Rc<Cell<u64>>,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, TaskError> {
     let admission = |message: String| TaskError::new(TaskErrorKind::Admission, message);
-    let request = parse_task_options(&opts_json)
+    let workspace = driver.workspace_root();
+    let request = parse_task_options(&opts_json, workspace.as_deref())
         .map_err(|message| admission(reject_task(&driver, &opts_json, message)))?;
     // Compile the schema before spawning so a malformed one fails fast
     // instead of burning a subagent.
@@ -835,10 +1089,20 @@ async fn task_host_inner(
     loop {
         attempt += 1;
         spawned.set(spawned.get() + 1);
-        let spawned_task = driver
-            .spawn_task(current.clone())
-            .await
-            .map_err(|err| TaskError::new(TaskErrorKind::from(&err), err.to_string()))?;
+        // Admission can wait (a saturated concurrency gate, a routing call),
+        // so it races the run's cancel exactly as the completion does below
+        // and as `tools.call()` does: a cancel that only closed the driver's
+        // gate used to be the one thing that could wake it.
+        let task_driver = driver.clone();
+        let task_request = current.clone();
+        let spawned_task = call_on_host(
+            &host_runtime,
+            &cancel,
+            cancelled_task(),
+            move || async move { task_driver.spawn_task(task_request).await },
+        )
+        .await?
+        .map_err(|err| TaskError::new(TaskErrorKind::from(&err), err.to_string()))?;
         let task_id = spawned_task.task_id;
         let completion_rx = spawned_task.completion;
         let completion = tokio::select! {
@@ -1013,7 +1277,10 @@ struct TaskOptions {
     phase: Option<String>,
 }
 
-fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
+fn parse_task_options(
+    opts_json: &str,
+    workspace: Option<&std::path::Path>,
+) -> Result<TaskRequest, String> {
     let mut options: TaskOptions =
         serde_json::from_str(opts_json).map_err(|err| format!("task(): invalid options: {err}"))?;
     if let Some(policy) = options.workspace_policy.take() {
@@ -1055,10 +1322,9 @@ fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
     options.exact_files = normalize_task_paths("exactFiles", options.exact_files, 32)?;
     let cwd = options
         .cwd
-        .take()
-        .map(|value| normalize_task_paths("cwd", vec![value], 1))
-        .transpose()?
-        .and_then(|mut paths| paths.pop());
+        .as_deref()
+        .map(|cwd| normalize_task_cwd_in(cwd, workspace))
+        .transpose()?;
     options.coordination_contracts =
         normalize_task_string_list("coordinationContracts", options.coordination_contracts, 16)?;
     options.dependencies = normalize_task_string_list("dependencies", options.dependencies, 8)?;
@@ -1092,33 +1358,10 @@ fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
     {
         return Err("task(): read-only roles cannot declare write-capable authority".to_string());
     }
-    if write_authority
-        .as_deref()
-        .is_some_and(|authority| authority != "read_only")
-        && options.write_roots.is_empty()
-        && options.exact_files.is_empty()
-        && options.coordination_contracts.is_empty()
-    {
-        return Err(
-            "task(): write-capable authority requires writeRoots, exactFiles, or coordinationContracts"
-                .to_string(),
-        );
-    }
-    let explicit_write_identity = declared_kind == Some(TaskRoleKind::Implementer)
-        || (declared_kind == Some(TaskRoleKind::General)
-            && (role.is_some() || options.subagent_type.is_some()))
-        || (profile.is_some() && declared_kind.is_none());
-    if explicit_write_identity
-        && write_authority.as_deref() != Some("read_only")
-        && options.write_roots.is_empty()
-        && options.exact_files.is_empty()
-        && options.coordination_contracts.is_empty()
-    {
-        return Err(
-            "task(): explicit write-capable identities require writeRoots, exactFiles, or coordinationContracts"
-                .to_string(),
-        );
-    }
+    // A write-capable task with no declared scope is not refused here: the
+    // spawn boundary (`validate_spawn_write_contract`) claims the workspace
+    // root, or the task's deliverables, exactly as it does for a plain Agent
+    // spawn, and the coordination ledger arbitrates contention with live peers.
     if let Some(attempts) = options.schema_repair_attempts
         && attempts > SCHEMA_REPAIR_MAX_ATTEMPTS
     {
@@ -1178,6 +1421,128 @@ fn normalize_task_string_list(
         }
     }
     Ok(normalized)
+}
+
+/// Normalize a task working directory at both plan preflight and VM dispatch.
+/// The same bounded repo-relative policy applies to both entry points.
+pub fn normalize_task_cwd(value: &str) -> Result<String, String> {
+    normalize_task_paths("cwd", vec![value.to_owned()], 1).map(|mut paths| paths.remove(0))
+}
+
+/// [`normalize_task_cwd`] for a run that knows its workspace root. An
+/// absolute path that lies inside `workspace` is rewritten to the same
+/// bounded repo-relative form; an absolute path outside it, or one that
+/// escapes through `..`, is still rejected. Without a workspace every
+/// absolute path is rejected, exactly as before.
+///
+/// The comparison is lexical and component-wise (no filesystem access), so
+/// `/ws-other` is never inside `/ws`. On Windows a drive letter or UNC share
+/// matches with or without the verbatim `\\?\` prefix, `/` and `\` are both
+/// separators, and components compare case-insensitively.
+pub fn normalize_task_cwd_in(
+    value: &str,
+    workspace: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let raw = value.trim();
+    let path = std::path::Path::new(raw);
+    let Some(workspace) = workspace.filter(|_| path.is_absolute()) else {
+        return normalize_task_cwd(value);
+    };
+    let outside = || {
+        format!(
+            "task(): cwd {raw:?} is outside the workspace {}; cwd entries must be bounded repo-relative paths or absolute paths inside the workspace",
+            workspace.display()
+        )
+    };
+    let mut remainder = path_keys(path).ok_or_else(outside)?.into_iter();
+    for expected in path_keys(workspace).ok_or_else(outside)? {
+        match remainder.next() {
+            Some(actual) if actual.matches(&expected) => {}
+            // `..` right after the workspace prefix is an escape, not a
+            // different root: name it as traversal.
+            Some(PathKey::Parent) => {
+                return Err("task(): cwd paths cannot contain parent traversal".to_string());
+            }
+            _ => return Err(outside()),
+        }
+    }
+    let mut segments = Vec::new();
+    for key in remainder {
+        match key {
+            PathKey::Name { original, .. } => segments.push(original),
+            PathKey::Parent => {
+                return Err("task(): cwd paths cannot contain parent traversal".to_string());
+            }
+            PathKey::Root => return Err(outside()),
+        }
+    }
+    if segments.is_empty() {
+        return Ok(".".to_string());
+    }
+    normalize_task_cwd(&segments.join("/"))
+}
+
+/// One lexical path component, keyed for comparison: a drive or UNC prefix
+/// with its verbatim marker dropped, and names case-folded on Windows.
+#[derive(Debug)]
+enum PathKey {
+    Root,
+    Parent,
+    Name { key: String, original: String },
+}
+
+impl PathKey {
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, Self::Root) | (Self::Parent, Self::Parent) => true,
+            (Self::Name { key: left, .. }, Self::Name { key: right, .. }) => left == right,
+            _ => false,
+        }
+    }
+}
+
+fn path_keys(path: &std::path::Path) -> Option<Vec<PathKey>> {
+    use std::path::{Component, Prefix};
+    let fold = |value: &str| {
+        if cfg!(windows) {
+            value.to_lowercase()
+        } else {
+            value.to_string()
+        }
+    };
+    let mut keys = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                let key = match prefix.kind() {
+                    Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                        format!("{}:", drive.to_ascii_lowercase() as char)
+                    }
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+                        "//{}/{}",
+                        server.to_str()?.to_lowercase(),
+                        share.to_str()?.to_lowercase()
+                    ),
+                    _ => prefix.as_os_str().to_str()?.to_lowercase(),
+                };
+                keys.push(PathKey::Name {
+                    original: key.clone(),
+                    key,
+                });
+            }
+            Component::RootDir => keys.push(PathKey::Root),
+            Component::CurDir => {}
+            Component::ParentDir => keys.push(PathKey::Parent),
+            Component::Normal(name) => {
+                let original = name.to_str()?.to_string();
+                keys.push(PathKey::Name {
+                    key: fold(&original),
+                    original,
+                });
+            }
+        }
+    }
+    Some(keys)
 }
 
 fn normalize_task_paths(

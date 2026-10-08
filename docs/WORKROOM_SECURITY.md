@@ -1,5 +1,7 @@
 # Workroom Security Model
 
+> 阅读简体中文版：[zh_hans/WORKROOM_SECURITY.md](zh_hans/WORKROOM_SECURITY.md)。
+
 ## Scope
 
 This document covers the security boundaries of Codewhale Workrooms — the
@@ -28,8 +30,9 @@ model-visible link resolution remain follow-up work.
    stated: the endpoint validates against a **closed** field set and rejects an
    entire batch carrying any key the published schema does not name, so a
    workroom field added by accident is refused at ingest rather than stored.
-   Counting is disclosed and can be disabled immediately. It is on by default,
-   but workroom content is still structurally absent from every accepted batch.
+   In the current 0.9.12 source, counting is on by default with a clear
+   disclosure and durable opt-out; earlier opt-outs stay off. Workroom content
+   remains structurally absent from every accepted batch.
 
 2. **No secrets in links.** `codewhale://workroom/wr_...` URLs contain only
    opaque UUIDs. They carry no API keys, bearer tokens, passwords, or file
@@ -62,7 +65,7 @@ model-visible link resolution remain follow-up work.
 ## API auth
 
 Future workroom endpoints should inherit the same auth middleware as other
-protected routes (`/thread`, `/app`, `/tool`, etc.):
+protected routes (`/thread`, `/app`, `/prompt`, etc.):
 
 - `Authorization: Bearer <token>` header required
 - Token validated against the runtime's configured bearer token(s)

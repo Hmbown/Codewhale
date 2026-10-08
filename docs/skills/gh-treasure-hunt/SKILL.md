@@ -8,7 +8,7 @@ description: "Hunt the issue/PR queue for highest value-over-risk wins: clean fo
 Hunt the open queue for the highest value-over-risk wins fast: clean focused
 community PRs, issues the branch already implements, and safe quick-fixes.
 Output a ranked action list with credit handling. Never act on title or labels
-alone, and never merge/close/tag without Hunter's approval.
+alone, and never merge/close/tag without maintainer approval.
 
 ## When to use
 
@@ -27,9 +27,9 @@ alone, and never merge/close/tag without Hunter's approval.
 
 1. Pull the queue (read everything, decide nothing yet):
    ```bash
-   gh pr list --repo Hmbown/CodeWhale --state open --limit 200 \
+   gh pr list --repo codewhale-hq/CodeWhale --state open --limit 200 \
      --json number,title,author,headRefName,baseRefName,isDraft,mergeable,mergeStateStatus,additions,deletions,changedFiles,reviewDecision,labels,url
-   gh issue list --repo Hmbown/CodeWhale --state open --limit 300 \
+   gh issue list --repo codewhale-hq/CodeWhale --state open --limit 300 \
      --json number,title,author,labels,milestone,url
    ```
 2. Shortlist PRs that look CLEAN + small (`mergeable=MERGEABLE`, low
@@ -37,9 +37,9 @@ alone, and never merge/close/tag without Hunter's approval.
    sandbox, install, publish, branding). Flag any NEW contributor for credit.
 3. Confirm each shortlisted PR from code, tests, comments, and checks:
    ```bash
-   gh pr view N --repo Hmbown/CodeWhale \
+   gh pr view N --repo codewhale-hq/CodeWhale \
      --json files,commits,reviews,comments,statusCheckRollup,closingIssuesReferences
-   gh pr checks N --repo Hmbown/CodeWhale
+   gh pr checks N --repo codewhale-hq/CodeWhale
    ```
 4. Test mergeability against the REAL landing branch (release branches are often
    local-only; the main-based `mergeable` flag lies):
@@ -78,7 +78,7 @@ alone, and never merge/close/tag without Hunter's approval.
 
 ## Red flags / don't
 
-- Don't merge, close, defer, harvest, or tag without Hunter's explicit approval.
+- Don't merge, close, defer, harvest, or tag without explicit maintainer approval.
 - Don't trust a `main`-based clean flag for a release branch; run `git merge-tree`
   against the real landing branch.
 - Don't judge from title/labels; read code + tests + comments + checks.

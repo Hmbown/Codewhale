@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "watch",
+      "detail": "tsc -p ./ --watch — background compile for the Run Extension launch config",
+      "type": "shell",
+      "command": "npx tsc -p ./ --watch",
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": "$tsc-watch",
+      "presentation": { "reveal": "never", "panel": "dedicated" },
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "compile",
+      "detail": "tsc -p ./ — one-shot build into out/",
+      "type": "shell",
+      "command": "npx tsc -p ./",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$tsc",
+      "presentation": { "reveal": "silent", "panel": "dedicated" },
+      "group": "build"
+    }
+  ]
+}

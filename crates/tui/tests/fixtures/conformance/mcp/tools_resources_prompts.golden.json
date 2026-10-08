@@ -1,0 +1,486 @@
+{
+  "server_received": [
+    {
+      "arguments": {
+        "text": "hi"
+      },
+      "method": "tools/call",
+      "name": "echo"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "fails"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "rpc-error"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "slow"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "image"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "hangs"
+    },
+    {
+      "arguments": {
+        "text": "after cancel"
+      },
+      "method": "tools/call",
+      "name": "echo"
+    },
+    {
+      "method": "resources/read",
+      "uri": "fixture://readme"
+    },
+    {
+      "method": "prompts/get",
+      "name": "summarize"
+    }
+  ],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "List available MCP resource templates across servers (optionally filtered by server).",
+          "input_schema": {
+            "properties": {
+              "server": {
+                "description": "Optional MCP server name to filter by",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "list_mcp_resource_templates"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "List available MCP resources across servers (optionally filtered by server).",
+          "input_schema": {
+            "properties": {
+              "server": {
+                "description": "Optional MCP server name to filter by",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "list_mcp_resources"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Echo the text argument.\nSecond description line.",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Always reports a tool-level error.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_fails"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Never answers until the caller goes away.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_hangs"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Returns text and an image block.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_image"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_rpc-error"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Sends progress notifications before its result.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_slow"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Listed first by the server; the catalog sorts by name.",
+          "input_schema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mcp_conformance_z_last"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Get a prompt from an MCP server",
+          "input_schema": {
+            "properties": {
+              "arguments": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Optional arguments for the prompt",
+                "type": "object"
+              },
+              "name": {
+                "description": "The name of the prompt",
+                "type": "string"
+              },
+              "server": {
+                "description": "The name of the MCP server",
+                "type": "string"
+              }
+            },
+            "required": [
+              "server",
+              "name"
+            ],
+            "type": "object"
+          },
+          "name": "mcp_get_prompt"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Read a resource from an MCP server using its URI",
+          "input_schema": {
+            "properties": {
+              "server": {
+                "description": "The name of the MCP server",
+                "type": "string"
+              },
+              "uri": {
+                "description": "The URI of the resource to read",
+                "type": "string"
+              }
+            },
+            "required": [
+              "server",
+              "uri"
+            ],
+            "type": "object"
+          },
+          "name": "mcp_read_resource"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Alias for mcp_read_resource.",
+          "input_schema": {
+            "properties": {
+              "server": {
+                "description": "The name of the MCP server",
+                "type": "string"
+              },
+              "uri": {
+                "description": "The URI of the resource to read",
+                "type": "string"
+              }
+            },
+            "required": [
+              "server",
+              "uri"
+            ],
+            "type": "object"
+          },
+          "name": "read_mcp_resource"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "echo: hi",
+                "type": "text"
+              }
+            ],
+            "structuredContent": {
+              "echoed": "hi"
+            }
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": "the fixture tool failed on purpose",
+          "content_blocks": [],
+          "metadata": null,
+          "success": false
+        }
+      },
+      "tool": "mcp_conformance_fails"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP error in 'tools/call': {\n  \"code\": -32602,\n  \"message\": \"invalid params: conformance\"\n}",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_rpc-error"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "slow done",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_slow"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "one pixel",
+                "type": "text"
+              },
+              {
+                "data": "[MCP image payload removed from text output]",
+                "mimeType": "image/png",
+                "type": "image"
+              }
+            ]
+          },
+          "content_blocks": [
+            {
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+              "mime_type": "image/png",
+              "type": "image"
+            }
+          ],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_image"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Tool execution cancelled: tool call interrupted by the host",
+          "kind": "cancelled"
+        }
+      },
+      "tool": "mcp_conformance_hangs"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "echo: hi",
+                "type": "text"
+              }
+            ],
+            "structuredContent": {
+              "echoed": "hi"
+            }
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "resources": [
+              {
+                "description": "The fixture readme.",
+                "mime_type": "text/plain",
+                "name": "readme",
+                "server": "conformance",
+                "uri": "fixture://readme"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "list_mcp_resources"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "templates": [
+              {
+                "description": null,
+                "mime_type": "text/plain",
+                "name": "note",
+                "server": "conformance",
+                "uri_template": "fixture://notes/{id}"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "list_mcp_resource_templates"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "contents": [
+              {
+                "mimeType": "text/plain",
+                "text": "conformance fixture\n",
+                "uri": "fixture://readme"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_read_resource"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "description": "Summarize a note.",
+            "messages": [
+              {
+                "content": {
+                  "text": "Summarize note 7.",
+                  "type": "text"
+                },
+                "role": "user"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_get_prompt"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: Unknown MCP tool name: mcp_conformance_not_advertised",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_not_advertised"
+    }
+  ]
+}

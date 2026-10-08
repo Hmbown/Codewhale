@@ -58,10 +58,10 @@ describe("FAQPage structured data", () => {
     });
   });
 
-  it("covers all 40 curated pairs from the FAQ page arrays", () => {
+  it("covers all 42 curated pairs from the FAQ page arrays", () => {
     const questions = [...faqPage.matchAll(/^\s+q: "(.+)"/gm)].map((match) => match[1]);
-    expect(questions).toHaveLength(40);
-    expect(new Set(questions).size).toBe(40);
+    expect(questions).toHaveLength(42);
+    expect(new Set(questions).size).toBe(42);
     expect(faqPage).toContain("const faqEn");
     expect(faqPage).toContain("const faqZh");
     expect(faqPage).toContain("buildFaqPageJsonLd({");
@@ -69,6 +69,12 @@ describe("FAQPage structured data", () => {
     expect(faqPage).toContain('canonicalLocaleForPath("/faq", locale)');
     expect(faqPage).toContain('type="application/ld+json"');
     expect(faqPage).toContain("serializeJsonLd(jsonLd)");
+  });
+
+  it("keeps every internal answer link on the reader's locale", () => {
+    // Every locale without its own FAQ reads the English answers, so a
+    // literal `/en/...` link sent a /ja reader to the English site (W01-02).
+    expect(faqPage).not.toMatch(/href=\{?["'`]\/[a-z]{2}(?:-[A-Za-z]+)?\//);
   });
 });
 

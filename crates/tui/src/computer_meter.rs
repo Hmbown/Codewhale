@@ -350,8 +350,9 @@ pub enum ComputerMeterError {
     /// Interval ends before it starts.
     #[error("A Computer meter interval cannot end before it starts.")]
     IntervalReversed,
-    /// Admission has expired before the interval started.
-    #[error("The Computer admission expired before this interval.")]
+    /// Admission expired before the interval ended. An interval must lie
+    /// wholly inside the admission; the tail after expiry was never authorized.
+    #[error("The Computer admission expired before this interval ended.")]
     AdmissionExpired,
     /// Meter or catalog revision is not the pinned v3 revision.
     #[error("{message}")]
@@ -479,7 +480,10 @@ pub fn issue_computer_meter_receipt(
         return Err(ComputerMeterError::IntervalReversed);
     }
     let expires = parse_timestamp(&admission.expires_at, "expiresAt")?;
-    if started >= expires {
+    // `ended_at` is exclusive, so an interval ending exactly at expiry is
+    // wholly authorized; one that runs past it is refused rather than clipped,
+    // because a clipped receipt would no longer restate the provider interval.
+    if started >= expires || ended > expires {
         return Err(ComputerMeterError::AdmissionExpired);
     }
     let accepted_seconds = elapsed_whole_seconds(started, ended);
@@ -539,21 +543,21 @@ pub fn issue_computer_meter_receipt(
     Ok(receipt)
 }
 
-/// Exact replay of an existing receipt. Identity and digest must match.
+/// Exact replay of an existing receipt. Every field must match (only the
+/// `replay_of` back-reference may differ), and the incoming digest and id must
+/// be the ones its own fields produce: a caller-supplied digest is never
+/// trusted to stand for fields it does not cover.
 pub fn assert_computer_meter_receipt_replay(
     existing: &ComputerMeterReceipt,
     incoming: &ComputerMeterReceipt,
 ) -> Result<(), ComputerMeterError> {
-    if existing.receipt_id == incoming.receipt_id
-        && existing.binding_digest == incoming.binding_digest
-        && existing.admission_id == incoming.admission_id
-        && existing.account_id == incoming.account_id
-        && existing.provider_event_ref == incoming.provider_event_ref
-        && existing.accepted_seconds == incoming.accepted_seconds
-        && existing.standard_equivalent_seconds == incoming.standard_equivalent_seconds
-        && existing.profile_id == incoming.profile_id
-        && existing.multiplier == incoming.multiplier
-    {
+    let self_consistent = receipt_binding_digest(incoming) == incoming.binding_digest
+        && receipt_id_for(incoming) == incoming.receipt_id;
+    let same_terms = ComputerMeterReceipt {
+        replay_of: existing.replay_of.clone(),
+        ..incoming.clone()
+    } == *existing;
+    if self_consistent && same_terms {
         return Ok(());
     }
     Err(ComputerMeterError::ReplayConflict)

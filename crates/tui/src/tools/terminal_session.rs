@@ -35,6 +35,11 @@ use super::spec::{optional_u64, required_str};
 const BUFFER_LIMIT: usize = 512 * 1024;
 #[cfg(unix)]
 const OUTPUT_LIMIT: usize = 12 * 1024;
+/// Ceiling for one [`OutputBuffer::read_since`] response. The ring is already
+/// bounded at [`BUFFER_LIMIT`]; this bounds a single frame so a client cannot
+/// ask for the whole window at once.
+#[cfg(unix)]
+pub(crate) const READ_LIMIT: usize = 64 * 1024;
 #[cfg(unix)]
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 #[cfg(unix)]
@@ -45,8 +50,12 @@ const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const CANCEL_SENTINEL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
-struct TerminalSession {
+pub(crate) struct TerminalSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// The pty master is retained after the reader and writer clones are taken
+    /// so [`TerminalSession::resize`] can reach the kernel's window size. The
+    /// clones keep the pty alive; nothing else clones the master.
+    master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send>,
     output: Arc<Mutex<OutputBuffer>>,
     read_cursor: u64,
@@ -110,6 +119,33 @@ struct OutputBuffer {
     total: u64,
 }
 
+/// One absolute-offset slice of a session's output.
+///
+/// Offsets are absolute for the life of the live PTY: they count every byte
+/// the reader thread ever appended, not the bytes still retained. That is what
+/// lets a client resume from a cursor it stored earlier, and what lets this
+/// type tell it the truth when the retained window has moved past it.
+///
+/// Field names match the `/v1/terminal/{name}/output` wire so the payload is a
+/// projection, not a translation (the same vocabulary the jobs byte stream
+/// uses).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutputChunk {
+    pub(crate) bytes: Vec<u8>,
+    /// Absolute offset of `bytes[0]` in the session's lifetime output.
+    pub(crate) offset: u64,
+    /// Offset to pass as the next `cursor`.
+    pub(crate) next_cursor: u64,
+    /// Every byte the session has produced, retained or not.
+    pub(crate) total: u64,
+    /// Leading bytes the ring has permanently discarded.
+    pub(crate) dropped: u64,
+    /// True when the requested cursor predates the retained window. The bytes
+    /// in between cannot be recovered from this process — report, not repair.
+    pub(crate) gap: bool,
+}
+
 #[cfg(unix)]
 impl OutputBuffer {
     fn append(&mut self, data: &[u8]) {
@@ -123,10 +159,41 @@ impl OutputBuffer {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes.iter().copied().collect::<Vec<_>>()).into_owned()
     }
+
+    /// Absolute offset of the oldest retained byte.
+    fn oldest(&self) -> u64 {
+        self.total.saturating_sub(self.bytes.len() as u64)
+    }
+
+    /// Read from an absolute cursor without consuming: the caller owns its own
+    /// position, so two readers can replay the same bytes and a repeated read
+    /// is idempotent. Does not advance `read_cursor` — the consuming
+    /// tool-result path is untouched. This is the cursor arithmetic only;
+    /// response-size policy belongs to the caller.
+    ///
+    /// A cursor past the head clamps to `total`: nothing is there yet, and
+    /// echoing the future cursor back as `next_cursor` would make every byte
+    /// produced before the stream reached it invisible to that client.
+    fn read_since(&self, cursor: u64, max_bytes: usize) -> OutputChunk {
+        let dropped = self.oldest();
+        let gap = cursor < dropped;
+        let start = cursor.max(dropped).min(self.total);
+        let skip = usize::try_from(start - dropped).unwrap_or(usize::MAX);
+        let take = max_bytes.min(self.bytes.len().saturating_sub(skip));
+        let bytes = self.bytes.iter().skip(skip).take(take).copied().collect();
+        OutputChunk {
+            bytes,
+            offset: start,
+            next_cursor: start + take as u64,
+            total: self.total,
+            dropped,
+            gap,
+        }
+    }
 }
 
 #[cfg(unix)]
-type SharedSession = Arc<Mutex<TerminalSession>>;
+pub(crate) type SharedSession = Arc<Mutex<TerminalSession>>;
 
 #[cfg(unix)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -282,9 +349,12 @@ fn create_session(
         command.arg(arg);
     }
     command.cwd(&prepared.cwd);
-    for (key, value) in &prepared.env {
-        command.env(key, value);
-    }
+    // Same sanitized environment as the `exec_shell` PTY path; sandbox
+    // markers from `prepared.env` are applied as explicit overrides.
+    crate::child_env::apply_to_pty_command(
+        &mut command,
+        crate::child_env::string_map_env(&prepared.env),
+    );
     let child = pair
         .slave
         .spawn_command(command)
@@ -341,6 +411,7 @@ fn create_session(
 
     Ok(Arc::new(Mutex::new(TerminalSession {
         writer: Arc::new(Mutex::new(writer)),
+        master: pair.master,
         child,
         output,
         read_cursor: 0,
@@ -352,7 +423,7 @@ fn create_session(
 }
 
 #[cfg(unix)]
-fn get_or_create(
+pub(crate) fn get_or_create(
     name: &str,
     workspace: &std::path::Path,
     policy: crate::sandbox::SandboxPolicy,
@@ -408,7 +479,7 @@ fn find(name: &str, workspace: &Path) -> Result<SharedSession, String> {
 }
 
 #[cfg(unix)]
-fn write_bytes(session: &TerminalSession, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_bytes(session: &TerminalSession, bytes: &[u8]) -> Result<(), String> {
     let mut writer = session
         .writer
         .lock()
@@ -433,12 +504,84 @@ fn take_output(session: &mut TerminalSession) -> String {
     let Ok(output) = session.output.lock() else {
         return String::new();
     };
-    let retained_start = output.total.saturating_sub(output.bytes.len() as u64);
-    let start = session.read_cursor.max(retained_start);
-    let skip = usize::try_from(start.saturating_sub(retained_start)).unwrap_or(usize::MAX);
-    let bytes = output.bytes.iter().skip(skip).copied().collect::<Vec<_>>();
+    let chunk = output.read_since(session.read_cursor, usize::MAX);
     session.read_cursor = output.total;
-    String::from_utf8_lossy(&bytes).into_owned()
+    String::from_utf8_lossy(&chunk.bytes).into_owned()
+}
+
+/// Resize the live pty's window. The kernel updates its `winsize` and signals
+/// the child, which is what makes an interactive app redraw at the new size.
+#[cfg(unix)]
+pub(crate) fn resize_session(
+    session: &TerminalSession,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    session
+        .master
+        .resize(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("PTY resize failed: {e}"))
+}
+
+/// Absolute-offset, non-consuming read. `max_bytes` is clamped to
+/// [`READ_LIMIT`] so one caller cannot ask for the whole retained window.
+///
+/// Known limitation: this reports a [`OutputChunk::gap`]; it does not repair
+/// one. Bytes dropped by the ring are gone with the process, and nothing here
+/// re-reads them from disk — the durable record is identity and lifecycle,
+/// never output.
+#[cfg(unix)]
+pub(crate) fn read_session_since(
+    session: &TerminalSession,
+    cursor: u64,
+    max_bytes: usize,
+) -> Result<OutputChunk, String> {
+    let output = session
+        .output
+        .lock()
+        .map_err(|_| "terminal output lock poisoned".to_string())?;
+    Ok(output.read_since(cursor, max_bytes.min(READ_LIMIT)))
+}
+
+/// Poll the shell without blocking; `None` means it is still running.
+#[cfg(unix)]
+pub(crate) fn session_exit_status(
+    session: &mut TerminalSession,
+) -> Result<Option<portable_pty::ExitStatus>, String> {
+    session
+        .child
+        .try_wait()
+        .map_err(|e| format!("PTY wait failed: {e}"))
+}
+
+/// Terminate the shell. The caller still observes the exit through
+/// [`session_exit_status`].
+#[cfg(unix)]
+pub(crate) fn kill_session(session: &mut TerminalSession) -> Result<(), String> {
+    session
+        .child
+        .kill()
+        .map_err(|e| format!("PTY kill failed: {e}"))
+}
+
+/// Resolve a live session without creating one.
+///
+/// `/v1/terminal` attaches to shells the Engine already owns (the agent's
+/// terminal tools create them). A request for a name that has no live session
+/// is a 404, never a new process: an HTTP client must not be able to conjure a
+/// shell the Engine does not know about.
+#[cfg(unix)]
+pub(crate) fn lookup(name: &str, workspace: &Path) -> Option<SharedSession> {
+    let key = session_key(name, workspace);
+    sessions()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&key).map(Arc::clone))
 }
 
 #[cfg(unix)]
@@ -452,15 +595,17 @@ fn prune_output(input: &str) -> String {
         .char_indices()
         .find(|(index, _)| *index >= head)
         .map_or(input.len(), |(index, _)| index);
+    // The earliest boundary that still fits: the tail is where a build's
+    // error and the command's completion marker are.
     let tail_start = input
         .char_indices()
-        .rev()
-        .find(|(index, _)| input.len() - *index <= tail)
-        .map_or(0, |(index, _)| index);
+        .map(|(index, _)| index)
+        .find(|index| *index >= head_end && input.len() - *index <= tail)
+        .unwrap_or(input.len());
     format!(
         "{}\n… [output truncated: {} bytes omitted] …\n{}",
         &input[..head_end],
-        input.len() - OUTPUT_LIMIT,
+        tail_start - head_end,
         &input[tail_start..]
     )
 }
@@ -674,7 +819,15 @@ fn timeout_secs(input: &serde_json::Value, key: &str) -> Result<Duration, ToolEr
     ))
 }
 
-fn shell_allowed(context: &ToolContext) -> Result<(), ToolError> {
+fn shell_allowed(context: &ToolContext, name: &str) -> Result<(), ToolError> {
+    crate::core::engine::tool_catalog::enforce_tool_denial(context, name, &json!({}))?;
+    if matches!(name, "terminal/run" | "terminal/send" | "terminal/reset")
+        && context.shell_policy != crate::worker_profile::ShellPolicy::Full
+    {
+        return Err(ToolError::permission_denied(
+            "Persistent terminal execution and input require full shell permission.",
+        ));
+    }
     if context.shell_policy.allows_shell() {
         Ok(())
     } else {
@@ -714,7 +867,7 @@ pub struct TerminalRunTool;
 impl ToolSpec for TerminalRunTool {
     terminal_tool_common!(
         "terminal/run",
-        "Run a command in a persistent PTY shell session. cd, exports, shell functions, and activated environments persist across calls in this process. Identity and a non-secret last-known summary persist across restarts; prior shells are surfaced as stale/lost and are never reattached."
+        "Run a command in a persistent PTY shell session. cd, exports, shell functions, and activated environments persist across calls in this process. Identity and a non-secret last-known summary persist across restarts; prior shells are surfaced as stale/lost and are never reattached. On timeout the wait is abandoned but the command keeps running in the session (use terminal/wait or cancel). (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"command":{"type":"string"},"session":{"type":"string","default":"term-1"},"timeout_secs":{"type":"integer","default":120}},"required":["command"]})
@@ -724,7 +877,7 @@ impl ToolSpec for TerminalRunTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        shell_allowed(context)?;
+        shell_allowed(context, self.name())?;
         #[cfg(unix)]
         {
             let command = required_str(&input, "command")?.to_string();
@@ -761,7 +914,7 @@ pub struct TerminalSendTool;
 impl ToolSpec for TerminalSendTool {
     terminal_tool_common!(
         "terminal/send",
-        "Send raw input to a live persistent terminal session. Use a literal ETX control byte to interrupt an interactive process. A prior-process shell is reported as stale/lost rather than reattached."
+        "Send raw input to a live persistent terminal session. Use a literal ETX control byte to interrupt an interactive process. A prior-process shell is reported as stale/lost rather than reattached. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"},"text":{"type":"string"},"wait_ms":{"type":"integer","default":250}},"required":["session","text"]})
@@ -771,7 +924,7 @@ impl ToolSpec for TerminalSendTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        shell_allowed(context)?;
+        shell_allowed(context, self.name())?;
         #[cfg(unix)]
         {
             let name = session_name(&input, true)?.to_string();
@@ -803,7 +956,7 @@ pub struct TerminalWaitTool;
 impl ToolSpec for TerminalWaitTool {
     terminal_tool_common!(
         "terminal/wait",
-        "Wait for the current foreground command in a live persistent terminal session and return buffered output. A prior-process shell is reported as stale/lost rather than reattached."
+        "Wait for the current foreground command in a live persistent terminal session and return buffered output. A prior-process shell is reported as stale/lost rather than reattached. Output buffer holds at most 512KiB; older bytes are dropped silently. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"},"timeout_secs":{"type":"integer","default":120}},"required":["session"]})
@@ -813,7 +966,7 @@ impl ToolSpec for TerminalWaitTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        shell_allowed(context)?;
+        shell_allowed(context, self.name())?;
         #[cfg(unix)]
         {
             let name = session_name(&input, true)?.to_string();
@@ -842,7 +995,7 @@ pub struct TerminalCancelTool;
 impl ToolSpec for TerminalCancelTool {
     terminal_tool_common!(
         "terminal/cancel",
-        "Interrupt the running foreground command with ETX. The live terminal session survives and can be reused; its non-secret summary persists."
+        "Interrupt the running foreground command with ETX. The live terminal session survives and can be reused; its non-secret summary persists. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"}},"required":["session"]})
@@ -852,7 +1005,7 @@ impl ToolSpec for TerminalCancelTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        shell_allowed(context)?;
+        shell_allowed(context, self.name())?;
         #[cfg(unix)]
         {
             let name = session_name(&input, true)?.to_string();
@@ -886,7 +1039,7 @@ pub struct TerminalResetTool;
 impl ToolSpec for TerminalResetTool {
     terminal_tool_common!(
         "terminal/reset",
-        "Kill and recreate a persistent terminal session with a fresh environment. This loses live cd, exports, functions, activated environments, and running work while retaining the prior historical summary."
+        "Kill and recreate a persistent terminal session with a fresh environment. This loses live cd, exports, functions, activated environments, and running work while retaining the prior historical summary. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"}},"required":["session"]})
@@ -896,7 +1049,7 @@ impl ToolSpec for TerminalResetTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        shell_allowed(context)?;
+        shell_allowed(context, self.name())?;
         #[cfg(unix)]
         {
             let name = session_name(&input, true)?.to_string();
@@ -956,6 +1109,55 @@ mod tests {
         start_command(&mut session, command).unwrap();
         let (done, timed_out) = wait_session(&mut session, timeout);
         session_result(&mut session, done, timed_out)
+    }
+
+    #[test]
+    fn prune_output_keeps_the_tail_and_counts_what_it_dropped() {
+        let input = format!(
+            "first-line\n{}\nerror: the last line é\n",
+            "x".repeat(OUTPUT_LIMIT * 2)
+        );
+        let pruned = prune_output(&input);
+        let (head, rest) = pruned
+            .split_once("\n… [output truncated: ")
+            .expect("truncation marker");
+        let (omitted, tail) = rest.split_once(" bytes omitted] …\n").expect("count");
+        let omitted: usize = omitted.parse().expect("omitted count");
+        assert!(head.starts_with("first-line"));
+        assert!(tail.ends_with("error: the last line é\n"), "{tail:?}");
+        assert!(tail.len() > OUTPUT_LIMIT / 2, "tail kept only {tail:?}");
+        assert_eq!(head.len() + omitted + tail.len(), input.len());
+    }
+
+    // The whole family is compiled and registered on Unix only, a run's
+    // timeout abandons the wait without stopping the command, and the output
+    // ring silently drops the oldest bytes past 512KiB — the descriptions
+    // must say all three so the model can plan around them.
+    #[test]
+    fn terminal_descriptions_disclose_platform_and_wait_semantics() {
+        let descriptions = [
+            (TerminalRunTool.name(), TerminalRunTool.description()),
+            (TerminalSendTool.name(), TerminalSendTool.description()),
+            (TerminalWaitTool.name(), TerminalWaitTool.description()),
+            (TerminalCancelTool.name(), TerminalCancelTool.description()),
+            (TerminalResetTool.name(), TerminalResetTool.description()),
+        ];
+        for (name, description) in descriptions {
+            assert!(
+                description.contains("(Unix only)"),
+                "{name} must disclose its platform restriction: {description}"
+            );
+        }
+        assert!(
+            TerminalRunTool
+                .description()
+                .contains("the command keeps running in the session"),
+            "terminal/run must disclose that a timeout abandons the wait, not the command"
+        );
+        assert!(
+            TerminalWaitTool.description().contains("512KiB"),
+            "terminal/wait must disclose the retained-output bound"
+        );
     }
 
     #[test]
@@ -1057,10 +1259,33 @@ mod tests {
     #[cfg(unix)]
     fn cancel_interrupts_sleep_and_session_survives() {
         let session = fresh("test-cancel");
+        // Prove the interactive shell is initialized before interrupting it.
+        // A SIGINT delivered while `sh -i` is still starting can kill the
+        // shell itself, which later surfaces as EIO on the next PTY write
+        // (hosted macOS run 34716492759 under load).
+        assert!(
+            run(&session, "printf ready", Duration::from_secs(10))
+                .content
+                .contains("ready")
+        );
         let worker = Arc::clone(&session);
         {
             let mut guard = worker.lock().unwrap();
-            start_command(&mut guard, "sleep 10").unwrap();
+            // The quoted split keeps the marker out of the echoed command
+            // line, so seeing it proves the shell reached this command.
+            start_command(&mut guard, "printf 'st''arted'; sleep 10").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let started = output_snapshot(&session.lock().unwrap()).contains("started");
+            if started {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell never reached the sleep command"
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
         let handle = std::thread::spawn(move || {
             let (done, timed_out) = wait_shared_session(&worker, Duration::from_secs(30)).unwrap();
@@ -1179,5 +1404,184 @@ mod tests {
         let result = run(&session, "yes x | head -n 100000", Duration::from_secs(3));
         assert!(result.content.len() <= OUTPUT_LIMIT + 100);
         assert!(result.content.contains("output truncated"));
+    }
+
+    /// The cursor contract the Engine byte stream rides on: offsets are
+    /// absolute for the life of the PTY, reads never consume, and a cursor the
+    /// retained window has moved past is reported rather than silently
+    /// answered from the middle of the stream.
+    #[test]
+    #[cfg(unix)]
+    fn bounded_replay_is_absolute_non_consuming_and_reports_its_gap() {
+        let mut buffer = OutputBuffer::default();
+        buffer.append(b"hello");
+        let first = buffer.read_since(0, 4);
+        assert_eq!(first.bytes, b"hell");
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.next_cursor, 4);
+        assert_eq!(first.total, 5);
+        assert_eq!(first.dropped, 0);
+        assert!(!first.gap);
+        // A second read at the same cursor returns the same bytes: the caller
+        // owns the position, so replay is idempotent.
+        assert_eq!(buffer.read_since(0, 4), first);
+        let rest = buffer.read_since(first.next_cursor, 4);
+        assert_eq!(rest.bytes, b"o");
+        assert_eq!(rest.offset, 4);
+        assert_eq!(rest.next_cursor, 5);
+
+        // Past the ring: the first 32 bytes are gone and the chunk says so.
+        let mut wrapped = OutputBuffer::default();
+        wrapped.append(&vec![b'x'; BUFFER_LIMIT + 32]);
+        let lost = wrapped.read_since(0, 8);
+        assert!(lost.gap, "a cursor below the retained window is a gap");
+        assert_eq!(lost.dropped, 32);
+        assert_eq!(
+            lost.offset, 32,
+            "the chunk starts at the oldest retained byte"
+        );
+        assert_eq!(lost.total, BUFFER_LIMIT as u64 + 32);
+        assert_eq!(lost.bytes, vec![b'x'; 8]);
+        assert_eq!(lost.next_cursor, 40);
+
+        // A cursor at the head is not a gap and returns nothing new.
+        let current = wrapped.read_since(BUFFER_LIMIT as u64 + 32, 8);
+        assert!(!current.gap);
+        assert!(current.bytes.is_empty());
+        assert_eq!(current.next_cursor, BUFFER_LIMIT as u64 + 32);
+
+        // A cursor past the head clamps to it instead of being echoed back:
+        // a client that continues from `next_cursor` must not skip the bytes
+        // the stream produces before it reaches the bogus position.
+        let beyond = wrapped.read_since(BUFFER_LIMIT as u64 + 4096, 8);
+        assert!(!beyond.gap);
+        assert!(beyond.bytes.is_empty());
+        assert_eq!(beyond.offset, BUFFER_LIMIT as u64 + 32);
+        assert_eq!(beyond.next_cursor, BUFFER_LIMIT as u64 + 32);
+    }
+
+    /// The session-level entry point an Engine byte stream will call: absolute
+    /// cursor, non-consuming, clamped, and honest about a cursor ahead of the
+    /// stream.
+    #[test]
+    #[cfg(unix)]
+    fn session_read_since_is_non_consuming_and_clamped() {
+        let session = fresh("test-read-since");
+        let _ = run(
+            &session,
+            "printf 'cw-replay-proof\\n'",
+            Duration::from_secs(3),
+        );
+        // The tool-result path already consumed this output through its own
+        // cursor; an absolute cursor still reads it, which is the point.
+        let printed = read_session_since(&session.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert!(
+            String::from_utf8_lossy(&printed.bytes).contains("cw-replay-proof"),
+            "{}",
+            String::from_utf8_lossy(&printed.bytes)
+        );
+        let again = read_session_since(&session.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert_eq!(again.bytes, printed.bytes, "a replay read must not consume");
+
+        // A cursor ahead of the stream is not a gap: nothing was lost, there
+        // is simply nothing there yet — and the answer clamps to the head so
+        // continuing from it cannot skip what arrives next.
+        let ahead =
+            read_session_since(&session.lock().unwrap(), printed.next_cursor + 4096, 16).unwrap();
+        assert!(!ahead.gap);
+        assert!(ahead.bytes.is_empty());
+        assert_eq!(ahead.next_cursor, ahead.total);
+
+        // More than one response's worth of output proves the clamp.
+        let large = fresh("test-read-since-clamp");
+        let _ = run(&large, "yes x | head -n 100000", Duration::from_secs(3));
+        let chunk = read_session_since(&large.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert_eq!(chunk.bytes.len(), READ_LIMIT);
+        assert!(!chunk.gap);
+        assert_eq!(chunk.next_cursor, READ_LIMIT as u64);
+    }
+
+    /// Resize has to reach the kernel, not just a field: `get_size` reads the
+    /// window back from the pty, and the shell reports it through `stty`.
+    #[test]
+    #[cfg(unix)]
+    fn resize_reaches_the_kernel_and_the_live_shell() {
+        let session = fresh("test-resize");
+        {
+            let guard = session.lock().unwrap();
+            assert_eq!(guard.master.get_size().unwrap().rows, 24);
+        }
+        resize_session(&session.lock().unwrap(), 40, 100).unwrap();
+        let size = session.lock().unwrap().master.get_size().unwrap();
+        assert_eq!((size.rows, size.cols), (40, 100));
+        let result = run(&session, "stty size", Duration::from_secs(3));
+        assert!(
+            result.content.contains("40 100"),
+            "the shell should see the new window: {}",
+            result.content
+        );
+    }
+
+    /// Exit is observable: a killed shell reports a status instead of looking
+    /// alive forever (the "pretending to reattach" failure the durable record
+    /// is written to avoid).
+    #[test]
+    #[cfg(unix)]
+    fn killed_shell_reports_an_exit_status() {
+        let session = fresh("test-exit-status");
+        {
+            let mut guard = session.lock().unwrap();
+            assert!(
+                session_exit_status(&mut guard).unwrap().is_none(),
+                "fresh shell is alive"
+            );
+            kill_session(&mut guard).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exited = session_exit_status(&mut session.lock().unwrap())
+                .unwrap()
+                .is_some();
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a killed shell must report its exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_session_does_not_inherit_parent_secret_env() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _env_lock = lock_test_env();
+        let _secret = EnvVarGuard::set("CODEWHALE_TEST_PTY_SECRET", "pty-secret-value");
+        let session = fresh("test-env-scrub");
+        let result = run(
+            &session,
+            "printf 'se''cret=%s ho''me=%s' \"${CODEWHALE_TEST_PTY_SECRET-unset}\" \"${HOME-none}\"",
+            Duration::from_secs(10),
+        );
+        assert!(
+            !result.content.contains("pty-secret-value"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("secret=unset"),
+            "{}",
+            result.content
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert!(
+                result.content.contains(&format!("home={home}")),
+                "allowlisted variables still reach the shell: {}",
+                result.content
+            );
+        }
     }
 }

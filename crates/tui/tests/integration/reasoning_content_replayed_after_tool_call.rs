@@ -2,8 +2,8 @@ use futures_util::StreamExt;
 
 use crate::llm_client::LlmClient;
 use crate::llm_client::mock::{MockLlmClient, canned};
-use crate::models::Role;
-use crate::models::{ContentBlock, Message, MessageRequest};
+use codewhale_models::Role;
+use codewhale_models::{ContentBlock, Message, MessageRequest};
 
 fn user_message(text: &str) -> Message {
     Message {
@@ -30,6 +30,7 @@ fn assistant_thinking_tool_call(
                 state: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -44,6 +45,7 @@ fn tool_result_message(tool_use_id: &str, content: &str) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: tool_use_id.to_string(),
             content: content.to_string(),
             is_error: None,

@@ -3,7 +3,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::palette;
+use codewhale_palette as palette;
 
 use super::{HistoryCell, TRANSCRIPT_RAIL};
 

@@ -19,7 +19,7 @@ pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// If no snapshot repo exists yet (first run) this is a cheap no-op.
 /// Returns the number of snapshots removed.
 pub fn prune_older_than(workspace: &Path, max_age: Duration) -> io::Result<usize> {
-    let git_dir = snapshot_git_dir(workspace);
+    let git_dir = snapshot_git_dir(workspace)?;
     if !git_dir.exists() {
         return Ok(0);
     }
@@ -37,43 +37,14 @@ pub fn prune_older_than(workspace: &Path, max_age: Duration) -> io::Result<usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::lock_test_env;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
     use tempfile::tempdir;
-
-    /// Same guard shape as in `repo::tests` — pins HOME for the lifetime
-    /// of one test under the process-wide env mutex.
-    struct ScopedHome {
-        prev: Option<std::ffi::OsString>,
-        _guard: crate::test_support::TestEnvLock,
-    }
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn scoped_home(home: &std::path::Path) -> ScopedHome {
-        let guard = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        ScopedHome {
-            prev,
-            _guard: guard,
-        }
-    }
 
     #[test]
     fn prune_no_repo_returns_zero() {
         let tmp = tempdir().unwrap();
-        let _home = scoped_home(tmp.path());
+        let _lock = lock_test_env();
+        let _profile = EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("profile"));
         let removed = prune_older_than(tmp.path(), DEFAULT_MAX_AGE).unwrap();
         assert_eq!(removed, 0);
     }
@@ -81,7 +52,8 @@ mod tests {
     #[test]
     fn prune_with_existing_repo_zero_age_clears_all() {
         let tmp = tempdir().unwrap();
-        let _home = scoped_home(tmp.path());
+        let _lock = lock_test_env();
+        let _profile = EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("profile"));
         let workspace = tmp.path().join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
         let repo = SnapshotRepo::open_or_init(&workspace).unwrap();

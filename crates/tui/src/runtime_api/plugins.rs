@@ -64,6 +64,10 @@ pub(super) struct PluginSummaryEntry {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) display_name: Option<String>,
+    pub(super) icon: Option<String>,
+    pub(super) author: Option<String>,
+    pub(super) homepage: Option<String>,
+    pub(super) platforms: Vec<String>,
     pub(super) version: String,
     pub(super) description: Option<String>,
     pub(super) scope: &'static str,
@@ -89,10 +93,10 @@ pub(super) struct PluginsResponse {
     pub(super) validation_clean: bool,
 }
 
-/// One reviewed-plugin MCP server in the trust-review payload. Secret-bearing
-/// maps are reduced to key names, mirroring `McpServerDetail` for configured
-/// servers: a reviewer sees what would run and where it would talk, never
-/// credential values.
+/// One reviewed-plugin MCP server in the trust-review payload. Environment
+/// and header maps expose only key names; URLs expose only their network
+/// authority. Command and argument text remain the bundle's declared launch
+/// instructions for review, so bundles should pass credentials through env.
 #[derive(Debug, Serialize)]
 pub(super) struct PluginMcpServerReview {
     pub(super) name: String,
@@ -133,8 +137,6 @@ pub(super) struct PluginReviewPayload {
 pub(super) struct PluginDetailResponse {
     #[serde(flatten)]
     pub(super) summary: PluginSummaryEntry,
-    pub(super) author: Option<String>,
-    pub(super) homepage: Option<String>,
     pub(super) repository: Option<String>,
     pub(super) license: Option<String>,
     pub(super) keywords: Vec<String>,
@@ -175,6 +177,23 @@ pub(super) struct InstallPluginRequest {
     /// installed tree matches this reviewed content hash.
     #[serde(default)]
     pub(super) expected_content_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct DshPreviewRequest {
+    /// DeepSeek Harness bundle package directory; relative paths resolve
+    /// against the workspace.
+    pub(super) path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct DshPreviewResponse {
+    /// Pass to `POST /v1/apps/plugins/install` as `source`, with
+    /// `content_hash` as `expected_content_hash`, to install exactly this
+    /// reviewed bundle.
+    pub(super) install_source: String,
+    pub(super) content_hash: String,
+    pub(super) conversion: crate::plugins::install::dsh::DshConversion,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +261,15 @@ fn plugin_summary(plugin: &LoadedPlugin) -> PluginSummaryEntry {
         id: plugin.id.as_str().to_string(),
         name: plugin.name().to_string(),
         display_name: plugin.manifest.plugin.display_name.clone(),
+        icon: plugin.manifest.plugin.icon.clone(),
+        author: plugin.manifest.plugin.author.clone(),
+        homepage: plugin.manifest.plugin.homepage.clone(),
+        platforms: plugin
+            .manifest
+            .when
+            .as_ref()
+            .and_then(|when| when.os.clone())
+            .unwrap_or_default(),
         version: plugin.manifest.plugin.version.clone(),
         description: plugin.manifest.plugin.description.clone(),
         scope: plugin.scope.as_str(),
@@ -270,7 +298,10 @@ fn mcp_server_review(name: &str, cfg: &crate::mcp::McpServerConfig) -> PluginMcp
         kind: if cfg.url.is_some() { "remote" } else { "stdio" },
         command: cfg.command.clone(),
         args: cfg.args.clone(),
-        url: cfg.url.clone(),
+        url: cfg
+            .url
+            .as_deref()
+            .map(crate::doctor::structural_url_authority),
         env_keys,
         header_keys,
     }
@@ -344,8 +375,6 @@ fn review_payload(plugin: &LoadedPlugin) -> PluginReviewPayload {
 fn plugin_detail(plugin: &LoadedPlugin) -> PluginDetailResponse {
     PluginDetailResponse {
         summary: plugin_summary(plugin),
-        author: plugin.manifest.plugin.author.clone(),
-        homepage: plugin.manifest.plugin.homepage.clone(),
         repository: plugin.manifest.plugin.repository.clone(),
         license: plugin.manifest.plugin.license.clone(),
         keywords: plugin.manifest.plugin.keywords.clone(),
@@ -383,7 +412,16 @@ async fn run_plugin_mutation(
     let mut registry = (*registry_for_state(state)).clone();
     let receipt = crate::plugins::mutation::execute(request, &ctx, &mut registry)
         .await
-        .map_err(|error| ApiError::internal(format!("plugin mutation failed: {error:#}")))?;
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::plugins::install::PluginNameConflict>()
+                .is_some()
+            {
+                ApiError::conflict(format!("plugin mutation failed: {error:#}"))
+            } else {
+                ApiError::internal(format!("plugin mutation failed: {error:#}"))
+            }
+        })?;
 
     // Policy outcomes are not server errors: report the blocked host with
     // the same wording the skill lifecycle API uses.
@@ -405,17 +443,20 @@ async fn run_plugin_mutation(
         PluginMutationOutcome::Uninstalled => "uninstalled",
     };
 
-    // Mutations can change merged plugin MCP servers; drop the cached pool
-    // exactly like the MCP config write endpoints do.
-    *state.mcp_pool.lock().await = None;
+    // Mutations can change merged plugin MCP servers. Advance the existing
+    // shared generation so each captured workspace pool reloads on next use.
+    state
+        .workspace_scopes
+        .mcp_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let plugin = registry_for_state(state)
         .get(receipt.name.as_str())
         .map(plugin_summary);
     let note = match receipt.outcome {
         PluginMutationOutcome::Installed => Some(
-            "Installed disabled and untrusted. Review the capability payload \
-             (GET /v1/apps/plugins/{name}), then trust and enable it.",
+            "Installed disabled and untrusted. Open this plugin's detail \
+             to review its capabilities, then trust and enable it.",
         ),
         PluginMutationOutcome::Updated => Some(
             "Content changed; the previous trust receipt no longer matches. \
@@ -452,7 +493,7 @@ async fn run_registry_mutation(
         if token != &plugin.review_token() {
             return Err(ApiError::bad_request(
                 "review token does not match this bundle's content and capability set; \
-                 re-read GET /v1/apps/plugins/{name} and confirm the current token",
+                 reload this plugin's detail and confirm the current review token",
             ));
         }
     }
@@ -475,9 +516,13 @@ async fn run_registry_mutation(
         ApiError::conflict(format!("{action} failed for '{selector}': {error}"))
     })?;
 
-    *state.mcp_pool.lock().await = None;
+    state
+        .workspace_scopes
+        .mcp_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let fresh = registry_for_state(state);
+    crate::extension_host::plugins_changed(Arc::clone(&fresh));
     let Some(plugin) = fresh.get(selector) else {
         return Ok(PluginActionResponse {
             name: selector.to_string(),
@@ -488,8 +533,8 @@ async fn run_registry_mutation(
     };
     let note = match (action, plugin.state_label()) {
         ("enabled", "enabled-untrusted") => Some(
-            "enabled-untrusted: the bundle is not trusted; run the review flow \
-             (GET /v1/apps/plugins/{name}) and trust it first",
+            "enabled-untrusted: the bundle is not trusted; open this plugin's \
+             detail, review its capabilities and trust it first",
         ),
         ("enabled", _) => {
             let inactive = plugin.inventory.unsupported_labels();
@@ -550,6 +595,8 @@ pub(super) struct MarketplaceInstallPlanEntry {
 pub(super) struct MarketplaceCandidateEntry {
     pub(super) name: String,
     pub(super) display_name: Option<String>,
+    pub(super) icon: Option<String>,
+    pub(super) platforms: Vec<String>,
     pub(super) description: Option<String>,
     pub(super) version: Option<String>,
     pub(super) author: Option<String>,
@@ -561,6 +608,8 @@ pub(super) struct MarketplaceCandidateEntry {
     pub(super) tier: String,
     pub(super) compatibility: Option<&'static str>,
     pub(super) install: MarketplaceInstallPlanEntry,
+    /// Name occupancy, not an assertion that the catalog and local bytes match.
+    pub(super) existing_plugin: Option<PluginSummaryEntry>,
     pub(super) diagnostics: Vec<PluginDiagnosticEntry>,
 }
 
@@ -596,14 +645,25 @@ pub(super) struct MarketplaceActionResponse {
 fn marketplace_candidate_entry(
     entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
     candidate: &crate::plugins::marketplace::types::MarketplaceCandidate,
+    registry: &crate::plugins::PluginRegistry,
 ) -> MarketplaceCandidateEntry {
-    let install = match resolve_candidate_install(entry, candidate) {
+    let mut existing_plugin = None;
+    let install = match resolve_candidate_install(entry, candidate, registry) {
         CatalogInstallResolution::Supported { spec, source_kind } => MarketplaceInstallPlanEntry {
             installable: true,
             spec: Some(spec),
             source_kind: Some(source_kind),
             reason: None,
         },
+        CatalogInstallResolution::AlreadyPresent { plugin, reason } => {
+            existing_plugin = Some(plugin_summary(plugin));
+            MarketplaceInstallPlanEntry {
+                installable: false,
+                spec: None,
+                source_kind: None,
+                reason: Some(reason),
+            }
+        }
         CatalogInstallResolution::Unsupported { reason } => MarketplaceInstallPlanEntry {
             installable: false,
             spec: None,
@@ -620,6 +680,12 @@ fn marketplace_candidate_entry(
     MarketplaceCandidateEntry {
         name: candidate.name.clone(),
         display_name: candidate.display_name.clone(),
+        icon: candidate.icon.clone(),
+        platforms: candidate
+            .when
+            .as_ref()
+            .and_then(|when| when.os.clone())
+            .unwrap_or_default(),
         description: candidate.description.clone(),
         version: candidate.version.clone(),
         author: candidate.author.clone(),
@@ -631,6 +697,7 @@ fn marketplace_candidate_entry(
         tier: candidate.provenance.tier.to_string(),
         compatibility: candidate.compatibility.as_ref().map(|c| c.as_str()),
         install,
+        existing_plugin,
         diagnostics: candidate
             .diagnostics
             .iter()
@@ -650,6 +717,7 @@ fn marketplace_candidate_entry(
 fn marketplace_catalog_entry(
     name: &str,
     entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
+    registry: &crate::plugins::PluginRegistry,
 ) -> MarketplaceCatalogEntry {
     MarketplaceCatalogEntry {
         name: name.to_string(),
@@ -680,7 +748,7 @@ fn marketplace_catalog_entry(
             .catalog
             .candidates
             .iter()
-            .map(|candidate| marketplace_candidate_entry(entry, candidate))
+            .map(|candidate| marketplace_candidate_entry(entry, candidate, registry))
             .collect(),
     }
 }
@@ -736,6 +804,38 @@ pub(super) async fn install_plugin_api(
     };
     let response = run_plugin_mutation(&state, request).await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// `POST /v1/apps/plugins/import/dsh/preview`: convert a DeepSeek Harness
+/// bundle package into scratch and return its receipt and review hash.
+/// Nothing is installed; the install endpoint does that with the same hash.
+pub(super) async fn preview_dsh_plugin_api(
+    State(state): State<RuntimeApiState>,
+    Json(req): Json<DshPreviewRequest>,
+) -> Result<Json<DshPreviewResponse>, ApiError> {
+    let requested = std::path::PathBuf::from(req.path.trim());
+    let path = if requested.is_absolute() {
+        requested
+    } else {
+        state.workspace.join(requested)
+    };
+    let preview = tokio::task::spawn_blocking(move || {
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| format!("DSH package not found at {}", path.display()))?;
+        crate::plugins::install::preview_dsh(&canonical)
+            .map(|(conversion, content_hash)| (canonical, conversion, content_hash))
+            .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("DSH preview task failed: {error}")))?;
+    let (canonical, conversion, content_hash) =
+        preview.map_err(|error| ApiError::bad_request(format!("DSH import refused: {error}")))?;
+    Ok(Json(DshPreviewResponse {
+        install_source: format!("dsh:{}", canonical.display()),
+        content_hash,
+        conversion,
+    }))
 }
 
 /// `POST /v1/apps/plugins/{selector}/update`
@@ -828,11 +928,12 @@ pub(super) async fn list_marketplaces(
 ) -> Result<Json<MarketplacesResponse>, ApiError> {
     let store = open_marketplace_store(&state)?;
     let marketplace_state = load_marketplace_state(&store)?;
+    let registry = registry_for_state(&state);
     Ok(Json(MarketplacesResponse {
         marketplaces: marketplace_state
             .catalogs()
             .iter()
-            .map(|(name, entry)| marketplace_catalog_entry(name, entry))
+            .map(|(name, entry)| marketplace_catalog_entry(name, entry, &registry))
             .collect(),
     }))
 }
@@ -847,7 +948,11 @@ pub(super) async fn get_marketplace(
     let entry = marketplace_state
         .get(&name)
         .ok_or_else(|| ApiError::not_found(format!("marketplace '{name}' not found")))?;
-    Ok(Json(marketplace_catalog_entry(&name, entry)))
+    Ok(Json(marketplace_catalog_entry(
+        &name,
+        entry,
+        &registry_for_state(&state),
+    )))
 }
 
 /// `POST /v1/apps/marketplaces`
@@ -918,7 +1023,8 @@ pub(super) async fn install_marketplace_candidate_api(
                 req.candidate
             ))
         })?;
-    match resolve_candidate_install(entry, candidate) {
+    let registry = registry_for_state(&state);
+    match resolve_candidate_install(entry, candidate, &registry) {
         CatalogInstallResolution::Supported { spec, .. } => {
             let response = run_plugin_mutation(
                 &state,
@@ -935,6 +1041,7 @@ pub(super) async fn install_marketplace_candidate_api(
             .await?;
             Ok((StatusCode::CREATED, Json(response)))
         }
+        CatalogInstallResolution::AlreadyPresent { reason, .. } => Err(ApiError::conflict(reason)),
         CatalogInstallResolution::Unsupported { reason } => Err(ApiError::conflict(format!(
             "candidate '{}' cannot be installed by Codewhale: {reason}",
             req.candidate
@@ -943,5 +1050,73 @@ pub(super) async fn install_marketplace_candidate_api(
             "candidate '{}' has parse errors and cannot be installed: {diagnostics}",
             req.candidate
         ))),
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::mcp_server_review;
+
+    #[test]
+    fn plugin_mcp_review_omits_url_credentials_without_changing_the_bundle() {
+        for (raw, expected) in [
+            (
+                "https://review-user:review-password@mcp.example.invalid:8443/review-path?arbitrary=review-query#review-fragment",
+                "https://mcp.example.invalid:8443",
+            ),
+            (
+                "http://[::1]:9000/mcp?token=review-query",
+                "http://[::1]:9000",
+            ),
+            (
+                "https://mcp.example.invalid/mcp",
+                "https://mcp.example.invalid",
+            ),
+            (
+                "not a URL review-secret",
+                "unparseable (configured value omitted)",
+            ),
+            (
+                "data:text/plain,review-secret",
+                "unparseable (configured value omitted)",
+            ),
+        ] {
+            let cfg: crate::mcp::McpServerConfig = serde_json::from_value(serde_json::json!({
+                "url": raw,
+                "env": { "REVIEW_ENV": "review-env-value" },
+                "headers": { "Authorization": "review-header-value" }
+            }))
+            .unwrap();
+            let review = mcp_server_review("demo", &cfg);
+            assert_eq!(review.url.as_deref(), Some(expected));
+            assert_eq!(review.kind, "remote");
+            assert_eq!(review.env_keys, ["REVIEW_ENV"]);
+            assert_eq!(review.header_keys, ["Authorization"]);
+            let payload = serde_json::to_string(&review).unwrap();
+            for secret in [
+                "review-user",
+                "review-password",
+                "review-path",
+                "review-query",
+                "review-fragment",
+                "review-secret",
+                "review-env-value",
+                "review-header-value",
+            ] {
+                assert!(!payload.contains(secret), "review exposed {secret}");
+            }
+            // Display redaction must not change the endpoint used at execution
+            // or the manifest from which the trust receipt is derived.
+            assert_eq!(cfg.url.as_deref(), Some(raw));
+        }
+        let stdio: crate::mcp::McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "npx", "args": ["demo-server"]
+        }))
+        .unwrap();
+        let review = mcp_server_review("stdio", &stdio);
+        assert_eq!(review.kind, "stdio");
+        assert_eq!(review.url, None);
+        assert_eq!(review.command, stdio.command);
+        assert_eq!(review.args, stdio.args);
     }
 }

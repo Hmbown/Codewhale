@@ -3,7 +3,14 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "${tmp_dir}"' EXIT
+# CI saw `rm: cannot remove '.../checkout': Directory not empty` here: a
+# detached `git maintenance run --auto` (spawned by the fixture's commit and
+# pushes) was still writing into .git while the trap deleted it. Keep every
+# git process in this fixture from spawning one, and retry once regardless.
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=maintenance.auto GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=gc.auto GIT_CONFIG_VALUE_1=0
+trap 'rm -rf "${tmp_dir}" 2>/dev/null || { sleep 1; rm -rf "${tmp_dir}"; }' EXIT
 
 remote="${tmp_dir}/remote.git"
 checkout="${tmp_dir}/checkout"

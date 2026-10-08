@@ -38,7 +38,7 @@ esac
 
 install -d -m 0750 -o root -g "${CODEWHALE_USER}" /etc/codewhale
 install -d -m 0700 -o "${CODEWHALE_USER}" -g "${CODEWHALE_USER}" "${BRIDGE_STATE_DIR}"
-install -d -o "${CODEWHALE_USER}" -g "${CODEWHALE_USER}" "${BRIDGE_DST}"
+mkdir -p "$(dirname "${BRIDGE_DST}")"
 
 if [[ ! -f /etc/codewhale/runtime.env && -f "${REPO_ROOT}/deploy/tencent-lighthouse/examples/runtime.env.example" ]]; then
   install -m 0640 -o root -g "${CODEWHALE_USER}" \
@@ -51,17 +51,37 @@ if [[ ! -f "${BRIDGE_ENV}" && -f "${REPO_ROOT}/${BRIDGE_ENV_EXAMPLE}" ]]; then
     "${REPO_ROOT}/${BRIDGE_ENV_EXAMPLE}" \
     "${BRIDGE_ENV}"
 fi
-rsync -a --delete \
+# Build the new bridge tree beside the live one and swap it in only once its
+# dependencies installed. A failed copy or `npm ci` (which empties
+# node_modules first) leaves the running bridge's tree exactly as it was.
+stage="$(mktemp -d "${BRIDGE_DST}.stage.XXXXXX")"
+previous=""
+trap 'if [[ -n "${stage}" ]]; then rm -rf "${stage}"; fi' EXIT
+chmod 0755 "${stage}"
+rsync -a \
   --exclude node_modules \
   "${REPO_ROOT}/${BRIDGE_SRC}/" \
-  "${BRIDGE_DST}/"
-chown -R "${CODEWHALE_USER}:${CODEWHALE_USER}" "${BRIDGE_DST}"
+  "${stage}/"
+chown -R "${CODEWHALE_USER}:${CODEWHALE_USER}" "${stage}"
 
-if [[ -f "${BRIDGE_DST}/package-lock.json" ]]; then
-  sudo -u "${CODEWHALE_USER}" npm --prefix "${BRIDGE_DST}" ci --omit=dev
+if [[ -f "${stage}/package-lock.json" ]]; then
+  sudo -u "${CODEWHALE_USER}" npm --prefix "${stage}" ci --omit=dev
 else
-  sudo -u "${CODEWHALE_USER}" npm --prefix "${BRIDGE_DST}" install --omit=dev
+  sudo -u "${CODEWHALE_USER}" npm --prefix "${stage}" install --omit=dev
 fi
+
+if [[ -e "${BRIDGE_DST}" ]]; then
+  previous="${BRIDGE_DST}.previous.$$"
+  mv "${BRIDGE_DST}" "${previous}"
+fi
+if ! mv "${stage}" "${BRIDGE_DST}"; then
+  # Put the old tree back rather than leave the service without one.
+  if [[ -n "${previous}" ]]; then mv "${previous}" "${BRIDGE_DST}"; fi
+  echo "Could not move the new bridge into ${BRIDGE_DST}; the previous tree was restored." >&2
+  exit 1
+fi
+stage=""
+if [[ -n "${previous}" ]]; then rm -rf "${previous}"; fi
 
 install -m 0644 "${REPO_ROOT}/deploy/tencent-lighthouse/systemd/codewhale-runtime.service" /etc/systemd/system/codewhale-runtime.service
 install -m 0644 "${REPO_ROOT}/deploy/tencent-lighthouse/systemd/${BRIDGE_UNIT}" "/etc/systemd/system/${BRIDGE_UNIT}"

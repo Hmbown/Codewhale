@@ -21,7 +21,6 @@
 //! provider-accepted active observation.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,11 +64,9 @@ pub const SANDBOX_PRODUCT_VALUE: &str = "dispatch";
 pub const CLOUD_AGENT_TOKEN_ENV: &str = "CODEWHALE_API_KEY";
 /// Operator override for the cloud-agent snapshot name.
 pub const CLOUD_AGENT_SNAPSHOT_ENV: &str = "CODEWHALE_DISPATCH_SNAPSHOT";
-/// The Daytona snapshot every cloud agent launches from: built by
-/// `docs/cloud-agent-snapshot/Dockerfile` with the `codewhale` CLI
-/// preinstalled (founder decision 2026-08-29 — the sandbox ships Codewhale
-/// itself, so `codewhale exec` exists inside it and closes the self-hosting
-/// loop: dispatch → sandbox(own codewhale) → account identity → forge PR).
+/// Default Daytona snapshot name. The image definition is maintained in
+/// `computer/snapshots/cloud-agent/Dockerfile`; its pinned Engine version and
+/// credential/acceptance limitations are documented beside it.
 pub const DEFAULT_CLOUD_AGENT_SNAPSHOT: &str = "codewhale-cloud-agent";
 /// Active jobs older than this are stale. The declared harness budget for
 /// one cloud-agent turn is an hour (`HARNESS_TIMEOUT_SECS`), so an active
@@ -290,25 +287,13 @@ impl CloudJobStore {
     }
 
     /// Persist a job atomically. Never writes credentials.
+    ///
+    /// The record is written through a unique temporary file (never a fixed
+    /// `.json.tmp` two writers would share) and renamed into place while the
+    /// job's lock is held, so it cannot interleave with a
+    /// [`Self::save_unless_canceled`] or a cancel.
     pub fn save(&self, job: &CloudJob) -> Result<()> {
-        fs::create_dir_all(&self.root).context("failed to create cloud-jobs directory")?;
-        let path = self.job_path(&job.id)?;
-        let tmp = path.with_extension("json.tmp");
-        let body = serde_json::to_vec_pretty(job).context("failed to encode cloud job")?;
-        {
-            let mut file =
-                fs::File::create(&tmp).context("failed to start a private cloud job write")?;
-            file.write_all(&body)
-                .context("failed to write the cloud job record")?;
-            file.sync_all().ok();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp, &path).context("failed to commit the cloud job record")?;
-        Ok(())
+        self.with_job_lock(&job.id, || self.write_record(job))
     }
 
     /// Cancel-authoritative save: refuse to overwrite a `canceled` record.
@@ -321,19 +306,53 @@ impl CloudJobStore {
     /// persisted record is already `canceled`, `Ok(true)` after a normal
     /// save.
     ///
-    /// This is load-check-save: the store is file-backed with no
-    /// cross-process lock, so the check cannot remove the load→save window
-    /// entirely — it narrows the clobber window from a whole phase (seconds
-    /// to minutes) to the span of one save, which is the single-writer
-    /// discipline this store assumes elsewhere.
+    /// The load, check and save run under the job's advisory file lock, and
+    /// [`cancel_job`] flips the record under the same lock, so the check and
+    /// the write are one step with respect to a cancel in another process.
     pub fn save_unless_canceled(&self, job: &CloudJob) -> Result<bool> {
-        if let Ok(current) = self.load(&job.id)
-            && current.status == CloudJobStatus::Canceled
-        {
-            return Ok(false);
-        }
-        self.save(job)?;
-        Ok(true)
+        self.with_job_lock(&job.id, || {
+            match self.load(&job.id) {
+                Ok(current) if current.status == CloudJobStatus::Canceled => return Ok(false),
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+                Err(error) => return Err(error.context("cannot verify the persisted job status")),
+            }
+            self.write_record(job)?;
+            Ok(true)
+        })
+    }
+
+    /// Run `f` holding the job's exclusive advisory lock
+    /// (`<root>/<id>.json.lock`). The lock is released when `f` returns.
+    ///
+    /// Limitation: the lock is advisory, so it serializes Codewhale writers
+    /// only; it is not reentrant, so `f` must not call a locking method.
+    fn with_job_lock<T>(&self, id: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let path = self.job_path(id)?;
+        fs::create_dir_all(&self.root).context("failed to create cloud-jobs directory")?;
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("json.lock"))
+            .context("failed to open the cloud job lock")?;
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let _guard = lock
+            .write()
+            .context("failed to lock the cloud job record")?;
+        f()
+    }
+
+    /// Write the record through a unique private temporary file. Callers
+    /// hold the job lock.
+    fn write_record(&self, job: &CloudJob) -> Result<()> {
+        let path = self.job_path(&job.id)?;
+        let body = serde_json::to_vec_pretty(job).context("failed to encode cloud job")?;
+        crate::utils::write_atomic(&path, &body).context("failed to commit the cloud job record")
     }
 
     /// Load one job by id.
@@ -741,36 +760,41 @@ pub fn confirm_job(
     credentials: &CredentialState,
     machine_token: &MachineTokenState,
 ) -> Result<DispatchOutcome> {
-    let mut job = store.load(id)?;
-    if job.status != CloudJobStatus::Proposed {
-        bail!(
-            "Cloud job {} is {} and cannot be confirmed.",
-            job.id,
-            status_label(job.status)
-        );
-    }
-    job.confirmed = true;
-    if matches!(credentials, CredentialState::Missing) {
-        job.status = CloudJobStatus::Refused;
-        job.refusal = Some(missing_credentials_message());
-        job.note = missing_credentials_message();
-        job.finished_unix = Some(unix_now());
-        store.save(&job)?;
-        return Ok(DispatchOutcome::Refused(job));
-    }
-    if matches!(machine_token, MachineTokenState::Missing) {
-        job.status = CloudJobStatus::Refused;
-        job.refusal = Some(missing_machine_token_message());
-        job.note = missing_machine_token_message();
-        job.finished_unix = Some(unix_now());
-        store.save(&job)?;
-        return Ok(DispatchOutcome::Refused(job));
-    }
+    // One locked read-modify-write, as in `cancel_job`: two racing confirms
+    // cannot both pass the `proposed` check (two sandboxes, two PRs), and a
+    // cancel that lands mid-confirm cannot be overwritten back to `launching`.
+    store.with_job_lock(id, || {
+        let mut job = store.load(id)?;
+        if job.status != CloudJobStatus::Proposed {
+            bail!(
+                "Cloud job {} is {} and cannot be confirmed.",
+                job.id,
+                status_label(job.status)
+            );
+        }
+        job.confirmed = true;
+        if matches!(credentials, CredentialState::Missing) {
+            job.status = CloudJobStatus::Refused;
+            job.refusal = Some(missing_credentials_message());
+            job.note = missing_credentials_message();
+            job.finished_unix = Some(unix_now());
+            store.write_record(&job)?;
+            return Ok(DispatchOutcome::Refused(job));
+        }
+        if matches!(machine_token, MachineTokenState::Missing) {
+            job.status = CloudJobStatus::Refused;
+            job.refusal = Some(missing_machine_token_message());
+            job.note = missing_machine_token_message();
+            job.finished_unix = Some(unix_now());
+            store.write_record(&job)?;
+            return Ok(DispatchOutcome::Refused(job));
+        }
 
-    job.status = CloudJobStatus::Launching;
-    job.note = "Cloud agent confirmed; the sandbox is launching and the runner will raise the branch and open the PR. Watch `codewhale dispatch --show` or `/dispatch show`.".to_string();
-    store.save(&job)?;
-    Ok(DispatchOutcome::Accepted(job))
+        job.status = CloudJobStatus::Launching;
+        job.note = "Cloud agent confirmed; the sandbox is launching and the runner will raise the branch and open the PR. Watch `codewhale dispatch --show` or `/dispatch show`.".to_string();
+        store.write_record(&job)?;
+        Ok(DispatchOutcome::Accepted(job))
+    })
 }
 
 /// True while the job may still hold a live sandbox.
@@ -791,23 +815,37 @@ pub fn cancel_job(
     id: &str,
     launcher: &dyn DaytonaLauncher,
 ) -> Result<CloudJob> {
-    let mut job = store.load(id)?;
-    if matches!(
-        job.status,
-        CloudJobStatus::Canceled | CloudJobStatus::Failed | CloudJobStatus::Refused
-    ) {
-        return Ok(job);
-    }
-    let had_sandbox = job.sandbox_id.is_some();
-    let sandbox_may_exist = had_sandbox || job.sandbox_pending;
-    job.status = CloudJobStatus::Canceled;
-    job.finished_unix = Some(unix_now());
-    job.note = if sandbox_may_exist {
-        "Canceled locally; the cloud agent sandbox is being torn down.".to_string()
-    } else {
-        "Canceled locally before a sandbox was created.".to_string()
+    // The flip is one locked read-modify-write, so a runner phase save cannot
+    // land between this load and this write (and lose either the cancel or
+    // the sandbox id the runner just recorded).
+    let flipped = store.with_job_lock(id, || {
+        let mut job = store.load(id)?;
+        // Terminal records stay as they are. `done` above all: its PR exists,
+        // and relabeling it `canceled` would misstate the outcome.
+        if matches!(
+            job.status,
+            CloudJobStatus::Canceled
+                | CloudJobStatus::Failed
+                | CloudJobStatus::Refused
+                | CloudJobStatus::Done
+        ) {
+            return Ok((job, false));
+        }
+        let sandbox_may_exist = job.sandbox_id.is_some() || job.sandbox_pending;
+        job.status = CloudJobStatus::Canceled;
+        job.finished_unix = Some(unix_now());
+        job.note = if sandbox_may_exist {
+            "Canceled locally; the cloud agent sandbox is being torn down.".to_string()
+        } else {
+            "Canceled locally before a sandbox was created.".to_string()
+        };
+        store.write_record(&job)?;
+        Ok((job, true))
+    })?;
+    let mut job = match flipped {
+        (job, false) => return Ok(job),
+        (job, true) => job,
     };
-    store.save(&job)?;
     if let Some(sandbox_id) = job.sandbox_id.clone() {
         let receipt = SandboxReceipt {
             sandbox_id,
@@ -1368,7 +1406,7 @@ pub struct LiveDaytonaLauncher;
 impl LiveDaytonaLauncher {
     /// Total timeout for short control-plane calls (create/status/delete/
     /// list). A dispatched harness turn is NOT a short call — see
-    /// [`Self::harness_client`].
+    /// [`Self::harness_client_budget_secs`].
     const CONTROL_PLANE_TIMEOUT_SECS: u64 = 120;
 
     /// Slack added to a harness command's declared budget for the client
@@ -1378,25 +1416,26 @@ impl LiveDaytonaLauncher {
     const HARNESS_CLIENT_SLACK_SECS: u64 = 120;
 
     fn blocking_client() -> Result<reqwest::blocking::Client> {
-        Self::blocking_client_with_timeout(Self::CONTROL_PLANE_TIMEOUT_SECS)
-    }
-
-    fn blocking_client_with_timeout(total_secs: u64) -> Result<reqwest::blocking::Client> {
-        reqwest::blocking::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(8))
-            .timeout(std::time::Duration::from_secs(total_secs))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("failed to initialize the cloud agent client")
-    }
-
-    /// A client scoped to one harness command: its total timeout is the
-    /// command's declared budget plus fixed slack. The declared turn budget
-    /// is an hour, so the 120s control-plane cap must NOT carry this call —
-    /// otherwise every dispatched turn longer than two minutes fails after
-    /// the spend has already started.
-    fn harness_client(command: &HarnessCommand) -> Result<reqwest::blocking::Client> {
-        Self::blocking_client_with_timeout(Self::harness_client_budget_secs(command))
+        // #6208: one client for the process. A `reqwest` client owns a
+        // connection pool and a TLS configuration, so building one per call
+        // paid a fresh TCP+TLS handshake on all nine call sites (one of them a
+        // poll loop). `clone()` here is a refcount bump on that shared pool.
+        //
+        // The total timeout is attached per request instead, because a harness
+        // turn carries a budget derived from its own command and must not
+        // inherit the control-plane cap.
+        static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+            std::sync::OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                crate::tls::reqwest_blocking_client_builder()
+                    .connect_timeout(std::time::Duration::from_secs(8))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map_err(|message| anyhow!("failed to initialize the cloud agent client: {message}"))
     }
 
     /// The total-timeout budget for a harness-carrying client, in seconds.
@@ -1455,14 +1494,22 @@ impl LiveDaytonaLauncher {
         api_key: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::blocking::Response> {
-        Self::send_json_on(&Self::blocking_client()?, method, url, api_key, body)
+        Self::send_json_on(
+            &Self::blocking_client()?,
+            Self::CONTROL_PLANE_TIMEOUT_SECS,
+            method,
+            url,
+            api_key,
+            body,
+        )
     }
 
-    /// [`Self::send_json`] on a caller-supplied client, so a call whose
-    /// declared budget differs from the control-plane cap (the harness
-    /// turn) can carry a client scoped to its own budget.
+    /// [`Self::send_json`] with an explicit total timeout, so a call whose
+    /// declared budget differs from the control-plane cap (the harness turn)
+    /// can carry its own without needing a client of its own.
     fn send_json_on(
         client: &reqwest::blocking::Client,
+        total_secs: u64,
         method: reqwest::Method,
         url: &reqwest::Url,
         api_key: &str,
@@ -1470,6 +1517,7 @@ impl LiveDaytonaLauncher {
     ) -> Result<reqwest::blocking::Response> {
         client
             .request(method, url.clone())
+            .timeout(std::time::Duration::from_secs(total_secs))
             .bearer_auth(api_key)
             .json(&body)
             .send()
@@ -1641,10 +1689,16 @@ impl DaytonaLauncher for LiveDaytonaLauncher {
             "timeout": command.timeout_secs,
         });
         // This call carries the declared turn budget (an hour for the agent
-        // entry), so it rides a client scoped to that budget plus slack —
-        // never the 120s control-plane client that used to cap it.
-        let client = Self::harness_client(command)?;
-        let response = Self::send_json_on(&client, reqwest::Method::POST, &url, &api_key, body)?;
+        // entry), so it asks for that budget plus slack per request — never the
+        // 120s control-plane cap that used to bound it.
+        let response = Self::send_json_on(
+            &Self::blocking_client()?,
+            Self::harness_client_budget_secs(command),
+            reqwest::Method::POST,
+            &url,
+            &api_key,
+            body,
+        )?;
         let status = response.status();
         let text = response.text().unwrap_or_default();
         if !status.is_success() {
@@ -2093,17 +2147,44 @@ fn one_line(value: &str, max: usize) -> String {
     }
 }
 
-/// Sanitized (control-character-free, bounded) error text for job notes.
+const SANITIZED_ERROR_MAX_CHARS: usize = 240;
+
+/// Sanitized (single-line, secret-redacted, bounded) error text for job
+/// notes. Controls, newlines and tabs become one space so words never fuse;
+/// long text keeps its head and its tail, because harness and command output
+/// put the actual failure last.
 pub fn sanitize_error(message: &str) -> String {
-    redact_machine_tokens(&redact_url_userinfo(
-        &message
-            .chars()
-            .filter(|ch| !ch.is_control())
-            .collect::<String>(),
-    ))
-    .chars()
-    .take(240)
-    .collect()
+    fn redact(text: &str) -> String {
+        redact_machine_tokens(&redact_url_userinfo(text))
+    }
+    fn flatten(text: &str) -> String {
+        text.split(|ch: char| ch.is_control() || ch.is_whitespace())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    // A secret split by a control character (a newline, BEL, an ANSI
+    // fragment) must still be caught, so redaction first sees the text with
+    // every control removed, which rejoins it. Only when that finds nothing
+    // do controls become spaces for readability; flattening only inserts
+    // separators, so it cannot expose a token the rejoined text did not.
+    let fused: String = message.chars().filter(|ch| !ch.is_control()).collect();
+    let fused_redacted = redact(&fused);
+    // Redact before cutting so a secret can never be split past the redactor.
+    let redacted = if fused_redacted == fused {
+        redact(&flatten(message))
+    } else {
+        flatten(&fused_redacted)
+    };
+    let count = redacted.chars().count();
+    if count <= SANITIZED_ERROR_MAX_CHARS {
+        return redacted;
+    }
+    let head_chars = SANITIZED_ERROR_MAX_CHARS / 3;
+    let tail_chars = SANITIZED_ERROR_MAX_CHARS - head_chars - 1;
+    let head: String = redacted.chars().take(head_chars).collect();
+    let tail: String = redacted.chars().skip(count - tail_chars).collect();
+    format!("{}…{}", head.trim_end(), tail.trim_start())
 }
 
 /// Replace anything shaped like a Codewhale account machine token with its
@@ -2183,7 +2264,7 @@ mod tests {
             Some(Forge::Cnb)
         );
         assert_eq!(
-            classify_remote("origin", "https://github.com/Hmbown/CodeWhale.git"),
+            classify_remote("origin", "https://github.com/codewhale-hq/CodeWhale.git"),
             Some(Forge::Github)
         );
         assert_eq!(
@@ -2199,7 +2280,7 @@ mod tests {
     #[test]
     fn ambiguous_github_and_cnb_require_an_explicit_remote() {
         let rows = remotes(&[
-            ("github", "https://github.com/Hmbown/CodeWhale.git"),
+            ("github", "https://github.com/codewhale-hq/CodeWhale.git"),
             ("origin", "https://cnb.cool/codewhale.net/codewhale.git"),
         ]);
         assert_eq!(
@@ -2552,15 +2633,52 @@ mod tests {
             redact_machine_tokens("prefix cwc_key_abc suffix"),
             "prefix cwc_key_abc suffix"
         );
-        // The dispatch runner's summary path inherits the redaction.
-        let summary = crate::dispatch_runner::summary_line(&format!("done with {token}"));
-        assert!(!summary.contains("AAAAAAAA"));
-        assert!(summary.contains("[redacted]"));
+        // `dispatch_runner` tests that its summary path inherits this
+        // redaction; asserting it here would pull a late module into the
+        // runtime closure (scripts/split/module_graph.py).
         assert!(
             !sanitize_error("clone failed https://user:token@github.com/org/repo.git")
                 .contains("token"),
             "userinfo must not survive sanitize_error"
         );
+    }
+
+    #[test]
+    fn sanitize_error_redacts_a_token_split_by_a_control_character() {
+        let head = "0123456789abcdef01234567";
+        for split in ['\u{7}', '\n', '\u{1b}'] {
+            let message = format!("push failed: cwc_key_{head}{split}tailsecret0123456789 done");
+            let sanitized = sanitize_error(&message);
+            assert!(!sanitized.contains("tailsecret"), "{sanitized}");
+            assert!(sanitized.contains("[redacted]"), "{sanitized}");
+        }
+    }
+
+    #[test]
+    fn sanitize_error_flattens_whitespace_and_keeps_the_tail() {
+        assert_eq!(
+            sanitize_error("npm ERR!\tcode 1\n\n  npm ERR!\u{7}  missing\r\nscript"),
+            "npm ERR! code 1 npm ERR! missing script"
+        );
+        let long = format!(
+            "{} error: the real failure is here",
+            "progress line\n".repeat(60)
+        );
+        let sanitized = sanitize_error(&long);
+        assert!(
+            sanitized.chars().count() <= SANITIZED_ERROR_MAX_CHARS,
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.starts_with("progress line progress line"),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains('…'), "{sanitized}");
+        assert!(
+            sanitized.ends_with("error: the real failure is here"),
+            "{sanitized}"
+        );
+        assert!(!sanitized.contains('\n'), "{sanitized}");
     }
 
     #[test]
@@ -2896,8 +3014,8 @@ mod tests {
     #[test]
     fn parse_git_remote_listing_prefers_first_url_per_name() {
         let parsed = parse_remote_listing(
-            "github\thttps://github.com/Hmbown/CodeWhale.git (fetch)\n\
-             github\thttps://github.com/Hmbown/CodeWhale.git (push)\n\
+            "github\thttps://github.com/codewhale-hq/CodeWhale.git (fetch)\n\
+             github\thttps://github.com/codewhale-hq/CodeWhale.git (push)\n\
              origin\thttps://cnb.cool/codewhale.net/codewhale.git (fetch)\n",
         );
         assert_eq!(parsed.len(), 2);
@@ -3101,6 +3219,128 @@ mod tests {
         assert_eq!(persisted.status, CloudJobStatus::Canceled);
         assert_eq!(persisted.note, "Canceled locally");
         assert_eq!(persisted.finished_unix, Some(10_000_060));
+    }
+
+    #[test]
+    fn a_phase_save_preserves_an_unreadable_job_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let job = stored_job(CloudJobStatus::Running, 10_000_000);
+        // A genuinely absent record can be created by the first phase save.
+        assert!(store.save_unless_canceled(&job).unwrap());
+        let path = store.job_path(&job.id).unwrap();
+        let damaged = b"{\"status\":\"canceled\", interrupted write";
+        fs::write(&path, damaged).unwrap();
+        let error = store.save_unless_canceled(&job).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot verify the persisted job status"));
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+
+        // An I/O failure is uncertainty too, rather than permission to replace it.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.save_unless_canceled(&job).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn a_phase_save_waits_for_a_cancel_holding_the_job_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let job = stored_job(CloudJobStatus::Running, 10_000_000);
+        store.save(&job).unwrap();
+        let mut runner_copy = job.clone();
+        runner_copy.status = CloudJobStatus::OpeningPr;
+
+        // A cancel in progress holds the lock between its load and its write;
+        // the runner's check-and-save must not slip into that window.
+        let outcome = store
+            .with_job_lock(&job.id, || {
+                let runner_store = store.clone();
+                let runner = std::thread::spawn(move || {
+                    runner_store.save_unless_canceled(&runner_copy).unwrap()
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                assert!(
+                    !runner.is_finished(),
+                    "the phase save ran inside the cancel's read-modify-write"
+                );
+                let mut canceled = store.load(&job.id)?;
+                canceled.status = CloudJobStatus::Canceled;
+                store.write_record(&canceled)?;
+                Ok(runner)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            !outcome,
+            "the phase save must see the cancel and stand down"
+        );
+        assert_eq!(
+            store.load(&job.id).unwrap().status,
+            CloudJobStatus::Canceled
+        );
+        assert!(
+            !temp
+                .path()
+                .join("jobs")
+                .join(format!("{}.json.tmp", job.id))
+                .exists(),
+            "records are written through unique temporaries"
+        );
+    }
+
+    #[test]
+    fn a_confirm_waits_for_a_cancel_holding_the_job_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let mut job = stored_job(CloudJobStatus::Proposed, 10_000_000);
+        job.confirmed = false;
+        store.save(&job).unwrap();
+
+        // A confirm that loaded `proposed` before the cancel wrote must not
+        // then overwrite the cancel with `launching` (and start a runner).
+        let confirm = store
+            .with_job_lock(&job.id, || {
+                let confirm_store = store.clone();
+                let id = job.id.clone();
+                let confirm = std::thread::spawn(move || {
+                    confirm_job(
+                        &confirm_store,
+                        &id,
+                        &CredentialState::Present {
+                            source: CredentialSource::Env,
+                        },
+                        &MachineTokenState::Present,
+                    )
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let mut canceled = store.load(&job.id)?;
+                canceled.status = CloudJobStatus::Canceled;
+                store.write_record(&canceled)?;
+                Ok(confirm)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(confirm.is_err(), "a canceled proposal cannot be confirmed");
+        assert_eq!(
+            store.load(&job.id).unwrap().status,
+            CloudJobStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn cancel_leaves_a_done_job_and_its_pr_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let mut done = stored_job(CloudJobStatus::Done, 10_000_000);
+        done.pr_url = Some("https://github.com/org/repo/pull/7".to_string());
+        store.save(&done).unwrap();
+        let after = cancel_job(&store, &done.id, &NoopLauncher).unwrap();
+        assert_eq!(after.status, CloudJobStatus::Done);
+        assert_eq!(after.pr_url, done.pr_url);
+        assert_eq!(store.load(&done.id).unwrap().status, CloudJobStatus::Done);
     }
 
     #[test]

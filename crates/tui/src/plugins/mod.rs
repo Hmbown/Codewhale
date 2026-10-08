@@ -2,15 +2,19 @@
 
 pub mod activation;
 pub mod agent_plugin;
+pub mod builtin;
 pub mod context;
 pub mod discovery;
 pub mod export;
 pub mod install;
+pub mod managed_policy;
 pub mod manifest;
 pub mod marketplace;
 pub mod matcher;
 pub mod mutation;
+pub(crate) mod native_presets;
 mod path_identity;
+pub mod providers;
 pub mod recommend;
 pub mod registry;
 pub mod runtime;
@@ -24,6 +28,8 @@ mod tests;
 pub use context::{HostEnvironment, PluginDiscoveryContext};
 pub use discovery::PluginCatalogStamp;
 pub(crate) use path_identity::metadata_is_link_or_reparse;
+#[cfg(windows)]
+pub(crate) use path_identity::windows_file_identity;
 pub use registry::PluginRegistry;
 
 pub const PLUGIN_RELOAD_NUDGE: &str = "Plugins changed on disk. Run /plugin reload to apply.";

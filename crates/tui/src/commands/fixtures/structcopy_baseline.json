@@ -1,0 +1,239 @@
+{
+  "turn_internal": {
+    "message": "{\"object\":{\"index\":1,\"omission_code\":\"internal_context\",\"role\":\"system\"},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":0,\"array_items_retained\":0,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":3,\"object_keys_retained\":3,\"object_keys_truncated\":0,\"payload_bytes\":62,\"string_bytes_original\":22,\"string_bytes_retained\":22,\"strings_retained\":2,\"strings_total\":2,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"turn\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":1}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "turn_blocks": {
+    "message": "{\"object\":{\"content\":[{\"text\":\"visible text\",\"type\":\"text\"},{\"omission_code\":\"internal_reasoning_and_signature\",\"type\":\"thinking\"},{\"caller_type\":\"code_execution_20250825\",\"id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"first-call\",\"type\":\"tool_use\"},{\"content\":\"first-result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"is_error\":false,\"tool_use_id\":\"call-golden\",\"type\":\"tool_result\"},{\"omission_code\":\"inline_or_local_image_payload\",\"type\":\"image\"},{\"type\":\"image\",\"url\":\"https://example.test/image.png\"},{\"id\":\"server-only\",\"input\":{\"x\":1},\"name\":\"server\",\"type\":\"server_tool_use\"},{\"content\":{\"matches\":[\"one\"]},\"tool_use_id\":\"search\",\"type\":\"tool_search_tool_result\"},{\"content\":{\"stdout\":\"ok\"},\"tool_use_id\":\"exec\",\"type\":\"code_execution_tool_result\"}],\"index\":2,\"role\":\"assistant\"},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":12,\"array_items_retained\":12,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":42,\"object_keys_retained\":42,\"object_keys_truncated\":0,\"payload_bytes\":974,\"string_bytes_original\":430,\"string_bytes_retained\":430,\"strings_retained\":32,\"strings_total\":32,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"turn\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":2}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "turn_unknown_result": {
+    "message": "{\"object\":{\"content\":[{\"content\":\"last-result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"is_error\":null,\"tool_use_id\":\"call-golden\",\"type\":\"tool_result\"},{\"caller_type\":\"code_execution_20250825\",\"id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"last-call\",\"type\":\"tool_use\"}],\"index\":3,\"role\":\"user\"},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":4,\"array_items_retained\":4,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":21,\"object_keys_retained\":21,\"object_keys_truncated\":0,\"payload_bytes\":485,\"string_bytes_original\":202,\"string_bytes_retained\":202,\"strings_retained\":15,\"strings_total\":15,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"turn\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":3}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "tool_duplicate_last": {
+    "message": "{\"object\":{\"call_id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"last-call\",\"result\":{\"content\":\"last-result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"found\":true,\"is_error\":null}},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":2,\"array_items_retained\":2,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":16,\"object_keys_retained\":16,\"object_keys_truncated\":0,\"payload_bytes\":367,\"string_bytes_original\":145,\"string_bytes_retained\":145,\"strings_retained\":10,\"strings_total\":10,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"tool\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":\"call-golden\"}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "plan_full": {
+    "message": "{\"object\":{\"constraints\":[\"read only\"],\"context_summary\":\"Context\",\"critical_files\":[\"src/file.rs\"],\"explanation\":\"Explanation\",\"handoff_packet\":\"ready\",\"items\":[{\"status\":\"pending\",\"step\":\"first\"},{\"status\":\"in_progress\",\"step\":\"second\"},{\"status\":\"completed\",\"step\":\"third\"}],\"objective\":\"Preserve output\",\"recommended_approach\":\"typed observations\",\"risks_and_unknowns\":\"unknown remains null\",\"sources_used\":[\"source\"],\"title\":\"Golden plan\",\"verification_plan\":\"golden comparison\"},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":6,\"array_items_retained\":6,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":18,\"object_keys_retained\":18,\"object_keys_truncated\":0,\"payload_bytes\":474,\"string_bytes_original\":173,\"string_bytes_retained\":173,\"strings_retained\":17,\"strings_total\":17,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"plan\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":null}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "usize_plus_and_stdout_case": {
+    "message": "{\"object\":{\"content\":[{\"text\":\"visible text\",\"type\":\"text\"},{\"omission_code\":\"internal_reasoning_and_signature\",\"type\":\"thinking\"},{\"caller_type\":\"code_execution_20250825\",\"id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"first-call\",\"type\":\"tool_use\"},{\"content\":\"first-result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"is_error\":false,\"tool_use_id\":\"call-golden\",\"type\":\"tool_result\"},{\"omission_code\":\"inline_or_local_image_payload\",\"type\":\"image\"},{\"type\":\"image\",\"url\":\"https://example.test/image.png\"},{\"id\":\"server-only\",\"input\":{\"x\":1},\"name\":\"server\",\"type\":\"server_tool_use\"},{\"content\":{\"matches\":[\"one\"]},\"tool_use_id\":\"search\",\"type\":\"tool_search_tool_result\"},{\"content\":{\"stdout\":\"ok\"},\"tool_use_id\":\"exec\",\"type\":\"code_execution_tool_result\"}],\"index\":2,\"role\":\"assistant\"},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":12,\"array_items_retained\":12,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":42,\"object_keys_retained\":42,\"object_keys_truncated\":0,\"payload_bytes\":974,\"string_bytes_original\":430,\"string_bytes_retained\":430,\"strings_retained\":32,\"strings_total\":32,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"turn\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":2}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "server_tool_unavailable": {
+    "message": "Error: The selected tool call is unavailable; nothing was copied",
+    "is_error": true,
+    "clipboard": null
+  },
+  "tool_missing_result": {
+    "message": "{\"object\":{\"call_id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"lonely\",\"result\":{\"found\":false}},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":0,\"array_items_retained\":0,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":7,\"object_keys_retained\":7,\"object_keys_truncated\":0,\"payload_bytes\":148,\"string_bytes_original\":67,\"string_bytes_retained\":67,\"strings_retained\":4,\"strings_total\":4,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"tool\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":\"call-golden\"}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "tool_error_false": {
+    "message": "{\"object\":{\"call_id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"lonely\",\"result\":{\"content\":\"result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"found\":true,\"is_error\":false}},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":2,\"array_items_retained\":2,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":16,\"object_keys_retained\":16,\"object_keys_truncated\":0,\"payload_bytes\":360,\"string_bytes_original\":137,\"string_bytes_retained\":137,\"strings_retained\":10,\"strings_total\":10,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"tool\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":\"call-golden\"}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "tool_error_true": {
+    "message": "{\"object\":{\"call_id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"lonely\",\"result\":{\"content\":\"result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"found\":true,\"is_error\":true}},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":2,\"array_items_retained\":2,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":16,\"object_keys_retained\":16,\"object_keys_truncated\":0,\"payload_bytes\":359,\"string_bytes_original\":137,\"string_bytes_retained\":137,\"strings_retained\":10,\"strings_total\":10,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"tool\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":\"call-golden\"}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "tool_error_unknown": {
+    "message": "{\"object\":{\"call_id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"lonely\",\"result\":{\"content\":\"result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"found\":true,\"is_error\":null}},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":2,\"array_items_retained\":2,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":16,\"object_keys_retained\":16,\"object_keys_truncated\":0,\"payload_bytes\":359,\"string_bytes_original\":137,\"string_bytes_retained\":137,\"strings_retained\":10,\"strings_total\":10,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"tool\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":\"call-golden\"}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "en_error_0": {
+    "message": "Error: Invalid structural-copy request. Usage: /structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_1": {
+    "message": "Error: Invalid structural-copy request. Usage: /structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_2": {
+    "message": "Error: Invalid structural-copy request. Usage: /structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_3": {
+    "message": "Error: Invalid structural-copy request. Usage: /structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_4": {
+    "message": "Error: Invalid structural-copy request. Usage: /structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_5": {
+    "message": "Error: Invalid structural-copy request. Usage: /structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_6": {
+    "message": "Error: Invalid structural-copy request. Usage: /structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_7": {
+    "message": "Error: The selected turn is unavailable; nothing was copied",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_error_8": {
+    "message": "Error: The selected Workflow run is unavailable; nothing was copied",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_native": {
+    "message": "Structural copy (turn, 1729 bytes) was handed to the clipboard; if no native clipboard was reachable, a terminal write was queued instead",
+    "is_error": false,
+    "clipboard": "{\"object\":{\"content\":[{\"text\":\"visible text\",\"type\":\"text\"},{\"omission_code\":\"internal_reasoning_and_signature\",\"type\":\"thinking\"},{\"caller_type\":\"code_execution_20250825\",\"id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"first-call\",\"type\":\"tool_use\"},{\"content\":\"first-result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"is_error\":false,\"tool_use_id\":\"call-golden\",\"type\":\"tool_result\"},{\"omission_code\":\"inline_or_local_image_payload\",\"type\":\"image\"},{\"type\":\"image\",\"url\":\"https://example.test/image.png\"},{\"id\":\"server-only\",\"input\":{\"x\":1},\"name\":\"server\",\"type\":\"server_tool_use\"},{\"content\":{\"matches\":[\"one\"]},\"tool_use_id\":\"search\",\"type\":\"tool_search_tool_result\"},{\"content\":{\"stdout\":\"ok\"},\"tool_use_id\":\"exec\",\"type\":\"code_execution_tool_result\"}],\"index\":2,\"role\":\"assistant\"},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":12,\"array_items_retained\":12,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":42,\"object_keys_retained\":42,\"object_keys_truncated\":0,\"payload_bytes\":974,\"string_bytes_original\":430,\"string_bytes_retained\":430,\"strings_retained\":32,\"strings_total\":32,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"turn\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":2}}"
+  },
+  "en_queued": {
+    "message": "Structural copy (turn, 1729 bytes) was queued for the terminal-client clipboard via tmux/OSC 52; delivery depends on terminal support and is not confirmed",
+    "is_error": false,
+    "clipboard": null
+  },
+  "en_failed": {
+    "message": "Error: Couldn't reach the clipboard (test clipboard unavailable). Nothing was written; re-run with `stdout` to see the text.",
+    "is_error": true,
+    "clipboard": null
+  },
+  "en_busy_plan": {
+    "message": "Error: The Plan state is busy; try again",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_0": {
+    "message": "Error: 结构化复制请求无效。用法：/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_1": {
+    "message": "Error: 结构化复制请求无效。用法：/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_2": {
+    "message": "Error: 结构化复制请求无效。用法：/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_3": {
+    "message": "Error: 结构化复制请求无效。用法：/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_4": {
+    "message": "Error: 结构化复制请求无效。用法：/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_5": {
+    "message": "Error: 结构化复制请求无效。用法：/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_6": {
+    "message": "Error: 结构化复制请求无效。用法：/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_7": {
+    "message": "Error: 所选轮次不可用；未复制任何内容",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_error_8": {
+    "message": "Error: 所选Workflow 运行不可用；未复制任何内容",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_native": {
+    "message": "结构化副本（轮次，1729 字节）已交给剪贴板；若无法访问原生剪贴板，则已改为加入终端写入队列",
+    "is_error": false,
+    "clipboard": "{\"object\":{\"content\":[{\"text\":\"visible text\",\"type\":\"text\"},{\"omission_code\":\"internal_reasoning_and_signature\",\"type\":\"thinking\"},{\"caller_type\":\"code_execution_20250825\",\"id\":\"call-golden\",\"input\":{\"api_key\":\"redacted:sensitive_value\",\"url\":\"https://example.test/path]\"},\"name\":\"first-call\",\"type\":\"tool_use\"},{\"content\":\"first-result\",\"content_blocks\":[{\"mime_type\":\"image/png\",\"omission_code\":\"inline_or_local_image_payload\",\"omitted_base64_bytes\":14,\"type\":\"image\"},{\"text\":\"visible tool text\",\"type\":\"text\"}],\"is_error\":false,\"tool_use_id\":\"call-golden\",\"type\":\"tool_result\"},{\"omission_code\":\"inline_or_local_image_payload\",\"type\":\"image\"},{\"type\":\"image\",\"url\":\"https://example.test/image.png\"},{\"id\":\"server-only\",\"input\":{\"x\":1},\"name\":\"server\",\"type\":\"server_tool_use\"},{\"content\":{\"matches\":[\"one\"]},\"tool_use_id\":\"search\",\"type\":\"tool_search_tool_result\"},{\"content\":{\"stdout\":\"ok\"},\"tool_use_id\":\"exec\",\"type\":\"code_execution_tool_result\"}],\"index\":2,\"role\":\"assistant\"},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":12,\"array_items_retained\":12,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":42,\"object_keys_retained\":42,\"object_keys_truncated\":0,\"payload_bytes\":974,\"string_bytes_original\":430,\"string_bytes_retained\":430,\"strings_retained\":32,\"strings_total\":32,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"turn\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":2}}"
+  },
+  "zh_hans_queued": {
+    "message": "结构化副本（轮次，1729 字节）已通过 tmux/OSC 52 加入终端客户端剪贴板队列；是否送达取决于终端支持，当前尚未确认",
+    "is_error": false,
+    "clipboard": null
+  },
+  "zh_hans_failed": {
+    "message": "Error: 复制到剪贴板失败：test clipboard unavailable。未写入任何内容；如需显式文本视图，请使用 `stdout` 重新运行",
+    "is_error": true,
+    "clipboard": null
+  },
+  "zh_hans_busy_plan": {
+    "message": "Error: Plan状态正忙；请重试",
+    "is_error": true,
+    "clipboard": null
+  },
+  "workflow_owned": {
+    "message": "{\"object\":{\"blocked_gate_count\":0,\"branch_count\":null,\"child_count\":0,\"completed_at_ms\":null,\"control_count\":null,\"dispatch_failure_count\":0,\"error\":null,\"event_count\":0,\"events_dropped\":0,\"execution_status\":null,\"gate_count\":0,\"gate_status\":[],\"last_event_type\":null,\"last_progress\":null,\"leaf_count\":null,\"lifecycle_seq\":1,\"progress_count\":0,\"run_id\":\"golden-run\",\"schema_error_count\":0,\"schema_repair_count\":0,\"source_file\":null,\"started_at_ms\":1700000000000,\"status\":\"running\",\"token_budget\":\"redacted:sensitive_value\",\"usage\":null,\"workflow_goal\":null,\"workflow_id\":null},\"receipt\":{\"applied_caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"caps\":{\"max_array_items\":64,\"max_depth\":12,\"max_key_bytes\":256,\"max_output_bytes\":49152,\"max_string_bytes\":2048},\"counts\":{\"array_items_original\":0,\"array_items_retained\":0,\"depth_omissions\":0,\"object_keys_deduped\":0,\"object_keys_original\":27,\"object_keys_retained\":27,\"object_keys_truncated\":0,\"payload_bytes\":566,\"string_bytes_original\":41,\"string_bytes_retained\":41,\"strings_retained\":3,\"strings_total\":3,\"strings_truncated\":0},\"human_only\":true,\"kind\":\"workflow\",\"reasons\":[],\"redaction\":\"export-sanitize/v1+typed-markers/v1+strict-url/v2+path-redact/v2\",\"schema\":\"codewhale/structcopy/v1\",\"selector\":\"golden-run\"}}",
+    "is_error": false,
+    "clipboard": null
+  },
+  "workflow_wrong_owner": {
+    "message": "Error: The selected Workflow run is unavailable; nothing was copied",
+    "is_error": true,
+    "clipboard": null
+  },
+  "workflow_no_session": {
+    "message": "Error: The selected Workflow run is unavailable; nothing was copied",
+    "is_error": true,
+    "clipboard": null
+  },
+  "empty_plan": {
+    "message": "Error: The selected Plan is unavailable; nothing was copied",
+    "is_error": true,
+    "clipboard": null
+  },
+  "empty_turn": {
+    "message": "Error: The selected turn is unavailable; nothing was copied",
+    "is_error": true,
+    "clipboard": null
+  },
+  "metadata": {
+    "name": "structcopy",
+    "aliases": [],
+    "usage": "/structcopy <turn <n>|tool <call-id>|plan|workflow <run-id>> [stdout]",
+    "description_en": "Copy one session object as redacted JSON; not a model tool",
+    "description_zh_hans": "以脱敏的规范化 JSON 复制单个有界会话对象（仅限人工使用，不会成为模型工具）",
+    "session_order": [
+      "rename",
+      "title",
+      "save",
+      "fork",
+      "new",
+      "sessions",
+      "load",
+      "resume",
+      "tree",
+      "branch",
+      "compact",
+      "purge",
+      "relay",
+      "rc",
+      "remote-env",
+      "export",
+      "structcopy"
+    ],
+    "native_model_tool": false
+  }
+}

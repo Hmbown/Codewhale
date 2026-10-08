@@ -5,7 +5,6 @@
 //!
 //! * Streaming-buffer parsing into a finalized `serde_json::Value` tool input
 //!   (`final_tool_input`, `parse_tool_input`, fenced/JSON segment helpers).
-//! * The `multi_tool_use.parallel` payload parser.
 //! * Policy predicates the turn loop consults — when a batch can run in
 //!   parallel and the small set of read-only MCP tools that are safe to run
 //!   in parallel.
@@ -16,11 +15,11 @@
 
 use serde_json::json;
 
-use crate::models::{Tool, ToolCaller};
 use crate::tools::spec::{
     ResourceClaim, ToolError, ToolExecutionOutcome, ToolResult, ToolResultContentBlock,
     schedule_non_conflicting,
 };
+use codewhale_models::{Tool, ToolCaller};
 
 use super::ToolUseState;
 
@@ -32,17 +31,252 @@ const MAX_SCHEMA_CONTAINER_REPAIR_BYTES: usize = 64 * 1024;
 pub(super) struct ToolExecOutcome {
     pub(super) index: usize,
     pub(super) id: String,
+    pub(super) model_call: Option<crate::core::events::ModelToolCall>,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) started_at: std::time::Instant,
     pub(super) terminal: ToolExecutionOutcome,
     pub(super) content_blocks: Vec<ToolResultContentBlock>,
+    /// Read-result bytes before spillover adds call-specific artifact paths.
+    pub(super) original_content_digest: Option<[u8; 32]>,
+}
+
+/// Notice appended as a user-role message when the guard first asks the worker
+/// to change strategy after repeated no-progress denials (#6015).
+pub(crate) const FLEET_STRATEGY_SWITCH_NOTICE: &str = "Fleet strategy switch required: repeated permission denials produced no new evidence. The rejected action is held. Use another permitted tool from the current catalog to make progress, or report completed work and the blocker. Do not work around permissions or request the same approval again.";
+
+/// Notice appended when denials continue past the strategy switch: the next
+/// response is report-only and its tool calls are admission-held (#6015).
+pub(crate) const FLEET_FINAL_REPORT_NOTICE: &str = "Fleet no-progress final report: permission denials continued after the strategy switch without new evidence. Your next response is report-only; no tools will execute. Report what you completed, exact evidence, the permission blocker and remaining work. This is the last response unless the user changes direction or authority.";
+
+/// Terminal reason once the report-only response has been recorded (#6015).
+pub(crate) const FLEET_NO_PROGRESS_STOP: &str = "Fleet worker stopped after repeated permission denials without new evidence. Work and tool results are retained in the transcript; review the blocker before resuming.";
+
+/// Progress observations for one provider response, independent of tool finish
+/// order. Only typed permission denials contribute to the retry guard (#6015).
+#[derive(Default)]
+pub(crate) struct FleetDenialBatch {
+    denied: std::collections::HashSet<String>,
+    made_progress: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FleetDenialAction {
+    Continue,
+    SwitchStrategy,
+    FinalReport,
+}
+
+/// Turn-local guard for an engine with a Fleet authority envelope. This is an
+/// admission predicate and result accumulator, not another execution loop.
+/// Three responses give the model two opportunities to use denial feedback;
+/// after one strategy notice, three more denied responses request a report.
+/// Fleet sub-agent workers run the same guard in their own loop (#6015).
+#[derive(Default)]
+pub(crate) struct FleetDenialGuard {
+    denied_rounds: std::collections::HashMap<String, u8>,
+    switch_requested: bool,
+    recovery_denied_rounds: u8,
+    denial_rounds_without_progress: u32,
+    report_only: bool,
+    // Last observed bytes per read request: paths alone cannot distinguish a
+    // changed file, and an unchanged read must not repeatedly reset denials.
+    // Coverage is bounded; an evicted observation is treated conservatively
+    // as new evidence. No raw arguments/bytes are kept.
+    reads: std::collections::VecDeque<([u8; 32], [u8; 32])>,
+}
+
+impl FleetDenialGuard {
+    const REPEATED_DENIAL_ROUNDS: u8 = 3;
+    const MAX_OBSERVATIONS: usize = 32;
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn report_only(&self) -> bool {
+        self.report_only
+    }
+
+    pub(crate) fn awaiting_strategy_change(&self) -> bool {
+        self.switch_requested
+    }
+
+    pub(super) fn denial_rounds_without_progress(&self) -> u32 {
+        self.denial_rounds_without_progress
+    }
+
+    pub(crate) fn original_content_digest(
+        name: &str,
+        input: &serde_json::Value,
+        output: &ToolResult,
+    ) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let action = crate::tools::canonical_action::canonical_action_alias(name, input);
+        (output.success
+            && matches!(
+                action,
+                "read_file" | "list_dir" | "file_search" | "grep_files"
+            ))
+        .then(|| Sha256::digest(output.content.as_bytes()).into())
+    }
+
+    pub(crate) fn admission_error(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<ToolError> {
+        let action = crate::tools::canonical_action::canonical_action_alias(name, input);
+        if self.report_only {
+            Some(ToolError::permission_denied(
+                "Fleet no-progress final report: no tools may execute in this response. Report completed work, evidence and the remaining blocker; do not change permission mode or retry tools.",
+            ))
+        } else if self.switch_requested && self.denied_rounds.contains_key(action) {
+            Some(ToolError::permission_denied(
+                "Fleet permission-denial loop: this action is held until useful permitted work or an explicit authority change. Use another permitted tool or report the blocker; do not change permission mode or request permission again.",
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        batch: &mut FleetDenialBatch,
+        name: &str,
+        input: &serde_json::Value,
+        status: crate::tools::spec::ToolTerminalStatus,
+        result: &Result<ToolResult, ToolError>,
+        original_content_digest: Option<[u8; 32]>,
+    ) {
+        use crate::tools::spec::ToolTerminalStatus;
+
+        let action = crate::tools::canonical_action::canonical_action_alias(name, input);
+        if status == ToolTerminalStatus::Denied
+            && matches!(result, Err(ToolError::PermissionDenied { .. }))
+        {
+            batch.denied.insert(action.to_owned());
+            return;
+        }
+        let Ok(output) = result else { return };
+        if status != ToolTerminalStatus::Succeeded
+            || !output.success
+            || output.metadata.as_ref().is_some_and(|metadata| {
+                metadata
+                    .get("executed")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                    || metadata
+                        .get("cancelled")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            })
+        {
+            return;
+        }
+        // Waiting is useful coordination, but its repeated success receipt is
+        // neither new evidence nor a failure. Its own timeouts still govern it.
+        if matches!(
+            action,
+            "exec_shell_wait" | "exec_wait" | "terminal/wait" | "wait_for_dev_server" | "sleep"
+        ) || name == "agent"
+            && input
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|action| matches!(action, "wait" | "status" | "list"))
+        {
+            return;
+        }
+        if matches!(
+            action,
+            "read_file" | "list_dir" | "file_search" | "grep_files"
+        ) {
+            use sha2::{Digest, Sha256};
+
+            let mut semantic_input = input.clone();
+            if action != name
+                && let Some(object) = semantic_input.as_object_mut()
+            {
+                object.remove("action");
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(action.as_bytes());
+            hasher.update([0]);
+            // Tool JSON preserves insertion order; reordered equivalent keys
+            // must not manufacture a new read request.
+            hasher.update(crate::client::canonical_json(&semantic_input).as_bytes());
+            let key: [u8; 32] = hasher.finalize().into();
+            let contents = original_content_digest
+                .unwrap_or_else(|| Sha256::digest(output.content.as_bytes()).into());
+            let previous = self
+                .reads
+                .iter()
+                .position(|(old_key, _)| *old_key == key)
+                .and_then(|index| self.reads.remove(index));
+            batch.made_progress |=
+                previous.is_none_or(|(_, old_contents)| old_contents != contents);
+            self.reads.push_back((key, contents));
+            if self.reads.len() > Self::MAX_OBSERVATIONS {
+                self.reads.pop_front();
+            }
+        } else {
+            // A successful mutation or unfamiliar tool is useful work. Do not
+            // terminate it based on guesses about its content or side effects.
+            batch.made_progress = true;
+        }
+    }
+
+    pub(crate) fn finish_batch(&mut self, batch: FleetDenialBatch) -> FleetDenialAction {
+        if self.report_only {
+            return FleetDenialAction::Continue;
+        }
+        if batch.made_progress {
+            self.denied_rounds.clear();
+            self.switch_requested = false;
+            self.recovery_denied_rounds = 0;
+            self.denial_rounds_without_progress = 0;
+            return FleetDenialAction::Continue;
+        }
+        if batch.denied.is_empty() {
+            return FleetDenialAction::Continue;
+        }
+        self.denial_rounds_without_progress = self.denial_rounds_without_progress.saturating_add(1);
+        if self.switch_requested {
+            self.recovery_denied_rounds = self.recovery_denied_rounds.saturating_add(1);
+            if self.recovery_denied_rounds >= Self::REPEATED_DENIAL_ROUNDS {
+                self.report_only = true;
+                return FleetDenialAction::FinalReport;
+            }
+            return FleetDenialAction::Continue;
+        }
+        for action in batch.denied {
+            // The guard never retains payloads. Unknown families beyond this
+            // bounded window do not evict an already observed denial streak.
+            if self.denied_rounds.contains_key(&action)
+                || self.denied_rounds.len() < Self::MAX_OBSERVATIONS
+            {
+                let count = self.denied_rounds.entry(action).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+        if self
+            .denied_rounds
+            .values()
+            .any(|count| *count >= Self::REPEATED_DENIAL_ROUNDS)
+        {
+            self.switch_requested = true;
+            FleetDenialAction::SwitchStrategy
+        } else {
+            FleetDenialAction::Continue
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct ToolExecutionPlan {
     pub(super) index: usize,
     pub(super) id: String,
+    pub(super) model_call: Option<crate::core::events::ModelToolCall>,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,
@@ -63,20 +297,6 @@ pub(super) enum ToolExecutionBatch {
     Serial(Box<ToolExecutionPlan>),
 }
 
-#[derive(Debug, serde::Serialize)]
-pub(super) struct ParallelToolResultEntry {
-    pub(super) tool_name: String,
-    pub(super) success: bool,
-    pub(super) content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(super) struct ParallelToolResult {
-    pub(super) results: Vec<ParallelToolResultEntry>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ToolApprovalStamp {
     ApprovedByUser,
@@ -84,6 +304,8 @@ pub(super) enum ToolApprovalStamp {
 }
 
 impl ToolApprovalStamp {
+    const ALL: [Self; 2] = [Self::ApprovedByUser, Self::ApprovedWithPolicy];
+
     fn decision(self) -> &'static str {
         match self {
             Self::ApprovedByUser => "approved_by_user",
@@ -128,6 +350,43 @@ pub(super) fn stamp_tool_result_approval(result: &mut ToolResult, approval: Tool
         result.content = note.to_string();
     } else {
         result.content = format!("{note}\n\n{}", result.content);
+    }
+}
+
+/// The tool output a person reads: the result without the note
+/// [`stamp_tool_result_approval`] put in front of it for the model (#6566).
+///
+/// Only a result the engine stamped (`metadata.approval.model_visible`) loses
+/// a note, and only that decision's exact note text followed by a blank line
+/// (or nothing). Output that merely begins with "[approval] " — from a
+/// command, a file, or anything else a tool read — is shown whole, so
+/// injected text cannot hide tool output from the person.
+pub(crate) fn content_without_approval_note(result: &ToolResult) -> &str {
+    let content = result.content.as_str();
+    let approval = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("approval"));
+    let stamped = approval
+        .and_then(|approval| approval.get("model_visible"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let Some(stamp) = approval
+        .and_then(|approval| approval.get("decision"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|decision| {
+            ToolApprovalStamp::ALL
+                .into_iter()
+                .find(|stamp| stamp.decision() == decision)
+        })
+        .filter(|_| stamped)
+    else {
+        return content;
+    };
+    match content.strip_prefix(stamp.model_visible_note()) {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix("\n\n").unwrap_or(content),
+        None => content,
     }
 }
 
@@ -190,7 +449,7 @@ pub(super) fn format_tool_error_with_schema(
             "Path escapes workspace: {}. Use a workspace-relative path or enable trust mode.",
             path.display()
         ),
-        ToolError::ExecutionFailed { message } => message.clone(),
+        ToolError::ExecutionFailed { message, .. } => message.clone(),
         ToolError::Timeout { seconds } => format!(
             "Tool '{tool_name}' timed out after {seconds}s. Try a narrower scope or a longer timeout."
         ),
@@ -200,7 +459,7 @@ pub(super) fn format_tool_error_with_schema(
             // #3020: Pass through self-explanatory messages that already name the
             // cause (mode switch, allow_shell, feature flag).  Avoids appending a
             // conflicting "Check mode, feature flags" suffix on top of
-            // "switch to Act mode" which already gives the recovery path.
+            // a message that already names the mode and who can change it.
             if lower.contains("current tool catalog")
                 || lower.contains("did you mean:")
                 || mentions_mode_word(&lower)
@@ -216,12 +475,15 @@ pub(super) fn format_tool_error_with_schema(
         }
         ToolError::PermissionDenied { message } => {
             let lower = message.to_ascii_lowercase();
-            // #3020: Pass through messages that already name the denial cause.
-            if mentions_mode_word(&lower)
-                || lower.contains("allow_shell")
-                || lower.contains("denied by user")
-            {
+            // #3020: messages that already name the denial cause get no
+            // conflicting "Adjust approval mode" suffix. They keep the
+            // `Tool '…' was denied:` lead, which is how a receipt tells a
+            // call Codewhale blocked from one that ran and failed; an
+            // approval denial already starts `Tool '…' denied by user`.
+            if lower.contains("denied by user") {
                 message.clone()
+            } else if mentions_mode_word(&lower) || lower.contains("allow_shell") {
+                format!("Tool '{tool_name}' was denied: {message}")
             } else {
                 format!(
                     "Tool '{tool_name}' was denied: {message}. Adjust approval mode or request permission."
@@ -274,35 +536,64 @@ pub(super) fn final_tool_input(state: &ToolUseState) -> serde_json::Value {
     if !state.input_buffer.trim().is_empty()
         && let Some(parsed) = parse_tool_input(&state.input_buffer)
     {
-        return parsed;
+        // Structure was synthesized to make this parse, so the argument text
+        // was cut off. Route it to the same malformed-arguments path as an
+        // outright parse failure rather than dispatching a completed guess.
+        if parsed.structure_synthesized {
+            return malformed_tool_arguments_input(&state.input_buffer);
+        }
+        return parsed.value;
     }
     state.input.clone()
 }
 
-pub(super) fn parse_tool_input(buffer: &str) -> Option<serde_json::Value> {
+/// A parsed tool-argument buffer, plus whether the parse only succeeded
+/// because the repair ladder synthesized structure (see
+/// `crate::tools::arg_repair`). Mid-stream callers mirroring partial state
+/// may ignore the flag; the caller making the final dispatch decision must
+/// not, because synthesized structure means the argument text was cut off.
+pub(super) struct ParsedToolInput {
+    pub(super) value: serde_json::Value,
+    pub(super) structure_synthesized: bool,
+}
+
+pub(super) fn parse_tool_input(buffer: &str) -> Option<ParsedToolInput> {
     let trimmed = buffer.trim();
     if trimmed.is_empty() {
         return None;
     }
     // Try the deterministic arg-repair ladder first (handles trailing commas,
     // unclosed braces, embedded control chars, etc.)
-    if let Ok(value) = crate::tools::arg_repair::repair(trimmed) {
-        return Some(value);
+    if let Ok(repaired) = crate::tools::arg_repair::repair(trimmed) {
+        return Some(ParsedToolInput {
+            value: repaired.value,
+            structure_synthesized: repaired.structure_synthesized,
+        });
     }
     // Fall back to existing strategies for code-fenced, double-encoded, and
     // segment-extraction patterns that the repair ladder doesn't cover.
     if let Some(stripped) = strip_code_fences(trimmed)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&stripped)
     {
-        return Some(value);
+        return Some(ParsedToolInput {
+            value,
+            structure_synthesized: false,
+        });
     }
     if let Ok(serde_json::Value::String(inner)) = serde_json::from_str::<serde_json::Value>(trimmed)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&inner)
     {
-        return Some(value);
+        return Some(ParsedToolInput {
+            value,
+            structure_synthesized: false,
+        });
     }
     extract_json_segment(trimmed)
         .and_then(|segment| serde_json::from_str::<serde_json::Value>(&segment).ok())
+        .map(|value| ParsedToolInput {
+            value,
+            structure_synthesized: false,
+        })
 }
 
 /// Decode a JSON container that a provider encoded as a string when the tool
@@ -420,52 +711,6 @@ fn extract_balanced_segment(text: &str, open: char, close: char) -> Option<Strin
     end.map(|end_idx| text[start..end_idx].to_string())
 }
 
-fn normalize_parallel_tool_name(raw: &str) -> String {
-    let mut name = raw.trim();
-    for prefix in ["functions.", "tools.", "tool."] {
-        if let Some(stripped) = name.strip_prefix(prefix) {
-            name = stripped;
-            break;
-        }
-    }
-    name.to_string()
-}
-
-pub(super) fn parse_parallel_tool_calls(
-    input: &serde_json::Value,
-) -> Result<Vec<(String, serde_json::Value)>, ToolError> {
-    let tool_uses = input
-        .get("tool_uses")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| ToolError::missing_field("tool_uses"))?;
-    if tool_uses.is_empty() {
-        return Err(ToolError::invalid_input(
-            "multi_tool_use.parallel requires at least one tool call",
-        ));
-    }
-
-    let mut calls = Vec::with_capacity(tool_uses.len());
-    for item in tool_uses {
-        let name = item
-            .get("recipient_name")
-            .or_else(|| item.get("tool_name"))
-            .or_else(|| item.get("name"))
-            .or_else(|| item.get("tool"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::missing_field("recipient_name"))?;
-        let params = item
-            .get("parameters")
-            .or_else(|| item.get("input"))
-            .or_else(|| item.get("args"))
-            .or_else(|| item.get("arguments"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        calls.push((normalize_parallel_tool_name(name), params));
-    }
-
-    Ok(calls)
-}
-
 // === Dispatch policy ==================================================
 
 #[cfg(test)]
@@ -544,11 +789,93 @@ pub(super) fn mcp_tool_is_read_only(name: &str) -> bool {
     )
 }
 
-pub(super) fn mcp_tool_approval_description(name: &str) -> String {
-    if mcp_tool_is_read_only(name) {
-        format!("Read-only MCP tool '{name}'")
-    } else {
-        format!("MCP tool '{name}' may have side effects")
+pub(super) fn mcp_tool_approval_description(name: &str, input: &serde_json::Value) -> String {
+    use crate::tools::approval_cache::{ComputerUseUserGate, computer_use_user_gate};
+
+    // K1/K2: a Computer Use consent or script card names exactly what the
+    // person is granting. Generic "may have side effects" text is how a
+    // model-issued consent used to read as routine.
+    match computer_use_user_gate(name, input) {
+        Some(ComputerUseUserGate::Consent {
+            action,
+            app,
+            bundle_id,
+            scope,
+            remember,
+            confirm,
+        }) => {
+            if confirm {
+                // The plugin paused on an action that cannot be taken back
+                // and handed the model a token; approving this card is the
+                // person's confirmation of that one action.
+                return "Computer Use confirmation requested by the model: allow the irreversible action (pay, buy, send, transfer or delete) the plugin just paused on. Approve only if you asked for exactly that action.".to_string();
+            }
+            let target = match scope {
+                "foreground" => {
+                    "shared-desktop foreground control (take the pointer and focus)".to_string()
+                }
+                _ => {
+                    let app = app.as_deref().unwrap_or("<unnamed app>");
+                    match bundle_id.as_deref() {
+                        Some(bundle) => format!("app '{app}' (bundle id {bundle})"),
+                        None => format!("app '{app}' (bundle id not given)"),
+                    }
+                }
+            };
+            let lifetime = if action == "revoke" {
+                "clears session and persisted decisions, including a saved deny"
+            } else if remember {
+                "persisted until revoked"
+            } else {
+                "this session"
+            };
+            let verb = if action == "revoke" {
+                "revoke recorded decisions for"
+            } else {
+                "allow"
+            };
+            return format!(
+                "Computer Use consent requested by the model: {verb} {target}; scope: {scope}; {lifetime}. Approve only if you want this."
+            );
+        }
+        Some(ComputerUseUserGate::AppScript {
+            language,
+            script_sha256,
+            first_line,
+            line_count,
+        }) => {
+            let shown = if line_count > 1 {
+                format!("first of {line_count} lines")
+            } else {
+                "1 line".to_string()
+            };
+            return format!(
+                "Computer Use app_script: run this exact {language} script outside the sandbox (sha256 {}, {shown}): {first_line}",
+                &script_sha256[..16]
+            );
+        }
+        Some(ComputerUseUserGate::Computer {
+            action,
+            transport,
+            destination,
+        }) => {
+            let transport = transport.as_deref().unwrap_or("default");
+            let destination = destination.as_deref().unwrap_or("<not given>");
+            return format!(
+                "Computer Use: {action} a computer the model will then drive (transport {transport}, {destination}). Approve only if you want this machine controlled."
+            );
+        }
+        None => {}
+    }
+    match crate::mcp::mcp_tool_approval_hint(name) {
+        _ if mcp_tool_is_read_only(name) => format!("Read-only MCP tool '{name}'"),
+        Some(crate::mcp::McpToolApprovalHint::TrustedReadOnly) => {
+            format!("Read-only MCP tool '{name}' (declared by a reviewed plugin)")
+        }
+        Some(crate::mcp::McpToolApprovalHint::Destructive) => {
+            format!("MCP tool '{name}' is marked destructive by its server")
+        }
+        None => format!("MCP tool '{name}' may have side effects"),
     }
 }
 
@@ -560,7 +887,7 @@ mod schema_json_container_tests {
 
     #[test]
     fn decodes_nested_containers_and_passes_tool_validation() {
-        let schema = crate::tools::user_input::RequestUserInputTool.input_schema();
+        let schema = crate::tools::user_input::RequestUserInputTool::default().input_schema();
         let encoded_options = serde_json::to_string(&json!([
             { "label": "Repository", "description": "Inspect the current repository" },
             { "label": "Workspace", "description": "Inspect the whole workspace" }

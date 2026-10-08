@@ -1,0 +1,124 @@
+name: Bug report
+description: Something is broken or behaves wrong. 报告问题。
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. English or 中文 are both fine.
+
+        - Security problem? Do not post it here. Use a [private advisory](https://github.com/codewhale-hq/CodeWhale/security/advisories/new).
+        - Already reported? Add a 👍 to that issue instead of opening a new one.
+        - Remove API keys and tokens from anything you paste.
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched existing issues and this is not a duplicate. 我已搜索过现有 issue。
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened? 发生了什么？
+      description: What you saw, and what you expected instead. Paste error text as text, not only a screenshot.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce 复现步骤
+      description: Exact commands, key presses, or prompts. Shorter is better.
+      placeholder: |
+        1. Run `codewhale` in a git repository
+        2. Type ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Codewhale version 版本
+      description: Output of `codewhale --version`. Desktop app — the version in About.
+      placeholder: codewhale 0.10.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it happen? 在哪里出现？
+      multiple: true
+      options:
+        - TUI (terminal interface)
+        - CLI command (codewhale exec, codewhale doctor, ...)
+        - Desktop app
+        - Web (codewhale web or app.codewhale.net)
+        - Plugins / extension host
+        - MCP
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system 操作系统
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - WSL
+        - Android (Termux)
+        - HarmonyOS
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: How did you get Codewhale? 获取方式
+      options:
+        - Official script (codewhale.net/install.sh)
+        - GitHub Releases download
+        - Desktop app download
+        - npm
+        - Homebrew
+        - Cargo (crates.io)
+        - Built from a git checkout
+        - Scoop / Nix / Docker / other package
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Provider and model 提供商和模型
+      description: As shown by `/model`. Leave empty if it does not matter.
+      placeholder: "provider / model id"
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and shell 终端
+      description: Only for terminal problems. Mention tmux, zellij, or screen if you use one.
+      placeholder: iTerm2 + zsh, Windows Terminal + PowerShell, VS Code terminal + bash
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: codewhale doctor (optional)
+      description: Run `codewhale doctor` and paste the relevant lines. Check it for secrets first.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Logs, screenshots, anything else (optional)
+      description: Logs, a screenshot or recording, config snippets, or a guess at the cause.

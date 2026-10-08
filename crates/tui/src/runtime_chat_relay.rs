@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{Config, MemoryBackend, MemoryConfig, SkillsConfig},
+    core::engine::ISOLATED_CHAT_SYSTEM_PROMPT,
     plugins::PluginRegistry,
     runtime_threads::{
         CreateThreadRequest, RuntimeEventRecord, RuntimeThreadManager, RuntimeThreadManagerConfig,
@@ -37,7 +38,6 @@ const MAX_RELAY_ID_BYTES: usize = 240;
 const MAX_OPERATION_KEY_BYTES: usize = 128;
 const STATE_FILE: &str = "runtime-chat-bindings.json";
 const SCOPE_LOCK_FILE: &str = "runtime-chat.owner.lock";
-const SAFE_CHAT_SYSTEM_PROMPT: &str = "You are Codewhale Chat. Answer the user's request directly and conversationally. This is an isolated chat-only session: no local project, workspace, memory, skill, account, credential, path, or runtime context is available or implied. Do not claim to inspect or change local files, run tools, or perform work execution.";
 
 #[cfg(test)]
 static TEST_STATE_PERSIST_FAILURES: std::sync::Mutex<Vec<(PathBuf, usize)>> =
@@ -71,6 +71,11 @@ fn take_state_persist_failure(path: &Path) -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RuntimeChatPrompt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<std::num::NonZeroU32>,
     #[serde(rename = "type")]
     pub command_type: String,
     pub run_id: String,
@@ -79,6 +84,8 @@ pub(crate) struct RuntimeChatPrompt {
     pub runtime_binding_id: String,
     pub runtime_thread_id: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<codewhale_protocol::runtime::RuntimeImageInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     pub model: String,
@@ -758,7 +765,11 @@ impl RuntimeChatRelayHost {
             .start_turn_with_reserved_id(
                 &binding.native_thread_id,
                 StartTurnRequest {
+                    profile_constitution: command.profile_constitution.clone(),
+                    expected_workspace: None,
+                    max_output_tokens: command.max_output_tokens,
                     prompt: command.prompt.clone(),
+                    images: command.images.clone(),
                     operation_key: Some(command.operation_key.clone()),
                     input_summary: None,
                     model: Some(command.model.clone()),
@@ -771,6 +782,8 @@ impl RuntimeChatRelayHost {
                     auto_approve: Some(false),
                     dynamic_tools: Vec::new(),
                     environment_id: None,
+                    model_provider: None,
+                    model_provider_id: None,
                 },
                 &reserved_native_turn_id,
             )
@@ -989,8 +1002,27 @@ impl RuntimeChatRelayHost {
                 .is_some_and(|models| {
                     models.iter().any(|model| {
                         model.get("id").and_then(Value::as_str) == Some(command.model.as_str())
+                            && (command.images.is_empty()
+                                || model.get("imageInput").and_then(Value::as_str)
+                                    == Some("supported"))
                     })
                 });
+        if command.max_output_tokens.is_some()
+            && !provider
+                .get("models")
+                .and_then(Value::as_array)
+                .is_some_and(|models| {
+                    models.iter().any(|model| {
+                        model.get("id").and_then(Value::as_str) == Some(command.model.as_str())
+                            && model.get("outputTokenLimit").and_then(Value::as_str)
+                                == Some("supported")
+                    })
+                })
+        {
+            return Err(
+                "The selected Runtime Chat route does not support maxOutputTokens.".to_string(),
+            );
+        }
         if !route_matches {
             return Err(
                 "The requested Runtime Chat route is not the active ready route.".to_string(),
@@ -1170,6 +1202,14 @@ impl RuntimeChatRelayHost {
 
 impl RuntimeChatPrompt {
     pub(crate) fn validate_shape(&self) -> Result<(), String> {
+        crate::image_attach::prepare_runtime_images(&self.images)
+            .map_err(|error| error.to_string())?;
+        if !self.images.is_empty() && self.model.trim().eq_ignore_ascii_case("auto") {
+            return Err(
+                "Image inputs require an exact named model; Auto is unavailable for images."
+                    .to_string(),
+            );
+        }
         if self.command_type != "prompt.request" {
             return Err("Codewhale sent an unsupported Runtime Chat command.".to_string());
         }
@@ -1189,6 +1229,9 @@ impl RuntimeChatPrompt {
         {
             return Err("The Runtime Chat prompt is empty or oversized.".to_string());
         }
+        if let Some(snapshot) = &self.profile_constitution {
+            snapshot.validate().map_err(|error| error.to_string())?;
+        }
         if let Some(system_prompt) = self.system_prompt.as_deref()
             && (system_prompt.trim().is_empty()
                 || system_prompt.len() > 64_000
@@ -1203,10 +1246,7 @@ impl RuntimeChatPrompt {
             return Err("Runtime relay turns must use Chat mode.".to_string());
         }
         if let Some(reasoning) = self.reasoning_effort.as_deref()
-            && !matches!(
-                reasoning,
-                "off" | "low" | "medium" | "high" | "xhigh" | "max"
-            )
+            && crate::reasoning_preference::ReasoningEffort::parse_strict(reasoning).is_err()
         {
             return Err("The Runtime Chat reasoning effort is invalid.".to_string());
         }
@@ -1277,15 +1317,15 @@ fn resolve_interrupt_target(
     ))
 }
 
-fn dedicated_chat_system_prompt(account_instructions: Option<&str>) -> String {
+pub(crate) fn dedicated_chat_system_prompt(account_instructions: Option<&str>) -> String {
     match account_instructions
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
         Some(instructions) => format!(
-            "{SAFE_CHAT_SYSTEM_PROMPT}\n\n<account_chat_instructions>\n{instructions}\n</account_chat_instructions>"
+            "{ISOLATED_CHAT_SYSTEM_PROMPT}\n\n<account_chat_instructions>\n{instructions}\n</account_chat_instructions>"
         ),
-        None => SAFE_CHAT_SYSTEM_PROMPT.to_string(),
+        None => ISOLATED_CHAT_SYSTEM_PROMPT.to_string(),
     }
 }
 
@@ -1857,6 +1897,9 @@ mod tests {
     #[test]
     fn chat_command_shape_requires_empty_tools_and_exact_chat_modes() {
         let mut prompt = RuntimeChatPrompt {
+            profile_constitution: None,
+            images: Vec::new(),
+            max_output_tokens: None,
             command_type: "prompt.request".to_string(),
             run_id: "run_fixture".to_string(),
             turn_id: format!("local_turn_{}", "b".repeat(24)),
@@ -1878,6 +1921,13 @@ mod tests {
             },
         };
         prompt.validate_shape().unwrap();
+        for reasoning in ["minimal", "ultra"] {
+            prompt.reasoning_effort = Some(reasoning.into());
+            prompt.validate_shape().unwrap();
+        }
+        prompt.reasoning_effort = Some("invented-effort".into());
+        assert!(prompt.validate_shape().is_err());
+        prompt.reasoning_effort = None;
         prompt.allowed_tools.push("bash".to_string());
         assert!(prompt.validate_shape().is_err());
         prompt.allowed_tools.clear();
@@ -1890,7 +1940,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = Config {
             provider: Some("ollama".to_string()),
-            default_text_model: Some(crate::config::DEFAULT_OLLAMA_MODEL.to_string()),
+            default_text_model: Some("relay-local:fixture".to_string()),
             ..Config::default()
         };
         let host = RuntimeChatRelayHost::open(
@@ -1905,6 +1955,9 @@ mod tests {
             .unwrap();
         host.authorize_run("run_fixture").unwrap();
         let prompt = RuntimeChatPrompt {
+            profile_constitution: None,
+            images: Vec::new(),
+            max_output_tokens: None,
             command_type: "prompt.request".to_string(),
             run_id: "run_fixture".to_string(),
             turn_id: format!("local_turn_{}", "e".repeat(24)),
@@ -1913,7 +1966,7 @@ mod tests {
             runtime_thread_id: format!("local_thread_{}", "f".repeat(24)),
             prompt: "hello".to_string(),
             system_prompt: None,
-            model: crate::config::DEFAULT_OLLAMA_MODEL.to_string(),
+            model: "relay-local:fixture".to_string(),
             model_provider: "ollama".to_string(),
             model_provider_id: "ollama".to_string(),
             reasoning_effort: None,
@@ -1961,15 +2014,19 @@ mod tests {
         host.bind_account("account_fixture", "target_fixture")
             .unwrap();
         host.authorize_run("run_fixture").unwrap();
-        let provider = host.config.api_provider();
+        let identity = host.config.active_provider_identity().unwrap();
+        let provider = identity.provider;
         let model_provider_id = host
             .config
-            .active_provider_identity(provider)
+            .active_provider_identity()
             .unwrap()
             .persisted_id()
             .unwrap_or_else(|| provider.as_str())
             .to_string();
         let prompt = RuntimeChatPrompt {
+            profile_constitution: None,
+            images: Vec::new(),
+            max_output_tokens: None,
             command_type: "prompt.request".to_string(),
             run_id: "run_fixture".to_string(),
             turn_id: format!("local_turn_{}", "8".repeat(24)),
@@ -2021,9 +2078,11 @@ mod tests {
             default_text_model: Some(crate::config::DEFAULT_OLLAMA_MODEL.to_string()),
             ..Config::default()
         };
-        config.api_key = Some("must-not-cross".to_string());
-        config.base_url = Some("http://127.0.0.1:11434/v1".to_string());
+        config.set_legacy_root(Some("must-not-cross".to_string()), None);
+        config.set_legacy_root(None, Some("http://127.0.0.1:11434/v1".to_string()));
         let challenge = "c".repeat(32);
+        assert!(crate::runtime_api::runtime_chat_relay_catalog(&config, &challenge).is_err());
+        config.default_text_model = Some("relay-local:fixture".to_string());
         let catalog = crate::runtime_api::runtime_chat_relay_catalog(&config, &challenge).unwrap();
         assert_eq!(catalog["protocol"], "codewhale.runtime-chat-relay.v1");
         assert_eq!(catalog["challenge"], challenge);
@@ -2033,7 +2092,11 @@ mod tests {
         assert_eq!(catalog["providers"].as_array().unwrap().len(), 1);
         assert_eq!(
             catalog["providers"][0]["models"][0]["imageInput"],
-            "unsupported"
+            "unknown"
+        );
+        assert_eq!(
+            catalog["runtime"]["capabilities"]["turn_image_inputs"],
+            true
         );
         let serialized = catalog.to_string();
         assert!(!serialized.contains("must-not-cross"));
@@ -2113,7 +2176,6 @@ mod tests {
             }),
             context: ContextConfig {
                 project_pack: Some(true),
-                ..ContextConfig::default()
             },
             ..Config::default()
         };
@@ -2131,7 +2193,7 @@ mod tests {
         assert!(execution.skills_config().scan_codewhale_only());
 
         let prompt = dedicated_chat_system_prompt(None);
-        assert_eq!(prompt, SAFE_CHAT_SYSTEM_PROMPT);
+        assert_eq!(prompt, ISOLATED_CHAT_SYSTEM_PROMPT);
         for canary in [
             "CANARY_SKILLS",
             "CANARY_AGENTS",
@@ -2141,7 +2203,7 @@ mod tests {
             assert!(!prompt.contains(canary));
         }
         let account_prompt = dedicated_chat_system_prompt(Some("Reply in short paragraphs."));
-        assert!(account_prompt.starts_with(SAFE_CHAT_SYSTEM_PROMPT));
+        assert!(account_prompt.starts_with(ISOLATED_CHAT_SYSTEM_PROMPT));
         assert!(account_prompt.contains("<account_chat_instructions>"));
     }
 
@@ -2479,5 +2541,32 @@ mod tests {
             .unwrap();
         assert!(!reopened.has_unsettled_authorized_turns());
         reopened.authorize_run("run_other").unwrap();
+    }
+    #[test]
+    fn runtime_image_relay_hash_preserves_text_and_binds_order() {
+        let legacy = json!({"type":"prompt.request","runId":"run_fixture","turnId":format!("local_turn_{}", "b".repeat(24)),"operationKey":"operation-1","runtimeBindingId":"binding_fixture","runtimeThreadId":format!("local_thread_{}", "a".repeat(24)),"prompt":"look","model":"deepseek-v4-flash-vision-exp","modelProvider":"deepseek","modelProviderId":"deepseek","allowedTools":[],"mode":"chat","requestedMode":"chat","workspace":{"id":"workspace_fixture","targetRef":"target_fixture"}});
+        let mut command: RuntimeChatPrompt = serde_json::from_value(legacy.clone()).unwrap();
+        command.validate_shape().unwrap();
+        let expected = hex_digest(Sha256::digest(
+            serde_json::to_vec(&canonical_json_value(&legacy)).unwrap(),
+        ));
+        assert_eq!(
+            runtime_chat_request_fingerprint(&command).unwrap(),
+            expected
+        );
+        let mut with_empty = legacy;
+        with_empty["images"] = json!([]);
+        let empty: RuntimeChatPrompt = serde_json::from_value(with_empty).unwrap();
+        assert_eq!(runtime_chat_request_fingerprint(&empty).unwrap(), expected);
+        command.images = vec![
+            crate::image_attach::tests::runtime_image_fixture(1),
+            crate::image_attach::tests::runtime_image_fixture(2),
+        ];
+        command.validate_shape().unwrap();
+        let first = runtime_chat_request_fingerprint(&command).unwrap();
+        command.images.reverse();
+        assert_ne!(runtime_chat_request_fingerprint(&command).unwrap(), first);
+        command.model = "auto".into();
+        assert!(command.validate_shape().is_err());
     }
 }

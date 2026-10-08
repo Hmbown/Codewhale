@@ -19,7 +19,9 @@ import {
   stripGroupPrefix
 } from "./lib.mjs";
 import {
+  ApprovalOwnershipError,
   createRuntimeClient,
+  decideApproval as decideRuntimeApproval,
   readJsonSafe,
   readSse,
   ThreadStore as CoreThreadStore
@@ -95,29 +97,6 @@ async function handleIncomingMessage(event) {
   const identity = incomingIdentity(event);
   if (!identity.chatId) return;
 
-  // Store the incoming message ID so sendText() can reply inside the same
-  // Feishu thread/topic — without this, every bot message creates a new
-  // standalone topic in thread-enabled groups.
-  // / 缓存入站消息 ID，让 sendText 能通过 reply API 在同一话题内回复。
-  // / 否则每条 bot 消息都会在话题群中创建独立的新话题（见 #1710）。
-  if (identity.messageId) {
-    const existing = await threadStore.getChat(identity.chatId);
-    if (existing) {
-      await threadStore.patchChat(identity.chatId, {
-        replyToMessageId: identity.messageId,
-        updatedAt: new Date().toISOString()
-      });
-    } else {
-      await threadStore.setChat(identity.chatId, {
-        replyToMessageId: identity.messageId,
-        threadId: null,
-        lastSeq: 0,
-        activeTurnId: null,
-        updatedAt: new Date().toISOString()
-      });
-    }
-  }
-
   if (identity.messageType && identity.messageType !== "text") {
     await sendText(identity.chatId, "Only text messages are supported in this first bridge.");
     return;
@@ -148,11 +127,19 @@ async function handleIncomingMessage(event) {
     return;
   }
 
+  // Only an admitted sender may change delivery/recovery provenance.
+  const { chatId, chatType, openId, unionId, userId } = identity;
+  await threadStore.patchChat(chatId, {
+    authorizedIdentity: { chatId, chatType, openId, unionId, userId },
+    ...(identity.messageId ? { replyToMessageId: identity.messageId } : {}),
+    updatedAt: new Date().toISOString()
+  });
+
   const command = parseCommand(scoped.text);
-  await handleCommand(identity.chatId, command);
+  await handleCommand(identity.chatId, command, identity);
 }
 
-async function handleCommand(chatId, command) {
+async function handleCommand(chatId, command, identity) {
   const action = commandAction(command);
   switch (action.kind) {
     case "help":
@@ -179,13 +166,13 @@ async function handleCommand(chatId, command) {
       await compactThread(chatId);
       return;
     case "approval":
-      await decideApproval(chatId, action);
+      await decideApproval(chatId, action, identity);
       return;
     case "set_model":
       await setChatModel(chatId, action.modelName);
       return;
     case "prompt":
-      await runPrompt(chatId, action.prompt);
+      await runPrompt(chatId, action.prompt, identity);
       return;
     default:
       await sendText(chatId, helpText());
@@ -226,11 +213,20 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   return state;
 }
 
-async function runPrompt(chatId, prompt) {
+function turnActor(identity) {
+  for (const kind of ["openId", "userId", "unionId"]) {
+    if (identity?.[kind]) return `feishu-${kind}:${identity[kind]}`;
+  }
+  return "";
+}
+
+async function runPrompt(chatId, prompt, identity) {
   if (!prompt.trim()) {
     await sendText(chatId, helpText());
     return;
   }
+  const actorId = turnActor(identity);
+  if (!actorId) throw new ApprovalOwnershipError("turn needs its initiating human");
   const state = await ensureThread(chatId);
   // Use per-chat model for this turn (may differ from the thread's
   // creation model if the user ran /model after the thread was created).
@@ -268,6 +264,11 @@ async function runPrompt(chatId, prompt) {
   );
 
   const turnId = turnResponse.turn?.id;
+  // A turn the Runtime accepted keeps streaming even when its origin cannot be
+  // recorded; its approvals then fail closed and are decided from the TUI.
+  if (turnId && actorId) {
+    await threadStore.recordTurnOrigin(chatId, state.threadId, turnId, actorId);
+  }
   await threadStore.patchChat(chatId, {
     activeTurnId: turnId || null,
     lastSeq: sinceSeq,
@@ -288,6 +289,12 @@ async function runPrompt(chatId, prompt) {
 async function reattachActiveTurns() {
   for (const [chatId, state] of threadStore.listChats()) {
     if (!state?.threadId || !state.activeTurnId) continue;
+    const identity = state.authorizedIdentity;
+    if (!identity || identity.chatId !== chatId ||
+        !["p2p", "group"].includes(identity.chatType) ||
+        (identity.chatType !== "p2p" && !config.allowGroups) ||
+        !isAllowed(identity, config.allowlist, config.allowUnlisted)) continue;
+
 
     const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(state.threadId)}`);
     const runningTurn = latestRunningTurn(detail);
@@ -502,7 +509,7 @@ async function compactThread(chatId) {
   await sendText(chatId, `Compaction started: ${result.turn?.id || "unknown turn"}`);
 }
 
-async function decideApproval(chatId, action) {
+async function decideApproval(chatId, action, identity) {
   const decision = action.decision;
   const { approvalId, remember } =
     action.approvalId != null ? action : parseApprovalDecisionArgs(action.args);
@@ -510,10 +517,13 @@ async function decideApproval(chatId, action) {
     await sendText(chatId, `Usage: /${decision} <approval_id>${decision === "allow" ? " [remember]" : ""}`);
     return;
   }
-  await runtimeJson(`/v1/approvals/${encodeURIComponent(approvalId)}`, {
-    method: "POST",
-    body: { decision, remember }
-  });
+  try {
+    await decideRuntimeApproval(runtimeJson, { store: threadStore, chatId, actorId: turnActor(identity), approvalId, decision, remember });
+  } catch (error) {
+    if (!(error instanceof ApprovalOwnershipError)) throw error;
+    await sendText(chatId, `Approval ${approvalId} is not waiting in this chat.`);
+    return;
+  }
   await sendText(chatId, `Approval ${approvalId}: ${decision}${remember ? " and remember" : ""}`);
 }
 

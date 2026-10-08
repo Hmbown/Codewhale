@@ -31,7 +31,6 @@ Codewhale skill.
    appear immediately in the available-skills list.
 5. If a skill conflicts by name with a workspace skill, explain that workspace
    skill directories take precedence over global `~/.codewhale/skills`, with
-   `~/.deepseek/skills` retained as a legacy fallback.
 
 Do not execute community skill scripts unless the user explicitly asks and the
 skill has been reviewed or trusted.

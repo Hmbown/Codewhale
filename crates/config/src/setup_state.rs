@@ -39,13 +39,13 @@ pub const SETUP_STATE_FILE_NAME: &str = "setup_state.json";
 /// Version of the *telemetry notice content* — not the app version.
 ///
 /// The notice is owed whenever
-/// [`SetupState::telemetry_notice_decided_for`] does not match this string.
+/// [`SetupState::needs_telemetry_notice`] reports that it has not been shown.
 /// Bumping it re-shows the disclosure to prior acceptors and unanswered users,
 /// so it is bumped only
 /// when the collection policy, schema, or disclosure materially changes. Prior
 /// declines remain off. Keying it to the app version would re-prompt every
 /// release, which is nagging with extra steps.
-pub const TELEMETRY_NOTICE_VERSION: &str = "3";
+pub const TELEMETRY_NOTICE_VERSION: &str = "5";
 
 /// Canonical setup step ids. The ordering matches the first-run spine so a
 /// `BTreeMap<SetupStep, _>` renders in wizard order.
@@ -107,6 +107,8 @@ pub enum StepStatus {
     Deferred,
     /// Currently being worked on.
     InProgress,
+    /// A usable route is configured, but has not been checked with the provider.
+    Configured,
     /// Completed and checked (e.g. key validated, mode confirmed).
     Verified,
     /// Reached a usable-but-incomplete state needing user action
@@ -125,7 +127,8 @@ impl StepStatus {
     pub fn is_settled(self) -> bool {
         matches!(
             self,
-            StepStatus::Verified
+            StepStatus::Configured
+                | StepStatus::Verified
                 | StepStatus::NeedsAction
                 | StepStatus::Deferred
                 | StepStatus::Optional
@@ -331,14 +334,9 @@ pub struct SetupState {
     pub inherited: bool,
 
     // ── Telemetry notice ────────────────────────────────────────────────
-    /// [`TELEMETRY_NOTICE_VERSION`] whose telemetry disclosure was shown.
-    /// `None` means the notice is still owed.
-    ///
-    /// Never auto-completed and never deferred-completed: unlike the
-    /// constitution checkpoint, which records a `Deferred` completion on the
-    /// skip-onboarding path, a telemetry notice that was not rendered leaves
-    /// this `None`. Collection follows the documented default
-    /// while the notice remains owed on the next interactive launch.
+    /// [`TELEMETRY_NOTICE_VERSION`] whose telemetry processor disclosure was explicitly accepted or declined.
+    /// `None` means no explicit preference was recorded. Usage defaults on;
+    /// presenting a disclosure never changes these preference fields.
     ///
     /// These are *fields* rather than a new [`SetupStep`] variant on purpose:
     /// an unknown enum variant fails the whole record parse and silently drops
@@ -348,9 +346,13 @@ pub struct SetupState {
     pub telemetry_notice_decided_for: Option<String>,
     /// The privacy preference recorded with the notice. `false` with any
     /// recorded notice version is a durable opt-out; `true` records that the
-    /// default-on disclosure was shown for that version.
+    /// processor disclosure was explicitly accepted for that version.
     #[serde(default, skip_serializing_if = "is_false")]
     pub telemetry_opt_in: bool,
+    /// Most recent telemetry policy disclosure actually presented locally.
+    /// This is display bookkeeping, never evidence of human acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_notice_shown_for: Option<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -376,6 +378,7 @@ impl Default for SetupState {
             inherited: false,
             telemetry_notice_decided_for: None,
             telemetry_opt_in: false,
+            telemetry_notice_shown_for: None,
         }
     }
 }
@@ -424,14 +427,14 @@ impl SetupState {
         self.status(step) == StepStatus::Verified
     }
 
-    /// Provider/model is acceptable for first-run readiness when it is either
-    /// verified or in an actionable needs-action state (the EPIC keeps a
-    /// failed-key path reaching the ready screen).
+    /// Provider/model is acceptable for first-run readiness when configured,
+    /// verified or in an actionable needs-action state (the failed-key path
+    /// still reaches the ready screen).
     #[must_use]
     fn provider_model_ready_or_needs_action(&self) -> bool {
         matches!(
             self.status(SetupStep::ProviderModel),
-            StepStatus::Verified | StepStatus::NeedsAction
+            StepStatus::Configured | StepStatus::Verified | StepStatus::NeedsAction
         )
     }
 
@@ -489,12 +492,45 @@ impl SetupState {
     /// count: the content changed, so the disclosure is owed again.
     #[must_use]
     pub fn needs_telemetry_notice(&self, version: &str) -> bool {
-        self.telemetry_notice_decided_for.as_deref() != Some(version)
+        self.telemetry_notice_shown_for.as_deref() != Some(version)
+            && self.telemetry_notice_decided_for.as_deref() != Some(version)
+    }
+
+    /// Record presentation without inventing a privacy preference.
+    pub fn record_telemetry_notice_shown(&mut self, version: impl Into<String>) -> &mut Self {
+        self.telemetry_notice_shown_for = Some(version.into());
+        self
+    }
+
+    /// Update fields from the latest readable sidecar under the shared lock.
+    ///
+    /// Startup configuration receipts, disclosure bookkeeping and explicit
+    /// privacy writes share this lock so none can erase a concurrent decision.
+    /// Missing state is fresh; corrupt state is never replaced with defaults.
+    pub fn update_at(path: &Path, update: impl FnOnce(&mut Self)) -> Result<()> {
+        let parent = path.parent().context("setup-state path has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            // Keep the released lock path for concurrent older processes.
+            .open(path.with_extension("telemetry.lock"))?;
+        let mut lock = fd_lock::RwLock::new(file);
+        let _guard = lock.try_write()?;
+        let mut state = if path.try_exists()? {
+            Self::load_from(path).context("setup state could not be read")?
+        } else {
+            Self::default()
+        };
+        update(&mut state);
+        state.save_to(path)
     }
 
     /// Record the privacy preference associated with the telemetry notice.
     ///
-    /// Default-on may be recorded only after the notice was actually rendered;
+    /// Acceptance is recorded only after an explicit choice to share counts;
     /// an explicit opt-out may also arrive from Settings. Deferral,
     /// skip-onboarding, and non-interactive surfaces leave it untouched.
     pub fn record_telemetry_notice(
@@ -507,10 +543,10 @@ impl SetupState {
         self
     }
 
-    /// True when the current default-on disclosure was shown and remains on.
+    /// True when the current processor disclosure was explicitly accepted.
     #[must_use]
     pub fn telemetry_accepted(&self, version: &str) -> bool {
-        !self.needs_telemetry_notice(version) && self.telemetry_opt_in
+        self.telemetry_notice_decided_for.as_deref() == Some(version) && self.telemetry_opt_in
     }
 
     /// True when the current notice record contains an explicit opt-out.
@@ -519,13 +555,12 @@ impl SetupState {
     /// only an opt-out may be acted on destructively.
     #[must_use]
     pub fn telemetry_declined(&self, version: &str) -> bool {
-        !self.needs_telemetry_notice(version) && !self.telemetry_opt_in
+        self.telemetry_notice_decided_for.as_deref() == Some(version) && !self.telemetry_opt_in
     }
 
     /// Whether any recorded telemetry notice was explicitly declined.
     ///
-    /// Declines recorded by the former opt-in notice remain durable opt-outs
-    /// after telemetry becomes default-on. A notice-version bump may explain a
+    /// Declines recorded by any former notice remain durable opt-outs. A notice-version bump may explain a
     /// changed policy, but it must never erase a user's earlier "no".
     #[must_use]
     pub fn telemetry_opted_out(&self) -> bool {
@@ -534,8 +569,8 @@ impl SetupState {
 
     /// Derive a safe inherited state for an existing user with no persisted
     /// `setup_state.json`. Surfaces they already configured become
-    /// [`StepStatus::Verified`]; an update never looks like a fresh, broken
-    /// setup. The constitution checkpoint is intentionally left incomplete so
+    /// settled; a provider route is only [`StepStatus::Configured`] until checked.
+    /// The constitution checkpoint is intentionally left incomplete so
     /// updating users still see it once.
     #[must_use]
     pub fn derive_inherited(facts: &InheritedConfigFacts) -> Self {
@@ -556,7 +591,7 @@ impl SetupState {
         if facts.has_provider_route && facts.has_credentials_or_local_runtime {
             state.set_step(
                 SetupStep::ProviderModel,
-                StepEntry::new(StepStatus::Verified, true, inherited),
+                StepEntry::new(StepStatus::Configured, true, inherited),
             );
         } else if facts.has_provider_route {
             state.set_step(
@@ -753,6 +788,24 @@ mod tests {
     }
 
     #[test]
+    fn configured_provider_settles_first_run_without_verifying_operate() {
+        let mut state = SetupState::default();
+        state.set_step(SetupStep::Language, verified("test"));
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Configured, true, "test"),
+        );
+        state.set_step(SetupStep::OperateFleet, verified("test"));
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.constitution_choice = ConstitutionChoice::Bundled;
+        state.operate_receipts_verified = true;
+        assert!(state.first_run_ready());
+        assert!(!state.operate_ready());
+        state.set_step(SetupStep::ProviderModel, verified("test"));
+        assert!(state.operate_ready());
+    }
+
+    #[test]
     fn needs_action_provider_still_reaches_ready() {
         let mut state = SetupState::default();
         state.set_step(SetupStep::Language, verified("0.8.67"));
@@ -797,7 +850,10 @@ mod tests {
         let state = SetupState::derive_inherited(&facts);
         assert!(state.inherited);
         assert_eq!(state.status(SetupStep::Language), StepStatus::Verified);
-        assert_eq!(state.status(SetupStep::ProviderModel), StepStatus::Verified);
+        assert_eq!(
+            state.status(SetupStep::ProviderModel),
+            StepStatus::Configured
+        );
         assert_eq!(state.status(SetupStep::TrustSandbox), StepStatus::Verified);
         assert_eq!(state.constitution_source, ConstitutionSource::Bundled);
         // The update checkpoint must still be shown to an upgrading user.

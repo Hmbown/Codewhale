@@ -1,6 +1,7 @@
-//! Secret storage for CodeWhale API keys.
+//! Secret storage for CodeWhale API keys, plus the shared output-sanitization
+//! primitives that keep secrets out of diagnostics and command output.
 //!
-//! Provides a small abstraction (`KeyringStore`) plus a default
+//! Secret storage: provides a small abstraction (`KeyringStore`) plus a default
 //! file-based implementation (`FileKeyringStore`), an opt-in OS keyring
 //! implementation (`DefaultKeyringStore`), and an in-memory store for tests
 //! (`InMemoryKeyringStore`).
@@ -9,10 +10,23 @@
 //! and falls back to environment variables. Config-file precedence lives in the
 //! config crate so user-facing commands can keep `config -> secret store -> env`
 //! explicit at the call site.
+//!
+//! Pure sanitization is implemented in `codewhale-sanitize`. The re-exports
+//! here preserve existing storage consumers' public paths; portable callers
+//! depend directly on that leaf crate and do not inherit credential backends.
 #![deny(missing_docs)]
 
 /// Shared secure-storage contract for the Codewhale account session.
 pub mod account;
+mod file_lock;
+#[cfg(test)]
+mod file_transactions_tests;
+/// Pure secret-redaction primitives shared by config diagnostics and the
+/// portable command sanitizer (FEAT-025 D4).
+pub use codewhale_sanitize::redact;
+/// Pure text/URL/ANSI output sanitization shared by the portable command
+/// helpers (FEAT-025 D4).
+pub use codewhale_sanitize::sanitize;
 
 use std::collections::HashMap;
 use std::fs;
@@ -94,6 +108,36 @@ pub trait KeyringStore: Send + Sync {
     /// Implementations should succeed (no-op) if the entry is already absent
     /// rather than returning an error.
     fn delete(&self, key: &str) -> Result<(), SecretsError>;
+
+    /// Run a non-reentrant entry mutation while holding the backend's authority
+    /// lock. Errors must leave the stored entry unchanged.
+    fn with_entry_transaction(
+        &self,
+        _key: &str,
+        _operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        Err(SecretsError::Keyring(
+            "This secret backend does not support atomic updates".into(),
+        ))
+    }
+
+    /// Replace an entry only while its exact bytes still match a snapshot.
+    fn compare_exchange(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        replacement: Option<&str>,
+    ) -> Result<bool, SecretsError> {
+        let mut changed = false;
+        self.with_entry_transaction(key, &mut |current| {
+            if current.as_deref() == expected {
+                *current = replacement.map(str::to_owned);
+                changed = true;
+            }
+            Ok(())
+        })?;
+        Ok(changed)
+    }
 
     /// Short, human-readable label for this backend.
     ///
@@ -189,8 +233,8 @@ impl DefaultKeyringStore {
     }
 }
 
-impl KeyringStore for DefaultKeyringStore {
-    fn get(&self, key: &str) -> Result<Option<String>, SecretsError> {
+impl DefaultKeyringStore {
+    fn get_unlocked(&self, key: &str) -> Result<Option<String>, SecretsError> {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
@@ -224,7 +268,7 @@ impl KeyringStore for DefaultKeyringStore {
         }
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), SecretsError> {
+    fn set_unlocked(&self, key: &str, value: &str) -> Result<(), SecretsError> {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
@@ -256,7 +300,7 @@ impl KeyringStore for DefaultKeyringStore {
         }
     }
 
-    fn delete(&self, key: &str) -> Result<(), SecretsError> {
+    fn delete_unlocked(&self, key: &str) -> Result<(), SecretsError> {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
@@ -287,6 +331,62 @@ impl KeyringStore for DefaultKeyringStore {
             let _ = key;
             Err(SecretsError::Keyring(unsupported_keyring_message()))
         }
+    }
+}
+
+impl DefaultKeyringStore {
+    fn with_key_lock<T>(
+        &self,
+        key: &str,
+        operation: impl FnOnce() -> Result<T, SecretsError>,
+    ) -> Result<T, SecretsError> {
+        use sha2::{Digest, Sha256};
+        // OS keyring authority is per user, not per CODEWHALE_HOME/profile.
+        let home = codewhale_paths::user_home()
+            .filter(|p| p.is_absolute())
+            .ok_or_else(home_resolution_error)?;
+        let mut digest = Sha256::new();
+        digest.update(self.service.as_bytes());
+        digest.update([0]);
+        digest.update(key.as_bytes());
+        let path = home.join(".codewhale").join("keyring-locks").join(
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+        file_lock::with_write_lock(&path, |_| operation())
+    }
+}
+
+impl KeyringStore for DefaultKeyringStore {
+    fn get(&self, key: &str) -> Result<Option<String>, SecretsError> {
+        self.get_unlocked(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretsError> {
+        self.with_key_lock(key, || self.set_unlocked(key, value))
+    }
+    fn delete(&self, key: &str) -> Result<(), SecretsError> {
+        self.with_key_lock(key, || self.delete_unlocked(key))
+    }
+    fn with_entry_transaction(
+        &self,
+        key: &str,
+        operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        self.with_key_lock(key, || {
+            let before = self.get_unlocked(key)?;
+            let mut current = before.clone();
+            operation(&mut current)?;
+            if current != before {
+                match current {
+                    Some(value) => self.set_unlocked(key, &value)?,
+                    None => self.delete_unlocked(key)?,
+                }
+            }
+            Ok(())
+        })
     }
 
     fn backend_name(&self) -> &'static str {
@@ -351,6 +451,28 @@ impl KeyringStore for InMemoryKeyringStore {
         Ok(())
     }
 
+    fn with_entry_transaction(
+        &self,
+        key: &str,
+        operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| SecretsError::Keyring("Secret store lock poisoned".into()))?;
+        let mut current = entries.get(key).cloned();
+        operation(&mut current)?;
+        match current {
+            Some(value) => {
+                entries.insert(key.into(), value);
+            }
+            None => {
+                entries.remove(key);
+            }
+        }
+        Ok(())
+    }
+
     fn backend_name(&self) -> &'static str {
         "in-memory (test)"
     }
@@ -390,10 +512,18 @@ struct ReadOnlyFileKeyringStore {
     legacy: Option<FileKeyringStore>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 struct FileSecretsBlob {
     #[serde(default)]
     entries: HashMap<String, String>,
+    /// Set once the legacy `~/.deepseek` store has been copied into this one.
+    /// The copy is one-shot: afterwards a key the user deletes here stays
+    /// deleted instead of being re-imported from the legacy file on the next
+    /// launch, and read-only lookup stops falling back to the legacy file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy_deepseek_migrated: bool,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl FileKeyringStore {
@@ -451,27 +581,45 @@ impl FileKeyringStore {
             return Ok(());
         }
 
+        let primary_store = Self::new(primary.to_path_buf());
+        if primary_store.load_unlocked()?.legacy_deepseek_migrated {
+            return Ok(());
+        }
+
         let legacy_store = Self::new(legacy.to_path_buf());
         let legacy_blob = legacy_store.load_unlocked()?;
         if legacy_blob.entries.is_empty() {
             return Ok(());
         }
 
-        let primary_store = Self::new(primary.to_path_buf());
-        let mut primary_blob = primary_store.load_unlocked()?;
-        let mut changed = false;
-        for (key, value) in legacy_blob.entries {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                primary_blob.entries.entry(key)
-            {
-                entry.insert(value);
-                changed = true;
+        primary_store.mutate(|primary_blob| {
+            // Re-check under the write lock: a concurrent process may have
+            // completed the copy, and the user may since have deleted keys.
+            if primary_blob.legacy_deepseek_migrated {
+                return Ok(());
             }
-        }
-        if changed {
-            primary_store.store_unlocked(&primary_blob)?;
-        }
-        Ok(())
+            for (key, value) in legacy_blob.entries {
+                primary_blob.entries.entry(key).or_insert(value);
+            }
+            primary_blob.legacy_deepseek_migrated = true;
+            Ok(())
+        })
+    }
+
+    fn mutate<T>(
+        &self,
+        operation: impl FnOnce(&mut FileSecretsBlob) -> Result<T, SecretsError>,
+    ) -> Result<T, SecretsError> {
+        file_lock::with_write_lock(&self.path, |path| {
+            let store = Self::new(path);
+            let mut blob = store.load_unlocked()?;
+            let original = serde_json::to_vec(&blob)?;
+            let result = operation(&mut blob)?;
+            if serde_json::to_vec(&blob)? != original {
+                store.store_unlocked(&blob)?;
+            }
+            Ok(result)
+        })
     }
 
     /// Path used for storage.
@@ -481,25 +629,16 @@ impl FileKeyringStore {
     }
 
     fn load_unlocked(&self) -> Result<FileSecretsBlob, SecretsError> {
-        if !self.path.exists() {
-            return Ok(FileSecretsBlob::default());
-        }
-        // Reject files with unsafe permissions on unix. On Windows the
-        // ACL model is too different to enforce here; the caller is
-        // responsible for placing the file in a per-user directory.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = fs::metadata(&self.path)?;
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(SecretsError::InsecurePermissions {
-                    path: self.path.clone(),
-                    mode,
-                });
+        use std::io::Read as _;
+        let mut file = match file_lock::open_private(&self.path, false) {
+            Ok(file) => file,
+            Err(SecretsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FileSecretsBlob::default());
             }
-        }
-        let raw = fs::read_to_string(&self.path)?;
+            Err(error) => return Err(error),
+        };
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
         if raw.trim().is_empty() {
             return Ok(FileSecretsBlob::default());
         }
@@ -555,13 +694,18 @@ impl ReadOnlyFileKeyringStore {
 
 impl KeyringStore for ReadOnlyFileKeyringStore {
     fn get(&self, key: &str) -> Result<Option<String>, SecretsError> {
-        match self.primary.get(key)? {
-            Some(value) => Ok(Some(value)),
-            None => self
-                .legacy
-                .as_ref()
-                .map_or(Ok(None), |legacy| legacy.get(key)),
+        let primary = self.primary.load_unlocked()?;
+        if let Some(value) = primary.entries.get(key) {
+            return Ok(Some(value.clone()));
         }
+        // Once the legacy store has been migrated, a key absent from the
+        // primary was deleted there; the legacy copy is stale, not a fallback.
+        if primary.legacy_deepseek_migrated {
+            return Ok(None);
+        }
+        self.legacy
+            .as_ref()
+            .map_or(Ok(None), |legacy| legacy.get(key))
     }
 
     fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
@@ -642,22 +786,43 @@ impl KeyringStore for FileKeyringStore {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), SecretsError> {
-        // load_unlocked already returns Ok(default) for a missing file, so the
-        // first-write-creates-the-file path is preserved. Any other Err
-        // (insecure permissions, corrupt JSON, transient I/O) MUST surface to
-        // the caller — propagating it via `unwrap_or_default()` silently
-        // wipes every previously stored secret on the next `store_unlocked`.
-        let mut blob = self.load_unlocked()?;
-        blob.entries.insert(key.to_string(), value.to_string());
-        self.store_unlocked(&blob)
+        self.mutate(|blob| {
+            account::invalidate_device_companion(&mut blob.entries, key, Some(value));
+            blob.entries.insert(key.to_string(), value.to_string());
+            Ok(())
+        })
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretsError> {
-        // Same invariant as `set`: never fall back to an empty blob on read
-        // error, or `delete <one-key>` becomes `delete <every-key>`.
-        let mut blob = self.load_unlocked()?;
-        blob.entries.remove(key);
-        self.store_unlocked(&blob)
+        self.mutate(|blob| {
+            account::invalidate_device_companion(&mut blob.entries, key, None);
+            blob.entries.remove(key);
+            Ok(())
+        })
+    }
+
+    fn with_entry_transaction(
+        &self,
+        key: &str,
+        operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        self.mutate(|blob| {
+            let before = blob.entries.get(key).cloned();
+            let mut current = before.clone();
+            operation(&mut current)?;
+            if current != before {
+                account::invalidate_device_companion(&mut blob.entries, key, current.as_deref());
+                match current {
+                    Some(value) => {
+                        blob.entries.insert(key.into(), value);
+                    }
+                    None => {
+                        blob.entries.remove(key);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     fn backend_name(&self) -> &'static str {
@@ -857,7 +1022,7 @@ fn configured_secret_backend() -> Option<String> {
 /// use codewhale_secrets::Secrets;
 ///
 /// let secrets = Secrets::auto_detect();
-/// if let Some(key) = secrets.resolve("deepseek") {
+/// if let Some(key) = secrets.resolve("deepseek", &["DEEPSEEK_API_KEY"]) {
 ///     // use the API key
 /// }
 /// ```
@@ -866,9 +1031,9 @@ pub struct Secrets {
     /// Underlying secret store backend.
     pub store: Arc<dyn KeyringStore>,
     /// Owner identifier within the secret store (typically `"deepseek"`).
-    /// The `key` parameter passed to [`resolve`](Secrets::resolve) is
-    /// forwarded to the store as-is, while environment variables are
-    /// looked up by canonical provider name via [`env_for`].
+    /// The `name` passed to [`resolve`](Secrets::resolve) is forwarded to
+    /// the store as-is; the environment variables tried after it are the
+    /// caller's list (see [`env_first`]).
     service: String,
 }
 
@@ -1070,22 +1235,28 @@ impl Secrets {
 
     /// Resolve a secret with `secret store → env → none` precedence.
     ///
-    /// `name` is the canonical provider name or a supported provider alias.
-    /// Empty strings on either layer are treated as "not set".
+    /// `name` is the secret-store slot; `env_vars` are the environment
+    /// variables to try after it, in order (see [`env_first`]). Empty strings
+    /// on either layer are treated as "not set".
     #[must_use]
-    pub fn resolve(&self, name: &str) -> Option<String> {
-        self.resolve_with_source(name).map(|(value, _)| value)
+    pub fn resolve(&self, name: &str, env_vars: &[&str]) -> Option<String> {
+        self.resolve_with_source(name, env_vars)
+            .map(|(value, _)| value)
     }
 
     /// Resolve a secret and report which layer supplied it.
     #[must_use]
-    pub fn resolve_with_source(&self, name: &str) -> Option<(String, SecretSource)> {
+    pub fn resolve_with_source(
+        &self,
+        name: &str,
+        env_vars: &[&str],
+    ) -> Option<(String, SecretSource)> {
         if let Ok(Some(v)) = self.store.get(name)
             && !v.trim().is_empty()
         {
             return Some((v, SecretSource::Keyring));
         }
-        env_for(name).map(|value| (value, SecretSource::Env))
+        env_first(env_vars).map(|(_, value)| (value, SecretSource::Env))
     }
 
     /// Convenience: write a secret through the underlying store.
@@ -1101,6 +1272,34 @@ impl Secrets {
     /// Convenience: read a secret directly (no env fallback).
     pub fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
         self.store.get(name)
+    }
+
+    /// Run one non-reentrant callback under the backend's entry authority.
+    pub fn with_entry_transaction<T>(
+        &self,
+        name: &str,
+        operation: impl FnOnce(&mut Option<String>) -> Result<T, SecretsError>,
+    ) -> Result<T, SecretsError> {
+        let mut operation = Some(operation);
+        let mut result = None;
+        self.store.with_entry_transaction(name, &mut |value| {
+            let call = operation.take().ok_or_else(|| {
+                SecretsError::Keyring("Secret transaction invoked more than once".into())
+            })?;
+            result = Some(call(value)?);
+            Ok(())
+        })?;
+        result.ok_or_else(|| SecretsError::Keyring("Secret transaction was not invoked".into()))
+    }
+
+    /// Atomically update one secret only while its exact stored bytes match.
+    pub fn compare_exchange(
+        &self,
+        name: &str,
+        expected: Option<&str>,
+        replacement: Option<&str>,
+    ) -> Result<bool, SecretsError> {
+        self.store.compare_exchange(name, expected, replacement)
     }
 
     /// Resolve a secret by key name with an optional source constraint.
@@ -1142,118 +1341,47 @@ impl Secrets {
     }
 }
 
-/// Map a canonical provider name to its environment variable(s), returning
-/// the first non-empty value found.
-///
-/// Provider names are case-insensitive. Supported providers and their
-/// environment variables:
-///
-/// | Provider | Env var(s) |
-/// |---|---|
-/// | `deepseek` | `DEEPSEEK_API_KEY` |
-/// | `openrouter` | `OPENROUTER_API_KEY` |
-/// | `xiaomi-mimo` / `mimo` | `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` |
-/// | `novita` / `novita-ai` | `NOVITA_API_KEY` |
-/// | `nvidia` / `nvidia-nim` / `nim` | `NVIDIA_API_KEY`, `NVIDIA_NIM_API_KEY` |
-/// | `fireworks` / `fireworks-ai` | `FIREWORKS_API_KEY` |
-/// | `together` / `togetherai` | `TOGETHER_API_KEY` |
-/// | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` |
-/// | `siliconflow` / `siliconflow-cn` | `SILICONFLOW_API_KEY` |
-/// | `arcee` / `arcee-ai` | `ARCEE_API_KEY` |
-/// | `moonshot` / `kimi` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
-/// | `sglang` | `SGLANG_API_KEY` |
-/// | `vllm` | `VLLM_API_KEY` |
-/// | `ollama` | `OLLAMA_API_KEY` |
-/// | `ollama-cloud` | `OLLAMA_CLOUD_API_KEY`, `OLLAMA_API_KEY` |
-/// | `openai` | `OPENAI_API_KEY` |
-/// | `atlascloud` / `atlas` | `ATLASCLOUD_API_KEY` |
-/// | `volcengine` / `ark` | `VOLCENGINE_API_KEY`, `VOLCENGINE_ARK_API_KEY`, `ARK_API_KEY` |
-/// | `wanjie` / `wanjie-ark` | `WANJIE_ARK_API_KEY`, `WANJIE_API_KEY`, `WANJIE_MAAS_API_KEY` |
-/// | `meta` / `muse-spark` | `META_MODEL_API_KEY`, `MODEL_API_KEY` |
-/// | `xai` / `grok` | `XAI_API_KEY` |
-/// | `telecomjs` / `tokenhub` | `TELECOMJS_API_KEY` |
-/// | `edenai` / `eden-ai` | `EDENAI_API_KEY` |
-/// | `concentrate` / `concentrate-ai` | `CONCENTRATE_API_KEY` |
-///
-/// Returns `None` if the provider is not recognised or none of its
-/// candidate environment variables are set to a non-empty value.
+/// Remove characters a copy-paste adds to an API key but no provider issues
+/// (#6528): Unicode whitespace anywhere (including NBSP and internal
+/// spaces/newlines), control characters, and invisible format characters —
+/// BOM, zero-width space/joiner/non-joiner, word joiner and invisible
+/// operators, soft hyphen, and bidi marks/embeddings/isolates. Every API-key
+/// entry path (onboarding, `/provider`, `auth set`, env import, and the
+/// runtime resolver) goes through this one helper.
 #[must_use]
-pub fn env_for(name: &str) -> Option<String> {
-    let candidates: &[&str] = match name.to_ascii_lowercase().as_str() {
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "xiaomi-mimo" | "xiaomi_mimo" | "xiaomimimo" | "mimo" | "xiaomi" => {
-            &["XIAOMI_MIMO_API_KEY", "XIAOMI_API_KEY", "MIMO_API_KEY"]
-        }
-        "novita" | "novita-ai" | "novita_ai" => &["NOVITA_API_KEY"],
-        "together" | "together-ai" | "together_ai" | "togetherai" => &["TOGETHER_API_KEY"],
-        "deepinfra" | "deep-infra" | "deep_infra" => &["DEEPINFRA_API_KEY", "DEEPINFRA_TOKEN"],
-        "nvidia" | "nvidia-nim" | "nvidia_nim" | "nim" => &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
-        "fireworks" | "fireworks-ai" => &["FIREWORKS_API_KEY"],
-        "siliconflow" | "silicon-flow" | "silicon_flow" | "siliconflow-cn" | "siliconflow_cn"
-        | "silicon-flow-cn" | "silicon_flow_cn" | "siliconflow-china" => &["SILICONFLOW_API_KEY"],
-        "arcee" | "arcee-ai" | "arcee_ai" => &["ARCEE_API_KEY"],
-        "moonshot" | "moonshot-ai" | "kimi" | "kimi-k2" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        "sglang" | "sg-lang" => &["SGLANG_API_KEY"],
-        "vllm" | "v-llm" => &["VLLM_API_KEY"],
-        "ollama" | "ollama-local" => &["OLLAMA_API_KEY"],
-        "ollama-cloud" | "ollama_cloud" => &["OLLAMA_CLOUD_API_KEY", "OLLAMA_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "anthropic" | "claude" => &["ANTHROPIC_API_KEY"],
-        "atlascloud" | "atlas-cloud" | "atlas_cloud" | "atlas" => &["ATLASCLOUD_API_KEY"],
-        "volcengine" | "volcengine-ark" | "volcengine_ark" | "ark" | "volc-ark"
-        | "volcengineark" => &[
-            "VOLCENGINE_API_KEY",
-            "VOLCENGINE_ARK_API_KEY",
-            "ARK_API_KEY",
-        ],
-        "wanjie" | "wanjie-ark" | "wanjie_ark" | "ark-wanjie" | "ark_wanjie" | "wanjieark"
-        | "wanjie-maas" | "wanjie_maas" | "wanjiemaas" => &[
-            "WANJIE_ARK_API_KEY",
-            "WANJIE_API_KEY",
-            "WANJIE_MAAS_API_KEY",
-        ],
-        "sakana" | "sakana-ai" | "sakana_ai" | "fugu" => &["FUGU_API_KEY", "SAKANA_API_KEY"],
-        "longcat" | "long-cat" | "meituan-longcat" | "meituan" => &["LONGCAT_API_KEY"],
-        "opencode-go" | "opencode_go" | "opencodego" => &["OPENCODE_GO_API_KEY"],
-        "opencode-zen" | "opencode_zen" | "opencodezen" | "zen" | "opencode" => {
-            &["OPENCODE_ZEN_API_KEY", "OPENCODE_API_KEY"]
-        }
-        "meta" | "meta-ai" | "meta_ai" | "meta-model-api" | "meta_model_api" | "muse"
-        | "muse-spark" => &["META_MODEL_API_KEY", "MODEL_API_KEY"],
-        "xai" | "x-ai" | "x_ai" | "grok" => &["XAI_API_KEY"],
-        "telecomjs" | "telecom-js" | "telecom_js" | "telecomjs-cn" | "tokenhub" => {
-            &["TELECOMJS_API_KEY"]
-        }
-        "edenai" | "eden-ai" | "eden_ai" => &["EDENAI_API_KEY"],
-        "concentrate" | "concentrate-ai" | "concentrate_ai" | "concentrateai" => {
-            &["CONCENTRATE_API_KEY"]
-        }
-        "daytona" => &[DAYTONA_API_KEY_ENV, CWC_DAYTONA_TOKEN_ENV],
-        // One Alibaba Cloud Model Studio account authenticates every plan /
-        // dialect variant; all four names share one env convention.
-        "modelstudio-token-plan"
-        | "modelstudio_token_plan"
-        | "modelstudio-token-plan-anthropic"
-        | "modelstudio_token_plan_anthropic"
-        | "modelstudio-coding-plan"
-        | "modelstudio_coding_plan"
-        | "modelstudio-coding-plan-anthropic"
-        | "modelstudio_coding_plan_anthropic"
-        | "modelstudio"
-        | "dashscope"
-        | "alibaba-token-plan"
-        | "alibaba-coding-plan" => &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"],
-        _ => return None,
-    };
-    for var in candidates {
-        if let Ok(value) = std::env::var(var)
-            && !value.trim().is_empty()
-        {
-            return Some(value);
-        }
-    }
-    None
+pub fn normalize_api_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| {
+            !(ch.is_whitespace()
+                || ch.is_control()
+                || matches!(
+                    ch,
+                    '\u{00ad}'
+                        | '\u{061c}'
+                        | '\u{180e}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{2064}'
+                        | '\u{2066}'..='\u{206f}'
+                        | '\u{feff}'
+                ))
+        })
+        .collect()
+}
+
+/// The first of `vars` set to a non-empty value (after
+/// [`normalize_api_key`]), with the variable's name so auth errors can point
+/// at it.
+///
+/// The variable list is the caller's: a provider's list lives on its
+/// descriptor (`codewhale_config::Provider::env_vars`), not in a second
+/// table here that can drift from it.
+#[must_use]
+pub fn env_first<'a>(vars: &[&'a str]) -> Option<(&'a str, String)> {
+    vars.iter().find_map(|var| {
+        let value = normalize_api_key(&std::env::var(var).ok()?);
+        (!value.is_empty()).then_some((*var, value))
+    })
 }
 
 /// Report whether a Daytona token is present without revealing it.
@@ -1285,6 +1413,29 @@ pub fn daytona_credential_source(secrets: &Secrets) -> Option<&'static str> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn normalize_api_key_strips_each_invisible_character_class() {
+        let cases = [
+            ("byte-order mark", "\u{feff}sk-abc123"),
+            ("zero-width space", "sk-abc\u{200b}123"),
+            ("zero-width non-joiner", "sk-abc\u{200c}123"),
+            ("zero-width joiner", "sk-abc\u{200d}123"),
+            ("no-break space", "sk-abc123\u{a0}"),
+            ("word joiner", "sk-\u{2060}abc123"),
+            ("soft hyphen", "sk-abc\u{ad}123"),
+            (
+                "bidi marks",
+                "\u{200e}sk-abc123\u{200f}\u{202a}\u{202c}\u{2066}\u{2069}",
+            ),
+            ("internal whitespace", " sk-abc\n 123\t\r\n"),
+        ];
+        for (class, raw) in cases {
+            assert_eq!(normalize_api_key(raw), "sk-abc123", "{class}");
+        }
+        assert_eq!(normalize_api_key("\u{feff}\u{200b} "), "");
+        assert_eq!(normalize_api_key("tp-Key_9.x/+="), "tp-Key_9.x/+=");
+    }
 
     /// Serialise env-mutating tests: tests in this module poke
     /// `DEEPSEEK_API_KEY` etc., which is process-global.
@@ -1332,6 +1483,8 @@ mod tests {
             "XAI_API_KEY",
             "TELECOMJS_API_KEY",
             "EDENAI_API_KEY",
+            "ZENMUX_API_KEY",
+            "CSDN_API_KEY",
             "CONCENTRATE_API_KEY",
             "MODELSTUDIO_API_KEY",
             "DASHSCOPE_API_KEY",
@@ -1725,6 +1878,46 @@ mod tests {
     }
 
     #[test]
+    fn file_default_path_migration_is_one_shot_so_deleted_keys_stay_deleted() {
+        let _lock = env_lock();
+        clear_known_envs();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _backend = EnvVarGuard::set(SECRET_BACKEND_ENV, "file");
+        let legacy = tmp
+            .path()
+            .join(".deepseek")
+            .join("secrets")
+            .join("secrets.json");
+        FileKeyringStore::new(&legacy)
+            .set("openrouter", "legacy-openrouter")
+            .unwrap();
+
+        let primary_store = FileKeyringStore::new(FileKeyringStore::default_path().unwrap());
+        assert_eq!(
+            primary_store.get("openrouter").unwrap().as_deref(),
+            Some("legacy-openrouter"),
+            "the first launch still copies legacy entries"
+        );
+
+        primary_store.delete("openrouter").unwrap();
+        let resolved = FileKeyringStore::default_path().unwrap();
+        assert_eq!(resolved, primary_store.path());
+        assert_eq!(
+            primary_store.get("openrouter").unwrap(),
+            None,
+            "a deleted key must not be re-imported from the legacy store"
+        );
+        assert_eq!(
+            Secrets::auto_detect_read_only().get("openrouter").unwrap(),
+            None,
+            "read-only lookup must not fall back to a migrated legacy store"
+        );
+        assert!(legacy.exists(), "migration never deletes legacy data");
+    }
+
+    #[test]
     fn in_memory_store_round_trips() {
         let store = InMemoryKeyringStore::new();
         assert_eq!(store.get("deepseek").unwrap(), None);
@@ -1752,9 +1945,14 @@ mod tests {
         store.set("deepseek", "ring-key").unwrap();
         let secrets = Secrets::new(store);
 
-        assert_eq!(secrets.resolve("deepseek").as_deref(), Some("ring-key"));
         assert_eq!(
-            secrets.resolve_with_source("deepseek"),
+            secrets
+                .resolve("deepseek", &["DEEPSEEK_API_KEY"])
+                .as_deref(),
+            Some("ring-key")
+        );
+        assert_eq!(
+            secrets.resolve_with_source("deepseek", &["DEEPSEEK_API_KEY"]),
             Some(("ring-key".to_string(), SecretSource::Keyring))
         );
         // Safety: env mutation guarded by env_lock().
@@ -1769,9 +1967,14 @@ mod tests {
         unsafe { std::env::set_var("DEEPSEEK_API_KEY", "env-fallback") };
 
         let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
-        assert_eq!(secrets.resolve("deepseek").as_deref(), Some("env-fallback"));
         assert_eq!(
-            secrets.resolve_with_source("deepseek"),
+            secrets
+                .resolve("deepseek", &["DEEPSEEK_API_KEY"])
+                .as_deref(),
+            Some("env-fallback")
+        );
+        assert_eq!(
+            secrets.resolve_with_source("deepseek", &["DEEPSEEK_API_KEY"]),
             Some(("env-fallback".to_string(), SecretSource::Env))
         );
         // Safety: env mutation guarded by env_lock().
@@ -1783,7 +1986,7 @@ mod tests {
         let _lock = env_lock();
         clear_known_envs();
         let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
-        assert_eq!(secrets.resolve("deepseek"), None);
+        assert_eq!(secrets.resolve("deepseek", &["DEEPSEEK_API_KEY"]), None);
     }
 
     #[test]
@@ -1796,458 +1999,36 @@ mod tests {
         let store = Arc::new(InMemoryKeyringStore::new());
         store.set("deepseek", "   ").unwrap();
         let secrets = Secrets::new(store);
-        assert_eq!(secrets.resolve("deepseek").as_deref(), Some("env-real"));
+        assert_eq!(
+            secrets
+                .resolve("deepseek", &["DEEPSEEK_API_KEY"])
+                .as_deref(),
+            Some("env-real")
+        );
         // Safety: env mutation guarded by env_lock().
         unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
     }
 
     #[test]
-    fn nvidia_env_aliases_resolve() {
+    fn env_first_takes_the_first_non_empty_normalized_value() {
         let _lock = env_lock();
         clear_known_envs();
+        let vars = ["OLLAMA_CLOUD_API_KEY", "OLLAMA_API_KEY"];
+        assert_eq!(env_first(&vars), None);
         // Safety: env mutation guarded by env_lock().
         unsafe {
-            std::env::set_var("NVIDIA_API_KEY", "nvidia-key");
-            std::env::set_var("NVIDIA_NIM_API_KEY", "nim-key");
+            std::env::set_var("OLLAMA_CLOUD_API_KEY", " \u{200b} ");
+            std::env::set_var("OLLAMA_API_KEY", " fallback-key\n");
         }
-        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
-        for alias in ["nvidia", "nvidia-nim", "nvidia_nim", "nim"] {
-            assert_eq!(
-                secrets.resolve(alias).as_deref(),
-                Some("nvidia-key"),
-                "NVIDIA_API_KEY should take precedence for {alias}"
-            );
-        }
-
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("NVIDIA_API_KEY") };
-        for alias in ["nvidia", "nvidia-nim", "nvidia_nim", "nim"] {
-            assert_eq!(
-                secrets.resolve(alias).as_deref(),
-                Some("nim-key"),
-                "NVIDIA_NIM_API_KEY should resolve for {alias}"
-            );
-        }
-        clear_known_envs();
-    }
-
-    #[test]
-    fn nvidia_env_aliases_do_not_consume_deepseek_credentials() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "deepseek-key") };
-        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
-
-        for alias in ["nvidia", "nvidia-nim", "nvidia_nim", "nim"] {
-            assert_eq!(
-                secrets.resolve(alias),
-                None,
-                "DeepSeek credentials must stay isolated from {alias}"
-            );
-        }
-        assert_eq!(secrets.resolve("deepseek").as_deref(), Some("deepseek-key"));
-        clear_known_envs();
-    }
-
-    #[test]
-    fn atlascloud_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("ATLASCLOUD_API_KEY", "atlas-key") };
-
-        assert_eq!(env_for("atlascloud").as_deref(), Some("atlas-key"));
-        assert_eq!(env_for("atlas").as_deref(), Some("atlas-key"));
-        assert_eq!(env_for("atlas-cloud").as_deref(), Some("atlas-key"));
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn sakana_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("FUGU_API_KEY", "fugu-key") };
-
-        assert_eq!(env_for("sakana").as_deref(), Some("fugu-key"));
-        assert_eq!(env_for("sakana-ai").as_deref(), Some("fugu-key"));
-        assert_eq!(env_for("sakana_ai").as_deref(), Some("fugu-key"));
-        assert_eq!(env_for("fugu").as_deref(), Some("fugu-key"));
-
-        clear_known_envs();
-        unsafe { std::env::set_var("SAKANA_API_KEY", "sakana-key") };
-        assert_eq!(env_for("sakana").as_deref(), Some("sakana-key"));
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn wanjie_ark_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("WANJIE_API_KEY", "wanjie-key") };
-
-        assert_eq!(env_for("wanjie-ark").as_deref(), Some("wanjie-key"));
-        assert_eq!(env_for("ark_wanjie").as_deref(), Some("wanjie-key"));
-        assert_eq!(env_for("wanjie-maas").as_deref(), Some("wanjie-key"));
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn xai_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("XAI_API_KEY", "xai-key") };
-
-        assert_eq!(env_for("xai").as_deref(), Some("xai-key"));
-        assert_eq!(env_for("x-ai").as_deref(), Some("xai-key"));
-        assert_eq!(env_for("x_ai").as_deref(), Some("xai-key"));
-        assert_eq!(env_for("grok").as_deref(), Some("xai-key"));
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn telecomjs_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("TELECOMJS_API_KEY", "telecom-key") };
-
-        for alias in [
-            "telecomjs",
-            "telecom-js",
-            "telecom_js",
-            "telecomjs-cn",
-            "tokenhub",
-        ] {
-            assert_eq!(env_for(alias).as_deref(), Some("telecom-key"), "{alias}");
-        }
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn edenai_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("EDENAI_API_KEY", "eden-key") };
-
-        for alias in ["edenai", "eden-ai", "eden_ai"] {
-            assert_eq!(env_for(alias).as_deref(), Some("eden-key"), "{alias}");
-        }
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn concentrate_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("CONCENTRATE_API_KEY", "concentrate-key") };
-
-        for alias in [
-            "concentrate",
-            "concentrate-ai",
-            "concentrate_ai",
-            "concentrateai",
-        ] {
-            assert_eq!(
-                env_for(alias).as_deref(),
-                Some("concentrate-key"),
-                "{alias}"
-            );
-        }
-        // The gateway key is its own slot: no other provider's env name feeds it
-        // and it feeds no other provider.
-        assert_eq!(env_for("edenai"), None);
-        assert_eq!(env_for("openrouter"), None);
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn opencode_go_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("OPENCODE_GO_API_KEY", "go-key") };
-
-        for alias in ["opencode-go", "opencode_go", "opencodego"] {
-            assert_eq!(env_for(alias).as_deref(), Some("go-key"), "{alias}");
-        }
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn modelstudio_variants_share_one_env_convention() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("MODELSTUDIO_API_KEY", "ms-key") };
-
-        for alias in [
-            "modelstudio-token-plan",
-            "modelstudio-token-plan-anthropic",
-            "modelstudio-coding-plan",
-            "modelstudio-coding-plan-anthropic",
-            "modelstudio",
-            "dashscope",
-            "alibaba-token-plan",
-            "alibaba-coding-plan",
-        ] {
-            assert_eq!(env_for(alias).as_deref(), Some("ms-key"), "{alias}");
-        }
-
-        clear_known_envs();
-        unsafe { std::env::set_var("DASHSCOPE_API_KEY", "dashscope-key") };
         assert_eq!(
-            env_for("modelstudio-token-plan").as_deref(),
-            Some("dashscope-key"),
-            "DASHSCOPE_API_KEY is the fallback for the same account"
+            env_first(&vars),
+            Some(("OLLAMA_API_KEY", "fallback-key".to_string()))
         );
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn opencode_zen_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("OPENCODE_ZEN_API_KEY", "zen-key") };
-
-        for alias in [
-            "opencode-zen",
-            "opencode_zen",
-            "opencodezen",
-            "zen",
-            "opencode",
-        ] {
-            assert_eq!(env_for(alias).as_deref(), Some("zen-key"), "{alias}");
-        }
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn meta_model_api_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("MODEL_API_KEY", "meta-key") };
-
-        for alias in [
-            "meta",
-            "meta-ai",
-            "meta_ai",
-            "meta-model-api",
-            "meta_model_api",
-            "muse",
-            "muse-spark",
-        ] {
-            assert_eq!(env_for(alias).as_deref(), Some("meta-key"), "{alias}");
-        }
-
-        clear_known_envs();
-        unsafe { std::env::set_var("META_MODEL_API_KEY", "meta-prefixed-key") };
-        assert_eq!(env_for("meta").as_deref(), Some("meta-prefixed-key"),);
-
-        clear_known_envs();
-    }
-
-    #[test]
-    fn xiaomi_mimo_env_aliases_resolve() {
-        let _guard = env_lock();
-        clear_known_envs();
-        unsafe { std::env::set_var("MIMO_API_KEY", "mimo-key") };
-
-        assert_eq!(env_for("xiaomi-mimo").as_deref(), Some("mimo-key"));
-        assert_eq!(env_for("xiaomimimo").as_deref(), Some("mimo-key"));
-        assert_eq!(env_for("mimo").as_deref(), Some("mimo-key"));
-        assert_eq!(env_for("xiaomi").as_deref(), Some("mimo-key"));
-
-        clear_known_envs();
-
-        unsafe { std::env::set_var("XIAOMI_API_KEY", "xiaomi-key") };
-        assert_eq!(env_for("xiaomi-mimo").as_deref(), Some("xiaomi-key"));
-        clear_known_envs();
-    }
-
-    #[test]
-    fn fireworks_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
         // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("FIREWORKS_API_KEY", "fw-key") };
-
-        assert_eq!(env_for("fireworks").as_deref(), Some("fw-key"));
-        assert_eq!(env_for("fireworks-ai").as_deref(), Some("fw-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("FIREWORKS_API_KEY") };
-    }
-
-    #[test]
-    fn together_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("TOGETHER_API_KEY", "together-key") };
-
-        // Canonical id plus the legacy hyphen/underscore spellings AND the
-        // separator-free `togetherai` id Models.dev publishes must all resolve.
-        assert_eq!(env_for("together").as_deref(), Some("together-key"));
-        assert_eq!(env_for("together-ai").as_deref(), Some("together-key"));
-        assert_eq!(env_for("together_ai").as_deref(), Some("together-key"));
-        assert_eq!(env_for("togetherai").as_deref(), Some("together-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("TOGETHER_API_KEY") };
-    }
-
-    #[test]
-    fn deepinfra_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("DEEPINFRA_API_KEY", "di-key") };
-
-        assert_eq!(env_for("deepinfra").as_deref(), Some("di-key"));
-        assert_eq!(env_for("deep-infra").as_deref(), Some("di-key"));
-        assert_eq!(env_for("deep_infra").as_deref(), Some("di-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("DEEPINFRA_API_KEY") };
-
-        // The DEEPINFRA_TOKEN fallback is honored when the primary key is unset.
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("DEEPINFRA_TOKEN", "di-token") };
-        assert_eq!(env_for("deepinfra").as_deref(), Some("di-token"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("DEEPINFRA_TOKEN") };
-    }
-
-    #[test]
-    fn novita_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("NOVITA_API_KEY", "novita-key") };
-
-        assert_eq!(env_for("novita").as_deref(), Some("novita-key"));
-        // `novita-ai` is the Models.dev provider id (Refs #4186).
-        assert_eq!(env_for("novita-ai").as_deref(), Some("novita-key"));
-        assert_eq!(env_for("novita_ai").as_deref(), Some("novita-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("NOVITA_API_KEY") };
-    }
-
-    #[test]
-    fn siliconflow_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("SILICONFLOW_API_KEY", "sf-key") };
-
-        assert_eq!(env_for("siliconflow").as_deref(), Some("sf-key"));
-        assert_eq!(env_for("silicon-flow").as_deref(), Some("sf-key"));
-        assert_eq!(env_for("silicon_flow").as_deref(), Some("sf-key"));
-        assert_eq!(env_for("siliconflow-cn").as_deref(), Some("sf-key"));
-        assert_eq!(env_for("silicon_flow_cn").as_deref(), Some("sf-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("SILICONFLOW_API_KEY") };
-    }
-
-    #[test]
-    fn arcee_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("ARCEE_API_KEY", "arcee-key") };
-
-        assert_eq!(env_for("arcee").as_deref(), Some("arcee-key"));
-        assert_eq!(env_for("arcee-ai").as_deref(), Some("arcee-key"));
-        assert_eq!(env_for("arcee_ai").as_deref(), Some("arcee-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("ARCEE_API_KEY") };
-    }
-
-    #[test]
-    fn moonshot_kimi_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("KIMI_API_KEY", "kimi-key") };
-
-        assert_eq!(env_for("moonshot").as_deref(), Some("kimi-key"));
-        assert_eq!(env_for("moonshot-ai").as_deref(), Some("kimi-key"));
-        assert_eq!(env_for("kimi").as_deref(), Some("kimi-key"));
-        assert_eq!(env_for("kimi-k2").as_deref(), Some("kimi-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("KIMI_API_KEY") };
-    }
-
-    #[test]
-    fn sglang_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("SGLANG_API_KEY", "sglang-key") };
-
-        assert_eq!(env_for("sglang").as_deref(), Some("sglang-key"));
-        assert_eq!(env_for("sg-lang").as_deref(), Some("sglang-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("SGLANG_API_KEY") };
-    }
-
-    #[test]
-    fn vllm_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("VLLM_API_KEY", "vllm-key") };
-
-        assert_eq!(env_for("vllm").as_deref(), Some("vllm-key"));
-        assert_eq!(env_for("v-llm").as_deref(), Some("vllm-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("VLLM_API_KEY") };
-    }
-
-    #[test]
-    fn ollama_env_aliases_resolve() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("OLLAMA_API_KEY", "ollama-key") };
-
-        assert_eq!(env_for("ollama").as_deref(), Some("ollama-key"));
-        assert_eq!(env_for("ollama-local").as_deref(), Some("ollama-key"));
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("OLLAMA_API_KEY") };
-    }
-
-    #[test]
-    fn ollama_cloud_env_prefers_pi_name_then_official_name() {
-        let _lock = env_lock();
-        clear_known_envs();
-        // Safety: env mutation guarded by env_lock().
-        unsafe {
-            std::env::set_var("OLLAMA_CLOUD_API_KEY", "cloud-specific-key");
-            std::env::set_var("OLLAMA_API_KEY", "official-fallback-key");
-        }
-
+        unsafe { std::env::set_var("OLLAMA_CLOUD_API_KEY", "cloud-key") };
         assert_eq!(
-            env_for("ollama-cloud").as_deref(),
-            Some("cloud-specific-key")
-        );
-        assert_eq!(
-            env_for("ollama_cloud").as_deref(),
-            Some("cloud-specific-key")
-        );
-        // The local identity stays on its original, keyless-provider env
-        // contract and never consumes the cloud-specific compatibility name.
-        assert_eq!(env_for("ollama").as_deref(), Some("official-fallback-key"));
-
-        // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("OLLAMA_CLOUD_API_KEY") };
-        assert_eq!(
-            env_for("ollama-cloud").as_deref(),
-            Some("official-fallback-key")
+            env_first(&vars),
+            Some(("OLLAMA_CLOUD_API_KEY", "cloud-key".to_string()))
         );
         clear_known_envs();
     }
@@ -2490,7 +2271,10 @@ mod tests {
 
         let _key = EnvVarGuard::set(DAYTONA_API_KEY_ENV, "dtn_env");
         assert_eq!(daytona_credential_source(&secrets), Some("env"));
-        assert_eq!(env_for("daytona").as_deref(), Some("dtn_env"));
+        assert_eq!(
+            env_first(&[DAYTONA_API_KEY_ENV, CWC_DAYTONA_TOKEN_ENV]),
+            Some((DAYTONA_API_KEY_ENV, "dtn_env".to_string()))
+        );
     }
 
     #[path = "diagnostic_tests.rs"]

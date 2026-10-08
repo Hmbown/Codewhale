@@ -21,16 +21,20 @@
 //!   never coalesce into (or clear) each other's slot.
 //! - **Durability reporting**: `FlushAndReport` returns accumulated results;
 //!   cycles without a listener log failures instead of discarding them.
-//! - **Unbounded channel** for `try_send` to always succeed. Queued snapshots
-//!   retain only the canonical journal; legacy `messages` are derived at the
-//!   disk boundary instead of doubling every paused request.
+//! - **Bounded command channel with sender-side coalescing** (#6212):
+//!   `try_send` absorbs each request into a shared latest-wins state at send
+//!   time and wakes the actor through a small bounded channel, so a paused
+//!   consumer retains one snapshot per session instead of one per send.
+//!   Queued snapshots retain only the canonical journal; legacy `messages`
+//!   are derived at the disk boundary instead of doubling every paused
+//!   request.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::session_manager::{OfflineQueueState, SavedSession, SessionManager};
+use crate::session_manager::{OfflineQueueLease, OfflineQueueState, SavedSession, SessionManager};
 use crate::utils::spawn_supervised;
 
 // ---------------------------------------------------------------------------
@@ -58,10 +62,14 @@ pub enum PersistRequest {
     /// Write queued/draft offline input for crash recovery.
     OfflineQueue {
         state: OfflineQueueState,
-        session_id: Option<String>,
+        lease: Arc<OfflineQueueLease>,
     },
     /// Remove the queued/draft offline input file.
-    ClearOfflineQueue,
+    ClearOfflineQueue {
+        /// Captures the exact owner and retains its exclusive editor lease
+        /// until the removal finishes. An unowned clear is unrepresentable.
+        lease: Arc<OfflineQueueLease>,
+    },
     /// Remove one session's crash-recovery checkpoint file. Scoped: cannot
     /// remove another session's checkpoint.
     ClearCheckpoint { session_id: String },
@@ -103,25 +111,107 @@ impl FlushReport {
 enum PendingOfflineQueue {
     Save {
         state: Box<OfflineQueueState>,
-        session_id: Option<String>,
+        lease: Arc<OfflineQueueLease>,
     },
-    Clear,
+    Clear {
+        lease: Arc<OfflineQueueLease>,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Handle (held by the TUI)
 // ---------------------------------------------------------------------------
 
-type PersistRequestSender = mpsc::UnboundedSender<PersistRequest>;
-type PersistRequestReceiver = mpsc::UnboundedReceiver<PersistRequest>;
+/// Control commands the actor reacts to. Work itself never crosses the
+/// channel: requests are coalesced into the shared [`PendingState`] at send
+/// time, so a paused consumer retains at most the latest request per session
+/// instead of every snapshot ever sent (#6212).
+enum ActorCommand {
+    /// The shared pending state has work the actor has not taken yet.
+    WorkReady,
+    FlushAndReport {
+        reply: oneshot::Sender<FlushReport>,
+    },
+    Shutdown,
+}
+
+/// Command-channel capacity. `WorkReady` is deduplicated by the `notified`
+/// flag, so only `FlushAndReport`/`Shutdown` can occupy slots unplanned; the
+/// capacity exists so those never observe a full channel in practice.
+const ACTOR_COMMAND_CAPACITY: usize = 8;
+
+/// The coalescing state shared between senders and the actor. Senders absorb
+/// under the lock; the actor `take`s (swap to empty) under the same lock and
+/// flushes outside it, so disk I/O never blocks a sender.
+#[derive(Debug, Default)]
+struct SharedPending {
+    pending: PendingState,
+    /// Whether a `WorkReady` is already queued (or being queued) and no
+    /// `take_pending` has observed it since. Reset only by `take_pending` —
+    /// the receiver side — so the flag always reflects the channel the actor
+    /// drains.
+    notified: bool,
+}
+
+#[derive(Clone)]
+struct PersistRequestSender {
+    shared: Arc<std::sync::Mutex<SharedPending>>,
+    cmd_tx: mpsc::Sender<ActorCommand>,
+    health: SessionSaveHealth,
+}
+
+impl std::fmt::Debug for PersistRequestSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistRequestSender")
+            .finish_non_exhaustive()
+    }
+}
+
+struct PersistRequestReceiver {
+    shared: Arc<std::sync::Mutex<SharedPending>>,
+    cmd_rx: mpsc::Receiver<ActorCommand>,
+    health: SessionSaveHealth,
+}
 
 /// Single construction seam for the production persistence request channel.
 ///
 /// The ignored backlog measurement uses this same factory with the receiver
-/// deliberately paused, so a later bounded-channel change cannot leave the
-/// baseline measuring an obsolete representation.
+/// deliberately paused, so the measurement always characterizes whatever
+/// representation the seam actually retains.
 fn persistence_request_channel() -> (PersistRequestSender, PersistRequestReceiver) {
-    mpsc::unbounded_channel()
+    let (cmd_tx, cmd_rx) = mpsc::channel(ACTOR_COMMAND_CAPACITY);
+    let shared = Arc::new(std::sync::Mutex::new(SharedPending::default()));
+    let health = SessionSaveHealth::default();
+    (
+        PersistRequestSender {
+            shared: Arc::clone(&shared),
+            cmd_tx,
+            health: health.clone(),
+        },
+        PersistRequestReceiver {
+            shared,
+            cmd_rx,
+            health,
+        },
+    )
+}
+
+impl PersistRequestReceiver {
+    /// Await the next actor command. `None` means every sender is gone.
+    async fn recv(&mut self) -> Option<ActorCommand> {
+        self.cmd_rx.recv().await
+    }
+
+    /// Atomically take everything coalesced so far. Resets the `notified`
+    /// flag so the next absorbed request queues a fresh `WorkReady`.
+    fn take_pending(&mut self) -> PendingState {
+        let mut guard = self
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.notified = false;
+        std::mem::take(&mut guard.pending)
+    }
 }
 
 /// Lightweight handle that the UI holds to queue persistence work.
@@ -131,8 +221,15 @@ pub struct PersistActorHandle {
 }
 
 impl PersistActorHandle {
-    /// Queue a persistence request without blocking. If the actor's channel is
-    /// closed (shutdown has already happened), return `false`.
+    /// Whether the latest save of each session document landed.
+    pub(crate) fn session_save_health(&self) -> SaveHealthReading {
+        self.tx.health.reading()
+    }
+
+    /// Queue a persistence request without blocking. The request is
+    /// coalesced into the shared pending state immediately (latest-wins per
+    /// session), so repeated snapshots of one session retain only the
+    /// newest. Returns `false` when the actor is already shut down.
     pub fn try_send(&self, mut request: PersistRequest) -> bool {
         match &mut request {
             PersistRequest::SaveCheckpoint { session }
@@ -142,7 +239,52 @@ impl PersistActorHandle {
             }
             _ => {}
         }
-        self.tx.send(request).is_ok()
+        let control = {
+            let mut guard = self
+                .tx
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.pending.absorb(request)
+        };
+        match control {
+            Control::Continue => {
+                // A WorkReady the actor has not taken yet is already queued;
+                // that take will observe this request too. `notified` resets
+                // only when the actor takes, so it always mirrors the
+                // channel the actor drains.
+                {
+                    let mut guard = self
+                        .tx
+                        .shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if guard.notified {
+                        return true;
+                    }
+                    guard.notified = true;
+                }
+                if self.tx.cmd_tx.try_send(ActorCommand::WorkReady).is_ok() {
+                    true
+                } else {
+                    // Roll the flag back so later sends re-attempt (and
+                    // re-fail) honestly instead of riding a dead wake.
+                    let mut guard = self
+                        .tx
+                        .shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.notified = false;
+                    false
+                }
+            }
+            Control::Flush(reply) => self
+                .tx
+                .cmd_tx
+                .try_send(ActorCommand::FlushAndReport { reply })
+                .is_ok(),
+            Control::Shutdown => self.tx.cmd_tx.try_send(ActorCommand::Shutdown).is_ok(),
+        }
     }
 }
 
@@ -180,13 +322,46 @@ pub fn persist(request: PersistRequest) {
     }
 }
 
+/// Order synchronous lifecycle saves after all previously queued snapshots.
+/// Refuse a single-thread runtime rather than deadlocking its persistence task.
+pub(crate) fn flush_before_transition() -> Result<(), String> {
+    let Some(handle) = ACTOR_TX.get() else {
+        return Ok(());
+    };
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    if runtime
+        .as_ref()
+        .is_some_and(|r| r.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        return Err("session transition requires an asynchronous persistence barrier".into());
+    }
+    let (reply, receiver) = oneshot::channel();
+    if !handle.try_send(PersistRequest::FlushAndReport { reply }) {
+        return Err("session transition could not queue persistence barrier".into());
+    }
+    let receive = || receiver.blocking_recv();
+    let report = if runtime.is_some() {
+        tokio::task::block_in_place(receive)
+    } else {
+        receive()
+    }
+    .map_err(|_| "session persistence stopped before the transition".to_string())?;
+    if !report.failures.is_empty() {
+        return Err(format!(
+            "session transition refused after persistence failures: {:?}",
+            report.failures
+        ));
+    }
+    Ok(())
+}
+
 fn request_label(request: &PersistRequest) -> &'static str {
     match request {
         PersistRequest::SaveCheckpoint { .. } => "SaveCheckpoint",
         PersistRequest::SessionSnapshot(_) => "SessionSnapshot",
         PersistRequest::CompletedCommit { .. } => "CompletedCommit",
         PersistRequest::OfflineQueue { .. } => "OfflineQueue",
-        PersistRequest::ClearOfflineQueue => "ClearOfflineQueue",
+        PersistRequest::ClearOfflineQueue { .. } => "ClearOfflineQueue",
         PersistRequest::ClearCheckpoint { .. } => "ClearCheckpoint",
         PersistRequest::FlushAndReport { .. } => "FlushAndReport",
         PersistRequest::Shutdown => "Shutdown",
@@ -195,6 +370,12 @@ fn request_label(request: &PersistRequest) -> &'static str {
 
 /// Queue persistence and report whether the actor accepted ownership. Work
 /// Graph projections use this acknowledgement as their publish boundary.
+/// [`PersistActorHandle::session_save_health`] of the global actor; `None`
+/// before it starts.
+pub(crate) fn session_save_health() -> Option<SaveHealthReading> {
+    ACTOR_TX.get().map(PersistActorHandle::session_save_health)
+}
+
 pub fn try_persist(request: PersistRequest) -> bool {
     ACTOR_TX
         .get()
@@ -220,9 +401,6 @@ pub fn spawn_persistence_actor(
         "persistence-actor",
         std::panic::Location::caller(),
         async move {
-            let mut pending = PendingState::default();
-            // Durability results from write cycles that no caller has asked
-            // about yet; drained into the next `FlushAndReport` reply.
             let mut unreported = FlushReport::default();
 
             // Flush pending work, log new failures, and fold the cycle's
@@ -231,51 +409,38 @@ pub fn spawn_persistence_actor(
                 manager: &SessionManager,
                 pending: &mut PendingState,
                 unreported: &mut FlushReport,
+                health: &SessionSaveHealth,
             ) {
-                let cycle = flush_inner(manager, pending);
+                let cycle = flush_inner(manager, pending, health);
                 log_flush_failures(&cycle);
                 unreported.merge(cycle);
             }
 
-            loop {
-                // Drain everything waiting, keeping only the latest of each kind.
-                while let Ok(req) = rx.try_recv() {
-                    match pending.absorb(req) {
-                        Control::Continue => {}
-                        Control::Flush(reply) => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
-                            let _ = reply.send(std::mem::take(&mut unreported));
-                        }
-                        Control::Shutdown => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
-                            return;
+            // Work is coalesced at send time into the shared pending state;
+            // every command handler takes whatever has accumulated and
+            // flushes it outside the sender lock.
+            while let Some(command) = rx.recv().await {
+                let mut pending = rx.take_pending();
+                match command {
+                    ActorCommand::WorkReady => {
+                        if !pending.is_empty() {
+                            flush_cycle(&manager, &mut pending, &mut unreported, &rx.health);
                         }
                     }
-                }
-
-                // Write coalesced work.
-                flush_cycle(&manager, &mut pending, &mut unreported);
-
-                // Block until the next request arrives.
-                match rx.recv().await {
-                    Some(req) => match pending.absorb(req) {
-                        Control::Continue => {}
-                        Control::Flush(reply) => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
-                            let _ = reply.send(std::mem::take(&mut unreported));
-                        }
-                        Control::Shutdown => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
-                            return;
-                        }
-                    },
-                    None => {
-                        // Channel closed — final flush and exit.
-                        flush_cycle(&manager, &mut pending, &mut unreported);
+                    ActorCommand::FlushAndReport { reply } => {
+                        flush_cycle(&manager, &mut pending, &mut unreported, &rx.health);
+                        let _ = reply.send(std::mem::take(&mut unreported));
+                    }
+                    ActorCommand::Shutdown => {
+                        flush_cycle(&manager, &mut pending, &mut unreported, &rx.health);
                         return;
                     }
                 }
             }
+            // Every sender is gone — final flush and exit. Each absorb
+            // guarantees a queued WorkReady, so this is normally empty.
+            let mut pending = rx.take_pending();
+            flush_cycle(&manager, &mut pending, &mut unreported, &rx.health);
         },
     );
 
@@ -302,7 +467,12 @@ struct PendingState {
     /// as a completion (or vice versa) and the clear intent stays bound to
     /// exactly the session that completed.
     completed_commits: BTreeMap<String, SavedSession>,
-    offline_queue: Option<PendingOfflineQueue>,
+    /// Latest-wins per session id, for the same reason `sessions` above is:
+    /// a single global slot dropped session A's queued text when session B
+    /// queued before the actor drained, which defeats the per-session file
+    /// naming entirely. Each pending request retains its editor lease, so a
+    /// window changing session cannot release ownership ahead of its writes.
+    offline_queue: BTreeMap<String, PendingOfflineQueue>,
 }
 
 /// What the actor loop should do after absorbing a request.
@@ -313,6 +483,16 @@ enum Control {
 }
 
 impl PendingState {
+    /// True when nothing coalesced is waiting. An empty `WorkReady` take is
+    /// skipped instead of running a no-op flush cycle.
+    fn is_empty(&self) -> bool {
+        self.checkpoints.is_empty()
+            && self.checkpoint_clears.is_empty()
+            && self.sessions.is_empty()
+            && self.completed_commits.is_empty()
+            && self.offline_queue.is_empty()
+    }
+
     fn absorb(&mut self, req: PersistRequest) -> Control {
         match req {
             PersistRequest::SaveCheckpoint { session } => {
@@ -359,14 +539,21 @@ impl PendingState {
                 self.checkpoints.remove(&id);
                 self.completed_commits.insert(id, session);
             }
-            PersistRequest::OfflineQueue { state, session_id } => {
-                self.offline_queue = Some(PendingOfflineQueue::Save {
-                    state: Box::new(state),
-                    session_id,
-                });
+            PersistRequest::OfflineQueue { state, lease } => {
+                self.offline_queue.insert(
+                    lease.session_id().to_string(),
+                    PendingOfflineQueue::Save {
+                        state: Box::new(state),
+                        lease,
+                    },
+                );
             }
-            PersistRequest::ClearOfflineQueue => {
-                self.offline_queue = Some(PendingOfflineQueue::Clear);
+            PersistRequest::ClearOfflineQueue { lease } => {
+                // A clear supersedes a pending save for its OWN session only.
+                self.offline_queue.insert(
+                    lease.session_id().to_string(),
+                    PendingOfflineQueue::Clear { lease },
+                );
             }
             PersistRequest::ClearCheckpoint { session_id } => {
                 // A clear supersedes a pending checkpoint write for the same
@@ -394,21 +581,27 @@ impl PendingState {
 /// commit clears its session's checkpoint only after that session's own
 /// write succeeded, so a failed save always leaves the crash-recovery
 /// checkpoint in place.
-fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushReport {
+fn flush_inner(
+    manager: &SessionManager,
+    pending: &mut PendingState,
+    health: &SessionSaveHealth,
+) -> FlushReport {
     let mut report = FlushReport::default();
     let mut record = |what: String, result: std::io::Result<()>| match result {
         Ok(()) => report.completed += 1,
         Err(err) => report.failures.push((what, err.kind())),
     };
 
+    // Document saves are bounded (#6842): an oversized journal is archived
+    // and pruned here, on the actor, never on the UI loop.
     for (session_id, session) in std::mem::take(&mut pending.sessions) {
-        record(
-            format!("session:{session_id}"),
-            manager.save_session(&session).map(|_| ()),
-        );
+        let result = manager.save_session_bounded(session).map(|_| ());
+        health.record(&session_id, &result);
+        record(format!("session:{session_id}"), result);
     }
     for (session_id, session) in std::mem::take(&mut pending.completed_commits) {
-        let commit_result = manager.save_session(&session);
+        let commit_result = manager.save_session_bounded(session);
+        health.record(&session_id, &commit_result);
         let save_succeeded = commit_result.is_ok();
         record(
             format!("completed-commit:{session_id}"),
@@ -433,24 +626,79 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
     for (session_id, session) in std::mem::take(&mut pending.checkpoints) {
         record(
             format!("checkpoint:{session_id}"),
-            manager.save_checkpoint(&session).map(|_| ()),
+            manager.save_checkpoint_owned(session).map(|_| ()),
         );
     }
-    if let Some(request) = pending.offline_queue.take() {
+    for (_, request) in std::mem::take(&mut pending.offline_queue) {
         match request {
-            PendingOfflineQueue::Save { state, session_id } => record(
+            PendingOfflineQueue::Save { state, lease } => record(
                 "offline-queue".to_string(),
                 manager
-                    .save_offline_queue_state(&state, session_id.as_deref())
+                    .save_offline_queue_state(&state, Some(lease.session_id()))
                     .map(|_| ()),
             ),
-            PendingOfflineQueue::Clear => record(
+            PendingOfflineQueue::Clear { lease } => record(
                 "clear-offline-queue".to_string(),
-                manager.clear_offline_queue_state(),
+                manager.clear_offline_queue_state_for(lease.session_id()),
             ),
         }
     }
     report
+}
+
+/// Which session documents' latest save failed. Only document saves count: a
+/// failed checkpoint, queue or cleanup write does not lose the conversation.
+/// A later successful save of the same session clears its entry, so a
+/// transient failure does not leave a standing alarm.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionSaveHealth(Arc<std::sync::Mutex<SaveHealthState>>);
+
+#[derive(Debug, Default)]
+struct SaveHealthState {
+    /// Bumped whenever `failing` changes, so a poller can tell what is new.
+    generation: u64,
+    failing: BTreeMap<String, std::io::ErrorKind>,
+}
+
+/// One reading of [`SessionSaveHealth`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SaveHealthReading {
+    pub(crate) generation: u64,
+    /// A session whose latest save failed, and how, while any has.
+    pub(crate) failing: Option<(String, std::io::ErrorKind)>,
+}
+
+impl SessionSaveHealth {
+    fn record<T>(&self, session_id: &str, result: &std::io::Result<T>) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = match result {
+            Ok(_) => state.failing.remove(session_id).is_some(),
+            Err(error) => {
+                state.failing.insert(session_id.to_string(), error.kind()) != Some(error.kind())
+            }
+        };
+        if changed {
+            state.generation += 1;
+        }
+    }
+
+    fn reading(&self) -> SaveHealthReading {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SaveHealthReading {
+            generation: state.generation,
+            failing: state
+                .failing
+                .iter()
+                .next()
+                .map(|(id, kind)| (id.clone(), *kind)),
+        }
+    }
 }
 
 /// Surface flush failures in the log for write cycles that have no caller
@@ -492,11 +740,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_sessions_queueing_before_a_drain_both_survive() {
+        // Per-session FILENAMES are not enough on their own: the actor
+        // coalesces pending work before those names are ever used, and the
+        // queue used one global slot while its checkpoint/session neighbours
+        // were already keyed per session. Session A's unsent text was
+        // therefore dropped whenever session B queued first.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        let (handle, task) = spawn_persistence_actor(manager);
+
+        let queue_manager = SessionManager::new(sessions_dir.clone()).expect("queue manager");
+        let lease_a = queue_manager
+            .acquire_offline_queue_lease("session-A")
+            .expect("lease A");
+        let lease_b = queue_manager
+            .acquire_offline_queue_lease("session-B")
+            .expect("lease B");
+        for (session, body) in [("session-A", "text from A"), ("session-B", "text from B")] {
+            let state = OfflineQueueState {
+                messages: vec![QueuedSessionMessage {
+                    display: body.to_string(),
+                    skill_instruction: None,
+                    skill_provenance: None,
+                }],
+                ..OfflineQueueState::default()
+            };
+            handle.try_send(PersistRequest::OfflineQueue {
+                state,
+                lease: Arc::clone(if session == "session-A" {
+                    &lease_a
+                } else {
+                    &lease_b
+                }),
+            });
+        }
+
+        let checkpoints = sessions_dir.join("checkpoints");
+        for (session, body) in [("session-A", "text from A"), ("session-B", "text from B")] {
+            let path = checkpoints.join(format!("{session}.offline_queue.json"));
+            // wait_until panics on timeout, which is the failure signal: a
+            // coalesced-away queue never appears.
+            wait_until(|| std::fs::read_to_string(&path).is_ok_and(|f| f.contains(body))).await;
+        }
+
+        // A clear names its own session and must not touch the other's.
+        handle.try_send(PersistRequest::ClearOfflineQueue {
+            lease: Arc::clone(&lease_a),
+        });
+        let a = checkpoints.join("session-A.offline_queue.json");
+        wait_until(|| !a.exists()).await;
+        assert!(
+            checkpoints.join("session-B.offline_queue.json").exists(),
+            "clearing one session must not delete another session's queued text"
+        );
+
+        drop(handle);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn actor_persists_and_clears_offline_queue_requests() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sessions_dir = tmp.path().join("sessions");
         let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
-        let queue_path = sessions_dir.join("checkpoints").join("offline_queue.json");
+        // The queue is keyed per session now (#5715-adjacent data-loss fix):
+        // two concurrent instances used to share one global file and the loser
+        // lost its unsent text. The request below carries session-A.
+        let queue_path = sessions_dir
+            .join("checkpoints")
+            .join("session-A.offline_queue.json");
+        let lease = manager
+            .acquire_offline_queue_lease("session-A")
+            .expect("queue lease");
         let (handle, task) = spawn_persistence_actor(manager);
 
         let state = OfflineQueueState {
@@ -510,7 +827,7 @@ mod tests {
 
         handle.try_send(PersistRequest::OfflineQueue {
             state,
-            session_id: Some("session-A".to_string()),
+            lease: Arc::clone(&lease),
         });
         wait_until(|| {
             std::fs::read_to_string(&queue_path)
@@ -518,7 +835,9 @@ mod tests {
         })
         .await;
 
-        handle.try_send(PersistRequest::ClearOfflineQueue);
+        handle.try_send(PersistRequest::ClearOfflineQueue {
+            lease: Arc::clone(&lease),
+        });
         wait_until(|| !queue_path.exists()).await;
         handle.try_send(PersistRequest::Shutdown);
         task.await.expect("persistence actor join");
@@ -675,6 +994,60 @@ mod tests {
         // failures — and the actor keeps running afterwards.
         assert!(report.completed >= 1, "checkpoint write must be counted");
         assert!(report.failures.is_empty(), "no failures expected");
+        handle.try_send(PersistRequest::Shutdown);
+        task.await.expect("persistence actor join");
+    }
+
+    /// The health the UI polls follows real saves through the actor: a failed
+    /// checkpoint does not count as a lost conversation, a failed document
+    /// save does, and a later successful save of that session clears it.
+    #[tokio::test]
+    async fn session_save_health_follows_document_saves_through_the_actor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        std::fs::write(sessions_dir.join("checkpoints"), b"not a directory")
+            .expect("block checkpoints dir");
+        let session = crate::session_manager::create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        let session_id = session.metadata.id.clone();
+        // A directory where the document goes makes its save fail.
+        let blocker = sessions_dir.join(format!("{session_id}.json"));
+        std::fs::create_dir(&blocker).expect("block session document");
+        let (handle, task) = spawn_persistence_actor(manager);
+        let flush = |handle: &PersistActorHandle| {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            handle.try_send(PersistRequest::FlushAndReport { reply: reply_tx });
+            reply_rx
+        };
+
+        handle.try_send(PersistRequest::SaveCheckpoint {
+            session: session.clone(),
+        });
+        flush(&handle).await.expect("flush");
+        assert_eq!(handle.session_save_health().failing, None);
+
+        handle.try_send(PersistRequest::SessionSnapshot(session.clone()));
+        flush(&handle).await.expect("flush");
+        let failed = handle.session_save_health();
+        assert_eq!(
+            failed.failing.as_ref().map(|(id, _)| id.as_str()),
+            Some(session_id.as_str())
+        );
+
+        std::fs::remove_dir(&blocker).expect("unblock");
+        handle.try_send(PersistRequest::SessionSnapshot(session));
+        flush(&handle).await.expect("flush");
+        let healed = handle.session_save_health();
+        assert_eq!(healed.failing, None, "a later save clears the failure");
+        assert!(healed.generation > failed.generation);
+
         handle.try_send(PersistRequest::Shutdown);
         task.await.expect("persistence actor join");
     }
@@ -967,5 +1340,43 @@ mod tests {
         );
         handle.try_send(PersistRequest::Shutdown);
         task.await.expect("persistence actor join");
+    }
+    #[test]
+    fn offline_queue_editor_lease_survives_until_pending_write_finishes() {
+        let directory = tempfile::tempdir().expect("queue fixture");
+        let manager = SessionManager::new(directory.path().join("sessions")).expect("manager");
+        let lease = manager
+            .acquire_offline_queue_lease("session-A")
+            .expect("first editor");
+        let mut pending = PendingState::default();
+        pending.absorb(PersistRequest::OfflineQueue {
+            state: OfflineQueueState {
+                draft: Some(QueuedSessionMessage {
+                    display: "last edited draft".into(),
+                    skill_instruction: None,
+                    skill_provenance: None,
+                }),
+                ..OfflineQueueState::default()
+            },
+            lease: Arc::clone(&lease),
+        });
+        drop(lease); // The old window changed session before the actor ran.
+        assert!(manager.acquire_offline_queue_lease("session-A").is_err());
+        let report = flush_inner(&manager, &mut pending, &SessionSaveHealth::default());
+        assert!(report.failures.is_empty(), "draft write failed: {report:?}");
+        assert_eq!(report.completed, 1);
+        let _next_editor = manager
+            .acquire_offline_queue_lease("session-A")
+            .expect("released after write");
+        assert_eq!(
+            manager
+                .load_offline_queue_state("session-A")
+                .unwrap()
+                .unwrap()
+                .draft
+                .unwrap()
+                .display,
+            "last edited draft"
+        );
     }
 }

@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -33,6 +34,11 @@ function installFixture(
     version?: string;
     glibc?: string;
     expectedStatus?: number;
+    shell?: string;
+    installUnderHome?: boolean;
+    installDirName?: string;
+    homeFiles?: string[];
+    onPath?: "first" | "shadowed";
   } = {},
 ) {
   const {
@@ -41,11 +47,19 @@ function installFixture(
     version,
     glibc = "2.39",
     expectedStatus = 0,
+    shell = "/bin/zsh",
+    installUnderHome = false,
+    installDirName = "install",
+    homeFiles = [],
+    onPath,
   } = options;
   const root = mkdtempSync(path.join(tmpdir(), "codewhale-web-installer-"));
   fixtureRoots.push(root);
   const releaseDir = path.join(root, "release");
-  const installDir = path.join(root, "install");
+  const home = path.join(root, "home");
+  const installDir = installUnderHome
+    ? path.join(home, ".local", "bin")
+    : path.join(root, installDirName);
   const fakeBin = path.join(root, "fake-bin");
   mkdirSync(releaseDir, { recursive: true });
   mkdirSync(installDir, { recursive: true });
@@ -101,6 +115,24 @@ function installFixture(
     chmodSync(destination, 0o755);
   }
 
+  for (const file of homeFiles) {
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path.join(home, file), "# existing profile\n");
+  }
+  // The installer resolves its directory with `cd -P`, so PATH must carry the
+  // real path (macOS tmpdir sits behind a /var -> /private/var symlink).
+  const pathPrefix: string[] = [];
+  if (onPath === "shadowed") {
+    const shadow = path.join(root, "shadow");
+    mkdirSync(shadow, { recursive: true });
+    for (const name of ["codewhale", "codew"]) {
+      writeFileSync(path.join(shadow, name), executable(`${name} other`));
+      chmodSync(path.join(shadow, name), 0o755);
+    }
+    pathPrefix.push(realpathSync(shadow));
+  }
+  if (onPath) pathPrefix.push(realpathSync(installDir));
+
   const legacyPath = path.join(installDir, "codewhale-tui");
   if (withLegacyTui) {
     writeFileSync(legacyPath, executable("codewhale-tui 0.9.4 (legacy fixture)"));
@@ -115,8 +147,9 @@ function installFixture(
       CODEWHALE_RELEASE_BASE_URL: "https://fixtures.invalid/download",
       ...(version ? { CODEWHALE_VERSION: version } : {}),
       FAKE_RELEASE_DIR: releaseDir,
-      HOME: path.join(root, "home"),
-      PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+      HOME: home,
+      SHELL: shell,
+      PATH: [...pathPrefix, fakeBin, process.env.PATH ?? "/usr/bin:/bin"].join(":"),
     },
   });
   expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(expectedStatus);
@@ -131,15 +164,15 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("public installer compatibility contract", () => {
-  it("refreshes a v0.9.4 legacy TUI command from verified consolidated bytes", () => {
-    const { installDir, legacyPath, result, runtime } = installFixture(true);
+  it("preserves a different legacy TUI command and directs migration to a fresh directory", () => {
+    const { installDir, legacyPath, result } = installFixture(true, { expectedStatus: 1 });
 
-    expect(readFileSync(path.join(installDir, "codewhale"))).toEqual(runtime);
-    expect(readFileSync(path.join(installDir, "codew"))).toEqual(runtime);
-    expect(readFileSync(legacyPath)).toEqual(runtime);
-    expect(result.stdout).toContain("Refreshed legacy compatibility command:");
-    expect(result.stdout).toContain("codewhale 0.9.5 (fixture)");
-    expect(result.stdout).not.toContain("0.9.4");
+    expect(existsSync(path.join(installDir, "codewhale"))).toBe(false);
+    expect(existsSync(path.join(installDir, "codew"))).toBe(false);
+    expect(readFileSync(legacyPath)).toEqual(executable("codewhale-tui 0.9.4 (legacy fixture)"));
+    expect(result.stderr).toContain(legacyPath);
+    expect(result.stderr).toContain("mktemp -d");
+    expect(result.stderr).toContain("No existing file was changed");
   });
 
   it("does not create the retired TUI command for a clean v0.9.5 install", () => {
@@ -149,6 +182,93 @@ describe.skipIf(process.platform === "win32")("public installer compatibility co
     expect(readFileSync(path.join(installDir, "codew"))).toEqual(runtime);
     expect(existsSync(legacyPath)).toBe(false);
     expect(result.stdout).not.toContain("Refreshed legacy compatibility command:");
+  });
+
+  it.each([
+    ["/bin/zsh", "Linux", `echo 'export PATH="INSTALL:$PATH"' >> ~/.zshrc`, ". ~/.zshrc"],
+    ["/bin/bash", "Linux", `echo 'export PATH="INSTALL:$PATH"' >> ~/.bashrc`, ". ~/.bashrc"],
+    ["/bin/bash", "Darwin", `echo 'export PATH="INSTALL:$PATH"' >> ~/.bash_profile`, ". ~/.bash_profile"],
+    ["/usr/bin/fish", "Linux", `fish_add_path "INSTALL"`, "this fish shell"],
+    ["/bin/dash", "Linux", `echo 'export PATH="INSTALL:$PATH"' >> ~/.profile`, ". ~/.profile"],
+  ] as const)(
+    "prints the persistent PATH line for %s on %s without editing a profile",
+    (shell, os, persist, reload) => {
+      const { installDir, result } = installFixture(false, { shell, os });
+
+      // The fixture install dir is never on PATH, so the hint always prints.
+      expect(result.stdout).toContain("PATH selects");
+      expect(result.stdout).toContain(persist.replace("INSTALL", realpathSync(installDir)));
+      expect(result.stdout).toContain(reload);
+      expect(result.stdout).toContain("docs/INSTALL.md#put-it-on-your-path");
+      // HOME (a sibling of the install dir) is never created: no profile was written.
+      expect(existsSync(path.join(installDir, "..", "home"))).toBe(false);
+    },
+  );
+
+  it.skipIf(!existsSync("/bin/dash"))("the printed profile and reload commands work in dash", () => {
+    const { installDir, result } = installFixture(false, { shell: "/bin/dash", os: "Linux" });
+    const persist = result.stdout.split("\n").find((line) => line.trim().startsWith("echo 'export PATH="));
+    const reload = result.stdout.match(/Then run: (.+?)   \(or open a new terminal\)/)?.[1];
+    expect(persist).toBeDefined();
+    expect(reload).toBeDefined();
+    const home = path.join(installDir, "..", "home");
+    mkdirSync(home, { recursive: true });
+    const applied = spawnSync("/bin/dash", ["-c", `set -e\n${persist}\n${reload}\ncommand -v codewhale`], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home },
+    });
+    expect(applied.status, applied.stderr).toBe(0);
+    expect(applied.stdout.trim()).toBe(path.join(realpathSync(installDir), "codewhale"));
+  });
+
+  it("writes the default directory as $HOME/.local/bin in the persistent line", () => {
+    const { result } = installFixture(false, { installUnderHome: true });
+
+    expect(result.stdout).toContain(`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`);
+  });
+
+  it.each([
+    [[".profile"], "~/.profile"],
+    [[".bash_login", ".profile"], "~/.bash_login"],
+    [[".bash_profile", ".profile"], "~/.bash_profile"],
+  ] as const)("keeps macOS login bash reading %j by naming %s", (homeFiles, profile) => {
+    const { result } = installFixture(false, { shell: "/bin/bash", os: "Darwin", homeFiles: [...homeFiles] });
+
+    expect(result.stdout).toContain(`:$PATH"' >> ${profile}\n`);
+  });
+
+  it.each(["/bin/tcsh", "/usr/bin/nu"])("prints no POSIX line for the unrecognised shell %s", (shell) => {
+    const { result } = installFixture(false, { shell });
+
+    expect(result.stdout).toContain(`this installer has no PATH line for ${path.basename(shell)}`);
+    expect(result.stdout).not.toContain("export PATH=");
+    expect(result.stdout).toContain("docs/INSTALL.md#put-it-on-your-path");
+  });
+
+  it.each(["it's", "$(id)", "a`b`", 'q"x', "back\\slash"])(
+    "prints no pasteable PATH line for a directory named %s",
+    (installDirName) => {
+      const { result } = installFixture(false, { installDirName });
+
+      expect(result.stdout).toContain("contains shell-special characters");
+      expect(result.stdout).not.toContain("export PATH=");
+      expect(result.stdout).not.toContain(">> ~/");
+    },
+  );
+
+  it("prints no PATH hint when PATH already selects this install", () => {
+    const { result } = installFixture(false, { onPath: "first" });
+
+    expect(result.stdout).not.toContain("PATH selects");
+    expect(result.stdout).not.toContain("first on PATH in future shells");
+    expect(result.stdout).not.toContain("export PATH=");
+  });
+
+  it("prints the PATH hint when an earlier PATH entry shadows this install", () => {
+    const { result } = installFixture(false, { onPath: "shadowed" });
+
+    expect(result.stdout).toMatch(/PATH selects .*shadow\/codewhale; this install is/);
+    expect(result.stdout).toContain("first on PATH in future shells");
   });
 
   it.each([undefined, "v0.9.6", "v0.9.11"])(

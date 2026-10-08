@@ -25,9 +25,9 @@ use std::path::Path;
 
 use crate::fleet::profile::{FleetProfileDraft, UntrustedProfileParse};
 use crate::llm_client::LlmClient;
-use crate::localization::Locale;
-use crate::models::Role;
-use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
+use codewhale_localization::Locale;
+use codewhale_models::Role;
+use codewhale_models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
 /// Output budget for the one-shot profile draft. Profiles are small; this is
 /// a real ceiling on a misbehaving provider, not a target.
@@ -274,10 +274,10 @@ pub(crate) async fn draft_fleet_profile_with_model<C: LlmClient>(
         .create_message(request)
         .await
         .map_err(|err| format!("request failed: {err:#}"))?;
-    if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+    if codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
         return Err(format!(
             "the draft reply was incomplete (provider stop reason `{}`)",
-            crate::models::stop_reason_detail(response.stop_reason.as_deref())
+            codewhale_models::stop_reason_detail(response.stop_reason.as_deref())
         ));
     }
     let text = profile_draft_response_text(&response.content);
@@ -294,7 +294,7 @@ pub(crate) async fn draft_fleet_profile_with_model<C: LlmClient>(
 mod tests {
     use super::*;
     use crate::llm_client::mock::MockLlmClient;
-    use crate::models::{MessageResponse, Usage};
+    use codewhale_models::{MessageResponse, Usage};
 
     fn text_response(text: &str) -> MessageResponse {
         MessageResponse {

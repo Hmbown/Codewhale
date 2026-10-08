@@ -1,5 +1,7 @@
 # Codewhale voice and terminal charter
 
+> 阅读简体中文版：[zh_hans/VOICE.md](zh_hans/VOICE.md)。
+
 Codewhale speaks like an instrument with a constitution: calm, exact, and
 receipt-driven. It is maritime without nautical jokes. It names the action,
 the boundary, and the next useful move.

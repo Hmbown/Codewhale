@@ -231,23 +231,54 @@ async fn task_round_trip_carries_all_options_and_normalizes_profile() {
 }
 
 #[tokio::test]
-async fn task_write_authority_requires_bounded_coordination_scope() {
+async fn scopeless_write_tasks_dispatch_and_leave_scope_to_the_spawn_boundary() {
+    // A Workflow script starts a writing child the same way the Agent tool
+    // does: no declared scope, so the spawn boundary claims the workspace
+    // root. The VM must not refuse it before dispatch.
     let driver = Arc::new(FakeDriver::new());
-    let error = run(
+    run(
         &driver,
         r#"
+        await task({ prompt: "implement it", type: "implementer" });
+        await task({ prompt: "build it", type: "builder" });
+        await task({ prompt: "do it", type: "general" });
+        await task({ prompt: "lead it", profile: "release-lead" });
         return await task({
             prompt: "edit without a claim",
-            type: "implementer",
             writeAuthority: "workspace_write",
         });
         "#,
         json!(null),
     )
     .await
-    .expect_err("unscoped Workflow writer must fail before driver dispatch")
+    .expect("scopeless write tasks dispatch");
+    let requests = driver.requests();
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert!(request.write_roots.is_empty());
+        assert!(request.exact_files.is_empty());
+        assert!(request.coordination_contracts.is_empty());
+    }
+    assert_eq!(requests[0].subagent_type.as_deref(), Some("implementer"));
+    assert_eq!(
+        requests[4].write_authority.as_deref(),
+        Some("workspace_write")
+    );
+
+    // A read-only role still cannot claim write authority.
+    let driver = Arc::new(FakeDriver::new());
+    let error = run(
+        &driver,
+        r#"return await task({ prompt: "x", type: "reviewer", writeAuthority: "workspace_write" });"#,
+        json!(null),
+    )
+    .await
+    .expect_err("read-only role with write authority")
     .to_string();
-    assert!(error.contains("requires writeRoots"), "{error}");
+    assert!(
+        error.contains("read-only roles cannot declare write-capable authority"),
+        "{error}"
+    );
     assert!(driver.requests().is_empty());
 }
 
@@ -316,12 +347,12 @@ async fn task_write_paths_normalize_and_reject_escape_spellings() {
 }
 
 #[tokio::test]
-async fn task_explicit_write_roles_fail_closed_without_scope_and_reject_write_escalation() {
+async fn task_read_only_roles_reject_write_escalation() {
+    // Scopeless write-capable tasks dispatch (see
+    // scopeless_write_tasks_dispatch_and_leave_scope_to_the_spawn_boundary);
+    // a read-only role still cannot claim write authority, and contradictory
+    // identities are still refused.
     for source in [
-        r#"return await task({prompt: "no scope", type: "implementer"});"#,
-        r#"return await task({prompt: "no scope", type: "builder"});"#,
-        r#"return await task({prompt: "no scope", type: "general"});"#,
-        r#"return await task({prompt: "no scope", profile: "release-lead"});"#,
         r#"return await task({prompt: "wrong authority", type: "reviewer", writeAuthority: "workspace_write", writeRoots: ["src"]});"#,
         r#"return await task({prompt: "wrong authority", type: "scout", writeAuthority: "workspace_write", writeRoots: ["src"]});"#,
         r#"return await task({prompt: "role conflict", type: "implementer", role: "reviewer", writeRoots: ["src"]});"#,
@@ -633,6 +664,45 @@ async fn parallel_partial_mode_keeps_schema_failures_as_structured_slots() {
             ProgressEvent::TaskSchemaValidationFailed { kind, .. } if kind == "json_parse"
         )),
         "partial mode must not swallow the schema-failure receipt"
+    );
+}
+
+/// Audit R06-10: a cancel that lands while `task()` is still waiting on
+/// admission ends the run instead of leaving it parked on the driver.
+#[tokio::test]
+async fn cancel_during_task_admission_ends_the_run() {
+    let driver = Arc::new(FakeDriver::new());
+    driver.on("gate", FakeReply::HoldAdmission);
+    let cancel = WorkflowRunCancel::new();
+    let run_cancel = cancel.clone();
+    let run_driver = driver.clone();
+    let handle = tokio::spawn(async move {
+        WorkflowVm::new()
+            .run_script_with_cancel(
+                r#"await task({ description: "gate" });"#,
+                json!(null),
+                run_driver as Arc<dyn codewhale_workflow_js::WorkflowDriver>,
+                run_cancel,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while driver.spawn_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task should reach admission");
+    cancel.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the run must end once cancelled")
+        .expect("VM task should join");
+    assert!(
+        matches!(result, Err(WorkflowJsError::Cancelled)),
+        "{result:?}"
     );
 }
 
@@ -2424,5 +2494,262 @@ async fn the_dropped_slot_breadcrumb_names_the_kind_and_the_slot() {
         )),
         "the breadcrumb must name the kind and the slot: {:?}",
         driver.events()
+    );
+}
+
+struct EchoInvoker;
+
+#[async_trait::async_trait]
+impl codewhale_workflow_js::ToolInvoker for EchoInvoker {
+    async fn invoke(
+        &self,
+        request: codewhale_workflow_js::ToolCallRequest,
+    ) -> Result<codewhale_workflow_js::ToolCallResponse, codewhale_workflow_js::DriverError> {
+        use codewhale_workflow_js::{DriverError, ToolCallResponse};
+        if request.tool == "boom" {
+            return Ok(ToolCallResponse {
+                ok: false,
+                result: json!("kaput"),
+            });
+        }
+        if request.tool == "deny" {
+            return Err(DriverError::Rejected("nope".to_string()));
+        }
+        Ok(ToolCallResponse {
+            ok: true,
+            result: json!({ "echo": request.input }),
+        })
+    }
+}
+
+async fn run_tools(source: &str) -> Result<serde_json::Value, WorkflowJsError> {
+    let driver = Arc::new(FakeDriver::new());
+    WorkflowVm::new()
+        .run_tools_script(
+            source,
+            json!(null),
+            driver.clone() as Arc<dyn codewhale_workflow_js::WorkflowDriver>,
+            Arc::new(EchoInvoker) as Arc<dyn codewhale_workflow_js::ToolInvoker>,
+            WorkflowRunCancel::new(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn tools_surface_is_absent_without_invoker() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(&driver, "return typeof tools;", json!(null))
+        .await
+        .unwrap();
+    assert_eq!(value, json!("undefined"));
+}
+
+#[tokio::test]
+async fn tools_call_round_trips() {
+    let value =
+        run_tools(r#"const r = await tools.call("read", { path: "x" }); return r.echo.path;"#)
+            .await
+            .unwrap();
+    assert_eq!(value, json!("x"));
+}
+
+#[tokio::test]
+async fn native_callbacks_stay_on_the_originating_host_runtime() {
+    use codewhale_workflow_js::{
+        BudgetSnapshot, DriverError, SpawnedTask, TaskRequest, ToolCallRequest, ToolCallResponse,
+        ToolInvoker, WorkflowDriver,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OriginCallbacks {
+        origin: std::thread::ThreadId,
+        calls: AtomicUsize,
+        driver: FakeDriver,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowDriver for OriginCallbacks {
+        async fn spawn_task(&self, request: TaskRequest) -> Result<SpawnedTask, DriverError> {
+            assert_eq!(std::thread::current().id(), self.origin);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.driver.spawn_task(request).await
+        }
+
+        fn cancel_all(&self) {
+            self.driver.cancel_all();
+        }
+
+        fn budget(&self) -> BudgetSnapshot {
+            self.driver.budget()
+        }
+
+        fn progress(&self, event: ProgressEvent) {
+            self.driver.progress(event);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolInvoker for OriginCallbacks {
+        async fn invoke(&self, request: ToolCallRequest) -> Result<ToolCallResponse, DriverError> {
+            assert_eq!(std::thread::current().id(), self.origin);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            EchoInvoker.invoke(request).await
+        }
+    }
+
+    let callbacks = Arc::new(OriginCallbacks {
+        origin: std::thread::current().id(),
+        calls: AtomicUsize::new(0),
+        driver: FakeDriver::new(),
+    });
+    let value = WorkflowVm::new()
+        .run_tools_script(
+            r#"const child = await task({ description: "origin-thread" });
+               const tool = await tools.call("read", { path: "original" });
+               return { child, path: tool.echo.path };"#,
+            json!(null),
+            callbacks.clone(),
+            callbacks.clone(),
+            WorkflowRunCancel::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        value,
+        json!({"child": "done:origin-thread", "path": "original"})
+    );
+    assert_eq!(callbacks.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(callbacks.driver.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn tools_call_refusal_throws_admission_kind() {
+    let value = run_tools(
+        r#"try { await tools.call("deny", {}); return "no-throw"; } catch (e) { return e.kind; }"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!("admission"));
+}
+
+#[tokio::test]
+async fn tools_call_failure_throws_agent_kind() {
+    let value = run_tools(
+        r#"try { await tools.call("boom", {}); return "no-throw"; } catch (e) { return e.kind; }"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!("agent"));
+}
+
+#[tokio::test]
+async fn tools_call_cap_rejects_runaway_loops() {
+    let err = run_tools(
+        r#"for (let i = 0; i < 55; i++) { await tools.call("read", {}); } return "never";"#,
+    )
+    .await;
+    let message = script_message(err);
+    assert!(
+        message.contains("per-run tool-call cap"),
+        "unexpected: {message}"
+    );
+}
+
+/// A platform-native absolute path for `unix_path` (`/a/b`): unchanged on
+/// Unix, `C:\a\b` on Windows, where `/a/b` has no drive and is not absolute.
+fn native_abs(unix_path: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", unix_path.replace('/', "\\"))
+    } else {
+        unix_path.to_string()
+    }
+}
+
+/// An absolute `cwd` inside the run's workspace normalizes to the
+/// repo-relative form; outside it, through `..`, or with no known workspace
+/// it is still refused (the trust boundary is unchanged).
+#[test]
+fn absolute_cwd_inside_the_workspace_normalizes_and_outside_is_refused() {
+    use codewhale_workflow_js::{normalize_task_cwd, normalize_task_cwd_in};
+    use std::path::PathBuf;
+    let workspace = PathBuf::from(native_abs("/Volumes/VIXinSSD/CW"));
+    let workspace = Some(workspace.as_path());
+    assert_eq!(
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/codewhale"), workspace).unwrap(),
+        "codewhale"
+    );
+    assert_eq!(
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/./crates/tui"), workspace).unwrap(),
+        "crates/tui"
+    );
+    assert_eq!(
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/"), workspace).unwrap(),
+        "."
+    );
+    assert_eq!(
+        normalize_task_cwd_in("crates/tui", workspace).unwrap(),
+        normalize_task_cwd("crates/tui").unwrap()
+    );
+    for outside in [
+        native_abs("/Volumes/VIXinSSD/CW-other/codewhale"),
+        native_abs("/Volumes/VIXinSSD"),
+        native_abs("/etc"),
+        native_abs("/Volumes/VIXinSSD/CW/../secrets"),
+        native_abs("/Volumes/VIXinSSD/CW/codewhale/../../secrets"),
+        native_abs("/Volumes/VIXinSSD/X/../CW/codewhale"),
+    ] {
+        let error = normalize_task_cwd_in(&outside, workspace).unwrap_err();
+        assert!(
+            error.contains("outside the workspace") || error.contains("parent traversal"),
+            "{outside}: {error}"
+        );
+    }
+    let error =
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/codewhale"), None).unwrap_err();
+    assert!(error.contains("bounded repo-relative paths"), "{error}");
+}
+
+/// Windows spellings of the same workspace path: a verbatim `\\?\` prefix on
+/// either side, forward slashes, and a different case all match; another
+/// drive or a sibling directory does not.
+#[cfg(windows)]
+#[test]
+fn absolute_cwd_matches_windows_spellings_of_the_workspace() {
+    use codewhale_workflow_js::normalize_task_cwd_in;
+    use std::path::Path;
+    let plain = Path::new(r"C:\Users\dev\CW");
+    let verbatim = Path::new(r"\\?\C:\Users\dev\CW");
+    for workspace in [plain, verbatim] {
+        for inside in [
+            r"C:\Users\dev\CW\codewhale",
+            "C:/Users/dev/CW/codewhale",
+            r"c:\users\DEV\cw\codewhale",
+            r"\\?\C:\Users\dev\CW\codewhale",
+        ] {
+            assert_eq!(
+                normalize_task_cwd_in(inside, Some(workspace)).unwrap(),
+                "codewhale",
+                "{inside} in {}",
+                workspace.display()
+            );
+        }
+        for outside in [
+            r"D:\Users\dev\CW\codewhale",
+            r"C:\Users\dev\CW-other",
+            r"C:\Users\dev\CW\..\secrets",
+            r"\\server\share\Users\dev\CW",
+        ] {
+            let error = normalize_task_cwd_in(outside, Some(workspace)).unwrap_err();
+            assert!(
+                error.contains("outside the workspace") || error.contains("parent traversal"),
+                "{outside}: {error}"
+            );
+        }
+    }
+    // A UNC workspace matches its own share, case-insensitively.
+    let unc = Path::new(r"\\Server\Share\CW");
+    assert_eq!(
+        normalize_task_cwd_in(r"\\server\share\cw\codewhale", Some(unc)).unwrap(),
+        "codewhale"
     );
 }

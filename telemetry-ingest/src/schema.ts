@@ -17,7 +17,13 @@
  */
 
 /** `SCHEMA_VERSION` in `crates/telemetry/src/event.rs`. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
+
+/** Disclosed default-on policy, not a record of human acceptance. */
+export const NOTICE_VERSION = 5;
+
+/** Explicit consent to the PostHog processor disclosure. */
+export const CONSENT_VERSION = 4;
 
 /** `BATCH_MAX_EVENTS` in `crates/telemetry/src/actor.rs`. */
 export const BATCH_MAX_EVENTS = 200;
@@ -83,7 +89,13 @@ export const SURFACES = [
   "app-server",
   "mcp-server",
   "serve",
+  "website",
+  "web-app",
+  "desktop",
+  "control-plane",
 ] as const;
+
+const LEGACY_SURFACES = SURFACES.slice(0, 6);
 
 /** `Os::as_str`. */
 export const OSES = [
@@ -137,6 +149,7 @@ export const COLD_START_BUCKETS = [
 /** `Batch::FIELDS`, in declaration order. */
 export const ENVELOPE_FIELDS = [
   "schema_version",
+  "notice_version",
   "sent_at",
   "install_id",
   "app_version",
@@ -147,6 +160,23 @@ export const ENVELOPE_FIELDS = [
   "libc",
   "tty",
   "events",
+] as const;
+
+/** The unchanged v1 contract never establishes processor consent. */
+export const LEGACY_ENVELOPE_FIELDS = ENVELOPE_FIELDS.filter((field) => field !== "notice_version");
+/** V2 retains its original explicit-consent meaning and closed field set. */
+export const V2_ENVELOPE_FIELDS = [...LEGACY_ENVELOPE_FIELDS, "consent_version"];
+
+/** Aggregate product interactions; no page, account, session, or tool identifiers. */
+export const PRODUCT_COUNTER_FIELDS = [
+  "page_view", "docs_view", "install_copy", "download", "signup", "login",
+  "session_create", "session_resume", "turn_submit", "turn_complete",
+  "settings_open", "integration_connect", "error_shown",
+] as const;
+
+/** Anonymous operator-consented service health aggregates. */
+export const OPERATIONS_FIELDS = [
+  "requests", "errors", "duration_ms_total", "duration_ms_max", "probes", "probes_failed",
 ] as const;
 
 /** `Counters::FIELDS`, in declaration order. */
@@ -201,6 +231,8 @@ export const EVENT_FIELDS: Readonly<Record<string, readonly string[]>> = {
     "turn_wall",
   ],
   panic: ["event", "site"],
+  product_usage: ["event", "counters"],
+  operations_summary: ["event", ...OPERATIONS_FIELDS],
 };
 
 /** Every event discriminant, for the doc-match test. */
@@ -250,6 +282,51 @@ const PROVIDER_RE = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
 
 const U32_MAX = 4294967295;
 
+/** Derived contract for CWC's product-only ingress; runtime events stay here. */
+export const CWC_PRODUCT_SCHEMA = {
+  $schema: "http://json-schema.org/draft-07/schema#",
+  $id: "https://codewhale.net/schemas/cwc-product-telemetry-v3.json",
+  title: "Codewhale CWC aggregate telemetry v3, notice v5",
+  description: "Generated from telemetry-ingest/src/schema.ts; do not edit the JSON artifact. No content or identity fields.",
+  type: "object",
+  additionalProperties: false,
+  required: ENVELOPE_FIELDS,
+  properties: {
+    schema_version: { const: SCHEMA_VERSION },
+    notice_version: { const: NOTICE_VERSION },
+    sent_at: { type: "string", pattern: SENT_AT_RE.source },
+    install_id: { type: "string", pattern: INSTALL_ID_RE.source },
+    app_version: { type: "string", maxLength: MAX_VERSION_LEN, pattern: VERSION_RE.source },
+    git_sha: { const: null },
+    surface: { enum: SURFACES.filter((surface) => surface === "web-app" || surface === "desktop") },
+    os: { const: "other" },
+    arch: { const: "other" },
+    libc: { const: "none" },
+    tty: { const: false },
+    events: {
+      type: "array",
+      minItems: 1,
+      maxItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: EVENT_FIELDS.product_usage,
+        properties: {
+          event: { const: "product_usage" },
+          counters: {
+            type: "object",
+            additionalProperties: false,
+            required: PRODUCT_COUNTER_FIELDS,
+            properties: Object.fromEntries(PRODUCT_COUNTER_FIELDS.map((field) => [
+              field, { type: "integer", minimum: 0, maximum: U32_MAX },
+            ])),
+          },
+        },
+      },
+    },
+  },
+} as const;
+
 // ------------------------------------------------------------------ validation
 
 /** A rejection carries a reason for the tests. It is never sent to a client. */
@@ -261,6 +338,8 @@ export type Accepted = { ok: true; batch: Batch };
 export type Counters = Record<(typeof COUNTER_FIELDS)[number], number>;
 export type Errors = Record<(typeof ERROR_FIELDS)[number], number>;
 export type TurnWall = Record<(typeof TURN_WALL_FIELDS)[number], number>;
+
+export type ProductCounters = Record<(typeof PRODUCT_COUNTER_FIELDS)[number], number>;
 
 export type Event =
   | { event: "install_or_upgrade"; kind: string; previous_version: string | null }
@@ -275,10 +354,14 @@ export type Event =
       errors: Errors;
       turn_wall: TurnWall;
     }
-  | { event: "panic"; site: string };
+  | { event: "panic"; site: string }
+  | { event: "product_usage"; counters: ProductCounters }
+  | ({ event: "operations_summary" } & Record<(typeof OPERATIONS_FIELDS)[number], number>);
 
 export interface Batch {
   schema_version: number;
+  consent_version?: number;
+  notice_version?: number;
   sent_at: string;
   install_id: string;
   app_version: string;
@@ -352,7 +435,7 @@ function u32Map(
 function validateEvent(value: unknown, where: string): string | null {
   if (!isPlainObject(value)) return `${where}: not an object`;
   const name = value.event;
-  if (typeof name !== "string" || !(name in EVENT_FIELDS)) {
+  if (typeof name !== "string" || !Object.hasOwn(EVENT_FIELDS, name)) {
     return `${where}: unknown event discriminant`;
   }
   const keyError = keysExactly(value, EVENT_FIELDS[name], `${where}(${name})`);
@@ -426,6 +509,12 @@ function validateEvent(value: unknown, where: string): string | null {
         u32Map(value.turn_wall, TURN_WALL_FIELDS, `${where}.turn_wall`)
       );
     }
+    case "operations_summary": {
+      const { event: _event, ...counts } = value;
+      return u32Map(counts, OPERATIONS_FIELDS, where);
+    }
+    case "product_usage":
+      return u32Map(value.counters, PRODUCT_COUNTER_FIELDS, `${where}.counters`);
     case "panic": {
       const site = value.site;
       if (typeof site !== "string" || site.length > MAX_PANIC_SITE_LEN) {
@@ -451,11 +540,19 @@ function validateEvent(value: unknown, where: string): string | null {
 export function validateBatch(value: unknown): Accepted | Rejection {
   if (!isPlainObject(value)) return { ok: false, reason: "batch: not an object" };
 
-  const keyError = keysExactly(value, ENVELOPE_FIELDS, "batch");
-  if (keyError) return { ok: false, reason: keyError };
-
-  if (value.schema_version !== SCHEMA_VERSION) {
+  const legacy = value.schema_version === 1;
+  const explicitConsent = value.schema_version === 2;
+  if (!legacy && !explicitConsent && value.schema_version !== SCHEMA_VERSION) {
     return { ok: false, reason: "batch.schema_version: unsupported" };
+  }
+  const fields = legacy ? LEGACY_ENVELOPE_FIELDS : explicitConsent ? V2_ENVELOPE_FIELDS : ENVELOPE_FIELDS;
+  const keyError = keysExactly(value, fields, "batch");
+  if (keyError) return { ok: false, reason: keyError };
+  if (explicitConsent && value.consent_version !== CONSENT_VERSION) {
+    return { ok: false, reason: "batch.consent_version: explicit current consent required" };
+  }
+  if (!legacy && !explicitConsent && value.notice_version !== NOTICE_VERSION) {
+    return { ok: false, reason: "batch.notice_version: current policy required" };
   }
   if (typeof value.sent_at !== "string" || !SENT_AT_RE.test(value.sent_at)) {
     return { ok: false, reason: "batch.sent_at: not RFC3339 UTC seconds" };
@@ -479,7 +576,7 @@ export function validateBatch(value: unknown): Accepted | Rejection {
     }
   }
   const enumErrors =
-    enumString(value.surface, SURFACES, "batch.surface") ??
+    enumString(value.surface, legacy ? LEGACY_SURFACES : SURFACES, "batch.surface") ??
     enumString(value.os, OSES, "batch.os") ??
     enumString(value.arch, ARCHES, "batch.arch") ??
     enumString(value.libc, LIBCS, "batch.libc");
@@ -495,7 +592,16 @@ export function validateBatch(value: unknown): Accepted | Rejection {
     return { ok: false, reason: "batch.events: over BATCH_MAX_EVENTS" };
   }
   for (let index = 0; index < value.events.length; index += 1) {
-    const eventError = validateEvent(value.events[index], `events[${index}]`);
+    const event = value.events[index];
+    if (isPlainObject(event)) {
+      if (legacy && (event.event === "product_usage" || event.event === "operations_summary")) {
+        return { ok: false, reason: "events: aggregate product/operations events require schema v2 or v3" };
+      }
+      if (event.event === "operations_summary" && value.surface !== "control-plane") {
+        return { ok: false, reason: "events: operations_summary requires control-plane surface" };
+      }
+    }
+    const eventError = validateEvent(event, `events[${index}]`);
     if (eventError) return { ok: false, reason: eventError };
   }
 

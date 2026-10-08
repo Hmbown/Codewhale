@@ -1,0 +1,397 @@
+[
+  {
+    "name": "bash",
+    "description": "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is the seconds to wait in the foreground (default 120 seconds); a command still running then is never killed for time: it moves to the background and you get its output so far and a task_id, so long builds and tests need no special timeout. Find task_shell_wait with tool_search to read more or wait for it. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "The command to execute. Actual execution shell: `/bin/bash`. Use Bash syntax: pipelines, redirections, $(command), and && / || are supported. Quote paths and variable expansions, such as \"$path\"; use single quotes for literal text. For literal multiline input, use a quoted heredoc delimiter (<<'EOF') with its closing delimiter on a separate line. Use only installed programs; do not assume GNU-specific flags on macOS/BSD. Example: printf '%s\\n' 'sample'.",
+          "type": "string"
+        },
+        "justification": {
+          "description": "Required with sandbox_permissions: one sentence explaining why this exact command needs wider access.",
+          "type": "string"
+        },
+        "read_only": {
+          "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation.",
+          "type": "boolean"
+        },
+        "sandbox_permissions": {
+          "description": "The wider sandbox mode this exact command needs. Use only as a one-shot retry after a sandbox denial; requires justification and user approval in Ask.",
+          "enum": [
+            "workspace-write",
+            "danger-full-access"
+          ],
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Optional seconds to wait in the foreground (default 120 seconds). A command still running then is not killed: it moves to the background and you get its output so far and a task_id. Find task_shell_wait with tool_search to read more or wait for it.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "create_goal",
+    "description": "Create the session's one persistent goal: a completion objective Codewhale keeps working toward across turns until it is verified complete, blocked, or the user stops it. A goal is for a durable objective that outlasts one turn: a multi-step outcome the user wants continued and verified. A question, a greeting, or a one-shot edit completes as an ordinary turn. When the user explicitly asks to use `/goal` or to make something the goal, `create_goal` is what records it; acknowledging it in prose records nothing. The objective is the user's full objective, not a shortened one-turn version. token_budget carries a budget the user stated; with none stated it stays unset. Creating a goal shows the user a one-line receipt (they can /goal pause or /goal clear), so it needs no separate confirmation. Only one unfinished goal exists at a time: an existing one is completed or cleared before another is created.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "objective": {
+          "description": "The full objective to pursue. Keep the complete user goal, not a shortened one-turn version.",
+          "type": "string"
+        },
+        "token_budget": {
+          "description": "Optional soft token budget for the goal.",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "objective"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "edit",
+    "description": "Edit one file with targeted text replacements. Every edits[].oldText must identify a unique, non-overlapping region of the original file. Merge nearby or overlapping changes into one edit.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "edits": {
+          "description": "One or more disjoint replacements, all matched against the original file.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "newText": {
+                "description": "Replacement text; may be empty to delete the matched span.",
+                "type": "string"
+              },
+              "oldText": {
+                "description": "Text identifying one unique region to replace.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "newText",
+              "oldText"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "Path to the file to edit (relative or absolute).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "edits",
+        "path"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "get_goal",
+    "description": "Inspect the current runtime goal state, including objective, status, token budget, elapsed time, evidence, and blocker.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "load_skill",
+    "description": "Load a named skill's SKILL.md body and companion file list into this turn. Use when the user names a skill, or when an entry in the system prompt's `## Skills` index matches the task -- load it before starting the work, not after. Pass query=\"...\" to search names and descriptions, or name=\"list\" for the whole catalogue. Resolves global and plugin skills that `read` cannot reach.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Skill id to load. Omit or pass \"list\" to see all available skills.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Search term matched against skill names and descriptions. Use when the index was truncated or no name is known.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "read",
+    "description": "Read a file. A text file comes back whole in one call when it fits this call's output budget — 100000 bytes by default, raisable to 500000 with max_bytes. There is no line cap. Use offset and limit for an exact line range; when output is budget-limited the footer names the exact offset to continue from. Every text response reports the file's byte size, line count, and whether output was truncated. A PNG, JPEG, GIF or WebP image comes back as image content you can see (large images are downscaled), including one the user attached from outside the workspace; read an image instead of running OCR or taking screenshots of it.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Maximum number of lines to read.",
+          "type": "number"
+        },
+        "max_bytes": {
+          "description": "Output budget in bytes for this one call. Defaults to 100000; values above the 500000 maximum are clamped down rather than rejected, and a value below the active default leaves the default in place.",
+          "type": "number"
+        },
+        "offset": {
+          "description": "Line number to start reading from (1-indexed).",
+          "type": "number"
+        },
+        "path": {
+          "description": "Path to the file to read (relative or absolute).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "todo_write",
+    "description": "Replace the To-do list the user watches. For any task with three or more steps or more than one file, write the list before you start, keep exactly one item in_progress, and mark items done as you finish them. Skip it only for a single quick answer or edit.",
+    "input_schema": {
+      "properties": {
+        "todos": {
+          "description": "The complete list of To-do items. This replaces the existing list.",
+          "items": {
+            "properties": {
+              "content": {
+                "description": "The task description",
+                "type": "string"
+              },
+              "status": {
+                "description": "Task status",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed",
+                  "cancelled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "content",
+              "status"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "todos"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "update_goal",
+    "description": "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "advisory": {
+          "description": "Required when status is advisory. Appended separately from the judged completion contract.",
+          "type": "string"
+        },
+        "blocker": {
+          "description": "Required when status is blocked. Explain the condition preventing progress.",
+          "type": "string"
+        },
+        "evidence": {
+          "description": "Required when status is complete. Briefly cite the proof that the goal is done.",
+          "type": "string"
+        },
+        "progress": {
+          "additionalProperties": false,
+          "description": "Optional with not_achieved or advisory: your current best estimate of overall completion, shown to the user as reported progress. Keep percent honest — it is an estimate, never a verified fraction.",
+          "properties": {
+            "next": {
+              "description": "One short line: what comes next.",
+              "type": "string"
+            },
+            "now": {
+              "description": "One short line: what is being worked on right now.",
+              "type": "string"
+            },
+            "percent": {
+              "description": "Estimated percent complete, 0-100.",
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "percent"
+          ],
+          "type": "object"
+        },
+        "status": {
+          "description": "Use complete only when a critical verifier proves the goal; not_achieved to record verifier gaps; blocked when meaningful progress cannot continue; advisory to append best-effort context without changing lifecycle state.",
+          "enum": [
+            "complete",
+            "blocked",
+            "not_achieved",
+            "advisory"
+          ],
+          "type": "string"
+        },
+        "verification": {
+          "additionalProperties": false,
+          "description": "Required when status is complete or not_achieved. A verifier-as-judge receipt from a concrete check, such as Run action=\"verifiers\" or an equivalent project-specific gate.",
+          "properties": {
+            "check": {
+              "description": "The verifier/check that passed.",
+              "type": "string"
+            },
+            "gaps": {
+              "description": "Concrete remaining gaps. Required for critical not_achieved reviews; order and duplicate wording do not affect the stall fingerprint.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "role": {
+              "description": "Critical reviews may satisfy the judged completion contract. Advisory reviews are fail-open and cannot complete it. Defaults to critical for compatibility.",
+              "enum": [
+                "critical",
+                "advisory"
+              ],
+              "type": "string"
+            },
+            "status": {
+              "description": "Use passed when a concrete verifier/check succeeded; not_applicable when no automated verifier applies; not_achieved when the verifier found concrete remaining gaps.",
+              "enum": [
+                "passed",
+                "not_applicable",
+                "not_achieved"
+              ],
+              "type": "string"
+            },
+            "summary": {
+              "description": "Brief result summary from the verifier/check.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "check",
+            "status",
+            "summary"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "write",
+    "description": "Write content to a file. Creates the file if it does not exist, overwrites it if it does, and creates parent directories automatically.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "Content to write to the file.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the file to write (relative or absolute).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "path"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false,
+    "cache_control": {
+      "type": "ephemeral"
+    }
+  },
+  {
+    "type": "tool_search_20251119",
+    "name": "tool_search",
+    "description": "Search deferred tool definitions and return matching tool references.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query for tool discovery."
+        },
+        "match": {
+          "type": "string",
+          "enum": [
+            "bm25",
+            "regex"
+          ],
+          "default": "bm25",
+          "description": "Matching algorithm: bm25 for natural-language matching, regex for a regular expression over tool names/descriptions/schema."
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 8,
+          "description": "Maximum number of matching tool references to return."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  }
+]

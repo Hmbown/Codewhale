@@ -1,26 +1,15 @@
-//! Finite turn budgets (R1, v0.9.12 Phase 1).
+//! Turn budgets shared by interactive hosts and headless execution.
 //!
-//! An agent loop with no finite bound can spend real money forever. Before
-//! R1 the parent turn had exactly one hard ceiling — the per-step stream
-//! caps in [`super::streaming`] — while the model-step ceiling defaulted to
-//! `u32::MAX` at every production call site and no cumulative per-turn
-//! wall-clock budget existed at all. This module is the single home for the
-//! four bounds R1 makes finite:
+//! Model steps and the cumulative per-turn wall clock are uncapped by
+//! default. Explicit positive limits still apply; neither a step counter nor
+//! elapsed time is a measure of useful progress, and a long autonomous turn
+//! should not stop at an arbitrary hour. Per-step stream budgets remain
+//! finite: they bound one stuck request, not the whole turn.
 //!
-//! 1. `max_steps` — model steps in one turn.
-//! 2. The cumulative per-turn wall clock.
-//! 3. `exec --max-turns` — the same step ceiling for headless runs.
-//! 4. The per-step stream caps (content bytes, stream duration).
-//!
-//! ## No `0`-means-unlimited sentinel
-//!
-//! Every resolver here rejects `0` and falls back to the finite default
-//! rather than reading it as "unlimited". That sentinel is exactly the bug
-//! class R1 exists to close: a `0` that skips the cap check turns a
-//! misconfiguration (or a typo) into an unbounded spend. There is also no
-//! "unlimited" value at all — a caller who genuinely wants a turn to run
-//! practically forever raises the knob to its documented maximum, which is
-//! large but still finite and still terminates.
+//! `EngineConfig` retains its integer representation for embedders:
+//! `u32::MAX` represents no model-step limit. `TurnContext::step_limit`
+//! resolves that representation to `None` before checking a ceiling or
+//! emitting diagnostics. It is not a very large finite fallback.
 //!
 //! ## Honesty at the limit
 //!
@@ -31,33 +20,25 @@
 
 use std::time::{Duration, Instant};
 
-/// Default ceiling on model steps within a single turn.
-///
-/// A "step" is one accepted provider response, so this bounds how many
-/// billable requests one user message can trigger. 200 is far above what an
-/// ordinary interactive turn spends and still finite: a runaway tool loop
-/// stops here instead of spending until the operator notices.
-pub const DEFAULT_MAX_MODEL_STEPS: u32 = 200;
+/// No model-step limit unless the caller configures one. This is the
+/// compatibility representation, not a ceiling checked at `u32::MAX`.
+pub const DEFAULT_MAX_MODEL_STEPS: u32 = u32::MAX;
 /// Smallest accepted model-step ceiling. One step still lets the model
 /// answer once.
 pub const MIN_MAX_MODEL_STEPS: u32 = 1;
-/// Largest accepted model-step ceiling. Deliberately large enough to serve
-/// as the "effectively unlimited" escape hatch while remaining finite, so
-/// no configuration path can produce an unbounded loop.
+/// Largest explicitly configured model-step ceiling.
 pub const MAX_MAX_MODEL_STEPS: u32 = 100_000;
 
-/// Default headless `exec --max-turns`. Same ceiling as the interactive
-/// engine: a non-interactive run has nobody watching it, so it must not be
-/// looser than the one a human is sitting in front of.
-pub const DEFAULT_EXEC_MAX_TURNS: u32 = DEFAULT_MAX_MODEL_STEPS;
-
-/// Default cumulative per-turn wall-clock budget, in seconds.
+/// No per-turn wall-clock limit unless the caller configures one.
 ///
-/// Measured across every model step of one turn, not per request. Time the
-/// turn spends blocked on a human approval decision is excluded (see
-/// [`TurnWallClock::begin_human_wait`]) so an unanswered prompt cannot
-/// consume the budget.
-pub const DEFAULT_TURN_WALL_CLOCK_SECS: u64 = 3_600;
+/// `Duration::MAX` is the representation, mirroring
+/// [`DEFAULT_MAX_MODEL_STEPS`]: [`TurnWallClock::exhausted`] can never reach
+/// it, and callers turning it into an absolute deadline must use
+/// `checked_add` (see `exec_agent`). When configured, the budget is measured
+/// across every model step of one turn, not per request, and time blocked on
+/// a human approval decision is excluded (see
+/// [`TurnWallClock::begin_human_wait`]).
+pub const DEFAULT_TURN_WALL_CLOCK: Duration = Duration::MAX;
 /// Smallest accepted per-turn wall-clock budget. Below this a single slow
 /// reasoning request would trip the budget before it could finish.
 pub const MIN_TURN_WALL_CLOCK_SECS: u64 = 30;
@@ -80,12 +61,79 @@ pub const MIN_STREAM_MAX_DURATION_SECS: u64 = 10;
 /// Largest accepted per-step stream duration cap (24 hours).
 pub const MAX_STREAM_MAX_DURATION_SECS: u64 = 86_400;
 
+/// Default whole-request resume budget after a failed stream (open failure,
+/// dead stream, sleep, or mid-stream network drop). Preserves the
+/// pre-#6700 hard-coded `MAX_STREAM_RETRIES`.
+pub const DEFAULT_STREAM_MAX_RESUMES: u32 = super::streaming::MAX_STREAM_RETRIES;
+/// Largest accepted resume budget. `0` is accepted and disables resumes.
+pub const MAX_STREAM_MAX_RESUMES: u32 = 10;
+/// Default in-stream transparent retry budget (nothing streamed yet).
+/// Preserves the pre-#6700 hard-coded `MAX_TRANSPARENT_STREAM_RETRIES`.
+pub const DEFAULT_STREAM_MAX_TRANSPARENT_RETRIES: u32 =
+    super::streaming::MAX_TRANSPARENT_STREAM_RETRIES;
+/// Largest accepted transparent retry budget. `0` disables them.
+pub const MAX_STREAM_MAX_TRANSPARENT_RETRIES: u32 = 10;
+/// Default streak of recoverable stream errors tolerated in one stream.
+/// Preserves the pre-#6700 hard-coded `MAX_STREAM_ERRORS_BEFORE_FAIL`.
+pub const DEFAULT_STREAM_MAX_ERRORS: u32 = super::streaming::MAX_STREAM_ERRORS_BEFORE_FAIL;
+/// Smallest accepted error streak: the first error ends the stream. `0` is
+/// not a value here; like the other finite stream budgets it selects
+/// [`DEFAULT_STREAM_MAX_ERRORS`].
+pub const MIN_STREAM_MAX_ERRORS: u32 = 1;
+/// Largest accepted error streak.
+pub const MAX_STREAM_MAX_ERRORS: u32 = 50;
+
+/// Stream-level retry budgets for one engine (#6700). Every field stays
+/// finite; the defaults are the historical compiled-in values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamRetryLimits {
+    /// Whole-request re-issues after a failed stream, shared by every
+    /// resume path and by stream-open failures (#6699).
+    pub max_resumes: u32,
+    /// In-stream re-requests while nothing has streamed yet (#103).
+    pub max_transparent_retries: u32,
+    /// Recoverable errors tolerated in one stream before it ends.
+    pub max_errors: u32,
+}
+
+impl Default for StreamRetryLimits {
+    fn default() -> Self {
+        resolve_stream_retry_limits(None, None, None)
+    }
+}
+
+/// Resolve configured stream retry budgets.
+///
+/// `None` selects each default. The two retry counts accept `0` (no
+/// retries) and clamp to their maximum. The error streak is a finite stream
+/// budget like `stream_max_content_mb`: `0` selects its default, and other
+/// values clamp to `MIN_STREAM_MAX_ERRORS..=MAX_STREAM_MAX_ERRORS`.
+#[must_use]
+pub fn resolve_stream_retry_limits(
+    max_resumes: Option<u32>,
+    max_transparent_retries: Option<u32>,
+    max_errors: Option<u32>,
+) -> StreamRetryLimits {
+    StreamRetryLimits {
+        max_resumes: max_resumes
+            .unwrap_or(DEFAULT_STREAM_MAX_RESUMES)
+            .min(MAX_STREAM_MAX_RESUMES),
+        max_transparent_retries: max_transparent_retries
+            .unwrap_or(DEFAULT_STREAM_MAX_TRANSPARENT_RETRIES)
+            .min(MAX_STREAM_MAX_TRANSPARENT_RETRIES),
+        max_errors: match max_errors {
+            None | Some(0) => DEFAULT_STREAM_MAX_ERRORS,
+            Some(value) => value.clamp(MIN_STREAM_MAX_ERRORS, MAX_STREAM_MAX_ERRORS),
+        },
+    }
+}
+
 /// Resolve a configured model-step ceiling.
 ///
-/// `None` and `0` both resolve to [`DEFAULT_MAX_MODEL_STEPS`]: `0` is
-/// treated as an invalid value, never as "unlimited". Positive values clamp
-/// into `MIN_MAX_MODEL_STEPS..=MAX_MAX_MODEL_STEPS`, so even the largest
-/// configurable turn terminates.
+/// `None` and `0` select the uncapped default. Explicit positive values
+/// clamp into `MIN_MAX_MODEL_STEPS..=MAX_MAX_MODEL_STEPS`. Resolve raw input
+/// once: passing an already resolved default back as an explicit value
+/// would incorrectly install the maximum configurable ceiling.
 #[must_use]
 pub fn resolve_max_model_steps(raw: Option<u32>) -> u32 {
     match raw {
@@ -94,22 +142,19 @@ pub fn resolve_max_model_steps(raw: Option<u32>) -> u32 {
     }
 }
 
-/// Resolve a configured per-turn wall-clock budget, in seconds.
+/// Resolve a configured per-turn wall-clock budget.
 ///
-/// `None` and `0` both resolve to [`DEFAULT_TURN_WALL_CLOCK_SECS`]; `0` is
-/// invalid, not "unlimited".
-#[must_use]
-pub fn resolve_turn_wall_clock_secs(raw: Option<u64>) -> u64 {
-    match raw {
-        None | Some(0) => DEFAULT_TURN_WALL_CLOCK_SECS,
-        Some(value) => value.clamp(MIN_TURN_WALL_CLOCK_SECS, MAX_TURN_WALL_CLOCK_SECS),
-    }
-}
-
-/// Resolve a configured per-turn wall-clock budget as a [`Duration`].
+/// `None` and `0` select the uncapped default ([`DEFAULT_TURN_WALL_CLOCK`]).
+/// Explicit positive values, in seconds, clamp into
+/// `MIN_TURN_WALL_CLOCK_SECS..=MAX_TURN_WALL_CLOCK_SECS`.
 #[must_use]
 pub fn resolve_turn_wall_clock(raw: Option<u64>) -> Duration {
-    Duration::from_secs(resolve_turn_wall_clock_secs(raw))
+    match raw {
+        None | Some(0) => DEFAULT_TURN_WALL_CLOCK,
+        Some(value) => {
+            Duration::from_secs(value.clamp(MIN_TURN_WALL_CLOCK_SECS, MAX_TURN_WALL_CLOCK_SECS))
+        }
+    }
 }
 
 /// Resolve a configured per-step stream content cap, given megabytes.
@@ -161,7 +206,7 @@ pub(crate) struct TurnWallClock {
 impl TurnWallClock {
     /// Start a fresh budget. A zero budget is legal here (and only here):
     /// it is how tests assert the stop path without sleeping. Configuration
-    /// never produces one — [`resolve_turn_wall_clock`] rejects `0`.
+    /// never produces one — [`resolve_turn_wall_clock`] reads `0` as no limit.
     pub(crate) fn start(budget: Duration) -> Self {
         Self {
             budget,
@@ -230,11 +275,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_step_defaults_are_finite_and_reject_the_zero_sentinel() {
+    fn model_step_defaults_do_not_install_a_ceiling() {
         assert_eq!(resolve_max_model_steps(None), DEFAULT_MAX_MODEL_STEPS);
-        // `0` is invalid, not "unlimited" — the trap R1 exists to close.
         assert_eq!(resolve_max_model_steps(Some(0)), DEFAULT_MAX_MODEL_STEPS);
-        const { assert!(DEFAULT_MAX_MODEL_STEPS < u32::MAX) };
+        assert_eq!(DEFAULT_MAX_MODEL_STEPS, u32::MAX);
         const { assert!(MAX_MAX_MODEL_STEPS < u32::MAX) };
     }
 
@@ -245,36 +289,41 @@ mod tests {
         assert_eq!(
             resolve_max_model_steps(Some(u32::MAX)),
             MAX_MAX_MODEL_STEPS,
-            "the escape hatch is large but still finite"
+            "explicit positive overrides retain the configured ceiling"
         );
     }
 
     #[test]
-    fn turn_wall_clock_defaults_are_finite_and_reject_the_zero_sentinel() {
-        assert_eq!(
-            resolve_turn_wall_clock_secs(None),
-            DEFAULT_TURN_WALL_CLOCK_SECS
-        );
-        assert_eq!(
-            resolve_turn_wall_clock_secs(Some(0)),
-            DEFAULT_TURN_WALL_CLOCK_SECS
-        );
-        assert_eq!(
-            resolve_turn_wall_clock(None),
-            Duration::from_secs(DEFAULT_TURN_WALL_CLOCK_SECS)
-        );
+    fn turn_wall_clock_defaults_to_no_limit() {
+        assert_eq!(resolve_turn_wall_clock(None), DEFAULT_TURN_WALL_CLOCK);
+        assert_eq!(resolve_turn_wall_clock(Some(0)), DEFAULT_TURN_WALL_CLOCK);
+        let mut clock = TurnWallClock::start(resolve_turn_wall_clock(None));
+        clock.rewind_for_test(Duration::from_secs(10 * MAX_TURN_WALL_CLOCK_SECS));
+        assert!(!clock.exhausted(), "the default never stops a turn");
+    }
+
+    /// Code mode and headless exec sleep toward what is left of the default
+    /// budget; a near-`Duration::MAX` sleep must park, not panic.
+    #[tokio::test]
+    async fn an_unbounded_remaining_budget_is_a_safe_sleep() {
+        let remaining = DEFAULT_TURN_WALL_CLOCK.saturating_sub(Duration::from_secs(1));
+        let woke =
+            tokio::time::timeout(Duration::from_millis(20), tokio::time::sleep(remaining)).await;
+        assert!(woke.is_err(), "the sleep parks until cancelled");
+        let started = std::time::Instant::now();
+        assert!(started.checked_add(remaining).is_none());
     }
 
     #[test]
     fn turn_wall_clock_is_overridable_and_clamped() {
-        assert_eq!(resolve_turn_wall_clock_secs(Some(120)), 120);
+        assert_eq!(resolve_turn_wall_clock(Some(120)), Duration::from_secs(120));
         assert_eq!(
-            resolve_turn_wall_clock_secs(Some(1)),
-            MIN_TURN_WALL_CLOCK_SECS
+            resolve_turn_wall_clock(Some(1)),
+            Duration::from_secs(MIN_TURN_WALL_CLOCK_SECS)
         );
         assert_eq!(
-            resolve_turn_wall_clock_secs(Some(u64::MAX)),
-            MAX_TURN_WALL_CLOCK_SECS
+            resolve_turn_wall_clock(Some(u64::MAX)),
+            Duration::from_secs(MAX_TURN_WALL_CLOCK_SECS)
         );
     }
 
@@ -307,6 +356,35 @@ mod tests {
             resolve_stream_max_duration_secs(Some(u64::MAX)),
             MAX_STREAM_MAX_DURATION_SECS
         );
+    }
+
+    #[test]
+    fn stream_retry_limits_default_to_historical_values_and_clamp() {
+        let defaults = resolve_stream_retry_limits(None, None, None);
+        assert_eq!(defaults, StreamRetryLimits::default());
+        assert_eq!(defaults.max_resumes, 3);
+        assert_eq!(defaults.max_transparent_retries, 2);
+        assert_eq!(defaults.max_errors, 5);
+
+        let disabled = resolve_stream_retry_limits(Some(0), Some(0), Some(0));
+        assert_eq!(disabled.max_resumes, 0, "0 disables resumes");
+        assert_eq!(disabled.max_transparent_retries, 0);
+        assert_eq!(
+            disabled.max_errors, DEFAULT_STREAM_MAX_ERRORS,
+            "0 selects the error-streak default, like the other finite stream budgets"
+        );
+        assert_eq!(
+            resolve_stream_retry_limits(None, None, Some(1)).max_errors,
+            MIN_STREAM_MAX_ERRORS
+        );
+
+        let huge = resolve_stream_retry_limits(Some(u32::MAX), Some(u32::MAX), Some(u32::MAX));
+        assert_eq!(huge.max_resumes, MAX_STREAM_MAX_RESUMES);
+        assert_eq!(
+            huge.max_transparent_retries,
+            MAX_STREAM_MAX_TRANSPARENT_RETRIES
+        );
+        assert_eq!(huge.max_errors, MAX_STREAM_MAX_ERRORS);
     }
 
     #[test]

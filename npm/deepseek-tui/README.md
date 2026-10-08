@@ -12,5 +12,5 @@ This legacy npm package is deprecated and receives no further releases.
 `deepseek` / `deepseek-tui` command shims existed only in v0.8.x and were
 removed in v0.9.0.
 
-See [docs/REBRAND.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/REBRAND.md)
+See [docs/REBRAND.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/REBRAND.md)
 for the full migration story.

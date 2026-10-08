@@ -11,6 +11,8 @@ import {
   buildCreateThreadRequest,
   claimInFlight,
   createThreadState,
+  createWebSessionFetch,
+  createStreamConnector,
   eventStreamUrl,
   formatRuntimeProvenance,
   imageInputPresentation,
@@ -407,7 +409,10 @@ test("new thread dialog labels exact vision capability without exposing attachme
   assert.match(html, /does not change your Runtime defaults/);
   assert.doesNotMatch(html, /type="file"/);
   assert.match(source, /api\("\/v1\/providers"\)/);
-  assert.match(source, /\/v1\/providers\/\$\{encodeURIComponent\(provider\.id\)\}\/models/);
+  // The dialog loads the catalog through the bounded, paginated collector
+  // keyed by provider.id; the wire endpoint stays /v1/providers/<id>/models.
+  assert.match(source, /collectProviderModelPages\(provider\.id/);
+  assert.match(source, /\/v1\/providers\/\$\{encodeURIComponent\(provider\)\}\/models\?\$\{query\.toString\(\)\}/);
   assert.match(source, /body: JSON\.stringify\(request\)/);
   assert.match(source, /function trapFocusWithin\(event, container\)/);
   assert.match(source, /dom\.newThreadCancel\.focus\(\{ preventScroll: true \}\)/);
@@ -599,12 +604,33 @@ test("registers the full emitted Runtime vocabulary and advances continuity for 
   let previousSeq = 7;
   for (const eventName of STREAM_EVENT_NAMES) {
     const sequence = previousSeq + 2;
-    const envelope = runtimeEvent(sequence, eventName, {}, { previous_seq: previousSeq });
+    const turnBefore = state.turns.get("turn-1");
+    const payload = eventName === "turn.usage"
+      ? { usage: { input_tokens: 100, output_tokens: 20 } }
+      : {};
+    const envelope = runtimeEvent(sequence, eventName, payload, { previous_seq: previousSeq });
     assert.equal(runtimeEventContinuity(state, envelope), "next", eventName);
     assert.equal(applyRuntimeEvent(state, envelope), true, eventName);
     assert.equal(state.latestSeq, sequence, eventName);
+    if (eventName === "turn.usage") {
+      // Request diagnostics advance continuity; only the settled turn owns totals.
+      assert.equal(state.turns.get("turn-1"), turnBefore);
+      assert.equal(applyRuntimeEvent(state, envelope), false);
+    }
     previousSeq = sequence;
   }
+  const settledTurn = {
+    id: "turn-1",
+    status: "completed",
+    usage: { input_tokens: 300, output_tokens: 60 },
+  };
+  assert.equal(applyRuntimeEvent(state, runtimeEvent(
+    previousSeq + 1,
+    "turn.completed",
+    { turn: settledTurn },
+    { previous_seq: previousSeq },
+  )), true);
+  assert.deepEqual(state.turns.get("turn-1"), settledTurn);
 });
 
 test("gap recovery snapshot restores approval and user-input attention before resubscribing", async () => {
@@ -1033,5 +1059,193 @@ test("renders hostile Runtime text only through the textContent sink", async () 
   assert.equal(source.includes("inner" + "HTML"), false);
   assert.equal(source.includes("insertAdjacent" + "HTML"), false);
   assert.equal(source.includes("local" + "Storage"), false);
-  assert.equal(source.includes("session" + "Storage"), false);
+  assert.equal(source.includes("codewhale_runtime_token"), false);
+});
+
+test("web session fetch keeps request proof outside cookies and strips bootstrap fragments", async () => {
+  const stored = new Map();
+  const storage = () => ({ setItem: (key, value) => stored.set(key, value), getItem: (key) => stored.get(key) });
+  const paths = [];
+  const calls = [];
+  const history = { replaceState: (_state, _title, path) => paths.push(path) };
+  const fetch = async (path, options) => { calls.push({ path, options }); return { ok: true }; };
+  const request = createWebSessionFetch({
+    location: { hash: "#p=proof-one", pathname: "/", search: "?view=threads" }, history, storage, fetch,
+  });
+  assert.deepEqual(paths, ["/?view=threads"]);
+  await request("/v1/threads", { method: "POST", body: "{}" });
+  await request("/__codewhale/web/stream-ticket", { method: "POST" });
+  const reloaded = createWebSessionFetch({ location: { hash: "" }, history, storage, fetch });
+  await reloaded("/v1/threads");
+  for (const { options } of calls) {
+    assert.equal(options.headers.get("x-codewhale-web-request"), "proof-one");
+    assert.equal(options.headers.has("cookie"), false);
+    assert.equal(options.credentials, "same-origin");
+    assert.equal(options.cache, "no-store");
+  }
+  assert.equal(calls[0].options.headers.get("content-type"), "application/json");
+  assert.equal(eventStreamUrl("thread-a", 4, "ticket-one"), "/v1/threads/thread-a/events?since_seq=4&web_stream_ticket=ticket-one");
+
+  const memoryOnly = createWebSessionFetch({
+    location: { hash: "#p=memory-proof", pathname: "/", search: "" }, history,
+    storage: () => { throw new Error("storage unavailable"); }, fetch,
+  });
+  await memoryOnly("/v1/threads");
+  assert.equal(calls.at(-1).options.headers.get("x-codewhale-web-request"), "memory-proof");
+});
+
+test("web session recovers from the page in an independent tab or without storage", async () => {
+  for (const storedProof of [null, "old-process-proof", "unavailable"]) {
+    const stored = new Map([["codewhale_web_request_proof", storedProof]]);
+    const calls = [];
+    const request = createWebSessionFetch({
+      location: { hash: "" },
+      history: { replaceState: () => assert.fail("no fragment to clear") },
+      storage: () => {
+        if (storedProof === "unavailable") throw new Error("storage unavailable");
+        return { getItem: (key) => stored.get(key), setItem: (key, value) => stored.set(key, value) };
+      },
+      pageProof: "current-page-proof",
+      fetch: async (_path, options) => { calls.push(options); return { ok: true }; },
+    });
+    await request("/v1/threads");
+    await request("/__codewhale/web/stream-ticket", { method: "POST" });
+    assert.equal(calls.length, 2);
+    for (const options of calls) {
+      assert.equal(options.headers.get("x-codewhale-web-request"), "current-page-proof");
+    }
+    if (storedProof !== "unavailable") {
+      assert.equal(stored.get("codewhale_web_request_proof"), "current-page-proof");
+    }
+  }
+});
+
+function streamHarness(api) {
+  const app = {
+    generation: 1, selectedThreadId: "thread-a", threadState: { latestSeq: 4 },
+    stream: null, streamOpenCancel: null, reconnectTimer: null,
+  };
+  const streams = [];
+  const timers = new Map();
+  const statuses = [];
+  let nextTimer = 0;
+  class EventSource {
+    constructor(url) { this.url = url; this.closed = false; streams.push(this); }
+    close() { this.closed = true; }
+    addEventListener() {}
+  }
+  const connector = createStreamConnector({
+    app, api, EventSource, receive: () => {}, setConnection: () => {},
+    showStatus: (message) => statuses.push(message),
+    setTimeout: (callback, delay) => { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
+    clearTimeout: (id) => timers.delete(id),
+  });
+  return {
+    ...connector, app, streams, timers, statuses,
+    tick: async () => {
+      assert.equal(timers.size, 1, "exactly one reconnect should be pending");
+      const [id, { callback, delay }] = timers.entries().next().value;
+      timers.delete(id);
+      callback();
+      await new Promise((resolve) => setImmediate(resolve));
+      return delay;
+    },
+  };
+}
+
+test("stream retries ticket network and 5xx failures with capped backoff and resumes the latest cursor", async () => {
+  let requests = 0;
+  const h = streamHarness(async () => {
+    requests += 1;
+    if (requests === 2) throw new TypeError("network unavailable");
+    if (requests > 2 && requests < 10) throw Object.assign(new Error("temporarily unavailable"), { status: 503 });
+    return { stream_ticket: `ticket-${requests}` };
+  });
+  await h.connectStream("thread-a", 4, 1);
+  h.streams[0].onopen();
+  h.streams[0].onerror();
+  assert.equal(h.streams[0].closed, true);
+  h.app.threadState.latestSeq = 9;
+  const delays = [];
+  while (h.streams.length === 1) delays.push(await h.tick());
+  assert.deepEqual(delays, [900, 1800, 3600, 7200, 14400, 28800, 30000, 30000, 30000]);
+  assert.match(h.streams[1].url, /since_seq=9&web_stream_ticket=ticket-10$/);
+  h.streams[1].onopen();
+  h.streams[1].onerror();
+  assert.equal(await h.tick(), 900, "opening a stream resets backoff");
+  h.stopStream();
+  assert.equal(h.timers.size, 0);
+});
+
+test("stream stops ticket retries on 401 and 403", async () => {
+  for (const status of [401, 403]) {
+    let requests = 0;
+    const h = streamHarness(async () => {
+      if (++requests === 1) return { stream_ticket: "first" };
+      throw Object.assign(new Error("session ended"), { status });
+    });
+    await h.connectStream("thread-a", 4, 1);
+    h.app.stream.onerror();
+    await h.tick();
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.app.stream, null);
+    assert.deepEqual(h.statuses, ["session ended"]);
+  }
+});
+
+test("stream ignores superseded ticket completions and failures, including stopped connections", async () => {
+  const pending = [];
+  const h = streamHarness(() => new Promise((resolve, reject) => pending.push({ resolve, reject })));
+  const first = h.connectStream("thread-a", 4, 1);
+  const second = h.connectStream("thread-a", 4, 1);
+  pending[1].resolve({ stream_ticket: "current" });
+  await second;
+  pending[0].resolve({ stream_ticket: "stale" });
+  await first;
+  assert.equal(h.streams.length, 1, "a late ticket cannot create an orphan stream");
+  assert.match(h.app.stream.url, /current$/);
+  const third = h.connectStream("thread-a", 4, 1);
+  assert.equal(h.streams[0].closed, true);
+  h.stopStream();
+  pending[2].resolve({ stream_ticket: "stopped" });
+  await third;
+  assert.equal(h.streams.length, 1);
+  assert.equal(h.app.stream, null);
+  const fourth = h.connectStream("thread-a", 4, 1);
+  h.app.generation += 1;
+  pending[3].reject(new Error("old selection failed"));
+  await fourth;
+  assert.equal(h.timers.size, 0);
+  assert.deepEqual(h.statuses, []);
+});
+
+test("stream recovery handshake leaves retries to snapshot recovery until open", async () => {
+  const h = streamHarness(async () => ({ stream_ticket: "recovery" }));
+  const opened = h.connectStream("thread-a", 4, 1, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.app.stream.onerror();
+  await assert.rejects(opened, /did not reopen/);
+  assert.equal(h.timers.size, 0);
+  const replacement = h.connectStream("thread-a", 4, 1, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.app.stream.onopen();
+  await replacement;
+  h.app.stream.onerror();
+  assert.equal(h.timers.size, 1, "normal reconnect resumes after the handshake");
+  h.stopStream();
+});
+
+test("records workspace restore-point receipts on their turn in order", () => {
+  const state = createThreadState("thread-a");
+  applySnapshot(state, snapshot("thread-a", 7));
+  const pre = { kind: "pre_turn", snapshot_id: "c1", tree_id: "t1", session_id: "thread-a" };
+  const post = { kind: "post_turn", snapshot_id: "c2", tree_id: "t2", session_id: "thread-a" };
+  assert.equal(applyRuntimeEvent(state, runtimeEvent(8, "turn.workspace_snapshot", pre)), true);
+  assert.equal(applyRuntimeEvent(state, runtimeEvent(9, "turn.workspace_snapshot", post)), true);
+  assert.deepEqual(state.turns.get("turn-1").workspace_snapshots, [pre, post]);
+  // A receipt for a turn the client has not seen still advances continuity.
+  const orphan = runtimeEvent(10, "turn.workspace_snapshot", pre, { turn_id: "turn-9" });
+  assert.equal(applyRuntimeEvent(state, orphan), true);
+  assert.equal(state.latestSeq, 10);
+  assert.equal(state.turns.has("turn-9"), false);
 });

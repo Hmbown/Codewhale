@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 
 use crate::tui::app::App;
 use crate::tui::app::ToolDetailRecord;
-use crate::tui::file_mention::{ContextReferenceKind, ContextReferenceSource};
 use crate::tui::file_picker::FilePickerRelevance;
 use crate::tui::file_picker::FilePickerView;
+use codewhale_core::{ContextReferenceKind, ContextReferenceSource};
 
 /// Push the `/files` picker onto the view stack, pre-populated with
 /// per-session relevance ranks (modified, @-mentioned, tool-touched).

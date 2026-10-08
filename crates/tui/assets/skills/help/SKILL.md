@@ -40,7 +40,7 @@ Answer from the surface that owns the fact, in this order:
 
 ## Working in a Codewhale checkout
 When the workspace *is* a Codewhale checkout, `docs/` is present on disk and
-`File` with `action: "read"` is the right tool. Read the single most relevant file and quote
+the `read` tool (`path: "docs/..."`) is the right tool. Read the single most relevant file and quote
 the specific lines. Outside a checkout, `docs/` is usually absent — in that
 case rely on `/help`, `/config`, and `doctor`, and say plainly that the
 reference docs are not installed locally.

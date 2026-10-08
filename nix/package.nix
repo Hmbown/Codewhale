@@ -126,7 +126,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   meta = {
     description = "Terminal coding agent for DeepSeek";
-    homepage = "https://github.com/Hmbown/CodeWhale";
+    homepage = "https://github.com/codewhale-hq/CodeWhale";
     license = lib.licenses.mit;
     mainProgram = "codewhale";
   };

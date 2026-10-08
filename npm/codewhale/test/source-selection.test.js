@@ -18,7 +18,7 @@ const {
 const { run, _internal } = require("../scripts/install");
 
 const VERSION = "0.9.10";
-const REPO = "Hmbown/CodeWhale";
+const REPO = "codewhale-hq/CodeWhale";
 const CODEWHALE_ASSET = "codewhale-linux-x64";
 const CODEW_ASSET = "codew-linux-x64";
 const REQUIRED_ASSETS = [CODEWHALE_ASSET, CODEW_ASSET];

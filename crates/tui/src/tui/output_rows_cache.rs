@@ -34,6 +34,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::tui::history::OutputRow;
 
@@ -48,14 +49,17 @@ const DEFAULT_CAPACITY: usize = 256;
 /// `line_limit` changes; rows are shared across all line limits.
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    rows: Vec<OutputRow>,
+    /// Shared so a cache hit hands back a refcount bump. Every hit used to
+    /// deep-copy each `String` and styled span of a payload whose whole point
+    /// is that it does not change between frames (#6213 T1).
+    rows: Arc<Vec<OutputRow>>,
     /// Map of `line_limit -> selected indices`. Bounded by the
     /// distinct line limits passed in by the renderer (typically 1–3).
     selected_by_limit: HashMap<usize, Vec<usize>>,
 }
 
 impl CacheEntry {
-    fn new(rows: Vec<OutputRow>) -> Self {
+    fn new(rows: Arc<Vec<OutputRow>>) -> Self {
         Self {
             rows,
             selected_by_limit: HashMap::new(),
@@ -102,14 +106,15 @@ impl OutputRowsCacheInner {
     }
 
     /// Get or compute the wrapped output rows for `output` at `width`.
-    /// On a hit, returns a clone of the cached `Vec<OutputRow>` — the
-    /// caller can iterate without holding a lock.
+    /// On a hit, returns another handle on the cached rows — the caller can
+    /// iterate without holding a lock, and pays a refcount bump rather than a
+    /// deep copy.
     fn get_or_compute_rows<F>(
         &mut self,
         content_hash: u64,
         width: u16,
         compute: F,
-    ) -> Vec<OutputRow>
+    ) -> Arc<Vec<OutputRow>>
     where
         F: FnOnce() -> Vec<OutputRow>,
     {
@@ -118,11 +123,11 @@ impl OutputRowsCacheInner {
             width,
         };
         if let Some(entry) = self.by_key.get(&key) {
-            return entry.rows.clone();
+            return Arc::clone(&entry.rows);
         }
 
-        let rows = compute();
-        let entry = CacheEntry::new(rows.clone());
+        let rows = Arc::new(compute());
+        let entry = CacheEntry::new(Arc::clone(&rows));
 
         if self.by_key.len() >= self.capacity
             && let Some(oldest) = self.insertion_order.pop_front()
@@ -183,12 +188,12 @@ pub fn reset_for_tests() {
 }
 
 /// Look up (or compute) the wrapped output rows for `output` at `width`.
-/// On a hit the cached `Vec<OutputRow>` is cloned without re-running
-/// the per-line ANSI strip or the wrap pass.
+/// On a hit the cached rows are handed back behind a shared handle, so the
+/// per-line ANSI strip and wrap pass are skipped without copying the rows.
 /// String-keyed convenience over [`get_or_compute_rows_with_hash`]. Only the
 /// tests use it now that production callers hash once and pass the hash.
 #[cfg(test)]
-pub fn get_or_compute_rows<F>(output: &str, width: u16, compute: F) -> Vec<OutputRow>
+pub fn get_or_compute_rows<F>(output: &str, width: u16, compute: F) -> Arc<Vec<OutputRow>>
 where
     F: FnOnce() -> Vec<OutputRow>,
 {
@@ -198,7 +203,11 @@ where
 /// As `get_or_compute_rows` but takes a precomputed content hash, so a
 /// caller that already hashed the output (e.g. to also key
 /// [`get_or_compute_indices`]) does not hash it a second time (#3757 review).
-pub fn get_or_compute_rows_with_hash<F>(content_hash: u64, width: u16, compute: F) -> Vec<OutputRow>
+pub fn get_or_compute_rows_with_hash<F>(
+    content_hash: u64,
+    width: u16,
+    compute: F,
+) -> Arc<Vec<OutputRow>>
 where
     F: FnOnce() -> Vec<OutputRow>,
 {

@@ -23,14 +23,13 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 
-use crate::localization::MessageId;
-use crate::models::Message;
 use crate::tools::subagent::SubAgentStatus;
 use crate::tui::app::App;
 use crate::tui::history::{HistoryCell, history_cells_from_message};
+use codewhale_localization::MessageId;
+use codewhale_models::Message;
 
 /// How often the focused transcript re-reads the child's durable artifact.
 /// The rail's live activity line already ticks per event; the full chat only
@@ -50,6 +49,11 @@ pub struct AgentFocus {
     pub source_message_count: usize,
     /// Messages omitted from the resident tail (durable artifact absent).
     pub omitted_messages: usize,
+    /// A settled agent's full result (or the reason it stopped), shown after
+    /// the transcript when the transcript does not already end with it, and
+    /// on its own when there is no transcript at all (#6565).
+    /// The text and whether it is a stop reason rather than a result.
+    pub result: Option<(String, bool)>,
     /// Local receipts appended after the source transcript: the user's own
     /// follow-ups echoed immediately and delivery notes.
     pub local_cells: Vec<HistoryCell>,
@@ -73,6 +77,7 @@ impl AgentFocus {
             cells: Vec::new(),
             source_message_count: 0,
             omitted_messages: 0,
+            result: None,
             local_cells: Vec::new(),
             scroll_top: None,
             last_visible: 0,
@@ -140,11 +145,7 @@ pub(crate) fn resolve_agent_transcript_messages(
 /// The same name the rail shows for a worker: its dispatch/session name when
 /// it has one, else the generated or labelled display name.
 pub(crate) fn agent_display_label(app: &App, agent_id: &str) -> String {
-    app.subagent_cache
-        .iter()
-        .find(|agent| agent.agent_id == agent_id)
-        .and_then(crate::tui::sidebar::dispatched_agent_name)
-        .map(str::to_string)
+    app.agent_given_name(agent_id)
         .unwrap_or_else(|| crate::tui::agent_details::safe_agent_display_name(app, agent_id))
 }
 
@@ -153,29 +154,56 @@ pub(crate) fn agent_display_label(app: &App, agent_id: &str) -> String {
 /// message that carries the tool's result (or, while the call is still
 /// running, after the tool-use block itself), so a decision reads in place.
 fn cells_for_messages(messages: &[Message], receipts: &[(String, String)]) -> Vec<HistoryCell> {
-    use crate::models::ContentBlock;
-    let mut resulted: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for message in messages {
-        for block in &message.content {
-            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                resulted.insert(tool_use_id.as_str());
+    use codewhale_models::ContentBlock;
+    let mut calls = std::collections::HashMap::new();
+    let mut results = std::collections::HashMap::new();
+    let mut raw_ids = std::collections::HashMap::<&str, usize>::new();
+    for block in messages.iter().flat_map(|message| &message.content) {
+        let Some(key) = block
+            .tool_call_key()
+            .filter(|key| !key.as_str().trim().is_empty())
+        else {
+            continue;
+        };
+        match block {
+            ContentBlock::ToolUse { id, .. } => {
+                *raw_ids.entry(key.as_str()).or_default() += 1;
+                calls
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(id.as_str()));
             }
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                results
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(tool_use_id.as_str()));
+            }
+            _ => {}
         }
     }
     let mut cells = Vec::new();
     for message in messages {
         cells.extend(history_cells_from_message(message));
         for block in &message.content {
-            let anchor = match block {
-                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                ContentBlock::ToolUse { id, .. } if !resulted.contains(id.as_str()) => {
-                    Some(id.as_str())
-                }
-                _ => None,
+            let Some(key) = block.tool_call_key() else {
+                continue;
             };
-            let Some(anchor) = anchor else { continue };
-            for (tool_id, text) in receipts {
-                if tool_id == anchor {
+            let Some(Some(provider)) = calls.get(&key) else {
+                continue;
+            };
+            if raw_ids.get(key.as_str()) != Some(&1) {
+                continue;
+            }
+            let anchor = match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    results.get(&key) == Some(&Some(*provider)) && tool_use_id.as_str() == *provider
+                }
+                ContentBlock::ToolUse { .. } => !results.contains_key(&key),
+                _ => false,
+            };
+            if anchor {
+                for (_, text) in receipts.iter().filter(|(id, _)| id == key.as_str()) {
                     cells.push(HistoryCell::System {
                         content: text.clone(),
                     });
@@ -190,6 +218,113 @@ fn child_receipts<'a>(app: &'a App, agent_id: &str) -> &'a [(String, String)] {
     app.child_gate_receipts
         .get(agent_id)
         .map_or(&[], Vec::as_slice)
+}
+
+/// What a settled agent produced, in full, and whether it is a failure
+/// reason rather than a result. The durable worker record (the roster) holds
+/// the complete text; the manager snapshot is the fallback. `None` while the
+/// agent is live or when it left nothing. Not redacted; see [`settled_result`].
+pub(crate) fn settled_result_raw(app: &App, agent_id: &str) -> Option<(String, bool)> {
+    let from_roster = app
+        .current_agent_roster()
+        .iter()
+        .find(|row| row.worker_id == agent_id)
+        .and_then(|row| {
+            let failed = matches!(
+                row.state,
+                crate::agent_roster::RosterState::Failed
+                    | crate::agent_roster::RosterState::Cancelled
+            );
+            row.outcome.clone().map(|text| (text, failed))
+        });
+    let from_snapshot = || {
+        let agent = app
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)?;
+        match &agent.status {
+            SubAgentStatus::Running => None,
+            SubAgentStatus::Completed => agent.result.clone().map(|text| (text, false)),
+            SubAgentStatus::Failed(reason) | SubAgentStatus::Interrupted(reason) => {
+                Some((reason.clone(), true))
+            }
+            SubAgentStatus::Cancelled | SubAgentStatus::BudgetExhausted => {
+                agent.result.clone().map(|text| (text, true))
+            }
+        }
+    };
+    from_roster
+        .or_else(from_snapshot)
+        .filter(|(text, _)| !text.trim().is_empty())
+}
+
+/// Strip terminal escapes and redact secrets before agent text is shown.
+fn visible_agent_text(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    crate::tui::osc8::strip_ansi_into(text, &mut visible);
+    codewhale_config::persistence::redact_secrets(&visible)
+}
+
+/// [`settled_result_raw`], safe to render.
+pub(crate) fn settled_result(app: &App, agent_id: &str) -> Option<(String, bool)> {
+    settled_result_raw(app, agent_id)
+        .map(|(text, failed)| (visible_agent_text(&text).trim().to_string(), failed))
+        .filter(|(text, _)| !text.is_empty())
+}
+
+/// One line saying what a settled agent produced (its result headline, or
+/// why it stopped), bounded for a row with a visible `…` when cut. The full
+/// text is in the agent's focused view.
+pub(crate) fn settled_headline(app: &App, agent_id: &str) -> Option<String> {
+    let (text, _) = settled_result_raw(app, agent_id)?;
+    crate::agent_roster::result_headline(&text)
+        .map(|headline| crate::agent_roster::one_line(&visible_agent_text(&headline)))
+}
+
+/// The result block for a settled agent, unless the transcript already ends
+/// with that answer. The completion envelope is machine data and is dropped.
+fn result_block_for(app: &App, agent_id: &str, messages: &[Message]) -> Option<(String, bool)> {
+    let (text, failed) = settled_result(app, agent_id)?;
+    let text = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("<codewhale:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let answered = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(message_plain_text)
+        .is_some_and(|last| {
+            crate::agent_roster::result_headline(text)
+                .is_some_and(|headline| last.contains(headline.as_str()))
+        });
+    (!answered || failed).then(|| (text.to_string(), failed))
+}
+
+/// The heading and body cells for a result block.
+fn result_cells(app: &App, result: Option<&(String, bool)>) -> Vec<HistoryCell> {
+    let Some((text, failed)) = result else {
+        return Vec::new();
+    };
+    let heading = if *failed {
+        MessageId::AgentFocusStopReason
+    } else {
+        MessageId::AgentFocusResult
+    };
+    vec![
+        HistoryCell::System {
+            content: app.tr(heading).into_owned(),
+        },
+        HistoryCell::Assistant {
+            content: text.clone(),
+            streaming: false,
+        },
+    ]
 }
 
 /// Focus a child: its full transcript owns the main area and the composer
@@ -212,8 +347,10 @@ pub(crate) fn focus_agent(app: &mut App, agent_id: &str) {
     focus.receipt_count = receipts.len();
     focus.source_message_count = messages.len();
     focus.omitted_messages = omitted;
+    focus.result = result_block_for(app, agent_id, &messages);
     focus.last_refresh = Instant::now();
     app.agent_focus = Some(focus);
+    crate::extension_host::command::bump_epoch();
     // The composer is now the natural owner: the next keys address the
     // worker, and Esc leaves focus rather than the rail.
     crate::tui::work_surface::release_focus(app);
@@ -228,6 +365,7 @@ pub(crate) fn focus_agent(app: &mut App, agent_id: &str) {
 
 /// Return to the main conversation. Returns whether a focus was active.
 pub(crate) fn exit_focus(app: &mut App) -> bool {
+    crate::extension_host::command::bump_epoch();
     let Some(focus) = app.agent_focus.take() else {
         return false;
     };
@@ -253,10 +391,19 @@ pub(crate) fn refresh_focus(app: &mut App) {
     let agent_id = focus.agent_id.clone();
     let (messages, omitted) = resolve_agent_transcript_messages(app, &agent_id);
     let receipts = child_receipts(app, &agent_id).to_vec();
+    // The result lands when the agent settles, often with no new message.
+    let result = result_block_for(app, &agent_id, &messages);
     let Some(focus) = app.agent_focus.as_mut() else {
         return;
     };
     focus.last_refresh = Instant::now();
+    if focus.result != result {
+        focus.result = result;
+        app.needs_redraw = true;
+    }
+    let Some(focus) = app.agent_focus.as_mut() else {
+        return;
+    };
     if messages.len() == focus.source_message_count
         && omitted == focus.omitted_messages
         && receipts.len() == focus.receipt_count
@@ -288,7 +435,7 @@ fn message_plain_text(message: &Message) -> String {
         .content
         .iter()
         .filter_map(|block| match block {
-            crate::models::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            codewhale_models::ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -331,6 +478,7 @@ pub(crate) fn apply_follow_up_receipt(
                     .map(|focus| focus.local_cells.clone())
                     .unwrap_or_default();
                 app.agent_focus = None;
+                crate::extension_host::command::bump_epoch();
                 focus_agent(app, &receipt.target_agent_id);
                 if let Some(focus) = app.agent_focus.as_mut() {
                     focus.local_cells = carried;
@@ -357,7 +505,18 @@ pub(crate) fn apply_follow_up_receipt(
     } else {
         crate::tui::app::StatusToastLevel::Warning
     };
-    if let Some(focus) = app.agent_focus.as_mut() {
+    // The receipt belongs to the agent it names (or the fork focus followed
+    // above). A delayed receipt for another agent must not land in whichever
+    // transcript happens to be focused now; the toast still reports it.
+    let receipt_target = outcome
+        .as_ref()
+        .ok()
+        .map(|receipt| receipt.target_agent_id.as_str());
+    if let Some(focus) = app
+        .agent_focus
+        .as_mut()
+        .filter(|focus| focus.is(agent_id) || receipt_target.is_some_and(|id| focus.is(id)))
+    {
         focus.local_cells.push(HistoryCell::System {
             content: note.clone(),
         });
@@ -439,17 +598,16 @@ pub(crate) enum AgentShellShortcut {
 /// surface owns that same arrow. Rendering and dispatch both consume this
 /// predicate so the footer cannot promise an action that another owner will
 /// swallow.
+///
+/// A workflow run on the workbar counts as agents to manage: `↓` then opens
+/// `/workflows` instead of the agent register.
 pub(crate) fn shell_shortcuts_available(app: &App, completion_menu_open: bool) -> bool {
-    agents_exist(app)
+    (agents_exist(app) || !app.workflow_runs.is_empty())
         && !completion_menu_open
         && app.input.is_empty()
         && app.view_stack.is_empty()
         && app.selected_composer_attachment_index().is_none()
         && !app.work_surface.focused
-        && !app
-            .workflow_panel
-            .as_ref()
-            .is_some_and(|panel| panel.keyboard_focus)
 }
 
 /// Resolve a key only while the agent shortcut contract is actually active.
@@ -519,6 +677,7 @@ pub(crate) fn composer_placeholder(app: &App) -> Option<String> {
 /// the jump-to-latest affordance behave exactly as they do on the main
 /// transcript.
 pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
+    let area = area.intersection(buf.area);
     let Some(focus) = app.agent_focus.as_ref() else {
         return;
     };
@@ -563,14 +722,20 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
             Style::default().fg(theme.text_muted),
         )));
     }
-    if focus.cells.is_empty() && focus.local_cells.is_empty() {
+    let result_cells = result_cells(app, focus.result.as_ref());
+    if focus.cells.is_empty() && result_cells.is_empty() && focus.local_cells.is_empty() {
         lines.push(Line::from(Span::styled(
             app.tr(MessageId::AgentFocusNoTranscript)
                 .replace("{agent}", &focus.label),
             Style::default().fg(theme.text_muted),
         )));
     }
-    for cell in focus.cells.iter().chain(focus.local_cells.iter()) {
+    for cell in focus
+        .cells
+        .iter()
+        .chain(result_cells.iter())
+        .chain(focus.local_cells.iter())
+    {
         lines.extend(cell.transcript_lines(width));
         lines.push(Line::default());
     }
@@ -594,22 +759,19 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
     focus.last_total = total;
     let top = focus.scroll_top.unwrap_or(max_top);
 
-    let banner_area = Rect::new(area.x, area.y, area.width, 1);
-    Paragraph::new(banner_line)
-        .style(background)
-        .render(banner_area, buf);
-    let body_area = Rect::new(
-        area.x,
-        area.y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(1),
+    lines.insert(0, banner_line);
+    let mut viewport = codewhale_ratatui::TranscriptViewport::new(&lines);
+    viewport.offset = top;
+    viewport.pinned_rows = 1;
+    viewport.style = background;
+    let plan = viewport.render(area, buf);
+    app.viewport.ocean_semantic_surfaces = codewhale_ratatui::ocean::ocean_semantic_surfaces(
+        plan.display_rows(),
+        plan.area,
+        crate::tui::ui_text::grapheme_display_width,
     );
-    let shown: Vec<Line<'static>> = lines.into_iter().skip(top).take(visible).collect();
-    Paragraph::new(shown)
-        .style(background)
-        .render(body_area, buf);
     // The focused view owns the transcript geometry for paging keys.
-    app.viewport.last_transcript_area = Some(body_area);
+    app.viewport.last_transcript_area = Some(plan.body_area);
     app.viewport.last_transcript_visible = visible;
     app.viewport.last_transcript_total = total;
     app.viewport.last_transcript_top = top;
@@ -634,6 +796,41 @@ mod tests {
             },
             &Config::default(),
         )
+    }
+
+    #[test]
+    fn child_receipts_anchor_only_to_unique_execution_pairs() {
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"first","name":"read_file","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"one"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"second","name":"read_file","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"second","content":"two"}]}
+        ])).unwrap();
+        let receipts = vec![
+            ("first".into(), "receipt one".into()),
+            ("second".into(), "receipt two".into()),
+        ];
+        let rendered = cells_for_messages(&messages, &receipts);
+        let anchored: Vec<_> = rendered
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::System { content } if content.starts_with("receipt ") => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(anchored, ["receipt one", "receipt two"]);
+
+        for duplicate in [messages[0].clone(), serde_json::from_value(json!({
+            "role":"assistant","content":[{"type":"tool_use","id":"first","name":"read_file","input":{}}]
+        })).unwrap()] {
+            let mut ambiguous = messages.clone();
+            ambiguous.push(duplicate);
+            let rendered = cells_for_messages(&ambiguous, &receipts);
+            assert!(!rendered.iter().any(|cell| matches!(cell, HistoryCell::System { content } if content == "receipt one")));
+            assert_eq!(rendered.iter().filter(|cell| matches!(cell, HistoryCell::System { content } if content == "receipt two")).count(), 1);
+        }
     }
 
     #[test]
@@ -779,6 +976,7 @@ mod tests {
         );
         app.subagent_cache
             .push(crate::tools::subagent::SubAgentResult {
+                usage: None,
                 name: "agent_scout".to_string(),
                 agent_id: "agent_scout".to_string(),
                 context_mode: "fresh".to_string(),
@@ -787,6 +985,7 @@ mod tests {
                 git_branch: None,
                 agent_type: crate::tools::subagent::FleetRole::Scout,
                 assignment: crate::tools::subagent::SubAgentAssignment {
+                    native_preset: None,
                     objective: "look around".to_string(),
                     role: Some("explore".to_string()),
                 },
@@ -816,6 +1015,8 @@ mod tests {
                 duration_ms: 0,
                 started_at: None,
                 from_prior_session: false,
+                idle_ms: None,
+                heartbeat_timeout_ms: None,
             });
         focus_agent(&mut app, "agent_scout");
         let posture = focused_posture(&app).expect("posture line from the snapshot");
@@ -845,6 +1046,158 @@ mod tests {
             .replace("{agent}", &focus_label(&app));
         let head: String = expected.chars().take(24).collect();
         assert!(screen.contains(head.trim_end()), "{screen}");
+    }
+
+    fn settled_agent(
+        agent_id: &str,
+        status: SubAgentStatus,
+        result: Option<&str>,
+    ) -> crate::tools::subagent::SubAgentResult {
+        crate::tools::subagent::SubAgentResult {
+            usage: None,
+            name: agent_id.to_string(),
+            agent_id: agent_id.to_string(),
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            workspace: None,
+            git_branch: None,
+            agent_type: crate::tools::subagent::FleetRole::Scout,
+            assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
+                objective: "audit the docs".to_string(),
+                role: Some("explore".to_string()),
+            },
+            model: "deepseek-v4-flash".to_string(),
+            nickname: None,
+            status,
+            worker_status: None,
+            runtime_permissions: None,
+            parent_run_id: None,
+            spawn_depth: 1,
+            child_route: None,
+            result: result.map(str::to_string),
+            steps_taken: 3,
+            checkpoint: None,
+            needs_input: None,
+            duration_ms: 1_000,
+            started_at: None,
+            from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_finished_agent_without_a_transcript_shows_its_full_result() {
+        // #6565: with no live capture the focused view explained the missing
+        // capture instead of showing the answer the engine had kept.
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        let body = (0..80)
+            .map(|n| format!("Finding {n} is documented in section {n}."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(body.len() > 2_500);
+        let result = format!("## Summary\n\n{body}\n\nEND-OF-RESULT");
+        app.subagent_cache.push(settled_agent(
+            "agent_done",
+            SubAgentStatus::Completed,
+            Some(&result),
+        ));
+        focus_agent(&mut app, "agent_done");
+        let (text, failed) = app
+            .agent_focus
+            .as_ref()
+            .and_then(|focus| focus.result.clone())
+            .expect("the stored result is the focused view");
+        assert!(!failed);
+        assert_eq!(text, result);
+        let screen = render(&mut app, 100, 200);
+        assert!(screen.contains("Finding 0 is documented"), "{screen}");
+        assert!(screen.contains("Finding 79 is documented"), "{screen}");
+        assert!(screen.contains("END-OF-RESULT"), "{screen}");
+        let heading = app.tr(MessageId::AgentFocusResult).into_owned();
+        assert!(screen.contains(&heading), "{screen}");
+        let missing = app
+            .tr(MessageId::AgentFocusNoTranscript)
+            .replace("{agent}", &focus_label(&app));
+        let head: String = missing.chars().take(12).collect();
+        assert!(!screen.contains(head.trim_end()), "{screen}");
+    }
+
+    #[test]
+    fn a_failed_agent_shows_why_it_stopped_in_full() {
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        let reason = format!(
+            "provider returned 429 after 5 retries; {} last-line",
+            "context ".repeat(80)
+        );
+        app.subagent_cache.push(settled_agent(
+            "agent_failed",
+            SubAgentStatus::Failed(reason.clone()),
+            None,
+        ));
+        focus_agent(&mut app, "agent_failed");
+        assert_eq!(
+            app.agent_focus
+                .as_ref()
+                .and_then(|focus| focus.result.clone()),
+            Some((reason.trim().to_string(), true))
+        );
+        let screen = render(&mut app, 100, 60);
+        assert!(screen.contains("last-line"), "{screen}");
+        let heading = app.tr(MessageId::AgentFocusStopReason).into_owned();
+        assert!(screen.contains(&heading), "{screen}");
+    }
+
+    #[test]
+    fn a_transcript_that_already_ends_with_the_answer_gets_no_result_block() {
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        seed_resident_transcript(
+            &mut app,
+            "agent_told",
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "audit", "cache_control": null}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "## Summary\n\nThree links are stale. Details follow.", "cache_control": null}]}
+            ]),
+        );
+        app.subagent_cache.push(settled_agent(
+            "agent_told",
+            SubAgentStatus::Completed,
+            Some("## Summary\n\nThree links are stale. Details follow."),
+        ));
+        focus_agent(&mut app, "agent_told");
+        assert_eq!(app.agent_focus.as_ref().unwrap().result, None);
+
+        // A capture that stops before the answer gets the answer appended,
+        // and the refresh picks it up when the agent settles later.
+        seed_resident_transcript(
+            &mut app,
+            "agent_partial",
+            json!([{"role": "user", "content": [{"type": "text", "text": "audit", "cache_control": null}]}]),
+        );
+        app.subagent_cache.push(settled_agent(
+            "agent_partial",
+            SubAgentStatus::Running,
+            None,
+        ));
+        focus_agent(&mut app, "agent_partial");
+        assert_eq!(app.agent_focus.as_ref().unwrap().result, None);
+        let agent = app
+            .subagent_cache
+            .iter_mut()
+            .find(|agent| agent.agent_id == "agent_partial")
+            .unwrap();
+        agent.status = SubAgentStatus::Completed;
+        agent.result = Some("Two links are stale.".to_string());
+        app.agent_focus.as_mut().unwrap().last_refresh = Instant::now() - REFRESH_INTERVAL;
+        refresh_focus(&mut app);
+        assert_eq!(
+            app.agent_focus.as_ref().unwrap().result,
+            Some(("Two links are stale.".to_string(), false))
+        );
     }
 
     #[test]
@@ -935,6 +1288,31 @@ mod tests {
         );
     }
 
+    /// U05-05: a delayed follow-up receipt for another agent must not be
+    /// appended to whichever transcript happens to be focused when it lands.
+    #[test]
+    fn delayed_follow_up_receipt_stays_out_of_another_agents_focus() {
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        focus_agent(&mut app, "agent_b");
+        let outcome = Ok(crate::tools::subagent::UserFollowUpOutcome {
+            agent_id: "agent_a".to_string(),
+            target_agent_id: "agent_a".to_string(),
+            delivered: true,
+            resumed: false,
+            note: "delivered".to_string(),
+        });
+        apply_follow_up_receipt(&mut app, "agent_a", &outcome);
+        let focus = app.agent_focus.as_ref().expect("focus kept");
+        assert_eq!(focus.agent_id, "agent_b");
+        assert!(
+            focus.local_cells.is_empty(),
+            "another agent's receipt leaked into this transcript: {:?}",
+            focus.local_cells
+        );
+        assert!(app.status_message.is_some(), "the toast still reports it");
+    }
+
     #[test]
     fn scroll_to_bottom_returns_the_focused_transcript_to_its_tail() {
         let tmp = tempdir().expect("tempdir");
@@ -1015,5 +1393,84 @@ mod tests {
             app.agent_focus.as_ref().unwrap().scroll_top.is_none(),
             "following the tail must not flip into a pinned offset"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "agent_focus/transcript_legacy.rs"]
+mod transcript_legacy;
+
+#[cfg(test)]
+mod mounted_transcript_acceptance {
+    use super::*;
+    use crate::config::Config;
+    use codewhale_localization::Locale;
+    use std::path::PathBuf;
+
+    fn fixture(locale: Locale, offset: Option<usize>) -> App {
+        let mut app = App::new(
+            crate::test_support::test_tui_options(PathBuf::from(".")),
+            &Config::default(),
+        );
+        app.launch.visible = false;
+        app.ui_locale = locale;
+        app.low_motion = true;
+        let mut focus = AgentFocus::new("worker".into(), "Builder 中".into());
+        focus.omitted_messages = 2;
+        focus.cells = vec![
+            HistoryCell::User { content: "Review the changed source".into() },
+            HistoryCell::Assistant { content: "A child receipt with 鲸鱼 cafe\u{0301} and wrapped source.\n\n```rust\nlet x = 1;\n```".into(), streaming: true },
+        ];
+        focus.local_cells.push(HistoryCell::User {
+            content: "Keep this local follow-up".into(),
+        });
+        focus.scroll_top = offset;
+        app.agent_focus = Some(focus);
+        app
+    }
+    #[test]
+    fn mounted_transcript_focused_child_banner_and_scroll_match_frozen_painter() {
+        for &locale in Locale::shipped() {
+            for offset in [None, Some(0), Some(2)] {
+                let (mut actual_app, mut old_app) =
+                    (fixture(locale, offset), fixture(locale, offset));
+                for width in [20, 40, 80, 120] {
+                    for height in [1, 3, 6, 12] {
+                        let area = Rect::new(7, 5, width, height);
+                        let mut actual = Buffer::empty(Rect::new(2, 3, width + 12, height + 8));
+                        for cell in &mut actual.content {
+                            cell.set_symbol("~");
+                        }
+                        let mut expected = actual.clone();
+                        transcript_legacy::render_focus(&mut old_app, area, &mut expected);
+                        render_focus(&mut actual_app, area, &mut actual);
+                        assert_eq!(
+                            actual, expected,
+                            "locale={locale:?} offset={offset:?} area={area:?}"
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_area,
+                            old_app.viewport.last_transcript_area
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_top,
+                            old_app.viewport.last_transcript_top
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_total,
+                            old_app.viewport.last_transcript_total
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_visible,
+                            old_app.viewport.last_transcript_visible
+                        );
+                        assert_eq!(
+                            actual_app.agent_focus.as_ref().unwrap().scroll_top,
+                            old_app.agent_focus.as_ref().unwrap().scroll_top
+                        );
+                    }
+                }
+            }
+        }
     }
 }

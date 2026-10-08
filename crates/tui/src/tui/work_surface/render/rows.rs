@@ -1,7 +1,7 @@
 //! Per-row composition: the columns a sub-agent row resolves to at a given
 //! width, and the style every row is painted with.
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::App;
@@ -240,11 +240,11 @@ pub(super) fn agent_row_styles(
     } else if hovered {
         app.ui_theme.elevated_bg
     } else {
-        app.ui_theme.surface_bg
+        app.ui_theme.panel_bg
     };
     let mut normal = Style::default().fg(app.ui_theme.text_body).bg(bg);
     let mut muted = Style::default().fg(app.ui_theme.text_muted).bg(bg);
-    if selected || opened {
+    if opened {
         normal = normal.fg(app.ui_theme.accent_primary);
         muted = muted.fg(app.ui_theme.accent_primary);
     }
@@ -259,6 +259,23 @@ pub(super) fn agent_row_styles(
     (normal, muted)
 }
 
+/// The one place a `WorkTone` becomes ink. Failure red is spent here and
+/// nowhere else in the work surface; `tone_color_reserves_failure_red` pins
+/// that against every selectable theme.
+///
+/// Headings (group headers like `▾ Subagents 2`) are muted structure, not
+/// interaction — accent_primary is reserved for selection/focus. GrokBuild
+/// uses the same gray-on-header treatment.
+pub(super) fn tone_color(tone: WorkTone, theme: &codewhale_palette::UiTheme) -> Color {
+    match tone {
+        WorkTone::Heading | WorkTone::Muted => theme.text_muted,
+        WorkTone::Live => theme.status_working,
+        WorkTone::Attention => theme.warning,
+        WorkTone::Failure => theme.error_fg,
+        WorkTone::Success => theme.success,
+    }
+}
+
 pub(super) fn row_style(
     app: &App,
     row: &WorkRow,
@@ -266,17 +283,8 @@ pub(super) fn row_style(
     hovered: bool,
     opened: bool,
 ) -> Style {
-    // Headings (group headers like `▾ Subagents 2`) are muted structure, not
-    // interaction — accent_primary is reserved for selection/focus. GrokBuild
-    // uses the same gray-on-header treatment.
-    let fg = match row.tone {
-        WorkTone::Heading => app.ui_theme.text_muted,
-        WorkTone::Live => app.ui_theme.status_working,
-        WorkTone::Attention => app.ui_theme.error_fg,
-        WorkTone::Success => app.ui_theme.success,
-        WorkTone::Muted => app.ui_theme.text_muted,
-    };
-    let mut style = Style::default().fg(fg).bg(app.ui_theme.surface_bg);
+    let fg = tone_color(row.tone, &app.ui_theme);
+    let mut style = Style::default().fg(fg).bg(app.ui_theme.panel_bg);
     if row.tone == WorkTone::Heading {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -290,10 +298,51 @@ pub(super) fn row_style(
     }
     if selected {
         style = style
+            .fg(codewhale_palette::enforce_contrast(
+                fg,
+                app.ui_theme.selection_bg,
+                4.5,
+            ))
             .bg(app.ui_theme.selection_bg)
             .add_modifier(Modifier::BOLD);
     } else if hovered {
         style = style.bg(app.ui_theme.elevated_bg);
     }
     style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkTone, tone_color};
+
+    /// Failure red is reserved for actual failure, on every preset — not just
+    /// the whale default (`docs/design/STATUS_BAR_COLOR_GRAMMAR.md`). Waiting,
+    /// blocked and stale work used to share `error_fg` with a crashed agent,
+    /// which spent the loudest ink in the palette on the routine case.
+    #[test]
+    fn tone_color_reserves_failure_red() {
+        for theme_id in codewhale_palette::SELECTABLE_THEMES {
+            let theme = theme_id.ui_theme();
+            for tone in [
+                WorkTone::Heading,
+                WorkTone::Live,
+                WorkTone::Attention,
+                WorkTone::Success,
+                WorkTone::Muted,
+            ] {
+                assert_ne!(
+                    tone_color(tone, &theme),
+                    theme.error_fg,
+                    "theme '{}' spends Failure red on {tone:?}",
+                    theme_id.name()
+                );
+            }
+            assert_eq!(
+                tone_color(WorkTone::Failure, &theme),
+                theme.error_fg,
+                "theme '{}' must still paint a real failure red",
+                theme_id.name()
+            );
+        }
+    }
 }

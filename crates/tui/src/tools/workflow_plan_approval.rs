@@ -158,6 +158,24 @@ pub fn analyze_workflow_plan_approval_with_config(
         return empty_summary(format!("workflow {action}"), None);
     }
 
+    let mut summary = analyze_workflow_launch(input, config);
+    // `verify: true` runs the workspace's detected gates (package scripts,
+    // `cargo check` build scripts, ...) when the run completes. That is shell
+    // execution of workspace code, so it leaves the read-only envelope.
+    if input.get("verify").and_then(Value::as_bool) == Some(true) {
+        summary.shell = true;
+        summary.elevated = true;
+        if !summary.reasons.iter().any(|r| r == "verify_gates") {
+            summary.reasons.push("verify_gates".into());
+        }
+    }
+    summary
+}
+
+fn analyze_workflow_launch(
+    input: &Value,
+    config: &WorkflowConfigToml,
+) -> WorkflowPlanApprovalSummary {
     if let Some(plan) = input.get("plan").filter(|v| v.is_object()) {
         return analyze_plan_object(plan, optional_u64(input, "token_budget"), config);
     }
@@ -184,7 +202,12 @@ pub fn analyze_workflow_plan_approval_with_config(
     let network = script_suggests_network(script);
     let worktree = script.contains("worktree") || script.contains("isolation");
     let token_budget = optional_u64(input, "token_budget");
-    let high_budget = token_budget.is_some_and(|b| b > config.default_token_budget);
+    // The card reports what the run will actually get: the caller's budget,
+    // else the configured default when one is set — 0 means none applies.
+    let effective_budget = token_budget
+        .filter(|b| *b > 0)
+        .or((config.default_token_budget > 0).then_some(config.default_token_budget));
+    let high_budget = is_high_budget(token_budget, config);
     // Unknown script authority: always elevated so the card is required.
     let elevated = true;
     let mut reasons = vec!["script_or_source".to_string()];
@@ -224,7 +247,7 @@ pub fn analyze_workflow_plan_approval_with_config(
         high_budget,
         broader_authority: false,
         token_budget,
-        budget_label: budget_label(token_budget, high_budget),
+        budget_label: budget_label(effective_budget, high_budget),
         elevated,
         reasons,
     }
@@ -432,7 +455,7 @@ fn analyze_plan_object(
         worktree = true;
     }
 
-    let high_budget = token_budget.is_some_and(|b| b > config.default_token_budget);
+    let high_budget = is_high_budget(token_budget, config);
     let mut reasons = Vec::new();
     if writes {
         reasons.push("writes".into());
@@ -576,27 +599,132 @@ fn collect_children(
             .and_then(Value::as_array)
         {
             for tool in tools {
-                let name = tool.as_str().unwrap_or_default();
-                if name.contains("shell") || name.contains("exec") {
-                    *shell = true;
-                }
-                if name.contains("secret") || name.contains("credential") || name == "read_env" {
-                    *secrets = true;
-                }
-                if matches!(name, "web_search" | "web_run" | "fetch_url")
-                    || name.starts_with("mcp_")
-                {
-                    *network = true;
-                }
-                if matches!(
-                    name,
-                    "write" | "edit" | "write_file" | "edit_file" | "apply_patch"
-                ) {
-                    *writes = true;
-                }
+                let authority = tool_name_authority(tool.as_str().unwrap_or_default());
+                *shell |= authority.shell;
+                *network |= authority.network;
+                *writes |= authority.writes;
+                *secrets |= authority.secrets;
             }
         }
     }
+}
+
+/// What an allowed-tool entry lets a child do.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ToolAuthority {
+    shell: bool,
+    network: bool,
+    writes: bool,
+    secrets: bool,
+}
+
+/// Classify one allowed-tool name, as a plan's `allowed_tools` or a script's
+/// quoted tool name spells it.
+///
+/// Names match case-insensitively (the model-facing families are spelled
+/// `Bash`, `Web`, `File`, `Run`, `Git`), and a pattern suffix such as
+/// `Web(*)` or `Bash(git status)` names the same family.
+fn tool_name_authority(raw: &str) -> ToolAuthority {
+    let name = raw
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let name = name.as_str();
+    let mut authority = ToolAuthority::default();
+    if name.contains("shell")
+        || name.contains("exec")
+        || name.contains("bash")
+        || name == "run"
+        || name.starts_with("run_")
+        // `rlm` evaluates code as well as fetching.
+        || name == "rlm"
+    {
+        authority.shell = true;
+    }
+    if name.contains("secret") || name.contains("credential") || name == "read_env" {
+        authority.secrets = true;
+    }
+    if matches!(
+        name,
+        "web" | "web_search" | "web_run" | "web.run" | "fetch_url" | "rlm" | "git_fetch"
+    ) || name.starts_with("mcp_")
+    {
+        authority.network = true;
+    }
+    // `File` carries write/edit/patch actions as well as reads; an
+    // allow-list entry for the family grants all of them.
+    if matches!(
+        name,
+        "file" | "write" | "edit" | "write_file" | "edit_file" | "apply_patch"
+    ) {
+        authority.writes = true;
+    }
+    // Git fetches and commits; the GitHub tools comment, close and publish.
+    if matches!(name, "git" | "github" | "gh") || name.starts_with("github_") {
+        authority.network = true;
+        authority.writes = true;
+    }
+    // Computer and browser control act on apps and pages directly.
+    if name.starts_with("computer") || name.starts_with("browser") {
+        authority.network = true;
+        authority.writes = true;
+    }
+    if name.starts_with("computer") {
+        authority.shell = true;
+    }
+    // Tasks and automations start delegated work that runs on its own.
+    if matches!(
+        name,
+        "task" | "tasks" | "task_create" | "automation" | "automations" | "automation_create"
+    ) {
+        authority.shell = true;
+        authority.writes = true;
+    }
+    authority
+}
+
+/// Tool names a script quotes, in any quote style (`"Web"`, `'Web'`,
+/// `` `Web` ``), combined. Only identifier-like literals count, so prompt
+/// text in the script is not read as a tool name.
+fn script_tool_authority(script: &str) -> ToolAuthority {
+    let mut authority = ToolAuthority::default();
+    let mut chars = script.chars();
+    while let Some(c) = chars.next() {
+        if !matches!(c, '"' | '\'' | '`') {
+            continue;
+        }
+        let mut literal = String::new();
+        let mut escaped = false;
+        for next in chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if next == '\\' {
+                escaped = true;
+            } else if next == c {
+                break;
+            }
+            literal.push(next);
+        }
+        let looks_like_tool = !literal.is_empty()
+            && literal.len() <= 64
+            && literal
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+            && literal.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-' | '(' | ')' | '*' | ' ')
+            });
+        if looks_like_tool {
+            let found = tool_name_authority(&literal);
+            authority.shell |= found.shell;
+            authority.network |= found.network;
+            authority.writes |= found.writes;
+            authority.secrets |= found.secrets;
+        }
+    }
+    authority
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -684,7 +812,9 @@ fn script_suggests_writes(script: &str) -> bool {
         || lower.contains("write_file")
         || lower.contains("\"write\"")
         || lower.contains("\"edit\"")
+        || lower.contains("\"file\"")
         || lower.contains("apply_patch")
+        || script_tool_authority(script).writes
 }
 
 fn script_suggests_shell(script: &str) -> bool {
@@ -694,11 +824,16 @@ fn script_suggests_shell(script: &str) -> bool {
         || lower.contains("bash(")
         || ((lower.contains("allowedtools") || lower.contains("allowed_tools"))
             && (lower.contains("shell") || lower.contains("bash")))
+        || script_tool_authority(script).shell
 }
 
 fn script_suggests_network(script: &str) -> bool {
     let lower = script.to_ascii_lowercase();
-    lower.contains("allow_network") || lower.contains("web_search") || lower.contains("fetch_url")
+    lower.contains("allow_network")
+        || lower.contains("web_search")
+        || lower.contains("fetch_url")
+        || lower.contains("\"web\"")
+        || script_tool_authority(script).network
 }
 
 fn count_script_tasks(script: &str) -> usize {
@@ -709,11 +844,17 @@ fn optional_u64(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64)
 }
 
+/// A budget is "high" only against a configured baseline; when
+/// `[workflow].default_token_budget` is 0 (the default) nothing is high.
+fn is_high_budget(token_budget: Option<u64>, config: &WorkflowConfigToml) -> bool {
+    config.default_token_budget > 0 && token_budget.is_some_and(|b| b > config.default_token_budget)
+}
+
 fn budget_label(token_budget: Option<u64>, high_budget: bool) -> String {
     match token_budget {
         Some(n) if high_budget => format!("{n} tokens (high)"),
         Some(n) => format!("{n} tokens"),
-        None => "default".to_string(),
+        None => "unbounded".to_string(),
     }
 }
 
@@ -831,6 +972,75 @@ mod tests {
     }
 
     #[test]
+    fn capability_flags_match_tool_family_names_case_insensitively() {
+        let input = json!({
+            "action": "start",
+            "plan": {
+                "goal": "scout",
+                "children": [{
+                    "prompt": "look",
+                    "type": "explore",
+                    "permissions": { "allowed_tools": ["Bash", "Web", "File"] }
+                }]
+            }
+        });
+        let summary = analyze_workflow_plan_approval(&input);
+        assert!(summary.shell, "{summary:?}");
+        assert!(summary.network, "{summary:?}");
+        assert!(summary.writes, "{summary:?}");
+
+        let script = r#"task({ allowedTools: ["Web", "File"] })"#;
+        assert!(script_suggests_network(script));
+        assert!(script_suggests_writes(script));
+    }
+
+    #[test]
+    fn capability_flags_cover_quote_styles_patterns_and_more_families() {
+        for script in [
+            "task({ allowedTools: ['Web', 'File'] })",
+            "task({ allowedTools: [`Web`, `File`] })",
+            "task({ allowedTools: ['Web(*)', 'File(*)'] })",
+        ] {
+            assert!(script_suggests_network(script), "{script}");
+            assert!(script_suggests_writes(script), "{script}");
+        }
+        assert!(script_suggests_shell("task({ allowedTools: ['Bash'] })"));
+        // Prompt text that mentions a tool is not a tool name.
+        let prose = "task({ prompt: 'read the file and summarise the web page' })";
+        assert!(!script_suggests_writes(prose));
+        assert!(!script_suggests_network(prose));
+
+        let flags = |tools: Value| {
+            analyze_workflow_plan_approval(&json!({
+                "action": "start",
+                "plan": {
+                    "goal": "scout",
+                    "children": [{
+                        "prompt": "look",
+                        "type": "explore",
+                        "permissions": { "allowed_tools": tools }
+                    }]
+                }
+            }))
+        };
+        let summary = flags(json!([" Web(*) ", "File(src/**)"]));
+        assert!(summary.network && summary.writes, "{summary:?}");
+        let summary = flags(json!(["rlm"]));
+        assert!(summary.shell && summary.network, "{summary:?}");
+        for family in ["github", "Git", "computer", "browser"] {
+            let summary = flags(json!([family]));
+            assert!(summary.network && summary.writes, "{family}: {summary:?}");
+        }
+        for family in ["tasks", "automation", "Run"] {
+            let summary = flags(json!([family]));
+            assert!(summary.shell, "{family}: {summary:?}");
+        }
+        // Read-only Git tools stay read-only.
+        let summary = flags(json!(["git_status", "git_diff"]));
+        assert!(!summary.network && !summary.writes, "{summary:?}");
+    }
+
+    #[test]
     fn canonical_worker_role_flags_shell_for_write_plan() {
         let input = json!({
             "action": "start",
@@ -934,12 +1144,20 @@ mod tests {
                 "children": [{ "prompt": "scan", "type": "explore" }]
             }
         });
-        let summary = analyze_workflow_plan_approval(&input);
+        // With no configured baseline (the default) nothing is "high" — the
+        // flag only exists relative to an operator-set cap (#6189).
+        let uncapped = analyze_workflow_plan_approval(&input);
+        assert!(!uncapped.high_budget, "{uncapped:?}");
+        let config = WorkflowConfigToml {
+            default_token_budget: 120_000,
+            ..WorkflowConfigToml::default()
+        };
+        let summary = analyze_workflow_plan_approval_with_config(&input, &config);
         assert!(summary.high_budget, "{summary:?}");
         assert!(summary.elevated);
         assert!(summary.budget_label.contains("high"));
         assert_eq!(
-            workflow_approval_requirement_for(&input, &config()),
+            workflow_approval_requirement_for(&input, &config),
             ApprovalRequirement::Required
         );
     }
@@ -1033,6 +1251,29 @@ mod tests {
         assert_eq!(
             workflow_approval_requirement_for(&input, &cfg),
             ApprovalRequirement::Auto
+        );
+    }
+
+    #[test]
+    fn verify_gates_leave_the_read_only_envelope() {
+        let plan = json!({
+            "goal": "scout crates",
+            "risk": "read_only",
+            "children": [{ "prompt": "look", "type": "explore" }]
+        });
+        let without = json!({ "action": "start", "plan": plan.clone() });
+        let with_verify = json!({ "action": "start", "plan": plan, "verify": true });
+        assert_eq!(
+            workflow_approval_requirement_for(&without, &config()),
+            ApprovalRequirement::Auto
+        );
+        let summary = analyze_workflow_plan_approval(&with_verify);
+        assert!(summary.elevated && summary.shell, "{summary:?}");
+        assert!(summary.reasons.iter().any(|r| r == "verify_gates"));
+        assert_eq!(
+            workflow_approval_requirement_for(&with_verify, &config()),
+            ApprovalRequirement::Required,
+            "completion gates run workspace code and need the approval card"
         );
     }
 

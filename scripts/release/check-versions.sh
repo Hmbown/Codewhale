@@ -17,7 +17,7 @@
 #   6. The current version has either an explicit source-candidate entry or a
 #      dated Keep a Changelog release entry and a matching compare link.
 #   7. README contributor additions are mentioned in the current release entry.
-#   8. `SECURITY.md` keeps the dedicated security contact.
+#   8. `.github/SECURITY.md` keeps the dedicated security contact.
 #   9. Generated website facts carry the workspace version.
 #  10. Public install and version snippets point at the current release.
 #  11. `codewhale-app-server` stays library-only; the shipped app-server
@@ -130,6 +130,7 @@ fi
 # 4) Internal path dependency pins.
 internal_dep_drift="$(
   grep -nE 'codewhale-[a-z-]+[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*"' crates/*/Cargo.toml \
+    | grep -vF 'codewhale-ratatui = { path = "../../vendor/codewhale-ratatui", version = "0.1.0" }' \
     | grep -v "version[[:space:]]*=[[:space:]]*\"${workspace_version}\"" || true
 )"
 if [[ -n "${internal_dep_drift}" ]]; then
@@ -145,10 +146,11 @@ if ! ./scripts/sync-changelog.sh --check >/dev/null 2>&1; then
   fail=1
 fi
 
-# 6) Current candidate/release-note shape. Normal branch and release-candidate
-# CI must accept an honest source candidate. Tag creation and public release
-# workflows pass --require-dated-release so publication cannot proceed until
-# the same entry has a real release date and tag-based compare link.
+# 6) Current candidate/release-note shape. Normal branch CI must accept an
+# honest source candidate. The release candidate, tag creation and public
+# release workflows pass --require-dated-release so publication cannot proceed
+# until the same entry has a real release date and tag-based compare link (an
+# RC receipt only counts for the exact tag SHA, so it must see the dated entry).
 current_section="$(
   awk -v version="${workspace_version}" '
     index($0, "## [" version "] - ") == 1 { in_section = 1; print; next }
@@ -182,7 +184,7 @@ if [[ -z "${compare_line}" ]]; then
   echo "::error::CHANGELOG.md must include a compare link for ${workspace_version}." >&2
   fail=1
 elif [[ "${require_dated_release}" == "1" ]] &&
-  ! grep -qE "^\\[${workspace_version}\\]: https://github.com/Hmbown/CodeWhale/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.v${workspace_version}$" <<<"${compare_line}"; then
+  ! grep -qE "^\\[${workspace_version}\\]: https://github.com/codewhale-hq/CodeWhale/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.v${workspace_version}$" <<<"${compare_line}"; then
   echo "::error::Publication requires the ${workspace_version} compare link to end at v${workspace_version}." >&2
   fail=1
 fi
@@ -254,12 +256,12 @@ fi
 
 # 8) Security contact guard.
 security_email="hmbown@gmail.com"
-if ! grep -qF "${security_email}" SECURITY.md; then
-  echo "::error::SECURITY.md must list ${security_email} as the security contact." >&2
+if ! grep -qF "${security_email}" .github/SECURITY.md; then
+  echo "::error::.github/SECURITY.md must list ${security_email} as the security contact." >&2
   fail=1
 fi
-if grep -qF "hmbown.dev@gmail.com" SECURITY.md; then
-  echo "::error::SECURITY.md must not use the alternate personal fallback email; use ${security_email}." >&2
+if grep -qF "hmbown.dev@gmail.com" .github/SECURITY.md; then
+  echo "::error::.github/SECURITY.md must not use the alternate personal fallback email; use ${security_email}." >&2
   fail=1
 fi
 

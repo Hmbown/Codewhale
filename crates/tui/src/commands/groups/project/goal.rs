@@ -88,13 +88,7 @@ fn goal_command(
                 // the conversation instead of demanding a restatement
                 // (mirrors bare /workflow). The end-of-turn GoalUpdated
                 // snapshot syncs the created goal into the sidebar.
-                let message = "The user invoked /goal with no objective — declare a goal for the \
-                     CURRENT work. Synthesize the objective from the conversation context (the \
-                     task in flight, recent findings, open items) and set it by calling \
-                     `create_goal` with the full objective (and a token_budget only if one was \
-                     discussed). Then continue working toward it. Only if the conversation \
-                     genuinely contains no work yet, ask the user what the goal should be."
-                    .to_string();
+                let message = BARE_GOAL_BRIEF.to_string();
                 CommandResult::with_message_and_action(
                     "Declaring a goal from the current context...",
                     AppAction::SendMessage(message),
@@ -103,6 +97,17 @@ fn goal_command(
         }
     }
 }
+
+/// Model-facing brief for a context-dependent bare `/goal`. `create_goal`
+/// is eager on the default catalog, but a narrowed surface can defer it, so
+/// the brief carries the activation path (#6747).
+pub(crate) const BARE_GOAL_BRIEF: &str = "The user invoked /goal with no objective — declare a goal for the \
+     CURRENT work. Synthesize the objective from the conversation context (the \
+     task in flight, recent findings, open items) and set it by calling \
+     `create_goal` with the full objective (and a token_budget only if one was \
+     discussed); if `create_goal` is not in your tool list, load it with `tool_search` \
+     first. Then continue working toward it. Only if the conversation \
+     genuinely contains no work yet, ask the user what the goal should be.";
 
 /// Plain status line: objective, state, elapsed, budget, continuations, and
 /// — for an active goal that no turn is driving right now — how to continue.
@@ -316,8 +321,19 @@ fn goal_contextual(contexts: CommandContexts<'_>, arg: Option<&str>) -> CommandR
 
 #[cfg(test)]
 mod tests {
+    /// #6747: the bare /goal brief names only callable tools and teaches
+    /// the `tool_search` activation path.
+    #[test]
+    fn bare_goal_brief_names_only_callable_tools() {
+        crate::tools::canonical_action::tests::assert_text_names_only_callable_tools(
+            "bare /goal brief",
+            BARE_GOAL_BRIEF,
+        );
+        assert!(BARE_GOAL_BRIEF.contains("`tool_search`"));
+    }
+
     use super::*;
-    use codewhale_command_contract::facets::{CommandProjectContext, ProjectShareProjection};
+    use codewhale_command_contract::facets::CommandProjectContext;
 
     /// Deterministic fake project facet over portable values only.
     struct FakeProject;
@@ -335,15 +351,6 @@ mod tests {
 
         fn lsp_set(&mut self, _enabled: bool) -> Result<(), String> {
             Ok(())
-        }
-
-        fn share_projection(&self) -> ProjectShareProjection {
-            ProjectShareProjection {
-                history_is_empty: true,
-                history_len: 0,
-                model: String::new(),
-                mode_label: String::new(),
-            }
         }
 
         fn goal_state(&self) -> ProjectGoalState {

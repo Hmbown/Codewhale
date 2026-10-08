@@ -13,7 +13,7 @@ use crate::commands;
 use super::app::{App, looks_like_slash_command_input};
 use super::model_picker::provider_scoped_model_completion_ids;
 use super::widgets::SlashMenuEntry;
-use super::widgets::slash_completion_hints_with_model_candidates;
+use super::widgets::slash_completion_hints_for_plugins;
 
 /// Return the slash-menu entries the composer should display, honouring
 /// `slash_menu_hidden` (set when the user dismisses the popup with Esc).
@@ -70,15 +70,33 @@ pub fn visible_slash_menu_entries(app: &App, limit: usize) -> Vec<SlashMenuEntry
                 effort_entries.push(SlashMenuEntry {
                     name: format!("/effort {}", label),
                     description: match eff {
-                        crate::tui::app::ReasoningEffort::Auto => "choose per turn".into(),
-                        crate::tui::app::ReasoningEffort::Off => "no extra reasoning".into(),
-                        crate::tui::app::ReasoningEffort::Minimal => "minimal reasoning".into(),
-                        crate::tui::app::ReasoningEffort::Low => "lighter reasoning".into(),
-                        crate::tui::app::ReasoningEffort::Medium => "balanced reasoning".into(),
-                        crate::tui::app::ReasoningEffort::High => "deeper reasoning".into(),
-                        crate::tui::app::ReasoningEffort::XHigh => "extra-high reasoning".into(),
-                        crate::tui::app::ReasoningEffort::Ultra => "ultra reasoning".into(),
-                        crate::tui::app::ReasoningEffort::Max => "maximum reasoning".into(),
+                        crate::reasoning_preference::ReasoningEffort::Auto => {
+                            "choose per turn".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::Off => {
+                            "no extra reasoning".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::Minimal => {
+                            "minimal reasoning".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::Low => {
+                            "lighter reasoning".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::Medium => {
+                            "balanced reasoning".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::High => {
+                            "deeper reasoning".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::XHigh => {
+                            "extra-high reasoning".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::Ultra => {
+                            "ultra reasoning".into()
+                        }
+                        crate::reasoning_preference::ReasoningEffort::Max => {
+                            "maximum reasoning".into()
+                        }
                     },
                     is_skill: false,
                     alias_hint: None,
@@ -89,13 +107,14 @@ pub fn visible_slash_menu_entries(app: &App, limit: usize) -> Vec<SlashMenuEntry
             return effort_entries.into_iter().take(limit).collect();
         }
     }
-    slash_completion_hints_with_model_candidates(
+    slash_completion_hints_for_plugins(
         &app.input,
         limit,
         &app.cached_skills,
         app.ui_locale,
         Some(&app.workspace),
         &model_candidates,
+        Some(app.extension_plugin_view().as_ref()),
     )
 }
 
@@ -129,12 +148,11 @@ pub fn apply_slash_menu_selection(
     let mut command = selected.name.clone();
 
     let command_key = command.trim_start_matches('/');
-    let user_takes_arguments =
-        commands::user_registry::with_registry_for_workspace(Some(&app.workspace), |registry| {
-            registry
-                .get(command_key)
-                .map(|metadata| metadata.takes_arguments())
-        });
+    let user_takes_arguments = commands::user_registry::with_registry_for_app(app, |registry| {
+        registry
+            .get(command_key)
+            .map(|metadata| metadata.takes_arguments())
+    });
     let takes_arguments = user_takes_arguments.unwrap_or_else(|| {
         commands::get_command_info(command_key)
             .is_some_and(|info| info.composer_wants_trailing_space())
@@ -295,13 +313,14 @@ pub fn try_autocomplete_slash_command(app: &mut App) -> bool {
     }
 
     let model_candidates = provider_scoped_model_completion_ids(app);
-    let candidates = slash_completion_hints_with_model_candidates(
+    let candidates = slash_completion_hints_for_plugins(
         &app.input,
         128,
         &app.cached_skills,
         app.ui_locale,
         Some(&app.workspace),
         &model_candidates,
+        Some(app.extension_plugin_view().as_ref()),
     )
     .into_iter()
     .map(|entry| entry.name)

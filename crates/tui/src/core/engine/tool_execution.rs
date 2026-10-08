@@ -24,6 +24,127 @@ fn inherited_interactive_shell_refusal(tool_name: &str, interactive: bool) -> Op
         .map(|message| ToolError::execution_failed(message.to_string()))
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static REPLAY_SPAN_SEQ: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Number operation spans on this thread from 1 until the guard drops, the
+/// way an otherwise idle process would (see [`OperationSpanGuard::span_id`]).
+#[cfg(all(test, unix))]
+pub(crate) fn pin_replay_span_sequence() -> ReplaySpanSequenceGuard {
+    REPLAY_SPAN_SEQ.with(|cell| cell.set(Some(1)));
+    ReplaySpanSequenceGuard
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct ReplaySpanSequenceGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for ReplaySpanSequenceGuard {
+    fn drop(&mut self) {
+        REPLAY_SPAN_SEQ.with(|cell| cell.set(None));
+    }
+}
+
+/// Pairs an observed `OperationActivityStarted` with at most one completion.
+///
+/// The turn loop drops an in-flight tool future when the user cancels
+/// (`tokio::select!` on the cancel token, or `drop(tool_tasks)` for a parallel
+/// batch), so a Completed sent inline after the await would never be sent.
+/// Dropping an unfinished span sends `Completed { Cancelled }` with
+/// `try_send`: best effort, like the other guards here, because `Drop` cannot
+/// await a full channel. Cancellation may release a completion parked on a
+/// full queue; the turn's reserved terminal observation settles its lifecycle.
+pub(super) struct OperationSpanGuard {
+    tx: mpsc::Sender<Event>,
+    span: Option<(String, codewhale_protocol::engine_owner::OwnerActivityKind)>,
+    cancel: Option<CancellationToken>,
+}
+
+impl OperationSpanGuard {
+    /// A process-unique span id. The model's tool-call id is not unique:
+    /// gateways that elide ids fall back to `call_{block_index}`, which
+    /// repeats every step, and a consumer deduplicates completed spans.
+    fn span_id(call_id: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        // A conformance replay numbers its own spans. The process-wide
+        // counter also counts every span another test starts in a shared
+        // process, so a golden recorded in isolation drifted there (#6698).
+        #[cfg(all(test, unix))]
+        if let Some(seq) = REPLAY_SPAN_SEQ.with(|cell| {
+            let seq = cell.get()?;
+            cell.set(Some(seq + 1));
+            Some(seq)
+        }) {
+            return format!("{call_id}#{seq}");
+        }
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{call_id}#{seq}")
+    }
+
+    pub(super) async fn start(
+        tx: mpsc::Sender<Event>,
+        call_id: &str,
+        activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        cancel: Option<CancellationToken>,
+    ) -> Self {
+        let span_id = Self::span_id(call_id);
+        // Reservation is cancel safe: if this future is dropped the event
+        // was either sent or not, and the guard is armed only once it was.
+        let sent = match super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        {
+            Ok(permit) => {
+                permit.send(Event::OperationActivityStarted {
+                    span_id: span_id.clone(),
+                    activity_kind,
+                });
+                true
+            }
+            Err(_) => false,
+        };
+        Self {
+            tx,
+            span: sent.then_some((span_id, activity_kind)),
+            cancel,
+        }
+    }
+
+    async fn complete(mut self, outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome) {
+        if let Some((span_id, activity_kind)) = self.span.take()
+            && let Ok(permit) = super::streaming::reserve_event_capacity(
+                &self.tx,
+                self.cancel.as_ref(),
+                super::streaming::EventReservationPolicy::Receipt,
+            )
+            .await
+        {
+            permit.send(Event::OperationActivityCompleted {
+                span_id,
+                activity_kind,
+                outcome,
+            });
+        }
+    }
+}
+
+impl Drop for OperationSpanGuard {
+    fn drop(&mut self) {
+        if let Some((span_id, activity_kind)) = self.span.take() {
+            let _ = self.tx.try_send(Event::OperationActivityCompleted {
+                span_id,
+                activity_kind,
+                outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Cancelled,
+            });
+        }
+    }
+}
+
 /// Emits delayed, best-effort liveness pulses for one running tool.
 ///
 /// Keep the ticker in its own task instead of embedding `tokio::time::Interval`
@@ -90,13 +211,11 @@ impl Drop for ToolHeartbeatGuard {
 /// wheel scrolls the host terminal instead of the transcript, and the TUI
 /// renders at the bottom of cooked-mode output.
 ///
-/// `Drop` runs synchronously and can't await, so we first use `try_send` on a
-/// **clone of the event channel** to push `ResumeEvents` non-blockingly. If the
-/// channel is full we enqueue the resume on the active Tokio runtime instead of
-/// dropping it; otherwise a burst of engine events can strand the UI in the
-/// paused terminal state.
+/// Reserve the matching resume before pausing. `Drop` consumes that permit
+/// synchronously, including on cancellation and a full channel. No detached
+/// sender can outlive the tool or compete with the turn's terminal event.
 pub(super) struct InteractiveTerminalGuard {
-    tx: Option<mpsc::Sender<Event>>,
+    resume: Option<(mpsc::Sender<Event>, mpsc::OwnedPermit<Event>)>,
 }
 
 impl InteractiveTerminalGuard {
@@ -105,87 +224,70 @@ impl InteractiveTerminalGuard {
     pub(super) async fn engage(
         tx: mpsc::Sender<Event>,
         interactive: bool,
+        cancel: Option<CancellationToken>,
     ) -> Result<Self, ToolError> {
         if !interactive {
-            return Ok(Self { tx: None });
+            return Ok(Self { resume: None });
         }
-        // Arm before the send/ack awaits. Cancellation can drop this future
-        // at either await point; the guard must still queue ResumeEvents if a
-        // PauseEvents raced into the UI first.
-        let guard = Self {
-            tx: Some(tx.clone()),
-        };
+        let resume = super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        .map_err(terminal_handoff_send_error)?;
         let ack = Arc::new(tokio::sync::Notify::new());
-        match tx
-            .send(Event::PauseEvents {
-                ack: Some(ack.clone()),
-            })
-            .await
-        {
-            Ok(()) => {
-                if tokio::time::timeout(Duration::from_millis(750), ack.notified())
-                    .await
-                    .is_err()
-                {
-                    // `guard` drops on return and queues the matching resume.
-                    return Err(ToolError::execution_failed(
-                        "Terminal handoff was not acknowledged; interactive tool was not launched.",
-                    ));
+        let pause = super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        .map_err(terminal_handoff_send_error)?;
+        // No await separates the pause send and guard installation. A
+        // cancelled reservation above never paused and needs no resume.
+        pause.send(Event::PauseEvents {
+            ack: Some(ack.clone()),
+        });
+        let guard = Self {
+            resume: Some((tx, resume)),
+        };
+        let acknowledged = match cancel.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(ToolError::cancelled("Terminal handoff cancelled; interactive tool was not launched."));
                 }
-            }
-            Err(err) => {
-                tracing::debug!(
-                    target: "engine.tool_execution",
-                    ?err,
-                    "InteractiveTerminalGuard: event channel closed before PauseEvents"
-                );
-                return Err(ToolError::execution_failed(
-                    "Terminal handoff channel closed; interactive tool was not launched.",
-                ));
-            }
+                result = tokio::time::timeout(Duration::from_millis(750), ack.notified()) => result,
+            },
+            None => tokio::time::timeout(Duration::from_millis(750), ack.notified()).await,
+        };
+        if acknowledged.is_err() {
+            return Err(ToolError::execution_failed(
+                "Terminal handoff was not acknowledged; interactive tool was not launched.",
+            ));
         }
         Ok(guard)
     }
 }
 
+fn terminal_handoff_send_error(reason: super::streaming::EventSendError) -> ToolError {
+    match reason {
+        super::streaming::EventSendError::Cancelled => {
+            ToolError::cancelled("Terminal handoff cancelled; interactive tool was not launched.")
+        }
+        super::streaming::EventSendError::Closed => ToolError::execution_failed(
+            "Terminal handoff channel closed; interactive tool was not launched.",
+        ),
+    }
+}
+
 impl Drop for InteractiveTerminalGuard {
     fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            match tx.try_send(Event::ResumeEvents) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                    match tokio::runtime::Handle::try_current() {
-                        Ok(handle) => {
-                            handle.spawn(async move {
-                                if let Err(err) = tx.send(event).await {
-                                    tracing::warn!(
-                                        target: "engine.tool_execution",
-                                        ?err,
-                                        "InteractiveTerminalGuard: async send(ResumeEvents) failed; \
-                                         terminal may stay in paused state until the next \
-                                         pause/resume cycle"
-                                    );
-                                }
-                            });
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "engine.tool_execution",
-                                ?err,
-                                "InteractiveTerminalGuard: event channel full and no Tokio runtime \
-                                 available to queue ResumeEvents; terminal may stay paused until \
-                                 the next pause/resume cycle"
-                            );
-                        }
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::debug!(
-                        target: "engine.tool_execution",
-                        "InteractiveTerminalGuard: event channel closed before ResumeEvents"
-                    );
-                }
-            }
+        if let Some((tx, resume)) = self.resume.take()
+            && !tx.is_closed()
+        {
+            resume.send(Event::ResumeEvents);
         }
     }
 }
@@ -229,12 +331,16 @@ fn emit_tool_audit_to_path(path: &Path, event: serde_json::Value) {
 }
 
 impl Engine {
-    pub(super) async fn execute_mcp_tool_with_pool(
+    pub(crate) async fn execute_mcp_tool_with_pool(
         pool: Arc<AsyncMutex<McpPool>>,
         tx_event: &mpsc::Sender<Event>,
         name: &str,
         input: serde_json::Value,
+        disallowed_tools: &[String],
+        decision: Option<&super::HumanDecision>,
     ) -> Result<RichToolResult, ToolError> {
+        McpPool::authorize_call(disallowed_tools, name, &input)
+            .map_err(|error| ToolError::not_available(error.to_string()))?;
         // A synthetic `mcp_<server>_authenticate` call runs the shared OAuth
         // login flow with the pool lock released during the browser wait, so
         // parallel MCP tools and the `/mcp` manager keep working while the
@@ -245,7 +351,8 @@ impl Engine {
         // call yet.
         let auth_target = pool.lock().await.authenticate_tool_target(name);
         if let Some(server) = auth_target {
-            let result = crate::mcp::authenticate_tool_via_pool(&pool, &server, |url| {
+            let mut notice_task = None;
+            let mut result = crate::mcp::authenticate_tool_via_pool(&pool, &server, |url| {
                 // The model cannot relay the URL until the call returns, and
                 // the call returns only after the sign-in completes — so the
                 // user must see it now. This status is the only copy of the
@@ -255,16 +362,26 @@ impl Engine {
                 let server = server.clone();
                 let url = url.to_string();
                 let tx = tx_event.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(Event::status(format!(
+                notice_task = Some(super::turn_heartbeat::AbortOnDrop(tokio::spawn(async move {
+                    if let Ok(permit) = super::streaming::reserve_event_capacity(
+                        &tx,
+                        None,
+                        super::streaming::EventReservationPolicy::Receipt,
+                    )
+                    .await
+                    {
+                        permit.send(Event::status(format!(
                             "◆ auth required: sign in to MCP server '{server}' in your browser — {url}"
-                        )))
-                        .await;
-                });
+                        )));
+                    }
+                })));
             })
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
+            if let Some(task) = notice_task.as_mut() {
+                let _ = (&mut task.0).await;
+            }
+            McpPool::filter_authenticate_result(&mut result, disallowed_tools);
             let mut rich = crate::tools::registry::mcp_result_to_bounded_rich_tool_result(result);
             if rich.result.success {
                 rich.result.metadata = Some(serde_json::json!({ "mcp_catalog_changed": true }));
@@ -272,7 +389,11 @@ impl Engine {
             return Ok(rich);
         }
         let needs_auth_generation_before = pool.lock().await.needs_auth_generation();
-        let result = pool.lock().await.call_tool(name, input).await;
+        let result = pool
+            .lock()
+            .await
+            .call_tool_with_disallowed(name, input, disallowed_tools, decision)
+            .await;
         match result {
             Ok(result) => {
                 Ok(crate::tools::registry::mcp_result_to_bounded_rich_tool_result(result))
@@ -304,141 +425,6 @@ impl Engine {
         }
     }
 
-    pub(super) async fn execute_parallel_tool(
-        &mut self,
-        input: serde_json::Value,
-        tool_registry: Option<&crate::tools::ToolRegistry>,
-        tool_exec_lock: Arc<RwLock<()>>,
-        context_override: Option<crate::tools::ToolContext>,
-    ) -> Result<RichToolResult, ToolError> {
-        let calls = parse_parallel_tool_calls(&input)?;
-        let mcp_pool = if calls.iter().any(|(tool, _)| McpPool::is_mcp_tool(tool)) {
-            Some(self.ensure_mcp_pool().await?)
-        } else {
-            None
-        };
-        let Some(registry) = tool_registry else {
-            return Err(ToolError::not_available(
-                "tool registry unavailable for multi_tool_use.parallel",
-            ));
-        };
-
-        let result_count = calls.len();
-        let mut tasks = FuturesUnordered::new();
-        let shell_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_SHELL_EXEC));
-        for (index, (tool_name, tool_input)) in calls.into_iter().enumerate() {
-            if tool_name == MULTI_TOOL_PARALLEL_NAME {
-                return Err(ToolError::invalid_input(
-                    "multi_tool_use.parallel cannot call itself",
-                ));
-            }
-            if McpPool::is_mcp_tool(&tool_name) {
-                if !mcp_tool_is_parallel_safe(&tool_name) {
-                    return Err(ToolError::invalid_input(format!(
-                        "Tool '{tool_name}' is an MCP tool and cannot run in parallel. \
-                         Allowed MCP tools: list_mcp_resources, list_mcp_resource_templates, \
-                         mcp_read_resource, read_mcp_resource, mcp_get_prompt."
-                    )));
-                }
-            } else {
-                let Some(spec) = registry.get(&tool_name) else {
-                    return Err(ToolError::not_available(format!(
-                        "tool '{tool_name}' is not registered"
-                    )));
-                };
-                if !spec.is_read_only_for(&tool_input) {
-                    return Err(ToolError::invalid_input(format!(
-                        "Tool '{tool_name}' is not read-only and cannot run in parallel"
-                    )));
-                }
-                if spec.approval_requirement_for(&tool_input) != ApprovalRequirement::Auto {
-                    return Err(ToolError::invalid_input(format!(
-                        "Tool '{tool_name}' requires approval and cannot run in parallel"
-                    )));
-                }
-                if !spec.supports_parallel_for(&tool_input) {
-                    return Err(ToolError::invalid_input(format!(
-                        "Tool '{tool_name}' does not support parallel execution"
-                    )));
-                }
-            }
-
-            let registry_ref = registry;
-            let lock = tool_exec_lock.clone();
-            let tx_event = self.tx_event.clone();
-            let mcp_pool = mcp_pool.clone();
-            let shell_permits = shell_permits.clone();
-            let workspace = self.session.workspace.clone();
-            let context_override = context_override.clone();
-            let cancel_token = self.cancel_token.clone();
-            tasks.push(async move {
-                let _shell_permit = if matches!(tool_name.as_str(), "bash" | "Bash" | "exec_shell")
-                {
-                    shell_permits.acquire_owned().await.ok()
-                } else {
-                    None
-                };
-                let result = Engine::execute_tool_with_lock(
-                    lock,
-                    true,
-                    false,
-                    tx_event,
-                    Some(cancel_token),
-                    tool_name.clone(),
-                    tool_input.clone(),
-                    workspace,
-                    Some(registry_ref),
-                    mcp_pool,
-                    context_override,
-                )
-                .await;
-                (index, tool_name, result)
-            });
-        }
-
-        let mut results: Vec<Option<ParallelToolResultEntry>> = Vec::with_capacity(result_count);
-        results.resize_with(result_count, || None);
-        let mut content_blocks = Vec::new();
-        while let Some((index, tool_name, result)) = tasks.next().await {
-            let entry = match result {
-                Ok(output) => {
-                    let RichToolResult {
-                        result: output,
-                        content_blocks: output_blocks,
-                    } = output;
-                    content_blocks.extend(output_blocks);
-                    let mut error = None;
-                    if !output.success {
-                        error = Some(output.content.clone());
-                    }
-                    ParallelToolResultEntry {
-                        tool_name,
-                        success: output.success,
-                        content: output.content,
-                        error,
-                    }
-                }
-                Err(err) => {
-                    let message = format!("{err}");
-                    ParallelToolResultEntry {
-                        tool_name,
-                        success: false,
-                        content: format!("Error: {message}"),
-                        error: Some(message),
-                    }
-                }
-            };
-            results[index] = Some(entry);
-        }
-        let results = results.into_iter().flatten().collect();
-
-        let result = ToolResult::json(&ParallelToolResult { results })
-            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        Ok(crate::image_attach::bound_rich_tool_result(
-            RichToolResult::with_content_blocks(result, content_blocks),
-        ))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_tool_with_lock(
         lock: Arc<RwLock<()>>,
@@ -447,6 +433,46 @@ impl Engine {
         tx_event: mpsc::Sender<Event>,
         cancel_token: Option<CancellationToken>,
         tool_name: String,
+        activity_call_id: Option<String>,
+        tool_input: serde_json::Value,
+        workspace: PathBuf,
+        registry: Option<&crate::tools::ToolRegistry>,
+        mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+        context_override: Option<crate::tools::ToolContext>,
+    ) -> Result<RichToolResult, ToolError> {
+        let child = context_override
+            .as_ref()
+            .or_else(|| registry.map(|registry| registry.context()))
+            .and_then(|context| context.child_host.clone());
+        let execution = Self::execute_tool_admitted(
+            lock,
+            supports_parallel,
+            interactive,
+            tx_event,
+            cancel_token,
+            tool_name,
+            activity_call_id,
+            tool_input,
+            workspace,
+            registry,
+            mcp_pool,
+            context_override,
+        );
+        match child {
+            Some(child) => child.run_tool_bounded(execution).await,
+            None => execution.await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool_admitted(
+        lock: Arc<RwLock<()>>,
+        supports_parallel: bool,
+        interactive: bool,
+        tx_event: mpsc::Sender<Event>,
+        cancel_token: Option<CancellationToken>,
+        tool_name: String,
+        activity_call_id: Option<String>,
         tool_input: serde_json::Value,
         workspace: PathBuf,
         registry: Option<&crate::tools::ToolRegistry>,
@@ -475,7 +501,7 @@ impl Engine {
             "mcp"
         } else if matches!(
             tool_name.as_str(),
-            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME | EXECUTE_TOOLS_TOOL_NAME
         ) {
             "interpreter"
         } else if registry.is_some() {
@@ -496,10 +522,20 @@ impl Engine {
             "tool.exec.start",
         );
 
-        let _guard = if supports_parallel {
-            ToolExecGuard::Read(lock.read().await)
-        } else {
-            ToolExecGuard::Write(lock.write().await)
+        let acquire = async {
+            if supports_parallel {
+                ToolExecGuard::Read(lock.read().await)
+            } else {
+                ToolExecGuard::Write(lock.write().await)
+            }
+        };
+        let _guard = match cancel_token.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(ToolError::cancelled("Tool lock wait cancelled.")),
+                guard = acquire => guard,
+            },
+            None => acquire.await,
         };
 
         // RAII pause/resume: ensures `Event::ResumeEvents` always fires on
@@ -507,7 +543,9 @@ impl Engine {
         // `InteractiveTerminalGuard` doc-comment for the regression this
         // closes (parent terminal scrollback hijacking the TUI after a
         // cancelled interactive tool).
-        let _terminal = InteractiveTerminalGuard::engage(tx_event.clone(), interactive).await?;
+        let _terminal =
+            InteractiveTerminalGuard::engage(tx_event.clone(), interactive, cancel_token.clone())
+                .await?;
 
         if cancel_token
             .as_ref()
@@ -516,6 +554,13 @@ impl Engine {
             return Err(ToolError::permission_denied(
                 "Turn stopped by user. Tool call blocked.",
             ));
+        }
+
+        if let Some(context) = context_override
+            .as_ref()
+            .or_else(|| registry.map(|registry| registry.context()))
+        {
+            super::tool_catalog::enforce_tool_denial(context, &tool_name, &tool_input)?;
         }
 
         let tool_authority = context_override
@@ -533,7 +578,7 @@ impl Engine {
             }
             if matches!(
                 tool_name.as_str(),
-                CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+                CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME | EXECUTE_TOOLS_TOOL_NAME
             ) {
                 return Err(ToolError::permission_denied(format!(
                     "worker '{}' cannot run {tool_name}: arbitrary code execution is outside its machine-readable authority envelope",
@@ -542,22 +587,188 @@ impl Engine {
             }
         }
 
+        // Typed owner activity: classified only after every gate above has
+        // passed, from the same authority that dispatches the call (the MCP
+        // pool's resolved server map, the interpreter, or the registry plus
+        // the canonical action alias). Names and arguments never leave here.
+        let activity_kind = match activity_call_id.as_ref() {
+            None => None,
+            Some(_) if McpPool::is_mcp_tool(&tool_name) => match mcp_pool.as_ref() {
+                Some(pool) => pool
+                    .lock()
+                    .await
+                    .resolved_tool_servers()
+                    .get(&tool_name)
+                    .map(|server| crate::tools::activity::mcp_activity_kind(server)),
+                None => None,
+            },
+            Some(_)
+                if matches!(
+                    tool_name.as_str(),
+                    CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+                ) =>
+            {
+                Some(codewhale_protocol::engine_owner::OwnerActivityKind::Executing)
+            }
+            // The code-mode wrapper is not itself an operation.
+            Some(_) if tool_name == EXECUTE_TOOLS_TOOL_NAME => None,
+            Some(_) => registry
+                .filter(|registry| registry.get(&tool_name).is_some())
+                .and_then(|_| {
+                    crate::tools::activity::registry_activity_kind(&tool_name, &tool_input)
+                }),
+        };
+        let operation_span = match (activity_call_id.as_deref(), activity_kind) {
+            (Some(call_id), Some(activity_kind)) => Some(
+                OperationSpanGuard::start(
+                    tx_event.clone(),
+                    call_id,
+                    activity_kind,
+                    cancel_token.clone(),
+                )
+                .await,
+            ),
+            _ => None,
+        };
+        if cancel_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolError::cancelled("Tool activity admission cancelled."));
+        }
+
+        let child_mcp_call = if McpPool::is_mcp_tool(&tool_name) {
+            let context = context_override
+                .as_ref()
+                .or_else(|| registry.map(|registry| registry.context()));
+            if context.is_some_and(|context| context.child_host.is_some()) {
+                let registry = registry.ok_or_else(|| {
+                    ToolError::permission_denied(
+                        "child MCP call has no canonical registered capability",
+                    )
+                })?;
+                registry
+                    .admit_child_call(
+                        &tool_name,
+                        &tool_input,
+                        context.expect("captured child context"),
+                    )
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(context) = context_override
+            .as_ref()
+            .or_else(|| registry.map(|registry| registry.context()))
+            && (context.acp_host.is_some() || context.child_host.is_some())
+        {
+            let spec = registry
+                .and_then(|registry| registry.get(&tool_name))
+                .ok_or_else(|| {
+                    ToolError::not_available("ACP call has no admitted registered tool")
+                })?;
+            crate::tools::registry::enforce_tool_authority(
+                &tool_name,
+                &tool_input,
+                spec.as_ref(),
+                context,
+            )?;
+            crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
+                .map_err(ToolError::not_available)?;
+            if let Some(id) = activity_call_id.as_ref() {
+                if let Ok(permit) = super::streaming::reserve_event_capacity(
+                    &tx_event,
+                    cancel_token.as_ref(),
+                    super::streaming::EventReservationPolicy::Receipt,
+                )
+                .await
+                {
+                    // Event backpressure is an await boundary. Recheck the
+                    // exact captured authority before claiming dispatch.
+                    if cancel_token
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(ToolError::cancelled("ACP dispatch admission cancelled"));
+                    }
+                    crate::tools::registry::enforce_tool_authority(
+                        &tool_name,
+                        &tool_input,
+                        spec.as_ref(),
+                        context,
+                    )?;
+                    crate::extension_host::validate_caller_plugins(
+                        context.plugin_registry.as_deref(),
+                    )
+                    .map_err(ToolError::not_available)?;
+                    permit.send(Event::ToolExecutionStarted { id: id.clone() });
+                } else {
+                    return Err(ToolError::cancelled("ACP dispatch observation unavailable"));
+                }
+            }
+        }
         let outcome: Result<RichToolResult, ToolError> = if McpPool::is_mcp_tool(&tool_name) {
             if let Some(pool) = mcp_pool {
-                Engine::execute_mcp_tool_with_pool(pool, &tx_event, &tool_name, tool_input).await
+                let disallowed_tools = context_override
+                    .as_ref()
+                    .or_else(|| registry.map(|registry| registry.context()))
+                    .map(|context| context.disallowed_tools.as_slice())
+                    .unwrap_or_default();
+                // Only a per-call override can carry a person's decision; the
+                // registry's shared context never does.
+                let decision = context_override
+                    .as_ref()
+                    .and_then(|context| context.human_decision.as_ref());
+                Engine::execute_mcp_tool_with_pool(
+                    pool,
+                    &tx_event,
+                    &tool_name,
+                    tool_input,
+                    disallowed_tools,
+                    decision,
+                )
+                .await
             } else {
                 Err(ToolError::not_available(format!(
                     "tool '{tool_name}' is not registered"
                 )))
             }
-        } else if tool_name == CODE_EXECUTION_TOOL_NAME {
-            execute_code_execution_tool(&tool_input, &workspace)
-                .await
-                .map(RichToolResult::plain)
-        } else if tool_name == JS_EXECUTION_TOOL_NAME {
-            execute_js_execution_tool(&tool_input, &workspace)
-                .await
-                .map(RichToolResult::plain)
+        } else if matches!(
+            tool_name.as_str(),
+            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+        ) {
+            if let Some(context) = context_override
+                .as_ref()
+                .or_else(|| registry.map(|registry| registry.context()))
+            {
+                let result = if tool_name == CODE_EXECUTION_TOOL_NAME {
+                    execute_code_execution_tool(&tool_input, &workspace, context).await
+                } else {
+                    execute_js_execution_tool(&tool_input, &workspace, context).await
+                };
+                result.map(RichToolResult::plain)
+            } else {
+                Err(ToolError::not_available(
+                    "local code execution requires an effective tool context",
+                ))
+            }
+        } else if tool_name == EXECUTE_TOOLS_TOOL_NAME {
+            if let Some(registry) = registry {
+                let context = context_override
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| registry.context().clone());
+                crate::tools::codemode::execute_tools_tool(&tool_input, registry, &context)
+                    .await
+                    .map(RichToolResult::plain)
+            } else {
+                Err(ToolError::not_available(format!(
+                    "tool '{tool_name}' is not registered"
+                )))
+            }
         } else if let Some(registry) = registry {
             registry
                 .execute_rich_full_with_context(&tool_name, tool_input, context_override.as_ref())
@@ -568,6 +779,22 @@ impl Engine {
             )))
         };
 
+        if let Some(operation_span) = operation_span {
+            let cancelled = cancel_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled);
+            operation_span
+                .complete(crate::tools::activity::operation_outcome(
+                    &outcome, cancelled,
+                ))
+                .await;
+        }
+
+        if outcome.as_ref().is_ok_and(|result| result.result.success)
+            && let Some((authority, writes)) = child_mcp_call
+        {
+            authority.record_settled_writes(writes).await;
+        }
         let duration_ms = started_at.elapsed().as_millis() as u64;
         // The surface-agnostic choke point for every tool call, so this one
         // bump covers exec and the CLI as well as the TUI. `memory_search` is
@@ -650,6 +877,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_capacity_cancelled_activity_preserves_exact_outcomes_and_releases_full_queue() {
+        use codewhale_protocol::engine_owner::{OwnerActivityKind, OwnerOperationOutcome};
+        for outcome in [
+            OwnerOperationOutcome::Succeeded,
+            OwnerOperationOutcome::Failed,
+            OwnerOperationOutcome::Denied,
+            OwnerOperationOutcome::Cancelled,
+        ] {
+            let (tx, mut rx) = mpsc::channel(2);
+            let cancel = CancellationToken::new();
+            let span = OperationSpanGuard::start(
+                tx,
+                "completed-call",
+                OwnerActivityKind::Tool,
+                Some(cancel.clone()),
+            )
+            .await;
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_millis(100), span.complete(outcome))
+                .await
+                .expect("completed activity preserves available capacity after cancellation");
+            let Event::OperationActivityStarted {
+                span_id,
+                activity_kind,
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("activity start");
+            };
+            let Event::OperationActivityCompleted {
+                span_id: completed_span,
+                activity_kind: completed_kind,
+                outcome: completed_outcome,
+            } = rx
+                .try_recv()
+                .expect("cancellation must not discard the completion")
+            else {
+                panic!("activity completion");
+            };
+            assert_eq!(completed_span, span_id);
+            assert_eq!(completed_kind, activity_kind);
+            assert_eq!(
+                completed_outcome, outcome,
+                "retain the observed outcome exactly"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one completion");
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let span = OperationSpanGuard::start(
+            tx,
+            "full-call",
+            OwnerActivityKind::Tool,
+            Some(cancel.clone()),
+        )
+        .await;
+        cancel.cancel();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            span.complete(OwnerOperationOutcome::Succeeded),
+        )
+        .await
+        .expect("a full queue cannot retain a cancelled activity sender");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::OperationActivityStarted { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "no sender survives to publish after draining"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_heartbeat_is_delayed_for_fast_tool() {
         let (tx, mut rx) = mpsc::channel(4);
 
@@ -702,10 +1003,13 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_guard_queues_resume_when_event_channel_is_full() {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(2);
+        let resume = tx.clone().reserve_owned().await.expect("resume capacity");
         tx.try_send(Event::status("filler")).expect("fill channel");
 
-        drop(InteractiveTerminalGuard { tx: Some(tx) });
+        drop(InteractiveTerminalGuard {
+            resume: Some((tx, resume)),
+        });
 
         assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
         let resumed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -713,12 +1017,13 @@ mod tests {
             .expect("queued resume event")
             .expect("event channel still open");
         assert!(matches!(resumed, Event::ResumeEvents));
+        assert!(rx.try_recv().is_err(), "restoration is exactly once");
     }
 
     #[tokio::test]
     async fn terminal_guard_waits_for_pause_ack_before_returning() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -750,7 +1055,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_guard_refuses_child_and_queues_resume_when_pause_is_not_acknowledged() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -784,7 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_guard_cancellation_during_pause_ack_still_queues_resume() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -807,6 +1112,97 @@ mod tests {
             .expect("queued resume event")
             .expect("event channel still open");
         assert!(matches!(resumed, Event::ResumeEvents));
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_cancelled_capacity_reservations_never_pause_or_restore() {
+        for capacity in [1, 2] {
+            let (tx, mut rx) = mpsc::channel(capacity);
+            tx.try_send(Event::status("occupied")).unwrap();
+            let cancel = CancellationToken::new();
+            let mut engage = Box::pin(InteractiveTerminalGuard::engage(
+                tx.clone(),
+                true,
+                Some(cancel.clone()),
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut engage)
+                    .await
+                    .is_err()
+            );
+            // Capacity 1 stalls the resume reservation; capacity 2 stalls
+            // the pause reservation while the first permit is held.
+            cancel.cancel();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut engage)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            drop(engage);
+            assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+            assert!(
+                rx.try_recv().is_err(),
+                "a pause that never entered needs no resume"
+            );
+            assert_eq!(
+                tx.capacity(),
+                capacity,
+                "cancelled waits release every permit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_cancelled_ack_restores_once_without_detached_sender() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(
+            tx.clone(),
+            true,
+            Some(cancel.clone()),
+        ));
+        assert!(matches!(rx.recv().await, Some(Event::PauseEvents { .. })));
+        tx.try_send(Event::status("fill after pause")).unwrap();
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Event::ResumeEvents)));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(tx.capacity(), 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_closed_receiver_refuses_or_releases_held_restoration() {
+        let (tx, rx) = mpsc::channel(3);
+        drop(rx);
+        assert!(
+            InteractiveTerminalGuard::engage(tx, true, None)
+                .await
+                .is_err()
+        );
+
+        let (tx, mut rx) = mpsc::channel(3);
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx.clone(), true, None));
+        let Some(Event::PauseEvents { ack: Some(ack) }) = rx.recv().await else {
+            panic!("pause with acknowledgement");
+        };
+        ack.notify_one();
+        let guard = task.await.unwrap().unwrap();
+        drop(rx);
+        drop(guard);
+        assert!(tx.is_closed());
+        assert_eq!(
+            tx.capacity(),
+            3,
+            "receiver closure cannot strand restoration capacity"
+        );
     }
 
     #[cfg(unix)]

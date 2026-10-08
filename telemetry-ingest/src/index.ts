@@ -46,6 +46,7 @@
  */
 
 import { writeBatch, type DataPointSink } from "./datapoint";
+import { deliverPostHog, type PostHogConfig } from "./posthog";
 import { INGEST_PATH } from "./route";
 import { MAX_BODY_BYTES, validateBatch } from "./schema";
 
@@ -61,7 +62,7 @@ export interface RateLimiter {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
-export interface Env {
+export interface Env extends PostHogConfig {
   /** `analytics_engine_datasets` binding. */
   TELEMETRY: DataPointSink;
   /**
@@ -181,6 +182,10 @@ async function ingest(request: Request, env: Env): Promise<Response> {
 
   // `writeDataPoint` is non-blocking and returns void; it is never awaited.
   writeBatch(env.TELEMETRY, result.batch);
+
+  // The optional processor sees only the same validated batch, never the
+  // incoming request. Its bounded, best-effort failure cannot reject AE data.
+  await deliverPostHog(result.batch, env);
 
   return status(204);
 }

@@ -8,12 +8,15 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 
+pub(crate) mod activity;
 pub mod apply_patch;
 pub mod approval_cache;
+pub mod approval_summary;
 pub mod arg_repair;
 pub mod automation;
 pub mod canonical_action;
 pub mod cargo_failure_summary;
+pub mod codemode;
 pub mod dev_server_readiness;
 pub mod diagnostics;
 pub mod diff_format;
@@ -41,7 +44,7 @@ pub mod mcp_registry;
 pub mod native_memory;
 pub mod notify;
 pub mod pandoc;
-mod pdf;
+pub(crate) mod pdf;
 pub mod plan;
 pub mod plugin;
 pub mod project;
@@ -52,20 +55,25 @@ pub mod request_plugin_install;
 mod resource_admission;
 pub mod revert_turn;
 pub mod review;
+pub(crate) mod review_host;
 pub mod review_hunks;
+pub(crate) mod review_pr;
 pub mod rlm;
 pub mod run_tool;
 pub mod runtime_mcp;
+mod rust_format;
 pub mod schema_canonicalize;
 pub mod schema_sanitize;
 pub mod search;
 pub mod send_later;
+pub mod session;
 pub mod shell;
 mod shell_output;
 pub mod skill;
 pub mod spec;
 pub mod speech;
 pub mod subagent;
+mod syntax_check;
 pub mod tasks;
 #[cfg(not(target_env = "ohos"))]
 pub mod terminal_session;
@@ -85,7 +93,6 @@ pub mod web_search;
 pub mod web_tool;
 pub mod workflow;
 pub mod workflow_plan_approval;
-pub mod workflow_trigger;
 
 pub use registry::{AgentToolSurfaceOptions, ToolRegistry, ToolRegistryBuilder};
 pub use review::ReviewOutput;

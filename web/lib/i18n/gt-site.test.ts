@@ -31,7 +31,7 @@ describe("website GT catalog pipeline", () => {
 
     const zh = JSON.parse(readFileSync(join(webRoot, "gt-catalog", "zh.json"), "utf8"));
     expect(zh.chrome.navDocs).toBe(getChrome("zh").navDocs);
-    expect(zh.home.kicker).toBe(getHome("zh").kicker);
+    expect(zh.home.heroTitle).toBe(getHome("zh").heroTitle);
     expect(zh["docs-guide"].overviewTitle).toBe(getDocsGuide("zh").overviewTitle);
 
     const config = readFileSync(join(webRoot, "gt.config.json"), "utf8");

@@ -1,0 +1,28 @@
+{
+  "repository": "https://github.com/Hmbown/CodeWhale",
+  "commit": "a79ce5c4d5ed1a5f7032185710c27343a900351c",
+  "files": {
+    "crates/palette/src/rgb.rs": "5575ff034d3a3830c854d36851f95904c945b70e72f17cf69a0a4f3df55a9036",
+    "crates/palette/src/tokens.rs": "18043e2b958fd2868d105e34a45acb4ebac8d562a5593f0128f862802e3dda72",
+    "crates/palette/src/themes.rs": "9d95aa14c94ec21d9891409e61a5a9ce0d5ce8e995ebd1b7f2c7da8ae9666051",
+    "crates/tui/src/tui/ocean.rs": "f04bd9ddeb8508c0f2ee3c4ad19fc7ade882b661b7435282c09908352368e9d5",
+    "crates/tui/src/tui/ui/frame.rs": "a9e825944fa6f32cce9a2473e0af30a7eab41c52d18675e2500e51b0f68d2553",
+    "crates/tui/src/tui/work_surface/model.rs": "8cf96e00b4f68aabb35520b9c15836da68ab4d2b8c93956d054ffe4ee150659c",
+    "crates/tui/src/tui/work_surface/render/mod.rs": "d4ddea15a9fcf08434a215b99704c2d9b4731778099df6f76c5702b1ec103eb8",
+    "crates/tui/src/tui/work_surface/render/layout.rs": "ddd3c92a9d9e66d4dc94ad9e817c5c036bb2c3cdd4936c076f324476a0aa7273",
+    "crates/tui/src/tui/work_surface/render/rows.rs": "c8a0da3e8c884a34063615dd6b84df479639ed1e169086173232dc0877bceddb",
+    "crates/tui/src/tui/work_surface/input.rs": "c22ae07d0d87cb496ee908a6de0983826b2390d1a1ab1d1acc0c89f6faa66072",
+    "crates/tui/src/tui/work_surface/views.rs": "2d5dbc46c9162470873537bc2bbc6d7b78933516d1a5ec953853d4751e11155f",
+    "crates/tui/src/tui/widgets/mod.rs": "6de9e1787f071a299fbf65c37408839aab0a1e68516e4cda6c01cbc8fdfc06e0",
+    "crates/tui/src/tui/widgets/workbar.rs": "caa9e3e974dba9e3e448f1905a2dd1b042b788cd601f46cac35f9915c4831f07",
+    "crates/tui/src/tui/composer_chrome.rs": "839dcaad57b959a4696979fbc2f615ce1da84fac8fcacc60ad6931e6623d3b55",
+    "crates/tui/src/tui/phase_strip.rs": "b13575fef42742f2a4a430bd78fe02178a65bb83fb9fee43721d6a0f7e3c1dcc",
+    "crates/tui/src/tui/infoline.rs": "5b50696f42d3bb461694029d3cdcf4a99245f005b3088b2fa6ea189c226329bc",
+    "crates/tui/src/tui/history/message.rs": "b3b65e040da3b50f7b53fc88e0f7e0433555822d7536ef10fa21c544f1c1256d",
+    "crates/tui/src/tui/views/mod.rs": "d1a9bfa9bb933d137db1b95a1a12c3ed8607b41aa4b7d859e3a9e2b4894b7b03",
+    "crates/tui/src/tui/session_picker.rs": "1e7cd52a572f275011ea21069c69046562813482a712a1e0bc33f6e3b87e2bdb",
+    "crates/tui/src/tui/command_palette.rs": "466c6c44b6083106aba730b0e33b0783ac1a5cf1732a5b8c7e0bddfe76e6fdb0",
+    "crates/tui/src/tui/views/mode_picker.rs": "d31a851785c8f4a9380d91d40630406c7546d023f4dbd6247a47b0f6e4e7836f",
+    "crates/tui/src/tui/views/status_picker.rs": "40e92aa90ed4d157fd451cf1e647f5219c8eebfbdc5f2110d00c45c36f4700e7"
+  }
+}

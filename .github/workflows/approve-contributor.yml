@@ -4,18 +4,28 @@ on:
   issue_comment:
     types: [created]
 
-permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-
-concurrency:
-  group: contribution-gate-approval
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
   approve:
+    # Cheap pre-filter before any token is minted: this workflow fires on
+    # every issue comment, but only a maintainer's lgtm/lgtmi command does
+    # anything. Expression string comparisons are case-insensitive; the
+    # script below still performs the exact trimmed-command match.
+    if: >-
+      contains(github.event.comment.body, 'lgtm')
+      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    # Job-level so skipped runs never enter the group: a workflow-level group
+    # let any unrelated comment queue and cancel a pending approval run.
+    concurrency:
+      group: contribution-gate-approval
+      cancel-in-progress: false
     steps:
       - name: Open allowlist update PR
         uses: actions/github-script@v9
@@ -35,24 +45,27 @@ jobs:
             ]);
             const scope = scopeByCommand.get(command);
 
+            // Answer the maintainer's command with a reaction, never a comment
+            // (founder, 2026-09-22). The run log carries the detail, and the
+            // allowlist PR body links back here, so the thread still shows it.
+            async function react(content, message) {
+              core.notice(message);
+              await github.rest.reactions.createForIssueComment({
+                owner,
+                repo,
+                comment_id: comment.id,
+                content,
+              });
+            }
+
             if (!scope) return;
             if (!privileged.has(comment.author_association)) return;
             if (scope === 'pr' && !issue.pull_request) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issue.number,
-                body: '`/lgtm` grants PR access and must be used on a pull request. Use `/lgtmi` to grant issue access.',
-              });
+              await react('confused', '`/lgtm` grants PR access and must be used on a pull request. Use `/lgtmi` to grant issue access.');
               return;
             }
             if (scope === 'issue' && issue.pull_request) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issue.number,
-                body: '`/lgtmi` grants issue access and must be used on an issue. Use `/lgtm` to grant PR access.',
-              });
+              await react('confused', '`/lgtmi` grants issue access and must be used on an issue. Use `/lgtm` to grant PR access.');
               return;
             }
 
@@ -116,12 +129,7 @@ jobs:
 
             const existing = parseAllowlist(content);
             if (existing.has(entry) || existing.has(`all:${normalizedLogin}`)) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issue.number,
-                body: `@${targetLogin} is already approved for ${scope} contributions in \`${path}\`.`,
-              });
+              await react('eyes', `@${targetLogin} is already approved for ${scope} contributions in \`${path}\`.`);
               return;
             }
 
@@ -145,12 +153,7 @@ jobs:
             });
 
             if (pendingPr) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issue.number,
-                body: `@${targetLogin} already has a pending allowlist update PR for ${scope} contributions: ${pendingPr.html_url}`,
-              });
+              await react('eyes', `@${targetLogin} already has a pending allowlist update PR for ${scope} contributions: ${pendingPr.html_url}`);
               return;
             }
 
@@ -210,9 +213,4 @@ jobs:
               ].join('\n'),
             });
 
-            await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: issue.number,
-              body: `Created allowlist update PR: ${pr.html_url}`,
-            });
+            await react('rocket', `Created allowlist update PR: ${pr.html_url}`);

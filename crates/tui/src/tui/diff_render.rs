@@ -3,9 +3,10 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
-use crate::palette;
+use codewhale_palette as palette;
 
 const LINE_NUMBER_WIDTH: usize = 4;
 
@@ -677,6 +678,12 @@ fn render_diff_line(
 ) -> Vec<Line<'static>> {
     let prefix = format_line_numbers(old_line, new_line, marker);
     let prefix_width = prefix.width();
+    // The whole logical row carries the change tint — numbers included. A
+    // bare gutter next to a painted body read as two unrelated strips.
+    let gutter_style = match style.bg {
+        Some(bg) => Style::default().fg(palette::TEXT_MUTED).bg(bg),
+        None => Style::default().fg(palette::TEXT_MUTED),
+    };
     let available = width.saturating_sub(prefix_width as u16).max(1) as usize;
     let wrapped = wrap_text(content, available);
     let mut painted = emphasis.and_then(|segments| emphasised_chunks(&wrapped, style, segments));
@@ -684,9 +691,9 @@ fn render_diff_line(
     let mut out = Vec::new();
     for (idx, chunk) in wrapped.into_iter().enumerate() {
         let gutter = if idx == 0 {
-            Span::styled(prefix.clone(), Style::default().fg(palette::TEXT_MUTED))
+            Span::styled(prefix.clone(), gutter_style)
         } else {
-            Span::raw(" ".repeat(prefix_width))
+            Span::styled(" ".repeat(prefix_width), gutter_style)
         };
         let mut spans = vec![gutter];
         match painted.as_mut() {
@@ -697,10 +704,7 @@ fn render_diff_line(
     }
 
     if out.is_empty() {
-        out.push(Line::from(vec![Span::styled(
-            prefix,
-            Style::default().fg(palette::TEXT_MUTED),
-        )]));
+        out.push(Line::from(vec![Span::styled(prefix, gutter_style)]));
     }
 
     out
@@ -754,7 +758,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 current = lead.clone();
                 current_width = lead_width;
             }
-            push_word_breaking_chars(word, width, &mut current, &mut current_width, &mut lines);
+            push_word_breaking_graphemes(word, width, &mut current, &mut current_width, &mut lines);
             has_word = current_width > lead_width;
             continue;
         }
@@ -791,21 +795,21 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn push_word_breaking_chars(
+fn push_word_breaking_graphemes(
     word: &str,
     width: usize,
     current: &mut String,
     current_width: &mut usize,
     lines: &mut Vec<String>,
 ) {
-    for ch in word.chars() {
-        let char_width = ch.width().unwrap_or(1);
-        if *current_width + char_width > width && *current_width > 0 {
+    for grapheme in word.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if *current_width + grapheme_width > width && *current_width > 0 {
             lines.push(std::mem::take(current));
             *current_width = 0;
         }
-        current.push(ch);
-        *current_width += char_width;
+        current.push_str(grapheme);
+        *current_width += grapheme_width;
     }
 }
 
@@ -1096,6 +1100,47 @@ diff --git a/src/a.rs b/src/a.rs
     }
 
     #[test]
+    fn render_diff_tints_the_gutter_with_the_row() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,3 @@
+ line
++new
+-old
+";
+
+        let rendered = render_diff(diff, 80);
+        let gutter_bg = |needle: &str| {
+            rendered
+                .iter()
+                .find(|line| line_text(line).contains(needle))
+                .expect("diff row renders")
+                .spans
+                .first()
+                .expect("gutter span")
+                .style
+                .bg
+        };
+        assert_eq!(
+            gutter_bg("+ new"),
+            Some(palette::DIFF_ADDED_BG),
+            "added numbers share the added tint"
+        );
+        assert_eq!(
+            gutter_bg("- old"),
+            Some(palette::DIFF_DELETED_BG),
+            "deleted numbers share the deleted tint"
+        );
+        assert_eq!(
+            gutter_bg(" line"),
+            None,
+            "context numbers stay on the bare ground"
+        );
+    }
+
+    #[test]
     fn wrap_text_preserves_leading_whitespace_without_extra_space() {
         assert_eq!(wrap_text("    let y = 2;", 80), vec!["    let y = 2;"]);
         assert_eq!(
@@ -1145,6 +1190,25 @@ diff --git a/src/lib.rs b/src/lib.rs
         }
 
         assert_eq!(lines.join(""), text);
+    }
+
+    #[test]
+    fn wrap_text_breaks_overlong_words_between_graphemes() {
+        // A ZWJ family and a skin-toned thumbs-up are one two-column grapheme
+        // each, the way Ratatui counts cells.
+        let word = "ab\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{1f44d}\u{1f3fd}cd";
+        for width in 2..=6 {
+            let lines = wrap_text(word, width);
+            let rejoined: Vec<&str> = lines.iter().flat_map(|line| line.graphemes(true)).collect();
+            assert_eq!(
+                rejoined,
+                word.graphemes(true).collect::<Vec<_>>(),
+                "width {width} split a grapheme: {lines:?}"
+            );
+            for line in &lines {
+                assert!(line.width() <= width, "line {line:?} exceeds width {width}");
+            }
+        }
     }
 
     #[test]

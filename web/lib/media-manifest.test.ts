@@ -18,6 +18,7 @@
  * the component source carries that contract.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   getMediaAsset,
@@ -25,9 +26,11 @@ import {
   MEDIA_BUDGETS,
   MEDIA_PUBLIC_DIR,
   REDUCED_MOTION_POLICY,
+  TERMINAL_SCREENSHOT,
   type MediaAsset,
 } from "./media-manifest";
 import { ALL_LOCALES } from "./i18n/config";
+import { getDocsShell } from "./i18n/dictionaries";
 
 // Captions are required for locales that ship a complete pack, not for every
 // routed locale: `locales` also includes `partial` locales, which route with an
@@ -50,6 +53,14 @@ function pngDimensions(src: string): [number, number] {
 }
 
 describe("media manifest integrity", () => {
+  it("keeps the terminal capture tied to its measured file and captured build", () => {
+    const src = TERMINAL_SCREENSHOT.src.slice(1);
+    const bytes = readFileSync(new URL(`public/${src}`, webRoot));
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(TERMINAL_SCREENSHOT.sha256);
+    expect(pngDimensions(src)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
+    expect(TERMINAL_SCREENSHOT.sourceCommit).toMatch(/^[0-9a-f]{40}$/);
+  });
+
   it("has unique asset ids and complete localized copy", () => {
     const ids = MEDIA_ASSETS.map((a) => a.id);
     expect(new Set(ids).size).toBe(ids.length);
@@ -152,8 +163,9 @@ describe("session media component contract", () => {
     expect(component).toContain("session-media-pending");
     expect(component).toContain("asset.pendingLabel");
     // Pending copy states plainly that nothing is recorded yet, both locales.
-    expect(component).toContain("There is no recording yet");
-    expect(component).toContain("还没有录像");
+    expect(component).toContain("t.mediaPendingNote");
+    expect(getDocsShell("en").mediaPendingNote).toContain("There is no recording yet");
+    expect(getDocsShell("zh").mediaPendingNote).toContain("还没有录像");
   });
 
   it("carries the structural reduced-motion contract: no autoplay, ever", () => {

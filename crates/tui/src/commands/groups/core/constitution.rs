@@ -9,9 +9,9 @@ use codewhale_config::{
 };
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::{Locale, MessageId};
 use crate::tui::app::{App, AppAction};
 use crate::tui::pager::PagerView;
+use codewhale_localization::{Locale, MessageId};
 
 use super::CommandResult;
 
@@ -116,7 +116,16 @@ fn open_review(app: &mut App) {
 
 fn open_preview(app: &mut App) {
     let locale = app.ui_locale;
-    let text = preview_text(locale);
+    let text = format!(
+        "{}\n\n{}",
+        match locale {
+            Locale::ZhHans =>
+                "这是本机宪章预览。已登录账户的宪章（包括默认值）优先；请在账户设置中预览。",
+            _ =>
+                "This previews the local constitution. The signed-in profile constitution, including its defaults, takes precedence; preview it in account settings.",
+        },
+        preview_text(locale)
+    );
     open_pager(app, rendered_title(locale), &text);
 }
 
@@ -383,6 +392,10 @@ fn format_status(app: &App, locale: Locale) -> String {
     let copy = ConstitutionManagerCopy::for_locale(locale);
 
     let _ = writeln!(out, "{}", copy.manager_header);
+    out.push_str(match locale {
+        Locale::ZhHans => "\n下方为本机宪章设置。已登录账户的宪章（包括默认值）优先于本机设置，由引擎在每轮开始时加载。在应用的设置 → 账户 → 宪章中编辑；更改从下一轮生效。\n",
+        _ => "\nLocal constitution settings follow. The signed-in profile constitution, including its defaults, takes precedence and is loaded by the Engine at each turn. Edit it in Settings → Accounts → Constitution; changes apply from the next turn.\n",
+    });
     out.push('\n');
     let _ = writeln!(out, "{}", copy.active_stack_header);
     let _ = writeln!(out, "- {}", copy.bundled_active);
@@ -1531,7 +1544,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("home");
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.as_os_str());
         let mut app = test_app();
-        app.ui_locale = crate::localization::Locale::ZhHans;
+        app.ui_locale = codewhale_localization::Locale::ZhHans;
 
         let result = ConstitutionCmd::execute(&mut app, None);
 
@@ -1553,7 +1566,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("home");
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.as_os_str());
         let mut app = test_app();
-        app.ui_locale = crate::localization::Locale::ZhHans;
+        app.ui_locale = codewhale_localization::Locale::ZhHans;
 
         let result = ConstitutionCmd::execute(&mut app, Some("preview"));
 
@@ -1569,7 +1582,7 @@ mod tests {
     #[test]
     fn constitution_explanation_uses_zh_hans_copy() {
         let mut app = test_app();
-        app.ui_locale = crate::localization::Locale::ZhHans;
+        app.ui_locale = codewhale_localization::Locale::ZhHans;
 
         let result = ConstitutionCmd::execute(&mut app, Some("explain"));
 

@@ -1,0 +1,341 @@
+{
+  "description": "A full-capability server: catalog normalization (name prefixing, sorting, meta-tools for resources/templates/prompts), a plain result, an isError result, a JSON-RPC error, progress before the result, an image block, cancellation of a call the server never answers followed by a working call, resources and prompts through the meta-tools, and an unadvertised tool that must never reach the server.",
+  "server_name": "conformance",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "conformance-server",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "prompts": {}
+        },
+        "instructions": "Conformance fixture server. Tools are deterministic."
+      }
+    },
+    "tools/list": {
+      "result": {
+        "tools": [
+          {
+            "name": "z_last",
+            "description": "Listed first by the server; the catalog sorts by name.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          {
+            "name": "echo",
+            "description": "Echo the text argument.\nSecond description line.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ]
+            },
+            "annotations": {
+              "readOnlyHint": true
+            }
+          },
+          {
+            "name": "fails",
+            "description": "Always reports a tool-level error.",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "rpc-error",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "slow",
+            "description": "Sends progress notifications before its result.",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "hangs",
+            "description": "Never answers until the caller goes away.",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "image",
+            "description": "Returns text and an image block.",
+            "inputSchema": {
+              "type": "object"
+            }
+          }
+        ]
+      }
+    },
+    "resources/list": {
+      "result": {
+        "resources": [
+          {
+            "uri": "fixture://readme",
+            "name": "readme",
+            "description": "The fixture readme.",
+            "mimeType": "text/plain"
+          }
+        ]
+      }
+    },
+    "resources/templates/list": {
+      "result": {
+        "resourceTemplates": [
+          {
+            "uriTemplate": "fixture://notes/{id}",
+            "name": "note",
+            "mimeType": "text/plain"
+          }
+        ]
+      }
+    },
+    "prompts/list": {
+      "result": {
+        "prompts": [
+          {
+            "name": "summarize",
+            "description": "Summarize a note.",
+            "arguments": [
+              {
+                "name": "id",
+                "required": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "resources/read": [
+      {
+        "match": {
+          "uri": "fixture://readme"
+        },
+        "result": {
+          "contents": [
+            {
+              "uri": "fixture://readme",
+              "mimeType": "text/plain",
+              "text": "conformance fixture\n"
+            }
+          ]
+        }
+      }
+    ],
+    "prompts/get": [
+      {
+        "match": {
+          "name": "summarize"
+        },
+        "result": {
+          "description": "Summarize a note.",
+          "messages": [
+            {
+              "role": "user",
+              "content": {
+                "type": "text",
+                "text": "Summarize note 7."
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "tools/call": [
+      {
+        "match": {
+          "name": "echo"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "echo: hi"
+            }
+          ],
+          "structuredContent": {
+            "echoed": "hi"
+          }
+        }
+      },
+      {
+        "match": {
+          "name": "fails"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "the fixture tool failed on purpose"
+            }
+          ],
+          "isError": true
+        }
+      },
+      {
+        "match": {
+          "name": "rpc-error"
+        },
+        "error": {
+          "code": -32602,
+          "message": "invalid params: conformance"
+        }
+      },
+      {
+        "match": {
+          "name": "slow"
+        },
+        "progress": [
+          {
+            "progress": 1,
+            "total": 2
+          },
+          {
+            "progress": 2,
+            "total": 2
+          }
+        ],
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "slow done"
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "hangs"
+        },
+        "hold": true
+      },
+      {
+        "match": {
+          "name": "image"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "one pixel"
+            },
+            {
+              "type": "image",
+              "mimeType": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "z_last"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "z"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {
+        "text": "hi"
+      }
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_fails",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_rpc-error",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_slow",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_image",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_hangs",
+      "input": {},
+      "cancel": "after_server_holds"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {
+        "text": "after cancel"
+      }
+    },
+    {
+      "op": "call",
+      "tool": "list_mcp_resources",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "list_mcp_resource_templates",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_read_resource",
+      "input": {
+        "server": "conformance",
+        "uri": "fixture://readme"
+      }
+    },
+    {
+      "op": "call",
+      "tool": "mcp_get_prompt",
+      "input": {
+        "server": "conformance",
+        "name": "summarize",
+        "arguments": {
+          "id": "7"
+        }
+      }
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_not_advertised",
+      "input": {}
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "direction": "host_to_core",
+  "valid": false,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "host/ready",
+    "params": {}
+  }
+}

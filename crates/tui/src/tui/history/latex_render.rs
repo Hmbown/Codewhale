@@ -990,31 +990,38 @@ fn render_latex_to_string(latex: &str) -> String {
                                 render_latex_to_string(&bot_s)
                             ));
                             pos = after_bot;
+                        } else {
+                            // Malformed: keep the command literal and advance,
+                            // or the loop would re-read it forever.
+                            out.push_str("\\binom");
+                            pos = total_cmd_end;
                         }
                     }
                     // --- Square root ---
                     "sqrt" => {
                         let after = &input[total_cmd_end..];
-                        // Optional [n] root index
-                        let (root_text, after_root) =
-                            if let Some(after_lb) = after.strip_prefix('[') {
-                                let end_bracket = after_lb.find(']').map(|i| i + 1);
-                                if let Some(e) = end_bracket {
-                                    (Some(&after_lb[..e]), total_cmd_end + e + 1)
-                                } else {
-                                    (None, total_cmd_end)
-                                }
-                            } else {
-                                (None, total_cmd_end)
-                            };
-                        if let Some((arg, _new_pos)) = read_braced_at(input, after_root) {
-                            let r = render_latex_to_string(&arg);
-                            if let Some(_root) = root_text {
-                                out.push_str(&format!("\u{221a}({r})"));
-                            } else {
-                                out.push_str(&format!("\u{221a}({r})"));
+                        // Optional [n] root index, without its brackets.
+                        let (root_text, after_root) = match after
+                            .strip_prefix('[')
+                            .and_then(|after_lb| after_lb.find(']').map(|end| (after_lb, end)))
+                        {
+                            Some((after_lb, end)) => {
+                                (Some(&after_lb[..end]), total_cmd_end + end + 2)
                             }
-                            out.push('\u{221a}');
+                            None => (None, total_cmd_end),
+                        };
+                        if let Some(root) = root_text {
+                            append_superscript(&render_latex_to_string(root), &mut out);
+                        }
+                        out.push('\u{221a}');
+                        // One radical, and resume after the whole argument:
+                        // the old path pushed a second radical and re-read the
+                        // argument, and a radicand without braces never
+                        // advanced at all (U04-m2).
+                        if let Some((arg, after_arg)) = read_braced_at(input, after_root) {
+                            out.push_str(&format!("({})", render_latex_to_string(&arg)));
+                            pos = after_arg;
+                        } else {
                             pos = after_root;
                         }
                     }
@@ -1659,6 +1666,36 @@ mod tests {
     fn test_superscript() {
         assert_eq!(render_latex_to_string("x^2"), "x\u{00b2}");
     }
+    /// U04-m2: one radical, the index as a superscript, and rendering
+    /// resumes after the argument instead of printing it twice.
+    #[test]
+    fn sqrt_renders_one_radical_and_consumes_its_argument() {
+        assert_eq!(render_latex_to_string(r"\sqrt{x}+1"), "\u{221a}(x)+1");
+        assert_eq!(
+            render_latex_to_string(r"\sqrt[3]{x}"),
+            "\u{00b3}\u{221a}(x)"
+        );
+    }
+
+    /// A radicand or binomial without braces must still finish rendering;
+    /// the old branches never advanced and spun the render loop forever.
+    #[test]
+    fn malformed_sqrt_and_binom_terminate() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((
+                render_latex_to_string(r"\sqrt 2"),
+                render_latex_to_string(r"\binom{n} k"),
+            ));
+        });
+        let (sqrt, binom) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("latex rendering must terminate");
+        assert!(sqrt.starts_with('\u{221a}'), "{sqrt}");
+        assert!(sqrt.ends_with('2'), "{sqrt}");
+        assert!(binom.contains("binom"), "{binom}");
+    }
+
     #[test]
     fn test_subscript() {
         assert_eq!(render_latex_to_string("x_1"), "x\u{2081}");

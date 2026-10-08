@@ -40,7 +40,8 @@ observe that one Runtime.
 ```
 
 - A **sub-agent** is the user-facing name for a *nested assignment* with a role
-  (`explore`, `review`, `implementer`, `verifier`, ...). It should be backed by
+  (`explore`, `reviewer`, `implement`, `test`, ... — see the canonical seven in
+  `docs/SUBAGENTS.md`). It should be backed by
   the same Runtime worker lifecycle used for a fleet-selected Agent. `agent` is
   the model-facing launcher, not a second runtime.
 - **`codewhale exec`** is the headless front door: usable by anyone at any time
@@ -131,7 +132,7 @@ transcripts, ACP/MCP clients, and internal compatibility callers, and rejects
 values above 8. Current model-authored calls inherit the Runtime configuration
 instead of negotiating recursion depth in the tool schema.
 
-Workflow IR has a separate structural validation limit of five nested nodes.
+Workflow IR has a separate default structural validation limit of five nested nodes.
 That limit constrains the orchestration document's shape; it does not grant or
 consume Runtime child-delegation depth.
 
@@ -152,6 +153,41 @@ emits
 run/phase/task/gate receipt while a Workflow is in flight and is retained as a
 typed `WorkflowEvent` in the Runtime execution ledger; the enclosing Runtime
 worker still owns the terminal `done` or `error`. One vocabulary, two surfaces.
+
+`session_capture` is emitted once, when the exec run persisted its transcript
+as a saved session, and carries the recoverable id in exactly one place:
+
+```json
+{"type": "session_capture", "schema": "codewhale.exec-stream", "schema_version": 1,
+ "content": "<redacted:…>", "saved_session_id": "01J…"}
+```
+
+- `saved_session_id` is the raw saved-session id, emitted only after a
+  successful save. For local Fleet workers, the parent assigns a fresh ID and
+  shares the Runtime's existing session directory. The executor advertises
+  `FleetReceipt.saved_session_id` only when that exact ID was reported and its
+  saved transcript can be loaded. A client with Runtime API access can then
+  read the reply through `GET /v1/sessions/{id}`. SSH workers retain their
+  excerpt and remote log, but do not advertise an unavailable local session
+  link. An ID is a lookup key, not a substitute for Runtime authentication.
+- `content` is the same redacted fingerprint the terminal `metadata.session_id`
+  carries, so a captured `metadata` receipt stays safe to log on its own and
+  the two events can still be correlated. `metadata.resume_command` therefore
+  names this field (`codewhale exec --resume <session_capture.saved_session_id>`)
+  rather than carrying the id itself.
+
+The terminal `metadata` receipt also carries the worker's visible final answer:
+`visible_final_answer_chars` is the real character count of the final
+assistant reply, and `visible_final_answer_excerpt` is a bounded (4,000
+characters, `...` when cut), secret-redacted excerpt of it, omitted when the
+current turn produced no visible answer. Resumed turns never reuse an older
+reply, and failed/interrupted receipts may carry partial current-turn text;
+the receipt status remains authoritative. The Runtime executor reads the excerpt from
+this receipt — never from the streamed `content` deltas, which are the run
+thinking out loud — and attaches it to `Completed.summary` and, for a task
+with no scorer and no file artifact, to the receipt notes as the task's
+deliverable. Lifecycle event labels and worker inspection summaries show a
+short excerpt; the event `payload` and the receipt keep the full excerpt.
 
 `turn_usage` is the per-model-call usage receipt, emitted once per model
 request (turn-step) when the provider reported usage for that call:
@@ -202,8 +238,9 @@ Codewhale should converge with Claude Code on **shape**, not on branding:
 The litmus test for any new agent surface: *does it launch and observe the one
 runtime, or does it invent a second one?* Only the former is allowed.
 
-## What remains after v0.9.0
+## Historical note: what remained after v0.9.0
 
+Archived roadmap snapshot — live state is the issue tracker, not this list.
 Refreshed 2026-08-17 from a full audit of the older 0.9-era documents. Those
 plans are evidence, not a second source of truth. v0.9.0 consolidated the
 underwater shell, message-first Operate, permission postures, the wired
@@ -268,10 +305,10 @@ A reproducible headless launch uses only existing generic surfaces:
   contains only the task servers the harness supplies
   (`{"mcpServers":{"task-tools":{"url":""}}}`; the `mcpServers` alias and
   URL-based Streamable HTTP / SSE transports already exist);
-- `CODEWHALE_MEMORY=false` and `CODEWHALE_TELEMETRY=false`. Anonymous usage
-  counting is on by default, so every sealed harness sets the run-scoped kill
-  switch explicitly. It also protects a home the caller reuses, whose ordinary
-  sessions send aggregate counts to a live endpoint
+- `CODEWHALE_MEMORY=false` and `CODEWHALE_TELEMETRY=false`. The 0.9.12 source
+  defaults usage counting on with an opt-out. Every sealed harness explicitly
+  sets the run-scoped kill switch so a test cannot collect or send from a
+  fresh or reused home. Ordinary enabled sessions send aggregate counts to an endpoint
   (`https://telemetry.codewhale.net/v1/telemetry`, the shipped default) rather
   than to a local file. It is a hard floor — an explicit "off" in the
   environment beats `--telemetry true` and `telemetry = true` in config. Set
@@ -315,7 +352,7 @@ is the provider-free acceptance lock for this contract.
 Actually adding Codewhale as a built-in harness lives in the external Verifiers
 repository; the public, immutable Codewhale GitHub Releases with checksum
 manifests it needs have existed since v0.9.1 (latest published release is
-v0.9.10; the workspace source candidate is v0.9.11).
+v0.9.13, published 2026-09-14; the workspace source version is 0.9.13).
 That upstream change is expected to be limited to a new
 `verifiers/v1/harnesses/codewhale/` package plus its test-matrix and docs
 registration, with `CodewhaleHarnessConfig` pinning the target release,

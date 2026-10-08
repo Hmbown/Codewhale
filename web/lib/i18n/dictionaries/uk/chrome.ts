@@ -7,9 +7,6 @@ import type { ChromeDict } from "../types";
  * режим дозволів for the permission posture, провайдер, репозиторій,
  * композер, міркування. Plan / Work / Operate and Ask / Auto-Review /
  * Full Access stay literal there and stay literal here.
- *
- * Secondary nav labels pair the Ukrainian primary with a short English
- * companion — the Han pair is the English edition's own device.
  */
 export const chrome: ChromeDict = {
   navDocs: "Документація",
@@ -19,15 +16,11 @@ export const chrome: ChromeDict = {
   navCommunity: "Спільнота",
   navContribute: "Участь",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
+  navProduct: "Продукт",
+  navModels: "Моделі",
+  navPlugins: "Плагіни",
 
   skipToContent: "Перейти до основного вмісту",
-
 
   navPrimaryAria: "Основна навігація",
   navHomeAria: "Головна сторінка Codewhale",
@@ -35,30 +28,8 @@ export const chrome: ChromeDict = {
   installCta: "Встановити →",
 
   authSignIn: "Увійти",
-  authRegister: "Реєстрація",
-  authGroupAria: "Обліковий запис",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "будь-яка модель, на вашій машині",
-
-  issueLabel: "Випуск {date}",
   dateLocale: "uk-UA",
-
-  starsAria: "Зірки на GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "Наживо",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "влито",
-  tickerOpened: "відкрито",
-  tickerClosed: "закрито",
-  tickerReleased: "реліз",
-  tickerFirstContribution: "перший внесок",
-  tickerBy: "автор {handle}",
-  tickerAria: "Нещодавня активність репозиторію",
-
-  traceLabel: "хід міркувань",
-  traceTabsAria: "Фрагменти сеансу",
 
   menuOpen: "Відкрити меню",
   menuClose: "Закрити меню",
@@ -66,11 +37,11 @@ export const chrome: ChromeDict = {
   themeAuto: "авто",
   themeLight: "світла",
   themeDark: "темна",
-  themeAria: "Тема документації: {mode} (натисніть, щоб перемкнути)",
-  themeTitle: "Тема документації · авто / світла / темна",
+  themeAria: "Тема: {mode} (натисніть, щоб перемкнути)",
+  themeTitle: "Тема · авто / світла / темна",
 
   footerTagline:
-    "Codewhale занурюється в глибину, щоб не довелося вам — документація, код і спільнота рантайму з відкритим кодом.",
+    "Редагуйте код, запускайте тести й переглядайте зміни за допомогою обраних вами моделей.",
   footerProduct: "Продукт",
   footerProject: "Проєкт",
   footerDocs: "Документація",
@@ -82,7 +53,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Проблеми",
   footerContribute: "Участь",
   footerLicense: "Ліцензія MIT",
-  footerPricing: "Ціни",
   footerTerms: "Умови використання",
   footerPrivacy: "Приватність",
   footerChangelog: "Журнал змін",

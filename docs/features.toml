@@ -1,0 +1,693 @@
+# Codewhale feature registry: the one hand-edited list of user features.
+#
+# A new command, `[features]` flag, provider or user-visible feature lands
+# with its row here in the same change. `crates/tui/tests/feature_registry.rs`
+# checks this file against the code and fails on drift:
+#
+#   cargo test -p codewhale-tui --test feature_registry
+#
+# Fields
+#   id        stable kebab-case id; never reused
+#   name      display name
+#   summary   one line, at most 120 characters
+#   status    stable | experimental | flagged | planned
+#               stable       shipped and on by default, no experimental label
+#               experimental shipped, labelled experimental or preview
+#               flagged      shipped but off until the user turns it on
+#               planned      not built; no `since` or `flag`
+#   surfaces  per-surface status: tui (the terminal binary and its CLI), web
+#             (the local browser client), api (Runtime API `/v1/*`); values
+#             are stable | preview | partial | none | planned. A missing key
+#             means "not recorded yet", not "absent".
+#   since     first release that shipped it ("unreleased" before a release).
+#             Optional until backfilled; when set it must be a CHANGELOG
+#             heading.
+#   flag      a `[features]` key from `crates/tui/src/features.rs`. Each key
+#             is owned by exactly one row, and the row's status follows the
+#             flag: off by default -> flagged; on and Stable -> stable; on and
+#             Experimental/Beta -> experimental.
+#   docs      user doc path (optional `#anchor`); must exist. Missing means
+#             the feature has no user doc yet, which is itself a gap to close.
+#   owner     code path that owns the behavior; must exist.
+#
+# Desktop (GPUI app) rows and surfaces are not recorded here yet: that
+# repository is private, so its unreleased features stay out of this public
+# file until that is decided.
+
+# --- Flag-backed tools (crates/tui/src/features.rs) ---
+
+[[feature]]
+id = "shell-tool"
+name = "Shell tool"
+summary = "Runs shell commands for the agent through the approval gate and sandbox."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.1.0"
+flag = "shell_tool"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/shell.rs"
+
+[[feature]]
+id = "local-code-execution"
+name = "Local code execution"
+summary = "Runs Python and Node with the shared execution policy and explicitly approved per-call elevation."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/TOOL_SURFACE.md#local-code-execution"
+owner = "crates/tui/src/core/engine/tool_catalog.rs"
+
+[[feature]]
+id = "subagents"
+name = "Sub-agents"
+summary = "Delegates bounded work to background child agents with their own budgets."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+since = "0.1.0"
+flag = "subagents"
+docs = "docs/SUBAGENTS.md"
+owner = "crates/tui/src/tools/subagent"
+
+[[feature]]
+id = "web-search"
+name = "Web search"
+summary = "Searches and fetches the web for the agent (web.run, with the web_search alias)."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.1.0"
+flag = "web_search"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/web_search.rs"
+
+[[feature]]
+id = "apply-patch"
+name = "apply_patch"
+summary = "Edits files with structured patches the user can review and undo."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.1.0"
+flag = "apply_patch"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/apply_patch.rs"
+
+[[feature]]
+id = "mcp-client"
+name = "MCP client"
+summary = "Connects local stdio and remote HTTP MCP servers and exposes their tools."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+since = "0.1.0"
+flag = "mcp"
+docs = "docs/MCP.md"
+owner = "crates/mcp"
+
+[[feature]]
+id = "exec-policy"
+name = "Execution policy"
+summary = "Decides allow, ask or deny for each tool call from layered permission rules."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.1.0"
+flag = "exec_policy"
+docs = "docs/AUTHORIZATION_ORDER.md"
+owner = "crates/execpolicy"
+
+[[feature]]
+id = "vision-model"
+name = "Vision model"
+summary = "Routes image analysis to a separate vision-capable model configured in [vision_model]."
+status = "flagged"
+surfaces = { tui = "stable" }
+since = "0.8.32"
+flag = "vision_model"
+docs = "docs/CONFIGURATION.md"
+owner = "crates/tui/src/vision"
+
+[[feature]]
+id = "verify-tool"
+name = "verify tool"
+summary = "Lets the agent ask for an adversarial self-critique of its own work."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.9.2"
+flag = "verify_tool"
+docs = "docs/CONFIGURATION.md#feature-flags"
+owner = "crates/tui/src/tools/verify.rs"
+
+[[feature]]
+id = "code-mode"
+name = "Code mode"
+summary = "execute_tools programs compose MCP, plugin and native tool calls under the normal gate."
+status = "experimental"
+surfaces = { tui = "stable" }
+since = "0.10.0"
+flag = "code_mode"
+docs = "docs/TOOL_SURFACE.md#code-mode-execute_tools"
+owner = "crates/tui/src/tools/codemode.rs"
+
+[[feature]]
+id = "extension-host"
+name = "Extension host"
+summary = "Runs reviewed plugins' native TypeScript/JavaScript tool and slash-command code in a Bun or Node sidecar."
+status = "flagged"
+surfaces = { tui = "preview", web = "none", api = "none" }
+since = "0.10.1"
+flag = "extension_host"
+docs = "docs/EXTENSIONS.md"
+owner = "crates/tui/src/extension_host"
+
+[[feature]]
+id = "finance-host"
+name = "Finance host"
+summary = "Routes opted-in finance tools through the bundled Native host under the existing permission and sandbox gates."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "finance_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/finance.rs"
+
+[[feature]]
+id = "data-host"
+name = "Data host"
+summary = "Routes opted-in data validation through the bundled Native host with owned input and output bounds."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "data_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/validate_data.rs"
+
+[[feature]]
+id = "speech-host"
+name = "Speech host"
+summary = "Routes opted-in speech tools through the bundled Native host while Rust retains credentials and permissions."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "speech_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/speech.rs"
+
+[[feature]]
+id = "pdf-host"
+name = "PDF host"
+summary = "Routes opted-in PDF extraction through the bundled Native host with the same Rust path and size guards."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "pdf_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/pdf.rs"
+
+[[feature]]
+id = "ocr-host"
+name = "OCR host"
+summary = "Routes opted-in image OCR through the bundled Native host under existing media and permission guards."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "ocr_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/image_ocr.rs"
+
+[[feature]]
+id = "github-host"
+name = "GitHub host"
+summary = "Routes opted-in GitHub operations through the bundled Native host while Rust retains credentials and approvals."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "github_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/github"
+
+[[feature]]
+id = "web-search-host"
+name = "Web search host"
+summary = "Routes opted-in web search through the bundled Native host with the existing Rust credential and network gates."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "web_search_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/web/adapter.rs"
+
+[[feature]]
+id = "web-extract-host"
+name = "Web extract host"
+summary = "Routes opted-in web extraction through the bundled Native host with owned URL and response bounds."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "web_extract_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/web/extract.rs"
+
+[[feature]]
+id = "review-host"
+name = "Review host"
+summary = "Routes opted-in review tools through the bundled Native host while Rust retains route and permission authority."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "review_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/review_host.rs"
+
+# --- Working with the agent ---
+
+[[feature]]
+id = "modes"
+name = "Modes"
+summary = "Plan, Work and Operate modes set what the agent may do in a session."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/MODES.md"
+owner = "crates/config/src/app_mode.rs"
+
+[[feature]]
+id = "permission-postures"
+name = "Permission postures"
+summary = "Ask, Auto-Review and Full Access postures decide when a tool call needs approval."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/MODES.md#permission-posture"
+owner = "crates/execpolicy/src/approval_mode.rs"
+
+[[feature]]
+id = "sandbox"
+name = "Command sandbox"
+summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is on by default once installed and verified."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/SANDBOX.md"
+owner = "crates/tui/src/sandbox"
+
+[[feature]]
+id = "providers"
+name = "Providers"
+summary = "First-class provider routes plus bundled OpenAI-compatible host descriptors."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/PROVIDERS.md"
+owner = "crates/config/assets/provider_descriptors.json"
+
+[[feature]]
+id = "model-routing"
+name = "Auto model routing"
+summary = "Picks a model per turn under Auto; /router sets up the router."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/CONFIGURATION.md#auto-model-routing-auto-autorouter"
+owner = "crates/tui/src/model_routing.rs"
+
+[[feature]]
+id = "fleet"
+name = "Fleet"
+summary = "Runs and supervises groups of worker agents with receipts and a pre-spend check."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/FLEET.md"
+owner = "crates/tui/src/fleet"
+
+[[feature]]
+id = "workflows"
+name = "Workflows"
+summary = "Checked-in .workflow.js scripts coordinate agents step by step."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/WORKFLOW_AUTHORING.md"
+owner = "crates/workflow"
+
+[[feature]]
+id = "automatic-workflows"
+name = "Automatic workflows"
+summary = "Turns a broad request into a compact Workflow plan without writing a script."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/AUTOMATIC_WORKFLOWS.md"
+owner = "crates/tui/src/tools/workflow"
+
+[[feature]]
+id = "goals"
+name = "Goals"
+summary = "/goal keeps the agent working toward one objective across turns."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/CONFIGURATION.md#goal-loop-goal"
+owner = "crates/tui/src/tools/goal.rs"
+
+[[feature]]
+id = "todos"
+name = "Todo list"
+summary = "The agent keeps a visible todo list for multi-step work."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/todo.rs"
+
+[[feature]]
+id = "composer-queue-steer"
+name = "Queue and steer"
+summary = "Queue messages while a turn runs, or steer the running turn."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/KEYBINDINGS.md"
+owner = "crates/tui/src/commands/groups/core/queue.rs"
+
+[[feature]]
+id = "receipts"
+name = "Receipts"
+summary = "/receipts lists what a session did: files, commands, calls, approvals and failures."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+since = "0.10.1"
+docs = "docs/RECEIPTS.md"
+owner = "crates/tui/src/receipts.rs"
+
+[[feature]]
+id = "preview-request"
+name = "Request preview"
+summary = "/preview-request shows the redacted outbound request without sending it."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/PREVIEW_REQUEST.md"
+owner = "crates/tui/src/request_manifest.rs"
+
+[[feature]]
+id = "read-media"
+name = "read_media"
+summary = "Reads and preprocesses images for vision-capable models with size and privacy guards."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/READ_MEDIA.md"
+owner = "crates/tui/src/tools/read_media.rs"
+
+[[feature]]
+id = "memory"
+name = "User memory"
+summary = "Opt-in local store of preferences and conventions that persists across sessions."
+status = "flagged"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/MEMORY.md"
+owner = "crates/memory"
+
+[[feature]]
+id = "cloud-dispatch"
+name = "Cloud dispatch"
+summary = "/dispatch sends a cloud agent to raise a branch and open a PR, after confirmation."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/DAYTONA_CLOUD_DISPATCH.md"
+owner = "crates/tui/src/cloud_dispatch.rs"
+
+# --- Extending Codewhale ---
+
+[[feature]]
+id = "skills"
+name = "Skills"
+summary = "Installs and loads trusted instruction packages with owned-root precedence and separate user/model invocation controls."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/SKILLS.md"
+owner = "crates/tui/src/skills"
+
+[[feature]]
+id = "plugins"
+name = "Plugins"
+summary = "Installs, reviews and trusts plugin bundles, including the first-party marketplace."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/PLUGINS.md"
+owner = "crates/tui/src/plugins"
+
+[[feature]]
+id = "script-tools"
+name = "Script tools"
+summary = "Scripts in ~/.codewhale/tools become approval-gated tools; [tools.overrides] disables built-ins, never replaces them."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/CONFIGURATION.md#script-tools-and-overrides"
+owner = "crates/tui/src/tools/plugin.rs"
+
+[[feature]]
+id = "claude-plugin-compat"
+name = "Claude plugin compatibility"
+summary = "Loads Claude Code plugin bundles and skill folders where their features are supported."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/CLAUDE_PLUGIN_COMPAT.md"
+owner = "crates/tui/src/plugins/agent_plugin.rs"
+
+[[feature]]
+id = "claude-settings-import"
+name = "Claude settings import"
+summary = "/import-claude plans a reviewable import of Claude Code settings and servers."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/import_claude.rs"
+
+[[feature]]
+id = "hooks"
+name = "Hooks"
+summary = "Runs user commands on session and tool events, with an execution receipt after shell tools."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/HOOKS.md"
+owner = "crates/hooks"
+
+[[feature]]
+id = "lsp"
+name = "LSP diagnostics"
+summary = "Feeds language-server diagnostics to the agent; custom servers can be added."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/LSP_PHP_CUSTOM.md"
+owner = "crates/tui/src/lsp"
+
+[[feature]]
+id = "runtime-api"
+name = "Runtime API"
+summary = "Local HTTP API for threads, events and approvals, with scoped watch/drive device tokens."
+status = "stable"
+surfaces = { api = "stable" }
+docs = "docs/RUNTIME_API.md"
+owner = "crates/tui/src/runtime_api.rs"
+
+[[feature]]
+id = "headless-exec"
+name = "Headless exec"
+summary = "codewhale exec runs one headless turn from a script and streams JSON."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/RUNTIME_API.md"
+owner = "crates/tui/src/exec_agent.rs"
+
+[[feature]]
+id = "github-review"
+name = "GitHub PR review"
+summary = "codewhale review --pr N writes an advisory review; posting to GitHub is opt-in."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/GITHUB_APP.md"
+owner = "crates/tui/src/tools/github"
+
+# --- Interface ---
+
+[[feature]]
+id = "web-client"
+name = "Local browser client"
+summary = "codewhale web opens the embedded browser client on 127.0.0.1 over the Runtime API."
+status = "stable"
+surfaces = { web = "stable" }
+docs = "docs/WEB.md"
+owner = "crates/tui/src/runtime_web"
+
+[[feature]]
+id = "keybindings"
+name = "Keybindings"
+summary = "Terminal key bindings, documented from the keybinding catalog."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/KEYBINDINGS.md"
+owner = "crates/tui/src/tui/keybindings.rs"
+
+[[feature]]
+id = "settings"
+name = "Settings"
+summary = "/config and codewhale config edit settings declared once in the settings schema."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/CONFIGURATION.md"
+owner = "crates/config/src/settings_schema.rs"
+
+[[feature]]
+id = "themes"
+name = "Themes"
+summary = "/theme picks a built-in theme; user themes follow a JSON schema."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/schemas/user-theme.schema.json"
+owner = "crates/palette"
+
+[[feature]]
+id = "localization"
+name = "Localization"
+summary = "Interface text in 15 locales."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/LOCALIZATION.md"
+owner = "crates/localization"
+
+[[feature]]
+id = "voice"
+name = "Voice input"
+summary = "/voice, /voicecontrol and /voicesend use the selected ASR backend without switching providers."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+owner = "crates/tui/src/voice.rs"
+
+[[feature]]
+id = "pet"
+name = "Pet"
+summary = "/pet turns the screen over to the Codewhale pet while it works."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/tui/pet_watch"
+
+[[feature]]
+id = "overview"
+name = "Home dashboard"
+summary = "/overview shows the home dashboard."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/PROVIDERS.md"
+owner = "crates/tui/src/commands/groups/core/home.rs"
+
+[[feature]]
+id = "account-login"
+name = "Account login"
+summary = "/login signs in to Codewhale or stores provider keys."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/commands/groups/config/config.rs"
+
+[[feature]]
+id = "context-anchors"
+name = "Context anchors"
+summary = "/anchor pins a fact that survives compaction."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/commands/groups/core/anchor.rs"
+
+[[feature]]
+id = "window-pin"
+name = "Pin window"
+summary = "/pin keeps the terminal window on top."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/commands/groups/core/pin.rs"
+
+[[feature]]
+id = "structured-copy"
+name = "Structured copy"
+summary = "/structcopy copies one session object as redacted JSON."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/commands/groups/session/structcopy.rs"
+
+[[feature]]
+id = "live-thinking"
+name = "Live thinking"
+summary = "/verbose toggles live model thinking in the transcript."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/commands/groups/config/mod.rs"
+
+[[feature]]
+id = "workbar"
+name = "Workbar"
+summary = "/workbar places the tasks, agents and context bar on any edge or hides it."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/tui/sidebar.rs"
+
+# --- Operations and platforms ---
+
+[[feature]]
+id = "telemetry"
+name = "Telemetry"
+summary = "Anonymous aggregate usage counts, disclosed at first launch, with a saved off switch."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/TELEMETRY.md"
+owner = "crates/telemetry"
+
+[[feature]]
+id = "docker"
+name = "Docker image"
+summary = "Runs Codewhale in a container, with an opt-in toolbox image."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/DOCKER.md"
+owner = "Dockerfile"
+
+[[feature]]
+id = "termux"
+name = "Android (Termux)"
+summary = "arm64 release archive for Termux on Android."
+status = "experimental"
+surfaces = { tui = "preview" }
+docs = "docs/TERMUX.md"
+owner = ".github/workflows/release-artifacts.yml"
+
+[[feature]]
+id = "chatgpt-plan-sign-in"
+name = "Sign in with ChatGPT"
+summary = "Uses official OAuth and the selected account catalog for eligible ChatGPT plan requests in the local OSS app."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
+owner = "crates/tui/src/oauth.rs"
+
+[[feature]]
+id = "plugin-oauth-providers"
+name = "Reviewed plugin OAuth providers"
+summary = "Reviewed plugins add OpenAI-compatible routes; the host owns PKCE grants and rechecks approval at each request."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PLUGIN_PROVIDERS.md"
+owner = "crates/tui/src/plugins/providers.rs"
+
+[[feature]]
+id = "orcarouter-sign-in"
+name = "Sign in with OrcaRouter"
+summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
+status = "experimental"
+surfaces = { tui = "preview", api = "none", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md"
+owner = "crates/tui/src/oauth.rs"
+
+# Community marketing website, separate from the Runtime's local web client.
+[[feature]]
+id = "merch-interest"
+name = "Merch interest list"
+summary = "The community website collects private merch opt-ins, material preferences and optional item-price feedback."
+status = "experimental"
+surfaces = { tui = "none", web = "none", api = "none" }
+since = "unreleased"
+docs = "web/lib/merch/README.md"
+owner = "web/components/merch-interest.tsx"
+
+[[feature]]
+id = "profile-constitution"
+name = "Profile constitution"
+summary = "Account preferences are captured per turn and previewed by the Engine."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+since = "unreleased"
+docs = "docs/RUNTIME_API.md#profile-constitution"
+owner = "crates/tui/src/profile_constitution.rs"

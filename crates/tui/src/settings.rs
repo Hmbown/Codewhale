@@ -2,8 +2,9 @@
 //!
 //! Settings are stored at ~/.codewhale/settings.toml, with legacy fallbacks.
 //!
-//! TUI-specific preferences (theme, keybinds, font_size) that survive project
-//! switches are stored separately in tui.toml. See [`TuiPrefs`].
+//! There is one persisted settings store. The historical `tui.toml` second
+//! store is folded into it on load and moved aside with a receipt — see
+//! [`TuiPrefsMigration`].
 
 use std::path::{Path, PathBuf};
 
@@ -11,11 +12,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{expand_path, normalize_model_name};
-use crate::localization::normalize_configured_locale;
-use crate::palette::{normalize_hex_rgb_color, normalize_theme_setting};
-use crate::tui::app::ReasoningEffort;
+use crate::reasoning_preference::ReasoningEffort;
+use codewhale_config::resolve::Layer;
+use codewhale_localization::normalize_configured_locale;
+use codewhale_palette::{normalize_hex_rgb_color, normalize_theme_setting};
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
+
+/// Fresh terminal installs and explicit theme resets share one default.
+pub(crate) use codewhale_config::settings_schema::DEFAULT_TUI_THEME;
 
 /// Smallest Top work surface that can show its divider plus the compact
 /// goal / to-do / Agent projection without turning the rail into invisible
@@ -59,220 +64,167 @@ impl InlineDiffMode {
 }
 
 // ============================================================================
-// TuiPrefs — ~/.codewhale/tui.toml
+// tui.toml — folded into settings.toml (0.9.12: one settings store)
 // ============================================================================
 
-/// TUI-specific preferences that are decoupled from agent/project config so
-/// they survive project switches (issue #437).
+/// What the one-time `tui.toml` fold did, so a session can say it out loud.
 ///
-/// Stored at `~/.codewhale/tui.toml` on new installs, with
-/// `~/.deepseek/tui.toml` retained as a legacy read fallback. When the file is
-/// absent the values fall back to the `[tui]` section of the normal
-/// `config.toml` (via [`TuiPrefs::load`]), and then to the struct's own
-/// defaults.
-///
-/// # Example `~/.codewhale/tui.toml`
-///
-/// ```toml
-/// theme    = "underwater"    # painted ocean field; "terminal" | "dark" | "light" | "grayscale" | ... remain available
-/// font_size = 14
-///
-/// [keybinds]
-/// submit   = "ctrl+enter"
-/// new_line = "enter"
-/// ```
-//
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TuiPrefs {
-    /// UI colour theme.
-    /// Default `"underwater"`, the painted ocean field. `"terminal"` leaves
-    /// foreground and background to the host terminal while retaining
-    /// ANSI-safe semantic accents.
-    pub theme: String,
-    /// Terminal font size hint forwarded to supporting front-ends (e.g. the
-    /// Tauri shell). `0` means "use terminal default". Default `0`.
-    pub font_size: u16,
-    /// Key-binding overrides. Each field accepts an xterm-style chord string
-    /// such as `"ctrl+enter"`, `"alt+n"`, or `"f1"`.
-    pub keybinds: KeybindPrefs,
+/// `tui.toml` used to be a second persisted store for `theme`, `font_size`,
+/// and keybind overrides. Startup never read it, so a theme saved there could
+/// disagree with `settings.toml` forever and nothing told the user which store
+/// won. The file is now folded into `settings.toml` at load: a value
+/// `settings.toml` does not already own explicitly is adopted, a value it does
+/// own is reported as kept, and a key with no `Settings` field is quarantined
+/// by name. The original bytes are moved to a dated backup — never deleted,
+/// never silently dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TuiPrefsMigration {
+    /// The `tui.toml` that was folded.
+    pub source: PathBuf,
+    /// Where its original bytes now live.
+    pub backup: Option<PathBuf>,
+    /// `(settings key, adopted value)` folded into `settings.toml`.
+    pub folded: Vec<(String, String)>,
+    /// `(settings key, tui.toml value, settings.toml value)` — settings.toml
+    /// already owned the key explicitly, so it won.
+    pub kept: Vec<(String, String, String)>,
+    /// `tui.toml` keys with no home in [`Settings`]. Listed, never dropped.
+    pub quarantined: Vec<String>,
 }
 
-impl Default for TuiPrefs {
-    fn default() -> Self {
-        Self {
-            theme: "underwater".to_string(),
-            font_size: 0,
-            keybinds: KeybindPrefs::default(),
+impl TuiPrefsMigration {
+    /// Whether anything at all is worth telling the user about.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.folded.is_empty() && self.kept.is_empty() && self.quarantined.is_empty()
+    }
+
+    /// One localized line per outcome, in the order a reader needs them:
+    /// what moved, what did not, and what was parked.
+    #[must_use]
+    pub fn lines(&self, locale: codewhale_localization::Locale) -> Vec<String> {
+        use codewhale_localization::{MessageId, tr};
+
+        let backup = self
+            .backup
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| self.source.display().to_string());
+        let mut lines = Vec::new();
+        for (key, value) in &self.folded {
+            lines.push(
+                tr(locale, MessageId::SettingsTuiPrefsFolded)
+                    .replace("{key}", key)
+                    .replace("{value}", value),
+            );
         }
+        for (key, from_prefs, from_settings) in &self.kept {
+            lines.push(
+                tr(locale, MessageId::SettingsTuiPrefsKept)
+                    .replace("{key}", key)
+                    .replace("{prefs}", from_prefs)
+                    .replace("{settings}", from_settings),
+            );
+        }
+        if !self.quarantined.is_empty() {
+            lines.push(
+                tr(locale, MessageId::SettingsTuiPrefsQuarantined)
+                    .replace("{keys}", &self.quarantined.join(", "))
+                    .replace("{path}", &backup),
+            );
+        }
+        lines
     }
 }
 
-/// Per-action keybinding overrides stored inside [`TuiPrefs`].
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct KeybindPrefs {
-    /// Key to submit the current composer input to the model.
-    /// Default: `"ctrl+enter"`.
-    pub submit: Option<String>,
-    /// Key to insert a literal newline inside the composer.
-    /// Default: `"enter"`.
-    pub new_line: Option<String>,
-    /// Key to open the command palette.
-    /// Default: `"ctrl+k"`.
-    pub command_palette: Option<String>,
-    /// Key to cancel / interrupt a running turn.
-    /// Default: `"ctrl+c"`.
-    pub cancel: Option<String>,
-    /// Key to toggle the sidebar.
-    /// Default: `"ctrl+b"`.
-    pub toggle_sidebar: Option<String>,
+/// The `tui.toml` next to each settings candidate, first existing wins.
+fn tui_prefs_path_from_settings_candidates(
+    primary: Option<&Path>,
+    legacy_home: Option<&Path>,
+) -> Option<PathBuf> {
+    [primary, legacy_home]
+        .into_iter()
+        .flatten()
+        .map(|path| path.with_file_name(TUI_PREFS_FILE_NAME))
+        .find(|path| path.exists())
 }
 
-impl TuiPrefs {
-    /// Return the canonical path of the TUI preferences file:
-    /// `~/.codewhale/tui.toml`, or legacy `~/.deepseek/tui.toml` when present.
-    ///
-    /// Tests may override the home directory through the canonical
-    /// `CODEWHALE_CONFIG_PATH` environment variable. The parent directory of
-    /// the pointed-to config is used instead of the default settings home.
-    pub fn path() -> Result<PathBuf> {
-        #[cfg(test)]
-        {
-            let honor_guarded_environment =
-                crate::test_support::guarded_environment_provides_state_paths();
-            crate::test_support::with_test_env_lock(|| {
-                if honor_guarded_environment {
-                    tui_prefs_path_from_environment()
-                } else {
-                    Ok(crate::test_support::unsealed_test_state_root().join(TUI_PREFS_FILE_NAME))
+/// Move `path` aside to `tui.toml.migrated-<YYYYMMDD>`, never clobbering an
+/// existing backup. The bytes are preserved; only the name changes, so the
+/// dead store cannot reappear as a second source of truth on the next launch.
+fn back_up_tui_prefs(path: &Path) -> Result<PathBuf> {
+    let stamp = chrono::Local::now().format("%Y%m%d").to_string();
+    let base = format!("{TUI_PREFS_FILE_NAME}.migrated-{stamp}");
+    let mut candidate = path.with_file_name(&base);
+    let mut attempt = 1u32;
+    while candidate.exists() {
+        candidate = path.with_file_name(format!("{base}-{attempt}"));
+        attempt += 1;
+    }
+    std::fs::rename(path, &candidate)
+        .with_context(|| format!("Failed to move {} aside", path.display()))?;
+    Ok(candidate)
+}
+
+/// Fold a legacy `tui.toml` into `settings`, returning the receipt.
+///
+/// `explicit` reports whether `settings.toml` named a key itself; an explicit
+/// value always wins, and the disagreement is recorded rather than resolved
+/// behind the user's back. When `apply` is false (read-only diagnostics) the
+/// values are still folded in memory but no file is moved or written.
+fn fold_tui_prefs(
+    settings: &mut Settings,
+    explicit: &std::collections::BTreeSet<String>,
+    prefs_path: &Path,
+    apply: bool,
+) -> Option<TuiPrefsMigration> {
+    let raw = std::fs::read_to_string(prefs_path).ok()?;
+    let mut receipt = TuiPrefsMigration {
+        source: prefs_path.to_path_buf(),
+        ..TuiPrefsMigration::default()
+    };
+    match toml::from_str::<toml::Value>(&raw) {
+        Ok(toml::Value::Table(table)) => {
+            for (key, value) in table {
+                // `theme` is the only tui.toml key with a `Settings` field.
+                // `font_size` and `[keybinds]` never had one, so they are
+                // quarantined by name instead of being thrown away.
+                if key != "theme" {
+                    receipt.quarantined.push(key);
+                    continue;
                 }
-            })
-        }
-
-        #[cfg(not(test))]
-        tui_prefs_path_from_environment()
-    }
-
-    /// Load TUI preferences from `~/.codewhale/tui.toml` or a legacy fallback.
-    ///
-    /// If the file does not exist the struct defaults are returned — no error
-    /// is produced. Parse errors surface as `Err` so the caller can warn the
-    /// user without crashing the session.
-    #[allow(dead_code)] // Startup currently only validates tui.toml parse; load is the persistence API.
-    pub fn load() -> Result<Self> {
-        let path = Self::path()?;
-        #[cfg(test)]
-        {
-            crate::test_support::with_test_state_io_lock(|| Self::load_from_path(&path))
-        }
-        #[cfg(not(test))]
-        Self::load_from_path(&path)
-    }
-
-    fn load_from_path(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read tui.toml from {}", path.display()))?;
-        let prefs: TuiPrefs = match toml::from_str(&content) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Failed to parse {} (using defaults): {e:#}", path.display());
-                return Ok(Self::default());
+                let Some(theme) = value.as_str().map(str::to_string) else {
+                    receipt.quarantined.push(key);
+                    continue;
+                };
+                let normalized = normalize_settings_theme(&theme);
+                if explicit.contains("theme") {
+                    if normalized != settings.theme {
+                        receipt.kept.push((key, normalized, settings.theme.clone()));
+                    }
+                } else {
+                    settings.theme = normalized.clone();
+                    receipt.folded.push((key, normalized));
+                }
             }
-        };
-        Ok(prefs)
-    }
-
-    /// Save TUI preferences to `~/.codewhale/tui.toml` (or a legacy file when
-    /// it already exists), creating the target directory if needed.
-    #[allow(dead_code)] // Persistence API; no settings UI write path yet.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
-        #[cfg(test)]
-        {
-            crate::test_support::with_test_state_io_lock(|| self.save_to_path(&path))
         }
-        #[cfg(not(test))]
-        self.save_to_path(&path)
-    }
-
-    fn save_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory {}", parent.display())
-            })?;
+        _ => {
+            // Unreadable bytes are still the user's: park the whole file
+            // under its own name rather than guessing at its contents.
+            receipt.quarantined.push(TUI_PREFS_FILE_NAME.to_string());
         }
-        let serialized = toml::to_string_pretty(self).context("Failed to serialize TuiPrefs")?;
-        let body = if path.exists() {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read tui.toml at {}", path.display()))?;
-            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
-                tracing::warn!("failed to merge tui.toml comments, saving without them: {e:#}");
-                serialized
-            })
-        } else {
-            serialized
-        };
-        std::fs::write(path, body)
-            .with_context(|| format!("Failed to write tui.toml to {}", path.display()))?;
-        Ok(())
     }
+    receipt.quarantined.sort();
 
-    /// Validate field values and normalise them in place.
-    ///
-    /// Returns `Err` if an unrecognised `theme` value is found so callers can
-    /// surface a helpful message rather than silently ignoring a typo.
-    #[allow(dead_code)] // Persistence API; no settings UI write path yet.
-    pub fn validate(&mut self) -> Result<()> {
-        self.theme = normalize_theme_setting(&self.theme).map_err(anyhow::Error::msg)?;
-        Ok(())
+    if apply {
+        match back_up_tui_prefs(prefs_path) {
+            Ok(backup) => receipt.backup = Some(backup),
+            Err(error) => {
+                tracing::warn!("failed to move {} aside: {error:#}", prefs_path.display());
+            }
+        }
     }
-}
-
-fn tui_prefs_path_from_environment() -> Result<PathBuf> {
-    // Honour the same env-var escape hatch used by Settings::path so that
-    // integration tests can redirect all config I/O to a temp directory.
-    if let Some(parent) = config_override_parent() {
-        return Ok(parent.join("tui.toml"));
-    }
-
-    let primary = codewhale_config::codewhale_home()
-        .ok()
-        .map(|home| home.join(TUI_PREFS_FILE_NAME));
-    if codewhale_config::codewhale_home_is_explicit() {
-        return primary.ok_or_else(|| {
-            anyhow::anyhow!("Failed to resolve tui.toml path: no Codewhale home found.")
-        });
-    }
-    let legacy_home = codewhale_config::legacy_deepseek_home()
-        .ok()
-        .map(|home| home.join(TUI_PREFS_FILE_NAME));
-
-    resolve_tui_prefs_path_from_candidates(primary, legacy_home)
-}
-
-fn resolve_tui_prefs_path_from_candidates(
-    primary: Option<PathBuf>,
-    legacy_home: Option<PathBuf>,
-) -> Result<PathBuf> {
-    if let Some(path) = primary.as_ref()
-        && path.exists()
-    {
-        return Ok(path.clone());
-    }
-
-    if let Some(path) = legacy_home.as_ref()
-        && path.exists()
-    {
-        return Ok(path.clone());
-    }
-
-    primary.or(legacy_home).ok_or_else(|| {
-        anyhow::anyhow!("Failed to resolve tui preferences path: no home directory found.")
-    })
+    Some(receipt)
 }
 
 /// User settings with defaults
@@ -379,6 +331,9 @@ pub struct Settings {
     /// the long tail. Type-to-filter still unfolds matches.
     #[serde(default)]
     pub help_expand_groups: bool,
+    /// Show quiet, action-triggered command discovery tips.
+    #[serde(default = "default_true")]
+    pub contextual_tips: bool,
     /// Pin the last user prompt at the top of the transcript when it has
     /// scrolled off. Default on.
     #[serde(default = "default_true")]
@@ -393,13 +348,14 @@ pub struct Settings {
     /// ca, de, fr, id, hi, ru, uk.
     /// Every shipped pack holds full `en.json` parity; nothing falls back.
     pub locale: String,
-    /// Named UI theme. `"underwater"` is the fresh-install default and paints
-    /// the ocean field. `"terminal"` fully inherits the host terminal's
-    /// foreground/background. `"system"`, `"dark"`, `"light"`,
-    /// `"grayscale"`, and the community presets: `"catppuccin-mocha"`,
-    /// `"tokyo-night"`, `"dracula"`, `"gruvbox-dark"`. The
-    /// `background_color` setting still overrides the surface color on top
-    /// of the resolved theme.
+    /// Named UI theme. `"underwater"` is the fresh-install default: a dark
+    /// navy water column. `"shoreline"` is the warm charcoal alternative.
+    /// `"terminal"` fully inherits the
+    /// host terminal's foreground/background. `"system"`, `"dark"`,
+    /// `"light"`, `"grayscale"`, and the community presets:
+    /// `"catppuccin-mocha"`, `"tokyo-night"`, `"dracula"`,
+    /// `"gruvbox-dark"`. The `background_color` setting still overrides the
+    /// surface color on top of the resolved theme.
     pub theme: String,
     /// Optional main TUI background color as a 6-digit hex RGB value.
     pub background_color: Option<String>,
@@ -452,10 +408,9 @@ pub struct Settings {
     pub cost_currency: String,
     /// Maximum number of input history entries to save
     pub max_input_history: usize,
-    /// Default provider override (e.g. "deepseek", "openai").
+    /// Archived startup provider used only to migrate older settings into config.
     pub default_provider: Option<String>,
-    /// DeepSeek-only fallback model. Non-DeepSeek providers use the
-    /// provider-scoped entry in [`Self::provider_models`] instead.
+    /// Archived DeepSeek fallback used only by the config selection migration.
     pub default_model: Option<String>,
     /// Default reasoning effort selected from the TUI model picker.
     /// `None` falls back to `config.toml` and then the runtime default.
@@ -473,12 +428,13 @@ pub struct Settings {
     /// never confused with unrestricted filesystem writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<String>,
-    /// Per-provider model overrides. Key is provider name (e.g. "openai"),
-    /// value is the model id. Takes precedence over `default_model`.
+    /// Archived provider model choices used only by the config selection
+    /// migration. Preserve them on unrelated settings saves until migrated.
     pub provider_models: Option<std::collections::HashMap<String, String>>,
-    /// Provider-scoped model IDs intentionally enabled for the ordinary model
-    /// picker. Missing on older files; current and saved provider choices are
-    /// seeded at load time so the migration is additive and non-breaking.
+    /// Legacy additive picker list written by older builds on every model
+    /// switch. Nothing reads it any more (#6533): the picker ranks by recent
+    /// use instead. Parsed and preserved only so old files load and survive
+    /// unrelated saves until a cleanup removes the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_models: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Exact provider/model tuples pinned to the top of model choosers, in
@@ -532,17 +488,45 @@ pub struct Settings {
     /// One-time YOLO deprecation toast has been shown. Suppresses the repeat
     /// toast after the first sighting per install (persisted across sessions).
     pub yolo_deprecation_shown: bool,
+    /// Round 3 (2026-09-01) moved the work bar under the composer. Every
+    /// settings.toml saved before that carries `work_surface_placement =
+    /// "top"` — the old default, persisted verbatim by ordinary saves, not a
+    /// choice anyone made. This flag records that the one-time `top` →
+    /// `bottom` migration ran, so a user who picks `top` afterwards keeps it.
+    #[serde(default)]
+    pub work_surface_bottom_migrated: bool,
     /// Persisted impression counts for action-triggered, ephemeral product
     /// guidance. Keys are stable tip identifiers; values are bounded by the
     /// behavioral-tip engine and omitted entirely before the first sighting.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub behavioral_tip_impressions: std::collections::BTreeMap<String, u8>,
+    /// Plugin names explicitly dismissed from proactive suggestions. Manual
+    /// plugin commands remain available. Names are stored in lowercase.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub dismissed_plugin_suggestions: std::collections::BTreeSet<String>,
+    /// Persisted use counts for the Tideline footer key hints. Keys are the
+    /// stable hint identifiers in `crate::tui::footer_hints`; a hint retires
+    /// to its bare state once its binding has been used enough times.
+    /// Omitted entirely before the first recorded use.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub footer_hint_uses: std::collections::BTreeMap<String, u8>,
     /// True only for the current load when `default_mode = "yolo"` was read
     /// from an older settings file. App startup uses this provenance to migrate
     /// the old bundled Full Access choice without weakening project or managed
     /// approval policy. It is never written back to disk.
     #[serde(skip)]
     pub(crate) legacy_yolo_default: bool,
+    /// Receipt for the one-time `tui.toml` fold performed by this load.
+    /// Never serialized: it describes what happened to a file, not a setting.
+    #[serde(skip)]
+    pub(crate) tui_prefs_migration: Option<TuiPrefsMigration>,
+    /// Which layer supplied the in-force value of each schema key: user
+    /// config for keys `settings.toml` named at load, the default for the
+    /// rest, session for keys `set()` touched since. Runtime only — the
+    /// resolver reads it, disk never sees it. CLI flags (2D) and managed
+    /// policy / project producers mark their own layers when they land.
+    #[serde(skip)]
+    pub(crate) provenance: std::collections::BTreeMap<String, Layer>,
 }
 
 impl Default for Settings {
@@ -587,11 +571,12 @@ impl Default for Settings {
             thinking_preview_lines: default_thinking_preview_lines(),
             thinking_highlight: true,
             help_expand_groups: false,
+            contextual_tips: true,
             pin_last_prompt: true,
             show_tool_details: false,
             inline_diffs: "full".to_string(),
             locale: "auto".to_string(),
-            theme: "underwater".to_string(),
+            theme: DEFAULT_TUI_THEME.to_string(),
             background_color: None,
             composer_density: "comfortable".to_string(),
             composer_border: true,
@@ -622,8 +607,13 @@ impl Default for Settings {
             workspace_follow_symlinks: false,
             feature_intro_shown: false,
             yolo_deprecation_shown: false,
+            work_surface_bottom_migrated: false,
             behavioral_tip_impressions: std::collections::BTreeMap::new(),
+            dismissed_plugin_suggestions: std::collections::BTreeSet::new(),
+            footer_hint_uses: std::collections::BTreeMap::new(),
             legacy_yolo_default: false,
+            tui_prefs_migration: None,
+            provenance: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -665,6 +655,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
         "context" => "context",
         "git" => "git",
         "price" => "price",
+        "watch" => "watch",
         // `pinned` folded into the tasks view (2026-09-02 dock views).
         _ => "tasks",
     }
@@ -777,6 +768,24 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Read archived route preferences from the user-global settings store.
+    ///
+    /// Canonical config migration must not inherit a project config's sibling
+    /// settings or runtime environment overlays, and must not migrate files.
+    pub(crate) fn load_legacy_route_preferences_read_only() -> Result<Self> {
+        let (primary, legacy_home, legacy_config_dir) = settings_path_candidates_for_scope(false);
+        let settings = Self::load_persisted_from_candidates_with_migration(
+            primary,
+            legacy_home,
+            legacy_config_dir,
+            false,
+        )?;
+        // Interactive readers may recover with defaults, but migration must
+        // not commit those defaults as if the archived selection were read.
+        anyhow::ensure!(settings.load_error.is_none(), "settings.toml: invalid TOML");
+        Ok(settings)
+    }
+
     /// Load the normalized values stored on disk without terminal/runtime
     /// overlays. Configuration editors use this path so a value labelled
     /// "saved" never silently reports a tmux, SSH, or accessibility override.
@@ -855,11 +864,14 @@ impl Settings {
             .ok_or_else(|| {
                 anyhow::anyhow!("Failed to resolve settings path: no config directory found.")
             })?;
+        let tui_prefs_path =
+            tui_prefs_path_from_settings_candidates(primary.as_deref(), legacy_home.as_deref());
         let read_path =
             resolve_settings_path_from_candidates(primary, legacy_home, legacy_config_dir)
                 .unwrap_or_else(|_| write_path.clone());
 
-        let settings = if !read_path.exists() {
+        let mut explicit_keys = std::collections::BTreeSet::new();
+        let mut settings = if !read_path.exists() {
             Self::default()
         } else {
             let content = std::fs::read_to_string(&read_path)
@@ -880,6 +892,15 @@ impl Settings {
                     }
                 }
             };
+            // Which keys the document named itself. An explicit value is user
+            // intent and always wins over a default or a migrated one.
+            explicit_keys.extend(
+                parsed_document
+                    .as_ref()
+                    .and_then(toml::Value::as_table)
+                    .into_iter()
+                    .flat_map(|table| table.keys().cloned()),
+            );
             // A persisted threshold is itself an explicit request for
             // auto-compaction. Older versions accepted this setting while
             // leaving the default `auto_compact = false`, silently turning the
@@ -888,14 +909,8 @@ impl Settings {
             s.auto_compact_explicit = parsed_document
                 .as_ref()
                 .is_some_and(auto_compact_explicitly_configured_in_document);
-            s.rail_panel_explicit = parsed_document
-                .as_ref()
-                .and_then(toml::Value::as_table)
-                .is_some_and(|table| table.contains_key("rail_panel"));
-            s.work_surface_placement_explicit = parsed_document
-                .as_ref()
-                .and_then(toml::Value::as_table)
-                .is_some_and(|table| table.contains_key("work_surface_placement"));
+            s.rail_panel_explicit = explicit_keys.contains("rail_panel");
+            s.work_surface_placement_explicit = explicit_keys.contains("work_surface_placement");
             if parsed_document.as_ref().is_some_and(|document| {
                 document.as_table().is_some_and(|table| {
                     !table.contains_key("auto_compact")
@@ -947,6 +962,15 @@ impl Settings {
             s.status_indicator = normalize_status_indicator(&s.status_indicator).to_string();
             s.work_surface_placement =
                 normalize_work_surface_placement(&s.work_surface_placement).to_string();
+            // Round 3 placement migration: a persisted `top` from before the
+            // default moved is the old default, not a preference. Move it
+            // once and remember; the next ordinary save persists both.
+            if !s.work_surface_bottom_migrated {
+                if s.work_surface_placement == "top" {
+                    s.work_surface_placement = "bottom".to_string();
+                }
+                s.work_surface_bottom_migrated = true;
+            }
             s.rail_panel = normalize_rail_panel(&s.rail_panel).to_string();
             // Migrate the unreadable 2..=4 legacy range in memory. The next
             // ordinary settings transaction persists the normalized value;
@@ -981,6 +1005,36 @@ impl Settings {
         if migrate_legacy_file {
             migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
         }
+        // One store: fold the dead `tui.toml` in and say what happened.
+        if let Some(prefs_path) = tui_prefs_path.filter(|path| path.exists())
+            && let Some(receipt) = fold_tui_prefs(
+                &mut settings,
+                &explicit_keys,
+                &prefs_path,
+                migrate_legacy_file,
+            )
+        {
+            if migrate_legacy_file && !receipt.folded.is_empty() {
+                // The fold is only real once settings.toml owns the value;
+                // otherwise the next launch would read the moved-aside file's
+                // theme back out of nothing and quietly lose it.
+                if let Err(error) = settings.save_to_path(&write_path) {
+                    tracing::warn!(
+                        "failed to persist folded tui.toml values to {}: {error:#}",
+                        write_path.display()
+                    );
+                }
+            }
+            if !receipt.is_empty() {
+                settings.tui_prefs_migration = Some(receipt);
+            }
+        }
+        // The provenance ledger: keys the document named itself came from
+        // user config; everything else is the schema default until `set()`,
+        // a CLI flag, or a higher layer says otherwise.
+        for key in &explicit_keys {
+            settings.provenance.insert(key.clone(), Layer::UserConfig);
+        }
         Ok(settings)
     }
 
@@ -990,6 +1044,60 @@ impl Settings {
     /// only Agent or Plan and serialize the independent permission posture.
     pub(crate) fn legacy_yolo_default_detected(&self) -> bool {
         self.legacy_yolo_default
+    }
+
+    /// Receipt for the one-time `tui.toml` fold, when this load performed one.
+    pub(crate) fn tui_prefs_migration(&self) -> Option<&TuiPrefsMigration> {
+        self.tui_prefs_migration.as_ref()
+    }
+
+    /// Which layer supplied the in-force value of `key`: the load ledger,
+    /// defaulting to [`Layer::Default`] for keys the document never named.
+    /// Aliases resolve to their canonical key first, so `/set collapse`
+    /// reports the same layer as the `tool_collapse` row.
+    pub(crate) fn provenance(&self, key: &str) -> Layer {
+        let canonical = Self::canonical_key(key).unwrap_or(key);
+        self.provenance
+            .get(canonical)
+            .copied()
+            .unwrap_or(Layer::Default)
+    }
+
+    /// The persisted field name behind a canonical schema key. Two schema
+    /// keys predate their persisted names and cannot be renamed without a
+    /// settings.toml migration.
+    fn persisted_field_name(canonical: &str) -> &str {
+        match canonical {
+            "tool_collapse" => "tool_collapse_mode",
+            "max_history" => "max_input_history",
+            other => other,
+        }
+    }
+
+    /// The value `key` currently holds in this store, in its written-to-disk
+    /// string form — `None` when the key is not a field of this store.
+    ///
+    /// `Settings` serializes field-for-field to settings.toml, so a document
+    /// lookup on the serialized form shares `set`'s key vocabulary instead
+    /// of growing a second hand-keyed reader beside it.
+    pub fn value(&self, key: &str) -> Option<String> {
+        let canonical = Self::canonical_key(key).unwrap_or(key);
+        let field = Self::persisted_field_name(canonical);
+        let document = toml::Value::try_from(self).ok()?;
+        let value = document.as_table()?.get(field)?;
+        Some(match value {
+            toml::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+    }
+
+    /// Whether the loaded settings document explicitly named `key` — a
+    /// persisted user choice rather than an inherited default.
+    pub fn is_set(&self, key: &str) -> bool {
+        let canonical = Self::canonical_key(key).unwrap_or(key);
+        self.provenance
+            .get(Self::persisted_field_name(canonical))
+            .is_some_and(|layer| *layer == Layer::UserConfig)
     }
 
     /// Whether the user explicitly persisted an auto-compaction preference.
@@ -1282,6 +1390,9 @@ impl Settings {
     }
 
     fn save_to_path(&self, path: &Path) -> Result<()> {
+        // Parse-error fallback values keep the UI usable, but cannot replace
+        // the unreadable document. Do not echo its potentially private text.
+        anyhow::ensure!(self.load_error.is_none(), "settings.toml: invalid TOML");
         // Create config directory if it doesn't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -1313,7 +1424,72 @@ impl Settings {
     }
 
     /// Set a single setting by key
+    /// Canonical schema key for a `set()` spelling: the first pattern of each
+    /// match arm below. `None` means `set()` rejects the spelling, so the
+    /// ledger never learns it. Keep in sync with the arms — the
+    /// `set_marks_session_provenance` test enforces it per spelling.
+    pub(crate) fn canonical_key(key: &str) -> Option<&'static str> {
+        Some(match key {
+            "auto_compact" | "compact" => "auto_compact",
+            "auto_compact_threshold" | "auto_compact_threshold_percent" => {
+                "auto_compact_threshold_percent"
+            }
+            "calm_mode" | "calm" => "calm_mode",
+            "tool_collapse" | "tool_collapse_mode" | "collapse" => "tool_collapse",
+            "low_motion" | "motion" => "low_motion",
+            "fancy_animations" | "fancy" | "animations" => "fancy_animations",
+            "focus_texture" | "texture" => "focus_texture",
+            "work_surface_placement" | "work_surface" | "work_rail" => "work_surface_placement",
+            "rail_panel" | "rail" => "rail_panel",
+            "work_surface_top_height" | "work_top_height" => "work_surface_top_height",
+            "work_surface_side_width" | "work_side_width" => "work_surface_side_width",
+            "bracketed_paste" | "paste" => "bracketed_paste",
+            "paste_burst_detection" | "paste_burst" => "paste_burst_detection",
+            "mention_menu_limit" | "mention_limit" => "mention_menu_limit",
+            "mention_walk_depth" | "mention_depth" | "completions_walk_depth" => {
+                "mention_walk_depth"
+            }
+            "mention_menu_behavior" | "mention_behavior" | "mention_menu" => {
+                "mention_menu_behavior"
+            }
+            "show_thinking" | "thinking" => "show_thinking",
+            "thinking_default_expanded" | "thinking_expanded" => "thinking_default_expanded",
+            "thinking_preview_lines" | "thinking_preview" => "thinking_preview_lines",
+            "thinking_highlight" | "reasoning_highlight" => "thinking_highlight",
+            "help_expand_groups" | "help_expanded" => "help_expand_groups",
+            "contextual_tips" => "contextual_tips",
+            "pin_last_prompt" | "pin_prompt" => "pin_last_prompt",
+            "show_tool_details" | "tool_details" => "show_tool_details",
+            "inline_diffs" | "inline_diff" | "diffs" => "inline_diffs",
+            "locale" | "language" => "locale",
+            "theme" | "ui_theme" => "theme",
+            "background_color" | "background" | "bg" => "background_color",
+            "composer_density" | "composer" => "composer_density",
+            "composer_border" | "border" => "composer_border",
+            "composer_multiline_mode" | "multiline_mode" | "multiline" => "composer_multiline_mode",
+            "composer_vim_mode" | "vim_mode" | "vim" => "composer_vim_mode",
+            "transcript_spacing" | "spacing" => "transcript_spacing",
+            "status_indicator" | "indicator" => "status_indicator",
+            "synchronized_output" | "sync_output" | "sync" => "synchronized_output",
+            "workspace_follow_symlinks" | "follow_symlinks" => "workspace_follow_symlinks",
+            "default_mode" | "mode" => "default_mode",
+            "context_panel" | "context" | "session_panel" => "context_panel",
+            "sessions_rail" | "sessions_panel" | "session_rail" => "sessions_rail",
+            "session_auto_resume" | "auto_resume" => "session_auto_resume",
+            "cost_currency" | "currency" => "cost_currency",
+            "max_history" | "history" => "max_history",
+            "default_model" | "model" => "default_model",
+            "reasoning_effort" | "effort" => "reasoning_effort",
+            "permission_posture" | "permissions" => "permission_posture",
+            "sandbox_mode" | "sandbox" | "filesystem_sandbox" => "sandbox_mode",
+            _ => return None,
+        })
+    }
+
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        // The ledger learns the canonical key only when the write below
+        // succeeds: a rejected value leaves the previous layer in force.
+        let canonical = Self::canonical_key(key);
         match key {
             "auto_compact" | "compact" => {
                 self.auto_compact = parse_bool(value)?;
@@ -1378,6 +1554,7 @@ impl Settings {
                         | "context"
                         | "git"
                         | "price"
+                        | "watch"
                         | "pinned"
                 ) {
                     anyhow::bail!(
@@ -1430,6 +1607,9 @@ impl Settings {
             "help_expand_groups" | "help_expanded" => {
                 self.help_expand_groups = parse_bool(value)?;
             }
+            "contextual_tips" => {
+                self.contextual_tips = parse_bool(value)?;
+            }
             "pin_last_prompt" | "pin_prompt" => {
                 self.pin_last_prompt = parse_bool(value)?;
             }
@@ -1449,15 +1629,12 @@ impl Settings {
                 let Some(locale) = normalize_configured_locale(value) else {
                     anyhow::bail!(
                         "Failed to update setting: invalid locale '{value}'. Expected: {}.",
-                        crate::localization::configured_locale_values(", ")
+                        codewhale_localization::configured_locale_values(", ")
                     );
                 };
                 self.locale = locale.to_string();
             }
-            "theme" => {
-                self.theme = normalize_theme_setting(value).map_err(anyhow::Error::msg)?;
-            }
-            "ui_theme" => {
+            "theme" | "ui_theme" => {
                 self.theme = normalize_theme_setting(value).map_err(anyhow::Error::msg)?;
             }
             "background_color" | "background" | "bg" => {
@@ -1559,23 +1736,9 @@ impl Settings {
                 self.max_input_history = max;
             }
             "default_model" | "model" => {
-                let trimmed = value.trim();
-                if trimmed.is_empty()
-                    || matches!(
-                        trimmed.to_ascii_lowercase().as_str(),
-                        "none" | "default" | "(default)"
-                    )
-                {
-                    self.default_model = None;
-                    return Ok(());
-                }
-
-                let Some(model) = normalize_default_model(trimmed) else {
-                    anyhow::bail!(
-                        "Failed to update setting: invalid model '{value}'. Expected: auto, a DeepSeek model ID (for example deepseek-v4-pro, deepseek-v4-flash), or none/default."
-                    );
-                };
-                self.default_model = Some(model);
+                anyhow::bail!(
+                    "Model defaults belong to config.toml. Use /model and choose Remember as my default, or /config model <id> --save."
+                );
             }
             "reasoning_effort" | "effort" => {
                 self.reasoning_effort = normalize_reasoning_effort_setting(value)?;
@@ -1599,6 +1762,10 @@ impl Settings {
             _ => {
                 anyhow::bail!("Failed to update setting: unknown setting '{key}'.");
             }
+        }
+        if let Some(canonical) = canonical {
+            self.provenance
+                .insert(canonical.to_string(), Layer::SessionOverride);
         }
         Ok(())
     }
@@ -1628,8 +1795,8 @@ impl Settings {
     }
 
     /// Get all settings as a displayable string
-    pub fn display(&self, locale: crate::localization::Locale) -> String {
-        use crate::localization::{MessageId, tr};
+    pub fn display(&self, locale: codewhale_localization::Locale) -> String {
+        use codewhale_localization::{MessageId, tr};
         let mut lines = Vec::new();
         lines.push(tr(locale, MessageId::SettingsTitle).to_string());
         lines.push("─────────────────────────────".to_string());
@@ -1682,6 +1849,7 @@ impl Settings {
             self.help_expand_groups
         ));
         lines.push(format!("  pin_last_prompt:    {}", self.pin_last_prompt));
+        lines.push(format!("  contextual_tips:    {}", self.contextual_tips));
         lines.push(format!("  show_tool_details:  {}", self.show_tool_details));
         lines.push(format!("  inline_diffs:      {}", self.inline_diffs));
         lines.push(format!("  locale:            {}", self.locale));
@@ -1711,30 +1879,7 @@ impl Settings {
         lines.push(format!("  context_panel:      {}", self.context_panel));
         lines.push(format!("  cost_currency:      {}", self.cost_currency));
         lines.push(format!("  max_history:        {}", self.max_input_history));
-        lines.push(format!(
-            "  deepseek_fallback:  {}",
-            self.default_model.as_deref().unwrap_or("(default)")
-        ));
-        lines.push(format!(
-            "  default_provider:   {}",
-            self.default_provider
-                .as_deref()
-                .unwrap_or("(config/default)")
-        ));
-        let mut provider_models = self
-            .provider_models
-            .as_ref()
-            .map(|models| models.iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        provider_models.sort_by_key(|(provider, _)| *provider);
-        if provider_models.is_empty() {
-            lines.push("  provider_models:    (none)".to_string());
-        } else {
-            lines.push("  provider_models:".to_string());
-            for (provider, model) in provider_models {
-                lines.push(format!("    {provider}: {model}"));
-            }
-        }
+        lines.push("  model defaults:     config.toml (use /config)".to_string());
         lines.push(format!(
             "  reasoning_effort:   {}",
             self.reasoning_effort
@@ -1757,198 +1902,31 @@ impl Settings {
             tr(locale, MessageId::SettingsConfigFile),
             Self::path().map_or_else(|_| "(unknown)".to_string(), |p| p.display().to_string())
         ));
+        // Provenance footer: which keys this load actually owns versus the
+        // schema defaults, so `/settings` says what the user set. Session
+        // marks only appear when the instance outlives a `set()` (the CLI
+        // and editor transactions reload from disk).
+        let mut user: Vec<&str> = Vec::new();
+        let mut session: Vec<&str> = Vec::new();
+        let mut keys: Vec<&str> = self.provenance.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        for key in keys {
+            match self.provenance(key) {
+                Layer::UserConfig => user.push(key),
+                Layer::SessionOverride => session.push(key),
+                Layer::ManagedPolicy | Layer::CliFlag | Layer::ProjectConfig | Layer::Default => {}
+            }
+        }
+        if !user.is_empty() || !session.is_empty() {
+            lines.push(String::new());
+            if !user.is_empty() {
+                lines.push(format!("  from settings.toml: {}", user.join(", ")));
+            }
+            if !session.is_empty() {
+                lines.push(format!("  session override: {}", session.join(", ")));
+            }
+        }
         lines.join("\n")
-    }
-
-    /// Get available setting keys and their descriptions
-    pub fn available_settings() -> Vec<(&'static str, &'static str)> {
-        vec![
-            (
-                "auto_compact",
-                "Auto-compact near the hard context limit: on/off (model-aware default)",
-            ),
-            (
-                "auto_compact_threshold_percent",
-                "Auto-compact trigger threshold percent: 10-100 (default 80; setting it enables auto-compaction unless auto_compact=false is explicit)",
-            ),
-            ("calm_mode", "Calmer UI defaults: on/off"),
-            (
-                "tool_collapse",
-                "Dense tool-run collapse mode: collapsed (alias compact), expanded, calm",
-            ),
-            (
-                "low_motion",
-                "Reduce decorative motion without changing model text delivery: on/off",
-            ),
-            ("fancy_animations", "Expressive live-state motion: on/off"),
-            (
-                "focus_texture",
-                "Modal focus-context texture prototype: off/scrim/grain (default off)",
-            ),
-            (
-                "work_surface_placement",
-                "Ocean Tasks/To-do/Workers rail placement: bottom (default)/top/left/right",
-            ),
-            (
-                "work_surface_top_height",
-                "Resizable To-do/Sub-agent top bar height: 2-16 rows",
-            ),
-            (
-                "work_surface_side_width",
-                "Resizable To-do/Sub-agent side bar width: 26-80 columns",
-            ),
-            (
-                "rail_panel",
-                "Which panel the rail shows: tasks/agents/context/pinned",
-            ),
-            (
-                "bracketed_paste",
-                "Terminal bracketed-paste mode: on/off (rare to disable)",
-            ),
-            (
-                "paste_burst_detection",
-                "Fallback rapid-key paste detection: on/off",
-            ),
-            (
-                "mention_menu_limit",
-                "Maximum @-mention popup candidates retained before rendering (default 128)",
-            ),
-            (
-                "mention_walk_depth",
-                "Maximum @-mention workspace walk depth; 0 means unlimited (default 10)",
-            ),
-            (
-                "mention_menu_behavior",
-                "@-mention completion behavior: fuzzy/browser (default fuzzy)",
-            ),
-            ("show_thinking", "Show model thinking: on/off"),
-            (
-                "thinking_default_expanded",
-                "Expand model thinking by default; Space still toggles: on/off",
-            ),
-            (
-                "thinking_preview_lines",
-                "Collapsed completed-thought preview rows (default 2, 0=header-only, 10=older dump)",
-            ),
-            (
-                "thinking_highlight",
-                "Fill the thinking/reasoning background: on/off",
-            ),
-            (
-                "help_expand_groups",
-                "Start Help/shortcuts with every group expanded: on/off (default off)",
-            ),
-            (
-                "pin_last_prompt",
-                "Pin the last user prompt at the top when it scrolls off: on/off (default on)",
-            ),
-            ("show_tool_details", "Show detailed tool output: on/off"),
-            (
-                "inline_diffs",
-                "Successful File mutation evidence: full/summary/off (exact detail is always retained)",
-            ),
-            (
-                "base_url",
-                "HTTP base URL for DeepSeek-compatible endpoints.",
-            ),
-            (
-                "locale",
-                "UI locale and default model language: auto, en, ja, zh-Hans, zh-Hant, pt-BR, es-419, vi, ko, ca, de, fr, id, hi, ru, uk; every shipped pack holds full English parity",
-            ),
-            (
-                "theme",
-                "UI theme: a compiled name or custom:<name> from the Codewhale themes directory",
-            ),
-            (
-                "background_color",
-                "Main TUI background color: #RRGGBB or default",
-            ),
-            (
-                "composer_density",
-                "Composer density: compact, comfortable, spacious",
-            ),
-            (
-                "composer_border",
-                "Show a border around the composer input area: on/off",
-            ),
-            (
-                "composer_multiline_mode",
-                "Enter inserts a newline and Shift+Enter sends: on/off",
-            ),
-            ("composer_vim_mode", "Composer editing mode: normal, vim"),
-            (
-                "transcript_spacing",
-                "Transcript spacing: compact, comfortable, spacious",
-            ),
-            (
-                "status_indicator",
-                "Header status mark, shown before the route: cw, whale, dots, off",
-            ),
-            (
-                "synchronized_output",
-                "DEC 2026 synchronized output: auto, on, off (set off if your terminal flickers)",
-            ),
-            (
-                "workspace_follow_symlinks",
-                "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
-            ),
-            (
-                "default_mode",
-                "Default mode: act (agent), plan, or operate",
-            ),
-            (
-                "context_panel",
-                "Show the session context workbar panel: on/off",
-            ),
-            (
-                "sessions_rail",
-                "Show the persistent Sessions workbar: on/off (default off)",
-            ),
-            (
-                "session_auto_resume",
-                "Reattach to this workspace's most recent session on startup: on/off (default off). --resume/--continue still win; archived, unreadable, or other-workspace sessions are never auto-resumed.",
-            ),
-            ("cost_currency", "Cost display currency: usd, cny"),
-            ("max_history", "Max input history entries"),
-            (
-                "default_model",
-                "DeepSeek fallback model: auto or a DeepSeek model ID (e.g. deepseek-v4-pro); other providers use provider_models",
-            ),
-            (
-                "reasoning_effort",
-                "Default thinking effort: auto, off, low, medium, high, max, or default",
-            ),
-        ]
-    }
-
-    /// Persist the model for a specific provider.
-    pub fn set_model_for_provider(&mut self, provider: &str, model: &str) {
-        self.provider_models
-            .get_or_insert_with(std::collections::HashMap::new)
-            .insert(provider.to_string(), model.to_string());
-        self.enable_model_for_provider(provider, model);
-    }
-
-    /// Add a model to a provider's enabled chooser set without removing prior
-    /// choices. IDs are compared case-insensitively but preserve their wire
-    /// spelling on disk.
-    pub fn enable_model_for_provider(&mut self, provider: &str, model: &str) {
-        let provider = provider.trim();
-        let model = model.trim();
-        if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
-            return;
-        }
-        let models = self
-            .enabled_models
-            .get_or_insert_with(std::collections::HashMap::new)
-            .entry(provider.to_string())
-            .or_default();
-        if !models
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(model))
-        {
-            models.push(model.to_string());
-        }
     }
 
     /// Toggle one exact provider/model pin without touching credentials or
@@ -2301,6 +2279,7 @@ fn replace_existing_settings_file(path: &Path, replacement: &Path) -> std::io::R
 
     let path_wide = wide_path(path);
     let replacement_wide = wide_path(replacement);
+    // SAFETY: both paths are NUL-terminated and live; reserved params are null.
     unsafe {
         // NamedTempFile marks its source with the temporary caching hint.
         // Clear it before publication, matching tempfile's persistence path.
@@ -2406,13 +2385,39 @@ fn lock_settings_transaction(
 }
 
 fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    settings_path_candidates_for_scope(true)
+}
+
+fn settings_path_candidates_for_scope(
+    include_config_override: bool,
+) -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    let from_environment = || {
+        if include_config_override {
+            settings_path_candidates_from_environment()
+        } else {
+            home_settings_path_candidates_from_environment()
+        }
+    };
     #[cfg(test)]
     {
         let honor_guarded_environment =
             crate::test_support::guarded_environment_provides_state_paths();
         crate::test_support::with_test_env_lock(|| {
-            if honor_guarded_environment {
-                settings_path_candidates_from_environment()
+            // A project-path guard cannot authorize a reader that deliberately
+            // ignores that path. Likewise, a guarded HOME must not expose an
+            // ambient CODEWHALE_HOME that takes precedence over it.
+            let home_is_guarded = || {
+                let present = |var| std::env::var_os(var).is_some_and(|value| !value.is_empty());
+                if present("CODEWHALE_HOME") {
+                    crate::test_support::env_var_currently_guarded("CODEWHALE_HOME")
+                } else {
+                    ["HOME", "USERPROFILE"].iter().any(|var| {
+                        crate::test_support::env_var_currently_guarded(var) && present(var)
+                    })
+                }
+            };
+            if honor_guarded_environment && (include_config_override || home_is_guarded()) {
+                from_environment()
             } else {
                 (
                     Some(crate::test_support::unsealed_test_state_root().join(SETTINGS_FILE_NAME)),
@@ -2424,7 +2429,7 @@ fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathB
     }
 
     #[cfg(not(test))]
-    settings_path_candidates_from_environment()
+    from_environment()
 }
 
 fn settings_path_candidates_from_environment() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)
@@ -2436,6 +2441,11 @@ fn settings_path_candidates_from_environment() -> (Option<PathBuf>, Option<PathB
         return (Some(parent.join(SETTINGS_FILE_NAME)), None, None);
     }
 
+    home_settings_path_candidates_from_environment()
+}
+
+fn home_settings_path_candidates_from_environment()
+-> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
     let primary = codewhale_config::codewhale_home()
         .ok()
         .map(|home| home.join(SETTINGS_FILE_NAME));
@@ -2602,7 +2612,7 @@ fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
 }
 
 /// Parse a boolean value from various formats
-fn parse_bool(value: &str) -> Result<bool> {
+pub(crate) fn parse_bool(value: &str) -> Result<bool> {
     match value.to_lowercase().as_str() {
         "on" | "true" | "yes" | "1" | "enabled" => Ok(true),
         "off" | "false" | "no" | "0" | "disabled" => Ok(false),
@@ -2737,10 +2747,9 @@ fn normalize_synchronized_output(value: &str) -> &str {
 }
 
 fn normalize_settings_theme(value: &str) -> String {
-    // A malformed persisted selector must not turn into a painted application
-    // background. Falling back to the underwater default keeps a single
-    // compiled first-party theme until the user picks an explicit palette.
-    normalize_theme_setting(value).unwrap_or_else(|_| "underwater".to_string())
+    // Unknown persisted selectors fall back to the same fresh-install default.
+    // Valid saved choices, including Shoreline, remain unchanged.
+    normalize_theme_setting(value).unwrap_or_else(|_| DEFAULT_TUI_THEME.to_string())
 }
 
 /// Returns `true` when the active terminal is Ptyxis (the new default
@@ -3282,6 +3291,23 @@ mod tests {
     }
 
     #[test]
+    fn settings_load_keeps_top_placement_chosen_after_the_bottom_migration() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &settings_path,
+            "work_surface_placement = \"top\"\nwork_surface_bottom_migrated = true\n",
+        )
+        .expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+        assert_eq!(loaded.work_surface_placement, "top");
+    }
+
+    #[test]
     fn settings_load_migrates_unreadable_top_work_surface_height() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3294,7 +3320,10 @@ mod tests {
         let loaded = Settings::load().expect("load settings");
 
         assert_eq!(loaded.work_surface_top_height, WORK_SURFACE_TOP_HEIGHT_MIN);
-        assert_eq!(loaded.work_surface_placement, "top");
+        // Round 3: a persisted `top` from before the default moved is the
+        // old default, migrated once to `bottom` (0.9.12 defect #9).
+        assert_eq!(loaded.work_surface_placement, "bottom");
+        assert!(loaded.work_surface_bottom_migrated);
         // `pinned` folded into the tasks view (2026-09-02 dock views).
         assert_eq!(loaded.rail_panel, "tasks");
         assert_eq!(
@@ -3451,6 +3480,65 @@ mod tests {
                 .get("planning_mode")
                 .copied(),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn contextual_tips_default_on_and_round_trip_opt_out() {
+        let old: Settings = toml::from_str("").unwrap();
+        assert!(old.contextual_tips);
+        let mut settings = old;
+        settings.set("contextual_tips", "off").unwrap();
+        let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert!(!restored.contextual_tips);
+    }
+
+    #[test]
+    fn settings_save_preserves_malformed_document_instead_of_fallback_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let malformed = "theme = [private_fixture_payload\n";
+        std::fs::write(&path, malformed).unwrap();
+        let mut settings =
+            Settings::load_persisted_from_candidates(Some(path.clone()), None, None).unwrap();
+        assert!(settings.load_error.is_some());
+        // Impression writers use this same save boundary as the opt-out.
+        settings
+            .behavioral_tip_impressions
+            .insert("planning_mode".into(), 1);
+        let error = settings.save_to_path(&path).unwrap_err().to_string();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), malformed);
+        assert!(!error.contains("private_fixture_payload"));
+    }
+
+    #[test]
+    fn plugin_dismissals_are_additive_and_omitted_until_used() {
+        let old = toml::to_string_pretty(&Settings::default()).unwrap();
+        assert!(!old.contains("dismissed_plugin_suggestions"));
+        let mut settings: Settings = toml::from_str(&old).unwrap();
+        assert!(settings.dismissed_plugin_suggestions.is_empty());
+        settings
+            .dismissed_plugin_suggestions
+            .insert("supabase".into());
+        let encoded = toml::to_string_pretty(&settings).unwrap();
+        let decoded: Settings = toml::from_str(&encoded).unwrap();
+        assert!(decoded.dismissed_plugin_suggestions.contains("supabase"));
+    }
+
+    #[test]
+    fn footer_hint_uses_are_backward_compatible_and_persist_when_recorded() {
+        let default_body = toml::to_string_pretty(&Settings::default()).expect("serialize");
+        assert!(!default_body.contains("footer_hint_uses"));
+
+        let mut settings = Settings::default();
+        settings
+            .footer_hint_uses
+            .insert("permission_cycle".to_string(), 2);
+        let body = toml::to_string_pretty(&settings).expect("serialize");
+        let restored: Settings = toml::from_str(&body).expect("restore settings");
+        assert_eq!(
+            restored.footer_hint_uses.get("permission_cycle").copied(),
+            Some(2)
         );
     }
 
@@ -3697,7 +3785,11 @@ mod tests {
             ("xhigh", "xhigh"),
             ("ultracode", "ultra"),
             ("maximum", "max"),
-            ("minimal", "low"),
+            // Slice 4, D3: `minimal` is a real rung with its own spelling, so it
+            // round-trips instead of being folded onto `low`.
+            ("minimal", "minimal"),
+            ("minimum", "low"),
+            ("light", "low"),
         ] {
             settings
                 .set("reasoning_effort", input)
@@ -3735,16 +3827,6 @@ mod tests {
         assert_eq!(settings.mention_menu_limit, 128);
         assert_eq!(settings.mention_walk_depth, 10);
         assert_eq!(settings.mention_menu_behavior, "fuzzy");
-        let mention_help = Settings::available_settings()
-            .into_iter()
-            .find(|(key, _)| *key == "mention_walk_depth")
-            .map(|(_, desc)| desc)
-            .expect("mention_walk_depth help");
-        assert!(
-            mention_help.contains("default 10"),
-            "help text still lists the pre-v0.8.50 default: {mention_help}"
-        );
-
         settings
             .set("mention_menu_limit", "256")
             .expect("set mention menu limit");
@@ -3806,21 +3888,31 @@ mod tests {
 
     #[test]
     fn default_settings_resolve_to_the_underwater_theme() {
-        // Slice C: the fresh-install default is the underwater theme, end to
-        // end from `Settings::default()` through theme resolution.
+        // The fresh-install default is the Underwater theme, end to end from
+        // `Settings::default()` through theme resolution.
         let settings = Settings::default();
         assert_eq!(settings.theme, "underwater");
-        let (name, id, theme) =
-            crate::palette::resolve_theme_setting(&settings.theme, None).expect("default resolves");
-        assert_eq!(id, crate::palette::ThemeId::Underwater);
+        let (name, id, theme) = codewhale_palette::resolve_theme_setting(&settings.theme, None)
+            .expect("default resolves");
+        assert_eq!(id, codewhale_palette::ThemeId::Underwater);
         assert_eq!(name, "underwater");
         assert_eq!(theme.name, "underwater");
+        let saved: Settings = toml::from_str("theme = \"shoreline\"\n").expect("saved theme");
+        assert_eq!(
+            saved.theme, "shoreline",
+            "upgrades preserve an explicit choice"
+        );
     }
 
     #[test]
     fn theme_normalizes_supported_values_and_rejects_unknowns() {
         let mut settings = Settings::default();
         assert_eq!(settings.theme, "underwater");
+
+        settings
+            .set("theme", "charcoal")
+            .expect("set charcoal alternative");
+        assert_eq!(settings.theme, "shoreline");
 
         settings.set("theme", "grayscale").expect("set grayscale");
         assert_eq!(settings.theme, "grayscale");
@@ -3963,14 +4055,14 @@ mod tests {
     #[test]
     fn display_localizes_header_and_config_file_label() {
         let settings = Settings::default();
-        let en = settings.display(crate::localization::Locale::En);
+        let en = settings.display(codewhale_localization::Locale::En);
         assert!(en.contains("Settings:"), "english header missing:\n{en}");
         assert!(
             en.contains("Config file:"),
             "english config label missing:\n{en}"
         );
 
-        let zh = settings.display(crate::localization::Locale::ZhHans);
+        let zh = settings.display(codewhale_localization::Locale::ZhHans);
         assert!(zh.contains("设置"), "chinese header missing:\n{zh}");
         assert!(
             zh.contains("配置文件"),
@@ -3979,51 +4071,84 @@ mod tests {
     }
 
     #[test]
-    fn display_separates_deepseek_fallback_from_provider_scoped_models() {
-        let mut settings = Settings {
+    fn display_does_not_present_archived_route_preferences_as_current_defaults() {
+        let settings = Settings {
             default_provider: Some("zai".to_string()),
             default_model: Some("deepseek-v4-pro".to_string()),
+            provider_models: Some(std::collections::HashMap::from([
+                ("zai".to_string(), "GLM-5.2".to_string()),
+                ("deepseek".to_string(), "deepseek-v4-flash".to_string()),
+            ])),
             ..Settings::default()
         };
-        settings.set_model_for_provider("zai", "GLM-5.2");
-        settings.set_model_for_provider("deepseek", "deepseek-v4-flash");
 
-        let display = settings.display(crate::localization::Locale::En);
+        let display = settings.display(codewhale_localization::Locale::En);
 
-        assert!(display.contains("deepseek_fallback:  deepseek-v4-pro"));
-        assert!(display.contains("default_provider:   zai"));
-        assert!(display.contains("    zai: GLM-5.2"));
-        assert!(display.contains("    deepseek: deepseek-v4-flash"));
-        assert!(!display.contains("  default_model:"));
+        assert!(display.contains("model defaults:     config.toml (use /config)"));
+        for archived in [
+            "deepseek_fallback:",
+            "default_provider:",
+            "provider_models:",
+            "default_model:",
+            "GLM-5.2",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        ] {
+            assert!(
+                !display.contains(archived),
+                "archived value shown as current: {display}"
+            );
+        }
     }
 
     #[test]
-    fn provider_model_selection_additively_enables_models() {
-        let mut settings = Settings::default();
+    fn archived_model_preferences_survive_serialization_but_reject_new_settings_writes() {
+        let mut settings: Settings = toml::from_str(
+            "default_provider = 'zai'\ndefault_model = 'deepseek-v4-pro'\n[provider_models]\nzai = 'GLM-5.3'\n",
+        ).expect("legacy preferences");
+        let before = toml::to_string(&settings).expect("legacy snapshot");
 
-        settings.set_model_for_provider("openrouter", "anthropic/claude-sonnet-4");
-        settings.enable_model_for_provider("openrouter", "qwen/qwen3.7-plus");
-        settings.enable_model_for_provider("openrouter", "QWEN/QWEN3.7-PLUS");
-        settings.enable_model_for_provider("openrouter", "auto");
+        for key in ["model", "default_model"] {
+            let error = settings
+                .set(key, "deepseek-v4-flash")
+                .expect_err("canonical config owns models");
+            assert!(error.to_string().contains("/config model"));
+        }
 
         assert_eq!(
-            settings
+            toml::to_string(&settings).expect("unchanged legacy snapshot"),
+            before
+        );
+        let restored: Settings = toml::from_str(&before).expect("preserved migration inputs");
+        assert_eq!(restored.default_provider.as_deref(), Some("zai"));
+        assert_eq!(restored.default_model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(
+            restored
                 .provider_models
                 .as_ref()
-                .and_then(|models| models.get("openrouter")),
-            Some(&"anthropic/claude-sonnet-4".to_string())
+                .and_then(|models| models.get("zai"))
+                .map(String::as_str),
+            Some("GLM-5.3")
         );
+    }
+
+    #[test]
+    fn legacy_enabled_models_table_still_loads_and_round_trips() {
+        let settings: Settings = toml::from_str(
+            r#"
+[enabled_models]
+zai = ["GLM-5.2", "GLM-5.3"]
+"#,
+        )
+        .expect("legacy enabled_models loads");
+        assert!(settings.provider_models.is_none());
         assert_eq!(
             settings
                 .enabled_models
                 .as_ref()
-                .and_then(|models| models.get("openrouter")),
-            Some(&vec![
-                "anthropic/claude-sonnet-4".to_string(),
-                "qwen/qwen3.7-plus".to_string(),
-            ])
+                .and_then(|models| models.get("zai")),
+            Some(&vec!["GLM-5.2".to_string(), "GLM-5.3".to_string()])
         );
-
         let encoded = toml::to_string(&settings).expect("serialize enabled models");
         let decoded: Settings = toml::from_str(&encoded).expect("deserialize enabled models");
         assert_eq!(decoded.enabled_models, settings.enabled_models);
@@ -4907,7 +5032,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // TuiPrefs tests
+    // Settings store tests
     // ────────────────────────────────────────────────────────────────────────
 
     /// Serialise tests that mutate `DEEPSEEK_CONFIG_PATH` through this guard
@@ -5033,7 +5158,7 @@ mod tests {
             primary.exists(),
             "settings load should migrate to primary path"
         );
-        let display = loaded.display(crate::localization::Locale::En);
+        let display = loaded.display(codewhale_localization::Locale::En);
         assert!(
             display.contains(&format!("Config file: {}", primary.display())),
             "settings display should surface the canonical codewhale path:\n{display}"
@@ -5075,6 +5200,91 @@ mod tests {
     }
 
     #[test]
+    fn legacy_route_preferences_ignore_project_settings_and_runtime_overlays() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&global).expect("global directory");
+        std::fs::create_dir_all(&project).expect("project directory");
+        let global_bytes = b"default_provider = \"zai\"\nlow_motion = false\n[provider_models]\nzai = \"GLM-5.3\"\n";
+        let project_bytes = b"default_provider = \"openai\"\nlow_motion = false\n[provider_models]\nopenai = \"project-model\"\n";
+        let global_settings = global.join(SETTINGS_FILE_NAME);
+        let project_settings = project.join(SETTINGS_FILE_NAME);
+        std::fs::write(&global_settings, global_bytes).expect("global settings");
+        std::fs::write(&project_settings, project_bytes).expect("project settings");
+        let _global_home = EnvVarRestore::set("CODEWHALE_HOME", &global);
+        let _config_override =
+            EnvVarRestore::set("CODEWHALE_CONFIG_PATH", project.join("config.toml"));
+        let _legacy_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", project.join("config.toml"));
+        let _no_animations = EnvVarRestore::set("NO_ANIMATIONS", "1");
+
+        let legacy =
+            Settings::load_legacy_route_preferences_read_only().expect("global legacy preferences");
+        assert_eq!(legacy.default_provider.as_deref(), Some("zai"));
+        assert_eq!(
+            legacy
+                .provider_models
+                .as_ref()
+                .and_then(|models| models.get("zai"))
+                .map(String::as_str),
+            Some("GLM-5.3")
+        );
+        assert!(
+            !legacy.low_motion,
+            "migration must read the persisted value"
+        );
+        let ordinary = Settings::load_read_only().expect("ordinary project settings");
+        assert_eq!(ordinary.default_provider.as_deref(), Some("openai"));
+        assert!(
+            ordinary.low_motion,
+            "ordinary runtime overlays are unchanged"
+        );
+        assert_eq!(
+            std::fs::read(&global_settings).expect("unchanged global settings"),
+            global_bytes
+        );
+        assert_eq!(
+            std::fs::read(&project_settings).expect("unchanged project settings"),
+            project_bytes
+        );
+
+        std::fs::remove_file(&global_settings).expect("remove fixture global settings");
+        let missing = Settings::load_legacy_route_preferences_read_only()
+            .expect("missing global preferences");
+        assert_eq!(missing.default_provider, None);
+        assert!(missing.provider_models.is_none());
+        assert!(
+            !global_settings.exists(),
+            "migration reads must not create settings"
+        );
+        assert!(!global.join("config.toml").exists());
+        assert!(!project.join("config.toml").exists());
+    }
+
+    #[test]
+    fn project_path_guard_does_not_authorize_global_legacy_settings_reads() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _config_override =
+            EnvVarRestore::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+        let _global_home = EnvVarRestore::remove("CODEWHALE_HOME");
+        let _home = EnvVarRestore::remove("HOME");
+        let _userprofile = EnvVarRestore::remove("USERPROFILE");
+
+        assert_eq!(
+            settings_path_candidates_for_scope(false),
+            (
+                Some(crate::test_support::unsealed_test_state_root().join(SETTINGS_FILE_NAME)),
+                None,
+                None,
+            ),
+            "a project-only test must stay isolated when reading global preferences"
+        );
+    }
+
+    #[test]
     fn settings_load_migrates_platform_legacy_fallback_into_codewhale_home_without_explicit_home() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -5107,7 +5317,7 @@ mod tests {
             primary.exists(),
             "legacy fallback should be copied into primary"
         );
-        let display = loaded.display(crate::localization::Locale::En);
+        let display = loaded.display(codewhale_localization::Locale::En);
         assert!(
             display.contains(&format!("Config file: {}", primary.display())),
             "settings display should surface the canonical codewhale path:\n{display}"
@@ -5199,211 +5409,306 @@ mod tests {
         assert_eq!(loaded.work_surface_placement, "left");
     }
 
+    /// The dead `tui.toml` store is folded into `settings.toml` on load: a
+    /// value settings.toml does not own is adopted, a value it owns wins, the
+    /// original bytes are moved aside, and unmappable keys are named.
     #[test]
-    fn tui_prefs_path_defaults_to_codewhale_home_for_new_writes() {
+    fn tui_toml_theme_is_folded_when_settings_toml_is_silent() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
-        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
-        let _home = EnvVarRestore::set("HOME", tmp.path());
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "cost_currency = \"usd\"\n",
+        )
+        .expect("settings");
+        let prefs_path = tmp.path().join("tui.toml");
+        std::fs::write(&prefs_path, "theme = \"light\"\n").expect("tui prefs");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
 
-        let got = TuiPrefs::path().expect("tui prefs path");
+        let loaded = Settings::load().expect("load settings");
 
-        assert_eq!(got, tmp.path().join(".codewhale").join("tui.toml"));
+        assert_eq!(loaded.theme, "light");
+        let receipt = loaded.tui_prefs_migration().expect("receipt");
+        assert_eq!(
+            receipt.folded,
+            vec![("theme".to_string(), "light".to_string())]
+        );
+        assert!(receipt.kept.is_empty());
+        assert!(!prefs_path.exists(), "original must be moved aside");
+        let backup = receipt.backup.as_ref().expect("backup path");
+        assert_eq!(
+            std::fs::read_to_string(backup).expect("backup readable"),
+            "theme = \"light\"\n",
+            "backup keeps the original bytes"
+        );
+        // The fold is only real once settings.toml owns it on disk.
+        let persisted =
+            std::fs::read_to_string(tmp.path().join("settings.toml")).expect("settings.toml");
+        assert!(persisted.contains("light"), "not persisted: {persisted}");
     }
 
     #[test]
-    fn tui_prefs_path_ignores_legacy_home_when_codewhale_home_is_explicit() {
+    fn explicit_settings_theme_wins_over_tui_toml_and_the_receipt_says_so() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let explicit_home = tmp.path().join("isolated-codewhale");
-        let legacy_dir = tmp.path().join(".deepseek");
-        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
-        std::fs::write(legacy_dir.join("tui.toml"), "theme = \"light\"\n").expect("legacy prefs");
-        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
-        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &explicit_home);
-        let _home = EnvVarRestore::set("HOME", tmp.path());
+        std::fs::write(tmp.path().join("settings.toml"), "theme = \"dark\"\n").expect("settings");
+        std::fs::write(tmp.path().join("tui.toml"), "theme = \"light\"\n").expect("tui prefs");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
 
-        let got = TuiPrefs::path().expect("tui prefs path");
+        let loaded = Settings::load().expect("load settings");
 
-        assert_eq!(got, explicit_home.join("tui.toml"));
+        assert_eq!(loaded.theme, "dark");
+        let receipt = loaded.tui_prefs_migration().expect("receipt");
+        assert!(receipt.folded.is_empty());
+        assert_eq!(
+            receipt.kept,
+            vec![("theme".to_string(), "light".to_string(), "dark".to_string())]
+        );
+        assert!(
+            !receipt.lines(codewhale_localization::Locale::En).is_empty(),
+            "a disagreement must be sayable"
+        );
     }
 
     #[test]
-    fn tui_prefs_path_reads_legacy_deepseek_home_when_present() {
+    fn tui_toml_keys_without_a_setting_are_quarantined_never_dropped() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let primary = tmp.path().join(".codewhale").join("tui.toml");
-        let legacy_dir = tmp.path().join(".deepseek");
-        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
-        let legacy_home = legacy_dir.join("tui.toml");
-        std::fs::write(&legacy_home, "theme = \"light\"\n").expect("legacy prefs");
+        let prefs_path = tmp.path().join("tui.toml");
+        std::fs::write(
+            &prefs_path,
+            "theme = \"light\"\nfont_size = 14\n\n[keybinds]\nsubmit = \"ctrl+enter\"\n",
+        )
+        .expect("tui prefs");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
 
-        let got = resolve_tui_prefs_path_from_candidates(Some(primary), Some(legacy_home.clone()))
-            .expect("tui prefs path");
+        let loaded = Settings::load().expect("load settings");
 
-        assert_eq!(got, legacy_home);
+        let receipt = loaded.tui_prefs_migration().expect("receipt");
+        assert_eq!(receipt.quarantined, vec!["font_size", "keybinds"]);
+        let backup = receipt.backup.as_ref().expect("backup path");
+        let preserved = std::fs::read_to_string(backup).expect("backup readable");
+        assert!(preserved.contains("font_size = 14"), "{preserved}");
+        assert!(preserved.contains("ctrl+enter"), "{preserved}");
+        let line = receipt
+            .lines(codewhale_localization::Locale::En)
+            .join(" ")
+            .to_lowercase();
+        assert!(line.contains("font_size"), "{line}");
+        assert!(line.contains("keybinds"), "{line}");
     }
 
     #[test]
-    fn tui_prefs_defaults_inherit_the_terminal_zero_font() {
-        let prefs = TuiPrefs::default();
-        assert_eq!(prefs.theme, "underwater");
-        assert_eq!(prefs.font_size, 0);
-        assert!(prefs.keybinds.submit.is_none());
-        assert!(prefs.keybinds.new_line.is_none());
+    fn an_unparseable_tui_toml_is_parked_whole_rather_than_guessed_at() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("tui.toml"), "theme = \n").expect("tui prefs");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+
+        let receipt = loaded.tui_prefs_migration().expect("receipt");
+        assert_eq!(receipt.quarantined, vec!["tui.toml"]);
+        assert!(receipt.folded.is_empty());
+        assert!(receipt.backup.is_some(), "bytes must survive");
     }
 
     #[test]
-    fn tui_prefs_validate_accepts_known_themes() {
-        for theme in [
-            "terminal",
-            "dark",
-            "light",
-            "system",
-            "grayscale",
-            "catppuccin-mocha",
-            "tokyo-night",
-            "dracula",
-            "gruvbox-dark",
-            "solarized-light",
-        ] {
-            let mut prefs = TuiPrefs {
-                theme: theme.to_string(),
-                ..TuiPrefs::default()
-            };
-            prefs
-                .validate()
-                .unwrap_or_else(|e| panic!("validate({theme}) failed: {e}"));
-            assert_eq!(prefs.theme, theme);
+    fn a_read_only_load_never_moves_tui_toml_aside() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefs_path = tmp.path().join("tui.toml");
+        std::fs::write(&prefs_path, "theme = \"light\"\n").expect("tui prefs");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load_read_only().expect("read-only load");
+
+        assert_eq!(loaded.theme, "light");
+        assert!(prefs_path.exists(), "diagnostics must not mutate the disk");
+    }
+
+    #[test]
+    fn a_second_backup_never_clobbers_the_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefs_path = tmp.path().join("tui.toml");
+        std::fs::write(&prefs_path, "theme = \"light\"\n").expect("first");
+        let first = back_up_tui_prefs(&prefs_path).expect("first backup");
+        std::fs::write(&prefs_path, "theme = \"dark\"\n").expect("second");
+        let second = back_up_tui_prefs(&prefs_path).expect("second backup");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "theme = \"light\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "theme = \"dark\"\n"
+        );
+    }
+
+    /// A successful `set()` marks the canonical key as session-supplied,
+    /// whatever spelling was used; aliases report the same layer as the row.
+    /// A rejected value marks nothing.
+    #[test]
+    fn set_marks_session_provenance_for_every_spelling() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["auto_compact", "compact"], "true"),
+            (
+                &["auto_compact_threshold_percent", "auto_compact_threshold"],
+                "80",
+            ),
+            (&["calm_mode", "calm"], "true"),
+            (
+                &["tool_collapse", "tool_collapse_mode", "collapse"],
+                "expanded",
+            ),
+            (&["low_motion", "motion"], "true"),
+            (&["fancy_animations", "fancy", "animations"], "true"),
+            (&["focus_texture", "texture"], "grain"),
+            (
+                &["work_surface_placement", "work_surface", "work_rail"],
+                "left",
+            ),
+            (&["rail_panel", "rail"], "tasks"),
+            (&["work_surface_top_height", "work_top_height"], "8"),
+            (&["work_surface_side_width", "work_side_width"], "40"),
+            (&["bracketed_paste", "paste"], "true"),
+            (&["paste_burst_detection", "paste_burst"], "true"),
+            (&["mention_menu_limit", "mention_limit"], "64"),
+            (
+                &[
+                    "mention_walk_depth",
+                    "mention_depth",
+                    "completions_walk_depth",
+                ],
+                "5",
+            ),
+            (
+                &["mention_menu_behavior", "mention_behavior", "mention_menu"],
+                "fuzzy",
+            ),
+            (&["show_thinking", "thinking"], "true"),
+            (&["thinking_default_expanded", "thinking_expanded"], "true"),
+            (&["thinking_preview_lines", "thinking_preview"], "3"),
+            (&["thinking_highlight", "reasoning_highlight"], "true"),
+            (&["help_expand_groups", "help_expanded"], "true"),
+            (&["pin_last_prompt", "pin_prompt"], "true"),
+            (&["show_tool_details", "tool_details"], "true"),
+            (&["inline_diffs", "inline_diff", "diffs"], "off"),
+            (&["locale", "language"], "en"),
+            (&["theme", "ui_theme"], "terminal"),
+            (&["background_color", "background", "bg"], "#1a1b26"),
+            (&["composer_density", "composer"], "compact"),
+            (&["composer_border", "border"], "true"),
+            (
+                &["composer_multiline_mode", "multiline_mode", "multiline"],
+                "true",
+            ),
+            (&["composer_vim_mode", "vim_mode", "vim"], "vim"),
+            (&["transcript_spacing", "spacing"], "compact"),
+            (&["status_indicator", "indicator"], "off"),
+            (&["synchronized_output", "sync_output", "sync"], "off"),
+            (&["workspace_follow_symlinks", "follow_symlinks"], "true"),
+            (&["default_mode", "mode"], "plan"),
+            (&["context_panel", "context", "session_panel"], "true"),
+            (&["sessions_rail", "sessions_panel", "session_rail"], "true"),
+            (&["session_auto_resume", "auto_resume"], "true"),
+            (&["cost_currency", "currency"], "cny"),
+            (&["max_history", "history"], "50"),
+            (&["reasoning_effort", "effort"], "low"),
+            (&["permission_posture", "permissions"], "ask"),
+            (
+                &["sandbox_mode", "sandbox", "filesystem_sandbox"],
+                "read-only",
+            ),
+        ];
+        for (spellings, value) in cases {
+            let canonical = spellings[0];
+            // `config set`, `/config` and `config doctor` route and suggest
+            // from the schema by this canonical key; a `/set` spelling with
+            // no declaration would be settable but unplaceable.
+            assert!(
+                codewhale_config::setting(canonical).is_some(),
+                "`/set {canonical}` is accepted but undeclared in SETTINGS_SCHEMA"
+            );
+            for spelling in *spellings {
+                assert_eq!(
+                    Settings::canonical_key(spelling),
+                    Some(canonical),
+                    "{spelling}"
+                );
+                let mut settings = Settings::default();
+                assert_eq!(settings.provenance(canonical), Layer::Default);
+                settings
+                    .set(spelling, value)
+                    .unwrap_or_else(|error| panic!("set({spelling}) rejected: {error:#}"));
+                assert_eq!(
+                    settings.provenance(canonical),
+                    Layer::SessionOverride,
+                    "{spelling} did not mark {canonical} as session"
+                );
+                assert_eq!(
+                    settings.provenance(spelling),
+                    Layer::SessionOverride,
+                    "{spelling} does not resolve to its own layer"
+                );
+            }
+        }
+        // `default_model` has no provenance case above; check its spellings too.
+        for spelling in ["default_model", "model"] {
+            let canonical = Settings::canonical_key(spelling).expect("model spelling");
+            assert!(codewhale_config::setting(canonical).is_some(), "{spelling}");
         }
     }
 
     #[test]
-    fn tui_prefs_validate_normalises_theme_case() {
-        let mut prefs = TuiPrefs {
-            theme: "MONO".to_string(),
-            ..TuiPrefs::default()
-        };
-        prefs
-            .validate()
-            .expect("MONO should normalise to grayscale");
-        assert_eq!(prefs.theme, "grayscale");
+    fn set_rejection_marks_no_provenance() {
+        let mut settings = Settings::default();
+        assert!(settings.set("theme", "not-a-theme").is_err());
+        assert_eq!(settings.provenance("theme"), Layer::Default);
+        assert!(settings.set("no_such_key", "1").is_err());
+        assert_eq!(settings.provenance("no_such_key"), Layer::Default);
     }
 
+    /// Keys the document named load as user config; the rest are default.
     #[test]
-    fn tui_prefs_validate_rejects_unknown_theme() {
-        let mut prefs = TuiPrefs {
-            theme: "nord".to_string(),
-            ..TuiPrefs::default()
-        };
-        let err = prefs.validate().expect_err("nord is not a valid theme");
-        assert!(err.to_string().contains("invalid theme 'nord'"));
-        assert!(err.to_string().contains("custom:<name>"));
-    }
-
-    #[test]
-    fn tui_prefs_validate_custom_selector_without_loading_file() {
-        let mut prefs = TuiPrefs {
-            theme: "custom:Ocean_1".to_string(),
-            ..TuiPrefs::default()
-        };
-        prefs
-            .validate()
-            .expect("selector validation must not depend on the file system");
-        assert_eq!(prefs.theme, "custom:ocean_1");
-    }
-
-    #[test]
-    fn tui_prefs_round_trips_through_toml() {
-        let prefs = TuiPrefs {
-            theme: "light".to_string(),
-            font_size: 16,
-            keybinds: KeybindPrefs {
-                submit: Some("ctrl+enter".to_string()),
-                new_line: Some("enter".to_string()),
-                command_palette: None,
-                cancel: None,
-                toggle_sidebar: None,
-            },
-        };
-        let serialised = toml::to_string_pretty(&prefs).expect("serialise");
-        let de: TuiPrefs = toml::from_str(&serialised).expect("deserialise");
-        assert_eq!(de.theme, "light");
-        assert_eq!(de.font_size, 16);
-        assert_eq!(de.keybinds.submit.as_deref(), Some("ctrl+enter"));
-        assert_eq!(de.keybinds.new_line.as_deref(), Some("enter"));
-        assert!(de.keybinds.command_palette.is_none());
-    }
-
-    #[test]
-    fn tui_prefs_load_returns_defaults_when_file_absent() {
+    fn load_marks_explicit_keys_as_user_config() {
         let _g = config_path_test_guard();
-        // Point config path at a non-existent location so tui.toml is absent.
-        let tmp = std::env::temp_dir().join("dst_tui_prefs_absent_test");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let _config_override = EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.join("config.toml"));
-        let prefs = TuiPrefs::load().expect("load should not fail when file absent");
-        assert_eq!(
-            prefs.theme, "underwater",
-            "should fall back to default theme"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("settings.toml"), "theme = \"light\"\n").expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+        assert_eq!(loaded.provenance("theme"), Layer::UserConfig);
+        assert_eq!(loaded.provenance("locale"), Layer::Default);
     }
 
+    /// `/settings` names the keys the load owns, so the text surface says
+    /// what the user set instead of printing defaults silently.
     #[test]
-    fn tui_prefs_save_and_load_round_trip() {
+    fn display_names_user_configured_keys() {
         let _g = config_path_test_guard();
-        let tmp = std::env::temp_dir().join("dst_tui_prefs_save_test");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let _config_override = EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.join("config.toml"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("settings.toml"), "theme = \"light\"\n").expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
 
-        let prefs = TuiPrefs {
-            theme: "light".to_string(),
-            font_size: 14,
-            keybinds: KeybindPrefs {
-                submit: Some("ctrl+enter".to_string()),
-                ..KeybindPrefs::default()
-            },
-        };
-        prefs.save().expect("save should succeed");
+        let loaded = Settings::load().expect("load settings");
+        let text = loaded.display(codewhale_localization::Locale::En);
+        assert!(text.contains("from settings.toml: theme"), "{text}");
+        assert!(!text.contains("session override"), "{text}");
 
-        let loaded = TuiPrefs::load().expect("load after save");
-        assert_eq!(loaded.theme, "light");
-        assert_eq!(loaded.font_size, 14);
-        assert_eq!(loaded.keybinds.submit.as_deref(), Some("ctrl+enter"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn tui_prefs_save_preserves_comments() {
-        let _g = config_path_test_guard();
-        let tmp = std::env::temp_dir().join("dst_tui_prefs_comment_test");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let config_file = tmp.join("config.toml");
-        let _config_override = EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", &config_file);
-
-        // tui.toml lives next to config.toml
-        let tui_path = tmp.join("tui.toml");
-        std::fs::write(
-            &tui_path,
-            "# my theme comment\ntheme = \"dark\"\n# footer note\n",
-        )
-        .unwrap();
-
-        let prefs = TuiPrefs {
-            theme: "light".to_string(),
-            ..TuiPrefs::default()
-        };
-        prefs.save().expect("save should succeed");
-
-        let body = std::fs::read_to_string(&tui_path).expect("read tui.toml");
-        assert!(body.contains("# my theme comment"), "comment lost: {body}");
-        assert!(body.contains("# footer note"), "footer lost: {body}");
-        assert!(body.contains("light"), "new value not written: {body}");
-
-        let _ = std::fs::remove_dir_all(&tmp);
+        let mut session = Settings::default();
+        session.set("locale", "en").expect("set locale");
+        let text = session.display(codewhale_localization::Locale::En);
+        assert!(text.contains("session override: locale"), "{text}");
     }
 
     #[test]
@@ -5433,19 +5738,6 @@ mod tests {
         assert!(body.contains("cny"), "new value not written: {body}");
 
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn tui_prefs_path_uses_home_codewhale_subdir_by_default() {
-        let _g = config_path_test_guard();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
-        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
-        let _home = EnvVarRestore::set("HOME", tmp.path());
-
-        let got = TuiPrefs::path().expect("path should resolve");
-
-        assert_eq!(got, tmp.path().join(".codewhale").join("tui.toml"));
     }
 
     #[test]

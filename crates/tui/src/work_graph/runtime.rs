@@ -196,6 +196,20 @@ impl WorkRuntime {
             title,
             NodeState::Initializing,
         )?;
+        // Registration is where finished shell calls accumulate (#6842):
+        // keep only the newest ended, non-durable operations.
+        if super::reducer::evictable_operations(graph.snapshot()).len()
+            > super::model::ENDED_OPERATION_CAP
+        {
+            apply_change(
+                &mut graph,
+                session_id,
+                &intent.source,
+                WorkGraphChange::PruneEndedOperations {
+                    keep: super::model::ENDED_OPERATION_CAP,
+                },
+            )?;
+        }
         let next = graph.into_snapshot();
         validate_combined(&next, &project_plan(&next), &project_todos(&next))?;
         active.snapshot = Some(next);
@@ -388,7 +402,7 @@ impl WorkRuntime {
         session_id: Option<&str>,
         requested: ReasoningEffortTier,
         effective: ReasoningEffortTier,
-        provider_kind: crate::config::ApiProvider,
+        provider_kind: crate::config::ProviderKind,
         provider: &str,
         endpoint_identity: Option<&str>,
         model: Option<&str>,
@@ -894,21 +908,33 @@ fn operation_parent(
     session_id: &str,
     source: &str,
 ) -> Result<WorkNodeId, String> {
-    if let Some(parent) = graph
-        .snapshot()
+    let snapshot = graph.snapshot();
+    // Only a step the current plan or To-do projection still lists may adopt
+    // new work. Replacing a plan keeps the dropped steps as history (their
+    // ids are reused if the plan grows back, so they are not retired), but a
+    // step nobody can see must never become an operation's parent.
+    let projected_step = |node: &&WorkNode, state: NodeState| {
+        node.kind == NodeKind::PlanStep
+            && node.state == state
+            && (snapshot.compat.plan_order.contains(&node.id)
+                || snapshot
+                    .compat
+                    .todos
+                    .iter()
+                    .any(|binding| binding.node == node.id))
+    };
+    if let Some(parent) = snapshot
         .nodes
         .iter()
-        .find(|node| node.kind == NodeKind::PlanStep && node.state == NodeState::Active)
+        .find(|node| projected_step(node, NodeState::Active))
         .or_else(|| {
-            graph
-                .snapshot()
+            snapshot
                 .nodes
                 .iter()
-                .find(|node| node.kind == NodeKind::PlanStep && node.state == NodeState::Ready)
+                .find(|node| projected_step(node, NodeState::Ready))
         })
         .or_else(|| {
-            graph
-                .snapshot()
+            snapshot
                 .nodes
                 .iter()
                 .find(|node| node.kind == NodeKind::Objective)
@@ -1442,6 +1468,11 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// These callers are synchronous methods reached from tool code on the Tokio
+// runtime, so this contention retry must not park the worker with
+// `thread::sleep`. `yield_now` hands the thread to the holder long enough for
+// its microsecond-scale critical section; if the lock is still contended the
+// caller surfaces the existing "state is busy" error instead of stalling.
 fn retry_lock<T>(
     mutex: &tokio::sync::Mutex<T>,
     retries: u32,
@@ -1450,7 +1481,7 @@ fn retry_lock<T>(
         if let Ok(guard) = mutex.try_lock() {
             return Some(guard);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::yield_now();
     }
     None
 }
@@ -1563,7 +1594,7 @@ mod tests {
                 Some("session"),
                 ReasoningEffortTier::Low,
                 ReasoningEffortTier::High,
-                crate::config::ApiProvider::Moonshot,
+                crate::config::ProviderKind::Moonshot,
                 "moonshot",
                 Some(crate::config::DEFAULT_MOONSHOT_BASE_URL),
                 Some("kimi-k2.5"),
@@ -1587,7 +1618,7 @@ mod tests {
             WorkActivityEvent::ReasoningEffortChanged {
                 requested: ReasoningEffortTier::Low,
                 effective: ReasoningEffortTier::High,
-                provider_kind: Some(crate::config::ApiProvider::Moonshot),
+                provider_kind: Some(crate::config::ProviderKind::Moonshot),
                 provider: "moonshot".to_string(),
                 endpoint_identity: Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
                 model: Some("kimi-k2.5".to_string()),
@@ -1821,6 +1852,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn replaced_plan_steps_never_parent_new_operations() {
+        let runtime = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let step = |step: &str, status: StepStatus| PlanItemArg {
+            step: step.to_string(),
+            status,
+        };
+        let three = PlanSnapshot {
+            items: vec![
+                step("first", StepStatus::Pending),
+                step("second", StepStatus::Pending),
+                step("third", StepStatus::InProgress),
+            ],
+            ..PlanSnapshot::default()
+        };
+        runtime
+            .apply_plan_update("session", "update_plan", &three)
+            .await
+            .expect("three-step plan");
+        let one = PlanSnapshot {
+            items: vec![step("only", StepStatus::Pending)],
+            ..PlanSnapshot::default()
+        };
+        runtime
+            .apply_plan_update("session", "update_plan", &one)
+            .await
+            .expect("replacement plan");
+
+        let operation = runtime
+            .register_operation(
+                "session",
+                OperationIntent::new(
+                    "shell:after",
+                    "after replacement",
+                    false,
+                    "exec_shell",
+                    "c1",
+                ),
+            )
+            .expect("register operation");
+        let graph = runtime
+            .capture(Some("session"))
+            .expect("capture")
+            .expect("graph")
+            .graph;
+        assert_eq!(graph.compat.plan_order.len(), 1);
+        let parent = graph
+            .edges
+            .iter()
+            .find(|edge| edge.kind == EdgeKind::Contains && edge.to == operation)
+            .map(|edge| edge.from.clone());
+        assert_eq!(
+            parent,
+            Some(graph.compat.plan_order[0].clone()),
+            "an orphaned step from the replaced plan must not adopt new work"
+        );
+    }
+
     #[test]
     fn legacy_restore_stays_pending_until_first_graph_bearing_write() {
         let todos = crate::tools::todo::new_shared_todo_list();
@@ -1852,5 +1944,63 @@ mod tests {
         assert_eq!(runtime.publish_pending_sync(), Ok(true));
         assert!(!runtime.has_pending_publish());
         assert!(todos.blocking_lock().snapshot().is_empty());
+    }
+
+    /// #6842: one Operation node per finished shell call grew without bound.
+    #[test]
+    fn ended_shell_operations_are_capped_oldest_first() {
+        let runtime = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let total = super::super::model::ENDED_OPERATION_CAP + 44;
+        let mut ids = Vec::new();
+        for i in 0..total {
+            let external = format!("shell:cap_{i}");
+            let intent =
+                OperationIntent::new(&external, "ls", false, "exec_shell", format!("c{i}"));
+            ids.push(
+                runtime
+                    .register_operation("session", intent)
+                    .expect("register"),
+            );
+            for (seq, state) in [(1, OwnerState::Running), (2, OwnerState::Completed)] {
+                runtime
+                    .reconcile_operation(
+                        "session",
+                        OperationOwnerSnapshot::new(
+                            &external,
+                            state,
+                            seq,
+                            i as i64 * 10 + seq as i64,
+                        ),
+                    )
+                    .expect("reconcile");
+            }
+        }
+        let graph = runtime
+            .capture(Some("session"))
+            .expect("capture")
+            .expect("graph")
+            .graph;
+        crate::work_graph::validate(&graph).expect("pruned graph validates");
+        let operations = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Operation)
+            .count();
+        // Pruned to the cap at each registration; the last call then ended.
+        assert!(
+            operations <= super::super::model::ENDED_OPERATION_CAP + 1,
+            "{operations}"
+        );
+        assert!(graph.node(&ids[0]).is_none(), "oldest ended call evicted");
+        assert!(graph.node(&ids[total - 1]).is_some(), "newest call kept");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| graph.node(&edge.from).is_some() && graph.node(&edge.to).is_some())
+        );
     }
 }

@@ -1,0 +1,18 @@
+{
+  "direction": "core_to_host",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "host/initialize",
+    "params": {
+      "protocol": 1,
+      "limits": {
+        "max_frame": 33554432,
+        "max_inflight": 256,
+        "dispose_deadline_ms": 2000,
+        "activate_deadline_ms": 5000
+      }
+    }
+  }
+}

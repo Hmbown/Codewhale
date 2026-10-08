@@ -1,0 +1,106 @@
+param(
+    [Parameter(Mandatory)][string]$Terminal,
+    [Parameter(Mandatory)][string]$Binary,
+    [Parameter(Mandatory)][string]$Workspace,
+    [Parameter(Mandatory)][string]$BaseUrl,
+    [Parameter(Mandatory)][string]$Title,
+    [Parameter(Mandatory)][string]$Evidence
+)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms, System.Drawing
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class ClipboardFixtureWindow {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int command);
+}
+'@
+$window = $null
+$ownedPid = $null
+function Read-Terminal {
+    $texts = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::IsTextPatternAvailableProperty, $true))
+    return (@($texts | ForEach-Object {
+        $_.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+    }) -join "`n")
+}
+function Wait-For([scriptblock]$Check, [string]$Label) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (& $Check) { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "Deadline waiting for $Label"
+}
+function Capture([string]$Name) {
+    (Read-Terminal) | Set-Content -Encoding UTF8 (Join-Path $Evidence "$Name.txt")
+    $r = $window.Current.BoundingRectangle
+    if ($r.IsEmpty -or $r.Width -le 0 -or $r.Height -le 0) { throw 'Terminal has no visible window' }
+    $bitmap = [System.Drawing.Bitmap]::new([int]$r.Width, [int]$r.Height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen([int]$r.X, [int]$r.Y, 0, 0, $bitmap.Size)
+        $bitmap.Save((Join-Path $Evidence "$Name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+}
+function Focus-OwnedWindow {
+    $process = Get-Process -Id $ownedPid
+    if ($process.Path -ne $Terminal) { throw 'Terminal process identity changed' }
+    $handle = [IntPtr]$window.Current.NativeWindowHandle
+    [void][ClipboardFixtureWindow]::ShowWindow($handle, 9)
+    [void][ClipboardFixtureWindow]::SetForegroundWindow($handle)
+    Wait-For { [ClipboardFixtureWindow]::GetForegroundWindow() -eq $handle } 'owned Terminal focus'
+}
+try {
+    # All arguments are owned fixture paths; the fake key cannot reach a paid provider.
+    foreach ($arg in @($Terminal, $Binary, $Workspace, $BaseUrl, $Title)) {
+        if ($arg.Contains('"')) { throw 'Unexpected quote in fixture argument' }
+    }
+    $arguments = "-w new new-tab --title `"$Title`" --suppressApplicationTitle --startingDirectory `"$Workspace`" `"$Binary`" --workspace `"$Workspace`" --no-project-config --fresh --provider openai --model gpt-4o-mini --api-key clipboard-fixture-only --base-url `"$BaseUrl`""
+    Start-Process -FilePath $Terminal -ArgumentList $arguments | Out-Null
+    Wait-For {
+        $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+            [System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($candidate in $windows) {
+            if ($candidate.Current.Name.Contains($Title)) {
+                $process = Get-Process -Id $candidate.Current.ProcessId
+                if ($process.Path -eq $Terminal) {
+                    $script:window = $candidate; $script:ownedPid = $process.Id; return $true
+                }
+            }
+        }
+        return $false
+    } 'owned Windows Terminal window'
+    Focus-OwnedWindow
+    Wait-For { (Read-Terminal).Contains('Type a message') } 'Codewhale composer'
+    Capture 'ready'
+    $payload = [System.IO.File]::ReadAllText((Join-Path $Evidence 'expected.txt'), [System.Text.Encoding]::UTF8)
+    [System.Windows.Forms.Clipboard]::SetText($payload)
+    if ([System.Windows.Forms.Clipboard]::GetText() -ne $payload) { throw 'Clipboard readback mismatch' }
+    Focus-OwnedWindow
+    [System.Windows.Forms.SendKeys]::SendWait('^+v')
+    # Let every pasted line arrive before asking the independent HTTP observer
+    # whether anything was submitted prematurely.
+    Start-Sleep -Milliseconds 1800
+    Capture 'pasted'
+    @{ processId = $ownedPid; sessionId = (Get-Process -Id $ownedPid).SessionId; chars = $payload.Length; input = 'Windows clipboard + Ctrl+Shift+V' } |
+        ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $Evidence 'pasted.json')
+    Wait-For { Test-Path (Join-Path $Evidence 'submit') } 'independent no-submit assertion'
+    Focus-OwnedWindow
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    Wait-For { (Read-Terminal).Contains('cw-clipboard-ok') } 'actual provider reply'
+    Capture 'completed'
+    @{ enterCount = 1; renderedReply = 'cw-clipboard-ok' } | ConvertTo-Json |
+        Set-Content -Encoding UTF8 (Join-Path $Evidence 'completed.json')
+} catch {
+    if ($window) { try { Capture 'failure' } catch { Write-Warning $_ } }
+    throw
+} finally {
+    # Retire only the portable Terminal instance proven to belong to this fixture.
+    if ($ownedPid) {
+        $process = Get-Process -Id $ownedPid -ErrorAction SilentlyContinue
+        if ($process -and $process.Path -eq $Terminal) { Stop-Process -Id $ownedPid -Force }
+    }
+}

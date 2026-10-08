@@ -4,7 +4,9 @@
 use ratatui::layout::Rect;
 
 use crate::tui::app::App;
-use crate::tui::work_surface::model::{self, WorkSurfacePlacement, visible_rows_for_panel};
+use crate::tui::work_surface::model::{
+    self, RailPanel, WorkSurfacePlacement, visible_rows_for_panel,
+};
 
 use super::{progress_shares_goal_row, top_goal_title, top_todo_progress};
 
@@ -51,7 +53,10 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, rail_budget: u16)
     }
     model::resolve_view(app);
     if app.work_surface.dismissed {
-        let current_rows = visible_rows_for_panel(app).len();
+        // New work anywhere in the auto views re-opens the dock — a worker
+        // spawning while the to-do list is on top counts, even though the
+        // resolved view stays TODO.
+        let current_rows = model::auto_work_rows(app);
         let new_work = app.work_surface.panel != app.work_surface.dismissed_view
             || current_rows > app.work_surface.dismissed_at_rows;
         if new_work {
@@ -62,7 +67,19 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, rail_budget: u16)
         }
     }
 
-    let rows = visible_rows_for_panel(app);
+    // The strip is something to SHOW, not a fixture: without an explicit
+    // pick it opens only for work — live agents, the to-do list, background
+    // jobs. The persisted `rail_panel` preference (files, context, git,
+    // price…) always has rows to paint, and letting it auto-open made the
+    // dock a permanent band under the composer. It still opens on demand
+    // (cycle, tab click, `/workbar <view>`) and then sticks until Esc.
+    let auto_open =
+        app.work_surface.explicit_view || RailPanel::AUTO_ORDER.contains(&app.work_surface.panel);
+    let rows = if auto_open {
+        visible_rows_for_panel(app)
+    } else {
+        Vec::new()
+    };
     let strip = app.work_surface.effective_placement.is_strip();
     let goal_rows = u16::from(strip && top_goal_title(app).is_some());
     let explicit = app.work_surface.explicit_view;
@@ -94,7 +111,10 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, rail_budget: u16)
     // by `top_cap`. An explicitly opened empty view keeps one row for its
     // "nothing here yet" line so cycling never lands on a blank band.
     let cap = top_cap(app, terminal_height, rail_budget);
-    if cap < model::TOP_HEIGHT_MIN {
+    // On compact terminals an explicit choice can fit in three rows:
+    // divider, tabs, and one usable content row. The usual five-row
+    // preference must not turn an accepted open command into a no-op.
+    if cap < model::TOP_HEIGHT_MIN && (!explicit || cap < 3) {
         collapse_strip(app);
         return 0;
     }
@@ -107,7 +127,7 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, rail_budget: u16)
         .saturating_add(progress)
         .saturating_add(goal_rows)
         .saturating_add(2);
-    desired.clamp(model::TOP_HEIGHT_MIN, cap)
+    desired.clamp(model::TOP_HEIGHT_MIN.min(cap), cap)
 }
 
 /// The ceilings the *terminal* imposes, independent of anything the user
@@ -175,7 +195,7 @@ pub(crate) fn collapse_strip(app: &mut App) {
 pub fn split_chat(app: &mut App, area: Rect, min_chat_width: u16) -> (Rect, Option<Rect>) {
     let placement = effective_placement(app.work_surface.placement, area.width);
     app.work_surface.effective_placement = placement;
-    if placement == WorkSurfacePlacement::Top || placement == WorkSurfacePlacement::Off {
+    if placement.is_strip() || placement == WorkSurfacePlacement::Off {
         return (area, None);
     }
     // Same empty-collapse rule as Top: a panel with nothing to show does not

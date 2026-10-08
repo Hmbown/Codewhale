@@ -28,8 +28,8 @@ use crate::plugins::manifest::PluginInventory;
 
 use super::super::types::{
     CatalogProvenance, CatalogTier, MarketplaceCandidate, MarketplaceCandidateId,
-    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceFormat, MarketplaceInstallPlan,
-    MarketplaceSourceSpec,
+    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceEntryKind, MarketplaceFormat,
+    MarketplaceInstallPlan, MarketplaceSourceSpec,
 };
 use super::{MarketplaceDocument, str_array_field, str_field, unknown_fields_warning};
 
@@ -326,6 +326,8 @@ fn parse_claude_entry(
     Some(MarketplaceCandidate {
         id: MarketplaceCandidateId::new(catalog_id, &name),
         catalog_id: catalog_id.clone(),
+        kind: MarketplaceEntryKind::Plugin,
+        icon: None,
         name,
         display_name,
         description: description.map(ToString::to_string),
@@ -420,6 +422,7 @@ fn count_declared_components(
             hooks: count("hooks", &mut diags),
             lsp: count("lspServers", &mut diags),
             native: 0,
+            providers: 0,
             filesystem_roots: Vec::new(),
             network_hosts: Vec::new(),
             lifecycle_mutation: false,

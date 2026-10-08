@@ -125,8 +125,7 @@ fn run_with<W: Write>(args: DispatchArgs, out: &mut W) -> Result<()> {
             &discover_machine_token(),
         )?;
         let runner = spawn_accepted(&store, &outcome);
-        write_outcome(out, outcome)?;
-        return join_runner(out, &store, prompt.trim(), runner);
+        return write_then_join(out, &store, prompt.trim(), outcome, runner);
     }
 
     let plan = plan_dispatch(
@@ -144,8 +143,24 @@ fn run_with<W: Write>(args: DispatchArgs, out: &mut W) -> Result<()> {
     )?;
     let runner = spawn_accepted(&store, &outcome);
     let job_id = outcome_job_id(&outcome).unwrap_or_default();
-    write_outcome(out, outcome)?;
-    join_runner(out, &store, &job_id, runner)
+    write_then_join(out, &store, &job_id, outcome, runner)
+}
+
+/// Print the outcome card, then stay attached to the runner — joining it even
+/// when the print failed. A closed stdout (`| head`, a dead terminal) used to
+/// return before the join, ending the process and the runner thread with it,
+/// which orphaned the paid sandbox this wait exists to supervise. The print
+/// error still wins the exit status.
+fn write_then_join<W: Write>(
+    out: &mut W,
+    store: &CloudJobStore,
+    id: &str,
+    outcome: DispatchOutcome,
+    runner: Option<std::thread::JoinHandle<()>>,
+) -> Result<()> {
+    let written = write_outcome(out, outcome);
+    let joined = join_runner(out, store, id, runner);
+    written.and(joined)
 }
 
 /// The CLI stays attached to a confirmed run: the card prints immediately,
@@ -302,6 +317,57 @@ mod tests {
         assert!(!text.contains("Daytona"));
         assert!(!text.contains("sk-"));
         assert!(!text.contains("Bearer"));
+    }
+
+    /// Audit R02-09: a stdout failure must not skip the runner join.
+    #[test]
+    fn a_failed_card_write_still_joins_the_runner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ClosedPipe;
+        impl Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let runner = {
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                finished.store(true, Ordering::SeqCst);
+            })
+        };
+        let job: codewhale_tui::cloud_dispatch::CloudJob =
+            serde_json::from_value(serde_json::json!({
+                "id": "cloud_test", "kind": "cloud", "status": "running",
+                "prompt": "p", "forge": "github", "remote_name": "origin",
+                "remote_url": "https://example.invalid/r.git", "branch": "b",
+                "confirmed": true, "sandbox_id": null, "pr_url": null,
+                "refusal": null, "note": "", "created_unix": 0
+            }))
+            .expect("job fixture");
+        let dir = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(dir.path().to_path_buf());
+
+        let result = write_then_join(
+            &mut ClosedPipe,
+            &store,
+            "cloud_test",
+            DispatchOutcome::Accepted(job),
+            Some(runner),
+        );
+
+        assert!(result.is_err(), "the print failure is still reported");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "returned before the runner finished"
+        );
     }
 
     #[test]

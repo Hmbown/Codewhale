@@ -40,7 +40,7 @@
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
-use crate::palette::{self, AA_BODY_CONTRAST, UiTheme};
+use codewhale_palette::{self as palette, AA_BODY_CONTRAST, UiTheme};
 
 /// Minimum frame size that earns the texture. Below this, content and
 /// controls own every cell. Mirrors the ambient-life floors.
@@ -247,7 +247,7 @@ mod tests {
     /// Whale Flat deliberately leaves its shell surface terminal-owned, so it
     /// is not a valid fixture for tests that exercise RGB scrim blending.
     fn theme() -> UiTheme {
-        let theme = crate::palette::ThemeId::Dracula.ui_theme();
+        let theme = codewhale_palette::ThemeId::Dracula.ui_theme();
         assert!(palette::resolvable_rgb(theme.surface_bg).is_some());
         assert!(palette::resolvable_rgb(theme.text_dim).is_some());
         theme

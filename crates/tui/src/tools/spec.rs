@@ -18,6 +18,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
+use codewhale_execpolicy::ApprovalMode;
+
 use crate::features::Features;
 use crate::lsp::LspManager;
 use crate::network_policy::NetworkPolicyDecider;
@@ -582,6 +584,17 @@ pub struct ToolContext {
 /// useful, without growing the top-level context by another field per feature.
 #[derive(Clone)]
 pub struct ToolExecutionState {
+    /// Actual Core caller admission for per-round Python RPCs. Kernels do not
+    /// retain it; unattached tool contexts cannot make model calls.
+    pub(crate) rlm_caller: Option<Arc<crate::core::engine::rlm_host::CapturedRlmCaller>>,
+    /// Effective session/ancestor tool ceiling, carried to MCP dispatch and runtime registration.
+    pub(crate) disallowed_tools: Vec<String>,
+    /// Trusted local host narrowing; inherited by every alias/nested context.
+    pub(crate) acp_host: Option<codewhale_config::AppMode>,
+    /// Captured child grant; retained through aliases and context overrides.
+    pub(crate) child_host: Option<Arc<crate::tools::subagent::engine::ChildAuthority>>,
+    /// Set only on the context of one call a person approved on a card.
+    pub(crate) human_decision: Option<crate::core::engine::HumanDecision>,
     /// Shared shell manager for background tasks and streaming IO.
     pub shell_manager: SharedShellManager,
     /// Per-session snapshots for files successfully observed by `read_file`.
@@ -593,23 +606,28 @@ pub struct ToolExecutionState {
     /// jobs can be attributed in UI surfaces.
     pub owner_agent_id: Option<String>,
     pub owner_agent_name: Option<String>,
+    /// Tool call and engine turn that created long-running work through this
+    /// context. Hosts use these stable identities to reconcile later updates
+    /// with the originating transcript position.
+    pub(crate) origin_tool_call_id: Option<String>,
+    pub(crate) origin_turn_id: Option<String>,
     /// Outer process authority cap installed by Fleet/headless dispatch.
     /// `None` for ordinary interactive/root sessions.
     pub(crate) tool_authority: Option<Arc<ToolAuthorityEnvelope>>,
     /// Whether to allow paths outside workspace
     pub trust_mode: bool,
     /// Current sandbox policy
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub sandbox_policy: SandboxPolicy,
     /// Path for notes file
     pub notes_path: PathBuf,
     /// MCP configuration path
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub mcp_config_path: PathBuf,
     /// Explicit skills directory used for model-visible skill discovery.
     pub skills_dir: Option<PathBuf>,
     /// Restrict skill discovery to CodeWhale-owned roots plus `skills_dir`.
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Immutable registry snapshot for this workspace/engine context.
     pub plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     /// Elevated sandbox policy override (used when retrying after sandbox denial).
@@ -626,6 +644,13 @@ pub struct ToolExecutionState {
     /// Whether tools should auto-approve without safety checks (YOLO mode).
     /// When true, command safety analysis is skipped for shell execution.
     pub auto_approve: bool,
+    /// Effective approval posture for this execution context. A turn stamps the
+    /// posture it resolved here; a context built from the legacy bit alone
+    /// folds it with [`crate::core::authority::posture_from_auto_approve`].
+    /// Tools that create work of their own (a durable task) pin it, so the work
+    /// inherits the authority the caller was granted rather than re-deriving
+    /// one from a legacy bit.
+    pub approval_mode: ApprovalMode,
     /// Effective shell policy for this execution context.
     pub shell_policy: ShellPolicy,
     /// Effective feature flag set for the running session.
@@ -660,6 +685,9 @@ pub struct ToolExecutionState {
     /// Cancellation token for the active engine turn. Tools that may wait on
     /// external work should observe this so UI cancel can interrupt them.
     pub cancel_token: Option<CancellationToken>,
+    /// Absolute deadline inherited from the active Engine turn after approval.
+    /// Nested model/code work may narrow this bound but must never reset it.
+    pub(crate) turn_deadline: Option<tokio::time::Instant>,
     /// Optional external sandbox backend for shell execution.
     /// When set, exec_shell routes commands through this instead of spawning
     /// a local process.
@@ -675,10 +703,11 @@ pub struct ToolExecutionState {
     /// result when this is present and the manager is enabled.
     pub lsp_manager: Option<Arc<LspManager>>,
 
-    /// Large-output router (#548). When `Some`, tool results that exceed the
-    /// configured token threshold are routed through a V4-Flash synthesis
-    /// sub-agent before being returned to the parent context. `None` disables
-    /// routing (e.g. in sub-agents and test contexts to avoid recursion).
+    /// Adaptive evidence router (#4619). Consulted only when
+    /// `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` opts the process in; under the
+    /// default classic lane this field is inert and bounding happens at the
+    /// engine/subagent completion boundary. `None` in sub-agents and test
+    /// contexts.
     pub large_output_router: Option<crate::tools::large_output_router::LargeOutputRouter>,
 
     /// Which search backend `web_search` should use. Default: Firecrawl. Set via
@@ -696,13 +725,16 @@ pub struct ToolExecutionState {
     pub(crate) provider_native_search: Option<crate::client::ProviderNativeSearchClient>,
     /// Exact active route capability facts. Unknown stays fail-closed.
     pub(crate) route_capabilities: codewhale_config::route::RouteCapabilities,
-
-    /// Per-session workshop variable store (#548). Holds the raw content of
-    /// the most recent large-tool routing event so the parent can call
-    /// `promote_to_context` later. `None` when the router is disabled.
-    pub workshop_vars: Option<
-        std::sync::Arc<tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>>,
-    >,
+    /// Engine-served gate for calls nested inside an `execute_tools` program.
+    /// Set only on the context of one `execute_tools` call by the turn loop;
+    /// every nested call is planned and approved through the same gate a
+    /// direct call gets. `None` everywhere else (sub-agents, tests, exec
+    /// hosts without an engine turn), where code mode keeps its read-only,
+    /// auto-approved profile.
+    pub(crate) nested_call_gate: Option<crate::tools::codemode::NestedCallGate>,
+    /// Where the session's live permission posture lives. Set by the engine;
+    /// every agent call re-reads it (`None` keeps the posture above as is).
+    pub(crate) live_posture: Option<crate::core::engine::LivePosture>,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -747,7 +779,6 @@ impl ToolContext {
     }
 
     /// Create a `ToolContext` with all settings specified.
-    #[allow(dead_code)]
     pub fn with_options(
         workspace: impl Into<PathBuf>,
         trust_mode: bool,
@@ -764,22 +795,30 @@ impl ToolContext {
         Self {
             workspace,
             execution: Box::new(ToolExecutionState {
+                rlm_caller: None,
+                disallowed_tools: Vec::new(),
+                acp_host: None,
+                child_host: None,
+                human_decision: None,
                 shell_manager,
                 file_read_tracker: new_shared_file_read_tracker(),
                 owner_agent_id: None,
                 owner_agent_name: None,
+                origin_tool_call_id: None,
+                origin_turn_id: None,
                 tool_authority,
                 trust_mode,
                 sandbox_policy: SandboxPolicy::None,
                 notes_path: notes_path.into(),
                 mcp_config_path: mcp_config_path.into(),
                 skills_dir: None,
-                skills_scan_codewhale_only: false,
+                skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                 plugin_registry: None,
                 elevated_sandbox_policy: None,
                 persist_services_enabled: false,
                 shell_network_denied_hint: None,
                 auto_approve: false,
+                approval_mode: ApprovalMode::Suggest,
                 shell_policy,
                 features: Features::with_defaults(),
                 state_namespace: "workspace".to_string(),
@@ -790,6 +829,7 @@ impl ToolContext {
                 runtime: RuntimeToolServices::default(),
                 session_objects: None,
                 cancel_token: None,
+                turn_deadline: None,
                 sandbox_backend: None,
                 memory_path: None,
                 lsp_manager: None,
@@ -799,7 +839,8 @@ impl ToolContext {
                 search_base_url: None,
                 provider_native_search: None,
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
-                workshop_vars: None,
+                nested_call_gate: None,
+                live_posture: None,
             }),
         }
     }
@@ -814,6 +855,10 @@ impl ToolContext {
     ) -> Self {
         let mut context = Self::with_options(workspace, trust_mode, notes_path, mcp_config_path);
         context.auto_approve = auto_approve;
+        // The bit stands for a posture, so fold it here rather than leaving the
+        // two fields to disagree. A turn-level builder overwrites this with the
+        // session's resolved posture, which is the authority that counts.
+        context.approval_mode = crate::core::authority::posture_from_auto_approve(auto_approve);
         context
     }
 
@@ -831,6 +876,19 @@ impl ToolContext {
         self
     }
 
+    /// Re-read the session's live permission posture (see `live_posture`) and
+    /// return what was read; `None` when this context has no live source.
+    pub(crate) fn refresh_live_posture(
+        &mut self,
+    ) -> Option<crate::core::engine::LiveRuntimeAuthority> {
+        let live = self.live_posture.clone()?;
+        let authority = live.apply(self);
+        if let Some(child) = self.child_host.as_ref() {
+            self.shell_policy = self.shell_policy.min_with(child.grant.shell_policy());
+        }
+        Some(authority)
+    }
+
     /// Stamp tool work with the sub-agent that owns it.
     #[must_use]
     pub fn with_owner_agent(
@@ -842,6 +900,20 @@ impl ToolContext {
         let agent_name = agent_name.into();
         self.owner_agent_id = (!agent_id.trim().is_empty()).then_some(agent_id);
         self.owner_agent_name = (!agent_name.trim().is_empty()).then_some(agent_name);
+        self
+    }
+
+    /// Bind long-running work to the engine turn that created it.
+    #[must_use]
+    pub(crate) fn with_origin_turn_id(mut self, turn_id: impl Into<String>) -> Self {
+        self.origin_turn_id = Some(turn_id.into());
+        self
+    }
+
+    /// Bind long-running work to the tool call that created it.
+    #[must_use]
+    pub(crate) fn with_origin_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
+        self.origin_tool_call_id = Some(tool_call_id.into());
         self
     }
 
@@ -869,10 +941,10 @@ impl ToolContext {
     pub fn with_skills_config(
         mut self,
         skills_dir: impl Into<PathBuf>,
-        scan_codewhale_only: bool,
+        discovery_mode: crate::skills::SkillDiscoveryMode,
     ) -> Self {
         self.skills_dir = Some(skills_dir.into());
-        self.skills_scan_codewhale_only = scan_codewhale_only;
+        self.skills_discovery_mode = discovery_mode;
         self
     }
 
@@ -911,15 +983,17 @@ impl ToolContext {
     }
 
     fn authority_clamped_shell_policy(&self, policy: ShellPolicy) -> ShellPolicy {
-        match self.tool_authority.as_deref() {
+        let policy = match self.tool_authority.as_deref() {
             Some(cap) => policy.min_with(cap.shell.shell_policy()),
             None => policy,
-        }
+        };
+        self.child_host
+            .as_ref()
+            .map_or(policy, |child| policy.min_with(child.grant.shell_policy()))
     }
 
     /// Attach an external sandbox backend for remote shell execution.
     #[must_use]
-    #[allow(dead_code)]
     pub fn with_sandbox_backend(mut self, backend: std::sync::Arc<dyn SandboxBackend>) -> Self {
         self.sandbox_backend = Some(backend);
         self
@@ -947,7 +1021,7 @@ impl ToolContext {
     /// Attach an LSP manager so that edit tools can auto-inject diagnostics
     /// into their results after a successful file modification (#428).
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_lsp_manager(mut self, manager: Arc<LspManager>) -> Self {
         self.lsp_manager = Some(manager);
         self
@@ -1012,6 +1086,32 @@ impl ToolContext {
         Ok(())
     }
 
+    /// Cap the authority a tool call asks for on work it hands off (a durable
+    /// task or a scheduled automation) at what this session holds. Requested
+    /// `allow_shell`, `trust_mode` and `auto_approve` bits are declarations
+    /// from the model; each survives only when this session already has that
+    /// authority, so delegated work never runs with more than its creator.
+    pub(crate) fn cap_delegated_authority(
+        &self,
+        allow_shell: Option<bool>,
+        trust_mode: Option<bool>,
+        auto_approve: Option<bool>,
+    ) -> (Option<bool>, Option<bool>, Option<bool>) {
+        let holds_shell = self.shell_policy == ShellPolicy::Full;
+        (
+            // An omitted flag falls back to the host's configured default, so
+            // a session without full shell must say "no" for it rather than
+            // leave it unset.
+            match allow_shell {
+                Some(requested) => Some(requested && holds_shell),
+                None if holds_shell => None,
+                None => Some(false),
+            },
+            trust_mode.map(|requested| requested && self.trust_mode),
+            auto_approve.map(|requested| requested && self.approval_mode == ApprovalMode::Bypass),
+        )
+    }
+
     /// Resolve a path relative to workspace, validating it doesn't escape.
     ///
     /// This handles both existing files (using canonicalize) and non-existent files
@@ -1028,7 +1128,9 @@ impl ToolContext {
     /// # Ok::<(), crate::tools::spec::ToolError>(())
     /// ```
     pub fn resolve_path(&self, raw: &str) -> Result<PathBuf, ToolError> {
-        let candidate = if std::path::Path::new(raw).is_absolute() {
+        let candidate = if let Some(home_path) = resolve_home_path(raw)? {
+            home_path
+        } else if std::path::Path::new(raw).is_absolute() {
             PathBuf::from(raw)
         } else {
             self.workspace.join(raw)
@@ -1115,6 +1217,24 @@ impl ToolContext {
         self.resolve_nonexistent_path(candidate, &workspace_canonical)
     }
 
+    /// Resolve `raw` against the workspace and require an existing directory.
+    ///
+    /// Tools that scope execution to a subdirectory (Run `cwd`) resolve
+    /// through here so containment, existence, and the refusal wording have
+    /// one owner. A workspace escape keeps the typed `PathEscape`; a missing
+    /// or non-directory path names the fallback (drop the field to run in
+    /// the workspace root).
+    pub fn resolve_existing_dir(&self, raw: &str, field: &str) -> Result<PathBuf, ToolError> {
+        let resolved = self.resolve_path(raw)?;
+        if resolved.is_dir() {
+            Ok(resolved)
+        } else {
+            Err(ToolError::invalid_input(format!(
+                "{field} '{raw}' is not an existing directory inside the workspace; drop `{field}` to run in the workspace root"
+            )))
+        }
+    }
+
     /// Resolve a non-existent path by canonicalizing its deepest existing
     /// ancestor and validating the result is under the workspace or a
     /// trusted external path.
@@ -1188,7 +1308,7 @@ impl ToolContext {
     }
 
     /// Set the trust mode.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_trust_mode(mut self, trust: bool) -> Self {
         self.trust_mode = trust;
         self
@@ -1223,6 +1343,16 @@ impl ToolContext {
         self
     }
 
+    /// Carry a person's card decision to the one call it approved.
+    #[must_use]
+    pub(crate) fn with_human_decision(
+        mut self,
+        decision: crate::core::engine::HumanDecision,
+    ) -> Self {
+        self.human_decision = Some(decision);
+        self
+    }
+
     /// Set the shell network-denial hint used by network-restricted modes.
     pub fn with_shell_network_denied_hint(mut self, hint: impl Into<String>) -> Self {
         self.shell_network_denied_hint = Some(hint.into());
@@ -1242,19 +1372,14 @@ impl ToolContext {
         self
     }
 
-    /// Attach the large-output router (#548). When set, tool results that
-    /// exceed the configured token threshold are synthesised by a V4-Flash
-    /// sub-agent before being returned to the parent context.
+    /// Attach the adaptive evidence router (#4619). Consulted only under the
+    /// `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` opt-in.
     #[must_use]
     pub fn with_large_output_router(
         mut self,
         router: crate::tools::large_output_router::LargeOutputRouter,
-        vars: std::sync::Arc<
-            tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>,
-        >,
     ) -> Self {
         self.large_output_router = Some(router);
-        self.workshop_vars = Some(vars);
         self
     }
 }
@@ -1332,11 +1457,75 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Resolve an exact `~` or `~/` path prefix to the current user's home directory.
+///
+/// Only exact `~` and `~/` (or `~\` on Windows) prefixes are resolved. Prefixes like
+/// `~otheruser`, shell variables (`$VAR`), command substitution, and globs are not
+/// expanded. Literal paths like `./~/file` stay literal.
+///
+/// Returns:
+/// - `Ok(Some(path))` if `raw` has an exact home prefix and home was determined.
+/// - `Ok(None)` if `raw` does not have an exact home prefix.
+/// - `Err(ToolError)` if `raw` has an exact home prefix but user home could not be determined.
+pub(crate) fn resolve_home_path(raw: &str) -> Result<Option<PathBuf>, ToolError> {
+    resolve_home_path_with(raw, crate::config::effective_home_dir)
+}
+
+pub(crate) fn resolve_home_path_with(
+    raw: &str,
+    home_lookup: impl FnOnce() -> Option<PathBuf>,
+) -> Result<Option<PathBuf>, ToolError> {
+    let suffix = if raw == "~" {
+        ""
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        rest.trim_start_matches(|c| c == '/' || (cfg!(windows) && c == '\\'))
+    } else {
+        #[cfg(windows)]
+        if let Some(rest) = raw.strip_prefix(r"~\") {
+            rest.trim_start_matches(['/', '\\'])
+        } else {
+            return Ok(None);
+        }
+        #[cfg(not(windows))]
+        return Ok(None);
+    };
+
+    // A drive prefix is not a home-relative suffix. `PathBuf::join` would
+    // otherwise replace the home on Windows (for example `~/C:\file`).
+    #[cfg(windows)]
+    if Path::new(suffix)
+        .components()
+        .any(|part| matches!(part, std::path::Component::Prefix(_)))
+    {
+        return Err(ToolError::invalid_input(
+            "a home-relative path cannot contain a drive prefix",
+        ));
+    }
+    let home = home_lookup().ok_or_else(|| {
+        ToolError::execution_failed(format!(
+            "Failed to resolve path '{raw}': user home directory could not be determined"
+        ))
+    })?;
+
+    if suffix.is_empty() {
+        Ok(Some(home))
+    } else {
+        Ok(Some(home.join(suffix)))
+    }
+}
+
 /// The core trait that all tools must implement.
 #[async_trait]
 pub trait ToolSpec: Send + Sync {
     /// Returns the unique name of this tool (used in API calls).
     fn name(&self) -> &str;
+
+    /// Identifies the implementation in local registration diagnostics only.
+    /// Adapters should use their existing source identity, never credentials,
+    /// command arguments, descriptions, or other execution payloads.
+    fn registration_origin(&self) -> std::borrow::Cow<'_, str> {
+        std::any::type_name::<Self>().into()
+    }
 
     /// Returns a human-readable description of what this tool does.
     fn description(&self) -> &str;
@@ -1365,7 +1554,7 @@ pub trait ToolSpec: Send + Sync {
     }
 
     /// Returns whether this tool is sandboxable.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn is_sandboxable(&self) -> bool {
         self.capabilities().contains(&ToolCapability::Sandboxable)
     }
@@ -1416,6 +1605,27 @@ pub trait ToolSpec: Send + Sync {
             resources: vec![ResourceClaim::GlobalExclusive],
             input,
         })
+    }
+
+    /// The approval-grant scope this tool's calls are keyed under instead of
+    /// the name-derived key families, if it has one. `None` (every built-in,
+    /// script and MCP tool) keeps [`crate::tools::approval_cache`]'s keys.
+    ///
+    /// Extension tools return `ext:<plugin_id>@<content_hash>`, so a session
+    /// grant covers one reviewed plugin build: an updated plugin, or another
+    /// plugin that later registers the same name, is asked again.
+    fn approval_scope(&self) -> Option<String> {
+        None
+    }
+
+    /// Who this tool is, if it is an extension tool: composed by Rust from its
+    /// registration. `Some` makes the turn loop serve a permission gate for
+    /// the tool's call, through which its `core/call`s are planned and
+    /// approved like a model's, and makes the tool unreachable from any other
+    /// extension's `core/call` (no recursion). `None` (every built-in, script
+    /// and MCP tool) changes nothing.
+    fn extension_caller(&self) -> Option<crate::tools::codemode::ExtensionCaller> {
+        None
     }
 
     /// Returns whether this tool should be excluded from the model-visible

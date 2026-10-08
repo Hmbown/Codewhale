@@ -8,6 +8,7 @@ fn sample_pr() -> GhPullRequest {
         head: "feat/cool".to_string(),
         url: "https://github.com/example/repo/pull/123".to_string(),
         head_sha: "abc123def456abc123def456abc123def456abc1".to_string(),
+        ..GhPullRequest::default()
     }
 }
 
@@ -32,6 +33,7 @@ fn format_pr_prompt_handles_empty_body_and_unknown_branches() {
         head: String::new(),
         url: String::new(),
         head_sha: String::new(),
+        ..GhPullRequest::default()
     };
     let prompt = format_pr_prompt(7, &pr, "(diff body)");
     assert!(prompt.contains("(PR #7)"));
@@ -41,13 +43,12 @@ fn format_pr_prompt_handles_empty_body_and_unknown_branches() {
 }
 
 #[test]
-fn format_pr_prompt_truncates_oversize_diff_at_a_codepoint_boundary() {
+fn format_pr_prompt_preserves_an_admitted_unicode_diff() {
     let mut diff = "X".repeat(190 * 1024);
     diff.push_str(&"🚀".repeat(5_000));
     let prompt = format_pr_prompt(1, &sample_pr(), &diff);
-    assert!(prompt.contains("[…diff truncated"));
-    assert!(prompt.contains("at 200 KiB"));
-    assert!(prompt.is_ascii() || prompt.contains('🚀'));
+    assert!(prompt.contains(&diff));
+    assert!(!prompt.contains("diff truncated"));
 }
 
 #[test]

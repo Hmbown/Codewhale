@@ -1,11 +1,12 @@
 //! Session resume picker view for the TUI.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -15,9 +16,6 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::localization::{Locale, MessageId, tr};
-use crate::models::Role;
-use crate::palette;
 use crate::session_manager::{
     SavedSession, SessionListFilter, SessionManager, SessionMetadata, extract_title,
     extract_user_prompt, strip_thinking_tags,
@@ -29,6 +27,9 @@ use crate::tui::views::{
     render_underwater_surface,
 };
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_models::Role;
+use codewhale_palette as palette;
 
 fn section_block(title: &str) -> Block<'static> {
     Block::default()
@@ -44,9 +45,85 @@ fn section_block(title: &str) -> Block<'static> {
         .padding(Padding::uniform(1))
 }
 
+/// Previews kept in memory. Each entry is a whole rendered transcript, so the
+/// cache is bounded: scrolling a long list must not retain every session.
+const PREVIEW_CACHE_CAPACITY: usize = 16;
+
+/// Small least-recently-used cache of rendered previews keyed by session id.
+#[derive(Default)]
+struct PreviewCache {
+    /// Oldest first; a hit moves its entry to the back.
+    entries: VecDeque<(String, Vec<String>)>,
+}
+
+impl PreviewCache {
+    fn get(&mut self, id: &str) -> Option<&Vec<String>> {
+        let index = self.entries.iter().position(|(key, _)| key == id)?;
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        self.entries.back().map(|(_, lines)| lines)
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.entries.retain(|(key, _)| key != id);
+    }
+
+    fn insert(&mut self, id: String, lines: Vec<String>) {
+        self.entries.retain(|(key, _)| *key != id);
+        self.entries.push_back((id, lines));
+        while self.entries.len() > PREVIEW_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Outcome of reading one session from disk for the preview pane.
+struct PreviewLoad {
+    lines: Vec<String>,
+    /// Only a successful load is cached; a failure is retried on reselect.
+    cacheable: bool,
+}
+
+/// A preview load running off the event loop. The result is only applied if
+/// it still matches the selection that requested it.
+struct PendingPreview {
+    session_id: String,
+    generation: u64,
+    cell: Arc<Mutex<Option<PreviewLoad>>>,
+}
+
+/// One session-store listing, or why the store could not be listed.
+type SessionListing = Result<Vec<SessionMetadata>, String>;
+
+/// The session-store listing running off the event loop (U08-09). The
+/// store's metadata scan grows with every saved session, so the picker opens
+/// at once and fills in when the listing lands.
+struct PendingSessionList {
+    cell: Arc<Mutex<Option<SessionListing>>>,
+    /// Row to land on once the list arrives (`new_selecting`).
+    select: Option<String>,
+}
+
+/// What the list pane says in place of rows it does not have yet.
+#[derive(Debug, Clone, Copy)]
+enum ListNotice<'a> {
+    Loading,
+    Failed(&'a str),
+}
+
 pub struct SessionPickerView {
     /// Every session loaded from disk. The picker filters from this set.
     sessions: Vec<SessionMetadata>,
+    /// The store listing still in flight, if any.
+    pending_list: Option<PendingSessionList>,
+    /// The store could not be listed. Shown instead of "no saved sessions",
+    /// which would claim an empty store nobody observed.
+    load_error: Option<String>,
     filtered: Vec<SessionMetadata>,
     selected: usize,
     list_scroll: Cell<usize>,
@@ -57,8 +134,12 @@ pub struct SessionPickerView {
     search_input: String,
     search_mode: bool,
     sort_mode: SessionSortMode,
-    preview_cache: HashMap<String, Vec<String>>,
+    preview_cache: PreviewCache,
     current_preview: Vec<String>,
+    /// Bumped on every preview refresh; a background load tagged with an
+    /// older generation is stale and dropped.
+    preview_generation: u64,
+    pending_preview: Option<PendingPreview>,
     confirm_delete: bool,
     rename_mode: bool,
     rename_input: String,
@@ -75,6 +156,14 @@ pub struct SessionPickerView {
     /// (#2934 / #4397). Defaults to `false`: archiving is the user putting a
     /// session away, and the browse default should honour that.
     show_archived: bool,
+    /// Hide empty auto-created sessions — the same filter the launch list
+    /// and `--continue` already apply (#6014). The picker exists to resume
+    /// work, and a session with no messages has none to resume.
+    hide_empty_sessions: bool,
+    /// The session the caller is running in, when it hands one over. Rows
+    /// mark it `current` so the user can tell which session they are inside
+    /// (#6014). Never inferred from disk state.
+    current_session_id: Option<String>,
     /// Screen rows owned by the visible session list. Keeping this local to
     /// the view gives mouse and keyboard the same selection/resume contract.
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
@@ -87,12 +176,90 @@ impl SessionPickerView {
     /// other workspaces are hidden by default — press `a` inside the
     /// picker to expand to all workspaces (#1395).
     pub fn new(workspace: &Path, locale: Locale) -> Self {
-        let sessions = SessionManager::default_location()
-            .and_then(|manager| manager.list_sessions())
-            .unwrap_or_default();
+        Self::load(workspace, locale, None)
+    }
 
+    /// Open over the session store. Listing it is blocking disk I/O that
+    /// grows with the store, so inside a runtime it runs on the blocking pool
+    /// and lands through `tick`; outside one (unit tests, headless callers)
+    /// there is no loop to stall, so it loads inline.
+    fn load(workspace: &Path, locale: Locale, select: Option<String>) -> Self {
+        let mut view = Self::from_session_list(workspace, locale, Vec::new());
+        if tokio::runtime::Handle::try_current().is_err() {
+            view.apply_session_list(list_session_store(), select);
+            return view;
+        }
+        let cell = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cell);
+        crate::utils::spawn_blocking_supervised("session-picker-list", move || {
+            let listed = list_session_store();
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(listed);
+            }
+        });
+        view.pending_list = Some(PendingSessionList { cell, select });
+        view
+    }
+
+    /// Install a finished store listing. A failure is shown as a failure —
+    /// never as an empty store — and the list stays empty.
+    fn apply_session_list(&mut self, listed: SessionListing, select: Option<String>) {
+        match listed {
+            Ok(sessions) => {
+                self.sessions = sessions;
+                self.load_error = None;
+                self.apply_sort_and_filter();
+                if let Some(session_id) = select {
+                    self.select_with_fallback(&session_id);
+                }
+            }
+            Err(error) => {
+                self.sessions.clear();
+                self.load_error =
+                    Some(tr(self.locale, MessageId::SessionsOpenFailed).replace("{error}", &error));
+                self.apply_sort_and_filter();
+            }
+        }
+    }
+
+    /// Apply the store listing once it lands. Returns whether the view changed.
+    fn poll_session_list(&mut self) -> bool {
+        let Some(pending) = self.pending_list.as_ref() else {
+            return false;
+        };
+        let Some(listed) = pending.cell.lock().ok().and_then(|mut guard| guard.take()) else {
+            return false;
+        };
+        let select = self.pending_list.take().and_then(|pending| pending.select);
+        self.apply_session_list(listed, select);
+        true
+    }
+
+    /// Construct a picker scoped to `workspace` over an explicit session list.
+    ///
+    /// Test seam for acceptance coverage (#5929): production always resolves
+    /// the store via [`Self::new`], but redirecting `CODEWHALE_HOME` to point
+    /// that resolution at a temp directory is process-global state — a
+    /// concurrent test that resolves the store without the env barrier can
+    /// observe the redirect mid-test and write sessions into it, so the two
+    /// listings under comparison drift apart. Handing the picker the list from
+    /// a private store removes the shared-state window without touching what
+    /// the picker does with the list.
+    #[cfg(test)]
+    pub fn new_with_sessions(
+        workspace: &Path,
+        locale: Locale,
+        sessions: Vec<SessionMetadata>,
+    ) -> Self {
+        Self::from_session_list(workspace, locale, sessions)
+    }
+
+    /// Shared constructor: everything except where the session list came from.
+    fn from_session_list(workspace: &Path, locale: Locale, sessions: Vec<SessionMetadata>) -> Self {
         let mut view = Self {
             sessions,
+            pending_list: None,
+            load_error: None,
             filtered: Vec::new(),
             selected: 0,
             list_scroll: Cell::new(0),
@@ -103,8 +270,10 @@ impl SessionPickerView {
             search_input: String::new(),
             search_mode: false,
             sort_mode: SessionSortMode::Recent,
-            preview_cache: HashMap::new(),
+            preview_cache: PreviewCache::default(),
             current_preview: Vec::new(),
+            preview_generation: 0,
+            pending_preview: None,
             confirm_delete: false,
             rename_mode: false,
             rename_input: String::new(),
@@ -112,6 +281,8 @@ impl SessionPickerView {
             workspace_scope: Some(canonical_or_self(workspace.to_path_buf())),
             show_all_workspaces: false,
             show_archived: false,
+            hide_empty_sessions: true,
+            current_session_id: None,
             last_row_hitboxes: RefCell::new(Vec::new()),
             locale,
         };
@@ -130,31 +301,53 @@ impl SessionPickerView {
     /// anything, so widening the view cannot cross a workspace boundary
     /// behind the user's back.
     pub fn new_selecting(workspace: &Path, locale: Locale, session_id: &str) -> Self {
-        let mut view = Self::new(workspace, locale);
-        if view.select_session_id(session_id) {
-            return view;
+        Self::load(workspace, locale, Some(session_id.to_string()))
+    }
+
+    /// Land the selection on `session_id`, widening one browse filter at a
+    /// time when the row is outside the default view.
+    fn select_with_fallback(&mut self, session_id: &str) {
+        if self.select_session_id(session_id) {
+            return;
         }
-        if !view.show_archived {
-            view.show_archived = true;
-            view.apply_sort_and_filter();
-            if view.select_session_id(session_id) {
-                view.status =
-                    Some(tr(view.locale, MessageId::SessionsShowingArchived).into_owned());
-                return view;
+        if !self.show_archived {
+            self.show_archived = true;
+            self.apply_sort_and_filter();
+            if self.select_session_id(session_id) {
+                self.status =
+                    Some(tr(self.locale, MessageId::SessionsShowingArchived).into_owned());
+                return;
             }
         }
-        if !view.show_all_workspaces {
-            view.show_all_workspaces = true;
-            view.apply_sort_and_filter();
-            if view.select_session_id(session_id) {
-                view.status =
-                    Some(tr(view.locale, MessageId::SessionsShowingAllWorkspaces).into_owned());
-                return view;
+        if !self.show_all_workspaces {
+            self.show_all_workspaces = true;
+            self.apply_sort_and_filter();
+            if self.select_session_id(session_id) {
+                self.status =
+                    Some(tr(self.locale, MessageId::SessionsShowingAllWorkspaces).into_owned());
+                return;
+            }
+        }
+        // Last resort: an empty auto-created session is hidden by default
+        // but a rail handoff may still target it — widen that filter too
+        // rather than report "no results" for a session that exists (#6014).
+        if self.hide_empty_sessions {
+            self.hide_empty_sessions = false;
+            self.apply_sort_and_filter();
+            if self.select_session_id(session_id) {
+                return;
             }
         }
         // Not found at all: leave the default view rather than pretending.
-        view.status = Some(tr(view.locale, MessageId::SessionsNoResults).into_owned());
-        view
+        self.status = Some(tr(self.locale, MessageId::SessionsNoResults).into_owned());
+    }
+
+    /// Mark `session_id` as the session the caller is running in. Rows mark
+    /// it `current` (#6014); `None` leaves every row unmarked.
+    #[must_use]
+    pub fn with_current_session(mut self, session_id: Option<&str>) -> Self {
+        self.current_session_id = session_id.map(str::to_string);
+        self
     }
 
     /// Move the selection onto `session_id` if it is in the filtered list.
@@ -181,6 +374,9 @@ impl SessionPickerView {
             .with_sort(self.sort_mode)
             .with_search(self.search_input.trim().to_string())
             .with_limit(MAX_PROJECTED_SESSIONS);
+        if self.hide_empty_sessions {
+            query = query.without_empty_auto_created();
+        }
         if !self.show_all_workspaces
             && let Some(scope) = self.workspace_scope.as_deref()
         {
@@ -255,10 +451,24 @@ impl SessionPickerView {
         self.refresh_preview();
     }
 
-    fn move_selection(&mut self, delta: isize) {
-        self.selected = crate::tui::list_nav::wrap_index(self.selected, self.filtered.len(), delta);
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. `Prev`/`Next` wrap (existing behavior);
+    /// paging and Home/End clamp — a paging key asks to travel, not to
+    /// teleport. The horizontal axis has nowhere to go on this surface.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        if self.filtered.is_empty() {
+            return false;
+        }
+        let page = self.list_visible_rows.get().max(1);
+        let Some(next) =
+            crate::tui::list_nav::apply(self.selected, self.filtered.len(), page, motion)
+        else {
+            return false;
+        };
+        self.selected = next;
         self.ensure_selected_visible();
         self.refresh_preview();
+        true
     }
 
     fn select_visible_shortcut(&mut self, c: char) -> bool {
@@ -357,6 +567,16 @@ impl SessionPickerView {
         );
     }
 
+    /// What the list pane shows in place of rows it has not got: the listing
+    /// is still in flight, or the store could not be listed.
+    fn list_notice(&self) -> Option<ListNotice<'_>> {
+        if self.pending_list.is_some() {
+            Some(ListNotice::Loading)
+        } else {
+            self.load_error.as_deref().map(ListNotice::Failed)
+        }
+    }
+
     fn sort_label(&self) -> String {
         match self.sort_mode {
             SessionSortMode::Recent => tr(self.locale, MessageId::SessionsSortRecent),
@@ -381,6 +601,19 @@ impl SessionPickerView {
     fn delete_selected(&mut self) -> Option<ViewEvent> {
         let session = self.selected_session().cloned()?;
         let manager = SessionManager::default_location().ok()?;
+        // A deleted document the live session still owns refuses every later
+        // save, so the conversation on screen would silently stop persisting.
+        let refusal = if self.current_session_id.as_deref() == Some(session.id.as_str()) {
+            Some(MessageId::SessionsDeleteOpenHere)
+        } else if manager.is_session_live_anywhere(&session.id) {
+            Some(MessageId::SessionsDeleteOpenElsewhere)
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            self.status = Some(tr(self.locale, reason).into_owned());
+            return None;
+        }
         if let Err(err) = manager.delete_session(&session.id) {
             self.status = Some(
                 tr(self.locale, MessageId::SessionsDeleteFailed)
@@ -453,7 +686,9 @@ impl SessionPickerView {
             tr(self.locale, message_id)
                 .replace("{id}", crate::session_manager::truncate_id(&session.id)),
         );
-        ViewAction::Emit(ViewEvent::SessionArchived { metadata })
+        ViewAction::Emit(ViewEvent::SessionArchived {
+            metadata: Box::new(metadata),
+        })
     }
 
     /// Flip whether archived sessions appear in the list.
@@ -505,10 +740,12 @@ impl SessionPickerView {
             );
             return ViewAction::None;
         }
-        // Update our local metadata cache.
+        // Update our local metadata cache. The cached preview renders the old
+        // title, so it is dropped rather than shown again (U08-09).
         if let Some(meta) = self.sessions.iter_mut().find(|s| s.id == session.id) {
             meta.title = new_title.to_string();
         }
+        self.preview_cache.remove(&session.id);
         self.apply_sort_and_filter();
         self.refresh_preview();
         self.status =
@@ -519,49 +756,148 @@ impl SessionPickerView {
     }
 
     fn refresh_preview(&mut self) {
+        // Any load still in flight belongs to the previous selection.
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.pending_preview = None;
+
         let Some(session) = self.selected_session() else {
             self.current_preview = vec![tr(self.locale, MessageId::SessionsNoResults).into_owned()];
             self.scroll_history_to_latest();
             return;
         };
+        let session_id = session.id.clone();
 
-        if let Some(lines) = self.preview_cache.get(&session.id) {
+        if let Some(lines) = self.preview_cache.get(&session_id) {
             self.current_preview = lines.clone();
             self.scroll_history_to_latest();
             return;
         }
 
-        let manager = match SessionManager::default_location() {
-            Ok(manager) => manager,
-            Err(_) => {
-                self.current_preview =
-                    vec![tr(self.locale, MessageId::SessionsDirectoryFailed).into_owned()];
-                self.scroll_history_to_latest();
-                return;
-            }
-        };
+        // Reading and parsing a saved session is blocking disk I/O that grows
+        // with the transcript; arrowing through the list must not stall the
+        // event loop on it. Outside a runtime (unit tests, headless callers)
+        // there is no loop to stall, so load inline.
+        if tokio::runtime::Handle::try_current().is_err() {
+            let load = load_preview(&session_id, self.locale);
+            self.apply_preview_load(session_id, load);
+            return;
+        }
 
-        let saved = match manager.load_session(&session.id) {
-            Ok(saved) => saved,
-            Err(_) => {
-                self.current_preview =
-                    vec![tr(self.locale, MessageId::SessionsPreviewFailed).into_owned()];
-                self.scroll_history_to_latest();
-                return;
-            }
-        };
+        if let Some(session) = self.selected_session() {
+            self.current_preview = loading_preview_lines(session, self.locale);
+        }
+        self.scroll_history_to_latest();
 
-        let preview = build_preview_lines(&saved, self.locale);
-        self.preview_cache
-            .insert(session.id.clone(), preview.clone());
-        self.current_preview = preview;
+        let cell = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cell);
+        let locale = self.locale;
+        let id = session_id.clone();
+        crate::utils::spawn_blocking_supervised("session-picker-preview", move || {
+            let load = load_preview(&id, locale);
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(load);
+            }
+        });
+        self.pending_preview = Some(PendingPreview {
+            session_id,
+            generation: self.preview_generation,
+            cell,
+        });
+    }
+
+    /// Apply a background preview load if it has landed and still belongs to
+    /// the current selection. Called from `tick`; returns whether the visible
+    /// preview changed, so the host knows to repaint.
+    fn poll_preview(&mut self) -> bool {
+        let Some(pending) = self.pending_preview.as_ref() else {
+            return false;
+        };
+        let landed = pending.cell.lock().ok().and_then(|mut guard| guard.take());
+        let Some(load) = landed else {
+            return false;
+        };
+        let Some(pending) = self.pending_preview.take() else {
+            return false;
+        };
+        let still_selected = self
+            .selected_session()
+            .is_some_and(|session| session.id == pending.session_id);
+        if pending.generation != self.preview_generation || !still_selected {
+            // Stale: keep a good result for later, never show it now.
+            if load.cacheable {
+                self.preview_cache.insert(pending.session_id, load.lines);
+            }
+            return false;
+        }
+        self.apply_preview_load(pending.session_id, load);
+        true
+    }
+
+    fn apply_preview_load(&mut self, session_id: String, load: PreviewLoad) {
+        if load.cacheable {
+            self.preview_cache.insert(session_id, load.lines.clone());
+        }
+        self.current_preview = load.lines;
         self.scroll_history_to_latest();
     }
+}
+
+/// List the saved-session store. Blocking; runs on the blocking pool when a
+/// runtime is available.
+fn list_session_store() -> SessionListing {
+    SessionManager::default_location()
+        .and_then(|manager| manager.list_sessions())
+        .map_err(|error| error.to_string())
+}
+
+/// Read one saved session and render its preview. Blocking; runs on the
+/// blocking pool when a runtime is available.
+fn load_preview(session_id: &str, locale: Locale) -> PreviewLoad {
+    let manager = match SessionManager::default_location() {
+        Ok(manager) => manager,
+        Err(_) => {
+            return PreviewLoad {
+                lines: vec![tr(locale, MessageId::SessionsDirectoryFailed).into_owned()],
+                cacheable: false,
+            };
+        }
+    };
+    match manager.load_session(session_id) {
+        Ok(saved) => PreviewLoad {
+            lines: build_preview_lines(&saved, locale),
+            cacheable: true,
+        },
+        Err(_) => PreviewLoad {
+            lines: vec![tr(locale, MessageId::SessionsPreviewFailed).into_owned()],
+            cacheable: false,
+        },
+    }
+}
+
+/// What the preview pane shows while the transcript loads: the header facts
+/// the list row already knows, then an ellipsis where the transcript goes.
+/// Built from existing localized strings so no locale falls back to English.
+fn loading_preview_lines(session: &SessionMetadata, locale: Locale) -> Vec<String> {
+    vec![
+        tr(locale, MessageId::SessionsPreviewId).replace("{id}", &session.id),
+        tr(locale, MessageId::SessionsPreviewTitle).replace("{title}", &session.title),
+        String::new(),
+        "\u{2026}".to_string(),
+    ]
 }
 
 impl ModalView for SessionPickerView {
     fn kind(&self) -> ModalKind {
         ModalKind::SessionPicker
+    }
+
+    fn tick(&mut self) -> ViewAction {
+        let listed = self.poll_session_list();
+        if self.poll_preview() || listed {
+            ViewAction::Redraw
+        } else {
+            ViewAction::None
+        }
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -570,8 +906,12 @@ impl ModalView for SessionPickerView {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.move_selection(-1),
-            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::ScrollUp => {
+                self.apply_motion(crate::tui::list_nav::Motion::Prev);
+            }
+            MouseEventKind::ScrollDown => {
+                self.apply_motion(crate::tui::list_nav::Motion::Next);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let clicked = self
                     .last_row_hitboxes
@@ -667,26 +1007,33 @@ impl ModalView for SessionPickerView {
             }
         }
 
+        // Shift-modified paging belongs to the preview pane (#6014) and must
+        // be claimed before the shared vocabulary sees the bare keys.
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            match key.code {
+                KeyCode::PageUp => {
+                    let rows = self.history_visible_rows.get().max(1);
+                    self.scroll_history(-(rows as isize));
+                    return ViewAction::None;
+                }
+                KeyCode::PageDown => {
+                    let rows = self.history_visible_rows.get().max(1);
+                    self.scroll_history(rows as isize);
+                    return ViewAction::None;
+                }
+                _ => {}
+            }
+        }
+        // Movement keys come from the shared vocabulary (#6290); this match
+        // owns only the picker's own verbs.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
-                ViewAction::None
-            }
-            KeyCode::PageUp => {
-                let rows = self.history_visible_rows.get().max(1);
-                self.scroll_history(-(rows as isize));
-                ViewAction::None
-            }
-            KeyCode::PageDown => {
-                let rows = self.history_visible_rows.get().max(1);
-                self.scroll_history(rows as isize);
-                ViewAction::None
-            }
             KeyCode::Char('/') => {
                 self.enter_search();
                 ViewAction::None
@@ -796,6 +1143,8 @@ impl ModalView for SessionPickerView {
                 self.rename_mode,
                 &self.rename_input,
                 self.status.as_deref(),
+                self.list_notice(),
+                self.current_session_id.as_deref(),
                 self.locale,
             );
             *self.last_row_hitboxes.borrow_mut() = (0..visible_rows)
@@ -826,7 +1175,10 @@ impl ModalView for SessionPickerView {
             .constraints(if narrow {
                 [Constraint::Percentage(42), Constraint::Percentage(58)]
             } else {
-                [Constraint::Percentage(64), Constraint::Percentage(36)]
+                // 36% was too thin for session rows — the list exists to be
+                // scanned, so give it a fairer share on wide terminals
+                // (#6014).
+                [Constraint::Percentage(56), Constraint::Percentage(44)]
             })
             .split(content);
         let (history_area, list_area) = if narrow {
@@ -867,6 +1219,8 @@ impl ModalView for SessionPickerView {
             self.rename_mode,
             &self.rename_input,
             self.status.as_deref(),
+            self.list_notice(),
+            self.current_session_id.as_deref(),
             self.locale,
         );
         *self.last_row_hitboxes.borrow_mut() = (0..visible_rows)
@@ -924,6 +1278,8 @@ fn build_list_lines(
     rename_mode: bool,
     rename_input: &str,
     status: Option<&str>,
+    notice: Option<ListNotice<'_>>,
+    current_session_id: Option<&str>,
     locale: Locale,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -957,6 +1313,23 @@ fn build_list_lines(
     }
 
     if sessions.is_empty() {
+        match notice {
+            Some(ListNotice::Loading) => {
+                lines.push(Line::from(Span::styled(
+                    "\u{2026}",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+                return lines;
+            }
+            Some(ListNotice::Failed(error)) => {
+                lines.push(Line::from(Span::styled(
+                    truncate(error, width),
+                    Style::default().fg(palette::STATUS_ERROR),
+                )));
+                return lines;
+            }
+            None => {}
+        }
         lines.push(Line::from(Span::styled(
             tr(locale, MessageId::SessionsEmptyTitle),
             Style::default().fg(palette::TEXT_MUTED),
@@ -975,10 +1348,19 @@ fn build_list_lines(
         } else {
             "   ".to_string()
         };
-        let mut line = format!("{prefix}{}", format_session_line(session, locale));
+        // The row for the session the user is inside gets a text label, not
+        // colour alone — the same monochrome-safe convention as the
+        // archived/fork labels (#6014).
+        let is_current = current_session_id == Some(session.id.as_str());
+        let mut line = format!(
+            "{prefix}{}",
+            format_session_line(session, is_current, locale)
+        );
         line = truncate(&line, width);
         let style = if idx == selected {
             menu_style::selected_row_style()
+        } else if is_current {
+            Style::default().fg(palette::WHALE_ACTION)
         } else {
             Style::default().fg(palette::TEXT_PRIMARY)
         };
@@ -1003,7 +1385,15 @@ fn build_list_lines(
     lines
 }
 
-fn format_session_line(session: &SessionMetadata, locale: Locale) -> String {
+pub(super) fn format_message_count(count: usize, locale: Locale) -> String {
+    if locale == Locale::En && count == 1 {
+        "1 msg".to_string()
+    } else {
+        tr(locale, MessageId::SessionsMessageCountCompact).replace("{count}", &count.to_string())
+    }
+}
+
+fn format_session_line(session: &SessionMetadata, is_current: bool, locale: Locale) -> String {
     let age = format_relative_time(&session.updated_at, locale);
     let updated = crate::session_manager::format_session_updated_at(&session.updated_at, &age);
     let raw_title = extract_title(&session.title);
@@ -1017,8 +1407,7 @@ fn format_session_line(session: &SessionMetadata, locale: Locale) -> String {
         .as_deref()
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| tr(locale, MessageId::SessionsUnknownMode).into_owned());
-    let message_count = tr(locale, MessageId::SessionsMessageCountCompact)
-        .replace("{count}", &session.message_count.to_string());
+    let message_count = format_message_count(session.message_count, locale);
     let fork_label = if session.parent_session_id.is_some() {
         format!(" | {}", tr(locale, MessageId::SessionsForkCompact))
     } else {
@@ -1034,11 +1423,17 @@ fn format_session_line(session: &SessionMetadata, locale: Locale) -> String {
     } else {
         fork_label
     };
+    let current_label = if is_current {
+        format!(" | {}", tr(locale, MessageId::SessionsCurrentCompact))
+    } else {
+        String::new()
+    };
     format!(
-        "{} | {} | {}{} | {} | {}",
+        "{} | {} | {}{}{} | {} | {}",
         crate::session_manager::truncate_id(&session.id),
         title,
         message_count,
+        current_label,
         fork_label,
         mode,
         updated
@@ -1046,11 +1441,48 @@ fn format_session_line(session: &SessionMetadata, locale: Locale) -> String {
 }
 
 fn build_preview_lines(session: &SavedSession, locale: Locale) -> Vec<String> {
-    let mut out = Vec::new();
-    out.push(
+    // Runtime control traffic is persisted with `role = "user"` because strict
+    // chat templates reject any other role mid-conversation. Both surfaces that
+    // already render a session drop it on this same predicate -- the live
+    // transcript in `history_cells_from_message` and the read-only pane in
+    // `session_peek::build_peek`. Showing it here attributed the runtime's own
+    // bookkeeping to the person: an Operate session previewed as `USER:`
+    // followed by the whole `<codewhale:runtime_event kind="operate_contract">`
+    // envelope.
+    //
+    // Render the turns first so the header can count exactly what the body
+    // draws. Filtering alone is not enough: a message can survive the filter
+    // and still draw nothing, because `message_text_for_history` yields an
+    // empty string for a thinking-only assistant turn (and for a user turn
+    // that `extract_user_prompt` reduces to nothing). Counting the filtered
+    // vector instead of the rendered turns reintroduced the same
+    // unaccountable total this function exists to remove.
+    let mut rendered_turns = 0usize;
+    let mut body: Vec<String> = Vec::new();
+    for message in session
+        .messages
+        .iter()
+        .filter(|message| !crate::runtime_handoff::is_internal_runtime_handoff(message))
+    {
+        let text = message_text_for_history(message, locale);
+        if text.trim().is_empty() {
+            continue;
+        }
+        rendered_turns += 1;
+        body.push(format!("{}:", message.role.as_str().to_ascii_uppercase()));
+        for line in text.lines() {
+            body.push(format!("  {line}"));
+        }
+        body.push(String::new());
+    }
+
+    let mut out = vec![
         tr(locale, MessageId::SessionsPreviewTitle)
             .replace("{title}", extract_title(&session.metadata.title)),
-    );
+    ];
+    // The full id is the handle `codewhale exec --session` and `/resume`
+    // need — the list row only has room for the truncated form (#6014).
+    out.push(tr(locale, MessageId::SessionsPreviewId).replace("{id}", &session.metadata.id));
     out.push(
         tr(locale, MessageId::SessionsPreviewUpdated).replace(
             "{updated}",
@@ -1062,9 +1494,19 @@ fn build_preview_lines(session: &SavedSession, locale: Locale) -> Vec<String> {
                 .to_string(),
         ),
     );
+    // Count what the preview actually shows. `session_peek` already reports
+    // the conversation this way, for the same reason: a total the pane cannot
+    // account for is not a useful number. The persisted
+    // `metadata.message_count` stays untouched -- it is an index quantity
+    // (`forked_from_message_count` stores it as a position, and the
+    // empty-session tests key on it), not a display one.
+    //
+    // Known limitation: the list row still shows the persisted total, because
+    // rows are rendered from the session index without loading messages. For
+    // an Operate session the row can therefore read higher than the preview.
     out.push(
         tr(locale, MessageId::SessionsPreviewMessagesModel)
-            .replace("{count}", &session.metadata.message_count.to_string())
+            .replace("{count}", &rendered_turns.to_string())
             .replace("{model}", &session.metadata.model),
     );
     if let Some(mode) = session.metadata.mode.as_deref() {
@@ -1072,41 +1514,31 @@ fn build_preview_lines(session: &SavedSession, locale: Locale) -> Vec<String> {
     }
     out.push("".to_string());
 
-    for message in &session.messages {
-        let text = message_text_for_history(message, locale);
-        if text.trim().is_empty() {
-            continue;
-        }
-        out.push(format!("{}:", message.role.as_str().to_ascii_uppercase()));
-        for line in text.lines() {
-            out.push(format!("  {line}"));
-        }
-        out.push(String::new());
-    }
+    out.extend(body);
     if out.last().is_some_and(String::is_empty) {
         out.pop();
     }
     out
 }
 
-fn message_text_for_history(message: &crate::models::Message, locale: Locale) -> String {
+fn message_text_for_history(message: &codewhale_models::Message, locale: Locale) -> String {
     let mut text = String::new();
     for block in &message.content {
         let part = match block {
-            crate::models::ContentBlock::Text { text: body, .. } => {
+            codewhale_models::ContentBlock::Text { text: body, .. } => {
                 if message.role == Role::User {
                     extract_user_prompt(body).to_string()
                 } else {
                     strip_thinking_tags(body)
                 }
             }
-            crate::models::ContentBlock::Thinking { .. } => String::new(),
-            crate::models::ContentBlock::ToolUse { name, input, .. } => {
+            codewhale_models::ContentBlock::Thinking { .. } => String::new(),
+            codewhale_models::ContentBlock::ToolUse { name, input, .. } => {
                 tr(locale, MessageId::SessionsToolCall)
                     .replace("{name}", name)
                     .replace("{input}", &truncate(&input.to_string(), 180))
             }
-            crate::models::ContentBlock::ToolResult {
+            codewhale_models::ContentBlock::ToolResult {
                 content, is_error, ..
             } => {
                 let id = if is_error.unwrap_or(false) {
@@ -1116,17 +1548,17 @@ fn message_text_for_history(message: &crate::models::Message, locale: Locale) ->
                 };
                 tr(locale, id).replace("{content}", &truncate(&content.replace('\n', " "), 220))
             }
-            crate::models::ContentBlock::ServerToolUse { name, input, .. } => {
+            codewhale_models::ContentBlock::ServerToolUse { name, input, .. } => {
                 tr(locale, MessageId::SessionsServerTool)
                     .replace("{name}", name)
                     .replace("{input}", &truncate(&input.to_string(), 180))
             }
-            crate::models::ContentBlock::ToolSearchToolResult { content, .. }
-            | crate::models::ContentBlock::CodeExecutionToolResult { content, .. } => {
+            codewhale_models::ContentBlock::ToolSearchToolResult { content, .. }
+            | codewhale_models::ContentBlock::CodeExecutionToolResult { content, .. } => {
                 tr(locale, MessageId::SessionsToolResult)
                     .replace("{content}", &truncate(&content.to_string(), 220))
             }
-            crate::models::ContentBlock::ImageUrl { .. } => {
+            codewhale_models::ContentBlock::ImageUrl { .. } => {
                 tr(locale, MessageId::SessionsImage).into_owned()
             }
         };
@@ -1267,6 +1699,7 @@ mod tests {
             cost: crate::session_manager::SessionCostSnapshot::default(),
             parent_session_id: None,
             forked_from_message_count: None,
+            runtime_store: None,
             cumulative_turn_secs: 0,
             archived: false,
             spawn_depth: 0,
@@ -1279,17 +1712,17 @@ mod tests {
         s
     }
 
-    fn text_message(role: &str, text: &str) -> crate::models::Message {
-        crate::models::Message {
+    fn text_message(role: &str, text: &str) -> codewhale_models::Message {
+        codewhale_models::Message {
             role: Role::from(role),
-            content: vec![crate::models::ContentBlock::Text {
+            content: vec![codewhale_models::ContentBlock::Text {
                 text: text.to_string(),
                 cache_control: None,
             }],
         }
     }
 
-    fn saved_session_with_messages(messages: Vec<crate::models::Message>) -> SavedSession {
+    fn saved_session_with_messages(messages: Vec<codewhale_models::Message>) -> SavedSession {
         let mut session = crate::session_manager::create_saved_session(
             &messages,
             "deepseek-v4-pro",
@@ -1305,6 +1738,8 @@ mod tests {
         let workspace_scope = scope.map(PathBuf::from);
         let mut view = SessionPickerView {
             sessions: sessions.clone(),
+            pending_list: None,
+            load_error: None,
             filtered: sessions,
             selected: 0,
             list_scroll: Cell::new(0),
@@ -1315,8 +1750,10 @@ mod tests {
             search_input: String::new(),
             search_mode: false,
             sort_mode: SessionSortMode::Recent,
-            preview_cache: HashMap::new(),
+            preview_cache: PreviewCache::default(),
             current_preview: Vec::new(),
+            preview_generation: 0,
+            pending_preview: None,
             confirm_delete: false,
             rename_mode: false,
             rename_input: String::new(),
@@ -1324,11 +1761,66 @@ mod tests {
             workspace_scope,
             show_all_workspaces: false,
             show_archived: false,
+            hide_empty_sessions: true,
+            current_session_id: None,
             last_row_hitboxes: RefCell::new(Vec::new()),
             locale: Locale::En,
         };
         view.apply_sort_and_filter();
         view
+    }
+
+    /// Deleting the session open in this window would leave it unable to
+    /// save anything afterwards, with nothing on screen saying so.
+    #[test]
+    fn delete_refuses_the_session_open_here() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut saved = saved_session_with_messages(vec![text_message("user", "hello")]);
+        saved.metadata.id = "session-open-here".to_string();
+        manager.save_session(&saved).expect("save session");
+        let mut view = picker_with(vec![saved.metadata.clone()], None);
+        view.current_session_id = Some("session-open-here".to_string());
+
+        assert!(view.delete_selected().is_none(), "no deletion event");
+
+        assert_eq!(
+            view.status.as_deref(),
+            Some(tr(view.locale, MessageId::SessionsDeleteOpenHere).as_ref())
+        );
+        assert_eq!(view.sessions.len(), 1, "the row stays listed");
+        assert!(
+            manager.load_session("session-open-here").is_ok(),
+            "the document is not deleted"
+        );
+    }
+
+    /// A session another Codewhale window holds open would be written back
+    /// by that window's next autosave, so deleting it here is refused.
+    #[test]
+    fn delete_refuses_a_session_open_in_another_window() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut saved = saved_session_with_messages(vec![text_message("user", "hello")]);
+        saved.metadata.id = "session-open-elsewhere".to_string();
+        manager.save_session(&saved).expect("save session");
+        let _lease = manager.hold_live_lease_elsewhere("session-open-elsewhere");
+        let mut view = picker_with(vec![saved.metadata.clone()], None);
+
+        assert!(view.delete_selected().is_none(), "no deletion event");
+
+        assert_eq!(
+            view.status.as_deref(),
+            Some(tr(view.locale, MessageId::SessionsDeleteOpenElsewhere).as_ref())
+        );
+        assert!(
+            manager.load_session("session-open-elsewhere").is_ok(),
+            "the document is not deleted"
+        );
     }
 
     #[test]
@@ -1342,8 +1834,24 @@ mod tests {
         saved.metadata.title = "Before".to_string();
         manager.save_session(&saved).expect("save session");
         let mut view = picker_with(vec![saved.metadata.clone()], None);
+        assert!(
+            view.current_preview
+                .iter()
+                .any(|line| line == "Title: Before"),
+            "{:?}",
+            view.current_preview
+        );
 
         let action = view.rename_selected("After");
+        // U08-09: the cached preview rendered the old title; it must not be
+        // shown again after the rename.
+        assert!(
+            view.current_preview
+                .iter()
+                .any(|line| line == "Title: After"),
+            "{:?}",
+            view.current_preview
+        );
 
         let ViewAction::Emit(ViewEvent::SessionRenamed { metadata }) = action else {
             panic!("expected SessionRenamed event");
@@ -1467,6 +1975,248 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_auto_created_sessions_stay_out_of_the_default_view() {
+        let mut empty = test_session(0, crate::session_manager::DEFAULT_SESSION_TITLE);
+        empty.message_count = 0;
+        let view = SessionPickerView::new_with_sessions(
+            std::path::Path::new("/tmp"),
+            Locale::En,
+            vec![test_session(1, "Real work"), empty],
+        );
+
+        assert_eq!(
+            view.visible_session_ids(),
+            vec!["session-01".to_string()],
+            "a session with no messages has nothing to resume (#6014)"
+        );
+    }
+
+    #[test]
+    fn preselecting_an_empty_row_widens_the_empty_filter_only() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut saved = saved_session_with_messages(vec![]);
+        saved.metadata.id = "session-01".to_string();
+        saved.metadata.title = crate::session_manager::DEFAULT_SESSION_TITLE.to_string();
+        saved.metadata.message_count = 0;
+        saved.metadata.workspace.clone_from(&workspace);
+        manager.save_session(&saved).expect("save session");
+
+        let view = SessionPickerView::new_selecting(&workspace, Locale::En, "session-01");
+
+        assert_eq!(
+            view.selected_session().map(|s| s.id.as_str()),
+            Some("session-01"),
+            "an explicit handoff must still land on a hidden empty row (#6014)"
+        );
+        assert!(
+            !view.hide_empty_sessions,
+            "the empty-session filter had to be lifted to reach the row"
+        );
+    }
+
+    #[test]
+    fn current_session_row_carries_a_text_label() {
+        let sessions = vec![
+            test_session(1, "first session"),
+            test_session(2, "second session"),
+        ];
+        let lines = build_list_lines(
+            &sessions,
+            1,
+            80,
+            0,
+            5,
+            false,
+            "",
+            "recent",
+            false,
+            false,
+            "",
+            None,
+            None,
+            Some("session-01"),
+            Locale::En,
+        );
+        let row_for = |needle: &str| {
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.to_string())
+                        .collect::<String>()
+                })
+                .find(|text| text.contains(needle))
+                .unwrap_or_default()
+        };
+        assert!(
+            row_for("first session").contains("current"),
+            "the active row needs a monochrome-safe label (#6014): {:?}",
+            row_for("first session")
+        );
+        assert!(!row_for("second session").contains("current"));
+    }
+
+    #[test]
+    fn preview_lists_the_full_session_id() {
+        let mut saved = saved_session_with_messages(vec![text_message("user", "hi")]);
+        saved.metadata.id = "session-with-a-long-identifier".to_string();
+        let lines = build_preview_lines(&saved, Locale::En);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("session-with-a-long-identifier")),
+            "the row truncates the id; the preview is where the full handle lives (#6014)"
+        );
+    }
+
+    /// The preview is a read-only view of a saved session, and runtime
+    /// control traffic rides `role = "user"` on disk. Rendering it verbatim
+    /// opened every Operate-mode preview with `USER:` and the whole internal
+    /// `operate_contract` envelope, attributing the runtime's own bookkeeping
+    /// to the person.
+    #[test]
+    fn preview_hides_internal_runtime_traffic() {
+        let saved = saved_session_with_messages(vec![
+            crate::runtime_handoff::operate_contract_runtime_message(),
+            text_message("user", "ship the release"),
+            text_message("assistant", "on it"),
+        ]);
+
+        let preview = build_preview_lines(&saved, Locale::En).join("\n");
+
+        assert!(
+            !preview.contains("codewhale:runtime_event"),
+            "internal runtime traffic must not be shown to a person: {preview}"
+        );
+        assert!(
+            !preview.contains("Input provenance:"),
+            "the runtime provenance envelope must not leak either: {preview}"
+        );
+        assert!(
+            preview.contains("ship the release") && preview.contains("on it"),
+            "the person's own conversation still belongs in the preview: {preview}"
+        );
+        // The header must count what the body shows. The persisted
+        // `metadata.message_count` is 3 here (it counts the runtime event);
+        // printing that beside two visible turns is a total the pane cannot
+        // account for.
+        assert_eq!(
+            saved.metadata.message_count, 3,
+            "guard the premise: the persisted count still includes runtime traffic"
+        );
+        assert!(
+            preview.contains("Messages: 2"),
+            "the preview counts the conversation it renders, not the persisted \
+             total: {preview}"
+        );
+    }
+
+    /// The header must count the turns the body actually draws, not the
+    /// messages that merely survived the runtime-traffic filter. A
+    /// thinking-only assistant turn renders nothing (`message_text_for_history`
+    /// yields an empty string for `ContentBlock::Thinking`), so counting the
+    /// filtered vector printed a total the pane could not account for --
+    /// the same defect the filter was added to remove.
+    #[test]
+    fn preview_count_excludes_turns_that_render_nothing() {
+        let thinking_only = codewhale_models::Message {
+            role: Role::from("assistant"),
+            content: vec![codewhale_models::ContentBlock::Thinking {
+                thinking: "silent deliberation".to_string(),
+                signature: None,
+                state: None,
+            }],
+        };
+        let saved = saved_session_with_messages(vec![
+            crate::runtime_handoff::operate_contract_runtime_message(),
+            thinking_only,
+            text_message("user", "ship the release"),
+            text_message("assistant", "on it"),
+        ]);
+
+        let preview = build_preview_lines(&saved, Locale::En).join("\n");
+
+        assert!(
+            preview.contains("Messages: 2"),
+            "two turns are drawn, so the header must say two: {preview}"
+        );
+        assert!(
+            !preview.contains("silent deliberation"),
+            "a thinking block is not a rendered turn: {preview}"
+        );
+        // The rendered `ROLE:` headings are the ground truth for the count.
+        let drawn = preview
+            .lines()
+            .filter(|line| *line == "USER:" || *line == "ASSISTANT:")
+            .count();
+        assert_eq!(drawn, 2, "header count must equal drawn turns: {preview}");
+    }
+
+    #[test]
+    fn page_keys_page_the_list_and_clamp_at_the_end() {
+        let sessions: Vec<SessionMetadata> = (0..20)
+            .map(|i| test_session(i, &format!("work {i}")))
+            .collect();
+        let mut view = picker_with(sessions, None);
+        // Seed the preview cache so refresh_preview never reaches the store.
+        for session in &view.sessions {
+            view.preview_cache
+                .insert(session.id.clone(), vec!["preview".to_string()]);
+        }
+
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(view.selected, 8, "one viewport of eight rows");
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(view.selected, 16);
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(view.selected, 19, "paging clamps at the last row");
+        view.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(view.selected, 11);
+    }
+
+    /// #6290 step 2: the picker navigates on the shared `list_nav` vocabulary,
+    /// so Home/End exist here and the `j`/`k` aliases keep working — the two
+    /// behaviors this surface previously hand-rolled (or lacked).
+    #[test]
+    fn home_end_and_letter_aliases_come_from_the_shared_vocabulary() {
+        let sessions: Vec<SessionMetadata> = (0..20)
+            .map(|i| test_session(i, &format!("work {i}")))
+            .collect();
+        let mut view = picker_with(sessions, None);
+        for session in &view.sessions {
+            view.preview_cache
+                .insert(session.id.clone(), vec!["preview".to_string()]);
+        }
+
+        view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(view.selected, 19, "End lands on the last row");
+        view.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(view.selected, 0, "Home lands on the first row");
+        view.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(view.selected, 1, "`j` is still the Down alias");
+        view.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(view.selected, 0, "`k` is still the Up alias");
+    }
+
+    #[test]
+    fn shift_page_keys_still_scroll_the_history_preview() {
+        let mut view = picker_with(vec![test_session(1, "only session")], None);
+        view.current_preview = (0..30).map(|i| format!("line {i}")).collect();
+        view.history_visible_rows.set(10);
+
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
+        assert_eq!(view.history_scroll.get(), 10);
+        view.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert_eq!(view.history_scroll.get(), 0);
+    }
+
     fn buffer_row_text(buf: &Buffer, area: Rect, y: u16) -> String {
         (area.x..area.x.saturating_add(area.width))
             .map(|x| buf[(x, y)].symbol())
@@ -1561,6 +2311,8 @@ mod tests {
             false,
             "",
             None,
+            None,
+            None,
             Locale::En,
         );
 
@@ -1591,6 +2343,8 @@ mod tests {
             false,
             false,
             "",
+            None,
+            None,
             None,
             Locale::En,
         );
@@ -1746,11 +2500,11 @@ mod tests {
 
             let dump = buffer_text(&buf, area);
             assert!(
-                dump.contains("sessions (1-9)"),
+                dump.contains("sessions (1-9, PgUp/PgDn)"),
                 "{label} sessions pane missing:\n{dump}"
             );
             assert!(
-                dump.contains("history (PgUp/PgDn)"),
+                dump.contains("history (Shift+PgUp/PgDn)"),
                 "{label} history pane missing:\n{dump}"
             );
             assert!(dump.contains('─'), "{label} hairline missing:\n{dump}");
@@ -1797,6 +2551,8 @@ mod tests {
             false,
             "",
             None,
+            None,
+            None,
             Locale::En,
         );
 
@@ -1830,6 +2586,8 @@ mod tests {
             false,
             "",
             None,
+            None,
+            None,
             Locale::En,
         );
 
@@ -1861,6 +2619,8 @@ mod tests {
             false,
             false,
             "",
+            None,
+            None,
             None,
             Locale::En,
         );
@@ -1994,6 +2754,8 @@ mod tests {
 
         let mut view = SessionPickerView {
             sessions: sessions.clone(),
+            pending_list: None,
+            load_error: None,
             filtered: sessions,
             selected: 0,
             list_scroll: Cell::new(0),
@@ -2004,8 +2766,10 @@ mod tests {
             search_input: String::new(),
             search_mode: false,
             sort_mode: SessionSortMode::Recent,
-            preview_cache: HashMap::new(),
+            preview_cache: PreviewCache::default(),
             current_preview: Vec::new(),
+            preview_generation: 0,
+            pending_preview: None,
             confirm_delete: false,
             rename_mode: false,
             rename_input: String::new(),
@@ -2013,6 +2777,8 @@ mod tests {
             workspace_scope: None,
             show_all_workspaces: true,
             show_archived: false,
+            hide_empty_sessions: false,
+            current_session_id: None,
             last_row_hitboxes: RefCell::new(Vec::new()),
             locale: Locale::En,
         };
@@ -2089,5 +2855,187 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Drive `tick` until the background preview load has been applied.
+    fn wait_for_preview(view: &mut SessionPickerView) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while view.pending_preview.is_some() {
+            view.tick();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preview load never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn select_id(view: &mut SessionPickerView, id: &str) {
+        view.selected = view
+            .filtered
+            .iter()
+            .position(|session| session.id == id)
+            .expect("session listed");
+    }
+
+    #[test]
+    fn preview_cache_is_a_bounded_lru() {
+        let mut cache = PreviewCache::default();
+        for idx in 0..PREVIEW_CACHE_CAPACITY {
+            cache.insert(format!("s{idx}"), vec![format!("line {idx}")]);
+        }
+        // Touch the oldest so it survives the next eviction.
+        assert!(cache.get("s0").is_some());
+        cache.insert("new".to_string(), vec!["new".to_string()]);
+        assert_eq!(cache.len(), PREVIEW_CACHE_CAPACITY);
+        assert!(cache.get("s0").is_some(), "recently used entry survives");
+        assert!(cache.get("s1").is_none(), "least recently used is evicted");
+        for idx in 0..40 {
+            cache.insert(format!("more{idx}"), Vec::new());
+        }
+        assert_eq!(cache.len(), PREVIEW_CACHE_CAPACITY);
+    }
+
+    /// Selecting a session must not read and parse its transcript on the
+    /// event loop: inside a runtime the pane shows a loading placeholder at
+    /// once, and the transcript arrives through `tick`. A load that finishes
+    /// after the selection moved on is never shown.
+    #[tokio::test]
+    async fn preview_loads_off_the_event_loop_and_drops_stale_results() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut first = saved_session_with_messages(vec![text_message("user", "alpha body")]);
+        first.metadata.id = "session-alpha".to_string();
+        let mut second = saved_session_with_messages(vec![text_message("user", "beta body")]);
+        second.metadata.id = "session-beta".to_string();
+        manager.save_session(&first).expect("save first");
+        manager.save_session(&second).expect("save second");
+        let mut view = picker_with(vec![first.metadata.clone(), second.metadata.clone()], None);
+
+        select_id(&mut view, "session-alpha");
+        view.refresh_preview();
+        assert!(
+            view.pending_preview.is_some(),
+            "load must run in the background"
+        );
+        assert!(
+            view.current_preview.iter().any(|line| line == "\u{2026}")
+                && view
+                    .current_preview
+                    .iter()
+                    .any(|line| line.contains("session-alpha")),
+            "placeholder names the session and marks the pending body: {:?}",
+            view.current_preview
+        );
+        let alpha_generation = view.preview_generation;
+
+        // Move on before alpha lands: alpha's result must never be shown.
+        select_id(&mut view, "session-beta");
+        view.refresh_preview();
+        assert_ne!(view.preview_generation, alpha_generation);
+        wait_for_preview(&mut view);
+        let shown = view.current_preview.join("\n");
+        assert!(shown.contains("beta body"), "{shown}");
+        assert!(!shown.contains("alpha body"), "{shown}");
+
+        // Returning to alpha loads it again, and a second visit is cached.
+        select_id(&mut view, "session-alpha");
+        view.refresh_preview();
+        wait_for_preview(&mut view);
+        assert!(view.current_preview.join("\n").contains("alpha body"));
+        select_id(&mut view, "session-beta");
+        view.refresh_preview();
+        assert!(
+            view.pending_preview.is_none(),
+            "a cached preview is shown without another load"
+        );
+        assert!(view.current_preview.join("\n").contains("beta body"));
+    }
+
+    /// A preview that lands in the background must repaint the frame on its
+    /// own; otherwise the placeholder stays up until the next key press.
+    #[tokio::test]
+    async fn landed_preview_requests_a_redraw_through_the_view_stack() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut saved = saved_session_with_messages(vec![text_message("user", "gamma body")]);
+        saved.metadata.id = "session-gamma".to_string();
+        manager.save_session(&saved).expect("save session");
+        let mut view = picker_with(vec![saved.metadata.clone()], None);
+        select_id(&mut view, "session-gamma");
+        view.refresh_preview();
+        assert!(
+            view.pending_preview.is_some(),
+            "load runs in the background"
+        );
+
+        let mut stack = crate::tui::views::ViewStack::new();
+        stack.push(view);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut redraws = 0;
+        loop {
+            let tick = stack.tick();
+            assert!(tick.events.is_empty(), "a preview load emits no event");
+            if tick.redraw {
+                redraws += 1;
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preview load never requested a redraw"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(redraws, 1);
+        assert!(
+            !stack.tick().redraw,
+            "an idle tick after the preview landed must not keep repainting"
+        );
+    }
+
+    /// U08-09: a session store that cannot be listed is reported as such,
+    /// never painted as "No saved sessions yet".
+    #[test]
+    fn unreadable_session_store_is_reported_not_shown_empty() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A regular file where the store directory belongs cannot be listed.
+        std::fs::write(tmp.path().join("sessions"), b"not a directory").expect("file");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let view = SessionPickerView::new(tmp.path(), Locale::En);
+        assert!(view.load_error.is_some(), "the listing failure was dropped");
+        let lines = build_list_lines(
+            &view.filtered,
+            0,
+            120,
+            0,
+            5,
+            false,
+            "",
+            "recent",
+            false,
+            false,
+            "",
+            None,
+            view.list_notice(),
+            None,
+            Locale::En,
+        );
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Could not open sessions"), "{text}");
+        assert!(!text.contains("No saved sessions yet"), "{text}");
     }
 }

@@ -90,3 +90,34 @@ grep -Fq "fresh_shell_codew=${dest_dir}/codew" "${receipt}"
 grep -Fq "installed_path=${dest_dir}/codew" "${receipt}"
 
 echo "install-dogfood tests passed"
+
+# A shell fixture cannot expose codesign's filename-derived identities. Run
+# the actual installer on a native Mach-O and require one signed artifact for
+# both command names, as the updater's sibling-ownership guard requires.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  cat >"${tmp_dir}/native.c" <<EOF
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    puts("codewhale 0.9.1 (${source_sha})");
+    return 0;
+  }
+  return 2;
+}
+EOF
+  /usr/bin/cc "${tmp_dir}/native.c" -o "${src_dir}/codewhale"
+  PATH="${fake_bin}:${PATH}" \
+  DOGFOOD_TEST_DEST="${dest_dir}" \
+  DOGFOOD_TEST_MARKER="${marker}" \
+  CODEWHALE_INSTALL_DIRS="${dest_dir}" \
+  CODEWHALE_DOGFOOD_RECEIPT_DIR="${receipt_dir}" \
+    "${fixture}/scripts/release/install-dogfood.sh" "${src_dir}" >/dev/null
+  cmp -s "${dest_dir}/codewhale" "${dest_dir}/codew" || {
+    echo "native dogfood aliases acquired different code signatures" >&2
+    exit 1
+  }
+  codesign --verify --strict "${dest_dir}/codewhale"
+  codesign --verify --strict "${dest_dir}/codew"
+  echo "native macOS dogfood identity test passed"
+fi

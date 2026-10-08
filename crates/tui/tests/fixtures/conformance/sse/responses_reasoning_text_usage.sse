@@ -1,0 +1,27 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_conf","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_conf","summary":[]}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_conf","output_index":0,"summary_index":0,"delta":"Checking the date format."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_conf","summary":[{"type":"summary_text","text":"Checking the date format."}],"encrypted_content":"ZW5jcnlwdGVkLWZpeHR1cmU="}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_conf","role":"assistant","content":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_conf","output_index":1,"content_index":0,"delta":"ISO 8601"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_conf","output_index":1,"content_index":0,"delta":" it is."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_conf","role":"assistant","content":[{"type":"output_text","text":"ISO 8601 it is."}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_conf","status":"completed","usage":{"input_tokens":30,"input_tokens_details":{"cached_tokens":10},"output_tokens":12,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":42}}}
+

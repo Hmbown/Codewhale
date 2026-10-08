@@ -31,9 +31,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
           package-manager-cache: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable 2026-07-18
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable 2026-07-18
         with:
           toolchain: stable
       - name: Match dispatch to the requested commit
@@ -69,8 +69,13 @@ jobs:
           echo "sha=${actual}" >> "${GITHUB_OUTPUT}"
           echo "version=${workspace_version}" >> "${GITHUB_OUTPUT}"
       - name: Check version and OHOS release contracts
+        # --require-dated-release, as auto-tag.yml and release.yml run it:
+        # release.yml only accepts an RC receipt for the exact tag SHA, so an
+        # RC on an undated "Unreleased candidate" changelog could never
+        # authorize a release. Fail here, before the long parity and artifact
+        # builds, instead of at tag time.
         run: |
-          ./scripts/release/check-versions.sh
+          ./scripts/release/check-versions.sh --require-dated-release
           ./scripts/release/check-ohos-deps.sh
       - name: Reconfirm clean source snapshot
         run: git diff --exit-code
@@ -88,6 +93,13 @@ jobs:
       # resolve already proved expected_sha equals GITHUB_SHA. Do not
       # interpolate that SHA into checkout or the npm cache key.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # `check:facts` derives each model's `addedAt` from the commit date
+          # on which its id first appeared in the model declaration paths
+          # (web/scripts/facts-lib.mjs). A shallow checkout collapses every
+          # date to the tip commit and the committed facts always read as
+          # stale; web.yml and ci.yml pin depth 0 for the same reason.
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -95,26 +107,33 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Install web dependencies
         run: npm ci
-      - name: Check public facts drift
-        run: npm run check:facts
-      - name: Generate derived facts
-        run: npm run prebuild
-      - name: Check public docs parity
-        run: npm run check:docs
       - name: Run web tests
         run: npm test
-      - name: Run web lint
-        run: npm run lint
-      - name: Run web type check
-        run: npx tsc --noEmit
-      - name: Build production web surface
-        run: npm run build
+      - name: Check exact candidate web surface
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run check
+
+  parity:
+    # The same gate release.yml runs before publish. release.yml refuses a tag
+    # unless an RC run for that exact SHA has this job green
+    # (scripts/release/require-rc-receipt.sh matches the "Parity" name).
+    name: Parity
+    needs: resolve
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
+    uses: ./.github/workflows/release-parity.yml
 
   artifacts:
+    permissions:
+      contents: read
+      actions: read
     needs: [resolve, web]
     if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.web.result == 'success' }}
     uses: ./.github/workflows/release-artifacts.yml
     with:
       source_sha: ${{ needs.resolve.outputs.sha }}
       version: ${{ needs.resolve.outputs.version }}
+      compiled_host_delivery: ${{ vars.CODEWHALE_COMPILED_HOST_DELIVERY == '1' }}
+      compiled_host_run_id: ${{ vars.CODEWHALE_COMPILED_HOST_QUALIFICATION_RUN_ID || '' }}
+      compiled_host_targets: ${{ vars.CODEWHALE_COMPILED_HOST_TARGETS || 'linux-x64,macos-arm64,windows-x64' }}
       retention_days: 7

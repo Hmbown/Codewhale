@@ -45,7 +45,10 @@ pub fn handle_file_tree_key(app: &mut App, key: &KeyEvent) -> bool {
             if let Some(rel_path) = file_tree.activate() {
                 let path_str = rel_path.to_string_lossy().to_string();
                 app.status_message = Some(format!("Attached @{path_str}"));
-                app.insert_str(&format!("@{path_str} "));
+                app.insert_str(&format!(
+                    "@{} ",
+                    crate::tui::file_mention::file_mention_body(&path_str)
+                ));
             } else {
                 app.needs_redraw = true;
             }

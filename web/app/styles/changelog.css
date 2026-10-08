@@ -1,0 +1,92 @@
+/* ------------------------------------------------------------------ */
+/*  Changelog — each release is a receipt                               */
+/* ------------------------------------------------------------------ */
+
+.changelog-list { display: grid; gap: var(--space-5); }
+
+.changelog-release {
+  padding: clamp(1.25rem, 3vw, 1.75rem);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-surface);
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+}
+
+.changelog-release-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-5);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.changelog-release-head h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-title);
+  font-variant-numeric: tabular-nums;
+}
+.changelog-release-head h2 svg { width: 1.25rem; height: 1.25rem; color: var(--accent); }
+
+.changelog-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  color: var(--muted);
+  font-size: var(--text-caption);
+}
+.changelog-links a { color: var(--accent); }
+.changelog-links a:hover { text-decoration: underline; text-underline-offset: 0.2em; }
+
+.changelog-unreleased-note {
+  max-width: 44rem;
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: var(--text-ui);
+  line-height: 1.6;
+}
+
+.changelog-sections { display: grid; gap: var(--space-5); margin-top: var(--space-5); }
+
+.changelog-sections h3 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  color: var(--muted);
+  font-size: var(--text-caption);
+  font-weight: 600;
+}
+.changelog-sections h3 a { color: var(--muted); font-weight: 500; }
+.changelog-sections h3 a:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 0.2em; }
+
+.changelog-sections ul { display: grid; margin-top: var(--space-2); }
+.changelog-sections li {
+  position: relative;
+  min-width: 0;
+  padding: var(--space-2) 0 var(--space-2) var(--space-5);
+  color: var(--text);
+  font-size: var(--text-ui);
+  line-height: 1.6;
+  /* Release notes quote commands, env names and URLs verbatim; a long
+     unbroken token wraps inside the column, never widens the page. */
+  overflow-wrap: anywhere;
+}
+.changelog-sections li + li { border-top: 1px solid var(--line); }
+.changelog-sections li::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 0.375rem;
+  top: 1.05em;
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: var(--radius-pill);
+  background: var(--line-strong);
+}
+
+.changelog-facts { max-width: 44rem; }
+.changelog-facts dd { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); }
+.changelog-facts dd > .status:first-child { display: inline-flex; margin: 0; font-size: var(--text-ui); }
+.changelog-links a { display: inline-flex; align-items: center; gap: 0.25rem; }

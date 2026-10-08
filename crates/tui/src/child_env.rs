@@ -51,6 +51,46 @@ where
     }
     #[cfg(windows)]
     fill_windows_common_program_files(&mut env);
+    // OS sandboxes set CODEWHALE_SANDBOX (seatbelt / bwrap / windows). sccache
+    // and other RUSTC_WRAPPER compilers need sockets or files those sandboxes
+    // deny, so nested `cargo` fails with "Operation not permitted" before any
+    // crate compiles (seen on macOS CI seatbelt). Drop the wrapper so rustc
+    // still runs under the sandbox; unsandboxed children keep it.
+    if env
+        .iter()
+        .any(|(key, _)| normalize_key(key) == "CODEWHALE_SANDBOX")
+    {
+        env.retain(|(key, _)| normalize_key(key) != "RUSTC_WRAPPER");
+    }
+    env
+}
+
+/// Environment for a Codewhale runtime child (a Fleet worker), built from a
+/// snapshot of the parent environment.
+///
+/// It uses the same allowlist as [`sanitized_child_env`], so provider keys and
+/// other secret-shaped variables are dropped, with one deliberate difference:
+/// proxy URLs keep their `user:password@` part. The runtime child is Codewhale
+/// itself, not a model-chosen program, and must reach its provider through the
+/// same authenticated proxy as the parent. Every tool it starts builds its own
+/// environment through [`sanitized_child_env`], which strips that userinfo at
+/// the model-facing boundary.
+pub fn sanitized_runtime_env_from<B, K, V>(base_environment: B) -> Vec<(OsString, OsString)>
+where
+    B: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut env = Vec::new();
+    for (key, value) in base_environment {
+        if is_allowed_parent_env_key(key.as_ref()) {
+            upsert_env(
+                &mut env,
+                key.as_ref().to_os_string(),
+                value.as_ref().to_os_string(),
+            );
+        }
+    }
     env
 }
 
@@ -78,6 +118,45 @@ where
     }
 }
 
+/// Parent variables git needs beyond the base allowlist: the ssh agent for
+/// remote transports, where the user's global config lives, a pinned ssh
+/// transport, and author/committer identity. None of them is a secret value.
+const GIT_PASSTHROUGH_KEYS: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "GNUPGHOME",
+    "XDG_CONFIG_HOME",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_EXEC_PATH",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+];
+
+/// Start a git child from the sanitized environment plus
+/// [`GIT_PASSTHROUGH_KEYS`]. Repository config (`core.fsmonitor`, hooks,
+/// filters, `core.sshCommand`) can make any git command run a program chosen
+/// by whoever wrote the workspace, so git must not hand that program the
+/// parent's credentials.
+pub fn apply_to_git_command(cmd: &mut std::process::Command) {
+    let passthrough: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| {
+            let normalized = normalize_key(key);
+            GIT_PASSTHROUGH_KEYS.contains(&normalized.as_str())
+        })
+        .collect();
+    apply_to_command(cmd, passthrough);
+}
+
 #[cfg(not(target_env = "ohos"))]
 pub fn apply_to_pty_command<I, K, V>(cmd: &mut portable_pty::CommandBuilder, overrides: I)
 where
@@ -99,8 +178,10 @@ where
 /// `npx ...` / `uvx ...` / `python -m mcp_server_*` setups (#1244), the
 /// MCP-launch allowlist is wider than the base shell-tool allowlist: it
 /// also passes through Node, npm, Python, Ruby, Java, proxy, and CA-bundle
-/// bootstrap variables. It still drops arbitrary parent env so secret-bearing
-/// vars (`AWS_*`, `*_API_KEY`, `GITHUB_TOKEN`, …) are not silently exported.
+/// bootstrap variables, plus the non-secret AWS profile/region/config-path
+/// selectors. It still drops arbitrary parent env so secret-bearing vars
+/// (AWS keys and session tokens, `*_API_KEY`, `GITHUB_TOKEN`, …) are not
+/// silently exported.
 pub fn sanitized_mcp_env<I, K, V>(overrides: I) -> Vec<(OsString, OsString)>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -200,6 +281,16 @@ fn is_allowed_parent_env_key(key: &OsStr) -> bool {
     matches!(
         normalized.as_str(),
         "PATH"
+            // Desktop connection metadata. Computer-use tools must reach
+            // the existing X11/Wayland and accessibility bus sessions. Keep
+            // this list exact; never inherit arbitrary XDG/DBUS namespaces
+            // or read the Xauthority credential file into the environment.
+            | "DISPLAY"
+            | "WAYLAND_DISPLAY"
+            | "XDG_RUNTIME_DIR"
+            | "XDG_SESSION_TYPE"
+            | "DBUS_SESSION_BUS_ADDRESS"
+            | "XAUTHORITY"
             | "HOME"
             | "USER"
             | "USERNAME"
@@ -284,12 +375,92 @@ fn is_allowed_parent_env_key(key: &OsStr) -> bool {
             | "CARGO_HOME"
             | "RUSTUP_HOME"
             | "RUSTUP_TOOLCHAIN"
+            // Non-secret build and toolchain configuration. Model-run
+            // builds and tests (`run_tests`, verifier and task gates,
+            // language servers) must honour the same target dir, job limit,
+            // flags, active virtualenv and CA bundle as the user's own shell;
+            // dropping them caused full rebuilds, lost memory limits and TLS
+            // failures. `CARGO_*` is handled below without its secret-shaped
+            // and registry keys. Connection strings such as `DATABASE_URL`
+            // stay out: they usually embed a password. `RUSTC_WRAPPER` is
+            // kept for unsandboxed children only; see the CODEWHALE_SANDBOX
+            // scrub in `sanitized_child_env`.
+            | "RUSTFLAGS"
+            | "RUSTDOCFLAGS"
+            | "RUSTC_WRAPPER"
+            | "RUST_BACKTRACE"
+            | "RUST_LOG"
+            | "RUST_MIN_STACK"
+            | "RUST_TEST_THREADS"
+            | "VIRTUAL_ENV"
+            | "CONDA_PREFIX"
+            | "CONDA_DEFAULT_ENV"
+            | "PYTHONPATH"
+            | "JAVA_HOME"
+            | "GOPATH"
+            | "GOROOT"
+            | "GOBIN"
+            | "GOFLAGS"
+            | "GOCACHE"
+            | "GOMODCACHE"
+            | "GOTOOLCHAIN"
+            | "GO111MODULE"
+            | "NVM_DIR"
+            | "NVM_BIN"
+            | "NVM_INC"
+            | "VOLTA_HOME"
+            | "NODE_PATH"
+            | "NODE_OPTIONS"
+            | "NODE_EXTRA_CA_CERTS"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "REQUESTS_CA_BUNDLE"
+            | "CURL_CA_BUNDLE"
     ) || normalized.starts_with("LC_")
+        || is_allowed_cargo_config_key(&normalized)
         // .NET CLI / SDK configuration (DOTNET_ROOT, DOTNET_CLI_*,
         // DOTNET_NOLOGO, DOTNET_CLI_TELEMETRY_OPTOUT, …). Paths and flags
         // only — no secret-shaped values (#1857).
         || normalized.starts_with("DOTNET_")
         || is_allowed_platform_path_like_child_env_key(&normalized)
+}
+
+/// Cargo's `CARGO_*` configuration namespace (`CARGO_TARGET_DIR`,
+/// `CARGO_BUILD_JOBS`, `CARGO_INCREMENTAL`, ...) minus anything that can carry
+/// a credential: registry tokens and credential providers live under
+/// `CARGO_REGISTRY_` / `CARGO_REGISTRIES_`, and secret-shaped names are
+/// dropped wherever they appear. `CARGO_HTTP_PROXY` is passed with its
+/// userinfo removed, like the other proxy variables.
+fn is_allowed_cargo_config_key(normalized: &str) -> bool {
+    normalized.starts_with("CARGO_")
+        && !normalized.starts_with("CARGO_REGISTRY_")
+        && !normalized.starts_with("CARGO_REGISTRIES_")
+        && !is_secret_like_child_env_key(normalized)
+}
+
+/// Proxy variables whose URL may embed `user:password@`.
+fn is_proxy_url_key(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "FTP_PROXY" | "CARGO_HTTP_PROXY"
+    )
+}
+
+/// Remove the `user:password@` part of a proxy URL so a child keeps the route
+/// (`scheme://host:port`) but not the proxy credentials. Values that are not
+/// valid UTF-8 cannot be inspected and are dropped.
+fn strip_proxy_userinfo(value: &OsStr) -> Option<OsString> {
+    let value = value.to_str()?;
+    let (scheme, rest) = match value.find("://") {
+        Some(index) => value.split_at(index + 3),
+        None => ("", value),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    Some(OsString::from(format!("{scheme}{host}{tail}")))
 }
 
 #[cfg(windows)]
@@ -315,7 +486,6 @@ fn is_allowed_path_like_child_env_key(normalized: &str) -> bool {
         || normalized.ends_with("SDKROOT")
 }
 
-#[cfg(windows)]
 fn is_secret_like_child_env_key(normalized: &str) -> bool {
     normalized.contains("SECRET")
         || normalized.contains("TOKEN")
@@ -374,6 +544,18 @@ fn is_allowed_mcp_env_key(key: &OsStr) -> bool {
             | "SSL_CERT_DIR"
             | "REQUESTS_CA_BUNDLE"
             | "CURL_CA_BUNDLE"
+            // AWS profile/region selection and config-file locations. These
+            // name *which* credentials to use, never the credentials
+            // themselves: an AWS MCP server launched with `--profile x`
+            // still needs the user's config file and region to resolve an
+            // SSO session. Keys, secrets and session tokens
+            // (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+            // `AWS_SESSION_TOKEN`, …) stay dropped.
+            | "AWS_PROFILE"
+            | "AWS_REGION"
+            | "AWS_DEFAULT_REGION"
+            | "AWS_CONFIG_FILE"
+            | "AWS_SHARED_CREDENTIALS_FILE"
     ) {
         return true;
     }
@@ -405,9 +587,16 @@ fn append_sanitized_child_env_candidate(
     key: OsString,
     value: OsString,
 ) {
-    if is_allowed_parent_env_key(&key) {
-        upsert_env(env, key, value);
+    if !is_allowed_parent_env_key(&key) {
+        return;
     }
+    if is_proxy_url_key(&normalize_key(&key)) {
+        if let Some(value) = strip_proxy_userinfo(&value) {
+            upsert_env(env, key, value);
+        }
+        return;
+    }
+    upsert_env(env, key, value);
 }
 
 fn upsert_env(env: &mut Vec<(OsString, OsString)>, key: OsString, value: OsString) {
@@ -432,6 +621,7 @@ fn windows_registry_env_vars() -> Vec<(OsString, OsString)> {
 fn append_windows_registry_env_key(env: &mut Vec<(OsString, OsString)>, root: HKEY, subkey: &str) {
     let mut key = HKEY::default();
     let subkey_wide = windows_wide_null(OsStr::new(subkey));
+    // SAFETY: `subkey_wide` is NUL-terminated and live; `key` is live.
     let open =
         unsafe { RegOpenKeyExW(root, PCWSTR(subkey_wide.as_ptr()), None, KEY_READ, &mut key) };
     if open != ERROR_SUCCESS {
@@ -452,6 +642,7 @@ fn append_windows_registry_env_key(env: &mut Vec<(OsString, OsString)>, root: HK
         }
     }
 
+    // SAFETY: `key` was opened above and is not used after.
     let _ = unsafe { RegCloseKey(key) };
 }
 
@@ -471,6 +662,7 @@ fn read_windows_registry_env_value(key: HKEY, index: u32) -> RegistryEnvValue {
         let mut name_len = name.len() as u32;
         let mut data_len = data.len() as u32;
         let mut value_type = 0u32;
+        // SAFETY: buffers are live with matching lengths passed.
         let status = unsafe {
             RegEnumValueW(
                 key,
@@ -535,12 +727,14 @@ fn registry_utf16_value_from_bytes(data: &[u8]) -> OsString {
 #[cfg(windows)]
 fn expand_windows_env_string(value: &OsStr) -> Option<OsString> {
     let src = windows_wide_null(value);
+    // SAFETY: `src` is NUL-terminated and live.
     let required_len = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), None) };
     if required_len == 0 {
         return None;
     }
 
     let mut expanded = vec![0u16; required_len as usize];
+    // SAFETY: `src` is NUL-terminated; `expanded` has the queried length.
     let written = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut expanded)) };
     if written == 0 || written > required_len {
         return None;
@@ -922,10 +1116,28 @@ mod tests {
     }
 
     #[test]
+    fn mcp_env_allowlist_includes_aws_profile_and_region_selectors() {
+        for key in [
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+        ] {
+            assert!(
+                is_allowed_mcp_env_key(OsStr::new(key)),
+                "MCP allowlist should include non-secret AWS selector {key}"
+            );
+        }
+    }
+
+    #[test]
     fn mcp_env_allowlist_excludes_secrets_and_creds() {
         for key in [
             "AWS_SECRET_ACCESS_KEY",
             "AWS_ACCESS_KEY_ID",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
             "GITHUB_TOKEN",
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
@@ -991,6 +1203,137 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_plugin_mcp_env_keeps_desktop_routing_without_secret_namespaces() {
+        let desktop = [
+            ("DISPLAY", ":1"),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("XAUTHORITY", "/run/user/1000/.Xauthority"),
+        ];
+        let unexpected = [
+            ("OPENAI_API_KEY", "provider-fixture"),
+            ("XDG_PRIVATE_TOKEN", "xdg-fixture"),
+            ("DBUS_PRIVATE_TOKEN", "dbus-fixture"),
+            ("CODEWHALE_CU_APP_BUNDLE", "/stale/helper.app"),
+        ];
+        let child = sanitized_plugin_mcp_env_from(
+            desktop.into_iter().chain(unexpected),
+            std::iter::empty::<(&str, &str)>(),
+        );
+        for (key, value) in desktop {
+            assert!(
+                child
+                    .iter()
+                    .any(|(found, content)| found == key && content == value)
+            );
+        }
+        for (key, _) in unexpected {
+            assert!(child.iter().all(|(found, _)| found != key));
+        }
+    }
+
+    #[test]
+    fn child_env_allowlist_keeps_build_config_but_not_credentials() {
+        for key in [
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_JOBS",
+            "CARGO_INCREMENTAL",
+            "RUSTFLAGS",
+            "RUST_BACKTRACE",
+            "RUST_LOG",
+            "VIRTUAL_ENV",
+            "JAVA_HOME",
+            "GOPATH",
+            "NVM_DIR",
+            "NODE_OPTIONS",
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+        ] {
+            assert!(
+                is_allowed_parent_env_key(OsStr::new(key)),
+                "child env should keep {key}"
+            );
+        }
+        for key in [
+            "CARGO_REGISTRY_TOKEN",
+            "CARGO_REGISTRIES_PRIVATE_TOKEN",
+            "CARGO_REGISTRIES_PRIVATE_CREDENTIAL_PROVIDER",
+            "CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS",
+            "CARGO_SOME_SECRET",
+            "CARGO_SIGNING_KEY",
+            "DATABASE_URL",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(
+                !is_allowed_parent_env_key(OsStr::new(key)),
+                "child env must not keep {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_userinfo_is_removed_before_reaching_a_child() {
+        for (input, expected) in [
+            ("http://user:secret@proxy:3128", "http://proxy:3128"),
+            (
+                "http://user:secret@proxy:3128/path?x=1",
+                "http://proxy:3128/path?x=1",
+            ),
+            ("socks5h://u:p@w@10.0.0.1:1080", "socks5h://10.0.0.1:1080"),
+            ("user:secret@proxy:3128", "proxy:3128"),
+            ("http://proxy:3128", "http://proxy:3128"),
+            ("http://proxy:3128/a@b", "http://proxy:3128/a@b"),
+        ] {
+            assert_eq!(
+                strip_proxy_userinfo(OsStr::new(input)),
+                Some(OsString::from(expected)),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitized_child_env_strips_proxy_credentials() {
+        let _guard = crate::test_support::lock_test_env();
+        let _https = EnvVarGuard::set(
+            "HTTPS_PROXY",
+            "http://fixture-user:fixture-pass@proxy.invalid:3128",
+        );
+        let _cargo = EnvVarGuard::set(
+            "CARGO_HTTP_PROXY",
+            "http://fixture-user:fixture-pass@proxy.invalid:3128",
+        );
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "localhost");
+
+        let env = sanitized_child_env(std::iter::empty::<(OsString, OsString)>());
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| normalize_key(key) == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            get("HTTPS_PROXY"),
+            Some(OsString::from("http://proxy.invalid:3128"))
+        );
+        assert_eq!(
+            get("CARGO_HTTP_PROXY"),
+            Some(OsString::from("http://proxy.invalid:3128"))
+        );
+        assert_eq!(get("NO_PROXY"), Some(OsString::from("localhost")));
+        assert!(
+            env.iter()
+                .all(|(_, value)| !value.to_string_lossy().contains("fixture-pass"))
+        );
+        // Explicit call-site overrides are trusted and kept as given.
+        let explicit = sanitized_child_env([("HTTPS_PROXY", "http://a:b@proxy.invalid:1")]);
+        assert!(explicit.iter().any(|(key, value)| {
+            normalize_key(key) == "HTTPS_PROXY" && value == "http://a:b@proxy.invalid:1"
+        }));
+    }
+
+    #[test]
     fn sanitized_child_env_drops_parent_secret_like_values() {
         let _guard = crate::test_support::lock_test_env();
         let _secret = EnvVarGuard::set("DEEPSEEK_CHILD_ENV_TEST_SECRET", "parent-secret");
@@ -1004,9 +1347,44 @@ mod tests {
     }
 
     #[test]
-    fn explicit_child_env_values_win_over_parent_allowlist() {
+    fn sanitized_child_env_drops_rustc_wrapper_under_os_sandbox() {
         let _guard = crate::test_support::lock_test_env();
-        let _path = EnvVarGuard::set("PATH", "/parent/bin");
+        let _wrapper = EnvVarGuard::set("RUSTC_WRAPPER", "sccache");
+
+        let unsandboxed = sanitized_child_env(std::iter::empty::<(OsString, OsString)>());
+        assert!(
+            unsandboxed
+                .iter()
+                .any(|(key, value)| normalize_key(key) == "RUSTC_WRAPPER" && value == "sccache"),
+            "unsandboxed children keep RUSTC_WRAPPER"
+        );
+
+        let sandboxed = sanitized_child_env([(
+            OsString::from("CODEWHALE_SANDBOX"),
+            OsString::from("seatbelt"),
+        )]);
+        assert!(
+            sandboxed.iter().any(
+                |(key, value)| normalize_key(key) == "CODEWHALE_SANDBOX" && value == "seatbelt"
+            ),
+            "sandbox marker must survive"
+        );
+        assert!(
+            sandboxed
+                .iter()
+                .all(|(key, _)| normalize_key(key) != "RUSTC_WRAPPER"),
+            "OS sandbox children must not keep RUSTC_WRAPPER"
+        );
+    }
+
+    #[test]
+    fn explicit_child_env_values_win_over_parent_allowlist() {
+        // The real parent PATH is enough to prove the override wins; setting
+        // PATH here would break every concurrent test that spawns a program.
+        assert_ne!(
+            std::env::var_os("PATH"),
+            Some(OsString::from("/explicit/bin"))
+        );
 
         let env = sanitized_child_env([(OsString::from("PATH"), OsString::from("/explicit/bin"))]);
 

@@ -16,7 +16,7 @@ the `codewhale-tui` bin unit tests):
 
 | harness | binary | what lives there | why it stays separate |
 |---|---|---|---|
-| `tests/integration/main.rs` | `integration` | 17 plain `#[test]`/`#[tokio::test]` suites: `adaptive_evidence_acceptance`, `cache_guard`, `coordination_acceptance`, `diagnostic_read_only`, `dotenv_authority`, `eval_harness`, `exec_persistent_service`, `exec_stream_drop_acceptance`, `exec_turn_usage`, `integration_mock_llm`, `palette_audit`, `protocol_recovery`, `reasoning_content_replayed_after_tool_call`, `skill_cli`, `telemetry_contract`, `verifiers_harness_contract`, `workflow_tool_stream_acceptance` | All are process-level but require no PTY or Gherkin runner; they share `wiremock`/`tempfile` and link the TUI once instead of 17 times. `crate::` for `eval`/`models`/`llm_client`/`palette`/`network_policy`/`config`/`install` is satisfied by `integration/main.rs` re-exporting those `#[path]` modules at the harness crate root so `crate::config` etc. resolve. |
+| `tests/integration/main.rs` | `integration` | 17 plain `#[test]`/`#[tokio::test]` suites: `adaptive_evidence_acceptance`, `cache_guard`, `coordination_acceptance`, `diagnostic_read_only`, `dotenv_authority`, `eval_harness`, `exec_persistent_service`, `exec_stream_drop_acceptance`, `exec_turn_usage`, `integration_mock_llm`, `palette_audit`, `protocol_recovery`, `reasoning_content_replayed_after_tool_call`, `skill_cli`, `telemetry_contract`, `verifiers_harness_contract`, `workflow_tool_stream_acceptance` | All are process-level but require no PTY or Gherkin runner; they share `wiremock`/`tempfile` and link the TUI once instead of 17 times. `crate::` for `eval`/`models`/`llm_client`/`network_policy`/`config`/`install` is satisfied by `integration/main.rs` re-exporting those `#[path]` modules at the harness crate root so `crate::config` etc. resolve. |
 | `tests/cucumber/main.rs` | `cucumber` | 6 Gherkin runners: `core_session_command_extraction`, `directory_listing_acceptance`, `epic_acceptance_harness`, `eval_smoke_acceptance`, `plugin_e2e_acceptance`, `tool_lifecycle_acceptance` | Each defines a distinct `cucumber::World`; steps are registered per-World via inventory, so merging is safe and cuts 6 `cucumber` link jobs to 1. `plugin_e2e`’s PTY part is `#[cfg(all(unix, feature="long-running-tests"))]` and stays dormant in the default run. |
 The former `tests/pty` harness was removed. It accumulated full-screen copy,
 color, timing, and geometry assertions that were expensive to link and made the
@@ -105,3 +105,20 @@ cat crates/tui/tests/fixtures/offline-tool-loop.jsonl | jq .
 
 The scenario name is sanitized to `[A-Za-z0-9_-]` before forming the filename,
 so unusual scenario strings stay portable across platforms.
+
+## Canonical executable
+
+The Engine crate is a library; its acceptance suites launch `codewhale` from
+`codewhale-cli`. Build it before direct acceptance invocations:
+
+```sh
+cargo build -p codewhale-cli --bin codewhale --locked
+cargo test -p codewhale-tui --test integration --locked
+```
+
+`scripts/dev-test.sh tui-integration` and `tui-cucumber` perform that build using
+the same cache and hermetic test boundary. Both harnesses use one resolver:
+`QA_TUI_BIN` selects an explicit QA binary, otherwise `CARGO_BIN_EXE_codewhale`
+or the canonical executable beside the test harness is required. A stale
+`codewhale-tui` executable is never an implicit fallback. Release aliases remain
+byte-identical copies of the canonical program.

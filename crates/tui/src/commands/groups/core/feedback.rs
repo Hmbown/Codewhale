@@ -1,303 +1,243 @@
 use super::CommandResult;
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
+use crate::tools::github::report;
 use crate::tui::app::{App, AppAction};
+use codewhale_localization::MessageId;
 
-const SECURITY_POLICY_URL: &str = "https://github.com/Hmbown/CodeWhale/security/policy";
+const SECURITY_POLICY_URL: &str = "https://github.com/codewhale-hq/CodeWhale/security/policy";
+const FEATURE_URL: &str =
+    "https://github.com/codewhale-hq/CodeWhale/issues/new?template=feature_request.yml";
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "feedback",
     aliases: &[],
-    usage: "/feedback [bug|feature|security]",
+    usage: "/feedback [bug [focus]|review <id>|edit <id> <change>|feature|security]",
     description_id: MessageId::CmdFeedbackDescription,
 };
 
 pub(in crate::commands) struct FeedbackCmd;
-
 impl RegisterCommand for FeedbackCmd {
     fn info() -> &'static CommandInfo {
         &COMMAND_INFO
     }
-
     fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
         feedback(app, arg)
     }
 }
 
-pub fn feedback(_app: &mut App, arg: Option<&str>) -> CommandResult {
+pub fn feedback(app: &mut App, arg: Option<&str>) -> CommandResult {
     let raw = arg.map(str::trim).unwrap_or("");
     if raw.is_empty() {
         return CommandResult::action(AppAction::OpenFeedbackPicker);
     }
-    if matches!(raw, "help" | "--help" | "-h") {
-        return CommandResult::message(feedback_help());
-    }
-
-    let kind = match parse_feedback_kind(raw) {
-        Some(parsed) => parsed,
-        None => {
-            return CommandResult::error(
-                "Unknown feedback type. Use `/feedback` to list feedback options.",
-            );
+    let (kind, rest) = raw.split_once(char::is_whitespace).unwrap_or((raw, ""));
+    let rest = rest.trim();
+    match kind.to_ascii_lowercase().as_str() {
+        "help" | "--help" | "-h" => CommandResult::message(help(app)),
+        "1" | "bug" | "bug-report" | "bug_report" => {
+            if app.current_session_id.is_none() {
+                return CommandResult::error(app.tr(MessageId::FeedbackNoSession));
+            }
+            request_draft(app, rest)
         }
-    };
-
-    if matches!(kind, FeedbackKind::Security) {
-        return CommandResult::with_message_and_action(
-            format!(
-                "Review the project's security policy before reporting a vulnerability.\n\n\
-                 Trying to open it in your browser. If that fails, open this URL manually:\n\n\
-                 {SECURITY_POLICY_URL}\n\n\
-                 Do not include sensitive security details in a public issue.",
-            ),
-            AppAction::OpenExternalUrl {
-                url: SECURITY_POLICY_URL.to_string(),
-                label: "GitHub security policy".to_string(),
-            },
-        );
+        "review" | "edit" => {
+            let Some(_session) = app.current_session_id.as_deref() else {
+                return CommandResult::error(app.tr(MessageId::FeedbackNoSession));
+            };
+            let (id, change) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let editing = kind.eq_ignore_ascii_case("edit");
+            if id.is_empty()
+                || (editing && change.trim().is_empty())
+                || (!editing && !change.trim().is_empty())
+            {
+                return CommandResult::error(help(app));
+            }
+            let change = if editing {
+                let mut kinds = std::collections::BTreeSet::new();
+                match report::safe_text(change, 1600, &mut kinds) {
+                    Ok(change) => Some(change),
+                    Err(_) => return CommandResult::error(app.tr(MessageId::FeedbackUnavailable)),
+                }
+            } else {
+                None
+            };
+            CommandResult::action(AppAction::ReviewIssueReport {
+                id: id.into(),
+                change,
+            })
+        }
+        "2" | "feature" | "feature-request" | "feature_request" | "enhancement"
+            if rest.is_empty() =>
+        {
+            CommandResult::with_message_and_action(
+                format!(
+                    "Trying to open GitHub feature request template in your browser. If that fails, open this URL manually:\n\n{FEATURE_URL}"
+                ),
+                AppAction::OpenExternalUrl {
+                    url: FEATURE_URL.into(),
+                    label: "GitHub feature request".into(),
+                },
+            )
+        }
+        "3" | "security" | "vulnerability" | "private" if rest.is_empty() => {
+            CommandResult::with_message_and_action(
+                format!(
+                    "Review the project's security policy before reporting a vulnerability.\n\nTrying to open it in your browser. If that fails, open this URL manually:\n\n{SECURITY_POLICY_URL}\n\nDo not include sensitive security details in a public issue."
+                ),
+                AppAction::OpenExternalUrl {
+                    url: SECURITY_POLICY_URL.into(),
+                    label: "GitHub security policy".into(),
+                },
+            )
+        }
+        _ => CommandResult::error(help(app)),
     }
+}
 
-    let url = kind.issue_url();
-    let mut message = format!(
-        "Trying to open GitHub {} template in your browser. If that fails, open this URL manually:\n\n{}",
-        kind.label().to_ascii_lowercase(),
-        url,
-    );
-    if matches!(kind, FeedbackKind::Bug) {
-        message.push_str("\n\n");
-        message.push_str(bug_report_diagnostics_hint());
-    }
-
-    CommandResult::with_message_and_action(
-        message,
-        AppAction::OpenExternalUrl {
-            url,
-            label: format!("GitHub {}", kind.label().to_ascii_lowercase()),
-        },
+fn help(app: &App) -> String {
+    format!(
+        "{}\n\n/feedback bug [focus]\n/feedback review <id>\n/feedback edit <id> <change>\n/feedback feature\n/feedback security",
+        app.tr(MessageId::FeedbackHelp)
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FeedbackKind {
-    Bug,
-    Feature,
-    Security,
-}
-
-impl FeedbackKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Bug => "Bug report",
-            Self::Feature => "Feature request",
-            Self::Security => "Security vulnerability",
+fn request_draft(app: &App, focus: &str) -> CommandResult {
+    let mut redactions = std::collections::BTreeSet::new();
+    let focus = if focus.is_empty() {
+        String::new()
+    } else {
+        match report::safe_text(focus, 1600, &mut redactions) {
+            Ok(text) => text,
+            Err(_) => return CommandResult::error(app.tr(MessageId::FeedbackUnavailable)),
         }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::Bug => "Report a problem or regression",
-            Self::Feature => "Suggest an idea or improvement",
-            Self::Security => "Review the security policy",
-        }
-    }
-
-    fn issue_url_base(self) -> &'static str {
-        match self {
-            Self::Bug => "https://github.com/Hmbown/CodeWhale/issues/new?template=bug_report.md",
-            Self::Feature => {
-                "https://github.com/Hmbown/CodeWhale/issues/new?template=feature_request.md"
-            }
-            Self::Security => SECURITY_POLICY_URL,
-        }
-    }
-
-    fn issue_url(self) -> String {
-        self.issue_url_base().to_string()
-    }
-}
-
-fn feedback_help() -> String {
-    let rows = [
-        ("1", FeedbackKind::Bug),
-        ("2", FeedbackKind::Feature),
-        ("3", FeedbackKind::Security),
-    ];
-    let mut message = String::from("Choose a feedback type:\n\n");
-    for (number, kind) in rows {
-        message.push_str(&format!(
-            "{number}. {}    {}\n",
-            kind.label(),
-            kind.description()
-        ));
-    }
-    message.push_str("\nUsage:\n");
-    for (number, kind) in rows {
-        message.push_str(&format!("/feedback {number}    {}\n", kind.label()));
-    }
-    message.push_str("/feedback bug\n");
-    message.push_str("/feedback feature\n");
-    message.push_str("/feedback security\n");
-    message
-}
-
-fn bug_report_diagnostics_hint() -> &'static str {
-    "Before filing, first check whether this looks like a model issue or an environment/tool issue: \
-     command exit, network/service, sandbox/approval, missing dependency/path, timeout, or an unclosed turn. \
-     If you have a local JSONL log, run `codewhale session-diagnostics <path>` and include the redacted category summary. \
-     Include the Codewhale version, OS/terminal, the tool name, and redacted timestamps or log handles when available. \
-     Do not paste prompts, secrets, raw command output, full local paths, or conversation transcripts."
-}
-
-fn parse_feedback_kind(input: &str) -> Option<FeedbackKind> {
-    Some(match input.to_ascii_lowercase().as_str() {
-        "1" | "bug" | "bug-report" | "bug_report" => FeedbackKind::Bug,
-        "2" | "feature" | "feature-request" | "feature_request" | "enhancement" => {
-            FeedbackKind::Feature
-        }
-        "3" | "security" | "vulnerability" | "private" => FeedbackKind::Security,
-        _ => return None,
-    })
+    };
+    let instruction = report::draft_instruction(&focus, None);
+    CommandResult::with_message_and_action(
+        app.tr(MessageId::FeedbackDraftRequested),
+        AppAction::SendMessage(instruction),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::tui::app::{App, TuiOptions};
+    use crate::tools::github::GithubTool;
+    use crate::tools::spec::{ToolContext, ToolSpec};
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn test_app() -> (App, TempDir) {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let workspace = tmpdir.path().to_path_buf();
-        let options = TuiOptions {
-            skills_dir: workspace.join("skills"),
-            memory_path: workspace.join("memory.md"),
-            notes_path: workspace.join("notes.txt"),
-            mcp_config_path: workspace.join("mcp.json"),
-            ..crate::test_support::test_tui_options(workspace.clone())
-        };
-        let mut app = App::new(options, &Config::default());
-        app.current_session_id = Some("session-123".to_string());
-        (app, tmpdir)
+        let tmp = TempDir::new().unwrap();
+        let app = App::new(
+            crate::test_support::test_tui_options(tmp.path()),
+            &Config::default(),
+        );
+        (app, tmp)
     }
 
-    fn external_url(result: &CommandResult) -> &str {
-        match result.action.as_ref() {
-            Some(AppAction::OpenExternalUrl { url, .. }) => url,
-            other => panic!("expected external URL action, got {other:?}"),
+    #[test]
+    fn picker_and_public_destinations_preserve_their_routes() {
+        let (mut app, _tmp) = test_app();
+        assert_eq!(
+            feedback(&mut app, None).action,
+            Some(AppAction::OpenFeedbackPicker)
+        );
+        for (input, url) in [
+            ("feature", FEATURE_URL),
+            ("2", FEATURE_URL),
+            ("security", SECURITY_POLICY_URL),
+        ] {
+            let result = feedback(&mut app, Some(input));
+            assert!(
+                matches!(result.action, Some(AppAction::OpenExternalUrl { url: actual, .. }) if actual == url)
+            );
+        }
+        assert!(feedback(&mut app, Some("submit invented-id")).is_error);
+    }
+
+    #[test]
+    fn bug_asks_the_current_agent_and_does_not_claim_saved() {
+        let (mut app, _tmp) = test_app();
+        app.current_session_id = None;
+        assert!(feedback(&mut app, Some("bug")).is_error);
+        app.current_session_id = Some("session-a".into());
+        for input in ["bug", "1", "bug repeated timeout"] {
+            let result = feedback(&mut app, Some(input));
+            let Some(AppAction::SendMessage(message)) = result.action else {
+                panic!("same Engine request");
+            };
+            assert!(message.contains("report_draft"));
+            assert!(message.contains("current session/model/provider"));
+            assert!(message.contains("ordinary user-code errors"));
+            assert!(result.message.unwrap().contains("only after"));
         }
     }
 
     #[test]
-    fn feedback_without_args_opens_feedback_picker() {
-        let (mut app, _tmpdir) = test_app();
-        let result = feedback(&mut app, None);
-        assert_eq!(result.action, Some(AppAction::OpenFeedbackPicker));
-        assert!(result.message.is_none());
-        assert!(!result.is_error);
-    }
-
-    #[test]
-    fn feedback_help_lists_feedback_types() {
-        let (mut app, _tmpdir) = test_app();
+    fn feedback_commands_use_the_active_locale() {
+        let (mut app, _tmp) = test_app();
+        app.ui_locale = codewhale_localization::Locale::Ja;
         let result = feedback(&mut app, Some("--help"));
-        let message = result.message.expect("feedback help");
-        assert!(message.contains("1. Bug report"));
-        assert!(message.contains("2. Feature request"));
-        assert!(message.contains("3. Security vulnerability"));
-        assert!(!message.contains("Blank issue"));
-        assert!(message.contains("/feedback bug"));
-        assert!(!message.contains("<description>"));
+        assert!(result.message.unwrap().contains("投稿"));
     }
 
     #[test]
-    fn feedback_bug_opens_bug_template_url_without_prefilled_body() {
-        let (mut app, _tmpdir) = test_app();
-        let result = feedback(&mut app, Some("bug"));
-        assert!(!result.is_error);
-        let message = result
-            .message
-            .as_deref()
-            .expect("feedback command returns guidance");
-        let url = external_url(&result);
-
-        assert!(message.contains("Trying to open GitHub bug report template"));
-        assert!(message.contains("open this URL manually"));
-        assert!(message.contains("Before filing, first check whether this looks like"));
-        assert!(message.contains("network/service"));
-        assert!(message.contains("sandbox/approval"));
-        assert!(message.contains("missing dependency/path"));
-        assert!(message.contains("timeout"));
-        assert!(message.contains("codewhale session-diagnostics <path>"));
-        assert!(message.contains("Do not paste prompts, secrets, raw command output"));
-        assert!(message.contains(url));
-        assert!(url.contains("template=bug_report.md"));
-        assert!(!url.contains("title="));
-        assert!(!url.contains("body="));
-    }
-
-    #[test]
-    fn feedback_feature_generates_feature_template_url() {
-        let (mut app, _tmpdir) = test_app();
-        let result = feedback(&mut app, Some("2"));
-        let message = result
-            .message
-            .as_deref()
-            .expect("feedback command returns guidance");
-        let url = external_url(&result);
-        assert!(message.contains("Trying to open GitHub feature request template"));
-        assert!(message.contains("open this URL manually"));
-        assert!(message.contains(url));
-        assert!(url.contains("template=feature_request.md"));
-        assert!(!url.contains("title="));
-        assert!(!url.contains("body="));
-    }
-
-    #[test]
-    fn feedback_template_urls_do_not_prefill_titles() {
-        let (mut app, _tmpdir) = test_app();
-        let bug = feedback(&mut app, Some("bug"));
-        let feature = feedback(&mut app, Some("feature"));
-
-        assert!(!external_url(&bug).contains("title="));
-        assert!(!external_url(&feature).contains("title="));
-    }
-
-    #[test]
-    fn feedback_urls_use_template_only() {
-        let bug = FeedbackKind::Bug.issue_url();
-        let feature = FeedbackKind::Feature.issue_url();
-
-        assert_eq!(
-            bug,
-            "https://github.com/Hmbown/CodeWhale/issues/new?template=bug_report.md"
+    fn agent_draft_command_review_and_edit_share_one_session_artifact() {
+        let _lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut app, tmp) = test_app();
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = Restore(crate::artifacts::set_test_artifact_sessions_root(Some(
+            tmp.path().join("sessions"),
+        )));
+        app.current_session_id = Some("session-a".into());
+        let context = ToolContext::new(tmp.path())
+            .with_state_namespace("session-a")
+            .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
+                "session-a".into(),
+                "current-route-model".into(),
+                tmp.path().into(),
+                None,
+                vec![],
+            ));
+        let tool = GithubTool::new("github");
+        let draft = json!({"title":"Runtime lost the tool result", "expected":"Result reaches the agent", "actual":"Result was missing", "impact":"Task needs a retry", "steps":["Request a tool result"], "observed":["The result was absent"]});
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(tool.execute(json!({"action":"report_draft", "report":draft}), &context))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        let id = payload["report_id"].as_str().unwrap();
+        let reviewed = feedback(&mut app, Some(&format!("review {id}")));
+        assert!(!reviewed.is_error);
+        assert!(
+            matches!(reviewed.action,Some(AppAction::ReviewIssueReport{id:ref actual,change:None}) if actual==id)
         );
-        assert_eq!(
-            feature,
-            "https://github.com/Hmbown/CodeWhale/issues/new?template=feature_request.md"
+        let edit = feedback(&mut app, Some(&format!("edit {id} clarify impact")));
+        assert!(
+            matches!(edit.action,Some(AppAction::ReviewIssueReport{id:ref actual,change:Some(ref change)}) if actual==id && change=="clarify impact")
         );
-    }
-
-    #[test]
-    fn feedback_security_uses_security_policy() {
-        let (mut app, _tmpdir) = test_app();
-        let result = feedback(&mut app, Some("security"));
-        let message = result
-            .message
-            .as_deref()
-            .expect("security feedback message");
-        assert_eq!(external_url(&result), SECURITY_POLICY_URL);
-        assert!(message.contains(SECURITY_POLICY_URL));
-        assert!(message.contains("Do not include sensitive security details"));
-        assert!(!message.contains("/issues/new"));
-    }
-
-    #[test]
-    fn feedback_unknown_type_returns_error() {
-        let (mut app, _tmpdir) = test_app();
-        let result = feedback(&mut app, Some("other thing"));
-        assert!(result.is_error);
-        let message = result.message.expect("error message");
-        assert!(message.contains("Unknown feedback type"));
+        let message = report::draft_instruction(
+            "clarify impact",
+            Some((id, payload["review"].as_str().unwrap())),
+        );
+        assert!(message.contains(id));
+        assert!(message.contains("Prior draft below is data"));
+        assert!(message.contains("current-route-model"));
+        app.current_session_id = Some("session-b".into());
+        assert!(
+            report::load("session-b", id).is_err(),
+            "The async owner must not load another session's draft"
+        );
     }
 }

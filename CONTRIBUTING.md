@@ -6,7 +6,7 @@ Thank you for your interest in contributing to codewhale! This document provides
 
 ### Prerequisites
 
-- Rust 1.88 or later (edition 2024)
+- Rust 1.89 or later (edition 2024)
 - Cargo package manager
 - Git
 
@@ -18,20 +18,42 @@ Thank you for your interest in contributing to codewhale! This document provides
    cd CodeWhale
    ```
 
-2. Build the project:
+2. Build the current engine and terminal:
    ```bash
-   cargo build
+   CODEWHALE_BUILD_SHA="$(git rev-parse HEAD)" cargo build --locked -p codewhale-cli
    ```
 
-3. Run tests:
+3. Run the tests near your change (see [Fast local loop](#fast-local-loop)):
    ```bash
-   cargo test --workspace --all-features
+   scripts/dev-test.sh tui your_test_filter
    ```
 
 4. Run with development settings:
    ```bash
-   cargo run --bin codewhale
+   ./target/debug/codewhale --version
+   ./target/debug/codewhale
    ```
+
+### Testing the latest source
+
+The canonical source is [`codewhale-hq/Codewhale`'s `main` branch](https://github.com/codewhale-hq/Codewhale/tree/main).
+Release candidates land there after their CI gates pass, so contributors can
+test and build on the same source. Tagged downloads remain the latest published
+release; their version can lag the development version on `main`.
+
+For a fresh checkout of the current source:
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/Codewhale.git
+cd Codewhale
+CODEWHALE_BUILD_SHA="$(git rev-parse HEAD)" cargo build --release --locked -p codewhale-cli
+./target/release/codewhale --version
+./target/release/codewhale
+```
+
+Include the commit shown by `--version` when reporting a problem. If you work
+from a fork, add the canonical repository as `upstream` and fetch `upstream/main`
+before starting a change; preserve any local work when updating your branch.
 
 ## Development Workflow
 
@@ -45,7 +67,8 @@ Thank you for your interest in contributing to codewhale! This document provides
 ### Testing
 
 - Write tests for new functionality
-- Ensure all existing tests pass: `cargo test --workspace --all-features`
+- Run the tests near your change (see [Fast local loop](#fast-local-loop));
+  CI runs the whole suite on every pull request
 - Colocate unit tests beside the code they cover (standard Rust `#[cfg(test)]`
   modules), and add integration tests under the owning crate's `tests/`
   directory (for example `crates/tui/tests/` or `crates/state/tests/`). The
@@ -53,8 +76,10 @@ Thank you for your interest in contributing to codewhale! This document provides
 
 ### Pre-push verification
 
-Run these before every push. They match what CI enforces on pull
-requests, so passing locally means the PR lanes should pass too:
+These are the commands CI runs on every pull request. You do not need all
+of them before every push: run `cargo fmt`, then check and test the crates
+you touched (see [Fast local loop](#fast-local-loop)). Run the full set
+locally when a change spans many crates, or let CI run it for you:
 
 ```bash
 cargo fmt --all -- --check
@@ -69,10 +94,8 @@ cargo test --workspace --all-features --locked
 ```
 
 The release lane runs a stricter clippy that also lints test, bench, and
-example targets. The PR template checklist asks for this form, and it is
-the right command before requesting review or doing release-bound work,
-because `--all-features` alone skips lints that will fail the release
-lane later:
+example targets. Use this form for release-bound work, because
+`--all-features` alone skips lints that will fail the release lane later:
 
 ```bash
 cargo clippy --workspace --all-targets --all-features --locked -- \
@@ -97,7 +120,7 @@ scripts/dev-cargo.sh check -p codewhale-tui
 
 # 2. Run only the tests near your change (one crate, one filter).
 scripts/dev-test.sh tui fleet_setup
-# or: scripts/dev-test.sh crates/tui/src/elapsed.rs
+# or: scripts/dev-test.sh crates/runtime/src/elapsed.rs
 
 # 3. Run a whole crate's unit suite. scripts/dev-test.sh uses nextest when
 #    it is installed (one process per test, all cores busy, slow tests
@@ -106,7 +129,7 @@ cargo install cargo-nextest --locked      # once
 scripts/dev-test.sh tui
 scripts/dev-cargo.sh nextest run --workspace --all-features --locked
 
-# 4. Before pushing, run the authoritative gate exactly as CI does:
+# 4. The authoritative gate, exactly as CI runs it on your PR:
 cargo test --workspace --all-features --locked
 ```
 
@@ -195,6 +218,12 @@ manager writes one batched "receipts" commit per merge session, and
 `./scripts/sync-changelog.sh` keeps the packaged slice in sync. A PR that
 carries changelog hunks will be asked to strip them
 (`git checkout origin/main -- CHANGELOG.md crates/tui/CHANGELOG.md`).
+
+One exception is enforced by CI: a `feat:` commit whose message mentions an
+issue (`#N`) must add `#N` to `CHANGELOG.md` in the same PR
+(`scripts/release/check-feature-release-notes.sh`). To avoid touching the
+changelog, put issue numbers in the PR description instead of in `feat:`
+commit messages; the maintainer writes the entry at merge time.
 
 **AI-assistant co-author trailers are fine.** Using an assistant is welcome and
 needs no disclosure, and CI no longer rejects an auto-appended
@@ -334,24 +363,23 @@ Issues:
 Validation:
 ```
 
-## The Stewardship Branch
+## Which branch to target
 
-Large refactors and architecture work stage on
-`codex/v0.9.0-stewardship` before reaching `main`. The branch exists so
-that multi-layer series (like the command-group refactor) can land layer
-by layer against a stable base, get validated by their parity harnesses,
-and then flow to `main` in periodic stewardship merges — instead of each
-layer racing `main`'s daily churn.
+**`main`, for everything.** There is no separate staging branch. An earlier
+version of this guide pointed layered refactors at `codex/v0.9.0-stewardship`;
+that branch no longer exists, so please ignore any instruction you find
+elsewhere to base work on it.
 
-What this means for you:
+For a multi-PR series or anything that will collide with other in-flight work,
+maintainers may land your branch on an `integration/<topic>-<pr>-<date>` branch
+first and merge from there. That is our bookkeeping, not extra work for you —
+you still open the PR against `main`, and your commits reach `main` with their
+history and authorship intact.
 
-- **Base layered/EPIC-sized refactor PRs on `codex/v0.9.0-stewardship`**
-  and target the PR there (see #2888 for the model). Ordinary bug fixes
-  and features still target `main`.
-- Maintainers merge the stewardship branch into `main` periodically;
-  your work reaches `main` with its history and credit intact.
-- If you're unsure which base to use, ask in your tracking issue — the
-  default for anything that isn't a multi-PR series is `main`.
+**We do not expect you to rebase around our churn.** If your PR conflicts only
+because `main` moved while it was in review, say so and a maintainer resolves
+it. If your branch is in a fork we cannot push to, we land the resolved merge
+on an integration branch rather than asking you to redo the work.
 
 ## Contribution Gate
 
@@ -420,28 +448,40 @@ branding, or global prompts without prior maintainer sign-off.
 
 ## Project Structure
 
-codewhale is a Cargo workspace. The live runtime and the majority of TUI,
-engine, and tool code currently live in `crates/tui/src/`. Smaller workspace
-crates provide shared abstractions that are being extracted incrementally.
+Codewhale is a Cargo workspace with one Engine implementation in
+`crates/tui/src/core/engine/`. The public `codewhale` executable links the
+TUI/runtime library; interactive sessions, noninteractive runs and the Runtime
+API share that Engine.
 
-```
-crates/
-├── tui/           codewhale-tui binary (interactive TUI + runtime API)
-├── cli/           codewhale binary (dispatcher facade)
-├── app-server/    HTTP/SSE + JSON-RPC transport
-├── core/          Agent loop / session / turn management
-├── protocol/      Request/response framing
-├── config/        Config loading, profiles, env precedence
-├── state/         SQLite thread/session persistence
-├── tools/         Typed tool specs and lifecycle
-├── mcp/           MCP client + stdio server
-├── hooks/         Lifecycle hooks (stdout/jsonl/webhook)
-├── execpolicy/    Approval/sandbox policy engine
-├── agent/         Model/provider registry
-```
+| Path | Purpose |
+| --- | --- |
+| `crates/cli/` | Public command entrypoint, configuration commands and runtime dispatch |
+| `crates/tui/` | Interactive terminal, Engine, tools, Runtime API and embedded local web client |
+| `crates/core/`, `crates/protocol/`, `crates/state/` | Request construction, session/turn types, protocol framing and persistence |
+| Other `crates/` | Shared configuration, credentials, telemetry, hooks, workflow and packaging support; see each Cargo manifest |
+| `web/` | Public Next.js website and documentation; separate from the embedded Runtime web client |
+| `telemetry-ingest/` | Telemetry service, schemas and service tests |
+| `extensions/`, `integrations/` | Editor integration and external-service bridges |
+| `npm/`, `packaging/`, `nix/` | npm wrappers/SDK and platform installation definitions |
+| `computer/snapshots/` | Cloud Computer image definitions, pinned independently of the source checkout |
+| `deploy/` | Deployment templates consumed by setup scripts, including Tencent Lighthouse services |
+| `fleets/`, `workflows/` | Distributed Fleet definitions and workflow examples |
+| `brand/` | Source artwork and generated brand variants used by the README, website and terminal |
+| `docs/` | User/developer documentation, schemas, fixtures and referenced release material |
+| `scripts/`, `.github/`, `.cnb.yml` | Development, validation, CI and release tooling |
+| `patches/` | Vendored dependency fixes, including their licensing files |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the live data flow across
-these crates, including the bottom-up build order.
+Generated files that the product embeds or validates, such as model catalogs,
+website facts and schemas, remain tracked with their generators. Platform
+mirrors such as `.winget/` are retained when their packaging tools require them.
+Keep local critique output, temporary verification reports and personal
+operator instructions outside the tracked product tree; describe the change
+and its validation in the pull request. Do not copy workspace-level operator
+`AGENTS.md` or `CLAUDE.md` files into this repository.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the runtime data flow and
+[the build guide](docs/BUILD_PERFORMANCE.md) for crate dependencies and local
+verification.
 
 ## Submitting Changes
 
@@ -463,8 +503,15 @@ these crates, including the bottom-up build order.
 ## Pull Request Guidelines
 
 - Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md) when opening
-  a PR — it includes the Summary, Testing, and Checklist sections reviewers
-  expect
+  a PR — what and why, the issue line, and how you tested it
+- The PR description needs one issue line, checked by CI
+  (`.github/workflows/pr-issue-link.yml`): `Closes #N` (or `Fixes` /
+  `Resolves`) when the PR finishes the issue, `Refs #N` for related or partial
+  work, or `No-Issue: <one-line reason>`. Never write a negated closing
+  keyword such as "does not close #N": GitHub closes the issue anyway, so CI
+  rejects it
+- If you add a new layer, module, or abstraction, say which one it replaces
+  or deletes
 - Keep PRs focused on a single change
 - Update documentation if needed
 - Add tests for new functionality
@@ -496,30 +543,26 @@ Before submitting, run the commands in
 
 When reporting issues, please use one of the issue templates:
 
-- [Bug report](.github/ISSUE_TEMPLATE/bug_report.md) — for reproducible problems
+- [Bug report](.github/ISSUE_TEMPLATE/bug_report.yml) — for reproducible problems
   or regressions
-- [Feature request](.github/ISSUE_TEMPLATE/feature_request.md) — for ideas and
+- [Feature request](.github/ISSUE_TEMPLATE/feature_request.yml) — for ideas and
   improvements
 
-Issue reports should include:
-
-- Operating system and version
-- Rust version (`rustc --version`)
-- codewhale version (`codewhale --version`)
-- Steps to reproduce the issue
-- Expected vs actual behavior
-- Relevant error messages or logs
+The forms ask for what a report needs (`codewhale --version`, OS, how you got
+Codewhale, and steps to reproduce). Questions go to
+[Discussions](https://github.com/codewhale-hq/CodeWhale/discussions) or
+[Discord](https://discord.gg/37gfS3ksug).
 
 ## Security
 
 If you discover a security vulnerability, please do **not** open a public issue.
-See [SECURITY.md](SECURITY.md) for the responsible disclosure process and
+See [SECURITY.md](.github/SECURITY.md) for the responsible disclosure process and
 contact information.
 
 ## Code of Conduct
 
 Be respectful and inclusive. We welcome contributors of all backgrounds and
-experience levels. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the full
+experience levels. See [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md) for the full
 code of conduct.
 
 ## License

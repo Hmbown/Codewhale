@@ -1,5 +1,5 @@
-//! The single owner for startup defaults written back by interactive TUI
-//! selectors.
+//! The single owner for mode and reasoning defaults written back by interactive
+//! TUI selectors. Provider/model choices persist through `config_persistence`.
 //!
 //! Before this module there were three unrelated writers for the same
 //! `settings.toml` keys: the model picker's combined model+effort apply, the
@@ -115,12 +115,12 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::settings::Settings;
-use crate::tui::app::AppMode;
+use codewhale_config::AppMode;
 
 /// One user selection's worth of startup-default writes.
 ///
-/// Fields left `None` are untouched on disk, so a thinking change never
-/// rewrites the persisted model and vice-versa.
+/// Fields left `None` are untouched on disk, so mode and thinking updates
+/// preserve each other's settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupDefaults {
     /// `settings.default_mode` — the mode a fresh session starts in.
@@ -128,8 +128,6 @@ pub struct StartupDefaults {
     /// `settings.reasoning_effort` — normalized for the active route by the
     /// caller, because only the caller knows the route.
     reasoning_effort: Option<String>,
-    /// Global `settings.default_model`.
-    default_model: Option<String>,
 }
 
 impl StartupDefaults {
@@ -158,13 +156,6 @@ impl StartupDefaults {
 
     #[cfg(test)]
     #[must_use]
-    pub fn with_default_model(mut self, model: &str) -> Self {
-        self.default_model = Some(model.to_string());
-        self
-    }
-
-    #[cfg(test)]
-    #[must_use]
     pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
         self.reasoning_effort = Some(effort.to_string());
         self
@@ -172,7 +163,7 @@ impl StartupDefaults {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.mode.is_none() && self.reasoning_effort.is_none() && self.default_model.is_none()
+        self.mode.is_none() && self.reasoning_effort.is_none()
     }
 
     /// Which user-facing settings this update touches, as typed subjects.
@@ -190,9 +181,6 @@ impl StartupDefaults {
         }
         if self.reasoning_effort.is_some() {
             subjects.push(StartupDefaultSubject::Thinking);
-        }
-        if self.default_model.is_some() {
-            subjects.push(StartupDefaultSubject::Model);
         }
         subjects
     }
@@ -213,9 +201,6 @@ impl StartupDefaults {
         Settings::transact(|settings| {
             if let Some(mode) = self.mode {
                 settings.set("default_mode", mode)?;
-            }
-            if let Some(model) = self.default_model.as_deref() {
-                settings.set("default_model", model)?;
             }
             if let Some(effort) = self.reasoning_effort.as_deref() {
                 settings.set("reasoning_effort", effort)?;
@@ -254,8 +239,6 @@ pub enum StartupDefaultSubject {
     Mode,
     /// `settings.reasoning_effort`.
     Thinking,
-    /// `settings.default_model` / the provider-scoped model map.
-    Model,
 }
 
 /// One startup-default write that did not land.
@@ -785,21 +768,15 @@ mod tests {
         let update = StartupDefaults::mode(AppMode::Operate);
         assert_eq!(update.mode, Some("operate"));
         assert!(update.reasoning_effort.is_none());
-        assert!(update.default_model.is_none());
         assert_eq!(update.subjects(), vec![StartupDefaultSubject::Mode]);
     }
 
     #[test]
-    fn subjects_stay_typed_for_a_combined_model_and_thinking_update() {
-        let update = StartupDefaults::default()
-            .with_default_model("deepseek-chat")
-            .with_reasoning_effort("high");
+    fn subjects_stay_typed_for_a_combined_mode_and_thinking_update() {
+        let update = StartupDefaults::mode(AppMode::Operate).with_reasoning_effort("high");
         assert_eq!(
             update.subjects(),
-            vec![
-                StartupDefaultSubject::Thinking,
-                StartupDefaultSubject::Model
-            ]
+            vec![StartupDefaultSubject::Mode, StartupDefaultSubject::Thinking,]
         );
     }
 

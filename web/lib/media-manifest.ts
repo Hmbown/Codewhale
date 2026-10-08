@@ -28,6 +28,23 @@
 
 import type { LocalizedText } from "./content/vocabulary";
 
+/**
+ * The homepage terminal. The site renders it as live text from the PTY cell
+ * capture (`capture`, via scripts/render-terminal-capture.mjs and
+ * components/terminal-capture.tsx); `src` is the same frame rasterized by
+ * that script for the README, which cannot run the site's renderer. Captured
+ * build identity is independent of the current source/release.
+ */
+export const TERMINAL_SCREENSHOT = {
+  capture: "web/lib/terminal-captures/website-home-100x24.json",
+  src: "/codewhale-tui-8ba2bbf.png",
+  width: 1000,
+  height: 480,
+  version: "0.10.1",
+  sourceCommit: "8ba2bbf805e1393ba27493bb5970db88b14ff7b3",
+  sha256: "7634edb50482ad098743ab14accc1b5836766211359ffa4fc763072cac396316",
+} as const;
+
 /** Published-asset budgets; see the module contract for what tests inspect. */
 export const MEDIA_BUDGETS = {
   poster: { width: 1280, height: 720, maxBytes: 500_000 },

@@ -1,4 +1,4 @@
-//! Default-on, user-disableable anonymous product usage counting for Codewhale.
+//! Default-on, user-disableable aggregate product usage counting for Codewhale.
 //!
 //! The whole of what this crate may ever send is [`event`]. The whole of what
 //! decides whether it may send anything is [`decision`]. Nothing else in the
@@ -58,7 +58,7 @@ pub use decision::{
 pub use envelope::reduce_panic_site;
 pub use event::{
     Arch, Batch, ColdStartBucket, Counters, DurationBucket, Errors, Event, ExitClass, InstallKind,
-    Libc, Os, SCHEMA_VERSION, SessionSource, Surface, TurnWall,
+    Libc, NOTICE_VERSION, Os, ProductCounters, SCHEMA_VERSION, SessionSource, Surface, TurnWall,
 };
 
 /// How long the shutdown flush may hold the process.
@@ -67,12 +67,6 @@ pub use event::{
 /// unbounded `task.await` next door is not a pattern to copy: a hung TLS
 /// handshake would hold a user's terminal past exit.
 pub const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Maximum time a short CLI command may spend sealing queued events locally.
-///
-/// This path never performs a network request. The bound protects command
-/// latency if the writer thread or local filesystem does not answer promptly.
-pub const CLI_PERSIST_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Everything a write path needs once the process is armed.
 struct Armed {
@@ -109,6 +103,8 @@ pub fn init(consent: TelemetryConsent) {
         tracing::debug!("telemetry could not prepare its buffer: {error}");
         return;
     }
+
+    notice::show_startup_disclosure(consent.surface());
 
     let context = actor::Context {
         root: root.clone(),
@@ -283,9 +279,17 @@ pub fn shutdown_blocking(deadline: Duration) -> FlushOutcome {
 /// With an explicitly empty endpoint this finalizes the local dry-run batch.
 /// With a configured endpoint it leaves events in the pending buffer for the
 /// next full flush. Returns [`FlushOutcome::Empty`] when unarmed.
+///
+/// This joins the writer instead of racing it (#6269). The local path seals
+/// at most a consent re-check, a tombstone probe, and one fsync append —
+/// bounded disk work with no network in it. A deadline here buys nothing the
+/// rest of the CLI does not already forgo: startup reads config from the
+/// same disk with no timeout either. The writer always acknowledges, even on
+/// panic, so the only fail-open outcome is a writer that is already gone.
+/// Only the network flush keeps a deadline.
 #[must_use]
-pub fn persist_local_blocking(deadline: Duration) -> FlushOutcome {
-    ARMED.get().map_or(FlushOutcome::Empty, |armed| {
-        armed.handle.persist_local(deadline)
-    })
+pub fn persist_local_blocking() -> FlushOutcome {
+    ARMED
+        .get()
+        .map_or(FlushOutcome::Empty, |armed| armed.handle.persist_local())
 }

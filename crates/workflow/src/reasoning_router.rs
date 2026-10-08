@@ -202,7 +202,7 @@ impl ReasoningRouterProfile {
         search_roots: &[FleetSearchRoot],
     ) -> Result<(Self, QualifiedRouterId), ReasoningRouterError> {
         let (requested_origin, bare) = split_qualified(name);
-        if bare.is_empty() {
+        if crate::named_fleet::validate_fleet_file_stem(bare).is_err() {
             return Err(ReasoningRouterError::InvalidToken {
                 field: "router reference".to_string(),
                 value: name.trim().to_string(),
@@ -573,6 +573,30 @@ call_reasoning = "low"
         let a = CapturedReasoningRouter::from_profile(&first, &first_id.origin);
         let b = CapturedReasoningRouter::from_profile(&second, &second_id.origin);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn router_names_cannot_leave_the_router_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(REASONING_ROUTER_DIR)).expect("dir");
+        let planted = LUNA.replace("\"luna-low\"", "\"outside\"");
+        std::fs::write(ws.join("outside.toml"), &planted).expect("sibling");
+        std::fs::write(tmp.path().join("outside.toml"), &planted).expect("outside");
+        let roots = vec![FleetSearchRoot::new("workspace", &ws)];
+        let absolute = tmp.path().join("outside");
+
+        for name in [
+            "workspace/../outside",
+            "workspace/../../outside",
+            absolute.to_string_lossy().as_ref(),
+        ] {
+            let err = ReasoningRouterProfile::load_by_name(name, &roots).expect_err(name);
+            assert!(
+                matches!(err, ReasoningRouterError::InvalidToken { .. }),
+                "{name}: expected InvalidToken, got {err:?}"
+            );
+        }
     }
 
     /// Bare-name ambiguity across origins must fail; a qualified origin works.

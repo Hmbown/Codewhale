@@ -54,6 +54,8 @@ pub struct PluginManifest {
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
     #[serde(default)]
     pub capabilities: PluginCapabilities,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, super::providers::PluginProviderDeclaration>,
     #[serde(default)]
     pub when: Option<PluginWhen>,
 }
@@ -72,6 +74,9 @@ pub struct PluginMeta {
     /// slugified to satisfy the Agent Plugins name rule.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Bounded inline PNG artwork. Never a remote fetch or executable SVG.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
@@ -193,6 +198,8 @@ pub struct PluginInventory {
     pub hooks: usize,
     pub lsp: usize,
     pub native: usize,
+    #[serde(default)]
+    pub providers: usize,
     pub filesystem_roots: Vec<String>,
     pub network_hosts: Vec<String>,
     pub lifecycle_mutation: bool,
@@ -247,6 +254,9 @@ impl PluginInventory {
         }
         if self.lsp > 0 {
             capabilities.push(PluginActivationCapability::Lsp);
+        }
+        if self.providers > 0 {
+            capabilities.push(PluginActivationCapability::Providers);
         }
         if self.native > 0 {
             capabilities.push(PluginActivationCapability::Native);
@@ -327,7 +337,7 @@ impl PluginInventory {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "skills={} mcp={} (stdio={} remote={}) commands={} agents={} hooks={} lsp={} native={}",
+            "skills={} mcp={} (stdio={} remote={}) commands={} agents={} hooks={} lsp={} native={} providers={}",
             self.skills,
             self.mcp_servers,
             self.stdio_mcp_servers,
@@ -336,7 +346,8 @@ impl PluginInventory {
             self.agents,
             self.hooks,
             self.lsp,
-            self.native
+            self.native,
+            self.providers
         )
     }
 }
@@ -352,6 +363,10 @@ pub struct ValidatedManifest {
     /// its lossless relative OS path. Runtime adapters use this to bind parsed
     /// representations to the same bytes that produced `content_hash`.
     pub(crate) file_hashes: BTreeMap<PathBuf, String>,
+    /// Plain SHA256 for declared regular Native entry files, captured from
+    /// the same anchored, bounded read as the domain-separated bundle hashes.
+    /// EntryRef binds these digests; the bundle file inventory keeps its domain.
+    pub(crate) native_entry_hashes: BTreeMap<PathBuf, String>,
     pub capability_hash: String,
     pub applicable: bool,
     pub warnings: Vec<String>,
@@ -365,12 +380,21 @@ pub struct ValidatedManifest {
 enum ManifestFormat {
     Json,
     KimiJson,
+    ClaudeJson,
     Toml,
 }
 
 impl ManifestFormat {
     fn from_path(path: &Path) -> Result<Self, String> {
         match path.file_name().and_then(|name| name.to_str()) {
+            Some(super::agent_plugin::PLUGIN_JSON_NAME)
+                if path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == ".claude-plugin") =>
+            {
+                Ok(Self::ClaudeJson)
+            }
             Some(super::agent_plugin::PLUGIN_JSON_NAME) => Ok(Self::Json),
             Some(super::agent_plugin::KIMI_PLUGIN_JSON_NAME) => Ok(Self::KimiJson),
             Some(super::agent_plugin::PLUGIN_TOML_NAME) => Ok(Self::Toml),
@@ -385,6 +409,7 @@ impl ManifestFormat {
         match self {
             Self::Json => super::agent_plugin::PLUGIN_JSON_NAME,
             Self::KimiJson => super::agent_plugin::KIMI_PLUGIN_JSON_NAME,
+            Self::ClaudeJson => ".claude-plugin/plugin.json",
             Self::Toml => super::agent_plugin::PLUGIN_TOML_NAME,
         }
     }
@@ -407,7 +432,7 @@ fn parse_manifest(
         }
         ManifestFormat::Json => {
             let standard = super::agent_plugin::parse_plugin_json(text)?;
-            let mcp_bytes = read_sibling_mcp_json(root)?;
+            let mcp_bytes = read_sibling_mcp_json(root, super::agent_plugin::MCP_JSON_NAME)?;
             let mcp_servers = match &mcp_bytes {
                 Some(bytes) => {
                     let text = std::str::from_utf8(bytes)
@@ -419,6 +444,12 @@ fn parse_manifest(
             let manifest = super::agent_plugin::standard_to_manifest(standard, mcp_servers, root)?;
             Ok((manifest, mcp_bytes))
         }
+        ManifestFormat::ClaudeJson => {
+            let bytes = read_sibling_mcp_json(root, ".mcp.json")?;
+            let manifest =
+                super::agent_plugin::parse_claude_plugin_json(text, root, bytes.as_deref())?;
+            Ok((manifest, bytes))
+        }
         ManifestFormat::KimiJson => Ok((
             super::agent_plugin::parse_kimi_plugin_json(text, root)?,
             None,
@@ -428,8 +459,8 @@ fn parse_manifest(
 
 /// Read a `plugin.json` bundle's sibling `mcp.json` under the same rules as
 /// the manifest itself: a regular file, never a link, size-bounded.
-fn read_sibling_mcp_json(root: &Path) -> Result<Option<Vec<u8>>, String> {
-    let path = root.join(super::agent_plugin::MCP_JSON_NAME);
+fn read_sibling_mcp_json(root: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = root.join(name);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -464,8 +495,7 @@ impl PluginManifest {
         let bytes = read_manifest_bytes(path, label)?;
         let content =
             std::str::from_utf8(&bytes).map_err(|_| format!("{label} must be valid UTF-8"))?;
-        let root = path
-            .parent()
+        let root = super::agent_plugin::plugin_root_for_manifest(path)
             .ok_or_else(|| format!("{label} has no parent directory"))?;
         Ok(parse_manifest(format, content, root)?.0)
     }
@@ -480,8 +510,7 @@ impl PluginManifest {
                 "{label} must be a regular file, not a symbolic link"
             ));
         }
-        let root = path
-            .parent()
+        let root = super::agent_plugin::plugin_root_for_manifest(path)
             .ok_or_else(|| format!("{label} has no parent directory"))?;
         let root_metadata = fs::symlink_metadata(root)
             .map_err(|e| format!("failed to inspect plugin root: {e}"))?;
@@ -518,8 +547,10 @@ impl PluginManifest {
 
         let components = manifest.resolve_components(&canonical_root)?;
         manifest.validate_mcp_servers(&canonical_root)?;
+        super::providers::validate_declarations(&manifest.providers)?;
         let inventory = manifest.inventory(&components)?;
-        let (content_hash, file_hashes) = hash_bundle(&canonical_root, &manifest_bytes, label)?;
+        let (content_hash, bundle_hashes) =
+            hash_bundle(&canonical_root, &manifest_bytes, label, &components.native)?;
         let capability_hash = hash_inventory(&inventory);
         let applicable = manifest.check_when();
         if read_manifest_bytes(path, label)? != manifest_bytes {
@@ -527,7 +558,14 @@ impl PluginManifest {
                 "{label} changed while it was being validated; retry discovery"
             ));
         }
-        if format == ManifestFormat::Json && read_sibling_mcp_json(&canonical_root)? != mcp_bytes {
+        let mcp_name = match format {
+            ManifestFormat::Json => Some(super::agent_plugin::MCP_JSON_NAME),
+            ManifestFormat::ClaudeJson => Some(".mcp.json"),
+            _ => None,
+        };
+        if let Some(name) = mcp_name
+            && read_sibling_mcp_json(&canonical_root, name)? != mcp_bytes
+        {
             return Err(
                 "mcp.json changed while it was being validated; retry discovery".to_string(),
             );
@@ -539,7 +577,8 @@ impl PluginManifest {
             components,
             inventory,
             content_hash,
-            file_hashes,
+            file_hashes: bundle_hashes.file_hashes,
+            native_entry_hashes: bundle_hashes.native_entry_hashes,
             capability_hash,
             applicable,
             warnings,
@@ -554,7 +593,7 @@ impl PluginManifest {
             ));
         }
         match format {
-            ManifestFormat::Json => {
+            ManifestFormat::Json | ManifestFormat::ClaudeJson => {
                 if !super::agent_plugin::is_standard_plugin_name(&self.plugin.name) {
                     return Err(format!(
                         "plugin name `{}` violates the Agent Plugins name rule (1-{MAX_PLUGIN_NAME_CHARS} lowercase ASCII letters, digits, or internal single hyphens or dots; never `--` or `..`)",
@@ -581,6 +620,9 @@ impl PluginManifest {
         validate_optional_text("description", self.plugin.description.as_deref(), 1_024)?;
         validate_optional_text("author", self.plugin.author.as_deref(), 256)?;
         validate_optional_text("display name", self.plugin.display_name.as_deref(), 128)?;
+        if let Some(icon) = &self.plugin.icon {
+            validate_icon(icon)?;
+        }
         validate_optional_text("homepage", self.plugin.homepage.as_deref(), 2_048)?;
         validate_optional_text("repository", self.plugin.repository.as_deref(), 2_048)?;
         validate_optional_text("license", self.plugin.license.as_deref(), 128)?;
@@ -653,7 +695,7 @@ impl PluginManifest {
         })
     }
 
-    fn validate_mcp_servers(&self, root: &Path) -> Result<(), String> {
+    pub(crate) fn validate_mcp_servers(&self, root: &Path) -> Result<(), String> {
         let Some(servers) = &self.mcp_servers else {
             return Ok(());
         };
@@ -904,6 +946,15 @@ impl PluginManifest {
                 }
             }
         }
+        for declaration in self.providers.values() {
+            for endpoint in declaration.endpoints() {
+                if let Ok(url) = reqwest::Url::parse(endpoint)
+                    && let Some(host) = url.host_str()
+                {
+                    network_hosts.push(host.to_ascii_lowercase());
+                }
+            }
+        }
         network_hosts.sort();
         network_hosts.dedup();
 
@@ -921,6 +972,7 @@ impl PluginManifest {
             hooks: components.hooks.len(),
             lsp: components.lsp.len(),
             native: components.native.len(),
+            providers: self.providers.len(),
             filesystem_roots,
             network_hosts,
             lifecycle_mutation: self.capabilities.lifecycle_mutation,
@@ -1213,7 +1265,7 @@ fn validate_environment_name(field: &str, value: &str) -> Result<(), String> {
     }
 }
 
-fn exact_environment_placeholder(value: &str) -> Option<&str> {
+pub(super) fn exact_environment_placeholder(value: &str) -> Option<&str> {
     value.strip_prefix("${")?.strip_suffix('}')
 }
 
@@ -1369,7 +1421,8 @@ fn hash_bundle(
     root: &Path,
     manifest_bytes: &[u8],
     manifest_label: &str,
-) -> Result<(String, BTreeMap<PathBuf, String>), String> {
+    native_entries: &[PathBuf],
+) -> Result<(String, HashBudget), String> {
     let mut hasher = Sha256::new();
     // v2 length-frames every variable-length field. The v1 delimiter-only
     // stream was structurally ambiguous across file-record boundaries.
@@ -1382,12 +1435,24 @@ fn hash_bundle(
     hasher.update(b"\0");
     hasher.update((manifest_bytes.len() as u64).to_le_bytes());
     hasher.update(manifest_bytes);
-    let mut budget = HashBudget::default();
+    let native_paths = native_entries
+        .iter()
+        .map(|entry| {
+            entry
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .map_err(|_| "Native entry escaped the reviewed bundle".to_string())
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut budget = HashBudget {
+        native_paths,
+        ..Default::default()
+    };
     // Hash the complete bundle, not only declared component roots. Local MCP
     // entrypoints and companion assets are security-relevant even when they do
     // not have a separate component table.
     hash_path(root, root, &mut hasher, &mut budget)?;
-    Ok((hex_digest(hasher.finalize()), budget.file_hashes))
+    Ok((hex_digest(hasher.finalize()), budget))
 }
 
 #[derive(Default)]
@@ -1395,6 +1460,8 @@ struct HashBudget {
     files: usize,
     bytes: u64,
     file_hashes: BTreeMap<PathBuf, String>,
+    native_paths: BTreeSet<PathBuf>,
+    native_entry_hashes: BTreeMap<PathBuf, String>,
 }
 
 fn hash_path(
@@ -1454,6 +1521,7 @@ fn hash_path(
         hasher.update(expected_len.to_le_bytes());
         let mut file_hasher = Sha256::new();
         file_hasher.update(b"codewhale-plugin-file-bytes-v1\0");
+        let mut native_entry_hasher = budget.native_paths.contains(relative).then(Sha256::new);
         // Keep the read buffer off the stack. `hash_path` is recursive and the
         // fixed-size array inflated every directory frame, which could exhaust
         // a Tokio worker stack while revalidating a nested plugin bundle.
@@ -1475,6 +1543,9 @@ fn hash_path(
             }
             hasher.update(&buffer[..read]);
             file_hasher.update(&buffer[..read]);
+            if let Some(entry_hasher) = &mut native_entry_hasher {
+                entry_hasher.update(&buffer[..read]);
+            }
         }
         if actual_len != expected_len {
             return Err(format!(
@@ -1485,6 +1556,11 @@ fn hash_path(
         budget
             .file_hashes
             .insert(relative.to_path_buf(), hex_digest(file_hasher.finalize()));
+        if let Some(entry_hasher) = native_entry_hasher {
+            budget
+                .native_entry_hashes
+                .insert(relative.to_path_buf(), hex_digest(entry_hasher.finalize()));
+        }
         #[cfg(windows)]
         ensure_windows_path_still_opened(path, &file)?;
     } else {
@@ -1529,11 +1605,26 @@ pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
 
 #[cfg(windows)]
 pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
+    open_bundle_file_with_access(
+        path,
+        windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ,
+    )
+}
+
+/// Same protected reader, retaining the right to move this exact opened object.
+#[cfg(windows)]
+pub(crate) fn open_bundle_file_for_retirement(path: &Path) -> std::io::Result<fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ};
+    open_bundle_file_with_access(path, FILE_GENERIC_READ | DELETE)
+}
+
+#[cfg(windows)]
+fn open_bundle_file_with_access(path: &Path, access: u32) -> std::io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let file = fs::OpenOptions::new()
-        .read(true)
+        .access_mode(access)
         .share_mode(0x0000_0001) // deny concurrent writes and replacement
         .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
         .open(path)?;
@@ -1660,6 +1751,7 @@ fn hash_inventory_counts(inventory: &PluginInventory) -> BTreeMap<&'static str, 
     normalized.insert("hooks", inventory.hooks.to_string());
     normalized.insert("lsp", inventory.lsp.to_string());
     normalized.insert("native", inventory.native.to_string());
+    normalized.insert("providers", inventory.providers.to_string());
     normalized.insert("filesystem", inventory.filesystem_roots.join("\n"));
     normalized.insert("network", inventory.network_hosts.join("\n"));
     normalized.insert("lifecycle", inventory.lifecycle_mutation.to_string());
@@ -1698,6 +1790,29 @@ pub(crate) fn capability_hash_v1(inventory: &PluginInventory) -> String {
 /// Historical v2 capability digest. Kept only to prove that receipts from the
 /// Skills/MCP-only activation policy fail closed when v3 enables additional
 /// declarative adapters.
+/// Catalog and manifest artwork follows one inert, bounded wire format.
+pub fn validate_icon(value: &str) -> Result<(), String> {
+    use base64::Engine;
+    if value.len() > 32_768 {
+        return Err("plugin icon exceeds 32 KiB".into());
+    }
+    let encoded = value
+        .strip_prefix("data:image/png;base64,")
+        .ok_or("plugin icon must be an inline PNG")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "plugin icon has invalid base64")?;
+    if bytes.len() < 33 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return Err("plugin icon has an invalid PNG header".into());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(|_| "invalid PNG width")?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(|_| "invalid PNG height")?);
+    if width == 0 || height == 0 || width > 256 || height > 256 {
+        return Err("plugin icon must fit within 256 by 256 pixels".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn capability_hash_v2(inventory: &PluginInventory) -> String {
     let mut hasher = Sha256::new();
@@ -1743,7 +1858,7 @@ pub(crate) fn capability_hash_with_policy(
     hash_inventory_with_policy(inventory, policy)
 }
 
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+pub(super) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1791,6 +1906,90 @@ mod tests {
         let second = PluginManifest::validate_from_path(&path).unwrap();
         assert_ne!(first.content_hash, second.content_hash);
         assert_eq!(first.capability_hash, second.capability_hash);
+    }
+
+    #[test]
+    fn native_entry_receipt_is_plain_same_read_digest_without_changing_bundle_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("native")).unwrap();
+        let entry_bytes = b"export function apply() {}\n";
+        fs::write(tmp.path().join("native/index.mjs"), entry_bytes).unwrap();
+        fs::write(
+            tmp.path().join("native/undeclared.mjs"),
+            b"export const sidecar = 1",
+        )
+        .unwrap();
+        let manifest = write_manifest(tmp.path(), "[native]\npath = \"native/index.mjs\"\n");
+        let first = PluginManifest::validate_from_path(&manifest).unwrap();
+        let relative = PathBuf::from("native/index.mjs");
+        let plain = hex_digest(Sha256::digest(entry_bytes));
+        let mut domain = Sha256::new();
+        domain.update(b"codewhale-plugin-file-bytes-v1\0");
+        domain.update(entry_bytes);
+        assert_eq!(first.native_entry_hashes.len(), 1);
+        assert_eq!(first.native_entry_hashes[&relative], plain);
+        assert_eq!(first.file_hashes[&relative], hex_digest(domain.finalize()));
+        assert_ne!(
+            first.file_hashes[&relative],
+            first.native_entry_hashes[&relative]
+        );
+        assert!(
+            !first
+                .native_entry_hashes
+                .contains_key(Path::new("native/undeclared.mjs"))
+        );
+
+        // The purpose-specific capture adds no bytes to the established
+        // bundle domain or its complete regular-file inventory.
+        let manifest_bytes = fs::read(&manifest).unwrap();
+        let (without_entries, without_entry_hashes) =
+            hash_bundle(&first.canonical_root, &manifest_bytes, "plugin.toml", &[]).unwrap();
+        assert_eq!(first.content_hash, without_entries);
+        assert_eq!(first.file_hashes, without_entry_hashes.file_hashes);
+        assert!(without_entry_hashes.native_entry_hashes.is_empty());
+
+        // Undeclared companions remain whole-bundle authority even though
+        // they receive no Native EntryRef digest.
+        fs::write(
+            tmp.path().join("native/undeclared.mjs"),
+            b"export const sidecar = 2",
+        )
+        .unwrap();
+        let changed_sidecar = PluginManifest::validate_from_path(&manifest).unwrap();
+        assert_ne!(first.content_hash, changed_sidecar.content_hash);
+        assert_eq!(
+            first.native_entry_hashes,
+            changed_sidecar.native_entry_hashes
+        );
+        fs::write(
+            tmp.path().join("native/index.mjs"),
+            b"export function changed() {}\n",
+        )
+        .unwrap();
+        let changed_entry = PluginManifest::validate_from_path(&manifest).unwrap();
+        assert_ne!(changed_sidecar.content_hash, changed_entry.content_hash);
+        assert_ne!(
+            first.native_entry_hashes[&relative],
+            changed_entry.native_entry_hashes[&relative]
+        );
+    }
+
+    #[test]
+    fn ordinary_native_entry_receipt_keeps_bundle_limit_beyond_preset_metadata_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("native")).unwrap();
+        let bytes = format!(
+            "// {}\nexport function apply() {{}}\n",
+            "x".repeat(32 * 1024)
+        );
+        fs::write(tmp.path().join("native/index.mjs"), &bytes).unwrap();
+        let manifest = write_manifest(tmp.path(), "[native]\npath = \"native/index.mjs\"\n");
+        let validated = PluginManifest::validate_from_path(&manifest).unwrap();
+        assert_eq!(validated.inventory.native, 1);
+        assert_eq!(
+            validated.native_entry_hashes[Path::new("native/index.mjs")],
+            hex_digest(Sha256::digest(bytes.as_bytes()))
+        );
     }
 
     #[test]
@@ -2305,14 +2504,22 @@ args = ["server.js", "--mode=worker", "-e", "console.log('ready')"]
     #[test]
     fn bundled_computer_use_plugin_validates() {
         use crate::plugins::agent_plugin;
-        let root = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../plugins/computer-use"
-        ));
+        let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/plugins/computer-use"));
         let validated = PluginManifest::validate_from_path(&root.join("plugin.json"))
             .expect("in-repo computer-use bundle must validate");
         assert_eq!(validated.manifest.plugin.name, "computer-use");
+        // One declared skills *root* (`skills/`), which holds both skills.
         assert_eq!(validated.inventory.skills, 1);
+        let skills_root = validated.components.skills.first().expect("skills root");
+        let mut skill_dirs: Vec<String> = fs::read_dir(skills_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        skill_dirs.sort();
+        assert_eq!(skill_dirs, ["computer-use", "recording"]);
+        for skill in &skill_dirs {
+            assert!(skills_root.join(skill).join("SKILL.md").is_file());
+        }
         assert_eq!(validated.components.commands.len(), 1);
         assert!(validated.warnings.is_empty(), "{:?}", validated.warnings);
 
@@ -2320,11 +2527,55 @@ args = ["server.js", "--mode=worker", "-e", "console.log('ready')"]
         let servers =
             agent_plugin::parse_mcp_json(&mcp_text).expect("computer-use mcp.json must parse");
         let computer = servers.get("computer").expect("computer server");
-        assert_eq!(computer.command.as_deref(), Some("python3"));
+        assert_eq!(computer.command.as_deref(), Some("node"));
         assert!(
-            computer.args.iter().any(|arg| arg.ends_with("server.py")),
+            computer.args.iter().any(|arg| arg.ends_with("server.mjs")),
             "{:?}",
             computer.args
         );
+        // The entrypoint must stay inside the bundle: the engine launches it
+        // with `cwd` set to the plugin root.
+        for arg in &computer.args {
+            assert!(
+                !Path::new(arg).is_absolute() && !arg.split('/').any(|part| part == ".."),
+                "{arg} must stay inside the bundle"
+            );
+            assert!(root.join(arg).is_file(), "{arg} must exist in the bundle");
+        }
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::validate_icon;
+    use base64::Engine;
+
+    #[test]
+    fn artwork_is_inline_bounded_png_only() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../plugins/computer-use/plugin.json")).unwrap();
+        let icon = manifest["extensions"]["net.codewhale"]["icon"]
+            .as_str()
+            .unwrap();
+        assert!(validate_icon(icon).is_ok());
+        for invalid in [
+            "https://publisher.example/tracker.png",
+            "data:image/svg+xml,<svg/>",
+            "data:image/png;base64,invalid",
+        ] {
+            assert!(validate_icon(invalid).is_err());
+        }
+        let mut png = base64::engine::general_purpose::STANDARD
+            .decode(icon.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap();
+        png[16..20].copy_from_slice(&100_000_u32.to_be_bytes());
+        assert!(
+            validate_icon(&format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            ))
+            .is_err()
+        );
+        assert!(validate_icon(&"x".repeat(32_769)).is_err());
     }
 }

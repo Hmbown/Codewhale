@@ -10,96 +10,86 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{Shell, generate};
+#[cfg(test)]
+use clap::CommandFactory;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 
 use crate::dependencies::ExternalTool;
 
-use rust_i18n::i18n;
-i18n!("locales", fallback = ["en"]);
-
 mod acp_server;
-mod agy_credentials;
+pub mod agent_roster;
 mod approval_log;
 mod artifacts;
 mod audit;
 mod auto_reasoning;
 mod automation_manager;
-mod chatgpt_oauth;
 mod child_env;
 mod client;
 pub mod cloud_dispatch;
 mod codex_model_cache;
-mod command_safety;
 mod commands;
 mod compaction;
 mod composer_history;
 mod composer_stash;
 pub mod computer_meter;
 mod config;
+pub mod config_keys;
 mod config_persistence;
-mod config_ui;
-mod context_budget;
+#[cfg(test)]
+mod conformance;
 mod context_report;
-mod continual_harness;
 mod core;
 mod cost_status;
 mod credentials;
-mod deepseek_theme;
+/// Guarded installation I/O reusing Engine's confined file primitives.
+pub mod delivery_files;
 mod dependencies;
 pub mod dispatch_runner;
 mod doctor;
 mod doctor_fix;
 mod dsh_credentials;
-mod elapsed;
 mod error_taxonomy;
 mod eval;
-mod execpolicy;
+mod extension_host;
 mod external_credentials;
-mod fast_hash;
 mod features;
 mod fleet;
-mod goal_loop;
-mod hashing;
+mod fs_confined;
 mod hooks;
 mod image_attach;
 mod import_claude;
 mod integrations;
 mod lane_control;
 mod llm_client;
-mod llm_response_cache;
-mod localization;
+mod local_ollama;
 mod logging;
 mod lsp;
 mod mcp;
 mod mcp_server;
-mod media_originals;
-mod model_catalog;
-mod model_context;
 mod model_inventory;
 mod model_profile;
-mod model_registry;
+mod model_relevance;
 mod model_routing;
-mod models;
 mod models_dev_live;
-mod native_memory;
 mod network_policy;
+mod notify;
 mod oauth;
 mod operate;
-mod palette;
 mod plugins;
-mod prefix_cache;
 mod pricing;
+mod process_tree;
+mod profile_constitution;
 mod project_context;
 mod project_context_cache;
-mod prompt_zones;
 mod prompts;
+mod provider_catalog_live;
 mod provider_lake;
 mod provider_readiness;
 mod purge;
-mod regex_cache;
+pub mod reasoning_preference;
+mod receipts;
 mod remote_control;
 mod remote_setup;
 pub mod repl;
@@ -107,10 +97,10 @@ mod repo_law;
 mod request_manifest;
 mod request_tuning;
 mod resource_telemetry;
-mod retry_status;
 pub mod rlm;
 mod route_billing;
 mod route_budget;
+pub mod route_preferences;
 mod route_receipt;
 mod route_runtime;
 mod runtime_api;
@@ -119,10 +109,8 @@ mod runtime_handoff;
 mod runtime_log;
 mod runtime_policy;
 mod runtime_threads;
-mod safe_label;
 mod sandbox;
 mod scorecard;
-#[allow(dead_code)]
 mod session_diagnostics;
 // Acceptance matrix for #2934 / #4397. Test-only: the table documents the
 // contract for reviewers and is enforced by the tests beside it, so it does
@@ -132,18 +120,19 @@ mod session_diagnostics;
 mod doctor_loader_tests;
 #[cfg(test)]
 mod session_control_acceptance;
-#[allow(dead_code)]
+mod session_export;
 mod session_manager;
 mod session_peek;
 mod session_projection;
+mod session_reconcile;
 mod session_resume;
-pub mod session_tree;
+mod session_secret_scrub;
 mod settings;
 mod shell_dispatcher;
-mod skill_state;
 mod skills;
 mod snapshot;
 mod startup_trace;
+mod superfast;
 mod task_manager;
 mod telemetry_notice;
 #[cfg(test)]
@@ -151,41 +140,58 @@ mod test_support;
 // TLS bootstrap and platform client builders live in codewhale-release;
 // `crate::tls::*` keeps resolving for every caller.
 use codewhale_release::tls;
+// Runtime split path alias: modules that moved to `crates/runtime` keep
+// resolving as `crate::<module>` inside this crate. One block, no per-item
+// re-exports; the split deletes it by rewriting these paths to
+// `codewhale_runtime::` (docs/design/TUI_DECONSTRUCTION.md).
+use codewhale_runtime::{
+    context_budget, continual_harness, elapsed, fast_hash, goal_loop, hashing, host_terminal,
+    llm_response_cache, media_originals, model_context, native_memory, prompt_zones, regex_cache,
+    retry_status, safe_label, session_tree, skill_state, sleep_guard, tool_history_repair,
+    workspace_discovery,
+};
+mod diagnostics_reports;
 mod todo_snapshot;
-mod tool_history_repair;
 mod tool_inspection;
 mod tool_output_receipts;
 mod tools;
 mod tui;
+/// Portable, dependency-free dot-whale core and conformance helpers.
+/// The terminal and external renderers share this implementation.
+pub use tui::ambient_life::pet_sim as pet;
 mod turn_route_plan;
 mod utils;
 mod vision;
+mod voice;
 mod work_graph;
 mod worker_profile;
 mod working_set;
-mod workspace_discovery;
 mod workspace_trust;
-mod xai_oauth;
 
-use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_dir};
+use crate::config::{
+    Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_dir,
+};
 use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};
 use crate::features::{Feature, render_feature_table};
 use crate::llm_client::LlmClient;
 use crate::mcp::{
-    McpCommandAvailability, McpConfig, McpPool, McpServerConfig, McpServerOAuthConfig,
+    McpCommandAvailability, McpPool, McpServerConfig, McpServerOAuthConfig,
     is_relative_stdio_path_arg,
 };
-use crate::models::Role;
-use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
-use crate::session_manager::{SessionManager, create_saved_session, truncate_id};
+#[cfg(test)]
+use crate::session_manager::create_saved_session;
+use crate::session_manager::{SessionManager, truncate_id};
 use crate::tui::app::ScreenMode;
 use crate::tui::history::{summarize_tool_args, summarize_tool_output};
+use codewhale_models::Role;
+use codewhale_models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
 #[cfg(windows)]
 fn configure_windows_console_utf8() {
     use windows::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
 
     const CP_UTF8: u32 = 65001;
+    // SAFETY: integer argument only; failures discarded.
     unsafe {
         let _ = SetConsoleCP(CP_UTF8);
         let _ = SetConsoleOutputCP(CP_UTF8);
@@ -199,84 +205,37 @@ fn install_rustls_crypto_provider() {
     crate::tls::ensure_rustls_crypto_provider();
 }
 
+mod runtime_options;
+pub use runtime_options::RuntimeOptions;
+
+// The canonical executable owns process arguments. This decoder handles only
+// delegated Engine commands and their command-specific interactive flags.
 #[derive(Parser, Debug)]
-#[command(
-    name = "codewhale-tui",
-    bin_name = "codewhale-tui",
-    author,
-    version = env!("CODEWHALE_BUILD_VERSION"),
-    about = "Codewhale terminal coding agent",
-    long_about = "Terminal-native TUI and CLI for open-source and open-weight coding models.\n\nRun 'codewhale' to start.\n\nProvider routes include DeepSeek, Arcee, Hugging Face, OpenRouter, Xiaomi MiMo, local vLLM/SGLang/Ollama, and more."
-)]
+#[command(name = "codewhale", bin_name = "codewhale", version = env!("CODEWHALE_BUILD_VERSION"))]
 struct Cli {
-    /// Subcommand to run
     #[command(subcommand)]
     command: Option<Commands>,
-
     #[command(flatten)]
-    feature_toggles: FeatureToggles,
-
-    /// Initial prompt to submit in the interactive TUI. Use `exec` for non-interactive runs.
+    options: RuntimeOptions,
+    /// Initial prompt to submit in the interactive TUI.
     #[arg(short, long, value_name = "PROMPT", num_args = 1..)]
     prompt: Vec<String>,
-
-    /// Legacy compatibility alias for Act + Full Access.
-    #[arg(long, hide = true)]
-    yolo: bool,
-
-    /// Maximum number of concurrent sub-agents (1-128; default 64)
-    #[arg(long)]
-    max_subagents: Option<usize>,
-
-    /// Path to config file
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// Enable verbose logging
-    #[arg(short, long)]
-    verbose: bool,
-
-    /// Config profile name
-    #[arg(long)]
-    profile: Option<String>,
-
-    /// Workspace directory for file operations
-    #[arg(short, long)]
-    workspace: Option<PathBuf>,
-
-    /// Resume a previous session by ID or prefix
-    #[arg(short, long)]
+    /// Resume a previous session by ID or prefix.
+    #[arg(short, long, conflicts_with = "continue_session")]
     resume: Option<String>,
-
-    /// Continue the most recent session in this workspace
-    #[arg(short = 'c', long = "continue")]
+    /// Continue the most recent session in this workspace.
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
     continue_session: bool,
+    /// Recover the exact durable Resume/Fork intent without repeating its mutation.
+    #[arg(long, global = true, value_name = "KEY")]
+    operation_key: Option<String>,
+}
 
-    /// Enable TUI mouse capture for internal scrolling, transcript selection,
-    /// and scrollbar dragging
-    /// (default off on Windows)
-    #[arg(long = "mouse-capture", conflicts_with = "no_mouse_capture")]
-    mouse_capture: bool,
-
-    /// Disable TUI mouse capture so terminal-native text selection works
-    #[arg(long = "no-mouse-capture", conflicts_with = "mouse_capture")]
-    no_mouse_capture: bool,
-
-    /// Skip onboarding screens
-    #[arg(long)]
-    skip_onboarding: bool,
-
-    /// Start account-owned web remote control for this interactive session.
-    #[arg(long, hide = true)]
-    remote_control: bool,
-
-    /// Start a fresh session, ignoring any crash-recovery checkpoint
-    #[arg(long = "fresh")]
-    fresh: bool,
-
-    /// Skip loading project-level config from $WORKSPACE/.codewhale/config.toml
-    #[arg(long = "no-project-config")]
-    no_project_config: bool,
+impl std::ops::Deref for Cli {
+    type Target = RuntimeOptions;
+    fn deref(&self) -> &Self::Target {
+        &self.options
+    }
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -290,13 +249,7 @@ enum Commands {
     Setup(SetupArgs),
     /// Generate a remote Codewhale agent deploy bundle (cloud + chat bridge)
     RemoteSetup(remote_setup::RemoteSetupArgs),
-    /// Generate shell completions
-    Completions {
-        /// Shell to generate completions for
-        #[arg(value_enum)]
-        shell: Shell,
-    },
-    /// List saved sessions
+    /// List saved sessions, or export one as a full-fidelity archive
     Sessions {
         /// Maximum number of sessions to display
         #[arg(short, long, default_value = "20")]
@@ -304,6 +257,26 @@ enum Commands {
         /// Search sessions by title
         #[arg(short, long)]
         search: Option<String>,
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
+    },
+    /// Show what a session did: files changed, commands run, web and MCP
+    /// calls, agents, approvals, and failures, read from its saved record
+    #[command(visible_alias = "receipt")]
+    Receipts {
+        /// Session id or unique prefix, or a Runtime thread id (thr_...).
+        /// Omit it (or pass --last) for the most recently updated one.
+        #[arg(value_name = "SESSION_ID")]
+        id: Option<String>,
+        /// Use the most recently updated session or thread
+        #[arg(long, conflicts_with = "id")]
+        last: bool,
+        /// Limit to one turn: a thread's turn id, or a session's turn number
+        #[arg(long, value_name = "TURN")]
+        turn: Option<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value = "md")]
+        format: receipts::ReceiptFormat,
     },
     /// Create default AGENTS.md in current directory
     Init,
@@ -317,7 +290,7 @@ enum Commands {
     Logout,
     /// Manage provider authentication flows.
     Auth(TuiAuthArgs),
-    /// List available models from the configured API endpoint
+    /// List cached models, or update catalogs for configured providers
     Models(ModelsArgs),
     /// Generate speech audio with Xiaomi MiMo TTS models
     #[command(visible_alias = "tts")]
@@ -389,6 +362,48 @@ enum Commands {
     },
 }
 
+/// Subcommands of `codewhale sessions`. Without one, the command falls back
+/// to listing sessions.
+#[derive(Subcommand, Debug, Clone)]
+enum SessionsCommand {
+    /// List saved sessions (default when no subcommand is given)
+    List {
+        /// Maximum number of sessions to display
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Search sessions by title
+        #[arg(short, long)]
+        search: Option<String>,
+    },
+    /// Mask credentials that older builds stored in saved sessions' tool
+    /// output. Reports what it would change unless `--apply` is given. Run it
+    /// while no Codewhale session is open.
+    ScrubSecrets {
+        /// Rewrite the affected session files (default: report only)
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
+    /// Export a session as a full-fidelity tar.xz archive (complete context:
+    /// system prompt, messages, tool calls and results, plus artifacts)
+    Export {
+        /// Session id (or unambiguous id prefix) to export
+        #[arg(value_name = "SESSION_ID")]
+        id: String,
+        /// Destination .tar.xz path (default: codewhale-session-<id>.tar.xz)
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Exclude the session artifacts directory from the archive
+        #[arg(long, default_value_t = false)]
+        skip_artifacts: bool,
+        /// xz compression preset, 0 (fastest) through 9 (smallest)
+        #[arg(long, default_value_t = session_export::DEFAULT_XZ_COMPRESSION_LEVEL)]
+        compression: u32,
+        /// Overwrite the destination file if it already exists
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+}
+
 #[derive(Args, Debug, Clone)]
 #[command(after_help = "\
 Examples:
@@ -396,9 +411,14 @@ Examples:
   codewhale exec --auto \"list crates/ with ls\"
   codewhale exec --auto --output-format stream-json \"fix the failing test\"
 
-Plain `codewhale exec` is a one-shot model response. Use `--auto` for
-non-interactive agent-with-tools execution. `--auto` does not change the
-sandbox posture or elevate a denied tool. Use `--sandbox danger-full-access`
+Plain `codewhale exec` is a one-shot model response: one Engine turn with the
+same system prompt as every other run, and no tools. Use `--auto` for
+non-interactive agent-with-tools execution. Tools are offered only with
+`--auto`, `--yolo`, `--allowed-tools`, or when resuming a session; limits such
+as `--max-turns`, `--disallowed-tools` or `--sandbox`, and the output format,
+never add tools. A reply cut off at the provider's output limit is continued
+in the same turn, at most 8 model steps unless `--max-turns` says otherwise.
+`--auto` does not change the sandbox posture or elevate a denied tool. Use `--sandbox danger-full-access`
 or `--allow-sandbox-elevation` to explicitly authorize sandbox elevation.
 ")]
 struct ExecArgs {
@@ -465,10 +485,22 @@ struct ExecArgs {
     /// Internal Fleet worker authority envelope. Non-secret, versioned JSON.
     #[arg(long, value_name = "JSON", hide = true)]
     tool_authority_json: Option<String>,
-    /// Prompt to send to the model
+    /// Fire the configured hooks in this run (opt-in). On the headless path
+    /// the engine-side events are `tool_call_before` — which may still deny
+    /// a call — and `shell_env`. A hook `ask` resolves fail-closed because
+    /// nothing can prompt headlessly. Fleet worker subprocesses never fire
+    /// operator hooks.
+    #[arg(long, default_value_t = false)]
+    hooks: bool,
+    /// Read the prompt from a file (`-` reads stdin) instead of argv, for
+    /// prompts past the OS per-argument limit (~128 KiB on Linux).
+    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    prompt_file: Option<PathBuf>,
+    /// Prompt to send to the model. Taken literally, including a lone `-`;
+    /// use `--prompt-file -` to read stdin.
     #[arg(
         value_name = "PROMPT",
-        required = true,
+        required_unless_present = "prompt_file",
         trailing_var_arg = true,
         allow_hyphen_values = true
     )]
@@ -500,15 +532,32 @@ struct TuiAuthArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 enum TuiAuthCommand {
-    /// Sign in to xAI/Grok with an SSH-friendly device code.
+    /// Sign in to xAI/Grok with an SSH-friendly device code; run again to switch accounts.
     #[command(name = "xai-device")]
     XaiDevice,
-    /// Sign in with ChatGPT for Codex subscription access (PKCE loopback).
+    /// Sign in with ChatGPT for Codex subscription access; run again to switch accounts.
     #[command(name = "chatgpt")]
     Chatgpt,
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    /// Sign in to OrcaRouter with OAuth 2.0 + PKCE; run again to switch accounts.
+    #[command(name = "orcarouter")]
+    Orcarouter,
+    /// Revoke the saved OrcaRouter credential. The OrcaRouter console also
+    /// revokes every key it issued to this app in one click.
+    #[command(name = "orcarouter-revoke")]
+    OrcarouterRevoke,
+    /// Sign in to a provider contributed by an enabled, reviewed plugin.
+    PluginLogin {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove credentials for one plugin provider without changing trust.
+    PluginLogout {
+        #[arg(long)]
+        provider: String,
+    },
 }
 
 const CODEWHALE_TOOL_SURFACE_ENV: &str = "CODEWHALE_TOOL_SURFACE";
@@ -560,6 +609,46 @@ fn shell_only_exec_allowed_tools() -> Vec<String> {
         .iter()
         .map(|name| (*name).to_string())
         .collect()
+}
+
+/// #6510: whether an `exec` run is offered tools. Plain exec is one Engine
+/// turn with no tools; only a flag that grants tool authority opens a
+/// surface: `--auto`/`--yolo`, an explicit `--allowed-tools` list, a Fleet
+/// authority envelope, or the launcher's tool-surface env. A resumed session
+/// keeps its surface, because its history can carry tool calls and results
+/// that a zero-tool request cannot replay.
+///
+/// Limits (`--max-turns`, `--max-tool-calls`, `--disallowed-tools`,
+/// `--sandbox`, `--allow-sandbox-elevation`), prompt and hook opt-ins
+/// (`--append-system-prompt`, `--hooks`) and the output format never grant
+/// tools. They used to, so `exec --max-turns 1 "hi"` silently became a
+/// tool-using agent.
+fn exec_grants_tool_surface(
+    args: &ExecArgs,
+    yolo: bool,
+    resuming: bool,
+    env_tool_surface: bool,
+) -> bool {
+    args.auto
+        || yolo
+        || resuming
+        || args.allowed_tools.is_some()
+        || args.tool_authority_json.is_some()
+        || env_tool_surface
+}
+
+/// Flags that only shape a tool surface, passed on a run that has none.
+fn exec_tool_flags_without_grant(args: &ExecArgs) -> Vec<&'static str> {
+    [
+        (args.max_tool_calls.is_some(), "--max-tool-calls"),
+        (args.disallowed_tools.is_some(), "--disallowed-tools"),
+        (args.sandbox.is_some(), "--sandbox"),
+        (args.allow_sandbox_elevation, "--allow-sandbox-elevation"),
+        (args.hooks, "--hooks"),
+    ]
+    .into_iter()
+    .filter_map(|(passed, flag)| passed.then_some(flag))
+    .collect()
 }
 
 fn resolve_exec_allowed_tools(
@@ -646,6 +735,10 @@ struct FleetRunArgs {
     /// Schedule once and return instead of staying in the manager loop
     #[arg(long, hide = true, default_value_t = false)]
     once: bool,
+    /// Validate the spec (shape, roster members, profiles, model routes)
+    /// without creating a run or starting any worker
+    #[arg(long, default_value_t = false)]
+    check: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -722,9 +815,16 @@ enum FleetAlertAdapterArg {
 /// terminated-by-signal exit (no code, no terminal restore, no `session_end`).
 /// After this function returns, the signals are armed.
 fn spawn_signal_cleanup_task() {
-    let signals = TerminatingSignals::register();
+    let mut signals = TerminatingSignals::register();
     tokio::spawn(async move {
         let exit_code = signals.wait().await;
+        // A serving Runtime API gets a bounded window to end its open event
+        // streams with a typed `stream.end`, so clients can tell a Runtime
+        // that stopped from a dropped connection. A second signal skips it.
+        tokio::select! {
+            () = runtime_api::drain_for_signal_exit() => {}
+            _ = signals.wait() => {}
+        }
         // If we get here a fatal signal arrived. Restore the terminal
         // and exit. A second signal during cleanup re-enters this
         // path and aborts via `std::process::exit` directly.
@@ -733,6 +833,8 @@ fn spawn_signal_cleanup_task() {
         if !CLEANED_UP.swap(true, std::sync::atomic::Ordering::SeqCst) {
             #[cfg(unix)]
             crate::tools::shell::abort_pending_persistent_process_groups_for_exit();
+            #[cfg(unix)]
+            crate::process_tree::kill_contained_trees_for_exit();
             crate::tui::ui::emergency_restore_terminal();
             // Nothing async survives the `exit` below, so this is the last
             // chance to say how the session ended. `record_blocking` is one
@@ -818,7 +920,7 @@ impl TerminatingSignals {
     /// Resolve with 128 + signal number for whichever arrives first. The
     /// fallback never-resolving future keeps `select!` well-typed when a
     /// stream failed to register.
-    async fn wait(mut self) -> i32 {
+    async fn wait(&mut self) -> i32 {
         tokio::select! {
             _ = async { match self.sigint.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 130,
             _ = async { match self.sigterm.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 143,
@@ -843,7 +945,7 @@ impl TerminatingSignals {
         }
     }
 
-    async fn wait(mut self) -> i32 {
+    async fn wait(&mut self) -> i32 {
         match self.ctrl_c.as_mut() {
             Some(s) => {
                 s.recv().await;
@@ -856,6 +958,45 @@ impl TerminatingSignals {
 
 fn join_prompt_parts(parts: &[String]) -> String {
     parts.join(" ")
+}
+
+/// Maximum bytes accepted for an exec prompt read from `--prompt-file` or
+/// stdin. Far past argv's per-argument ceiling; the model's context window
+/// stays the real limit (#6688).
+const MAX_EXEC_PROMPT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The effective exec prompt: argv words, or the body of `--prompt-file`
+/// (`-` = stdin). A positional `-` stays literal text: raw-prompt callers
+/// such as cloud dispatch pass a job prompt verbatim as argv. Runs before
+/// any model call so a missing or empty source fails loudly (#6688).
+fn resolve_exec_prompt(args: &ExecArgs) -> Result<String> {
+    let Some(path) = &args.prompt_file else {
+        return Ok(join_prompt_parts(&args.prompt));
+    };
+    let prompt = if path.as_os_str() == "-" {
+        if args.parent_death_watch {
+            bail!("--parent-death-watch owns stdin; pass the prompt with --prompt-file <PATH>");
+        }
+        let stdin = io::stdin();
+        if stdin.is_terminal() {
+            bail!("--prompt-file - reads stdin, but stdin is a terminal; pipe the prompt in.");
+        }
+        read_capped_text(stdin.lock(), MAX_EXEC_PROMPT_BYTES, "exec prompt on stdin")?
+    } else {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open --prompt-file {}", path.display()))?;
+        read_capped_text(file, MAX_EXEC_PROMPT_BYTES, "--prompt-file")
+            .with_context(|| format!("failed to read --prompt-file {}", path.display()))?
+    };
+    if prompt.trim().is_empty() {
+        let source = if path.as_os_str() == "-" {
+            "stdin".to_string()
+        } else {
+            path.display().to_string()
+        };
+        bail!("exec prompt from {source} is empty");
+    }
+    Ok(prompt)
 }
 
 fn resolve_exec_model(config: &Config, explicit_model: Option<&str>) -> String {
@@ -881,14 +1022,14 @@ fn apply_exec_provider_override(config: &mut Config, provider_arg: &str) -> Resu
         config.provider = Some(provider_arg.to_string());
         return Ok(());
     }
-    if let Some(provider) = crate::config::ApiProvider::parse(provider_arg) {
+    if let Some(provider) = crate::config::ProviderKind::parse(provider_arg) {
         config.provider = Some(provider.as_str().to_string());
         return Ok(());
     }
     bail!(
         "Unrecognized --provider {provider_arg:?}. Known providers: {} \
          or a configured [providers.<name>] custom provider",
-        crate::config::ApiProvider::names_hint()
+        crate::config::ProviderKind::names_hint()
     );
 }
 
@@ -936,11 +1077,39 @@ fn resolve_exec_resume_session_id(args: &ExecArgs, workspace: &Path) -> Result<O
 }
 
 fn load_exec_resume_session(session_id: &str) -> Result<session_manager::SavedSession> {
-    let session_ref = exec_stream_session_ref(session_id);
-    SessionManager::default_location()
+    match SessionManager::default_location()
         .context("could not open session manager for resume")?
-        .load_session_by_prefix(session_id)
-        .with_context(|| format!("could not load session {session_ref}"))
+        .attach_session_by_prefix(session_id)
+    {
+        Ok((recovery, lease)) => {
+            // This exec run owns the session until it exits.
+            lease.commit();
+            Ok(recovery.session)
+        }
+        // Resuming a session a TUI has open would give its document two
+        // writers; the TUI's next autosave would drop this run's turns.
+        Err(error) if error.kind() == io::ErrorKind::ResourceBusy => {
+            bail!(exec_resume_busy_error(session_id))
+        }
+        Err(error) => Err(error).with_context(|| exec_resume_load_error(session_id)),
+    }
+}
+
+fn exec_resume_busy_error(session_id: &str) -> String {
+    format!(
+        "session {} is open in another Codewhale window. Continue it there, or run \
+         `codewhale fork <SESSION_ID>` and resume the copy.",
+        exec_stream_session_ref(session_id)
+    )
+}
+
+/// The typed `--resume` value stays redacted in every output mode: exec runs
+/// in CI logs, and a mistyped or pasted value can be a secret.
+fn exec_resume_load_error(session_id: &str) -> String {
+    format!(
+        "could not load session {}. Run `codewhale sessions` to list ids.",
+        exec_stream_session_ref(session_id)
+    )
 }
 
 /// Select the route for `exec --resume` before any engine/client is built.
@@ -975,7 +1144,9 @@ fn resolve_exec_resume_route(
                     saved_provider_identity
                 )
             })?;
-        config.scope_to_provider_identity(&identity);
+        config
+            .scope_to_provider_identity(&identity)
+            .map_err(anyhow::Error::msg)?;
     }
 
     if let Some(model) = explicit_model {
@@ -1038,7 +1209,7 @@ struct SetupArgs {
     /// Print a compact, read-only status report (no network calls)
     #[arg(long, default_value_t = false, conflicts_with_all = ["mcp", "skills", "tools", "plugins", "all", "local", "clean"])]
     status: bool,
-    /// Remove regenerable session checkpoints (latest + offline_queue)
+    /// Remove crash checkpoints while preserving unsent offline input
     #[arg(long, default_value_t = false, conflicts_with_all = ["mcp", "skills", "tools", "plugins", "all", "local", "status"])]
     clean: bool,
 }
@@ -1096,6 +1267,17 @@ struct DoctorArgs {
     /// Apply the planned repairs without prompting (requires --fix)
     #[arg(long, default_value_t = false, requires = "fix")]
     yes: bool,
+    /// Repair the saved-session store now: re-index recoverable sessions,
+    /// unbind dead thread links, set aside (never delete) what nothing uses
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["json", "context_json"]
+    )]
+    repair_sessions: bool,
+    /// With --repair-sessions: report what would be repaired, change nothing
+    #[arg(long, default_value_t = false, requires = "repair_sessions")]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1124,7 +1306,7 @@ struct ScorecardArgs {
     #[arg(long, value_name = "FILE")]
     baseline: Option<PathBuf>,
     /// Regression threshold, in percent increase over the baseline.
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, default_value_t = 5.0, value_parser = parse_regression_threshold)]
     threshold: f64,
     /// Emit machine-readable JSON instead of the human summary.
     #[arg(long, default_value_t = false)]
@@ -1159,6 +1341,12 @@ struct ModelsArgs {
     /// Print models as pretty JSON
     #[arg(long, default_value_t = false)]
     json: bool,
+    /// Refresh catalogs for all configured providers (no inference requests)
+    #[arg(long, visible_alias = "refresh")]
+    update: bool,
+    /// Limit listing or refresh to this exact provider identity
+    #[arg(long, value_name = "ID")]
+    provider: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1205,29 +1393,6 @@ struct SpeechArgs {
     json: bool,
 }
 
-#[derive(Args, Debug, Default, Clone)]
-struct FeatureToggles {
-    /// Enable a feature (repeatable). Equivalent to `features.<name>=true`.
-    #[arg(long = "enable", value_name = "FEATURE", action = clap::ArgAction::Append, global = true)]
-    enable: Vec<String>,
-
-    /// Disable a feature (repeatable). Equivalent to `features.<name>=false`.
-    #[arg(long = "disable", value_name = "FEATURE", action = clap::ArgAction::Append, global = true)]
-    disable: Vec<String>,
-}
-
-impl FeatureToggles {
-    fn apply(&self, config: &mut Config) -> Result<()> {
-        for feature in &self.enable {
-            config.set_feature(feature, true)?;
-        }
-        for feature in &self.disable {
-            config.set_feature(feature, false)?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Args, Debug, Clone)]
 struct ReviewArgs {
     /// Review staged changes instead of the working tree
@@ -1261,9 +1426,13 @@ struct ReviewArgs {
     /// with "available from configured provider route(s): ...").
     #[arg(long)]
     provider: Option<String>,
-    /// Maximum diff characters to include
+    /// Maximum diff characters; an oversized diff is refused, never truncated
     #[arg(long, default_value_t = 200_000)]
     max_chars: usize,
+    /// Maximum complete PR review passes. Values above 1 explicitly authorize
+    /// additional model requests; the default preserves single-pass behavior.
+    #[arg(long, default_value_t = 1)]
+    max_passes: usize,
     /// Write a durable pre-push review receipt after a successful review
     #[arg(long, default_value_t = false)]
     write_receipt: bool,
@@ -1376,7 +1545,8 @@ enum McpCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Connect to MCP servers and report status
+    /// Connect to MCP servers and report status (does not attach to a
+    /// running session)
     Connect {
         /// Optional server name to connect to
         #[arg(value_name = "SERVER")]
@@ -1414,7 +1584,7 @@ enum McpCommand {
         #[arg(long = "scope", requires = "url", value_delimiter = ',')]
         scopes: Vec<String>,
         /// Arguments for command-based servers
-        #[arg(long = "arg")]
+        #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Authenticate to a URL-based MCP server using OAuth
@@ -1607,7 +1777,7 @@ enum SandboxCommand {
     },
 }
 
-const CODEWHALE_MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+const CODEWHALE_MAIN_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 /// Pre-clap seam feeding `apply_process_hardening` (#5723): resolve only the
 /// *startup* sandbox posture — `CODEWHALE_SANDBOX_MODE` /
@@ -1642,11 +1812,10 @@ fn resolve_startup_sandbox_mode_for_hardening() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Entry point for the single binary. Takes argv including binary name at 0,
-/// parses with clap, and runs the TUI/runtime dispatch. Returns process exit
-/// code for the caller to exit with.
-pub fn run(args: Vec<String>) -> std::process::ExitCode {
-    match run_with_args(args) {
+/// Run a delegated Engine command in the canonical CLI process. Startup facts
+/// are typed; `args` contains only command arguments, without a binary name.
+pub fn run(options: RuntimeOptions, args: Vec<String>) -> std::process::ExitCode {
+    match run_with_args(options, args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
@@ -1659,12 +1828,16 @@ pub fn run(args: Vec<String>) -> std::process::ExitCode {
 }
 
 /// Internal implementation that mirrors the old `main()` but takes explicit
-/// args instead of reading `std::env::args()`. Used by `run()` and tested
-/// directly.
-fn run_with_args(args: Vec<String>) -> Result<()> {
+/// args instead of reading `std::env::args()`. Startup facts are captured by
+/// the canonical CLI and applied before config/discovery or worker startup.
+fn run_with_args(options: RuntimeOptions, args: Vec<String>) -> Result<()> {
+    let args: Vec<String> = std::iter::once("codewhale".to_string())
+        .chain(args)
+        .collect();
     // Match the dispatcher entrypoint: Unix shells and supervisors may inherit
     // SIGPIPE ignored, which turns short pipelines such as `codewhale doctor |
     // head` into BrokenPipe panics once this delegated TUI binary prints.
+    // SAFETY: first call at startup; no threads or handlers yet.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -1673,6 +1846,10 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     startup_trace::mark_process_start();
     configure_windows_console_utf8();
     install_rustls_crypto_provider();
+    // The TUI is the terminal host for every mode this binary runs
+    // (interactive, exec, serve): runtime code reaches raw mode and
+    // notification delivery only through this port.
+    crate::tui::ui::install_host_terminal();
 
     // ── Process hardening (#2183) ─────────────────────────────────────────
     // MUST run before Tokio is booted and before any threads are spawned.
@@ -1683,6 +1860,23 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     let startup_sandbox_mode = resolve_startup_sandbox_mode_for_hardening();
     crate::sandbox::process_hardening::apply_process_hardening(startup_sandbox_mode.as_deref());
 
+    if args.get(1).is_some_and(|arg| arg == "pet") {
+        let root = crate::tui::pet_watch::owner::directory()?;
+        match args.get(2).map(String::as_str) {
+            Some("serve") if args.len() == 3 => {
+                return crate::tui::pet_watch::owner::serve(
+                    root,
+                    std::env::var("CODEWHALE_PET_PORT")
+                        .ok()
+                        .map(|p| p.parse::<u16>())
+                        .transpose()?
+                        .unwrap_or(4633),
+                );
+            }
+            _ => anyhow::bail!("Usage: codewhale pet serve"),
+        }
+    }
+
     // ── Fatal-signal terminal guard (#5424) ───────────────────────────────
     // Abort-class deaths (stack overflow, allocation failure, double panic)
     // skip the panic hook AND every Drop guard, leaving mouse capture and
@@ -1692,7 +1886,7 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     crate::tui::ui::fatal_signal_guard::install_fatal_signal_guard();
 
     // Set up process panic hook before anything else — writes crash dumps
-    // to ~/.deepseek/crashes/ even if the panic happens before tokio is up,
+    // to the selected profile's crashes/ even before tokio is up,
     // and restores the terminal so a panicked TUI doesn't leave the user's
     // shell stuck in alt-screen mode.
     let orig_hook = std::panic::take_hook();
@@ -1735,8 +1929,8 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
             codewhale_telemetry::record_blocking(codewhale_telemetry::Event::Panic { site });
         }
         // Write crash dump best-effort
-        if let Some(home) = crate::config::effective_home_dir() {
-            let crash_dir = home.join(".deepseek").join("crashes");
+        if let Ok(home) = codewhale_config::codewhale_home() {
+            let crash_dir = home.join("crashes");
             let _ = std::fs::create_dir_all(&crash_dir);
             use chrono::Utc;
             let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
@@ -1756,7 +1950,10 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     // discovery. Plugin discovery therefore runs first, and the loader below
     // admits only built-in provider credential names from a stable file read.
     let cli = match Cli::try_parse_from(args) {
-        Ok(c) => c,
+        Ok(mut cli) => {
+            cli.options = options.merge(cli.options)?;
+            cli
+        }
         Err(e) => {
             e.exit();
         }
@@ -1776,12 +1973,14 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
             plugin_registry = Some(discovery.registry_for_workspace(&workspace));
             plugin_discovery = Some(discovery);
         },
-        warn_on_workspace_dotenv_result,
+        || warn_on_workspace_dotenv_result(&workspace),
     );
     let plugin_discovery = plugin_discovery
         .expect("plugin discovery initialization must precede workspace dotenv loading");
     let plugin_registry = plugin_registry
         .expect("plugin discovery initialization must precede workspace dotenv loading");
+
+    crate::plugins::providers::install_startup_registry(plugin_registry.clone());
 
     // The interactive runtime intentionally carries a large state machine:
     // terminal rendering, modal dispatch, provider setup, and fleet/workflow
@@ -1790,6 +1989,18 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     // platform main-thread default (8 MiB on macOS). Give that owner an
     // explicit stack while keeping process hardening and the global panic hook
     // above this boundary, before Tokio or any worker thread exists.
+    //
+    // 16 MiB stopped being enough: in a debug build the deepest measured
+    // chain — the event-loop poll stack down to the trust-confirm engine
+    // respawn (`handle_view_events` → `apply_command_result` →
+    // `spawn_tui_engine` → `Engine::new` → `CodewhaleClient::new` →
+    // `resolve_runtime_route` → `Config::clone`) — consumed ~16.5 MiB and
+    // aborted on the guard page (the plugin_toml_binary cucumber acceptance
+    // on the ubuntu CI leg). The fat frames are the debug poll functions of
+    // the giant top-level futures (`run_async_main_inner` ~5.5 MiB, `run_tui`
+    // ~3.2 MiB, `handle_view_events` ~2.1 MiB), so any small addition to them
+    // re-tips a zero-margin stack. 32 MiB restores real headroom; the cost is
+    // address space only, since thread stacks commit lazily.
     let runtime_thread = std::thread::Builder::new()
         .name("codewhale-main".to_string())
         .stack_size(CODEWHALE_MAIN_STACK_BYTES)
@@ -1887,7 +2098,8 @@ fn diagnostic_worker_count(command: Option<&Commands>) -> Option<usize> {
             Commands::Doctor(_)
             | Commands::Eval(_)
             | Commands::SessionDiagnostics(_)
-            | Commands::Sessions { .. },
+            | Commands::Sessions { .. }
+            | Commands::Receipts { .. },
         ) => true,
         // Only the read-only status report; mutating setup keeps defaults.
         Some(Commands::Setup(args)) => args.status,
@@ -1940,10 +2152,17 @@ fn telemetry_session_source(command: Option<&Commands>) -> codewhale_telemetry::
 }
 
 /// Read-only commands must not create telemetry state as a side effect.
+// Sessions export only projects local records to an explicit output. Like
+// listing, it must not initialize telemetry or interactive session state.
 fn telemetry_command_is_read_only(command: Option<&Commands>) -> bool {
     matches!(
         command,
-        Some(Commands::Doctor(_) | Commands::SessionDiagnostics(_) | Commands::Sessions { .. })
+        Some(
+            Commands::Doctor(_)
+                | Commands::SessionDiagnostics(_)
+                | Commands::Sessions { .. }
+                | Commands::Receipts { .. }
+        )
     ) || matches!(command, Some(Commands::Setup(args)) if args.status)
 }
 
@@ -2004,22 +2223,51 @@ fn arm_telemetry(cli: &Cli, command: Option<&Commands>) {
     );
 }
 
-/// Apply the choice made in the native TUI disclosure.
-///
-/// The in-memory setup state is authoritative for this process. In particular,
-/// a Disable choice reaches `decide` as an opt-out even when neither durable
-/// write landed, so the current launch cannot arm and any existing buffer is
-/// wiped whenever the telemetry home remains reachable.
-pub(crate) fn apply_tui_telemetry_decision(
-    pending: &crate::telemetry_notice::PendingTelemetryNotice,
-    setup: &codewhale_config::SetupState,
-) {
-    arm_telemetry_with_setup(
-        pending.config_path.clone(),
-        codewhale_telemetry::Surface::Tui,
-        pending.session_source,
-        Some(setup),
-    );
+/// Non-secret account label (email, plan) of the Codewhale-owned
+/// subscription sign-in stored in `generation`, for `codewhale auth status`
+/// and `auth list`. Reads only that Codewhale-owned file: no refresh, no
+/// network, no external CLI file. `Err` carries a fixed, token-free reason
+/// the sign-in is unusable (missing, unreadable, no usable entry).
+pub fn owned_oauth_account_label(
+    provider: codewhale_config::ProviderKind,
+    generation: &str,
+) -> Result<Option<String>> {
+    let provider = match provider {
+        codewhale_config::ProviderKind::OpenaiCodex => oauth::OAuthProvider::Chatgpt,
+        codewhale_config::ProviderKind::Xai => oauth::OAuthProvider::Xai,
+        _ => bail!("provider has no subscription sign-in"),
+    };
+    oauth::owned_account_label_for_generation(provider, generation)
+}
+
+/// Whether a resolved route is the canonical public ChatGPT API endpoint.
+/// CLI diagnostics use the same destination check as inference dispatch.
+#[must_use]
+pub fn is_official_chatgpt_api_base(base_url: &str) -> bool {
+    pricing::is_official_chatgpt_api(base_url)
+}
+
+/// Compatibility command to explicitly enable usage under the current policy.
+/// This optional choice never arms the current process.
+pub fn accept_telemetry_notice(config_path: Option<PathBuf>, version: u32) -> Result<String> {
+    if version != codewhale_telemetry::NOTICE_VERSION {
+        anyhow::bail!(
+            "read `codewhale config telemetry`, then explicitly accept current notice version {}",
+            codewhale_config::TELEMETRY_NOTICE_VERSION
+        );
+    }
+    set_telemetry_preference(config_path, true)
+}
+
+/// Set the durable usage preference through the same transition as Settings.
+/// Enabling affects the next launch; disabling immediately erases queued usage.
+pub fn set_telemetry_preference(config_path: Option<PathBuf>, enabled: bool) -> Result<String> {
+    let applied = crate::telemetry_notice::apply_persistent_preference(config_path, enabled);
+    let message = applied.message(codewhale_localization::Locale::En);
+    if applied.is_error() {
+        anyhow::bail!("{message}");
+    }
+    Ok(message)
 }
 
 /// Close the armed session and flush, bounded.
@@ -2043,8 +2291,10 @@ async fn finish_telemetry(outcome: &Result<()>, surface: codewhale_telemetry::Su
     }
     codewhale_telemetry::record(telemetry_session_end());
     if surface == codewhale_telemetry::Surface::Cli {
-        let _ =
-            codewhale_telemetry::persist_local_blocking(codewhale_telemetry::CLI_PERSIST_TIMEOUT);
+        let persistence = codewhale_telemetry::persist_local_blocking();
+        logging::info(format!(
+            "telemetry local persistence outcome={persistence:?}"
+        ));
         return;
     }
     // `shutdown_blocking` parks a thread waiting on the writer, so it goes to
@@ -2088,11 +2338,9 @@ async fn run_async_main_inner(
     // ahead of it collects nothing.
     spawn_signal_cleanup_task();
 
-    // A due interactive disclosure belongs to the first native TUI frame. In
-    // that one case arming is deferred until its decision event; every other
-    // surface keeps the ordinary pre-dispatch predicate. This is what lets an
-    // immediate Disable choice stop this very session without printing or
-    // blocking on a shell questionnaire first.
+    // A due interactive disclosure belongs to the native TUI. Presentation
+    // does not gate the default-on policy; unreadable privacy state does.
+    // Settings can disable this session and erase its pending aggregates.
     let surface = telemetry_surface(command.as_ref());
     let telemetry_notice_plan = if surface == codewhale_telemetry::Surface::Tui {
         crate::telemetry_notice::plan_if_due(
@@ -2128,6 +2376,14 @@ async fn run_async_main_dispatch(
     mut pending_telemetry_notice: Option<crate::telemetry_notice::PendingTelemetryNotice>,
 ) -> Result<()> {
     logging::set_verbose(cli.verbose || logging::env_requests_verbose_logging());
+    anyhow::ensure!(
+        cli.operation_key.is_none()
+            || matches!(
+                command.as_ref(),
+                Some(Commands::Resume { .. } | Commands::Fork { .. })
+            ),
+        "--operation-key is an exact read-only recovery of an explicit resume/fork intent"
+    );
 
     // Install any user prompt overrides from the config directory before an
     // engine can compose a system prompt. The override cells are
@@ -2148,13 +2404,12 @@ async fn run_async_main_dispatch(
                 let config = match load_doctor_config_from_cli(&cli, &args) {
                     Ok(config) => config,
                     Err(error) if args.json => return run_doctor_json_config_error(&error),
-                    Err(_) => {
-                        bail!(
-                            "doctor configuration validation failed; details omitted because configuration errors may contain credential material"
-                        )
-                    }
+                    Err(error) => bail!(doctor_config_error_text(&error)),
                 };
                 let workspace = resolve_workspace(&cli);
+                if args.repair_sessions {
+                    return run_doctor_repair_sessions(args.dry_run);
+                }
                 if args.context_json {
                     run_doctor_context_json(&config, &workspace)
                 } else if args.json {
@@ -2176,6 +2431,7 @@ async fn run_async_main_dispatch(
                         &config,
                         &workspace,
                         cli.config.as_deref(),
+                        effective_config_profile(&cli).as_deref(),
                         probes,
                         plugin_registry.as_ref(),
                     )
@@ -2202,11 +2458,41 @@ async fn run_async_main_dispatch(
                 run_setup(&config, &workspace, args, plugin_registry.as_ref())
             }
             Commands::RemoteSetup(args) => remote_setup::run_remote_setup(args),
-            Commands::Completions { shell } => {
-                generate_completions(shell);
-                Ok(())
-            }
-            Commands::Sessions { limit, search } => list_sessions(limit, search),
+            Commands::Sessions {
+                command,
+                limit,
+                search,
+            } => match command {
+                None => list_sessions(limit, search),
+                Some(SessionsCommand::List { limit, search }) => list_sessions(limit, search),
+                Some(SessionsCommand::ScrubSecrets { apply }) => {
+                    run_sessions_scrub_secrets(
+                        apply,
+                        cli.config.clone(),
+                        effective_config_profile(&cli),
+                    )
+                    .await
+                }
+                Some(SessionsCommand::Export {
+                    id,
+                    output,
+                    skip_artifacts,
+                    compression,
+                    force,
+                }) => {
+                    run_sessions_export(&id, output.as_deref(), skip_artifacts, compression, force)
+                }
+            },
+            Commands::Receipts {
+                id,
+                last,
+                turn,
+                format,
+            } => receipts::run_receipts_command(
+                if last { None } else { id.as_deref() },
+                turn.as_deref(),
+                format,
+            ),
             Commands::Init => init_project(),
             Commands::Login { api_key } => run_login(api_key),
             Commands::Logout => run_logout(),
@@ -2214,9 +2500,40 @@ async fn run_async_main_dispatch(
                 TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::Chatgpt => run_chatgpt_pkce_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::ChatgptRevoke => run_chatgpt_pkce_revoke(cli.config.as_deref()),
+                TuiAuthCommand::Orcarouter => run_orcarouter_pkce_auth(cli.config.as_deref()).await,
+                TuiAuthCommand::OrcarouterRevoke => run_orcarouter_revoke(cli.config.as_deref()),
+                TuiAuthCommand::PluginLogin { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    crate::oauth::plugin_oauth_login(
+                        provider,
+                        entry.base_url.clone().unwrap(),
+                        entry.oauth.clone().unwrap(),
+                        entry.plugin_authority.clone().unwrap(),
+                    )
+                    .await
+                }
+                TuiAuthCommand::PluginLogout { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    let policy = crate::plugins::activation::extension_host_policy_enabled();
+                    tokio::task::spawn_blocking(move || {
+                        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+                        crate::plugins::registry::verify_plugin_component_authority(
+                            entry.plugin_authority.as_ref().unwrap(),
+                            crate::plugins::activation::PluginActivationCapability::Providers,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        crate::oauth::plugin_oauth_logout(
+                            &provider,
+                            entry.base_url.as_deref().unwrap(),
+                            entry.oauth.as_ref().unwrap(),
+                        )
+                    })
+                    .await?
+                }
             },
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
+                initialize_cloud_facts(&config);
                 run_models(&config, args).await
             }
             Commands::Speech(args) => {
@@ -2225,6 +2542,7 @@ async fn run_async_main_dispatch(
             }
             Commands::Exec(args) => {
                 let config = load_config_from_cli(&cli)?;
+                let plugin_registry = policy_current_registry(plugin_registry);
                 let workspace = cli.workspace.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                 });
@@ -2240,23 +2558,29 @@ async fn run_async_main_dispatch(
                     let _ = parse_sandbox_policy(sandbox, true, Vec::new(), false, false)?;
                     config.sandbox_mode = Some(sandbox.to_ascii_lowercase());
                 }
-                // Honour CODEWHALE_BASE_URL / DEEPSEEK_BASE_URL forwarded by
-                // the CLI dispatcher from --base-url.
+                // Honour CODEWHALE_BASE_URL (forwarded by the CLI dispatcher
+                // from --base-url) or the user-set legacy DEEPSEEK_BASE_URL.
                 if let Ok(env_url) = std::env::var("CODEWHALE_BASE_URL")
                     .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
                 {
                     let trimmed = env_url.trim();
                     if !trimmed.is_empty() {
-                        config.base_url = Some(trimmed.to_string());
+                        let identity = config
+                            .active_provider_identity()
+                            .map_err(anyhow::Error::msg)?;
+                        config
+                            .set_provider_base_url_override(&identity, Some(trimmed.to_string()))
+                            .map_err(anyhow::Error::msg)?;
                     }
                 }
                 // Honour `--provider` (#4093): a Fleet worker whose profile pins
                 // a provider launches on that provider even when the parent
                 // session is on another one. This sets ONLY the non-secret
                 // provider identity (`config.provider`); credentials/base URL
-                // still resolve from the worker's own env/config, and for a
-                // non-DeepSeek provider the legacy root `base_url` above is
-                // ignored by `deepseek_base_url()`. Must precede model
+                // still resolve from the worker's own env/config, and the
+                // endpoint above stays in the previously active provider's
+                // own table, so a different pinned provider never reads it.
+                // Must precede model
                 // resolution so an `auto`/default model resolves to the
                 // overridden provider's default.
                 let explicit_provider = args
@@ -2276,7 +2600,27 @@ async fn run_async_main_dispatch(
                     config.reasoning_effort = normalize_cli_reasoning_effort(reasoning_arg)?;
                     config.reasoning_effort_inferred_from_legacy_alias = false;
                 }
-                let prompt = join_prompt_parts(&args.prompt);
+                initialize_cloud_facts(&config);
+                // #6705: OpenCode Zen's per-model wire comes from its
+                // Models.dev catalog. Seed the persisted snapshot (disk only,
+                // no network) so exec routes the models the picker offers
+                // instead of only the ones compiled into this build. This runs
+                // unconditionally, as in the interactive path: the final route
+                // is not known yet (a selected Fleet operator or `--resume` can
+                // still move it onto Zen, and both resolve through the lake).
+                // The read and JSON parse are blocking, so they leave the
+                // runtime's worker threads.
+                if let Err(error) =
+                    tokio::task::spawn_blocking(crate::models_dev_live::maybe_load_persisted_cache)
+                        .await
+                {
+                    tracing::warn!(
+                        target: "models_dev_live",
+                        %error,
+                        "persisted Models.dev cache load did not complete; keeping bundled"
+                    );
+                }
+                let prompt = resolve_exec_prompt(&args)?;
                 let resume_session_id = resolve_exec_resume_session_id(&args, &workspace)?;
                 validate_exec_tool_authority_resume(
                     args.tool_authority_json.as_deref(),
@@ -2335,32 +2679,49 @@ async fn run_async_main_dispatch(
                 // `config.yolo`), not as a CLI flag. Honour either source.
                 let yolo = cli.yolo || config.yolo.unwrap_or(false);
                 let env_tool_surface = exec_tool_surface_from_env();
-                let needs_engine = args.auto
-                    || yolo
-                    || resume_session_id.is_some()
-                    || args.output_format == ExecOutputFormat::StreamJson
-                    || args.max_turns.is_some()
-                    || args.max_tool_calls.is_some()
-                    || args.allowed_tools.is_some()
-                    || args.disallowed_tools.is_some()
-                    || args.append_system_prompt.is_some()
-                    || args.tool_authority_json.is_some()
-                    || args.sandbox.is_some()
-                    || args.allow_sandbox_elevation
-                    || env_tool_surface.is_some();
-                if needs_engine {
+                // #6510: every exec runs on the Engine — one turn loop, one
+                // prompt authority (BASE_PROMPT, AGENTS.md, skills). Without
+                // a tool grant the run is a one-shot answer on a zero-tool
+                // surface.
+                let tool_surface_requested = exec_grants_tool_surface(
+                    &args,
+                    yolo,
+                    resume_session_id.is_some(),
+                    env_tool_surface.is_some(),
+                );
+                {
                     if args.parent_death_watch {
                         spawn_parent_death_watch();
                     }
-                    let provider = config.api_provider();
+                    let identity = config
+                        .active_provider_identity()
+                        .map_err(anyhow::Error::msg)?;
                     let max_subagents = cli.max_subagents.map_or_else(
-                        || config.max_subagents_for_provider(provider),
+                        || config.max_subagents_for_provider(&identity),
                         |value| value.clamp(1, MAX_SUBAGENTS),
                     );
                     let auto_mode = args.auto || yolo;
-                    let max_turns = exec_max_steps(args.max_turns);
-                    let allowed_tools =
-                        resolve_exec_allowed_tools(args.allowed_tools.as_deref(), env_tool_surface);
+                    // A zero-tool run only spends model steps on output-limit
+                    // continuations; without `--max-turns` those would run to
+                    // the turn wall clock, so it gets a small default ceiling.
+                    let max_turns = exec_max_steps(
+                        args.max_turns
+                            .or((!tool_surface_requested).then_some(ONE_SHOT_DEFAULT_MAX_STEPS)),
+                    );
+                    if !tool_surface_requested {
+                        let ignored = exec_tool_flags_without_grant(&args);
+                        if !ignored.is_empty() {
+                            eprintln!(
+                                "codewhale exec: {} only apply to tools, and this run offers none; add --auto or --allowed-tools to run with tools.",
+                                ignored.join(", ")
+                            );
+                        }
+                    }
+                    let allowed_tools = if tool_surface_requested {
+                        resolve_exec_allowed_tools(args.allowed_tools.as_deref(), env_tool_surface)
+                    } else {
+                        Some(Vec::new())
+                    };
                     let disallowed_tools = args
                         .disallowed_tools
                         .as_deref()
@@ -2385,13 +2746,11 @@ async fn run_async_main_dispatch(
                         disallowed_tools,
                         args.append_system_prompt.clone(),
                         args.tool_authority_json.clone(),
+                        args.hooks,
                         std::sync::Arc::clone(&plugin_registry),
+                        !tool_surface_requested,
                     )
                     .await
-                } else if args.json {
-                    run_one_shot_json(&config, &model, &prompt, force_configured_route).await
-                } else {
-                    run_one_shot(&config, &model, &prompt, force_configured_route).await
                 }
             }
             Commands::Fleet(args) => {
@@ -2455,10 +2814,11 @@ async fn run_async_main_dispatch(
                     args.acp,
                 )?;
                 if args.mcp {
-                    tokio::task::block_in_place(|| mcp_server::run_mcp_server(workspace))
+                    mcp_server::run_mcp_server(workspace).await
                 } else if http_selected {
                     let (mut config, config_profile) =
                         load_config_from_cli_with_effective_profile(&cli)?;
+                    initialize_cloud_facts(&config);
                     let explicit_route_override =
                         crate::config::explicit_launch_provider_override().is_some()
                             || crate::config::explicit_launch_model_override().is_some();
@@ -2489,18 +2849,33 @@ async fn run_async_main_dispatch(
                             show_qr: args.qr,
                             config_path: cli.config.clone(),
                             config_profile,
+                            control_frontend: cli.control_frontend.clone(),
                         },
                     )
                     .await
                 } else if args.acp {
-                    let config = load_config_from_cli(&cli)?;
+                    let (config, config_profile) =
+                        load_config_from_cli_with_effective_profile(&cli)?;
+                    initialize_cloud_facts(&config);
                     let model = config.default_model();
-                    acp_server::run_acp_server(config, model, workspace).await
+                    acp_server::run_acp_server(
+                        config,
+                        model,
+                        workspace,
+                        std::sync::Arc::clone(&plugin_discovery),
+                        cli.config.clone(),
+                        config_profile,
+                    )
+                    .await
                 } else {
                     unreachable!("server mode count checked above")
                 }
             }
             Commands::Resume { session_id, last } => {
+                tui::ui::require_interactive_terminal(
+                    io::stdin().is_terminal(),
+                    io::stdout().is_terminal(),
+                )?;
                 let config = load_config_from_cli(&cli)?;
                 let workspace = resolve_workspace(&cli);
                 let resume_id = resolve_session_id(session_id, last, &workspace)?;
@@ -2515,13 +2890,27 @@ async fn run_async_main_dispatch(
                 .await
             }
             Commands::Fork { session_id, last } => {
+                tui::ui::require_interactive_terminal(
+                    io::stdin().is_terminal(),
+                    io::stdout().is_terminal(),
+                )?;
                 let config = load_config_from_cli(&cli)?;
-                let workspace = resolve_workspace(&cli);
-                let new_session_id = fork_session(&config, session_id, last, &workspace)?;
-                run_interactive(
+                let plugin_registry = policy_current_registry(plugin_registry);
+                let prepared = prepare_interactive_config(&cli, &config, true)?;
+                let source_id = resolve_session_id(session_id, last, &prepared.workspace)?;
+                let (prepared, new_session_id) = prepare_mounted_session(
                     &cli,
-                    &config,
+                    prepared,
+                    source_id,
+                    MountedHistoryIntent::Fork,
+                    std::sync::Arc::clone(&plugin_registry),
+                )
+                .await?;
+                run_interactive_prepared(
+                    &cli,
+                    prepared,
                     Some(new_session_id),
+                    None,
                     None,
                     pending_telemetry_notice.take(),
                     std::sync::Arc::clone(&plugin_registry),
@@ -2530,6 +2919,8 @@ async fn run_async_main_dispatch(
             }
         };
     }
+
+    tui::ui::require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
 
     // Top-level prompt mode: submit the initial prompt, then keep the TUI alive
     // for follow-up messages. Use `codewhale exec` for explicit non-interactive
@@ -2645,8 +3036,8 @@ struct WorkspaceDotenvReport {
 /// MCP servers, plugin trust, executable lookup, sandbox/approval posture, or
 /// network destinations. Shell-exported values and config/CLI arguments remain
 /// the explicit surfaces for those controls.
-fn warn_on_workspace_dotenv_result() {
-    match load_workspace_dotenv_credentials() {
+fn warn_on_workspace_dotenv_result(workspace: &Path) {
+    match load_workspace_dotenv_credentials(workspace) {
         Ok(Some(report)) if !report.ignored.is_empty() => {
             eprintln!(
                 "Codewhale ignored non-credential settings in {}: {}. Use config.toml, CLI flags, or the launching shell for control settings.",
@@ -2686,21 +3077,31 @@ fn display_env_key_set(keys: &BTreeSet<String>) -> String {
     labels.join(", ")
 }
 
-fn load_workspace_dotenv_credentials() -> Result<Option<WorkspaceDotenvReport>> {
-    let Some(path) = find_workspace_dotenv()? else {
+fn load_workspace_dotenv_credentials(workspace: &Path) -> Result<Option<WorkspaceDotenvReport>> {
+    let Some(path) = find_workspace_dotenv(workspace)? else {
         return Ok(None);
     };
     load_workspace_dotenv_credentials_from_path(&path).map(Some)
 }
 
-fn find_workspace_dotenv() -> Result<Option<PathBuf>> {
-    let cwd = std::env::current_dir().context("could not resolve the current workspace")?;
-    let boundary = cwd
+/// The nearest `.env` from the resolved launch workspace (`--workspace`, else
+/// the current directory) up to its repository root. Searching from the
+/// process directory instead would load another tree's credentials when the
+/// two differ.
+fn find_workspace_dotenv(workspace: &Path) -> Result<Option<PathBuf>> {
+    let start = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("could not resolve the current workspace")?
+            .join(workspace)
+    };
+    let boundary = start
         .ancestors()
         .find(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok())
-        .unwrap_or(cwd.as_path());
+        .unwrap_or(start.as_path());
 
-    for ancestor in cwd.ancestors() {
+    for ancestor in start.ancestors() {
         let candidate = ancestor.join(".env");
         match std::fs::symlink_metadata(&candidate) {
             Ok(_) => return Ok(Some(candidate)),
@@ -2765,8 +3166,10 @@ fn is_workspace_dotenv_credential_key(key: &str) -> bool {
             key,
             "DEEPSEEK_SEARCH_API_KEY"
                 | "SOFYA_API_KEY"
+                | "SERPLY_API_KEY"
                 | "METASO_API_KEY"
                 | "BAIDU_SEARCH_API_KEY"
+                | "TAVILY_API_KEY"
                 | "DEEPSEEK_SANDBOX_API_KEY"
         )
 }
@@ -2951,13 +3354,6 @@ fn open_workspace_dotenv_without_following_links(path: &Path) -> Result<std::fs:
         .map_err(|error| anyhow!("could not securely open {}: {error}", path.display()))
 }
 
-/// Generate shell completions for the given shell
-fn generate_completions(shell: Shell) {
-    let mut cmd = Cli::command();
-    let name = cmd.get_name().to_string();
-    generate(shell, &mut cmd, name, &mut io::stdout());
-}
-
 /// Run the offline evaluation harness (no network/LLM calls).
 fn run_eval(args: EvalArgs) -> Result<()> {
     let fail_step = match args.fail_step.as_deref() {
@@ -3025,6 +3421,20 @@ fn run_eval(args: EvalArgs) -> Result<()> {
     } else {
         bail!("offline evaluation harness reported failure")
     }
+}
+
+/// A regression gate threshold must be a finite percentage: `NaN` compares
+/// false against every change (a gate that always passes) and infinity
+/// disables the gate outright.
+fn parse_regression_threshold(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number"))?;
+    if !value.is_finite() {
+        return Err(format!("`{raw}` is not a finite percentage"));
+    }
+    Ok(value)
 }
 
 /// Score a run's token/cache/cost from recorded turns and (optionally) flag
@@ -3198,17 +3608,44 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
     }
 
     let fleet_config = config.fleet_config();
-    let provider = config.api_provider();
-    let max_subagents = config.max_subagents_for_provider(provider);
+    // `fleet run --check` must not conjure the ledger or the sub-agent state it
+    // would write to, so it validates before either is opened below.
+    if let FleetCommand::Run(run_args) = &args.command
+        && run_args.check
+    {
+        initialize_cloud_facts(config);
+        let check = FleetManager::check_task_spec_path_in(
+            workspace,
+            fleet_config,
+            config.default_model(),
+            config.clone(),
+            &run_args.task_spec,
+        )?;
+        println!(
+            "Fleet spec ok: {} ({} task{}). Nothing was created or launched.",
+            run_args.task_spec.display(),
+            check.task_count,
+            if check.task_count == 1 { "" } else { "s" }
+        );
+        for warning in &check.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    let identity = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
+
+    let max_subagents = config.max_subagents_for_provider(&identity);
     let coordination_manager = crate::tools::subagent::new_shared_subagent_manager_with_timeout(
         workspace.to_path_buf(),
         max_subagents,
         config
-            .max_admitted_subagents_for_provider(provider)
+            .max_admitted_subagents_for_provider(&identity)
             .max(max_subagents),
-        Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(provider)),
-        config.launch_concurrency_for_provider(provider),
-        config.subagent_token_budget_for_provider(provider),
+        Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(&identity)),
+        config.launch_concurrency_for_provider(&identity),
     );
     // Probe the durable ledger *before* opening the manager: FleetManager::open
     // creates `.codewhale/fleet.jsonl` as a side effect, so a later probe would
@@ -3255,6 +3692,7 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
             Ok(())
         }
         FleetCommand::Run(args) => {
+            initialize_cloud_facts(config);
             let max_workers = args.max_workers.clamp(1, 128);
             let manager =
                 manager.with_stale_after(Duration::from_secs(args.stale_after_seconds.max(1)));
@@ -3277,7 +3715,8 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
             println!(
                 "manager loop running; use `codewhale fleet status`, `inspect`, `interrupt`, or `stop --all` from another terminal."
             );
-            let mut executor = FleetExecutor::new(workspace);
+            let mut executor = FleetExecutor::new(workspace)
+                .with_sessions_dir(session_manager::default_sessions_dir()?);
             let codewhale_binary = fleet::executor::configured_codewhale_binary();
             let status = manager
                 .run_to_completion(
@@ -3338,7 +3777,8 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
                 "manager loop running for restarted run {}; use `codewhale fleet status`, `inspect`, `interrupt`, or `stop --all` from another terminal.",
                 report.run_id.0
             );
-            let mut executor = FleetExecutor::new(workspace);
+            let mut executor = FleetExecutor::new(workspace)
+                .with_sessions_dir(session_manager::default_sessions_dir()?);
             let codewhale_binary = fleet::executor::configured_codewhale_binary();
             let status = manager
                 .run_to_completion(
@@ -3438,41 +3878,12 @@ fn write_template_file(path: &Path, contents: &str, force: bool) -> Result<Write
     Ok(status)
 }
 
-fn mcp_template_json() -> Result<String> {
-    let mut cfg = McpConfig::default();
-    cfg.servers.insert(
-        "example".to_string(),
-        McpServerConfig {
-            command: Some("node".to_string()),
-            args: vec!["./path/to/your-mcp-server.js".to_string()],
-            env: std::collections::HashMap::new(),
-            cwd: None,
-            url: None,
-            transport: None,
-            connect_timeout: None,
-            execute_timeout: None,
-            read_timeout: None,
-            disabled: true,
-            enabled: true,
-            required: false,
-            enabled_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            headers: std::collections::HashMap::new(),
-            env_headers: std::collections::HashMap::new(),
-            bearer_token_env_var: None,
-            scopes: Vec::new(),
-            oauth: None,
-            oauth_resource: None,
-            reviewed_plugin: None,
-        },
-    );
-    serde_json::to_string_pretty(&cfg)
-        .map_err(|e| anyhow!("Failed to render MCP template JSON: {e}"))
-}
-
 fn init_mcp_config(path: &Path, force: bool) -> Result<WriteStatus> {
-    let template = mcp_template_json()?;
-    write_template_file(path, &template, force)
+    Ok(match crate::mcp::init_config(path, force)? {
+        crate::mcp::McpWriteStatus::Created => WriteStatus::Created,
+        crate::mcp::McpWriteStatus::Overwritten => WriteStatus::Overwritten,
+        crate::mcp::McpWriteStatus::SkippedExists => WriteStatus::SkippedExists,
+    })
 }
 
 fn skills_template(name: &str) -> String {
@@ -3506,7 +3917,7 @@ fn init_skills_dir(skills_dir: &Path, force: bool) -> Result<(PathBuf, WriteStat
 fn tools_readme_template() -> &'static str {
     "# Local tools\n\n\
      Drop self-describing scripts here so they can be discovered by\n\
-     `codewhale-tui setup --status` and surfaced in `codewhale-tui doctor`.\n\n\
+     `codewhale setup --status` and surfaced in `codewhale doctor`.\n\n\
      When `[tools.plugin_dir]` is set in config.toml (or when the default\n\
      `~/.codewhale/tools/` directory exists), they are auto-discovered and\n\
      registered as model-visible tools.\n\n\
@@ -3528,7 +3939,7 @@ fn tools_example_script() -> &'static str {
      # name: example\n\
      # description: Print a confirmation that local tool discovery works\n\
      # usage: example [name]\n\
-     printf 'codewhale-tui local tool ok: %s\\n' \"${1:-world}\"\n"
+     printf 'codewhale local tool ok: %s\\n' \"${1:-world}\"\n"
 }
 
 fn init_tools_dir(tools_dir: &Path, force: bool) -> Result<(PathBuf, WriteStatus, WriteStatus)> {
@@ -3703,16 +4114,19 @@ struct CleanPlan {
 }
 
 fn collect_clean_targets(checkpoints_dir: &Path) -> CleanPlan {
-    // Every `*.json` file in the checkpoints directory is checkpoint state:
-    // per-session crash checkpoints (`<session_id>.json`), the legacy
-    // single-slot checkpoint (`latest.json`), and the offline input queue
-    // (`offline_queue.json`). Non-JSON files and subdirectories are left
-    // alone.
+    // Unsent input is not regenerable. Preserve legacy and per-session queue
+    // files by name even if their contents are malformed or from a newer
+    // schema; cleanup must not erase drafts it cannot currently decode.
     let mut targets: Vec<PathBuf> = std::fs::read_dir(checkpoints_dir)
         .map(|entries| {
             entries
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
                 .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "json"))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| !crate::session_manager::is_offline_queue_file(name))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -3743,7 +4157,7 @@ fn run_setup(
         return run_setup_clean(&default_checkpoints_dir(), args.force);
     }
 
-    use crate::palette;
+    use codewhale_palette as palette;
     use colored::Colorize;
 
     let (aqua_r, aqua_g, aqua_b) = palette::WHALE_ACTION_RGB;
@@ -3839,9 +4253,8 @@ fn run_setup(
         println!("    Next: run `/plugin validate`, review `example`, then trust and enable it.");
     }
 
-    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-        config.prefer_bwrap.unwrap_or(false),
-    );
+    let sandbox =
+        crate::sandbox::get_platform_sandbox_with_bwrap_preference(config.prefers_bwrap());
     if let Some(kind) = sandbox {
         println!("  ✓ Sandbox available: {kind}");
     } else {
@@ -3926,9 +4339,15 @@ impl CredentialDiagnostic {
 }
 
 fn resolve_credential_diagnostic(config: &Config) -> CredentialDiagnostic {
-    let provider = config.api_provider();
-    let base_url = config.deepseek_base_url();
-    let auth_mode = config.auth_mode_for_provider(provider);
+    let Ok(identity) = config.active_provider_identity() else {
+        return CredentialDiagnostic::new(
+            ApiKeySource::Unknown,
+            CredentialAvailability::Unavailable,
+        );
+    };
+    let provider = identity.provider;
+    let base_url = config.base_url_for_route(&identity);
+    let auth_mode = config.auth_mode_for_provider(&identity);
     if crate::config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return CredentialDiagnostic::new(
             ApiKeySource::NoAuth,
@@ -3944,10 +4363,10 @@ fn resolve_credential_diagnostic(config: &Config) -> CredentialDiagnostic {
             CredentialAvailability::NotRequired,
         );
     }
-    let custom_endpoint = config.provider_uses_custom_endpoint(provider);
-    if !custom_endpoint && provider == crate::config::ApiProvider::OpenaiCodex {
+    let custom_endpoint = config.provider_uses_custom_endpoint(&identity);
+    if !custom_endpoint && provider == crate::config::ProviderKind::OpenaiCodex {
         return config
-            .external_credential_consent_status(provider)
+            .external_credential_consent_status(&identity)
             .filter(|status| status.route_state == "active")
             .map_or_else(
                 || {
@@ -3965,13 +4384,13 @@ fn resolve_credential_diagnostic(config: &Config) -> CredentialDiagnostic {
             );
     }
     if !custom_endpoint
-        && provider == crate::config::ApiProvider::Xai
+        && provider == crate::config::ProviderKind::Xai
         && auth_mode
             .as_deref()
-            .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
+            .is_some_and(crate::oauth::auth_mode_uses_xai_oauth)
     {
         return config
-            .external_credential_consent_status(provider)
+            .external_credential_consent_status(&identity)
             .filter(|status| status.route_state == "active")
             .map_or_else(
                 || {
@@ -3992,14 +4411,18 @@ fn resolve_credential_diagnostic(config: &Config) -> CredentialDiagnostic {
     let provider_config_key_kind = provider_config
         .and_then(|entry| entry.api_key.as_deref())
         .map(crate::config::classify_config_api_key_value);
-    let root_key_applies = matches!(
-        provider,
-        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN
-    ) || (provider == crate::config::ApiProvider::Custom
-        && config.uses_legacy_literal_custom_route());
-    let root_key_kind = root_key_applies
-        .then_some(config.api_key.as_deref())
+    // DeepSeek-CN shares `[providers.deepseek]`'s key (the two identities
+    // used to share the top-level `api_key`, #6394).
+    let root_key_kind = (identity.key.as_str()
+        == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id)
+        .then(|| {
+            config
+                .builtin_provider_identity(crate::config::ProviderKind::Deepseek)
+                .ok()
+        })
         .flatten()
+        .and_then(|owner| config.provider_config_for(&owner))
+        .and_then(|entry| entry.api_key.as_deref())
         .map(crate::config::classify_config_api_key_value);
 
     if matches!(
@@ -4035,7 +4458,7 @@ fn resolve_credential_diagnostic(config: &Config) -> CredentialDiagnostic {
         root_key_kind,
         Some(crate::config::ConfigApiKeyValueKind::SecretStoreSentinel)
     ) {
-        if config.should_skip_secret_store_for_provider(provider) {
+        if config.should_skip_secret_store_for_provider(&identity) {
             return CredentialDiagnostic::new(
                 ApiKeySource::SecretStoreUnavailable,
                 CredentialAvailability::Unavailable,
@@ -4047,7 +4470,7 @@ fn resolve_credential_diagnostic(config: &Config) -> CredentialDiagnostic {
             ApiKeySource::SecretStoreUnprobed,
             CredentialAvailability::NotProbed,
         )
-    } else if !config.should_skip_secret_store_for_provider(provider) {
+    } else if !config.should_skip_secret_store_for_provider(&identity) {
         // No literal config declaration was found, but this route can continue
         // through the durable store and ambient provider environment. Ordinary
         // doctor deliberately does not inspect either source.
@@ -4065,11 +4488,12 @@ fn resolve_api_key_source(config: &Config) -> ApiKeySource {
     resolve_credential_diagnostic(config).source
 }
 
-fn provider_config_table_key(provider: crate::config::ApiProvider) -> &'static str {
-    provider
-        .metadata()
-        .map(|metadata| metadata.provider_config_key())
-        .unwrap_or("deepseek_cn")
+#[cfg(test)]
+fn provider_config_table_key(provider: crate::config::ProviderKind) -> String {
+    format!(
+        "providers.{}",
+        codewhale_config::descriptors::compatibility_for_kind(provider).config_key
+    )
 }
 
 fn count_dir_entries(dir: &Path) -> usize {
@@ -4090,7 +4514,7 @@ fn run_setup_status(
     workspace: &Path,
     plugins: &crate::plugins::PluginRegistry,
 ) -> Result<()> {
-    use crate::palette;
+    use codewhale_palette as palette;
     use colored::Colorize;
 
     let (aqua_r, aqua_g, aqua_b) = palette::WHALE_ACTION_RGB;
@@ -4152,7 +4576,7 @@ fn run_setup_status(
     );
     println!(
         "  · base_url: {}",
-        crate::doctor::structural_url_authority(&config.deepseek_base_url())
+        crate::doctor::structural_url_authority(&config.active_route_base_url())
     );
     let model = config
         .default_text_model
@@ -4220,9 +4644,8 @@ fn run_setup_status(
         crate::utils::display_path(&plugins_dir)
     );
 
-    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-        config.prefer_bwrap.unwrap_or(false),
-    );
+    let sandbox =
+        crate::sandbox::get_platform_sandbox_with_bwrap_preference(config.prefers_bwrap());
     match sandbox {
         Some(kind) => println!(
             "  {} sandbox: {kind}",
@@ -4318,7 +4741,7 @@ fn run_session_diagnostics(args: SessionDiagnosticsArgs) -> Result<()> {
 /// Live API checks are explicit. Local endpoints have a separate opt-in because
 /// an HTTP request can wake a desktop-managed daemon (notably Ollama.app).
 fn doctor_should_probe_api(
-    provider: crate::config::ApiProvider,
+    provider: crate::config::ProviderKind,
     base_url: &str,
     probes: crate::doctor::DoctorProbeRequest,
 ) -> bool {
@@ -4327,25 +4750,39 @@ fn doctor_should_probe_api(
     probes.should_probe_api(local)
 }
 
+/// Providers whose credential *presence* `codewhale doctor` reports.
+///
+/// The retired Antigravity identity is a non-runnable tombstone kept only so
+/// legacy tables deserialize and clear; doctor never advertises it as a slot.
+fn doctor_api_key_providers() -> impl Iterator<Item = crate::config::ProviderKind> {
+    crate::config::ProviderKind::all()
+        .iter()
+        .copied()
+        .filter(|provider| *provider != crate::config::ProviderKind::Antigravity)
+}
+
 /// Doctor must never turn credential inspection into a refresh/write path.
 /// OAuth connectivity is exercised by an ordinary user request instead;
 /// doctor limits itself to non-mutating readiness inspection.
 fn doctor_should_probe_auth(config: &Config) -> bool {
-    let provider = config.api_provider();
-    if provider == crate::config::ApiProvider::OpenaiCodex
-        && !config.provider_uses_custom_endpoint(provider)
+    let Ok(identity) = config.active_provider_identity() else {
+        return false;
+    };
+    let provider = identity.provider;
+    if provider == crate::config::ProviderKind::OpenaiCodex
+        && !config.provider_uses_custom_endpoint(&identity)
     {
         return false;
     }
-    let auth_mode = config.auth_mode_for_provider(provider);
-    if provider == crate::config::ApiProvider::Xai
+    let auth_mode = config.auth_mode_for_provider(&identity);
+    if provider == crate::config::ProviderKind::Xai
         && auth_mode
             .as_deref()
-            .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
+            .is_some_and(crate::oauth::auth_mode_uses_xai_oauth)
     {
         return false;
     }
-    !(provider == crate::config::ApiProvider::Moonshot
+    !(provider == crate::config::ProviderKind::Moonshot
         && auth_mode
             .as_deref()
             .is_some_and(crate::config::auth_mode_uses_kimi_imported_token))
@@ -4356,10 +4793,11 @@ async fn run_doctor(
     config: &Config,
     workspace: &Path,
     config_path_override: Option<&Path>,
+    profile: Option<&str>,
     probes: crate::doctor::DoctorProbeRequest,
     plugins: &crate::plugins::PluginRegistry,
 ) {
-    use crate::palette;
+    use codewhale_palette as palette;
     use colored::Colorize;
 
     let (accent_r, accent_g, accent_b) = palette::WHALE_HUMAN_RGB;
@@ -4374,12 +4812,52 @@ async fn run_doctor(
             .bold()
     );
     println!("{}", "==================".truecolor(sky_r, sky_g, sky_b));
+    // The answer comes before the detail (U7). A requested live probe runs
+    // first so that answer can include it; the probe line is the only thing
+    // printed while that check is in flight.
+    let (verdict_state, _) = doctor_setup_state(config, workspace);
+    let identity = config.active_provider_identity().ok();
+    let api_target = doctor_api_target(config);
+    let live_api_requested = identity.as_ref().is_some_and(|identity| {
+        doctor_should_probe_api(identity.provider, &api_target.base_url, probes)
+    });
+    // The opt-in live check runs once, before the verdict, so the verdict,
+    // the credential lines and API Connectivity all report the same result.
+    let live_probe = if doctor_should_probe_auth(config) && live_api_requested {
+        println!("{} Testing connection...", "·".dimmed());
+        // Resolve a credential through the diagnostic-only store first, then
+        // probe with an in-memory clone. Constructing the normal client from
+        // the original config could otherwise trigger its legacy secret-store
+        // migration while a user merely asks doctor to test connectivity.
+        Some(match config.with_read_only_api_key_for_diagnostic() {
+            Ok(diagnostic_config) => test_api_connectivity(&diagnostic_config).await,
+            Err(error) => Err(error),
+        })
+    } else {
+        None
+    };
+    // Presence and variable name only; the value is never held here.
+    let env_key_source = crate::config::active_provider_env_api_key_source(config);
+    let verdict = doctor_verdict(
+        &verdict_state,
+        identity
+            .as_ref()
+            .map_or("unavailable", |identity| identity.key.as_str()),
+        &DoctorVerdictFacts {
+            onboarded: crate::tui::onboarding::is_onboarded(),
+            env_key_source: env_key_source.clone(),
+            live_probe: live_probe.as_ref().map(Result::is_ok),
+        },
+    );
+    println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
     println!();
 
     // Version info
     println!("{}", "Version Information:".bold());
-    println!("  codewhale-tui: {}", env!("CODEWHALE_BUILD_VERSION"));
-    println!("  rust: {}", rustc_version());
+    println!("  codewhale: {}", env!("CODEWHALE_BUILD_VERSION"));
+    // A release binary needs no Rust toolchain; this line describes the host,
+    // not the build, so a missing rustc must not read as a fault.
+    println!("  host rustc: {}", rustc_version());
     println!();
 
     println!("{}", "Updates:".bold());
@@ -4401,7 +4879,7 @@ async fn run_doctor(
     println!("{}", "Configuration:".bold());
     let config_path = &doctor_paths.config;
 
-    if config_path.exists() {
+    if tokio::fs::try_exists(config_path).await.unwrap_or(false) {
         println!(
             "  {} config.toml found at {}",
             "✓".truecolor(aqua_r, aqua_g, aqua_b),
@@ -4409,7 +4887,7 @@ async fn run_doctor(
         );
         // Secret hygiene: name the keys, never the values. Plain-text config
         // is not a secret store.
-        if let Ok(raw) = std::fs::read_to_string(config_path) {
+        if let Ok(raw) = tokio::fs::read_to_string(config_path).await {
             let flagged = crate::doctor::config_credential_shaped_keys(&raw);
             if !flagged.is_empty() {
                 println!(
@@ -4418,6 +4896,24 @@ async fn run_doctor(
                     flagged.join(", ")
                 );
             }
+        }
+        // Legacy top-level `base_url` / `api_key` (#6394): which moves the
+        // file still has pending, which pair disagrees and which side is in
+        // use. Sources only, never values.
+        for note in &config.legacy_root.notes {
+            let pending = !matches!(
+                note,
+                codewhale_config::legacy_root::LegacyRootNote::Conflict { .. }
+            );
+            println!(
+                "  {} {note}{}",
+                "!".truecolor(sky_r, sky_g, sky_b),
+                if pending {
+                    " (read that way already; `codewhale config migrate` updates the file)"
+                } else {
+                    ""
+                }
+            );
         }
     } else {
         println!(
@@ -4441,6 +4937,16 @@ async fn run_doctor(
     for line in crate::doctor::secret_backend_human_lines(&secret_backend) {
         println!("  · {line}");
     }
+
+    println!();
+    println!("{}", "Sessions:".bold());
+    println!(
+        "  · {}",
+        crate::session_reconcile::last_run(&doctor_paths.sessions).map_or_else(
+            || "no session repair has run yet (it runs at launch; `codewhale doctor --repair-sessions` runs it now)".to_string(),
+            |summary| summary.doctor_detail()
+        )
+    );
 
     // State root (v0.8.44)
     println!();
@@ -4479,6 +4985,11 @@ async fn run_doctor(
         (aqua_r, aqua_g, aqua_b),
         (sky_r, sky_g, sky_b),
     );
+    print_doctor_stored_secrets_report(
+        config_path_override.map(Path::to_path_buf),
+        profile.map(str::to_owned),
+    )
+    .await;
 
     let (setup_state, setup_source) = doctor_setup_state(config, workspace);
     print_doctor_setup_report(
@@ -4498,23 +5009,31 @@ async fn run_doctor(
     // Per-provider state: env + config file only (no values printed).
     // Keep doctor/status prompt-free and credential-value-free even for
     // unsigned rebuilt binaries.
-    for provider in crate::config::ApiProvider::all().iter().copied() {
+    for provider in doctor_api_key_providers() {
         let slot = provider.as_str();
-        let provider_config = config.provider_config_for(provider);
+        let provider_identity = config.builtin_provider_identity(provider).ok();
+        let provider_config = provider_identity
+            .as_ref()
+            .and_then(|identity| config.provider_config_for(identity));
         let config_declared = provider_config.is_some_and(|entry| {
             entry.api_key.as_deref().is_some_and(|key| {
                 crate::config::classify_config_api_key_value(key)
                     == crate::config::ConfigApiKeyValueKind::Literal
             })
-        }) || (matches!(provider, crate::config::ApiProvider::Deepseek)
-            && config.api_key.as_deref().is_some_and(|key| {
-                crate::config::classify_config_api_key_value(key)
-                    == crate::config::ConfigApiKeyValueKind::Literal
-            }));
-        let env_source_declared = provider_config
+        });
+        let declared_env = provider_config
             .and_then(|entry| entry.api_key_env.as_deref())
-            .is_some_and(|name| !name.trim().is_empty());
-        let icon = if config_declared || env_source_declared {
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let env_source_declared = declared_env.is_some();
+        // Presence only: name the variable that holds a key, never its value.
+        let env_set = declared_env
+            .filter(|name| {
+                std::env::var_os(name)
+                    .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+            })
+            .or_else(|| crate::config::provider_env_api_key_var(provider));
+        let icon = if config_declared || env_source_declared || env_set.is_some() {
             "·".truecolor(aqua_r, aqua_g, aqua_b)
         } else {
             "·".dimmed()
@@ -4522,10 +5041,10 @@ async fn run_doctor(
         println!(
             "  {} {slot}: env_source={}, config_source={}",
             icon,
-            if env_source_declared {
-                "declared (value not inspected)"
-            } else {
-                "not inspected"
+            match env_set {
+                Some(var) => doctor_env_key_label(var),
+                None if env_source_declared => "declared (value not inspected)".to_string(),
+                None => "not inspected".to_string(),
             },
             if config_declared {
                 "declared (value not inspected)"
@@ -4570,19 +5089,36 @@ async fn run_doctor(
         ApiKeySource::LocalRuntime => "local runtime; credentials not required",
         ApiKeySource::Unknown => "unknown; credential environment and stores not inspected",
     };
-    println!(
-        "  {} active provider credential source: {source_label}",
-        "·".dimmed()
-    );
+    match env_key_source.as_deref() {
+        Some(source) => println!(
+            "  {} active provider credential source: {}",
+            "·".dimmed(),
+            doctor_env_key_label(source)
+        ),
+        None => println!(
+            "  {} active provider credential source: {source_label}",
+            "·".dimmed()
+        ),
+    }
     println!(
         "  · active provider credential availability: {}",
         credential.availability.label()
     );
+    match &live_probe {
+        Some(Ok(())) => println!(
+            "  {} active provider credential: accepted by the live API check",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
+        Some(Err(_)) => println!(
+            "  {} active provider credential: live API check failed (see API Connectivity)",
+            "✗".truecolor(red_r, red_g, red_b)
+        ),
+        None => {}
+    }
 
     // API connectivity test
     println!();
     println!("{}", "API Connectivity:".bold());
-    let api_target = doctor_api_target(config);
     // Configured-vs-active honesty (DGF-01): doctor describes the route a
     // session launched NOW would resolve. It cannot see inside an already
     // running session, which keeps the route it resolved at its own launch.
@@ -4626,52 +5162,53 @@ async fn run_doctor(
             crate::doctor::structural_url_authority(recommended)
         );
     }
-    let capability = crate::config::provider_capability(config.api_provider(), &api_target.model);
-    if let Some(alias) = capability.alias_deprecation.as_ref() {
+    let capability = identity
+        .as_ref()
+        .map(|identity| crate::config::provider_capability(identity.provider, &api_target.model));
+    if let Some(alias) = capability
+        .as_ref()
+        .and_then(|capability| capability.alias_deprecation.as_ref())
+    {
         println!(
             "  ! model alias {} retires {}; switch to {}",
             alias.alias, alias.retirement_date, alias.replacement
         );
     }
-    let live_api_requested =
-        doctor_should_probe_api(config.api_provider(), &api_target.base_url, probes);
-    let endpoint_is_local = crate::config::provider_route_is_keyless_self_hosted(
-        config.api_provider(),
-        &api_target.base_url,
-    ) || crate::config::base_url_uses_local_host(&api_target.base_url);
-    if doctor_should_probe_auth(config) && live_api_requested {
-        print!("  {} Testing connection...", "·".dimmed());
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-
-        // Resolve a credential through the diagnostic-only store first, then
-        // probe with an in-memory clone. Constructing the normal client from
-        // the original config could otherwise trigger its legacy secret-store
-        // migration while a user merely asks doctor to test connectivity.
-        let connectivity_result = match config.with_read_only_api_key_for_diagnostic() {
-            Ok(diagnostic_config) => test_api_connectivity(&diagnostic_config).await,
-            Err(error) => Err(error),
-        };
+    let endpoint_is_local = identity.as_ref().is_some_and(|identity| {
+        crate::config::provider_route_is_keyless_self_hosted(
+            identity.provider,
+            &api_target.base_url,
+        ) || crate::config::base_url_uses_local_host(&api_target.base_url)
+    });
+    if let Some(connectivity_result) = &live_probe {
         match connectivity_result {
             Ok(()) => {
                 println!(
-                    "\r  {} API connection successful",
+                    "  {} API connection successful",
                     "✓".truecolor(aqua_r, aqua_g, aqua_b)
                 );
             }
             Err(e) => {
                 let error_msg = e.to_string();
                 println!(
-                    "\r  {} API connection failed",
+                    "  {} API connection failed",
                     "✗".truecolor(red_r, red_g, red_b)
                 );
-                if error_msg.contains("401") || error_msg.contains("Unauthorized") {
+                let names_status =
+                    |status| crate::mcp::oauth::text_names_http_status(&error_msg, status);
+                let provider = identity
+                    .as_ref()
+                    .map(|identity| identity.provider)
+                    .unwrap_or(crate::config::ProviderKind::Deepseek);
+                if names_status("401") || error_msg.contains("Unauthorized") {
                     println!(
-                        "    Invalid API key. Check `codewhale auth status`, DEEPSEEK_API_KEY, or config.toml"
+                        "    Invalid API key. Check `codewhale auth status`, {}, or config.toml",
+                        doctor_provider_key_place(provider)
                     );
-                } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
+                } else if names_status("403") || error_msg.contains("Forbidden") {
                     println!(
-                        "    API key lacks permissions. Verify key is active at platform.deepseek.com"
+                        "    API key lacks permissions. Verify the {} key is active.",
+                        provider.provider().display_name()
                     );
                 } else if error_msg.contains("timeout") || error_msg.contains("Timeout") {
                     for line in doctor_timeout_recovery_lines(config) {
@@ -4782,6 +5319,7 @@ async fn run_doctor(
                 "·".dimmed(),
                 cfg.servers.len()
             );
+            let duplicate_computer_use = crate::mcp::duplicate_computer_use_servers(&cfg);
             for (name, server) in &cfg.servers {
                 let status = doctor_check_mcp_server(server);
                 let icon = match &status {
@@ -4816,6 +5354,13 @@ async fn run_doctor(
                     );
                 }
             }
+            for (name, _) in &duplicate_computer_use {
+                println!(
+                    "  {} {}",
+                    "!".truecolor(sky_r, sky_g, sky_b),
+                    duplicate_computer_use_warning(name).trim_start()
+                );
+            }
             if probes.should_probe_mcp() {
                 println!();
                 println!(
@@ -4827,7 +5372,9 @@ async fn run_doctor(
                     workspace,
                     std::sync::Arc::new(plugins.clone()),
                 ) {
-                    Ok(mut pool) => {
+                    Ok(pool) => {
+                        let mut pool =
+                            pool.with_backend(crate::mcp::McpBackend::from_config(config));
                         let errors = pool.connect_all().await;
                         let failed = errors
                             .iter()
@@ -5156,6 +5703,92 @@ async fn run_doctor(
         }
     }
 
+    {
+        // The runtime the TypeScript extension host would use, resolved the
+        // same way the host launcher does (`[extension_host] runtime`), and
+        // with the host on, the OS sandbox it would get, planned (on Linux,
+        // bwrap-probed) the way a launch plans it. Both run child processes,
+        // so they stay off the async runtime. Known limit: the runtime probes
+        // have no timeout, so a runtime binary that hangs on `--version`
+        // stalls doctor here.
+        let options = crate::extension_host::ExtensionHostOptions::from_config(
+            config.extension_host.as_ref(),
+        );
+        let native_enabled = config
+            .features()
+            .enabled(crate::features::Feature::ExtensionHost);
+        let mcp_enabled =
+            crate::mcp::McpBackend::from_config(config) == crate::mcp::McpBackend::Host;
+        let enabled = native_enabled || mcp_enabled;
+        let tier = if mcp_enabled {
+            crate::extension_host::tier::HostTier::Builtin
+        } else {
+            crate::extension_host::tier::HostTier::Plugin
+        };
+        let resolution = tokio::task::spawn_blocking(move || {
+            let resolution = crate::dependencies::resolve_extension_host_runtime(
+                options.runtime,
+                options.node_override.as_deref(),
+                options.bun_override.as_deref(),
+            );
+            let sandbox = resolution
+                .selected
+                .as_ref()
+                .filter(|_| enabled)
+                .map(|runtime| crate::extension_host::planned_sandbox(&options, runtime, tier));
+            (resolution, sandbox)
+        })
+        .await;
+        let state = if enabled {
+            ""
+        } else {
+            " (unused: Native extensions and Host MCP are off)"
+        };
+        let failed = if enabled {
+            "✗".truecolor(red_r, red_g, red_b)
+        } else {
+            "·".dimmed()
+        };
+        match resolution {
+            Ok((resolution, sandbox)) => match &resolution.selected {
+                Some(runtime) => {
+                    println!(
+                        "  {} Extension host runtime: {}{state}",
+                        "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                        resolution.summary(),
+                    );
+                    println!(
+                        "    Node remains the default; Bun default eligibility awaits measured runtime and platform isolation gates."
+                    );
+                    if native_enabled {
+                        println!(
+                            "    Native admission requires a verified OS sandbox; an unsandboxed pinned Builtin host does not qualify Native extensions."
+                        );
+                    }
+                    println!(
+                        "    {}",
+                        crate::extension_host::supervisor::MemoryEnforcement::planned(runtime.kind)
+                            .describe(crate::extension_host::supervisor::HOST_MEMORY_CAP)
+                    );
+                    match sandbox {
+                        Some(Ok(sandbox)) => println!("    {sandbox}"),
+                        Some(Err(error)) => {
+                            println!("    host sandbox not determined: {error}")
+                        }
+                        None => {}
+                    }
+                }
+                None => println!(
+                    "  {failed} Extension host runtime: {}{state}",
+                    resolution.failure(),
+                ),
+            },
+            Err(error) => println!(
+                "  {failed} Extension host runtime: the runtime probe did not finish ({error}){state}"
+            ),
+        }
+    }
+
     match crate::dependencies::resolve_pandoc() {
         Some(_) => println!(
             "  {} pandoc: present → pandoc_convert tool registered",
@@ -5164,12 +5797,12 @@ async fn run_doctor(
         None => {
             println!("  {} pandoc: not found (optional)", "·".dimmed(),);
             println!(
-                "    pandoc_convert tool is NOT advertised to the model. Install pandoc to enable:"
+                "    pandoc_convert tool is NOT advertised to the model. Install pandoc 2.15+ to enable:"
             );
             match std::env::consts::OS {
                 "macos" => println!("      brew install pandoc"),
                 "linux" => println!(
-                    "      sudo apt install pandoc    (Debian/Ubuntu) — or your distro's equivalent"
+                    "      release package from pandoc.org/installing.html (distro packages may predate 2.15)"
                 ),
                 "windows" => {
                     println!("      winget install JohnMacFarlane.Pandoc")
@@ -5302,9 +5935,8 @@ async fn run_doctor(
     println!("  OS: {}", std::env::consts::OS);
     println!("  Arch: {}", std::env::consts::ARCH);
 
-    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-        config.prefer_bwrap.unwrap_or(false),
-    );
+    let sandbox =
+        crate::sandbox::get_platform_sandbox_with_bwrap_preference(config.prefers_bwrap());
     if let Some(kind) = sandbox {
         println!(
             "  {} sandbox available: {}",
@@ -5319,12 +5951,298 @@ async fn run_doctor(
     }
 
     println!();
-    println!(
-        "{}",
-        "All checks complete!"
-            .truecolor(aqua_r, aqua_g, aqua_b)
-            .bold()
-    );
+    println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
+}
+
+/// Human-facing facts the verdict uses beyond the setup-state record. None of
+/// these change structural Setup/Fleet readiness (the JSON contract): a set
+/// environment variable is reported, never certified, until a live probe.
+#[derive(Debug, Clone, Default)]
+struct DoctorVerdictFacts {
+    /// The TUI's own first-run receipt (`.onboarded`). TUI onboarding finishes
+    /// after its key gate but never fills the `/setup` wizard's language and
+    /// constitution steps, so `first_run_ready()` alone misreads it.
+    onboarded: bool,
+    /// Name of the env place holding the active provider's key, from
+    /// `config::active_provider_env_api_key_source`; never the value.
+    env_key_source: Option<String>,
+    /// Outcome of the opt-in live API check; `None` when it did not run.
+    live_probe: Option<bool>,
+}
+
+/// `set via <VAR> (value not shown; not checked offline)`.
+fn doctor_env_key_label(source: &str) -> String {
+    format!("set via {source} (value not shown; not checked offline)")
+}
+
+/// Where a rejected key might live, named without reading it. A route that
+/// binds `api_key_env` is named by that variable; otherwise the provider's
+/// first ambient variable.
+fn doctor_provider_key_place(provider: crate::config::ProviderKind) -> String {
+    provider
+        .provider()
+        .env_vars()
+        .first()
+        .copied()
+        .unwrap_or("the provider environment variable")
+        .to_string()
+}
+
+/// Doctor's one-line answer: ready, or the single next step (U7). Readiness
+/// starts from the setup lane's record. Offline doctor never reads the secret
+/// store, so a stored key is "not checked", not missing; "Not ready" is kept
+/// for a missing route, a key nothing can account for, or a failed probe.
+fn doctor_verdict(
+    state: &codewhale_config::SetupState,
+    provider: &str,
+    facts: &DoctorVerdictFacts,
+) -> String {
+    use codewhale_config::StepStatus;
+    const PROBE_HINT: &str = "run `codewhale doctor --probe-api` to verify";
+    match facts.live_probe {
+        Some(false) => {
+            return format!(
+                "Not ready: the live {provider} API check failed → see API Connectivity below; `codewhale auth set --provider {provider}` replaces a rejected key."
+            );
+        }
+        Some(true) => return format!("Ready: the live {provider} API check passed."),
+        None => {}
+    }
+    let env_ready = facts.env_key_source.as_deref().map(|source| {
+        format!("Ready: {provider} key is set via {source} (not checked offline; {PROBE_HINT}).")
+    });
+    // NeedsAction means a named route exists but its key is missing, unchecked
+    // or failed. Configured routes can be used without a prior probe.
+    // `first_run_ready` accepts NeedsAction (a failed key still reaches the
+    // wizard's ready screen), so check the provider first.
+    match state.status(codewhale_config::SetupStep::ProviderModel) {
+        StepStatus::Verified if state.first_run_ready() || facts.onboarded => {
+            "Ready: setup is complete.".to_string()
+        }
+        StepStatus::Configured | StepStatus::Verified
+            if state.first_run_ready() || facts.onboarded =>
+        {
+            format!("Ready: setup is complete (saved key not checked offline; {PROBE_HINT}).")
+        }
+        StepStatus::Configured | StepStatus::Verified => env_ready.unwrap_or_else(|| {
+            "Not ready: first-run setup is unfinished → run `codewhale setup`.".to_string()
+        }),
+        StepStatus::NeedsAction => env_ready.unwrap_or_else(|| {
+            // A derived NeedsAction only means offline doctor cannot see the
+            // stored key; onboarding already gated on one. A NeedsAction the
+            // setup lane persisted is a real missing or failed key.
+            if state.inherited && facts.onboarded {
+                format!(
+                    "Ready: onboarding is complete (saved {provider} key not checked offline; {PROBE_HINT})."
+                )
+            } else {
+                format!(
+                    "Not ready: the {provider} route has no verified key → save one with /provider in Codewhale or `codewhale auth set --provider {provider}`; `codewhale doctor --probe-api` checks a key already saved."
+                )
+            }
+        }),
+        _ => env_ready.unwrap_or_else(|| {
+            "Not ready: no model provider set up → run /provider in Codewhale, or `codewhale setup`."
+                .to_string()
+        }),
+    }
+}
+
+#[cfg(test)]
+mod doctor_verdict_tests {
+    #[test]
+    fn a_fresh_home_is_not_ready_and_names_the_provider_step() {
+        let verdict = super::doctor_verdict(
+            &codewhale_config::SetupState::default(),
+            "deepseek",
+            &super::DoctorVerdictFacts::default(),
+        );
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(verdict.contains("/provider"), "{verdict}");
+    }
+
+    #[test]
+    fn a_route_without_a_verified_key_is_not_called_missing() {
+        // A fresh home derives NeedsAction for the default route because
+        // doctor does not read saved keys; the verdict must not claim there is
+        // no provider, and names both the headless fix and the probe.
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::NeedsAction, true, "inherited"),
+        );
+        let verdict =
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default());
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(!verdict.contains("no model provider"), "{verdict}");
+        assert!(
+            verdict.contains("`codewhale auth set --provider deepseek`"),
+            "{verdict}"
+        );
+        assert!(verdict.contains("--probe-api"), "{verdict}");
+    }
+
+    #[test]
+    fn finished_setup_with_an_unconfirmed_key_is_not_ready() {
+        use codewhale_config::{
+            ConstitutionChoice, RuntimePostureSource, SetupState, SetupStep, StepEntry, StepStatus,
+        };
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::Language,
+            StepEntry::new(StepStatus::Verified, true, "0.10.1"),
+        );
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::NeedsAction, true, "0.10.1"),
+        );
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.constitution_choice = ConstitutionChoice::Bundled;
+        assert!(state.first_run_ready(), "fixture must be wizard-ready");
+        let verdict =
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default());
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(verdict.contains("/provider"), "{verdict}");
+
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Verified, true, "0.10.1"),
+        );
+        assert_eq!(
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default()),
+            "Ready: setup is complete."
+        );
+    }
+
+    fn facts(
+        onboarded: bool,
+        env_key_source: Option<&str>,
+        live_probe: Option<bool>,
+    ) -> super::DoctorVerdictFacts {
+        super::DoctorVerdictFacts {
+            onboarded,
+            env_key_source: env_key_source.map(str::to_string),
+            live_probe,
+        }
+    }
+
+    #[test]
+    fn completed_tui_onboarding_is_not_unfinished_setup() {
+        // TUI onboarding records the route step only; never the wizard's
+        // language/constitution steps.
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Configured, true, "0.10.1"),
+        );
+        assert!(!state.first_run_ready(), "fixture is not wizard-ready");
+        let verdict = super::doctor_verdict(&state, "openai", &facts(true, None, None));
+        assert!(verdict.starts_with("Ready: setup is complete"), "{verdict}");
+        assert!(verdict.contains("--probe-api"), "{verdict}");
+        assert!(!verdict.contains("unfinished"), "{verdict}");
+
+        // Without the receipt (or a key) the wizard's verdict stands.
+        let verdict = super::doctor_verdict(&state, "openai", &facts(false, None, None));
+        assert!(
+            verdict.contains("first-run setup is unfinished"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn onboarded_home_without_a_record_is_ready_but_a_recorded_failure_is_not() {
+        use codewhale_config::{InheritedConfigFacts, SetupState};
+        let derived = SetupState::derive_inherited(&InheritedConfigFacts {
+            has_provider_route: true,
+            ..Default::default()
+        });
+        let verdict = super::doctor_verdict(&derived, "openai", &facts(true, None, None));
+        assert!(
+            verdict.starts_with("Ready: onboarding is complete"),
+            "{verdict}"
+        );
+
+        let mut recorded = derived.clone();
+        recorded.inherited = false;
+        let verdict = super::doctor_verdict(&recorded, "openai", &facts(true, None, None));
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+    }
+
+    #[test]
+    fn a_set_env_key_is_ready_and_named_for_any_provider() {
+        use codewhale_config::{InheritedConfigFacts, SetupState};
+        // Structural derivation keeps NeedsAction: env never certifies it.
+        let derived = SetupState::derive_inherited(&InheritedConfigFacts {
+            has_provider_route: true,
+            ..Default::default()
+        });
+        let verdict = super::doctor_verdict(
+            &derived,
+            "anthropic",
+            &facts(false, Some("ANTHROPIC_API_KEY"), None),
+        );
+        assert_eq!(
+            verdict,
+            "Ready: anthropic key is set via ANTHROPIC_API_KEY (not checked offline; run `codewhale doctor --probe-api` to verify)."
+        );
+    }
+
+    #[test]
+    fn the_live_probe_result_decides_the_verdict() {
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::NeedsAction, true, "0.10.1"),
+        );
+        let verdict = super::doctor_verdict(&state, "openai", &facts(false, None, Some(true)));
+        assert!(
+            verdict.starts_with("Ready: the live openai API check passed"),
+            "{verdict}"
+        );
+
+        let verdict = super::doctor_verdict(
+            &state,
+            "openai",
+            &facts(true, Some("OPENAI_API_KEY"), Some(false)),
+        );
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(verdict.contains("API Connectivity"), "{verdict}");
+    }
+
+    #[test]
+    fn env_key_source_names_the_providers_own_variable_without_its_value() {
+        let _lock = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let _openai = crate::test_support::EnvVarGuard::set("OPENAI_API_KEY", "MUST-NOT-BE-SHOWN");
+        let config = crate::config::Config {
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let source = crate::config::active_provider_env_api_key_source(&config)
+            .expect("ambient key present");
+        assert_eq!(source, "OPENAI_API_KEY");
+        let label = super::doctor_env_key_label(&source);
+        assert_eq!(
+            label,
+            "set via OPENAI_API_KEY (value not shown; not checked offline)"
+        );
+        assert!(!label.contains("MUST-NOT-BE-SHOWN"));
+        // The structural contract is untouched: env presence is not readiness.
+        assert!(
+            !super::resolve_credential_diagnostic(&config)
+                .availability
+                .certifies_ready()
+        );
+
+        let _openai = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        assert_eq!(
+            crate::config::active_provider_env_api_key_source(&config),
+            None
+        );
+    }
 }
 
 const DOCTOR_LEGACY_STATE_ITEMS: &[&str] = &[
@@ -6034,11 +6952,15 @@ fn print_doctor_setup_report(
         "  {first_run_icon} first-run: {}",
         doctor_ready_label(first_run_ready)
     );
-    println!(
-        "  {update_icon} update checkpoint {}: {}",
-        crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
-        doctor_ready_label(update_ready)
-    );
+    // An update checkpoint only means something once a prior setup exists;
+    // on a fresh home it is a stale version number with nothing to update.
+    if first_run_ready {
+        println!(
+            "  {update_icon} update checkpoint {}: {}",
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            doctor_ready_label(update_ready)
+        );
+    }
     println!(
         "  {operate_icon} operate/fleet: {}",
         doctor_ready_label(operate_ready)
@@ -6290,23 +7212,34 @@ fn doctor_control_socket_posture_line(config: &Config) -> String {
 
 /// Resolved telemetry consent and where it came from (#5441).
 ///
-/// Telemetry ships ON by default, and no posture surface reported that — a
-/// user who never opted in saw nothing saying "telemetry: on (default)".
-/// Truth change only: the resolution itself is [`codewhale_config`]'s.
+/// Report the durable opt-out and environment preference without arming or
+/// touching telemetry state. Notice presentation is not a permission gate.
 fn doctor_runtime_telemetry(config: &Config) -> (bool, &'static str) {
     let (on, source) = codewhale_config::resolved_telemetry_consent(config.telemetry);
-    (on, source.as_str())
+    if !on {
+        return (false, source.as_str());
+    }
+    match codewhale_telemetry::load_setup_state_for_decision() {
+        Some(state) if state.telemetry_opted_out() => (false, "recorded_opt_out"),
+        Some(_) => (true, source.as_str()),
+        None => (false, "privacy_state_unreadable"),
+    }
 }
 
 fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
     use serde_json::json;
 
-    let provider = config.api_provider();
+    let identity = match config.active_provider_identity() {
+        Ok(identity) => identity,
+        Err(_) => {
+            return json!({"provider": config.provider, "ready": false, "route_error": "provider_identity_unavailable", "auth": {"availability": "unavailable", "source": "unknown"}});
+        }
+    };
     // Doctor reports configured routing posture only. In particular it must
     // never consume an external-file grant merely to label Fleet readiness.
     let credential = resolve_credential_diagnostic(config);
     let has_credentials_or_local = credential.availability.certifies_ready();
-    let subagents_enabled = config.subagents_enabled_for_provider(provider);
+    let subagents_enabled = config.subagents_enabled_for_provider(&identity);
     let disabled_reason = if subagents_enabled {
         None
     } else {
@@ -6316,10 +7249,10 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
                 .unwrap_or("disabled for active provider"),
         )
     };
-    let max_subagents = config.max_subagents_for_provider(provider);
-    let launch_concurrency = config.launch_concurrency_for_provider(provider);
-    let max_admitted = config.max_admitted_subagents_for_provider(provider);
-    let max_spawn_depth = config.subagent_max_spawn_depth_for_provider(provider);
+    let max_subagents = config.max_subagents_for_provider(&identity);
+    let launch_concurrency = config.launch_concurrency_for_provider(&identity);
+    let max_admitted = config.max_admitted_subagents_for_provider(&identity);
+    let max_spawn_depth = config.subagent_max_spawn_depth_for_provider(&identity);
     let roster =
         crate::fleet::identity::load_effective_roster(&config.fleet_config(), workspace, None);
     let mut built_in_members = 0usize;
@@ -6327,6 +7260,7 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
     let mut config_members = 0usize;
     let mut personal_members = 0usize;
     let mut workspace_members = 0usize;
+    let mut claude_members = 0usize;
     for member in roster.members() {
         match member.origin {
             crate::fleet::roster::ProfileOrigin::BuiltIn => built_in_members += 1,
@@ -6334,10 +7268,12 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
             crate::fleet::roster::ProfileOrigin::Config => config_members += 1,
             crate::fleet::roster::ProfileOrigin::Personal => personal_members += 1,
             crate::fleet::roster::ProfileOrigin::Workspace => workspace_members += 1,
+            crate::fleet::roster::ProfileOrigin::ClaudeCode => claude_members += 1,
         }
     }
     let roster_members = roster.members().len();
-    let custom_members = plugin_members + config_members + personal_members + workspace_members;
+    let custom_members =
+        plugin_members + config_members + personal_members + workspace_members + claude_members;
     let roster_ready = roster.load_error().is_none() && roster_members > 0;
     let runtime_ready =
         subagents_enabled && max_subagents > 0 && launch_concurrency > 0 && max_spawn_depth > 0;
@@ -6364,10 +7300,13 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
         })
         .collect();
 
+    let model_pin_drift = doctor_model_pin_drift(config, workspace, &roster);
+
     json!({
         "ready": has_credentials_or_local && runtime_ready && roster_ready,
+        "model_pin_drift": model_pin_drift,
         "provider": {
-            "id": config.provider_identity_for(provider),
+            "id": identity.key.as_str(),
             "auth": {
                 "present_or_local": has_credentials_or_local,
                 "source": doctor_api_key_source_label(credential.source),
@@ -6392,6 +7331,7 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
             "config": config_members,
             "personal": personal_members,
             "workspace": workspace_members,
+            "claude": claude_members,
             "custom": custom_members,
             "starter_roster_available": built_in_members > 0,
             "readiness_rule": "built-in starter roster or custom roster",
@@ -6406,13 +7346,101 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
     })
 }
 
+/// Warning-only model-pin drift surfacing (#6035). A pin is flagged only
+/// when a FRESH cached live roster for that provider route exists and does
+/// not list the pinned wire id — stale, failed, or absent rosters cannot
+/// prove drift, and bundled catalog rows say nothing about what the account
+/// currently serves. The id may still answer (soft deprecation) or be served
+/// by other providers on their own routes, so this never rewrites the pin.
+fn doctor_model_pin_drift(
+    config: &Config,
+    workspace: &Path,
+    roster: &crate::fleet::roster::FleetRoster,
+) -> serde_json::Value {
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    // One row per affected route: (provider, model) -> pin owners.
+    let mut pins: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+
+    for entry in crate::fleet::store::list_fleets(workspace) {
+        if entry.parse_error.is_some() {
+            continue;
+        }
+        let Ok((fleet, scope)) = crate::fleet::store::load_fleet_at(&entry.path) else {
+            continue;
+        };
+        let owner = format!("fleet:{} ({})", fleet.name, scope.label());
+        if let Some(operator) = fleet.operator.as_ref() {
+            pins.entry((operator.provider.clone(), operator.model.clone()))
+                .or_default()
+                .push(format!("{owner} operator"));
+        }
+        for member in &fleet.members {
+            if let (Some(provider), Some(model)) = (member.provider.as_ref(), member.model.as_ref())
+            {
+                pins.entry((provider.clone(), model.clone()))
+                    .or_default()
+                    .push(format!("{owner} member:{}", member.id));
+            }
+        }
+    }
+    for member in roster.members() {
+        if let (Some(provider), Some(model)) = (
+            member.profile.provider.as_ref(),
+            member.profile.model.as_ref(),
+        ) {
+            pins.entry((provider.clone(), model.clone()))
+                .or_default()
+                .push(format!("agent:{}", member.id));
+        }
+    }
+
+    let mut unverifiable = 0usize;
+    let drifted = pins
+        .iter()
+        .filter_map(|((provider, model), owners)| {
+            let Some(missing) = crate::provider_catalog_live::pin_missing_from_fresh_roster(
+                config, provider, model,
+            ) else {
+                unverifiable += 1;
+                return None;
+            };
+            missing.then(|| {
+                json!({
+                    "provider": provider,
+                    "model": model,
+                    "owners": owners,
+                    "message": format!(
+                        "pinned id `{model}` is absent from {provider}'s current live roster; \
+                         the id may still answer (soft deprecation) or be served by other \
+                         providers on their own routes — the pin is left unchanged"
+                    ),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "checked": pins.len(),
+        "unverifiable": unverifiable,
+        "drifted": drifted,
+    })
+}
+
 fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
     use serde_json::json;
 
-    let provider = config.api_provider();
+    let identity = match config.active_provider_identity() {
+        Ok(identity) => identity,
+        Err(_) => {
+            return json!({"provider": config.provider, "ready": false, "route_error": "provider_identity_unavailable", "auth": {"availability": "unavailable", "source": "unknown"}});
+        }
+    };
+    let provider = identity.provider;
     let credential = resolve_credential_diagnostic(config);
     let auth_present_or_local = credential.availability.certifies_ready();
-    let credential_help = provider.credential_help();
+    let credential_help = provider.provider().credential_help();
     let credential_url = credential_help
         .credential_url
         .map(crate::doctor::structural_url_authority);
@@ -6422,8 +7450,8 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
 
     json!({
         "provider": {
-            "id": config.provider_identity_for(provider),
-            "display": provider.display_name(),
+            "id": identity.key.as_str(),
+            "display": identity.compatibility().map_or(identity.key.as_str(), |row| row.label),
         },
         "model": {
             "resolved": config.default_model(),
@@ -6432,7 +7460,7 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
             "present_or_local": auth_present_or_local,
             "source": doctor_api_key_source_label(credential.source),
             "availability": credential.availability.label(),
-            "env_vars": provider.env_vars(),
+            "env_vars": provider.provider().env_vars(),
             "credential_mode": credential_help.acquisition.as_str(),
             "credential_url": credential_url,
             "credential_docs_url": credential_docs_url,
@@ -6514,12 +7542,15 @@ fn doctor_external_credential_consent_statuses(
     config: &Config,
 ) -> Vec<codewhale_config::ExternalCredentialConsentStatus> {
     [
-        crate::config::ApiProvider::OpenaiCodex,
-        crate::config::ApiProvider::Xai,
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::OpenaiCodex,
+        crate::config::ProviderKind::Xai,
+        crate::config::ProviderKind::Deepseek,
     ]
     .into_iter()
-    .filter_map(|provider| config.external_credential_consent_status(provider))
+    .filter_map(|provider| {
+        let identity = config.builtin_provider_identity(provider).ok()?;
+        config.external_credential_consent_status(&identity)
+    })
     .collect()
 }
 
@@ -6725,6 +7756,7 @@ fn setup_status_id(status: codewhale_config::StepStatus) -> &'static str {
         codewhale_config::StepStatus::Optional => "optional",
         codewhale_config::StepStatus::Deferred => "deferred",
         codewhale_config::StepStatus::InProgress => "in_progress",
+        codewhale_config::StepStatus::Configured => "configured",
         codewhale_config::StepStatus::Verified => "verified",
         codewhale_config::StepStatus::NeedsAction => "needs_action",
         codewhale_config::StepStatus::Failed => "failed",
@@ -6771,15 +7803,57 @@ fn runtime_posture_source_id(source: codewhale_config::RuntimePostureSource) -> 
 /// Emit a bounded, secret-redacted JSON failure when configuration cannot be
 /// loaded or validated. Invalid configuration must not be forced through the
 /// normal doctor report because its route/capability facts would be misleading.
+/// `codewhale doctor --repair-sessions [--dry-run]` (#6144).
+fn run_doctor_repair_sessions(dry_run: bool) -> Result<()> {
+    let manager = session_manager::SessionManager::default_location()?;
+    let summary = crate::session_reconcile::reconcile(
+        &manager,
+        &crate::session_reconcile::ReconcileOptions {
+            dry_run,
+            ..Default::default()
+        },
+    )?;
+    let report = serde_json::to_string_pretty(&summary)?;
+    if summary.skipped_concurrent {
+        println!("Another Codewhale process is repairing the session store; try again shortly.");
+    } else if dry_run {
+        println!("Session repair (dry run — nothing changed):");
+    } else {
+        println!("Session repair:");
+    }
+    println!("{report}");
+    Ok(())
+}
+
+const DOCTOR_CONFIG_ERROR_OMITTED: &str = "configuration validation failed; details omitted because configuration errors may contain credential material";
+
+/// Human doctor text for a config load failure. Plain value/profile
+/// validation errors are shown with their fix; anything else (parse errors,
+/// credential fields) stays suppressed because it may echo secret material.
+fn doctor_config_error_text(error: &anyhow::Error) -> String {
+    let Some(diagnostic) = crate::config::SafeConfigDiagnostic::find_in(error) else {
+        return format!("doctor {DOCTOR_CONFIG_ERROR_OMITTED}");
+    };
+    let mut text = format!(
+        "doctor configuration validation failed: {}",
+        diagnostic.display_message()
+    );
+    if let Some(fix) = diagnostic.fix() {
+        text.push_str("\nfix: ");
+        text.push_str(fix);
+    }
+    text
+}
+
 fn run_doctor_json_config_error(error: &anyhow::Error) -> Result<()> {
-    let safe_message = error
-        .downcast_ref::<crate::config::SafeConfigDiagnostic>()
-        .map(ToString::to_string);
+    let diagnostic = crate::config::SafeConfigDiagnostic::find_in(error);
+    let safe_message = diagnostic.map(crate::config::SafeConfigDiagnostic::display_message);
     let report = serde_json::json!({
         "status": "error",
         "error": {
             "kind": "config_validation",
-            "message": safe_message.as_deref().unwrap_or("configuration validation failed; details omitted because configuration errors may contain credential material"),
+            "message": safe_message.as_deref().unwrap_or(DOCTOR_CONFIG_ERROR_OMITTED),
+            "fix": diagnostic.and_then(crate::config::SafeConfigDiagnostic::fix),
         },
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -6926,6 +8000,9 @@ fn run_doctor_json(
         "version": env!("CARGO_PKG_VERSION"),
         "config_path": config_path.display().to_string(),
         "config_present": config_path.exists(),
+        "sessions": {
+            "last_repair": crate::session_reconcile::last_run(&doctor_paths.sessions),
+        },
         "paths": doctor_paths,
         "secret_backend": secret_backend,
         "workspace": workspace.display().to_string(),
@@ -7025,7 +8102,7 @@ fn run_doctor_json(
             },
         },
         "sandbox": match crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-            config.prefer_bwrap.unwrap_or(false),
+            config.prefers_bwrap(),
         ) {
             Some(kind) => json!({"available": true, "kind": kind.to_string()}),
             None => json!({"available": false, "kind": null}),
@@ -7060,10 +8137,19 @@ fn run_doctor_context_json(config: &Config, workspace: &Path) -> Result<()> {
 fn provider_capability_report(config: &Config) -> serde_json::Value {
     use serde_json::json;
 
-    let provider = config.api_provider();
+    let identity = match config.active_provider_identity() {
+        Ok(identity) => identity,
+        Err(_) => {
+            return json!({"provider": config.provider, "ready": false, "route_error": "provider_identity_unavailable", "auth": {"availability": "unavailable", "source": "unknown"}});
+        }
+    };
+    let provider = identity.provider;
     let configured_model = config.default_model();
-    let route_result =
-        crate::route_runtime::resolve_runtime_route(config, provider, Some(&configured_model));
+    let route_result = crate::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        &identity,
+        Some(&configured_model),
+    );
     let route_error = route_result
         .is_err()
         .then_some("route_resolution_failed_details_omitted");
@@ -7077,7 +8163,7 @@ fn provider_capability_report(config: &Config) -> serde_json::Value {
     let cap = crate::config::provider_capability_with_wire(
         provider,
         resolved_model,
-        config.provider_wire_dialect(provider),
+        config.provider_wire_dialect(&identity),
     );
     let route_profile = route.as_ref().map(|route| {
         crate::model_profile::resolved_capability_profile_for_route(
@@ -7126,7 +8212,7 @@ fn provider_capability_report(config: &Config) -> serde_json::Value {
     let alias_deprecation = config.active_deepseek_alias_deprecation();
 
     json!({
-        "resolved_provider": config.provider_identity_for(provider),
+        "resolved_provider": identity.key.as_str(),
         "resolved_model": resolved_model,
         "context_window": context_window,
         "context_window_source": context_window_source,
@@ -7143,10 +8229,19 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
     use serde_json::json;
 
     let target = doctor_api_target(config);
-    let provider = config.api_provider();
+    let identity = match config.active_provider_identity() {
+        Ok(identity) => identity,
+        Err(_) => {
+            return json!({"provider": config.provider, "ready": false, "route_error": "provider_identity_unavailable", "auth": {"availability": "unavailable", "source": "unknown"}});
+        }
+    };
+    let provider = identity.provider;
     let redacted_base_url = crate::doctor::structural_url_authority(&target.base_url);
-    let route_result =
-        crate::route_runtime::resolve_runtime_route(config, provider, Some(&target.model));
+    let route_result = crate::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        &identity,
+        Some(&target.model),
+    );
     let route_error = route_result
         .is_err()
         .then_some("route_resolution_failed_details_omitted");
@@ -7172,7 +8267,7 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
     json!({
         "provider": target.provider,
         "provider_source": doctor_provider_source(config),
-        "provider_config_table": doctor_provider_config_table(config, provider),
+        "provider_config_table": doctor_provider_config_table(&identity),
         "model": target.model,
         "route_identity": route_identity,
         "wire_protocol": doctor_wire_protocol(provider),
@@ -7191,15 +8286,13 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
     })
 }
 
-fn doctor_provider_config_table(config: &Config, provider: crate::config::ApiProvider) -> String {
-    if provider != crate::config::ApiProvider::Custom {
-        return provider_config_table_key(provider).to_string();
-    }
-    if config.uses_legacy_literal_custom_route() {
-        "root (legacy literal custom)".to_string()
-    } else {
-        format!("providers.{}", config.provider_identity_for(provider))
-    }
+fn doctor_provider_config_table(identity: &crate::config::ProviderIdentity) -> String {
+    format!(
+        "providers.{}",
+        identity
+            .compatibility()
+            .map_or(identity.key.as_str(), |row| row.config_key)
+    )
 }
 
 fn doctor_provider_source(config: &Config) -> &'static str {
@@ -7214,13 +8307,8 @@ fn doctor_provider_source(config: &Config) -> &'static str {
     }
 }
 
-fn doctor_wire_protocol(provider: crate::config::ApiProvider) -> &'static str {
-    let policy = provider
-        .metadata()
-        .map(|metadata| metadata.wire_policy())
-        .unwrap_or(codewhale_config::provider::WirePolicy::Fixed(
-            codewhale_config::provider::WireFormat::ChatCompletions,
-        ));
+fn doctor_wire_protocol(provider: crate::config::ProviderKind) -> &'static str {
+    let policy = provider.provider().wire_policy();
     match policy.fixed() {
         Some(codewhale_config::provider::WireFormat::ChatCompletions) => "chat_completions",
         Some(codewhale_config::provider::WireFormat::Responses) => "responses",
@@ -7229,7 +8317,7 @@ fn doctor_wire_protocol(provider: crate::config::ApiProvider) -> &'static str {
     }
 }
 
-fn doctor_base_url_class(provider: crate::config::ApiProvider, base_url: &str) -> &'static str {
+fn doctor_base_url_class(provider: crate::config::ProviderKind, base_url: &str) -> &'static str {
     let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
     if normalized.starts_with("http://localhost")
         || normalized.starts_with("http://127.0.0.1")
@@ -7238,8 +8326,8 @@ fn doctor_base_url_class(provider: crate::config::ApiProvider, base_url: &str) -
         return "local";
     }
     if normalized
-        == provider
-            .default_base_url()
+        == codewhale_config::descriptors::compatibility_for_kind(provider)
+            .base_url
             .trim_end_matches('/')
             .to_ascii_lowercase()
     {
@@ -7250,25 +8338,29 @@ fn doctor_base_url_class(provider: crate::config::ApiProvider, base_url: &str) -
 }
 
 fn doctor_auth_scheme(config: &Config) -> &'static str {
-    let provider = config.api_provider();
-    if crate::config::auth_mode_disables_api_key(config.auth_mode_for_provider(provider).as_deref())
-    {
+    let Ok(identity) = config.active_provider_identity() else {
+        return "unavailable";
+    };
+    let provider = identity.provider;
+    if crate::config::auth_mode_disables_api_key(
+        config.auth_mode_for_provider(&identity).as_deref(),
+    ) {
         "none"
-    } else if provider == crate::config::ApiProvider::Anthropic {
+    } else if provider == crate::config::ProviderKind::Anthropic {
         "x-api-key"
-    } else if provider == crate::config::ApiProvider::XiaomiMimo
-        && doctor_xiaomi_mimo_base_url_uses_token_plan(&config.deepseek_base_url())
+    } else if provider == crate::config::ProviderKind::XiaomiMimo
+        && doctor_xiaomi_mimo_base_url_uses_token_plan(&config.base_url_for_route(&identity))
     {
         "api-key"
-    } else if provider == crate::config::ApiProvider::XiaomiMimo {
+    } else if provider == crate::config::ProviderKind::XiaomiMimo {
         // The alternate MiMo scheme depends on a credential prefix. Ordinary
         // doctor does not read credentials merely to make this label precise.
         "unknown"
     } else if matches!(
         provider,
-        crate::config::ApiProvider::Sglang
-            | crate::config::ApiProvider::Vllm
-            | crate::config::ApiProvider::Ollama
+        crate::config::ProviderKind::Sglang
+            | crate::config::ProviderKind::Vllm
+            | crate::config::ProviderKind::Ollama
     ) {
         "optional_bearer"
     } else {
@@ -7315,13 +8407,41 @@ fn doctor_search_provider_line(config: &Config) -> String {
     } else {
         ""
     };
+    // Missing-key is stdout-only (never JSON) and only applies when the
+    // operator pinned Tavily: autodetect (`tavily key`) cannot reach this line
+    // without a key signal, so it never reports a missing key.
+    let missing_key = if search_provider.provider == crate::config::SearchProvider::Tavily
+        && matches!(
+            search_provider.source,
+            crate::config::SearchProviderSource::Config
+                | crate::config::SearchProviderSource::EnvOverride
+        )
+        && !search_provider_has_tavily_key(config)
+    {
+        "; missing TAVILY_API_KEY or [search] api_key"
+    } else {
+        ""
+    };
 
     format!(
-        "search_provider: {} (source: {}{})",
+        "search_provider: {} (source: {}{}){}",
         search_provider.provider.as_str(),
         search_provider.source.as_str(),
-        switch_hint
+        switch_hint,
+        missing_key
     )
+}
+
+/// Whether *any* Tavily key is reachable: the dedicated env var, or a
+/// non-empty generic `[search] api_key`. Deliberately not prefix-gated — an
+/// explicit `provider = "tavily"` accepts any non-empty generic key.
+fn search_provider_has_tavily_key(config: &Config) -> bool {
+    crate::config::tavily_env_key().is_some()
+        || config
+            .search
+            .as_ref()
+            .and_then(|search| search.api_key.as_deref())
+            .is_some_and(|key| !key.trim().is_empty())
 }
 
 fn doctor_search_provider_json(config: &Config) -> serde_json::Value {
@@ -7364,24 +8484,39 @@ struct DoctorStrictToolModeStatus {
 }
 
 fn doctor_api_target(config: &Config) -> DoctorApiTarget {
-    let provider = config.api_provider();
+    let identity = config.active_provider_identity().ok();
     // Report the model through the same resolver the live client uses at
     // session launch (`client.rs` → `resolve_runtime_route`), so doctor's
     // answer matches what a session started now would actually serve —
     // saved provider models, alias normalization, and roster preference
     // included — instead of re-deriving a config default that can diverge
     // from the engine (DGF-01, dogfood 2026-08-02).
-    let (model, resolution) =
-        match crate::route_runtime::resolve_runtime_route(config, provider, None) {
-            Ok(route) => (route.model.clone(), DoctorModelResolution::Resolved),
-            Err(_) => (
-                config.default_model(),
-                DoctorModelResolution::ConfiguredOnly,
-            ),
-        };
+    let (model, resolution) = match identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("provider_identity_unavailable"))
+        .and_then(|identity| {
+            crate::route_runtime::resolve_runtime_route_for_identity(config, identity, None)
+                .map_err(anyhow::Error::msg)
+        }) {
+        Ok(route) => (route.model.clone(), DoctorModelResolution::Resolved),
+        Err(_) => (
+            config.default_model(),
+            DoctorModelResolution::ConfiguredOnly,
+        ),
+    };
     DoctorApiTarget {
-        provider: config.provider_identity_for(provider),
-        base_url: config.deepseek_base_url(),
+        provider: identity.as_ref().map_or_else(
+            || {
+                config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".to_string())
+            },
+            |identity| identity.key.to_string(),
+        ),
+        base_url: identity
+            .as_ref()
+            .map_or_else(String::new, |identity| config.base_url_for_route(identity)),
         model,
         resolution,
     }
@@ -7451,7 +8586,15 @@ struct DoctorTlsStatus {
 }
 
 fn doctor_tls_status(config: &Config) -> DoctorTlsStatus {
-    let provider = config.provider_identity_for(config.api_provider());
+    let provider = config.active_provider_identity().map_or_else(
+        |_| {
+            config
+                .provider
+                .clone()
+                .unwrap_or_else(|| "unavailable".to_string())
+        },
+        |identity| identity.key.to_string(),
+    );
     let insecure_skip_tls_verify = config.insecure_skip_tls_verify();
     let message = if insecure_skip_tls_verify {
         format!(
@@ -7502,8 +8645,12 @@ fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
         crate::doctor::structural_url_authority(&target.base_url)
     )];
 
-    match config.api_provider() {
-        crate::config::ApiProvider::Deepseek
+    match config
+        .active_provider_identity()
+        .ok()
+        .map(|identity| identity.provider)
+    {
+        Some(crate::config::ProviderKind::Deepseek)
             if target.base_url.contains("api.deepseek.com")
                 && !target.base_url.contains("api.deepseeki.com") =>
         {
@@ -7512,7 +8659,7 @@ fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
                     .to_string(),
             );
         }
-        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => {
+        Some(crate::config::ProviderKind::Deepseek) => {
             lines.push(
                 "If this is a custom DeepSeek-compatible endpoint, confirm it serves `/v1/models` and `/v1/chat/completions` over HTTPS."
                     .to_string(),
@@ -7543,44 +8690,15 @@ fn run_features_command(config: &Config, command: FeaturesCli) -> Result<()> {
 }
 
 async fn run_models(config: &Config, args: ModelsArgs) -> Result<()> {
-    use crate::client::DeepSeekClient;
-
-    let client = DeepSeekClient::new(config)?;
-    let mut models = client.list_models().await?;
-    models.sort_by(|a, b| a.id.cmp(&b.id));
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&models)?);
-        return Ok(());
-    }
-
-    if models.is_empty() {
-        println!("No models returned by the API.");
-        return Ok(());
-    }
-
-    let default_model = config.default_model();
-
-    println!("Available models (default: {default_model})");
-    for model in models {
-        let marker = if model.id == default_model { "*" } else { " " };
-        if let Some(owner) = model.owned_by {
-            println!("{marker} {} ({owner})", model.id);
-        } else {
-            println!("{marker} {}", model.id);
-        }
-    }
-
-    Ok(())
+    crate::provider_lake::run_models(config, args.update, args.provider.as_deref(), args.json).await
 }
 
 async fn run_speech(config: &Config, args: SpeechArgs) -> Result<()> {
-    use crate::client::{DeepSeekClient, SpeechSynthesisRequest};
-    use crate::config::ApiProvider;
+    use crate::client::{CodewhaleClient, SpeechSynthesisRequest};
+    use crate::config::ProviderKind;
     use crate::tools::speech::{
-        DEFAULT_VOICE, SPEECH_MODEL_EXAMPLES, combine_speech_instructions,
-        default_speech_output_name, describe_speech_voice, encode_voice_clone_sample_data_uri,
-        infer_speech_model, normalize_speech_format,
+        DEFAULT_VOICE, SpeechPreparation, SpeechSurface, SpeechVoice, describe_speech_voice,
+        encode_voice_clone_sample_data_uri, prepare_speech_format, prepare_speech_options,
     };
 
     let SpeechArgs {
@@ -7596,71 +8714,63 @@ async fn run_speech(config: &Config, args: SpeechArgs) -> Result<()> {
         json: json_output,
     } = args;
 
-    if config.api_provider() != ApiProvider::XiaomiMimo {
+    let identity = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
+    if identity.provider != ProviderKind::XiaomiMimo {
         bail!(
             "`speech` requires provider = \"xiaomi-mimo\" (current: {}). Run with `--provider xiaomi-mimo` or set it in config.",
-            config.api_provider().as_str()
+            identity.key.as_str()
         );
     }
 
     if text.trim().is_empty() {
         bail!("Speech text cannot be empty");
     }
-    let voice_is_data_uri = voice
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| value.starts_with("data:audio/"));
-    if clone_voice.is_some() && voice.is_some() {
-        bail!("Use either --clone-voice or --voice for cloned voice data, not both");
-    }
-    let model = infer_speech_model(
-        model.as_deref(),
-        clone_voice.is_some() || voice_is_data_uri,
-        voice_prompt.is_some(),
-    );
-    let model_lower = model.to_ascii_lowercase();
-    if !model_lower.contains("tts") {
-        bail!(
-            "speech requires a TTS model (examples: {}); got {model}",
-            SPEECH_MODEL_EXAMPLES.join(", ")
-        );
-    }
-    let is_voice_design = model_lower.contains("voicedesign");
-    let is_voice_clone = model_lower.contains("voiceclone");
-
-    let instruction = combine_speech_instructions(instruction, voice_prompt);
-    if is_voice_design
-        && instruction
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-    {
-        bail!(
-            "mimo-v2.5-tts-voicedesign requires --voice-prompt or --instruction to describe the voice"
-        );
-    }
-
-    let voice = if let Some(clone_path) = clone_voice {
-        Some(encode_voice_clone_sample_data_uri(&clone_path)?)
-    } else if is_voice_design {
-        None
-    } else if let Some(value) = voice.filter(|value| !value.trim().is_empty()) {
-        Some(value)
-    } else if is_voice_clone {
-        bail!("mimo-v2.5-tts-voiceclone requires --clone-voice <mp3|wav> or --voice <data-uri>");
-    } else {
-        Some(DEFAULT_VOICE.to_string())
+    let features = config.features();
+    let workspace = std::env::current_dir()?;
+    let context = crate::tools::spec::ToolContext::new(workspace).with_features(features);
+    let adapter_error = |error| match error {
+        crate::tools::spec::ToolError::InvalidInput { message } => anyhow::anyhow!(message),
+        error => anyhow::anyhow!(error),
     };
-    let format = normalize_speech_format(&format).with_context(|| {
-        format!("Unsupported speech format '{format}' (allowed: wav, mp3, pcm16)")
-    })?;
+    let plan = prepare_speech_options(
+        SpeechPreparation {
+            model: model.as_deref(),
+            voice: voice.as_deref(),
+            instruction,
+            voice_prompt,
+            has_clone_path: clone_voice.is_some(),
+            surface: SpeechSurface::Cli,
+        },
+        &context,
+    )
+    .await
+    .map_err(adapter_error)?;
+    let model = plan.model;
+    let instruction = plan.instruction;
+    // Clone sample/voice data stays inside the existing Core/provider path.
+    let voice = match plan.voice {
+        SpeechVoice::Clone => Some(encode_voice_clone_sample_data_uri(
+            clone_voice
+                .as_deref()
+                .context("speech adapter requested an uncaptured clone sample")?,
+        )?),
+        SpeechVoice::Omit => None,
+        SpeechVoice::Raw => Some(voice.context("speech adapter requested an uncaptured voice")?),
+        SpeechVoice::Default => Some(DEFAULT_VOICE.to_string()),
+    };
+    let format = prepare_speech_format(&format, SpeechSurface::Cli, &context)
+        .await
+        .map_err(adapter_error)?;
     let output = output.unwrap_or_else(|| {
         output_dir
             .or_else(|| config.speech_output_dir())
             .unwrap_or_default()
-            .join(default_speech_output_name(&format))
+            .join(format!("speech.{format}"))
     });
 
-    let client = DeepSeekClient::new(config)?;
+    let client = CodewhaleClient::new(config)?;
     let response = client
         .synthesize_speech(SpeechSynthesisRequest {
             model: model.clone(),
@@ -7672,10 +8782,12 @@ async fn run_speech(config: &Config, args: SpeechArgs) -> Result<()> {
         .await?;
 
     if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
     }
-    std::fs::write(&output, &response.audio_bytes)
+    tokio::fs::write(&output, &response.audio_bytes)
+        .await
         .with_context(|| format!("Failed to write audio file {}", output.display()))?;
 
     if json_output {
@@ -7704,6 +8816,10 @@ async fn run_speech(config: &Config, args: SpeechArgs) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/speech_host_cli.rs"]
+mod speech_host_cli_tests;
 
 #[cfg(test)]
 mod speech_cli_tests {
@@ -7768,10 +8884,10 @@ mod speech_cli_tests {
 
 /// Test API connectivity by making a minimal request
 async fn test_api_connectivity(config: &Config) -> Result<()> {
-    use crate::client::DeepSeekClient;
-    use crate::models::{ContentBlock, Message, MessageRequest};
+    use crate::client::CodewhaleClient;
+    use codewhale_models::{ContentBlock, Message, MessageRequest};
 
-    let client = DeepSeekClient::new(config)?;
+    let client = CodewhaleClient::new(config)?;
     let model = client.model().to_string();
 
     if crate::doctor::is_keyless_ds4_route(config) {
@@ -7815,7 +8931,7 @@ fn rustc_version() -> String {
     // banner as a side effect of the probe; reuse it instead of launching a
     // second rustc process (each launch loads libLLVM).
     if !crate::dependencies::RustC::available() {
-        return "unknown".to_string();
+        return "not installed (only needed to build from source)".to_string();
     }
     crate::dependencies::rustc_version_banner().unwrap_or_else(|| "unknown".to_string())
 }
@@ -7825,8 +8941,163 @@ fn sessions_resume_command() -> &'static str {
     "codewhale resume"
 }
 
+/// Newest files per category (sessions/checkpoints and Runtime receipts) inspected;
+/// `codewhale sessions scrub-secrets` covers every file.
+const DOCTOR_SECRET_SCAN_FILES: usize = 50;
+
+/// B1 finding: sessions written before tool output was redacted at the
+/// transcript boundary can still hold live credentials. Report, never
+/// rewrite — scrubbing is the explicit `scrub-secrets` command. Doctor is a
+/// read-only diagnostic, so this resolves the sessions directory with the
+/// read-path resolver: it never creates the home or migrates a legacy tree.
+async fn print_doctor_stored_secrets_report(config_path: Option<PathBuf>, profile: Option<String>) {
+    use colored::Colorize;
+
+    let scan = tokio::task::spawn_blocking(move || -> Result<_> {
+        let sessions_dir = codewhale_config::resolve_state_dir("sessions")?;
+        let runtime = runtime_threads::RuntimeThreadManagerConfig::from_task_data_dir(
+            task_manager::default_tasks_dir(),
+        );
+        let mut unreadable = Vec::new();
+        let files =
+            session_secret_scrub::session_files(&sessions_dir, &runtime.data_dir, &mut unreadable);
+        let total = files.len();
+        let checked = session_secret_scrub::doctor_files(files, DOCTOR_SECRET_SCAN_FILES);
+        let secrets = session_secret_scrub::configured_secrets(config_path, profile.as_deref())?;
+        let mut report = session_secret_scrub::scrub_files(&checked, None, &secrets)?;
+        report.unreadable.extend(unreadable);
+        Ok((report, total))
+    })
+    .await;
+    println!();
+    println!("{}", "Stored Sessions:".bold());
+    match scan {
+        Ok(Ok((report, total))) => println!("{}", doctor_stored_secrets_summary(&report, total)),
+        _ => println!("  ! stored credential scan could not be completed"),
+    }
+}
+
+fn doctor_stored_secrets_summary(
+    report: &session_secret_scrub::ScrubReport,
+    total: usize,
+) -> String {
+    let scope = if total > report.files_scanned {
+        format!(
+            "{} of {total}; newest up to {DOCTOR_SECRET_SCAN_FILES} per category: sessions/checkpoints and Runtime receipts",
+            report.files_scanned
+        )
+    } else {
+        format!("{total}")
+    };
+    let mut lines = Vec::new();
+    if report.flagged_files.is_empty() && report.unreadable.is_empty() {
+        lines.push(format!(
+            "  ✓ no credentials found in stored tool output ({scope} files)"
+        ));
+    }
+    if !report.flagged_files.is_empty() {
+        lines.push(format!(
+            "  ✗ {} files hold credentials in stored tool output ({scope} checked)",
+            report.flagged_files.len()
+        ));
+        lines.push(format!(
+            "    fix: `{}` to review, then `--apply` to mask them; rotate any exposed credential",
+            session_secret_scrub::SCRUB_COMMAND
+        ));
+    }
+    if !report.unreadable.is_empty() {
+        lines.push(format!(
+            "  ! scan incomplete: {} files or directories could not be read or parsed ({scope} checked)",
+            report.unreadable.len()
+        ));
+        for path in &report.unreadable {
+            lines.push(format!("    {}", path.display()));
+        }
+    }
+    lines.join("\n")
+}
+
+async fn run_sessions_scrub_secrets(
+    apply: bool,
+    config_path: Option<PathBuf>,
+    profile: Option<String>,
+) -> Result<()> {
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        run_sessions_scrub_secrets_blocking(apply, config_path, profile.as_deref())
+    })
+    .await?
+}
+
+fn run_sessions_scrub_secrets_blocking(
+    apply: bool,
+    config_path: Option<PathBuf>,
+    profile: Option<&str>,
+) -> Result<()> {
+    let manager = session_manager::SessionManager::default_location()?;
+    let runtime = runtime_threads::RuntimeThreadManagerConfig::from_task_data_dir(
+        task_manager::default_tasks_dir(),
+    );
+    let mut unreadable = Vec::new();
+    let files = session_secret_scrub::session_files(
+        manager.sessions_dir(),
+        &runtime.data_dir,
+        &mut unreadable,
+    );
+    let secrets = session_secret_scrub::configured_secrets(config_path, profile)?;
+    let mut report =
+        session_secret_scrub::scrub_files(&files, apply.then_some(&manager), &secrets)?;
+    report.unreadable.extend(unreadable);
+    let affected = report.flagged_files.len();
+    if affected == 0 && report.unreadable.is_empty() && report.busy.is_empty() {
+        println!(
+            "No stored credentials found in tool output across {} files.",
+            report.files_scanned
+        );
+    } else if affected > 0 {
+        let verb = if apply { "Scrubbed" } else { "Found" };
+        println!(
+            "{verb} {} credential-bearing tool results in {affected} of {} session files:",
+            report.flagged_tool_results, report.files_scanned
+        );
+        for path in &report.flagged_files {
+            println!("  {}", path.display());
+        }
+        if !apply {
+            println!(
+                "Re-run with `{} --apply` to mask them (close open Codewhale sessions first). \
+                 Rotate any credential that was exposed: redaction cannot un-leak it.",
+                session_secret_scrub::SCRUB_COMMAND
+            );
+        }
+    }
+    if !report.unreadable.is_empty() {
+        println!(
+            "{} files or directories could not be read or parsed and were left untouched.",
+            report.unreadable.len()
+        );
+        for path in &report.unreadable {
+            println!("  {}", path.display());
+        }
+    }
+    if !report.busy.is_empty() {
+        println!(
+            "{} credential-bearing files were skipped because their session or Runtime store is open. Close the session or Runtime server and re-run `{} --apply`:",
+            report.busy.len(),
+            session_secret_scrub::SCRUB_COMMAND
+        );
+        for path in &report.busy {
+            println!("  {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
-    use crate::palette;
+    use codewhale_palette as palette;
     use colored::Colorize;
     use session_manager::{SessionManager, format_session_line};
 
@@ -7893,9 +9164,80 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Export one saved session as a full-fidelity `tar.xz` archive
+/// (`session_export`). Prefers an exact session id; falls back to an
+/// unambiguous id prefix like the resume flow.
+fn run_sessions_export(
+    id: &str,
+    output: Option<&Path>,
+    skip_artifacts: bool,
+    compression: u32,
+    force: bool,
+) -> Result<()> {
+    use session_export::{SessionArchiveOptions, default_archive_file_name, write_session_archive};
+
+    let manager = SessionManager::default_location()?;
+    let session = match manager.load_session_snapshot(id) {
+        Ok(session) => session,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            manager.load_session_snapshot(&manager.resolve_session_id_prefix(id)?)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let output_path = output.map_or_else(
+        || PathBuf::from(default_archive_file_name(&session.metadata)),
+        Path::to_path_buf,
+    );
+    let summary = write_session_archive(
+        &session,
+        Some(manager.sessions_dir()),
+        &output_path,
+        SessionArchiveOptions {
+            include_artifacts: !skip_artifacts,
+            compression_level: compression,
+            overwrite: force,
+        },
+    )?;
+
+    use codewhale_localization::{MessageId, resolve_locale, tr};
+    let settings = crate::settings::Settings::load_read_only().unwrap_or_default();
+    let locale = resolve_locale(&settings.locale);
+    println!(
+        "{} {} → {}",
+        tr(locale, MessageId::SessionArchiveExported),
+        truncate_id(&session.metadata.id),
+        summary.output.display()
+    );
+    println!(
+        "  {}: {} / {} / {}",
+        tr(locale, MessageId::SessionArchiveSizes),
+        summary.members.len(),
+        format_bytes(summary.total_member_bytes()),
+        format_bytes(summary.compressed_bytes())
+    );
+    if !summary.includes_artifacts && !skip_artifacts {
+        println!("  {}", tr(locale, MessageId::SessionArchiveNoArtifacts));
+    }
+    println!("  {}", tr(locale, MessageId::SessionArchiveRestoreHint));
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= KIB * KIB {
+        format!("{:.1} MiB", bytes / (KIB * KIB))
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Initialize a new project with AGENTS.md
 fn init_project() -> Result<()> {
-    use crate::palette;
+    use codewhale_palette as palette;
     use colored::Colorize;
     use project_context::create_default_agents_md;
 
@@ -7944,6 +9286,34 @@ fn resolve_workspace(cli: &Cli) -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// Activate facts only at accepted inference runtime settings boundaries.
+/// Identical settings preserve the shared ticket; readers track its generation.
+pub(crate) fn initialize_cloud_facts(config: &Config) {
+    let settings = config.cloud_facts_config().settings();
+    codewhale_cloud_facts::configure(&settings);
+    codewhale_cloud_facts::maybe_load_persisted_cache(&settings);
+    if tokio::runtime::Handle::try_current().is_ok() {
+        codewhale_cloud_facts::spawn_background_refresh(settings, None);
+    }
+}
+
+async fn plugin_auth_entry_from_cli(
+    cli: &Cli,
+    provider: &str,
+) -> Result<crate::config::ProviderConfig> {
+    let path = cli.config.clone();
+    let profile = effective_config_profile(cli);
+    let options = cli.options.clone();
+    let provider = provider.to_owned();
+    let policy = crate::plugins::activation::extension_host_policy_enabled();
+    tokio::task::spawn_blocking(move || {
+        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+        let config = load_config_with_cli_preferences(path, profile.as_deref(), &options)?;
+        crate::plugins::providers::plugin_auth_entry(&config, &provider)
+    })
+    .await?
+}
+
 fn load_config_from_cli(cli: &Cli) -> Result<Config> {
     load_config_from_cli_with_effective_profile(cli).map(|(config, _)| config)
 }
@@ -7965,8 +9335,39 @@ fn load_structural_config_from_cli(cli: &Cli) -> Result<Config> {
     if let Ok(settings) = crate::settings::Settings::load_read_only() {
         apply_saved_reasoning_preference(&mut config, &settings);
     }
-    cli.feature_toggles.apply(&mut config)?;
+    cli.options.apply_features(&mut config)?;
+    install_extension_host_boot_config(&config);
     Ok(config)
+}
+
+/// Select the plugin activation policy (v5, or v6 with the experimental
+/// extension host) and the host's runtime settings, once per process, before
+/// any plugin discovery. Later config reloads never flip either.
+fn install_extension_host_boot_config(config: &Config) {
+    let enabled = config
+        .features()
+        .enabled(crate::features::Feature::ExtensionHost);
+    crate::plugins::activation::install_extension_host_policy(enabled);
+    // Builtin MCP uses the configured runtime without enabling Native plugins.
+    // Configuration is lazy: it does not start an unused host.
+    crate::extension_host::configure_with_handle(
+        crate::extension_host::ExtensionHostOptions::from_config(config.extension_host.as_ref()),
+        tokio::runtime::Handle::try_current().ok(),
+    );
+    if enabled {
+        // The host asks the command table whether a built-in command answers
+        // to a name before it admits an extension command; without this it
+        // refuses every extension command.
+        crate::extension_host::command::install_builtin_commands(std::sync::Arc::new(
+            crate::commands::BuiltinCommandNames,
+        ));
+        // Per-plugin settings (`[plugins."<name>".config]`) and the file
+        // `/plugin reload` re-reads them from.
+        crate::extension_host::install_plugin_settings(
+            config.plugins.as_ref(),
+            config.loaded_config_path.clone(),
+        );
+    }
 }
 
 fn effective_config_profile(cli: &Cli) -> Option<String> {
@@ -7978,20 +9379,31 @@ fn effective_config_profile(cli: &Cli) -> Option<String> {
 
 fn load_config_from_cli_with_effective_profile(cli: &Cli) -> Result<(Config, Option<String>)> {
     let profile = effective_config_profile(cli);
-    let mut config = Config::load(cli.config.clone(), profile.as_deref())?;
+    let config =
+        load_config_with_cli_preferences(cli.config.clone(), profile.as_deref(), &cli.options)?;
+    Ok((config, profile))
+}
+
+fn load_config_with_cli_preferences(
+    path: Option<PathBuf>,
+    profile: Option<&str>,
+    options: &RuntimeOptions,
+) -> Result<Config> {
+    let mut config = Config::load(path, profile)?;
     // Config loading is shared by diagnostics and mutating runtimes. Read the
     // saved preference without migrating or creating state here; interactive
     // startup performs any permitted migration later through `Settings::load`.
     if let Ok(settings) = crate::settings::Settings::load_read_only() {
         apply_saved_reasoning_preference(&mut config, &settings);
     }
-    cli.feature_toggles.apply(&mut config)?;
+    options.apply_features(&mut config)?;
+    install_extension_host_boot_config(&config);
     // Install the foreign-instruction opt-in before anything can load project
     // context. This is the single funnel every runtime goes through — TUI,
     // exec, ACP, and the app-server passthrough all resolve config here — so
     // the loader never has to be handed the setting at each of its call sites.
     install_foreign_instruction_imports(&config);
-    Ok((config, profile))
+    Ok(config)
 }
 
 /// Apply the selected v2 Fleet's operator to a fresh root session.
@@ -8142,30 +9554,110 @@ fn run_logout() -> Result<()> {
 }
 
 async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
-    let pending = xai_oauth::device_code_login().await?;
-    let activation = xai_oauth::activate_device_login(pending, config_path, None)?;
+    let pending = crate::oauth::login(crate::oauth::OAuthProvider::Xai).await?;
+    let activation = crate::oauth::activate_login(pending, config_path, None)?;
+    println!("{}", activation.summary(codewhale_localization::Locale::En));
     println!(
         "xAI OAuth is ready; activated {} via {}",
         codewhale_config::quote_os_path(&activation.auth_path),
         codewhale_config::quote_os_path(&activation.config_path)
     );
+    println!(
+        "To switch accounts later, run `codewhale auth xai-device` again (or `/auth xai-device` in Codewhale) and approve with the other account. Restart open Codewhale sessions after a shell login."
+    );
     Ok(())
 }
 
 async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
-    let pending = chatgpt_oauth::pkce_login().await?;
-    let activation = chatgpt_oauth::activate_pkce_login(pending, config_path, None)?;
+    let config = Config::load(config_path.map(Path::to_path_buf), None)?;
+    let pending =
+        crate::oauth::login_with_config(crate::oauth::OAuthProvider::Chatgpt, &config).await?;
+    let activation = crate::oauth::activate_login(pending, config_path, None)?;
+    println!("{}", activation.summary(codewhale_localization::Locale::En));
+    if let Some(warning) = activation.env_override_warning(codewhale_localization::Locale::En) {
+        println!("{warning}");
+    }
     println!(
         "ChatGPT OAuth is ready; activated {} via {}",
         codewhale_config::quote_os_path(&activation.auth_path),
         codewhale_config::quote_os_path(&activation.config_path)
     );
+    println!(
+        "To switch ChatGPT accounts or workspaces, run `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt` in a shell and restart open Codewhale sessions. `/auth chatgpt` reauthorizes the selected account."
+    );
+    let mut selected = Config::load(config_path.map(Path::to_path_buf), None)?;
+    selected.provider = Some(config::ProviderKind::OpenaiCodex.as_str().to_string());
+    match crate::codex_model_cache::update_from_chatgpt(&selected).await {
+        Ok(roster) => println!(
+            "{} ChatGPT models available. Use `codewhale models --provider openai-codex` to list them.",
+            roster.models.len()
+        ),
+        Err(_) => println!(
+            "Sign-in is saved. Model discovery is unavailable; retry `codewhale models --update --provider openai-codex`."
+        ),
+    }
     Ok(())
 }
 
 fn run_chatgpt_pkce_revoke(config_path: Option<&Path>) -> Result<()> {
-    chatgpt_oauth::revoke_owned_login(config_path, None)?;
-    println!("Revoked Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.");
+    crate::oauth::revoke_owned_login(crate::oauth::OAuthProvider::Chatgpt, config_path, None)?;
+    println!("Removed Codewhale's saved ChatGPT sign-in.");
+    Ok(())
+}
+
+/// OrcaRouter account sign-in: OAuth 2.0 + PKCE on a loopback redirect,
+/// exchanged for a durable `sk-orca-...` key.
+///
+/// This is the "OrcaRouter - Auth" entry point. It never replaces the
+/// API-key path (`codewhale auth set --provider orcarouter`); both land in the
+/// same credential slot and are independently usable.
+async fn run_orcarouter_pkce_auth(config_path: Option<&Path>) -> Result<()> {
+    let inputs = crate::oauth::OrcaLoginInputs::from_env();
+    if inputs.auth_base == crate::oauth::ORCAROUTER_AUTH_BASE
+        && std::env::var_os("ORCA_AUTH_BASE_URL").is_none()
+    {
+        println!(
+            "Signing in to OrcaRouter at {} (consent is granted on the OrcaRouter site).",
+            crate::oauth::ORCAROUTER_AUTH_BASE
+        );
+    }
+    let api_base = inputs.api_base.clone();
+    if api_base != crate::oauth::ORCAROUTER_API_BASE {
+        println!("OrcaRouter inference and model discovery will use {api_base}.");
+    }
+    let mut challenge = crate::oauth::cli_challenge_writer()?;
+    let credential = tokio::task::spawn_blocking(move || {
+        crate::oauth::orcarouter_pkce_login(&inputs, challenge.as_mut())
+    })
+    .await
+    .context("OrcaRouter PKCE login worker failed")??;
+    let saved = crate::oauth::activate_orcarouter_credential(&credential, config_path)?;
+    println!(
+        "OrcaRouter is ready; stored the key in {}",
+        saved.describe()
+    );
+    if !credential.scope_satisfies_purpose() {
+        println!(
+            "Note: OrcaRouter granted scope \"{}\"; this client asked for \"{}\". The narrower grant is reused as-is.",
+            credential.granted_scope(),
+            crate::oauth::ORCAROUTER_SCOPE
+        );
+    }
+    println!(
+        "Revoke access any time at https://www.orcarouter.ai/console/authorized-apps. To switch accounts, run `codewhale auth orcarouter` again."
+    );
+    Ok(())
+}
+
+/// Clear the saved OrcaRouter credential from the secret store and config.
+fn run_orcarouter_revoke(config_path: Option<&Path>) -> Result<()> {
+    let mut store = codewhale_config::ConfigStore::load(config_path.map(Path::to_path_buf))?;
+    let Some(secrets) = crate::config::credential_secret_store() else {
+        anyhow::bail!("no credential store is available in this environment");
+    };
+    let provider = codewhale_config::ProviderKind::Orcarouter;
+    codewhale_config::credentials::clear_provider_api_key(&mut store, &secrets, provider)?;
+    println!("Removed Codewhale's saved OrcaRouter credential.");
     Ok(())
 }
 
@@ -8191,76 +9683,320 @@ fn latest_session_id_for_workspace(workspace: &Path) -> std::io::Result<Option<S
         .map(|session| session.id))
 }
 
-fn fork_session(
-    config: &Config,
-    session_id: Option<String>,
-    last: bool,
-    workspace: &Path,
-) -> Result<String> {
-    let manager = SessionManager::default_location()?;
-    let saved = if last {
-        let Some(meta) = manager.get_latest_session_for_workspace(workspace)? else {
-            bail!(
-                "No saved sessions found for workspace {}.",
-                workspace.display()
-            );
-        };
-        manager.load_session(&meta.id)?
-    } else {
-        let id = resolve_session_id(session_id, false, workspace)?;
-        manager.load_session_by_prefix(&id)?
+/// A local mounted intent uses the same durable owner operation as HTTP. It
+/// acquires only an inactive store, drains it, then lets the existing UI/session
+/// leases acquire that exact binding. A live owner or a handoff race refuses;
+/// no remote UI transport or parallel autosave writer is introduced here.
+#[derive(Clone, Copy)]
+enum MountedHistoryIntent {
+    Resume,
+    Fork,
+}
+
+async fn prepare_mounted_session(
+    cli: &Cli,
+    mut prepared: PreparedInteractiveConfig,
+    selector: String,
+    intent: MountedHistoryIntent,
+    plugins: Arc<crate::plugins::PluginRegistry>,
+) -> Result<(PreparedInteractiveConfig, String)> {
+    use crate::runtime_api::thread_history::{
+        history_owner_work, lookup_thread_history_operation_in_runtime,
+        mutate_thread_history_in_runtime, recover_thread_history_operation_in_runtime,
+        saved_document_digest, session_goal_digest,
     };
-    let saved_provider_identity = saved
-        .metadata
-        .model_provider_id
-        .as_deref()
-        .filter(|identity| !identity.trim().is_empty())
-        .unwrap_or(&saved.metadata.model_provider);
-    let provider_identity = config
+    use crate::runtime_threads::{RuntimeThreadManager, RuntimeThreadManagerConfig};
+    use codewhale_protocol::{
+        CanonicalHistoryOptions, CanonicalHistorySource, CanonicalThreadMutation,
+        CanonicalThreadMutationRequest, CanonicalThreadOperationKind,
+        CanonicalThreadOperationLookup, CanonicalThreadOperationRecovery,
+        CanonicalThreadOperationStatus, MAX_CANONICAL_HISTORY_BYTES,
+    };
+
+    if let Some(key) = cli.operation_key.as_ref() {
+        anyhow::ensure!(
+            !key.is_empty() && key.len() <= 128 && !key.chars().any(char::is_control),
+            "invalid retained canonical operation key; no mutation was attempted"
+        );
+    }
+    let sessions_dir = crate::session_manager::default_sessions_dir()?;
+    let read_dir = sessions_dir.clone();
+    let selection_workspace = prepared.workspace.clone();
+    let (saved, source_digest, source_goal_digest) = history_owner_work(move || {
+        let manager = SessionManager::new(read_dir)?;
+        let id = if selector == "latest" {
+            manager
+                .get_latest_session_for_workspace(&selection_workspace)?
+                .ok_or_else(|| anyhow!("No saved sessions found for this workspace"))?
+                .id
+        } else {
+            manager.resolve_session_id_prefix(&selector)?
+        };
+        // Capture the complete document and separate local goal under the
+        // same existing inactive-session guard; neither read repairs history.
+        let _source_lease = manager.reserve_session_for_external_write(&id)?;
+        let saved = manager.load_session_snapshot_bounded(&id, MAX_CANONICAL_HISTORY_BYTES)?;
+        // Project grants were captured for this launch before awaiting. The
+        // existing restore changes App workspace, so it cannot silently apply
+        // that snapshot to a different saved project. Match the same physical/
+        // config equality used by workspace overlays without changing either
+        // selected lexical path or merging a second project after the await.
+        let launch_scope = selection_workspace.canonicalize().unwrap_or_else(|_| selection_workspace.clone());
+        let saved_scope = saved.metadata.workspace.canonicalize().unwrap_or_else(|_| saved.metadata.workspace.clone());
+        anyhow::ensure!(
+            paths_equal_for_config(&launch_scope, &saved_scope),
+            "selected session belongs to workspace {}; captured launch project differs; retry with --workspace {} before any canonical operation",
+            saved.metadata.workspace.display(), saved.metadata.workspace.display(),
+        );
+        let digest = saved_document_digest(&saved)?;
+        if let Some(binding) = saved.metadata.runtime_store.as_ref() {
+            // Never let open_for_session recover a missing saved store here:
+            // an empty replacement cannot prove the original durable history.
+            binding.validate_existing_store()?;
+        }
+        let goal_digest = session_goal_digest(&manager.load_session_goal(&id)?)?;
+        Ok((saved, digest, goal_digest))
+    })
+    .await
+    .with_context(|| {
+        cli.operation_key.as_ref().map_or_else(
+            || "selected saved history could not be captured; no mutation attempted".to_string(),
+            |key| {
+                format!("retained operation {key}; source selection failed; no mutation attempted")
+            },
+        )
+    })?;
+    let source_id = saved.metadata.id.clone();
+    let source_title = saved.metadata.title.clone();
+    if cli.operation_key.is_none() {
+        let identity = prepared
+            .config
+            .resolve_persisted_provider_identity(
+                Some(&saved.metadata.model_provider),
+                saved.metadata.model_provider_id.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        // Same exact route projection as mounted restore; policy and credentials
+        // come only from this already captured merged Config.
+        let route = crate::route_runtime::resolve_runtime_route_for_identity(
+            &prepared.config,
+            &identity,
+            Some(&saved.metadata.model),
+        )
+        .map_err(anyhow::Error::msg)?;
+        prepared.config = *route.config;
+    }
+    let task_config = crate::task_manager::TaskManagerConfig::from_runtime(
+        &prepared.config,
+        saved.metadata.workspace.clone(),
+        Some(saved.metadata.model.clone()),
+        None,
+    );
+    let manager_config = RuntimeThreadManagerConfig::for_session(task_config.data_dir, &source_id);
+    let owner_config = prepared.config.clone();
+    let owner_workspace = saved.metadata.workspace.clone();
+    let prior_binding = saved.metadata.runtime_store.clone();
+    let recovery = cli.operation_key.is_some();
+    let runtime = history_owner_work(move || {
+        // Recheck the captured binding immediately before the actual factory.
+        if let Some(binding) = prior_binding.as_ref() {
+            binding.validate_existing_store()?;
+        }
+        match prior_binding.as_ref() {
+            Some(binding) => RuntimeThreadManager::open_existing_session(
+                owner_config,
+                owner_workspace,
+                manager_config,
+                plugins,
+                binding,
+            ),
+            None if recovery => RuntimeThreadManager::open_existing_session_unbound(
+                owner_config,
+                owner_workspace,
+                manager_config,
+                plugins,
+            ),
+            None => RuntimeThreadManager::open_for_session(
+                owner_config,
+                owner_workspace,
+                manager_config,
+                plugins,
+                None,
+            ),
+        }
+        .map(Arc::new)
+    })
+    .await
+    .with_context(|| cli.operation_key.as_ref().map_or_else(
+        || "inactive canonical owner could not be acquired; no history mutation attempted".to_string(),
+        |key| format!("retained operation {key}; existing owner could not be acquired; no mutation attempted"),
+    ))?;
+    let binding = runtime.session_store_binding();
+    let operation_key = cli
+        .operation_key
+        .clone()
+        .unwrap_or_else(|| format!("mounted-history:{}", uuid::Uuid::new_v4()));
+    let profile = effective_config_profile(cli);
+    let selected_workspace = saved.metadata.workspace.clone();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        if recovery {
+            // Lookup uses only the retained key, before a current document can
+            // be proposed as a different request. This lookup only verifies
+            // the historical outcome; explicit prepared recovery follows below.
+            let lookup = CanonicalThreadOperationLookup {
+                version: 1, operation_key: operation_key.clone(),
+                expected_data_dir: binding.data_dir.clone(),
+                expected_execution_scope: binding.execution_scope.clone(),
+                workspace: selected_workspace.clone(),
+            };
+            let mut status = lookup_thread_history_operation_in_runtime(
+                &runtime, &sessions_dir, lookup.clone(),
+            ).await?;
+            if let CanonicalThreadOperationStatus::Pending { receipt, association } = &status {
+                let expected_kind = match intent {
+                    MountedHistoryIntent::Resume => CanonicalThreadOperationKind::Resume,
+                    MountedHistoryIntent::Fork => CanonicalThreadOperationKind::Fork,
+                };
+                anyhow::ensure!(
+                    association.kind == expected_kind
+                        && association.source_session_id.as_deref() == Some(source_id.as_str()),
+                    "retained operation {operation_key} targets thread {} / session {}, but its original action/source does not match this selected intent; no recovery or automatic attach",
+                    receipt.runtime_thread_id, receipt.session_id,
+                );
+                // An explicit retained-key invocation may finish only that
+                // already-prepared owner operation. No current source/body is
+                // proposed, and the owner rechecks the complete association.
+                status = recover_thread_history_operation_in_runtime(
+                    &runtime, &sessions_dir,
+                    CanonicalThreadOperationRecovery {
+                        operation: lookup, association: association.clone(),
+                    },
+                ).await?;
+            }
+            match status {
+                CanonicalThreadOperationStatus::Committed { receipt, association } => {
+                    let expected_kind = match intent {
+                        MountedHistoryIntent::Resume => CanonicalThreadOperationKind::Resume,
+                        MountedHistoryIntent::Fork => CanonicalThreadOperationKind::Fork,
+                    };
+                    anyhow::ensure!(
+                        association.kind == expected_kind
+                            && association.source_session_id.as_deref() == Some(source_id.as_str()),
+                        "retained operation {operation_key} targets thread {} / session {}, but its original action/source does not match this selected intent; no automatic attach",
+                        receipt.runtime_thread_id, receipt.session_id,
+                    );
+                    Ok(receipt)
+                }
+                CanonicalThreadOperationStatus::Pending { receipt, .. } => bail!(
+                    "retained operation {operation_key} is pending for thread {} / session {}; outcome remains uncertain; no new intent or automatic attach",
+                    receipt.runtime_thread_id, receipt.session_id,
+                ),
+                CanonicalThreadOperationStatus::Absent => bail!(
+                    "retained operation {operation_key} is absent from this exact owner; no mutation or new identity was attempted"
+                ),
+            }
+        } else {
+            let source = CanonicalHistorySource::SavedSession {
+                session: serde_json::to_value(&saved)?,
+                expected_document_digest: source_digest,
+            };
+            let options = CanonicalHistoryOptions {
+                expected_session_goal_digest: Some(source_goal_digest),
+                ..Default::default()
+            };
+            let mutation = match intent {
+                MountedHistoryIntent::Resume => CanonicalThreadMutation::Resume { source, options },
+                MountedHistoryIntent::Fork => CanonicalThreadMutation::Fork { source, selected_entry_id: None, options },
+            };
+            mutate_thread_history_in_runtime(
+                &runtime, &sessions_dir, cli.config.as_deref(), profile.as_deref(),
+                CanonicalThreadMutationRequest {
+                    version: 1, operation_key: operation_key.clone(),
+                    expected_data_dir: binding.data_dir.clone(),
+                    expected_execution_scope: binding.execution_scope.clone(),
+                    workspace: selected_workspace.clone(), mutation,
+                },
+            ).await
+        }
+    }).await.context("canonical history deadline expired; outcome uncertain")
+        .and_then(|result| result);
+    let shutdown = tokio::time::timeout(Duration::from_secs(30), runtime.shutdown_and_wait())
+        .await
+        .context("canonical owner shutdown deadline expired; mounted handoff refused")
+        .and_then(|result| result);
+    drop(runtime);
+    let receipt = match (outcome, shutdown) {
+        (Ok(receipt), Ok(())) => receipt,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error).with_context(|| {
+            format!("canonical history operation {operation_key}; retained outcome must be recovered using this exact key")
+        }),
+        (Err(error), Err(shutdown)) => return Err(error).with_context(|| {
+            format!("canonical history operation {operation_key}; retained outcome may be uncertain; owner handoff also refused: {shutdown:#}")
+        }),
+    };
+    anyhow::ensure!(
+        receipt.version == 1
+            && receipt.operation_key == operation_key
+            && receipt.data_dir == binding.data_dir
+            && receipt.execution_scope == binding.execution_scope,
+        "canonical history operation {operation_key}: receipt does not match the acquired owner; mounted handoff refused"
+    );
+    let result_id = receipt.session_id.clone();
+    let verify_id = result_id.clone();
+    let committed = history_owner_work(move || {
+        let manager = SessionManager::new(sessions_dir)?;
+        let committed =
+            manager.load_session_snapshot_bounded(&verify_id, MAX_CANONICAL_HISTORY_BYTES)?;
+        anyhow::ensure!(
+            committed.metadata.id == verify_id
+                && committed.metadata.runtime_store.as_ref() == Some(&binding)
+                && committed.metadata.workspace == selected_workspace,
+            "committed saved session lost its exact owner binding; mounted handoff refused"
+        );
+        Ok(committed)
+    })
+    .await
+    .with_context(|| format!("canonical history operation {operation_key}; committed target handoff failed; retain this exact key"))?;
+    let identity = prepared
+        .config
         .resolve_persisted_provider_identity(
-            Some(&saved.metadata.model_provider),
-            saved.metadata.model_provider_id.as_deref(),
+            Some(&committed.metadata.model_provider),
+            committed.metadata.model_provider_id.as_deref(),
         )
         .map_err(anyhow::Error::msg)
         .with_context(|| {
             format!(
-                "saved session provider '{}' is unavailable; fork will not fall back",
-                saved_provider_identity
+                "canonical history operation {operation_key}; committed route admission refused"
             )
         })?;
-
-    let system_prompt = saved
-        .system_prompt
-        .as_ref()
-        .map(|text| SystemPrompt::Text(text.clone()));
-    let mut forked = create_saved_session(
-        &saved.messages,
-        &saved.metadata.model,
-        &saved.metadata.workspace,
-        saved.metadata.total_tokens,
-        system_prompt.as_ref(),
-    );
-    forked.metadata.set_model_provider_route(
-        provider_identity.provider.as_str(),
-        provider_identity.persisted_id(),
-    );
-    forked.metadata.copy_cost_from(&saved.metadata);
-    forked.metadata.mark_forked_from(&saved.metadata);
-    manager.save_session(&forked)?;
-
-    let source_title = saved.metadata.title.trim();
-    let source_label = if source_title.is_empty() {
-        "session".to_string()
-    } else {
-        format!("\"{source_title}\"")
-    };
-    println!(
-        "Forked {source_label} ({source_id}) → new session {new_id}",
-        source_id = truncate_id(&saved.metadata.id),
-        new_id = truncate_id(&forked.metadata.id),
-    );
-
-    Ok(forked.metadata.id)
+    let route = crate::route_runtime::resolve_runtime_route_for_identity(
+        &prepared.config,
+        &identity,
+        Some(&committed.metadata.model),
+    )
+    .map_err(anyhow::Error::msg)
+    .with_context(|| {
+        format!("canonical history operation {operation_key}; committed route projection refused")
+    })?;
+    prepared.config = *route.config;
+    if recovery {
+        println!(
+            "Recovered canonical history operation {operation_key}: thread {} / session {}",
+            receipt.runtime_thread_id, result_id
+        );
+    } else if matches!(intent, MountedHistoryIntent::Fork) {
+        let label = if source_title.trim().is_empty() {
+            "session".to_string()
+        } else {
+            format!("\"{}\"", source_title.trim())
+        };
+        println!(
+            "Forked {label} ({}) → new session {}",
+            truncate_id(&source_id),
+            truncate_id(&result_id)
+        );
+    }
+    Ok((prepared, result_id))
 }
 
 fn pick_session_id() -> Result<String> {
@@ -8293,12 +10029,14 @@ fn pick_session_id() -> Result<String> {
 }
 
 async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
-    use crate::client::DeepSeekClient;
+    initialize_cloud_facts(config);
+    use crate::client::CodewhaleClient;
 
     // Resolved before anything is fetched or billed so an unknown
     // `--provider` fails fast with the provider vocabulary hint.
     let (config, force_configured_route) = review_execution_route(config, &args)?;
     let config = &config;
+    validate_review_receipt_args(&args)?;
 
     if args.pr.is_some() && !is_command_available("gh") {
         bail!(
@@ -8313,161 +10051,480 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
         Some(number) => Some((number, run_gh_pr_view(number, args.repo.as_deref())?)),
         None => None,
     };
-    let diff = collect_diff(&args)?;
+    let diff = collect_diff(
+        &args,
+        pr_view.as_ref().map(|(_, view)| view),
+        &std::env::current_dir()?,
+    )?;
     if diff.trim().is_empty() {
         bail!("No diff to review.");
     }
-    validate_review_receipt_args(&args)?;
     if args.check_receipt {
-        return run_review_receipt_check(&diff, &args);
+        return run_review_receipt_check(&diff, &args, pr_view.as_ref().map(|(_, view)| view));
     }
 
-    let model = resolve_review_model(config, args.model.as_deref());
-    let route = resolve_cli_exec_route(config, &model, &diff, force_configured_route).await?;
-    let execution_config = config_for_cli_route(config, &route);
-    let route_provider = execution_config.provider_identity_for(route.provider);
-    let model = route.model.clone();
-    // PR reviews run under the structured JSON review contract so findings
-    // carry file/line positions that can be posted as inline review comments.
-    let (user_prompt, system) = if let Some((number, view)) = &pr_view {
-        (
-            format_pr_prompt(*number, view, &diff),
-            SystemPrompt::Text(crate::tools::review::review_system_prompt().to_string()),
-        )
+    let pr_plan = pr_view
+        .as_ref()
+        .map(|(_, view)| {
+            crate::tools::review::plan_pr_review(&diff, view, args.max_chars, args.max_passes)
+        })
+        .transpose()?;
+    let review_workspace = std::env::current_dir()?;
+    // A stateless CLI review has no Engine session or Native caller to invent.
+    let review_context =
+        crate::tools::spec::ToolContext::new(&review_workspace).with_features(config.features());
+    // #6510: one review prompt authority. Plain diffs and PRs both ask for
+    // the structured review contract; a plain diff renders it locally.
+    let system = SystemPrompt::Text(crate::tools::review::review_system_prompt().to_string());
+    let prompts = if let (Some((number, view)), Some(plan)) = (&pr_view, &pr_plan) {
+        crate::tools::review_host::pr_prompts(*number, view, plan, &review_context).await?
     } else {
-        (
-            format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff."),
-            SystemPrompt::Text(
-                "You are a senior code reviewer. Focus on bugs, risks, behavioral regressions, and missing tests. \
-Provide findings ordered by severity with file references, then open questions, then a brief summary."
-                    .to_string(),
-            ),
-        )
+        vec![if review_context
+            .features
+            .enabled(crate::features::Feature::ReviewHost)
+        {
+            crate::tools::review_host::cli_prompt(&diff, &review_context).await?
+        } else {
+            format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.")
+        }]
     };
-    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
-        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, &user_prompt)
-    });
-
-    let client = DeepSeekClient::new(&execution_config)?;
+    let model = resolve_review_model(config, args.model.as_deref());
+    let route_input = prompts
+        .iter()
+        .max_by_key(|prompt| prompt.chars().count())
+        .expect("review has at least one prompt");
+    let route = resolve_cli_exec_route(config, &model, route_input, force_configured_route).await?;
+    let execution_config = config_for_cli_route(config, &route)?;
+    let route_provider = execution_config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?
+        .key
+        .to_string();
+    let model = route.model.clone();
+    let client = CodewhaleClient::new(&execution_config)?;
     let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
-    let request = MessageRequest {
-        model: model.clone(),
-        messages: vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: user_prompt,
-                cache_control: None,
-            }],
-        }],
-        max_tokens: client.effective_max_output_tokens(&request_route.model),
-        system: Some(system),
-        tools: None,
-        tool_choice: None,
-        metadata: None,
-        thinking: None,
-        reasoning_effort,
-        stream: Some(false),
-        temperature: None,
-        top_p: None,
+    let planned_passes = prompts.len();
+    let mut usage = codewhale_models::Usage::default();
+    let mut publication = if args.post {
+        ReviewPublication::NotAttempted
+    } else {
+        ReviewPublication::NotRequested
     };
-
-    let response = client.create_message(request).await?;
-    let review_stop_reason = response.stop_reason.clone();
-    let review_incomplete = crate::models::is_incomplete_stop_reason(review_stop_reason.as_deref());
+    let report_failure =
+        |usage: &codewhale_models::Usage, completed_passes, publication, message| {
+            report_review_failure(
+                &args,
+                &route_provider,
+                &model,
+                usage,
+                completed_passes,
+                planned_passes,
+                publication,
+                message,
+            )
+        };
+    let mut accumulator = pr_plan
+        .as_ref()
+        .map(crate::tools::review::PrReviewAccumulator::new);
+    // Visible-text reserve for this exact route/model (#6285). A reasoning route
+    // shares one `max_tokens` allowance between hidden reasoning and visible
+    // text, so the review request has to keep room for the review itself.
+    let review_allowance = client.effective_max_output_tokens(&request_route.model);
+    let review_reserve_percent =
+        crate::route_budget::review_visible_text_reserve_percent(&request_route.model);
+    let review_reserve_tokens = crate::route_budget::review_visible_text_reserve_tokens(
+        &request_route.model,
+        review_allowance,
+    );
     let mut output = String::new();
-    for block in response.content {
-        if let ContentBlock::Text { text, .. } = block {
-            output.push_str(&text);
+    let mut review_stop_reason = None;
+    for (index, user_prompt) in prompts.into_iter().enumerate() {
+        let reasoning_effort = route.reasoning_effort.and_then(|effort| {
+            review_reasoning_effort_value_for_prompt(
+                &execution_config,
+                &model,
+                effort,
+                review_reserve_percent,
+            )
+        });
+        let request = MessageRequest {
+            model: model.clone(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: user_prompt,
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: client.effective_max_output_tokens(&request_route.model),
+            system: Some(system.clone()),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort,
+            stream: Some(false),
+            temperature: None,
+            top_p: None,
+        };
+        let response = match client.create_message(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return report_failure(
+                    &usage,
+                    index,
+                    publication,
+                    format!(
+                        "{}; no partial review was accepted or posted",
+                        crate::tools::review::request_failure_message(
+                            index + 1,
+                            planned_passes,
+                            &error
+                        )
+                    ),
+                );
+            }
+        };
+        crate::tools::review::add_review_usage(&mut usage, &response.usage);
+        review_stop_reason = response.stop_reason.clone();
+        if codewhale_models::is_incomplete_stop_reason(review_stop_reason.as_deref()) {
+            // #6285: budget exhaustion is an infrastructure outcome, not a
+            // review verdict. The PR was never judged, so the message must not
+            // read as findings and must name what was and was not reviewed.
+            let reasoning_tokens = usage
+                .reasoning_tokens
+                .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string());
+            let reserve_clause = if review_reserve_percent == 0 {
+                "no reasoning reserve was needed for this model".to_string()
+            } else {
+                "the pass's reasoning level was capped to fit that reserve".to_string()
+            };
+            return report_failure(
+                &usage,
+                index,
+                publication,
+                format!(
+                    "Review pass {}/{} exhausted its output allowance and produced no review text. This is an infrastructure/budget outcome, not a review result: the provider stopped with reason `{}` after reporting {} of {} requested output tokens as reasoning; this model's review reserve is {} tokens ({review_reserve_percent}% of the allowance) and {reserve_clause}. Coverage: {}. Reviewed so far: {} of {} planned pass(es). The partial review was not accepted or posted.",
+                    index + 1,
+                    planned_passes,
+                    codewhale_models::stop_reason_detail(review_stop_reason.as_deref()),
+                    reasoning_tokens,
+                    review_allowance,
+                    review_reserve_tokens,
+                    pr_review_unreviewed_note(pr_plan.as_ref(), index),
+                    index,
+                    planned_passes,
+                ),
+            );
+        }
+        let mut pass_output = String::new();
+        for block in response.content {
+            if let ContentBlock::Text { text, .. } = block {
+                pass_output.push_str(&text);
+            }
+        }
+        if let (Some(plan), Some(accumulator)) = (&pr_plan, accumulator.as_mut()) {
+            if let Err(error) = accumulator.accept(&plan.passes[index], pass_output) {
+                return report_failure(&usage, index, publication, error.to_string());
+            }
+        } else {
+            output = pass_output;
         }
     }
-    let structured = pr_view
-        .as_ref()
-        .map(|_| crate::tools::review::ReviewOutput::from_str(&output));
-    // A truncated review must not be posted or become a receipt. The partial
-    // text is still printed for diagnostics below.
-    if args.post && !review_incomplete {
-        let (number, view) = pr_view
-            .as_ref()
-            .expect("--post requires --pr (enforced by clap)");
-        let review = structured
-            .as_ref()
-            .expect("structured output exists for PR reviews");
-        post_pr_review(*number, view, args.repo.as_deref(), review, &diff)?;
-    }
-    let receipt = if args.write_receipt && !review_incomplete {
-        let parsed_output = crate::tools::review::ReviewOutput::from_str(&output);
-        let receipt = crate::tools::review::build_review_receipt(
-            review_target_label(&args),
-            &diff,
-            &route_provider,
-            &model,
-            &parsed_output,
+    let (structured, coverage) = if let Some(accumulator) = accumulator {
+        let (review, content, coverage) = match accumulator.finish(&diff) {
+            Ok(complete) => complete,
+            Err(error) => {
+                return report_failure(&usage, planned_passes, publication, error.to_string());
+            }
+        };
+        output = content;
+        (Some(review), Some(coverage))
+    } else {
+        // A plain diff is structured when the model kept the JSON contract;
+        // otherwise its prose is the report, exactly as before.
+        (
+            crate::tools::review::ReviewOutput::from_structured_str(&output),
+            None,
+        )
+    };
+    // Presentation is prepared before publication. Any peer failure retains the
+    // completed provider usage and cannot cause a partial post or Rust fallback.
+    let rendered_report = if args.post || !args.json {
+        let posted = args
+            .post
+            .then(|| pr_view.as_ref().expect("post requires PR"))
+            .map(|(number, view)| (*number, view));
+        match render_review_report_for_context(
+            structured.as_ref(),
             &output,
-            Vec::new(),
-        );
-        let path =
-            crate::tools::review::write_review_receipt(&receipt, args.receipt_path.as_deref())?;
-        Some((path, receipt))
+            posted,
+            &review_context,
+        )
+        .await
+        {
+            Ok(body) => Some(body),
+            Err(error) => {
+                return report_failure(&usage, planned_passes, publication, error.to_string());
+            }
+        }
     } else {
         None
     };
-    let review_error = review_incomplete.then(|| {
-        format!(
-            "Model response incomplete: provider stop reason `{}`; the partial review was not accepted.",
-            crate::models::stop_reason_detail(review_stop_reason.as_deref())
-        )
-    });
+    let finalized = (|| -> Result<_> {
+        if let Some((number, view)) = &pr_view {
+            let cwd = std::env::current_dir().context(
+                "Failed to resolve the current directory before final PR revision check",
+            )?;
+            crate::tools::review_pr::ensure_current(*number, args.repo.as_deref(), &cwd, view)?;
+        }
+        if args.post {
+            let (number, view) = pr_view
+                .as_ref()
+                .expect("--post requires --pr (enforced by clap)");
+            let review = structured
+                .as_ref()
+                .expect("structured output exists for PR reviews");
+            post_pr_review(
+                *number,
+                view,
+                args.repo.as_deref(),
+                review,
+                &diff,
+                rendered_report
+                    .as_deref()
+                    .expect("posted review has prepared body"),
+                &mut publication,
+            )
+            .context("PR review publication failed")?;
+        }
+        let receipt = if args.write_receipt {
+            let parsed_output = structured
+                .clone()
+                .unwrap_or_else(|| crate::tools::review::ReviewOutput::from_str(&output));
+            let mut receipt = crate::tools::review::build_review_receipt(
+                review_target_label(&args),
+                &diff,
+                &route_provider,
+                &model,
+                &parsed_output,
+                &output,
+                Vec::new(),
+            );
+            if let Some(coverage) = coverage {
+                crate::tools::review::attach_pr_review_coverage(&mut receipt, coverage)
+                    .context("Failed to attach PR coverage to review receipt")?;
+            }
+            let path =
+                crate::tools::review::write_review_receipt(&receipt, args.receipt_path.as_deref())
+                    .context("Failed to write review receipt")?;
+            Some((path, receipt))
+        } else {
+            None
+        };
+        Ok(receipt)
+    })();
+    let receipt = match finalized {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return report_failure(&usage, planned_passes, publication, error.to_string());
+        }
+    };
+    if args.json {
+        let payload = serde_json::json!({
+            "mode": "review",
+            "provider": route_provider,
+            "model": model,
+            "success": true,
+            "publication": publication.as_str(),
+            "content": output,
+            "pr": pr_view.as_ref().map(|(number, view)| serde_json::json!({
+                "number": number,
+                "url": view.url,
+                "title": view.title,
+                "head_sha": view.head_sha,
+            })),
+            "review": structured,
+            "stop_reason": review_stop_reason,
+            "usage": usage,
+            "review_passes": pr_plan.as_ref().map(|plan| plan.passes.len()),
+            "complete": pr_plan
+                .as_ref()
+                .is_none_or(|plan| plan.manifest.skipped_files.is_empty()),
+            "skipped_files": pr_plan.as_ref().map(|plan| &plan.manifest.skipped_files),
+            "receipt_path": receipt
+                .as_ref()
+                .map(|(path, _)| path.display().to_string()),
+            "receipt": receipt.as_ref().map(|(_, receipt)| receipt),
+        });
+        let payload = match serde_json::to_string_pretty(&payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return report_failure(
+                    &usage,
+                    planned_passes,
+                    publication,
+                    format!("Failed to serialize completed review output: {error}"),
+                );
+            }
+        };
+        println!("{payload}");
+    } else if pr_view.is_some() {
+        println!(
+            "{}",
+            rendered_report
+                .as_deref()
+                .expect("local PR review has prepared report")
+        );
+        if let Some((path, _)) = receipt {
+            eprintln!("Review receipt written: {}", path.display());
+        }
+    } else {
+        println!(
+            "{}",
+            rendered_report
+                .as_deref()
+                .expect("plain review has prepared report")
+        );
+        if let Some((path, _)) = receipt {
+            eprintln!("Review receipt written: {}", path.display());
+        }
+    }
+    if let Some(plan) = &pr_plan
+        && !plan.manifest.skipped_files.is_empty()
+    {
+        // #6285 AC3: the partial review above is real findings, already
+        // printed and posted — but the gate must not pass on unread
+        // files. The exit still fails, naming what the gate did not read
+        // and the remedy, so it reads as limits rather than as "this PR
+        // failed review".
+        bail!(
+            "Partial PR review: {} pass(es) completed, but the gate did not read: {}. Raise --max-chars/--max-passes or shrink the PR, then re-run; publication: {}",
+            plan.passes.len(),
+            crate::tools::review::format_skipped_files(&plan.manifest.skipped_files),
+            publication.as_str()
+        );
+    }
+    Ok(())
+}
+
+/// Criterion 4 (no silent caps): whatever a budget stop leaves unread is
+/// named by file, never silently dropped — including files the plan itself
+/// skipped before the first pass ran (#6285 AC4). A free function so tests
+/// can pin the note without running a review.
+fn pr_review_unreviewed_note(
+    plan: Option<&crate::tools::review::PrReviewPlan>,
+    completed_passes: usize,
+) -> String {
+    let Some(plan) = plan else {
+        return "the entire diff".to_string();
+    };
+    let mut unread: Vec<String> = Vec::new();
+    for pass in plan.manifest.passes.iter().skip(completed_passes) {
+        for file in &pass.files {
+            if !unread.iter().any(|seen| seen == file) {
+                unread.push(file.clone());
+            }
+        }
+    }
+    let mut clauses = Vec::new();
+    if !unread.is_empty() {
+        clauses.push(format!(
+            "{} file(s) were never read: {}",
+            unread.len(),
+            unread.join(", ")
+        ));
+    }
+    if !plan.manifest.skipped_files.is_empty() {
+        clauses.push(format!(
+            "the plan never scheduled: {}",
+            crate::tools::review::format_skipped_files(&plan.manifest.skipped_files)
+        ));
+    }
+    if clauses.is_empty() {
+        "no planned file was left unread".to_string()
+    } else {
+        clauses.join("; ")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewPublication {
+    NotRequested,
+    NotAttempted,
+    Uncertain,
+    Posted,
+}
+
+impl ReviewPublication {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::NotAttempted => "not_attempted",
+            Self::Uncertain => "uncertain",
+            Self::Posted => "posted",
+        }
+    }
+}
+
+fn review_failure_payload(
+    provider: &str,
+    model: &str,
+    usage: &codewhale_models::Usage,
+    completed_passes: usize,
+    planned_passes: usize,
+    publication: ReviewPublication,
+    message: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mode": "review",
+        "provider": provider,
+        "model": model,
+        "success": false,
+        "complete": false,
+        // #6285: a run that never produced findings is an infrastructure or
+        // budget outcome. Keeping it explicit in the payload stops CI and
+        // operators from reading `success: false` as "this PR failed review".
+        "outcome": "infrastructure",
+        "review_verdict": "not_produced",
+        "publication": publication.as_str(),
+        "error": message,
+        "usage": usage,
+        "completed_review_passes": completed_passes,
+        "planned_review_passes": planned_passes,
+    })
+}
+
+fn report_review_failure(
+    args: &ReviewArgs,
+    provider: &str,
+    model: &str,
+    usage: &codewhale_models::Usage,
+    completed_passes: usize,
+    planned_passes: usize,
+    publication: ReviewPublication,
+    message: impl Into<String>,
+) -> Result<()> {
+    let message = message.into();
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "mode": "review",
-                "provider": route_provider,
-                "model": model,
-                "success": !review_incomplete,
-                "content": output,
-                "pr": pr_view.as_ref().map(|(number, view)| serde_json::json!({
-                    "number": number,
-                    "url": view.url,
-                    "title": view.title,
-                    "head_sha": view.head_sha,
-                })),
-                "review": structured,
-                "stop_reason": review_stop_reason,
-                "error": review_error,
-                "receipt_path": receipt
-                    .as_ref()
-                    .map(|(path, _)| path.display().to_string()),
-                "receipt": receipt.as_ref().map(|(_, receipt)| receipt),
-            }))?
+            serde_json::to_string_pretty(&review_failure_payload(
+                provider,
+                model,
+                usage,
+                completed_passes,
+                planned_passes,
+                publication,
+                &message,
+            ))?
         );
-        if let Some(error) = review_error {
-            anyhow::bail!(error);
-        }
-    } else if let Some((number, view)) = &pr_view {
-        let review = structured
-            .as_ref()
-            .expect("structured output exists for PR reviews");
-        println!(
-            "{}",
-            render_pr_review_markdown(*number, view, review, args.post)
-        );
-        if let Some((path, _)) = receipt {
-            eprintln!("Review receipt written: {}", path.display());
-        }
-        if let Some(error) = review_error {
-            anyhow::bail!(error);
-        }
-    } else {
-        println!("{output}");
-        if let Some((path, _)) = receipt {
-            eprintln!("Review receipt written: {}", path.display());
-        }
-        if let Some(error) = review_error {
-            anyhow::bail!(error);
-        }
     }
-    Ok(())
+    let usage = serde_json::to_string(usage)?;
+    let publication = publication.as_str();
+    bail!(
+        "{message}; publication: {publication}; completed review passes: {completed_passes}/{planned_passes}; accumulated usage: {usage}"
+    )
 }
 
 /// Apply `codewhale review --provider <name>` and decide whether the route is
@@ -8508,10 +10565,23 @@ fn validate_review_receipt_args(args: &ReviewArgs) -> Result<()> {
     if args.write_receipt && args.check_receipt {
         bail!("--write-receipt and --check-receipt are mutually exclusive");
     }
+    if args.pr.is_none() && args.max_passes != 1 {
+        bail!("--max-passes applies only to --pr reviews");
+    }
+    if !(1..=crate::tools::review::MAX_REVIEW_PASSES).contains(&args.max_passes) {
+        bail!(
+            "--max-passes must be from 1 to {}",
+            crate::tools::review::MAX_REVIEW_PASSES
+        );
+    }
     Ok(())
 }
 
-fn run_review_receipt_check(diff: &str, args: &ReviewArgs) -> Result<()> {
+fn run_review_receipt_check(
+    diff: &str,
+    args: &ReviewArgs,
+    pr_view: Option<&GhPullRequest>,
+) -> Result<()> {
     let (path, receipt) = if let Some(path) = args.receipt_path.as_ref() {
         (
             path.clone(),
@@ -8525,8 +10595,16 @@ fn run_review_receipt_check(diff: &str, args: &ReviewArgs) -> Result<()> {
             )
         })?
     };
-    let validation =
+    let mut validation =
         crate::tools::review::validate_review_receipt_for_diff(diff, &receipt, Some(path.clone()));
+    if validation.passed
+        && pr_view
+            .is_some_and(|view| !crate::tools::review::receipt_matches_pr_revision(&receipt, view))
+    {
+        validation.passed = false;
+        validation.reason =
+            "review receipt does not match the current PR base/head revision".into();
+    }
 
     if args.json {
         println!(
@@ -8611,7 +10689,7 @@ async fn run_pr(
     }
 
     let view = run_gh_pr_view(number, repo)?;
-    let diff = run_gh_pr_diff(number, repo)?;
+    let diff = run_gh_pr_diff(number, repo, &view)?;
 
     if checkout {
         match run_gh_pr_checkout(number, repo) {
@@ -8622,7 +10700,16 @@ async fn run_pr(
         }
     }
 
-    let prompt = format_pr_prompt(number, &view, &diff);
+    let context = crate::tools::spec::ToolContext::new(std::env::current_dir()?)
+        .with_features(config.features());
+    let prompt = if context
+        .features
+        .enabled(crate::features::Feature::ReviewHost)
+    {
+        crate::tools::review_host::interactive(number, &view, &diff, &context).await?
+    } else {
+        format_pr_prompt(number, &view, &diff)
+    };
     let resume_session_id = if cli.continue_session {
         let workspace = resolve_workspace(cli);
         latest_session_id_for_workspace(&workspace).ok().flatten()
@@ -8675,69 +10762,14 @@ fn is_command_available(name: &str) -> bool {
     false
 }
 
-#[derive(Debug, Clone, Default)]
-struct GhPullRequest {
-    title: String,
-    body: String,
-    base: String,
-    head: String,
-    url: String,
-    /// Head commit SHA (`headRefOid`). Anchors posted review comments to the
-    /// exact revision that was reviewed.
-    head_sha: String,
-}
+use crate::tools::review_pr::GhPullRequest;
 
 fn run_gh_pr_view(number: u32, repo: Option<&str>) -> Result<GhPullRequest> {
-    let mut cmd = crate::dependencies::Gh::command()
-        .ok_or_else(|| anyhow::anyhow!("gh not found on PATH"))?;
-    cmd.arg("pr").arg("view").arg(number.to_string());
-    if let Some(r) = repo {
-        cmd.arg("--repo").arg(r);
-    }
-    cmd.arg("--json")
-        .arg("title,body,baseRefName,headRefName,url,headRefOid");
-    let output = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to run `gh pr view`: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!("gh pr view #{number} failed: {stderr}");
-    }
-    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("gh pr view returned non-JSON output: {e}"))?;
-    let pick = |key: &str| {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    Ok(GhPullRequest {
-        title: pick("title"),
-        body: pick("body"),
-        base: pick("baseRefName"),
-        head: pick("headRefName"),
-        url: pick("url"),
-        head_sha: pick("headRefOid"),
-    })
+    crate::tools::review_pr::fetch_view(number, repo, &std::env::current_dir()?)
 }
 
-fn run_gh_pr_diff(number: u32, repo: Option<&str>) -> Result<String> {
-    let mut cmd = crate::dependencies::Gh::command()
-        .ok_or_else(|| anyhow::anyhow!("gh not found on PATH"))?;
-    cmd.arg("pr").arg("diff").arg(number.to_string());
-    if let Some(r) = repo {
-        cmd.arg("--repo").arg(r);
-    }
-    let output = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to run `gh pr diff`: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!("gh pr diff #{number} failed: {stderr}");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+fn run_gh_pr_diff(number: u32, repo: Option<&str>, view: &GhPullRequest) -> Result<String> {
+    crate::tools::review_pr::fetch_diff(number, repo, &std::env::current_dir()?, view)
 }
 
 fn run_gh_pr_checkout(number: u32, repo: Option<&str>) -> Result<()> {
@@ -9054,13 +11086,26 @@ fn plan_inline_review_comments(
     plan
 }
 
-/// Render a structured review as the markdown body printed for — and, with
-/// `--post`, attached to — a pull-request review.
-fn render_pr_review_markdown(
-    number: u32,
-    view: &GhPullRequest,
+/// The local report for a plain-diff review (#6510). The diff is reviewed
+/// under the one structured review prompt; when the model kept the JSON
+/// contract the report is rendered Markdown, otherwise its prose is printed
+/// verbatim, as before.
+fn plain_diff_review_report(
+    structured: Option<&crate::tools::review::ReviewOutput>,
+    output: &str,
+) -> String {
+    structured.map_or_else(
+        || output.to_string(),
+        |review| render_review_markdown(review, None),
+    )
+}
+
+/// Render a structured review as Markdown. `posted` names the PR the body is
+/// being published to; `None` is the local report (plain diffs and unposted
+/// PR reviews), where suggestion fences stay live.
+fn render_review_markdown(
     review: &crate::tools::review::ReviewOutput,
-    posted: bool,
+    posted: Option<(u32, &GhPullRequest)>,
 ) -> String {
     let mut body = String::new();
     body.push_str("## Codewhale review\n\n");
@@ -9124,7 +11169,11 @@ fn render_pr_review_markdown(
                 .filter(|replacement| !replacement.trim().is_empty())
             {
                 let fence = suggestion_fence(replacement);
-                let info = if posted { "text" } else { "suggestion" };
+                let info = if posted.is_some() {
+                    "text"
+                } else {
+                    "suggestion"
+                };
                 body.push_str(&format!("\n  {fence}{info}\n"));
                 for line in replacement.split('\n') {
                     body.push_str(&format!("  {line}\n"));
@@ -9139,20 +11188,50 @@ fn render_pr_review_markdown(
         body.push_str(review.overall_assessment.trim());
         body.push_str("\n\n");
     }
-    if posted {
-        body.push_str(&format!(
-            "---\n*Advisory review by Codewhale (`codewhale review --pr {number} --post`, \
+    if let Some((number, view)) = posted {
+        body.push_str(&review_advisory_footer(number, view));
+    }
+    body
+}
+
+async fn render_review_report_for_context(
+    review: Option<&crate::tools::review::ReviewOutput>,
+    output: &str,
+    posted: Option<(u32, &GhPullRequest)>,
+    context: &crate::tools::spec::ToolContext,
+) -> Result<String> {
+    if !context
+        .features
+        .enabled(crate::features::Feature::ReviewHost)
+    {
+        return Ok(match posted {
+            Some(posted) => review.map_or_else(
+                || output.to_string(),
+                |review| render_review_markdown(review, Some(posted)),
+            ),
+            None => plain_diff_review_report(review, output),
+        });
+    }
+    let mut body =
+        crate::tools::review_host::report(review, output, posted.is_some(), context).await?;
+    if let Some((number, view)) = posted {
+        body.push_str(&review_advisory_footer(number, view));
+    }
+    Ok(body)
+}
+
+fn review_advisory_footer(number: u32, view: &GhPullRequest) -> String {
+    format!(
+        "---\n*Advisory review by Codewhale (`codewhale review --pr {number} --post`, \
              head `{head}`). Line-specific findings are also posted as inline review \
              comments; mechanical fixes arrive as committable suggestions you can \
              apply from the Files tab. CODEOWNERS approval still governs merge.*\n",
-            head = if view.head_sha.is_empty() {
-                "unknown"
-            } else {
-                view.head_sha.as_str()
-            }
-        ));
-    }
-    body
+        head = if view.head_sha.is_empty() {
+            "unknown"
+        } else {
+            view.head_sha.as_str()
+        }
+    )
 }
 
 /// Post one COMMENT review: summary body plus inline comments anchored to the
@@ -9164,6 +11243,7 @@ fn run_gh_post_pr_review(
     body: &str,
     commit_id: &str,
     comments: &[serde_json::Value],
+    publication: &mut ReviewPublication,
 ) -> Result<()> {
     let mut payload = serde_json::json!({
         "body": body,
@@ -9189,6 +11269,7 @@ fn run_gh_post_pr_review(
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to run `gh api`: {e}"))?;
+    *publication = ReviewPublication::Uncertain;
     if let Some(stdin) = child.stdin.as_mut() {
         use std::io::Write;
         stdin
@@ -9202,18 +11283,24 @@ fn run_gh_post_pr_review(
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!("gh api POST repos/{repo}/pulls/{number}/reviews failed: {stderr}");
     }
+    *publication = ReviewPublication::Posted;
     Ok(())
 }
 
-/// Publish a completed PR review: resolve the repository, render the summary,
-/// and post it (with inline comments where the diff confirms the position).
+/// Publish a completed PR review exactly once: resolve the repository, render
+/// the summary, and include every comment whose position the diff confirms.
+/// A failed request can have an uncertain remote outcome, so reconciliation
+/// and any retry stay under the caller's control rather than risking a duplicate.
 fn post_pr_review(
     number: u32,
     view: &GhPullRequest,
     repo: Option<&str>,
     review: &crate::tools::review::ReviewOutput,
     diff: &str,
+    body: &str,
+    publication: &mut ReviewPublication,
 ) -> Result<()> {
+    crate::tools::review_pr::ensure_current(number, repo, &std::env::current_dir()?, view)?;
     let repo_name = match repo.map(str::trim).filter(|repo| !repo.is_empty()) {
         Some(repo) => repo.to_string(),
         None => run_gh_repo_name()?,
@@ -9222,47 +11309,21 @@ fn post_pr_review(
     if let Some(receipt) = plan.receipt() {
         eprintln!("{receipt}");
     }
-    let inline = plan.comments;
-    let body = render_pr_review_markdown(number, view, review, true);
-    if inline.is_empty() {
-        run_gh_post_pr_review(&repo_name, number, &body, &view.head_sha, &[])?;
-    } else if let Err(err) =
-        run_gh_post_pr_review(&repo_name, number, &body, &view.head_sha, &inline)
-    {
-        // Anchors are pre-filtered against the parsed diff hunks, so this
-        // path should now be unreachable in the common case. It stays as a
-        // last resort for anchors GitHub rejects for reasons the diff cannot
-        // show (a stale head SHA, a suppressed large file), and it announces
-        // exactly how many inline comments were lost rather than failing
-        // silently.
-        eprintln!(
-            "warning: {} inline review comment(s) rejected ({err}); retrying summary-only",
-            inline.len()
-        );
-        run_gh_post_pr_review(&repo_name, number, &body, &view.head_sha, &[])?;
-    }
-    Ok(())
+    let body = neutralize_model_suggestion_fences(body);
+    run_gh_post_pr_review(
+        &repo_name,
+        number,
+        &body,
+        &view.head_sha,
+        &plan.comments,
+        publication,
+    )
 }
 
-/// Format the PR review prompt that lands in the composer. Caps the
-/// diff at 200 KiB so a massive PR doesn't blow the model's context
-/// window before the user even hits Enter — they can always ask the
-/// model to fetch more via `gh pr diff #N` from inside the session.
+/// Both the CLI review and interactive composer receive the complete diff.
+/// Collection and review-budget checks must fail before any partial review.
 fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
-    const MAX_DIFF_BYTES: usize = 200 * 1024;
-    let diff_section = if diff.len() > MAX_DIFF_BYTES {
-        let cut = (0..=MAX_DIFF_BYTES)
-            .rev()
-            .find(|&i| diff.is_char_boundary(i))
-            .unwrap_or(0);
-        format!(
-            "{}\n\n[…diff truncated at {} KiB; ask me to fetch more if needed]\n",
-            &diff[..cut],
-            MAX_DIFF_BYTES / 1024
-        )
-    } else {
-        diff.to_string()
-    };
+    let diff_section = crate::tools::review_pr::model_diff(diff);
     let body = if view.body.trim().is_empty() {
         "(no description)".to_string()
     } else {
@@ -9284,6 +11345,8 @@ fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
          \n\
          URL: {url}\n\
          Branches: {branches}\n\
+         Revision: {head_sha} (base {base_sha}); {changed_files} file patches.\n\
+         Binary changes are represented by metadata; their contents are not semantically inspected. Exact binary object IDs remain in the review evidence.\n\
          \n\
          ## Description\n\
          \n\
@@ -9294,6 +11357,9 @@ fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
          ```diff\n\
          {diff_section}\n\
          ```\n",
+        head_sha = view.head_sha,
+        base_sha = view.base_sha,
+        changed_files = view.changed_files,
         url = if view.url.is_empty() {
             "(unavailable)"
         } else {
@@ -9302,13 +11368,23 @@ fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
     )
 }
 
-fn collect_diff(args: &ReviewArgs) -> Result<String> {
-    let mut diff = if let Some(number) = args.pr {
-        run_gh_pr_diff(number, args.repo.as_deref())?
+fn collect_diff(
+    args: &ReviewArgs,
+    pr_view: Option<&GhPullRequest>,
+    workspace: &std::path::Path,
+) -> Result<String> {
+    let diff = if let Some(number) = args.pr {
+        run_gh_pr_diff(
+            number,
+            args.repo.as_deref(),
+            pr_view.context("PR snapshot is required")?,
+        )?
     } else {
-        let mut cmd = crate::dependencies::Git::command()
-            .ok_or_else(|| anyhow::anyhow!("git not found on PATH"))?;
-        cmd.arg("diff");
+        let mut cmd = crate::dependencies::Git::review_command(workspace)?;
+        // Review repository content without executing its diff drivers.
+        cmd.current_dir(workspace)
+            .arg("diff")
+            .args(crate::dependencies::Git::REVIEW_DIFF_ARGS);
         if args.staged {
             cmd.arg("--cached");
         }
@@ -9319,19 +11395,71 @@ fn collect_diff(args: &ReviewArgs) -> Result<String> {
             cmd.arg("--").arg(path);
         }
 
+        ensure_review_workspace_is_git_repo(workspace)?;
         let output = cmd
             .output()
             .map_err(|e| anyhow::anyhow!("Failed to run git diff. Is git installed? ({e})"))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("git diff failed: {}", stderr.trim());
+            bail!(
+                "git diff failed: {}",
+                first_stderr_line(&String::from_utf8_lossy(&output.stderr))
+            );
         }
         String::from_utf8_lossy(&output.stdout).to_string()
     };
-    if diff.len() > args.max_chars {
-        diff = crate::utils::truncate_with_ellipsis(&diff, args.max_chars, "\n...[truncated]\n");
+    if args.pr.is_none() {
+        ensure_local_review_diff_fits(&diff, args.max_chars)?;
     }
     Ok(diff)
+}
+
+/// Outside a work tree `git diff` prints its whole `--no-index` usage; say
+/// what is actually wrong instead. Only git's own "not a git repository"
+/// becomes that one line; any other failure (dubious ownership, permissions,
+/// a corrupt repository) keeps git's stderr, which names the fix.
+fn ensure_review_workspace_is_git_repo(workspace: &std::path::Path) -> Result<()> {
+    let output = crate::dependencies::Git::review_command(workspace)?
+        .current_dir(workspace)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run git. Is git installed? ({e})"))?;
+    if output.status.success() {
+        if String::from_utf8_lossy(&output.stdout).trim() == "true" {
+            return Ok(());
+        }
+        // Inside `.git` or a bare repository: a repository, but no work tree.
+        bail!(
+            "Not inside a git work tree (cwd: {}); run review from a checkout, not a bare repository or .git directory",
+            workspace.display()
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.to_ascii_lowercase().contains("not a git repository") {
+        bail!("Not inside a git repository (cwd: {})", workspace.display());
+    }
+    bail!(
+        "git could not read the repository at {}: {}",
+        workspace.display(),
+        stderr.trim()
+    );
+}
+
+fn first_stderr_line(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(no error output)")
+}
+
+fn ensure_local_review_diff_fits(diff: &str, max_chars: usize) -> Result<()> {
+    let chars = diff.chars().count();
+    if chars > max_chars {
+        bail!(
+            "Complete local diff requires {chars} characters, exceeding the review limit of {max_chars}. No review was run and no receipt was written or accepted. Select an explicit --path scope, or increase --max-chars only if the selected model can accept the complete input."
+        );
+    }
+    Ok(())
 }
 
 fn review_target_label(args: &ReviewArgs) -> String {
@@ -9387,14 +11515,105 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     Ok(())
 }
 
+/// Maximum bytes read for a patch on stdin. Generous for large diffs;
+/// anything larger is not a patch.
+const MAX_STDIN_PATCH_BYTES: u64 = 16 * 1024 * 1024;
+
 fn read_patch_from_stdin() -> Result<String> {
-    let mut stdin = io::stdin();
+    let stdin = io::stdin();
     if stdin.is_terminal() {
         bail!("No patch file provided and stdin is empty.");
     }
+    read_capped_text(stdin.lock(), MAX_STDIN_PATCH_BYTES, "patch on stdin")
+}
+
+/// Read UTF-8 text, refusing more than `limit` bytes with a message that
+/// names the limit in bytes.
+fn read_capped_text(reader: impl Read, limit: u64, what: &str) -> Result<String> {
     let mut buffer = String::new();
-    stdin.read_to_string(&mut buffer)?;
+    reader.take(limit + 1).read_to_string(&mut buffer)?;
+    if buffer.len() as u64 > limit {
+        bail!("{what} exceeds the {limit}-byte limit");
+    }
     Ok(buffer)
+}
+
+/// Warning for a user MCP server that duplicates the enabled built-in
+/// Computer Use bundle. Advisory: the entry is never removed.
+fn duplicate_computer_use_warning(name: &str) -> String {
+    format!(
+        "  warning: `{name}` launches the same Computer Use plugin as the enabled built-in computer-use bundle; every Computer Use tool is advertised twice (~2.5k extra tokens per request) with separate consent state. Remove or disable `{name}` in mcp.json, or disable the built-in bundle, to keep one."
+    )
+}
+
+/// Credential-safe launch summary used by the actual `mcp list` path.
+fn mcp_server_listing(command: Option<&str>, args: &[String], url: Option<&str>) -> String {
+    use codewhale_secrets::sanitize::{
+        is_sensitive_key_name, redact_url_for_display, sanitize_text,
+    };
+    let flag_name = |arg: &str| arg.trim_start_matches('-').to_string();
+    let mut shown = Vec::with_capacity(args.len());
+    let mut mask_next = false;
+    for arg in args {
+        if mask_next {
+            shown.push("***".to_string());
+            mask_next = false;
+            continue;
+        }
+        if arg.starts_with('-') {
+            if let Some((flag, _)) = arg.split_once('=') {
+                if is_sensitive_key_name(&flag_name(flag)) {
+                    shown.push(format!("{flag}=***"));
+                    continue;
+                }
+            } else if is_sensitive_key_name(&flag_name(arg)) {
+                mask_next = true;
+            }
+        }
+        // Each argument on its own, so a masked value never swallows the
+        // arguments after it.
+        shown.push(sanitize_text(arg));
+    }
+    match (command, url) {
+        (Some(command), _) if shown.is_empty() => sanitize_text(command),
+        (Some(command), _) => format!("{} {}", sanitize_text(command), shown.join(" ")),
+        (None, Some(url)) => sanitize_text(&redact_url_for_display(url)),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
+/// Printed after `mcp connect` and `mcp validate` succeed. docs/MCP.md
+/// § Connection Lifecycle already states that these commands inspect their
+/// own process's pool and never attach transports to a running TUI or exec
+/// session; the success line alone reads as a real fix for the running
+/// session otherwise (issue #6828).
+const MCP_OWN_PROCESS_NOTE: [&str; 2] = [
+    "Note: this command ran in its own process; it does not attach to a running TUI or exec session.",
+    "In a running session, use in-session discovery: search for the server name or an mcp_<server>_ tool name, or call one of its tools directly.",
+];
+
+fn print_mcp_own_process_note() {
+    for line in MCP_OWN_PROCESS_NOTE {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod mcp_own_process_note_tests {
+    use super::MCP_OWN_PROCESS_NOTE;
+
+    #[test]
+    fn mcp_own_process_note_states_the_session_boundary_and_recovery() {
+        let note = MCP_OWN_PROCESS_NOTE.join("\n");
+        assert!(
+            note.contains("own process") && note.contains("does not attach"),
+            "the connect/validate note must name the process boundary: {note}"
+        );
+        assert!(
+            note.contains("search for the server name"),
+            "the note must point at in-session discovery: {note}"
+        );
+    }
 }
 
 async fn run_mcp_command(
@@ -9404,6 +11623,9 @@ async fn run_mcp_command(
     plugins: &crate::plugins::PluginRegistry,
 ) -> Result<()> {
     let config_path = config.mcp_config_path();
+    let network_policy = config.network.clone().map(|network| {
+        crate::network_policy::NetworkPolicyDecider::with_default_audit(network.into_runtime())
+    });
     match command {
         McpCommand::Init { force } => {
             let status = init_mcp_config(&config_path, force)?;
@@ -9439,13 +11661,19 @@ async fn run_mcp_command(
                 return Ok(());
             }
             println!("MCP servers ({}):", cfg.servers.len());
+            let duplicate_computer_use = crate::mcp::duplicate_computer_use_servers(&cfg);
             for (name, server) in cfg.servers {
                 let status = if server.enabled && !server.disabled {
                     "enabled"
                 } else {
                     "disabled"
                 };
-                let auth_status = crate::mcp::oauth::auth_status_for_server(&name, &server).await;
+                let auth_status = crate::mcp::oauth::auth_status_for_server(
+                    &name,
+                    &server,
+                    network_policy.as_ref(),
+                )
+                .await;
                 let auth = if auth_status == crate::mcp::oauth::McpAuthStatus::Unsupported {
                     String::new()
                 } else {
@@ -9457,20 +11685,16 @@ async fn run_mcp_command(
                             .replace(' ', "-")
                     )
                 };
-                let args = if server.args.is_empty() {
-                    "".to_string()
-                } else {
-                    format!(" {}", server.args.join(" "))
-                };
-                let cmd_str = if let Some(cmd) = server.command {
-                    format!("{cmd}{args}")
-                } else if let Some(url) = server.url {
-                    url
-                } else {
-                    "unknown".to_string()
-                };
+                let cmd_str = mcp_server_listing(
+                    server.command.as_deref(),
+                    &server.args,
+                    server.url.as_deref(),
+                );
                 let required = if server.required { " required" } else { "" };
                 println!("  - {name} [{status}{required}{auth}] {cmd_str}");
+            }
+            for (name, _) in &duplicate_computer_use {
+                println!("{}", duplicate_computer_use_warning(name));
             }
             Ok(())
         }
@@ -9479,7 +11703,8 @@ async fn run_mcp_command(
                 &config_path,
                 workspace,
                 std::sync::Arc::new(plugins.clone()),
-            )?;
+            )?
+            .with_backend(crate::mcp::McpBackend::from_config(config));
             if let Some(name) = server {
                 if let Err(err) = pool.get_or_connect(&name).await {
                     if crate::mcp::oauth::error_looks_auth_required(&err) {
@@ -9489,10 +11714,12 @@ async fn run_mcp_command(
                     return Err(err);
                 }
                 println!("Connected to MCP server: {name}");
+                print_mcp_own_process_note();
             } else {
                 let errors = pool.connect_all().await;
                 if errors.is_empty() {
                     println!("Connected to all configured MCP servers.");
+                    print_mcp_own_process_note();
                 } else {
                     for (name, err) in errors {
                         eprintln!("Failed to connect {name}: {err:#}");
@@ -9509,7 +11736,8 @@ async fn run_mcp_command(
                 &config_path,
                 workspace,
                 std::sync::Arc::new(plugins.clone()),
-            )?;
+            )?
+            .with_backend(crate::mcp::McpBackend::from_config(config));
             if let Some(name) = server {
                 let conn = match pool.get_or_connect(&name).await {
                     Ok(conn) => conn,
@@ -9600,6 +11828,8 @@ async fn run_mcp_command(
                 }),
                 oauth_resource,
                 reviewed_plugin: None,
+                runtime_added: false,
+                allow_private_network: false,
             };
             let can_suggest_oauth = added_server.url.is_some()
                 && added_server.bearer_token_env_var.is_none()
@@ -9611,12 +11841,13 @@ async fn run_mcp_command(
                     .env_headers
                     .keys()
                     .all(|key| !key.trim().eq_ignore_ascii_case("authorization"));
-            let mut cfg = load_mcp_config(&config_path)?;
-            cfg.servers.insert(name.clone(), added_server.clone());
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::mutate_config(&config_path, None, |cfg| {
+                cfg.servers.insert(name.clone(), added_server.clone());
+                Ok(())
+            })?;
             println!("Added MCP server '{name}' in {}", config_path.display());
             if can_suggest_oauth
-                && crate::mcp::oauth::oauth_login_support(&added_server)
+                && crate::mcp::oauth::oauth_login_support(&added_server, network_policy.as_ref())
                     .await
                     .is_ok_and(|support| support.is_some())
             {
@@ -9643,6 +11874,7 @@ async fn run_mcp_command(
                 explicit_scopes,
                 config.mcp_oauth_callback_port,
                 config.mcp_oauth_callback_url.as_deref(),
+                network_policy.as_ref(),
             )
             .await?;
             println!("Stored OAuth credentials for MCP server '{name}'.");
@@ -9659,42 +11891,26 @@ async fn run_mcp_command(
                 .get(&name)
                 .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
             if crate::mcp::oauth::delete_oauth_tokens_for_server(&name, server)? {
-                println!("Deleted stored OAuth credentials for MCP server '{name}'.");
+                println!(
+                    "Deleted locally stored OAuth credentials for MCP server '{name}'. That clears this machine only; the provider may keep its grant, and the next login forces the consent screen."
+                );
             } else {
                 println!("No stored OAuth credentials found for MCP server '{name}'.");
             }
             Ok(())
         }
         McpCommand::Remove { name } => {
-            let mut cfg = load_mcp_config(&config_path)?;
-            if cfg.servers.remove(&name).is_none() {
-                bail!("MCP server '{name}' not found");
-            }
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::remove_server_config(&config_path, &name)?;
             println!("Removed MCP server '{name}'");
             Ok(())
         }
         McpCommand::Enable { name } => {
-            let mut cfg = load_mcp_config(&config_path)?;
-            let server = cfg
-                .servers
-                .get_mut(&name)
-                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
-            server.enabled = true;
-            server.disabled = false;
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::set_server_enabled(&config_path, &name, true)?;
             println!("Enabled MCP server '{name}'");
             Ok(())
         }
         McpCommand::Disable { name } => {
-            let mut cfg = load_mcp_config(&config_path)?;
-            let server = cfg
-                .servers
-                .get_mut(&name)
-                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
-            server.enabled = false;
-            server.disabled = true;
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::set_server_enabled(&config_path, &name, false)?;
             println!("Disabled MCP server '{name}'");
             Ok(())
         }
@@ -9703,10 +11919,12 @@ async fn run_mcp_command(
                 &config_path,
                 workspace,
                 std::sync::Arc::new(plugins.clone()),
-            )?;
+            )?
+            .with_backend(crate::mcp::McpBackend::from_config(config));
             let errors = pool.connect_all().await;
             if errors.is_empty() {
                 println!("MCP config is valid. All enabled servers connected.");
+                print_mcp_own_process_note();
                 return Ok(());
             }
             eprintln!("MCP validation failed:");
@@ -9728,40 +11946,43 @@ async fn run_mcp_command(
             args.push("serve".to_string());
             args.push("--mcp".to_string());
 
-            let mut cfg = load_mcp_config(&config_path)?;
-            if cfg.servers.contains_key(&name) {
-                bail!(
-                    "MCP server '{name}' already exists in {}. Use `codewhale mcp remove {name}` first, or choose a different --name.",
-                    config_path.display()
+            crate::mcp::mutate_config(&config_path, None, |cfg| {
+                if cfg.servers.contains_key(&name) {
+                    bail!(
+                        "MCP server '{name}' already exists in {}. Use `codewhale mcp remove {name}` first, or choose a different --name.",
+                        config_path.display()
+                    );
+                }
+                cfg.servers.insert(
+                    name.clone(),
+                    McpServerConfig {
+                        command: Some(exe_str.clone()),
+                        args,
+                        env: std::collections::HashMap::new(),
+                        cwd: None,
+                        url: None,
+                        transport: None,
+                        connect_timeout: None,
+                        execute_timeout: None,
+                        read_timeout: None,
+                        disabled: false,
+                        enabled: true,
+                        required: false,
+                        enabled_tools: Vec::new(),
+                        disabled_tools: Vec::new(),
+                        headers: std::collections::HashMap::new(),
+                        env_headers: std::collections::HashMap::new(),
+                        bearer_token_env_var: None,
+                        scopes: Vec::new(),
+                        oauth: None,
+                        oauth_resource: None,
+                        reviewed_plugin: None,
+                        runtime_added: false,
+                        allow_private_network: false,
+                    },
                 );
-            }
-            cfg.servers.insert(
-                name.clone(),
-                McpServerConfig {
-                    command: Some(exe_str.clone()),
-                    args,
-                    env: std::collections::HashMap::new(),
-                    cwd: None,
-                    url: None,
-                    transport: None,
-                    connect_timeout: None,
-                    execute_timeout: None,
-                    read_timeout: None,
-                    disabled: false,
-                    enabled: true,
-                    required: false,
-                    enabled_tools: Vec::new(),
-                    disabled_tools: Vec::new(),
-                    headers: std::collections::HashMap::new(),
-                    env_headers: std::collections::HashMap::new(),
-                    bearer_token_env_var: None,
-                    scopes: Vec::new(),
-                    oauth: None,
-                    oauth_resource: None,
-                    reviewed_plugin: None,
-                },
-            );
-            save_mcp_config(&config_path, &cfg)?;
+                Ok(())
+            })?;
             println!(
                 "Registered Codewhale as MCP server '{name}' in {}",
                 config_path.display()
@@ -9777,21 +11998,6 @@ async fn run_mcp_command(
             Ok(())
         }
     }
-}
-
-fn load_mcp_config(path: &Path) -> Result<McpConfig> {
-    if !path.exists() {
-        return Ok(McpConfig::default());
-    }
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read MCP config {}: {}", path.display(), e))?;
-    let cfg: McpConfig = serde_json::from_str(&contents).map_err(|_| {
-        anyhow::anyhow!(
-            "Failed to parse MCP config {}; file contents were omitted",
-            codewhale_config::quote_os_path(path)
-        )
-    })?;
-    Ok(cfg)
 }
 
 /// Diagnostic status for an MCP server entry.
@@ -9975,19 +12181,6 @@ fn is_scoped_npm_package_arg(command: &str, argument: &str) -> bool {
         })
 }
 
-fn save_mcp_config(path: &Path, cfg: &McpConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create MCP config directory {}", parent.display())
-        })?;
-    }
-    let rendered = serde_json::to_string_pretty(cfg)
-        .map_err(|e| anyhow!("Failed to serialize MCP config: {e}"))?;
-    crate::utils::write_atomic(path, rendered.as_bytes())
-        .map_err(|e| anyhow!("Failed to write MCP config {}: {}", path.display(), e))?;
-    Ok(())
-}
-
 fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
     use crate::sandbox::{CommandSpec, SandboxManager};
 
@@ -10026,10 +12219,26 @@ fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
+    // Lead a process group so the timeout ends everything the command started.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to run command: {e}"))?;
+    // The sandbox run is the tree's lifetime: dropping `tree` on return ends
+    // anything the command left running, as `contained_output` does.
+    let tree = match crate::process_tree::ProcessTree::attach(&child) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Failed to contain the sandboxed command: {error}");
+        }
+    };
     let stdout_handle = child
         .stdout
         .take()
@@ -10039,48 +12248,78 @@ fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("stderr unavailable"))?;
 
-    let timeout = exec_env.timeout;
-    let stdout_thread = std::thread::spawn(move || {
+    // Output streams straight through instead of being buffered whole: a
+    // command's output size is unbounded, so only a bounded stderr tail is
+    // kept for sandbox-denial detection.
+    const STDERR_TAIL_BYTES: usize = 64 * 1024;
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let stdout_done = done_tx.clone();
+    std::thread::spawn(move || {
         let mut reader = stdout_handle;
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
+        let _ = io::copy(&mut reader, &mut io::stdout());
+        let _ = stdout_done.send(());
     });
-    let stderr_thread = std::thread::spawn(move || {
+    let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let tail = Arc::clone(&stderr_tail);
+    std::thread::spawn(move || {
         let mut reader = stderr_handle;
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let _ = io::stderr().write_all(&chunk[..read]);
+            if let Ok(mut tail) = tail.lock() {
+                tail.extend_from_slice(&chunk[..read]);
+                let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                tail.drain(..excess);
+            }
+        }
+        let _ = done_tx.send(());
     });
 
-    if let Some(status) = child.wait_timeout(timeout)? {
-        let stdout = stdout_thread.join().unwrap_or_default();
-        let stderr = stderr_thread.join().unwrap_or_default();
-        let stderr_str = String::from_utf8_lossy(&stderr);
-        let exit_code = status.code().unwrap_or(-1);
-        let sandbox_type = exec_env.sandbox_type;
-        let sandbox_denied = SandboxManager::was_denied(sandbox_type, exit_code, &stderr_str);
-
-        if !stdout.is_empty() {
-            print!("{}", String::from_utf8_lossy(&stdout));
-        }
-        if !stderr.is_empty() {
-            eprint!("{stderr_str}");
-        }
-        if sandbox_denied {
-            eprintln!(
-                "{}",
-                SandboxManager::denial_message(sandbox_type, &stderr_str)
-            );
-        }
-
-        if !status.success() {
-            bail!("Command failed with exit code {exit_code}");
-        }
-    } else {
+    let timeout = exec_env.timeout;
+    let deadline = Instant::now() + timeout;
+    let Some(status) = child.wait_timeout(timeout)? else {
+        let _ = tree.kill();
         let _ = child.kill();
         let _ = child.wait();
         bail!("Command timed out after {}ms", timeout.as_millis());
+    };
+    // A descendant may still hold the output pipes. Let it finish inside the
+    // same budget, then end the tree so the drain always reaches EOF.
+    let mut drained = 0;
+    while drained < 2 {
+        match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(()) => drained += 1,
+            Err(_) => break,
+        }
+    }
+    if drained < 2 {
+        let _ = tree.kill();
+        while drained < 2 && done_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+            drained += 1;
+        }
+    }
+
+    let stderr = stderr_tail
+        .lock()
+        .map(|tail| tail.clone())
+        .unwrap_or_default();
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    let exit_code = status.code().unwrap_or(-1);
+    let sandbox_type = exec_env.sandbox_type;
+    if SandboxManager::was_denied(sandbox_type, exit_code, &stderr_str) {
+        eprintln!(
+            "{}",
+            SandboxManager::denial_message(sandbox_type, &stderr_str)
+        );
+    }
+    if !status.success() {
+        bail!("Command failed with exit code {exit_code}");
     }
     Ok(())
 }
@@ -10234,6 +12473,20 @@ fn load_recent_checkpoints(manager: &session_manager::SessionManager) -> Vec<Rec
     let refs = manager.list_checkpoints().unwrap_or_default();
     let mut recent = Vec::new();
     for checkpoint_ref in refs {
+        // A session open in another terminal refreshes its own checkpoint
+        // mid-turn. It is not interrupted: promoting or clearing it would
+        // take that session's only crash-recovery record while it runs. The
+        // legacy slot is checked by the session it names, before anything
+        // prunes, promotes or migrates it over that session's live state.
+        let owner = match &checkpoint_ref.source {
+            session_manager::CheckpointSource::Session(id) => Some(id.clone()),
+            session_manager::CheckpointSource::Legacy => {
+                manager.legacy_checkpoint_origin().ok().flatten()
+            }
+        };
+        if owner.is_some_and(|id| manager.is_session_live_anywhere(&id)) {
+            continue;
+        }
         let Ok(age) = std::time::SystemTime::now().duration_since(checkpoint_ref.modified) else {
             continue;
         };
@@ -10341,6 +12594,15 @@ fn recover_interrupted_checkpoint_for_resume(launch_workspace: &Path) -> Option<
 
     let session_id = best.session.metadata.id.clone();
 
+    // Take the session's live lease before promoting or clearing anything:
+    // the liveness filter above is a check, and another terminal can attach
+    // between it and these writes. The TUI's own attach then finds the lease
+    // already held by this process. Losing the race leaves every file alone.
+    match manager.reserve_session_for_attach(&session_id) {
+        Ok(lease) => lease.commit(),
+        Err(_) => return None,
+    }
+
     // Persist the checkpoint as a regular session so the TUI can load it by
     // id — unless a newer regular session file for the same id already
     // exists (e.g. `--continue` ran before and the session advanced since).
@@ -10435,7 +12697,19 @@ fn preserve_interrupted_checkpoint_for_explicit_resume(launch_workspace: &Path) 
 /// else falls back to the global value.
 #[cfg(test)]
 fn merge_project_config(config: &mut Config, workspace: &Path) {
-    merge_project_config_with_approval_baseline(config, workspace, None);
+    merge_project_config_with_approval_baseline(config, workspace, None)
+        .expect("project config applies");
+}
+
+/// A project config that exists but cannot be applied is an error, not an
+/// absent file: it may be the thing tightening approval, sandbox or shell for
+/// this workspace, and launching on the looser user baseline without it would
+/// fail open. The reason never quotes file contents.
+fn project_config_unusable(path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "Project config {} could not be applied ({reason}), so its approval, sandbox and shell restrictions are not in effect. Fix the file, or launch with --no-project-config to ignore it.",
+        path.display()
+    )
 }
 
 /// Apply project config while evaluating approval tightening against the
@@ -10446,7 +12720,7 @@ fn merge_project_config_with_approval_baseline(
     config: &mut Config,
     workspace: &Path,
     saved_permission_posture: Option<&str>,
-) {
+) -> Result<()> {
     // When the workspace is the user's home directory, the project-scope
     // config file is also the global config file. Skip the merge to avoid
     // redundant processing and a misleading "project-scope config key
@@ -10458,46 +12732,41 @@ fn merge_project_config_with_approval_baseline(
         )
         && w == h
     {
-        return;
+        return Ok(());
     }
 
     // v0.8.44: prefer .codewhale/config.toml, fall back to .deepseek/
-    let path = workspace
+    let primary = workspace
         .join(codewhale_config::CODEWHALE_APP_DIR)
         .join("config.toml");
-    let raw = match read_project_config_file(&path) {
-        Ok(Some(r)) => r,
+    let (path, raw) = match read_project_config_file(&primary) {
+        Ok(Some(raw)) => (primary, raw),
         Ok(None) => {
             let legacy = workspace
                 .join(codewhale_config::LEGACY_APP_DIR)
                 .join("config.toml");
             match read_project_config_file(&legacy) {
-                Ok(Some(r)) => r,
-                Ok(None) => return,
-                Err(err) => {
-                    eprintln!(
-                        "warning: failed to read project-scope config {}: {err}",
-                        legacy.display()
-                    );
-                    return;
-                }
+                Ok(Some(raw)) => (legacy, raw),
+                Ok(None) => return Ok(()),
+                Err(err) => return Err(project_config_unusable(&legacy, &err.to_string())),
             }
         }
-        Err(err) => {
-            eprintln!(
-                "warning: failed to read project-scope config {}: {err}",
-                path.display()
-            );
-            return;
-        }
+        Err(err) => return Err(project_config_unusable(&primary, &err.to_string())),
     };
-    let project: toml::Value = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let table = match project.as_table() {
-        Some(t) => t,
-        None => return,
+    let project: toml::Value = toml::from_str(&raw).map_err(|err| {
+        // Position only: the parser's message can quote the offending value.
+        let reason = err.span().map_or_else(
+            || "invalid TOML".to_string(),
+            |span| {
+                let prefix = &raw.as_bytes()[..span.start.min(raw.len())];
+                let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
+                format!("invalid TOML at line {line}")
+            },
+        );
+        project_config_unusable(&path, &reason)
+    })?;
+    let Some(table) = project.as_table() else {
+        return Err(project_config_unusable(&path, "not a TOML table"));
     };
 
     // #417: dangerous keys are denied at project scope. A malicious
@@ -10522,6 +12791,9 @@ fn merge_project_config_with_approval_baseline(
         "mcp_config_path",
         "mcp_oauth_callback_port",
         "mcp_oauth_callback_url",
+        // The auto-approved `note` tool appends to `notes_path`, so a
+        // project value would be a write target the user never reviewed.
+        "notes_path",
     ];
     for key in DENY_AT_PROJECT_SCOPE {
         if table.contains_key(*key) {
@@ -10534,17 +12806,24 @@ fn merge_project_config_with_approval_baseline(
     }
 
     // String fields a project may legitimately override (model,
-    // approval/sandbox tightening, notes path, reasoning effort).
-    for (key, field) in [
-        ("model", &mut config.default_text_model),
-        ("reasoning_effort", &mut config.reasoning_effort),
-        ("notes_path", &mut config.notes_path),
-    ] {
-        if let Some(v) = table.get(key).and_then(toml::Value::as_str)
-            && !v.is_empty()
-        {
-            *field = Some(v.to_string());
-        }
+    // approval/sandbox tightening, reasoning effort).
+    if !config.environment_model_applied
+        && let Some(model) = table.get("model").and_then(toml::Value::as_str)
+        && !model.is_empty()
+    {
+        config.default_text_model = Some(model.to_string());
+        let identity = config
+            .active_provider_identity()
+            .map_err(anyhow::Error::msg)?;
+        config
+            .set_provider_model_override(&identity, Some(model.to_string()))
+            .map_err(anyhow::Error::msg)?;
+        config.remembered_selection_scope = Some(false);
+    }
+    if let Some(v) = table.get("reasoning_effort").and_then(toml::Value::as_str)
+        && !v.is_empty()
+    {
+        config.reasoning_effort = Some(v.to_string());
     }
 
     if let Some(v) = table.get("approval_policy").and_then(toml::Value::as_str)
@@ -10608,7 +12887,11 @@ fn merge_project_config_with_approval_baseline(
              (See #417.)"
         );
     }
+    Ok(())
 }
+
+/// Maximum bytes read from a project config file. Configs are kilobytes.
+const MAX_PROJECT_CONFIG_BYTES: u64 = 1024 * 1024;
 
 fn read_project_config_file(path: &Path) -> io::Result<Option<String>> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -10627,9 +12910,16 @@ fn read_project_config_file(path: &Path) -> io::Result<Option<String>> {
         return Ok(None);
     }
 
-    let mut file = open_project_config_file(path)?;
+    let file = open_project_config_file(path)?;
     let mut raw = String::new();
-    file.read_to_string(&mut raw)?;
+    file.take(MAX_PROJECT_CONFIG_BYTES + 1)
+        .read_to_string(&mut raw)?;
+    if raw.len() as u64 > MAX_PROJECT_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("project config {} exceeds the 1 MiB limit", path.display()),
+        ));
+    }
     Ok(Some(raw))
 }
 
@@ -10772,6 +13062,26 @@ fn normalize_windows_config_path_str(path: &str) -> String {
     normalized.to_ascii_lowercase()
 }
 
+/// Startup discovery runs before config can select the extension-host policy,
+/// so it judged every reviewed Native plugin `CapabilitiesChanged`. Call this
+/// after the config load to re-judge under the installed policy, as
+/// `/plugin reload` does, so trusted host plugins survive a restart. With the
+/// flag off it returns the startup snapshot unchanged.
+///
+/// Known limits: plugin-declared providers keep the startup snapshot, and the
+/// `mcp`, `doctor`, `setup`, `pr`, `review` and workflow-tool subcommands do
+/// not call this yet.
+fn policy_current_registry(
+    registry: Arc<crate::plugins::PluginRegistry>,
+) -> Arc<crate::plugins::PluginRegistry> {
+    if crate::plugins::activation::extension_host_policy_enabled() {
+        let workspace = registry.workspace().to_path_buf();
+        registry.rediscover_for_workspace(&workspace)
+    } else {
+        registry
+    }
+}
+
 fn interactive_tui_allow_shell(yolo: bool, config: &Config) -> bool {
     yolo || config.interactive_allow_shell()
 }
@@ -10808,11 +13118,44 @@ async fn run_interactive_with_notice(
     pending_telemetry_notice: Option<crate::telemetry_notice::PendingTelemetryNotice>,
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
 ) -> Result<()> {
-    let initial_input = if cli.remote_control {
-        Some(tui::InitialInput::RemoteControl)
+    tui::ui::require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
+    let plugin_registry = policy_current_registry(plugin_registry);
+    let prepared = prepare_interactive_config(cli, config, resume_session_id.is_some())?;
+    let (prepared, resume_session_id) = if let Some(selector) = resume_session_id {
+        let (prepared, id) = prepare_mounted_session(
+            cli,
+            prepared,
+            selector,
+            MountedHistoryIntent::Resume,
+            Arc::clone(&plugin_registry),
+        )
+        .await?;
+        (prepared, Some(id))
     } else {
-        initial_input
+        (prepared, None)
     };
+    run_interactive_prepared(
+        cli,
+        prepared,
+        resume_session_id,
+        initial_input,
+        startup_notice,
+        pending_telemetry_notice,
+        plugin_registry,
+    )
+    .await
+}
+
+struct PreparedInteractiveConfig {
+    config: Config,
+    workspace: PathBuf,
+}
+
+fn prepare_interactive_config(
+    cli: &Cli,
+    config: &Config,
+    resuming: bool,
+) -> Result<PreparedInteractiveConfig> {
     let workspace = cli
         .workspace
         .clone()
@@ -10831,9 +13174,9 @@ async fn run_interactive_with_notice(
             &mut merged_config,
             &workspace,
             saved_permission_posture.as_deref(),
-        );
+        )?;
     }
-    if resume_session_id.is_none() {
+    if !resuming {
         let explicit_route_override = crate::config::explicit_launch_provider_override().is_some()
             || crate::config::explicit_launch_model_override().is_some();
         apply_selected_fleet_operator_for_launch(
@@ -10843,7 +13186,29 @@ async fn run_interactive_with_notice(
             false,
         )?;
     }
-    let config = &merged_config;
+    Ok(PreparedInteractiveConfig {
+        config: merged_config,
+        workspace,
+    })
+}
+
+async fn run_interactive_prepared(
+    cli: &Cli,
+    prepared: PreparedInteractiveConfig,
+    resume_session_id: Option<String>,
+    initial_input: Option<tui::InitialInput>,
+    startup_notice: Option<String>,
+    pending_telemetry_notice: Option<crate::telemetry_notice::PendingTelemetryNotice>,
+    plugin_registry: Arc<crate::plugins::PluginRegistry>,
+) -> Result<()> {
+    let PreparedInteractiveConfig { config, workspace } = prepared;
+    let config = &config;
+    let initial_input = if cli.remote_control {
+        Some(tui::InitialInput::RemoteControl)
+    } else {
+        initial_input
+    };
+    initialize_cloud_facts(config);
 
     if !cli.skip_onboarding {
         match crate::config::ensure_config_file_exists(cli.config.clone()) {
@@ -10867,9 +13232,13 @@ async fn run_interactive_with_notice(
     }
 
     let model = config.default_model();
-    let provider = config.api_provider();
+    let identity = config.active_provider_identity().ok();
     let max_subagents = cli.max_subagents.map_or_else(
-        || config.max_subagents_for_provider(provider),
+        || {
+            identity.as_ref().map_or(DEFAULT_MAX_SUBAGENTS, |identity| {
+                config.max_subagents_for_provider(identity)
+            })
+        },
         |value| value.clamp(1, MAX_SUBAGENTS),
     );
     let screen_mode = startup_screen_mode(cli, config);
@@ -10897,7 +13266,7 @@ async fn run_interactive_with_notice(
     // own /v1/models endpoint and merges live rows into the provider lake
     // alongside the Models.dev snapshot. Currently active for TelecomJS, whose
     // model list is not covered by the Models.dev catalog.
-    crate::client::DeepSeekClient::spawn_active_provider_catalog_refresh(config);
+    crate::client::CodewhaleClient::spawn_active_provider_catalog_refresh(config);
 
     // Boot janitors — snapshot prune (7-day default), spillover prune
     // (#422), and managed-session cleanup (v0.8.44) — are best-effort disk
@@ -10994,9 +13363,9 @@ async fn run_interactive_with_notice(
 
 #[derive(Debug)]
 struct CliAutoRoute {
-    provider: crate::config::ApiProvider,
+    provider: crate::config::ProviderIdentity,
     model: String,
-    reasoning_effort: Option<crate::tui::app::ReasoningEffort>,
+    reasoning_effort: Option<crate::reasoning_preference::ReasoningEffort>,
     /// Whether the runtime should continue resolving reasoning per prompt.
     ///
     /// This is independent from `auto_model`: an Auto model can carry a fixed
@@ -11008,25 +13377,47 @@ struct CliAutoRoute {
 fn cli_reasoning_effort_value(
     config: &Config,
     model: &str,
-    effort: crate::tui::app::ReasoningEffort,
+    effort: crate::reasoning_preference::ReasoningEffort,
 ) -> Option<String> {
+    let identity = config.active_provider_identity().ok()?;
     effort
-        .api_value_for_route(config.api_provider(), &config.deepseek_base_url(), model)
+        .api_value_for_route(
+            identity.provider,
+            &config.base_url_for_route(&identity),
+            model,
+        )
         .map(str::to_string)
 }
 
 fn cli_reasoning_effort_value_for_prompt(
     config: &Config,
     model: &str,
-    effort: crate::tui::app::ReasoningEffort,
-    prompt: &str,
+    effort: crate::reasoning_preference::ReasoningEffort,
 ) -> Option<String> {
-    let resolved = if effort == crate::tui::app::ReasoningEffort::Auto {
-        crate::auto_reasoning::select(false, prompt)
+    let resolved = if effort == crate::reasoning_preference::ReasoningEffort::Auto {
+        crate::auto_reasoning::select()
     } else {
         effort
     };
     cli_reasoning_effort_value(config, model, resolved)
+}
+
+/// Review-pass reasoning effort: resolve `Auto` from the prompt exactly as the
+/// ordinary CLI path does, then bound the result so hidden reasoning cannot
+/// consume the whole shared output allowance (#6285).
+fn review_reasoning_effort_value_for_prompt(
+    config: &Config,
+    model: &str,
+    effort: crate::reasoning_preference::ReasoningEffort,
+    reserve_percent: u32,
+) -> Option<String> {
+    let resolved = if effort == crate::reasoning_preference::ReasoningEffort::Auto {
+        crate::auto_reasoning::select()
+    } else {
+        effort
+    };
+    let bounded = crate::tools::review::bounded_review_reasoning_effort(resolved, reserve_percent);
+    cli_reasoning_effort_value(config, model, bounded)
 }
 
 fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
@@ -11040,22 +13431,21 @@ fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
     ) {
         return Ok(None);
     }
-    crate::tui::app::ReasoningEffort::parse_strict(trimmed)
+    crate::reasoning_preference::ReasoningEffort::parse_strict(trimmed)
         .map(|effort| Some(effort.as_setting().to_string()))
         .map_err(anyhow::Error::msg)
 }
 
-fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
+fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Result<Config> {
     let mut execution_config = config.clone();
-    execution_config.provider = Some(config.provider_identity_for(route.provider));
-    execution_config.set_provider_model_override(route.provider, Some(route.model.clone()));
-    if matches!(
-        route.provider,
-        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN
-    ) {
+    execution_config
+        .scope_to_provider_identity(&route.provider)
+        .map_err(anyhow::Error::msg)?;
+    execution_config.set_provider_model_override(&route.provider, Some(route.model.clone()))?;
+    if route.provider.provider == crate::config::ProviderKind::Deepseek {
         execution_config.default_text_model = Some(route.model.clone());
     }
-    execution_config
+    Ok(execution_config)
 }
 
 async fn resolve_cli_auto_route(
@@ -11063,6 +13453,9 @@ async fn resolve_cli_auto_route(
     model: &str,
     prompt: &str,
 ) -> Result<CliAutoRoute> {
+    let active = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
     if model.trim().eq_ignore_ascii_case("auto") {
         let selection =
             model_routing::resolve_auto_route_with_inventory(config, prompt, "", "auto", "auto")
@@ -11070,7 +13463,7 @@ async fn resolve_cli_auto_route(
         let preference = config
             .reasoning_effort()
             .filter(|_| config.reasoning_effort_is_explicit())
-            .map(crate::tui::app::ReasoningEffort::from_setting);
+            .map(crate::reasoning_preference::ReasoningEffort::from_setting);
         let (reasoning_effort, auto_controls_reasoning) =
             model_routing::resolve_auto_model_reasoning(preference, selection.reasoning_effort);
         Ok(CliAutoRoute {
@@ -11085,7 +13478,7 @@ async fn resolve_cli_auto_route(
         {
             let auto_controls_reasoning = matches!(
                 selection.reasoning_effort,
-                Some(crate::tui::app::ReasoningEffort::Auto)
+                Some(crate::reasoning_preference::ReasoningEffort::Auto)
             );
             return Ok(CliAutoRoute {
                 provider: selection.provider,
@@ -11097,11 +13490,10 @@ async fn resolve_cli_auto_route(
         }
 
         let candidate_providers = model_routing::explicit_route_candidate_providers(config, model);
-        if !candidate_providers.is_empty() && !candidate_providers.contains(&config.api_provider())
-        {
+        if !candidate_providers.is_empty() && !candidate_providers.contains(&active) {
             let providers = candidate_providers
                 .iter()
-                .map(|provider| provider.as_str())
+                .map(|provider| provider.key.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
@@ -11119,13 +13511,13 @@ async fn resolve_cli_auto_route(
         // 30+ second SSE idle timeouts on trivial prompts.
         let reasoning_effort = config
             .reasoning_effort()
-            .map(crate::tui::app::ReasoningEffort::from_setting);
+            .map(crate::reasoning_preference::ReasoningEffort::from_setting);
         Ok(CliAutoRoute {
-            provider: config.api_provider(),
+            provider: active,
             model: model.to_string(),
             auto_controls_reasoning: matches!(
                 reasoning_effort,
-                Some(crate::tui::app::ReasoningEffort::Auto)
+                Some(crate::reasoning_preference::ReasoningEffort::Auto)
             ),
             reasoning_effort,
             auto_model: false,
@@ -11142,13 +13534,15 @@ async fn resolve_cli_exec_route(
     if force_configured_route && !model.trim().eq_ignore_ascii_case("auto") {
         let reasoning_effort = config
             .reasoning_effort()
-            .map(crate::tui::app::ReasoningEffort::from_setting);
+            .map(crate::reasoning_preference::ReasoningEffort::from_setting);
         return Ok(CliAutoRoute {
-            provider: config.api_provider(),
+            provider: config
+                .active_provider_identity()
+                .map_err(anyhow::Error::msg)?,
             model: model.to_string(),
             auto_controls_reasoning: matches!(
                 reasoning_effort,
-                Some(crate::tui::app::ReasoningEffort::Auto)
+                Some(crate::reasoning_preference::ReasoningEffort::Auto)
             ),
             reasoning_effort,
             auto_model: false,
@@ -11169,170 +13563,12 @@ fn should_force_configured_exec_route(
     resuming || explicit_provider.is_some() || explicit_model.is_none()
 }
 
-async fn run_one_shot(
-    config: &Config,
-    model: &str,
-    prompt: &str,
-    force_configured_route: bool,
-) -> Result<()> {
-    use crate::client::DeepSeekClient;
-    use crate::models::{
-        ContentBlock, Message, MessageRequest, is_incomplete_stop_reason, stop_reason_detail,
-    };
-
-    let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
-    let execution_config = config_for_cli_route(config, &route);
-    let client = DeepSeekClient::new(&execution_config)?;
-    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
-        cli_reasoning_effort_value_for_prompt(&execution_config, &route.model, effort, prompt)
-    });
-    let model = route.model;
-    let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
-
-    let request = MessageRequest {
-        model,
-        messages: vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-                cache_control: None,
-            }],
-        }],
-        max_tokens: client.effective_max_output_tokens(&request_route.model),
-        system: None,
-        tools: None,
-        tool_choice: None,
-        metadata: None,
-        thinking: None,
-        reasoning_effort,
-        stream: Some(false),
-        temperature: None,
-        top_p: None,
-    };
-
-    let response = client.create_message(request).await?;
-    let stop_reason = response.stop_reason.clone();
-
-    for block in response.content {
-        if let ContentBlock::Text { text, .. } = block {
-            println!("{text}");
-        }
-    }
-
-    if is_incomplete_stop_reason(stop_reason.as_deref()) {
-        anyhow::bail!(
-            "Model response incomplete: provider stop reason `{}`; the partial response was printed but the command did not succeed.",
-            stop_reason_detail(stop_reason.as_deref())
-        );
-    }
-
-    Ok(())
-}
-
-async fn run_one_shot_json(
-    config: &Config,
-    model: &str,
-    prompt: &str,
-    force_configured_route: bool,
-) -> Result<()> {
-    use crate::client::DeepSeekClient;
-    use crate::models::{
-        ContentBlock, Message, MessageRequest, SystemPrompt, is_incomplete_stop_reason,
-        stop_reason_detail,
-    };
-
-    let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
-    let execution_config = config_for_cli_route(config, &route);
-    let provider = execution_config.provider_identity_for(route.provider);
-    let client = DeepSeekClient::new(&execution_config)?;
-    let model = route.model.clone();
-    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
-        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, prompt)
-    });
-    let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
-    let request = MessageRequest {
-        model: model.clone(),
-        messages: vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-                cache_control: None,
-            }],
-        }],
-        max_tokens: client.effective_max_output_tokens(&request_route.model),
-        system: Some(SystemPrompt::Text(
-            "You are a coding assistant. Give concise, actionable responses.".to_string(),
-        )),
-        tools: None,
-        tool_choice: None,
-        metadata: None,
-        thinking: None,
-        reasoning_effort,
-        stream: Some(false),
-        temperature: None,
-        top_p: None,
-    };
-
-    let response = client.create_message(request).await?;
-    let stop_reason = response.stop_reason.clone();
-    let usage = response.usage.clone();
-    let mut output = String::new();
-    for block in response.content {
-        if let ContentBlock::Text { text, .. } = block {
-            output.push_str(&text);
-        }
-    }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&one_shot_exec_json_receipt(
-            provider,
-            model,
-            output,
-            stop_reason.clone(),
-            usage,
-        ))?
-    );
-    if is_incomplete_stop_reason(stop_reason.as_deref()) {
-        anyhow::bail!(
-            "Model response incomplete: provider stop reason `{}`; the JSON receipt records success=false.",
-            stop_reason_detail(stop_reason.as_deref())
-        );
-    }
-    Ok(())
-}
-
-fn one_shot_exec_json_receipt(
-    provider: String,
-    model: String,
-    output: String,
-    stop_reason: Option<String>,
-    usage: crate::models::Usage,
-) -> serde_json::Value {
-    let incomplete = crate::models::is_incomplete_stop_reason(stop_reason.as_deref());
-    let error = incomplete.then(|| {
-        format!(
-            "Model response incomplete: provider stop reason `{}`.",
-            crate::models::stop_reason_detail(stop_reason.as_deref())
-        )
-    });
-    serde_json::json!({
-        "mode": "one-shot",
-        "provider": provider,
-        "model": model,
-        "success": !incomplete,
-        "output": output,
-        "stop_reason": stop_reason,
-        "usage": usage,
-        "error": error,
-    })
-}
-
 fn exec_stream_provider_route(
     identity: &crate::config::ProviderIdentity,
 ) -> (String, Option<String>) {
-    let provider = identity.provider.as_str().to_string();
-    let provider_id = if identity.provider == crate::config::ApiProvider::Custom {
-        identity.exact_id.clone()
+    let provider = identity.persisted_kind().to_string();
+    let provider_id = if identity.provider == crate::config::ProviderKind::Custom {
+        identity.persisted_id().map(str::to_string)
     } else {
         None
     };
@@ -11382,7 +13618,13 @@ struct ExecStreamMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_catalog_sha256: Option<String>,
     input_analysis: ExecStreamInputAnalysis,
+    /// Real character count of the visible final answer, before any bound.
     visible_final_answer_chars: usize,
+    /// Bounded, secret-redacted excerpt of the visible final answer (see
+    /// [`exec_stream_final_answer_excerpt`]). Omitted when the run produced
+    /// no visible answer.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    visible_final_answer_excerpt: String,
     session_id: String,
     resume_command: String,
     workspace: String,
@@ -11424,6 +13666,8 @@ struct ExecStreamInputAnalysis {
 // payload would introduce a nested object and break the stream schema.
 #[allow(clippy::large_enum_variant)]
 enum ExecStreamEvent {
+    #[serde(rename = "status")]
+    Status { message: String },
     #[serde(rename = "content")]
     Content { content: String },
     #[serde(rename = "tool_use")]
@@ -11483,7 +13727,17 @@ enum ExecStreamEvent {
         event: serde_json::Value,
     },
     #[serde(rename = "session_capture")]
-    SessionCapture { content: String },
+    SessionCapture {
+        /// Redacted fingerprint for logs/forensics, the same value the
+        /// terminal `metadata.session_id` carries; never the recoverable id.
+        content: String,
+        /// The real saved-session id a caller can resolve via
+        /// `GET /v1/sessions/{id}` to read the worker's full transcript. This
+        /// is the only place the exec stream carries the raw id: `metadata`
+        /// stays fingerprint-only so a captured terminal receipt is safe to
+        /// log on its own.
+        saved_session_id: String,
+    },
     #[serde(rename = "service_released")]
     #[cfg(unix)]
     ServiceReleased {
@@ -11533,8 +13787,49 @@ fn exec_sandbox_elevation_authorized(
 }
 
 fn emit_exec_stream_event(event: &ExecStreamEvent) -> Result<()> {
-    println!("{}", serde_json::to_string(&exec_stream_value(event)?)?);
-    Ok(())
+    let mut line = serde_json::to_string(&exec_stream_value(event)?)?;
+    line.push('\n');
+    write_exec_stdout(&line)
+}
+
+/// Headless `exec` ignores SIGPIPE while it runs, because it writes to pipes
+/// it does not own: a stdio MCP server, LSP, hook or shell child that exits
+/// early must fail that one write with `EPIPE`, not kill the run with no
+/// output. Under the default disposition, an MCP server whose interpreter
+/// could not start (a broken `node` on PATH for the built-in Computer Use
+/// plugin) made `exec --auto` exit 141 before printing anything.
+fn ignore_sigpipe_for_headless_exec() {
+    // SAFETY: a plain disposition change with no handler. Children still start
+    // with SIGPIPE at SIG_DFL: the standard library resets it before exec.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+/// Write exec output to stdout. SIGPIPE is ignored during exec (see
+/// [`ignore_sigpipe_for_headless_exec`]), so a reader that closed stdout
+/// (`codewhale exec ... | head -1`) surfaces here as `BrokenPipe`. End the
+/// process the way the default disposition would have (#4030) instead of
+/// panicking inside `print!`.
+fn write_exec_stdout(text: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+            // SAFETY: restores the default disposition and re-raises the
+            // signal the write would have delivered without SIG_IGN.
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::raise(libc::SIGPIPE);
+            }
+            std::process::exit(141);
+        }
+        result => result.map_err(Into::into),
+    }
 }
 
 /// Process exit code `codewhale exec` uses when a turn ends on a retryable
@@ -11668,10 +13963,16 @@ async fn run_workflow_tool_command_inner(
     {
         let trimmed = env_url.trim();
         if !trimmed.is_empty() {
-            config.base_url = Some(trimmed.to_string());
+            let identity = config
+                .active_provider_identity()
+                .map_err(anyhow::Error::msg)?;
+            config
+                .set_provider_base_url_override(&identity, Some(trimmed.to_string()))
+                .map_err(anyhow::Error::msg)?;
         }
     }
 
+    initialize_cloud_facts(&config);
     let model = resolve_exec_model(&config, None);
     let route = resolve_cli_exec_route(
         &config,
@@ -11680,9 +13981,9 @@ async fn run_workflow_tool_command_inner(
         true,
     )
     .await?;
-    let execution_config = config_for_cli_route(&config, &route);
+    let execution_config = config_for_cli_route(&config, &route)?;
     let route_identity = execution_config
-        .active_provider_identity(route.provider)
+        .active_provider_identity()
         .map_err(anyhow::Error::msg)
         .context("workflow terminal route lost its exact provider identity")?;
     let (route_provider, route_provider_id) = exec_stream_provider_route(&route_identity);
@@ -11791,6 +14092,7 @@ async fn run_workflow_tool_command_inner(
             tool_catalog_sha256: None,
             input_analysis: ExecStreamInputAnalysis::default(),
             visible_final_answer_chars: result.content.chars().count(),
+            visible_final_answer_excerpt: exec_stream_final_answer_excerpt(&result.content),
             session_id: String::new(),
             resume_command: String::new(),
             workspace: workspace.display().to_string(),
@@ -11859,6 +14161,7 @@ async fn initialize_direct_workflow_mcp_pool(
         tracing::debug!("No MCP config for direct Workflow runtime: {error:#}");
         crate::mcp::McpPool::new(crate::mcp::McpConfig::default())
     });
+    pool = pool.with_backend(crate::mcp::McpBackend::from_config(config));
     if let Some(policy) = network_policy {
         pool = pool.with_network_policy(policy);
     }
@@ -11883,19 +14186,22 @@ async fn build_direct_workflow_tool(
 )> {
     use std::sync::Arc;
 
-    use crate::client::DeepSeekClient;
+    use crate::client::CodewhaleClient;
     use crate::core::authority::shell_policy_for_mode;
     use crate::tools::AgentToolSurfaceOptions;
     use crate::tools::goal::new_shared_goal_state;
     use crate::tools::subagent::{SubAgentRuntime, new_shared_subagent_manager_with_timeout};
     use crate::tools::todo::new_shared_todo_list;
-    use crate::tui::app::AppMode;
+    use codewhale_config::AppMode;
+    use codewhale_execpolicy::ApprovalMode;
 
-    let provider = config.api_provider();
-    if !config.subagents_enabled_for_provider(provider) {
+    let identity = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
+    if !config.subagents_enabled_for_provider(&identity) {
         bail!(
             "Workflow dispatch requires sub-agents for provider {} ({})",
-            provider.as_str(),
+            identity.key.as_str(),
             config
                 .subagents_disabled_reason()
                 .unwrap_or("provider-specific sub-agent configuration disabled it")
@@ -11917,7 +14223,7 @@ async fn build_direct_workflow_tool(
     .with_features(config.features())
     .with_skills_config(
         config.skills_dir(),
-        config.skills_config().scan_codewhale_only(),
+        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config()),
     )
     .with_plugin_registry(std::sync::Arc::clone(&plugin_registry))
     .with_shell_policy(shell_policy)
@@ -11925,9 +14231,9 @@ async fn build_direct_workflow_tool(
     .with_elevated_sandbox_policy(crate::core::authority::sandbox_policy_for_turn(
         mode,
         if yolo {
-            crate::tui::approval::ApprovalMode::Bypass
+            ApprovalMode::Bypass
         } else {
-            crate::tui::approval::ApprovalMode::Suggest
+            ApprovalMode::Suggest
         },
         config.sandbox_mode.as_deref(),
         workspace,
@@ -11955,16 +14261,15 @@ async fn build_direct_workflow_tool(
         context = context.with_sandbox_backend(Arc::from(backend));
     }
 
-    let max_subagents = config.max_subagents_for_provider(provider);
+    let max_subagents = config.max_subagents_for_provider(&identity);
     let manager = new_shared_subagent_manager_with_timeout(
         workspace.to_path_buf(),
         max_subagents,
         config
-            .max_admitted_subagents_for_provider(provider)
+            .max_admitted_subagents_for_provider(&identity)
             .max(max_subagents),
-        Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(provider)),
-        config.launch_concurrency_for_provider(provider),
-        config.subagent_token_budget_for_provider(provider),
+        Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(&identity)),
+        config.launch_concurrency_for_provider(&identity),
     );
     let roster = Arc::new(crate::fleet::identity::load_effective_roster(
         &config.fleet_config(),
@@ -11986,7 +14291,7 @@ async fn build_direct_workflow_tool(
     surface.speech_output_dir = config.speech_output_dir();
     surface.goal_state = Some(new_shared_goal_state());
 
-    let client = DeepSeekClient::new(config)?;
+    let client = CodewhaleClient::new(config)?;
     // A FIXED model with `reasoning_effort = auto` (the shape a Fleet worker
     // subprocess launches with: `--model <exact> --reasoning-effort auto`) is
     // still Auto. Deriving the auto flag from `route.auto_model` alone left it
@@ -12012,6 +14317,7 @@ async fn build_direct_workflow_tool(
     } else {
         None
     };
+    let fleet_governor = manager.read().await.rate_limit_governor();
     let runtime = SubAgentRuntime::new(
         client,
         route.model.clone(),
@@ -12020,8 +14326,9 @@ async fn build_direct_workflow_tool(
         Some(event_tx),
         manager.clone(),
     )
+    .with_fleet_governor(fleet_governor)
     .with_locale_tag(
-        crate::localization::resolve_locale(
+        codewhale_localization::resolve_locale(
             &crate::settings::Settings::load_persisted()
                 .unwrap_or_default()
                 .locale,
@@ -12033,9 +14340,9 @@ async fn build_direct_workflow_tool(
     .with_auto_model(route.auto_model)
     .with_reasoning_effort(reasoning_effort, reasoning_effort_auto)
     .with_agent_tool_surface_options(surface)
-    .with_max_spawn_depth(config.subagent_max_spawn_depth_for_provider(provider))
+    .with_max_spawn_depth(config.subagent_max_spawn_depth_for_provider(&identity))
     .with_step_api_timeout(Duration::from_secs(
-        config.subagent_api_timeout_secs_for_provider(provider),
+        config.subagent_api_timeout_secs_for_provider(&identity),
     ))
     .with_speech_output_dir(config.speech_output_dir())
     .with_mcp_pool(mcp_pool)
@@ -12205,11 +14512,74 @@ fn exec_stream_session_ref(session_id: &str) -> String {
     crate::utils::redacted_identifier_for_log(session_id)
 }
 
+/// Resume hint for the terminal `metadata` receipt. `metadata` carries only
+/// the session fingerprint, so the hint names the `session_capture` field
+/// that holds the recoverable id instead of pretending to redact one.
 fn exec_stream_resume_hint(session_id: &str) -> String {
     if session_id.trim().is_empty() {
         String::new()
     } else {
-        "codewhale exec --resume <redacted-session-id>".to_string()
+        "codewhale exec --resume <session_capture.saved_session_id>".to_string()
+    }
+}
+
+/// Character bound for `metadata.visible_final_answer_excerpt`. The excerpt
+/// is a status surface (fleet receipts, event labels, runtime API payloads),
+/// not the transcript: the full answer lives in the saved session and the
+/// worker's stream-json log, and `visible_final_answer_chars` carries the real
+/// length so a consumer can tell a bounded excerpt from a short answer.
+const EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS: usize = 4_000;
+
+/// The final visible assistant reply for the terminal receipt: the text
+/// blocks of the last assistant-like message after the current user prompt.
+/// Tool results also use the user role, so they must not start a new turn.
+/// A resumed session can be synchronized before its new prompt is accepted;
+/// without current output its old answer must never become a new deliverable.
+fn exec_stream_final_answer_text(
+    messages: &[Message],
+    current_turn_has_output: bool,
+) -> Option<String> {
+    if !current_turn_has_output {
+        return None;
+    }
+    let turn_start = messages.iter().rposition(|message| {
+        message.role == Role::User
+            && !message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    })?;
+    let text = messages
+        .iter()
+        .skip(turn_start + 1)
+        .rev()
+        .find(|message| message.role.is_assistant_like())?
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Bound and secret-redact the visible final answer once, at the emitter, so
+/// every downstream consumer reads the same excerpt.
+fn exec_stream_final_answer_excerpt(output: &str) -> String {
+    let redacted = codewhale_config::persistence::redact_secrets(output.trim());
+    let mut chars = redacted.chars();
+    let excerpt: String = chars
+        .by_ref()
+        .take(EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!("{excerpt}...")
+    } else {
+        excerpt
     }
 }
 
@@ -12227,9 +14597,16 @@ fn persist_exec_session(
     system_prompt: &Option<SystemPrompt>,
     session_id: Option<&str>,
     total_tokens: u64,
+    session_manager: Option<&SessionManager>,
 ) -> Result<String> {
-    let manager =
-        SessionManager::default_location().context("could not open session manager for save")?;
+    let default_manager;
+    let manager = if let Some(manager) = session_manager {
+        manager
+    } else {
+        default_manager = SessionManager::default_location()
+            .context("could not open session manager for save")?;
+        &default_manager
+    };
     let mut saved = if let Some(id) = session_id.filter(|id| !id.trim().is_empty()) {
         match manager.load_session(id) {
             Ok(existing) => session_manager::update_session(
@@ -12320,6 +14697,22 @@ struct ExecSummary {
     error: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     released_services: Vec<crate::tools::shell::PersistentServiceReceipt>,
+    /// One-shot (`mode: "one-shot"`) receipt fields kept from the pre-#6510
+    /// direct-call path: whether the turn completed without error, and its
+    /// provider-reported usage. Absent on agent receipts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<codewhale_models::Usage>,
+}
+
+impl ExecSummary {
+    /// Fill the one-shot receipt fields from the settled turn: success means a
+    /// completed status with no error; usage is what the provider reported.
+    fn record_one_shot_outcome(&mut self, usage: Option<codewhale_models::Usage>) {
+        self.success = Some(self.error.is_none() && self.status.as_deref() == Some("completed"));
+        self.usage = usage;
+    }
 }
 
 fn validate_exec_tool_authority_resume(
@@ -12482,6 +14875,61 @@ mod doctor_legacy_state_tests {
     use std::ffi::OsString;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn doctor_reports_unreadable_files_without_clean_marker() {
+        let tmp = TempDir::new().unwrap();
+        let broken = tmp.path().join("broken.json");
+        fs::write(&broken, "{\"access_token\": unfinished").unwrap();
+        let mut report =
+            session_secret_scrub::scrub_files(std::slice::from_ref(&broken), None, &[]).unwrap();
+        let summary = doctor_stored_secrets_summary(&report, 1);
+        assert!(summary.contains("scan incomplete") && summary.contains("broken.json"));
+        assert!(!summary.contains('✓') && !summary.contains("no credentials found"));
+        report.flagged_files.push(tmp.path().join("dirty.json"));
+        let summary = doctor_stored_secrets_summary(&report, 2);
+        assert!(summary.contains("hold credentials") && summary.contains("scan incomplete"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scrub_does_not_block_tokio_worker() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let _env = lock_test_env();
+        let tmp = TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let _runtime = EnvVarGuard::set("CODEWHALE_RUNTIME_DIR", tmp.path().join("runtime"));
+        let manager = session_manager::SessionManager::default_location().unwrap();
+        fs::write(manager.sessions_dir().join("dirty.json"), serde_json::json!({"type":"tool_result", "content":"sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghij"}).to_string()).unwrap();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let progressed = Arc::new(AtomicBool::new(false));
+        let progress_for_lock = progressed.clone();
+        let holder = std::thread::spawn(move || {
+            manager
+                .with_session_file_lock("dirty", || {
+                    locked_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    Ok(progress_for_lock.load(Ordering::SeqCst))
+                })
+                .unwrap()
+                .unwrap()
+        });
+        locked_rx.recv().unwrap();
+        let tick = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            progressed.store(true, Ordering::SeqCst);
+        });
+        run_sessions_scrub_secrets(true, None, None).await.unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "the timer must run while the scrub waits on the file lock"
+        );
+        tick.await.unwrap();
+    }
 
     struct EnvVarRestore {
         key: &'static str,
@@ -13199,7 +15647,7 @@ mod doctor_setup_state_tests {
         let codex_report = doctor_setup_report_json(&codex_config, &workspace);
         assert_eq!(
             codex_report["provider_model"]["provider"]["id"],
-            crate::config::ApiProvider::OpenaiCodex.as_str()
+            crate::config::ProviderKind::OpenaiCodex.as_str()
         );
         assert!(codex_report["provider_model"]["auth"]["credential_url"].is_null());
         assert_eq!(
@@ -13416,7 +15864,6 @@ mod doctor_setup_state_tests {
         .save()
         .expect("persist user constitution");
         let config = Config {
-            api_key: Some("TEST-STRUCTURAL-LITERAL".to_string()),
             approval_policy: Some("never".to_string()),
             allow_shell: Some(false),
             sandbox_mode: Some("read-only".to_string()),
@@ -13425,7 +15872,8 @@ mod doctor_setup_state_tests {
                 ..Default::default()
             }),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("TEST-STRUCTURAL-LITERAL".to_string()), None);
 
         let report = doctor_setup_report_json(&config, &workspace);
 
@@ -13469,10 +15917,8 @@ mod doctor_setup_state_tests {
         );
         assert_eq!(provider_step(&report)["result"], "deepseek/deepseek-chat");
 
-        let unprobed_config = Config {
-            api_key: Some(crate::config::API_KEYRING_SENTINEL.to_string()),
-            ..config.clone()
-        };
+        let unprobed_config = Config { ..config.clone() }
+            .with_legacy_root(Some(crate::config::API_KEYRING_SENTINEL.to_string()), None);
         let unprobed_report = doctor_setup_report_json(&unprobed_config, &workspace);
         assert_eq!(unprobed_report["credential"]["ready"], false);
         assert_eq!(unprobed_report["credential"]["availability"], "not_probed");
@@ -13525,9 +15971,8 @@ mod doctor_setup_state_tests {
         );
     }
 
-    /// #5441: telemetry ships ON by default, and the runtime-posture doctor
-    /// section must say so — with the source that decided it — instead of
-    /// staying silent about the one default users never opted into.
+    /// Doctor must distinguish a configured preference from current processor
+    /// consent, and accurately report the default-off posture.
     #[test]
     fn doctor_reports_resolved_telemetry_with_its_source() {
         let _guard = crate::test_support::lock_test_env();
@@ -13552,6 +15997,23 @@ mod doctor_setup_state_tests {
         let report = doctor_setup_report_json(&config, &workspace);
         assert_eq!(report["runtime_posture"]["telemetry"]["value"], true);
         assert_eq!(report["runtime_posture"]["telemetry"]["source"], "default");
+
+        let configured_on = Config {
+            telemetry: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(doctor_runtime_telemetry(&configured_on), (true, "config"));
+        let mut accepted = codewhale_config::SetupState::default();
+        accepted.record_telemetry_notice("3", true);
+        accepted.save().expect("old acceptance");
+        assert_eq!(doctor_runtime_telemetry(&configured_on), (true, "config"));
+        accepted.record_telemetry_notice(codewhale_config::TELEMETRY_NOTICE_VERSION, true);
+        accepted.save().expect("current acceptance");
+        assert_eq!(doctor_runtime_telemetry(&configured_on), (true, "config"));
+        {
+            let _env_on = crate::test_support::EnvVarGuard::set("CODEWHALE_TELEMETRY", "true");
+            assert_eq!(doctor_runtime_telemetry(&Config::default()), (true, "env"));
+        }
 
         // A persisted opt-out is reported as the config file's decision.
         let config = Config {
@@ -13611,9 +16073,9 @@ mod doctor_setup_state_tests {
         state.save().expect("persist setup state");
 
         let config = Config {
-            api_key: Some("TEST-STRUCTURAL-LITERAL".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("TEST-STRUCTURAL-LITERAL".to_string()), None);
         let report = doctor_setup_report_json(&config, &workspace);
 
         assert_eq!(report["first_run_ready"], true);
@@ -13737,9 +16199,9 @@ mod doctor_endpoint_tests {
     fn strict_tool_mode_doctor_warns_for_non_beta_deepseek_endpoint() {
         let config = Config {
             strict_tool_mode: Some(true),
-            base_url: Some("https://api.deepseek.com".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(None, Some("https://api.deepseek.com".to_string()));
 
         let status = doctor_strict_tool_mode_status(&config);
 
@@ -13842,10 +16304,10 @@ mod doctor_endpoint_tests {
     #[test]
     fn provider_capability_report_preserves_custom_deepseek_alias_namespace() {
         let mut config = Config {
-            base_url: Some("https://models.example/v1".to_string()),
             default_text_model: Some("deepseek-chat".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(None, Some("https://models.example/v1".to_string()));
         crate::config::normalize_model_config_for_test(&mut config);
 
         let report = provider_capability_report(&config);
@@ -13867,6 +16329,48 @@ mod doctor_endpoint_tests {
         assert!(report["alias_deprecation"].is_null());
     }
 
+    /// The vendor reversed the planned retirement; Pro remains its own route.
+    #[test]
+    fn provider_capability_report_preserves_v4_pro_without_retirement() {
+        let mut config = Config {
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            ..Default::default()
+        }
+        .with_legacy_root(
+            None,
+            Some(crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string()),
+        );
+        crate::config::normalize_model_config_for_test(&mut config);
+        let report = provider_capability_report(&config);
+        assert_eq!(report["resolved_model"], "deepseek-v4-pro");
+        assert!(report["alias_deprecation"].is_null());
+        assert!(
+            crate::config::provider_capability(
+                crate::config::ProviderKind::Deepseek,
+                "deepseek-v4-pro"
+            )
+            .alias_deprecation
+            .is_none()
+        );
+    }
+
+    /// A custom endpoint owns the same model strings; DeepSeek's retirement is
+    /// not a claim CodeWhale may make about someone else's host.
+    #[test]
+    fn provider_capability_report_leaves_custom_v4_pro_namespace_untouched() {
+        let mut config = Config {
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            ..Default::default()
+        }
+        .with_legacy_root(None, Some("https://models.example/v1".to_string()));
+        crate::config::normalize_model_config_for_test(&mut config);
+
+        let report = provider_capability_report(&config);
+
+        assert_eq!(report["resolved_model"], "deepseek-v4-pro");
+        assert!(report["alias_deprecation"].is_null());
+    }
+
     #[test]
     fn doctor_route_report_exposes_tokenhub_openai_compatible_route_without_secret() {
         let mut providers = crate::config::ProvidersConfig::default();
@@ -13884,7 +16388,7 @@ mod doctor_endpoint_tests {
 
         assert_eq!(report["provider"], "openai");
         assert_eq!(report["provider_source"], "config");
-        assert_eq!(report["provider_config_table"], "openai");
+        assert_eq!(report["provider_config_table"], "providers.openai");
         assert_eq!(report["model"], "deepseek-ai/DeepSeek-V4-Pro");
         assert_eq!(report["wire_protocol"], "chat_completions");
         assert_eq!(
@@ -13919,7 +16423,7 @@ mod doctor_endpoint_tests {
         let serialized = report.to_string();
 
         assert_eq!(report["provider"], "siliconflow-CN");
-        assert_eq!(report["provider_config_table"], "siliconflow_cn");
+        assert_eq!(report["provider_config_table"], "providers.siliconflow_cn");
         assert_eq!(report["model"], crate::config::DEFAULT_SILICONFLOW_MODEL);
         assert_eq!(
             report["base_url"]["redacted"],
@@ -14042,19 +16546,134 @@ mod doctor_endpoint_tests {
     #[test]
     fn doctor_search_provider_line_includes_firecrawl_default_source_and_switch_hint() {
         let _guard = crate::test_support::lock_test_env();
+        // A Default pin means all three Tavily-resolution signals are absent.
+        let prev_code = std::env::var_os("CODEWHALE_SEARCH_PROVIDER");
         let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
-        unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") };
+        let prev_tavily = std::env::var_os("TAVILY_API_KEY");
+        unsafe {
+            std::env::remove_var("CODEWHALE_SEARCH_PROVIDER");
+            std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER");
+            std::env::remove_var("TAVILY_API_KEY");
+        }
 
         let line = doctor_search_provider_line(&Config::default());
 
+        match prev_code {
+            Some(value) => unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("CODEWHALE_SEARCH_PROVIDER") },
+        }
         match prev {
             Some(value) => unsafe { std::env::set_var("DEEPSEEK_SEARCH_PROVIDER", value) },
             None => unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") },
+        }
+        match prev_tavily {
+            Some(value) => unsafe { std::env::set_var("TAVILY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("TAVILY_API_KEY") },
         }
         assert!(line.contains("search_provider: firecrawl"));
         assert!(line.contains("source: default"));
         assert!(line.contains("[search] provider"));
         assert!(line.contains("provider = \"baidu\""));
+        assert!(!line.contains("missing"), "got `{line}`");
+    }
+
+    #[test]
+    fn doctor_search_provider_line_reports_autodetected_tavily_key_without_missing_key() {
+        let _guard = crate::test_support::lock_test_env();
+        let prev_code = std::env::var_os("CODEWHALE_SEARCH_PROVIDER");
+        let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
+        let prev_tavily = std::env::var_os("TAVILY_API_KEY");
+        unsafe {
+            std::env::remove_var("CODEWHALE_SEARCH_PROVIDER");
+            std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER");
+            std::env::set_var("TAVILY_API_KEY", "tvly-test-doctor");
+        }
+
+        let config = Config::default();
+        let line = doctor_search_provider_line(&config);
+        let report = doctor_search_provider_json(&config);
+
+        match prev_code {
+            Some(value) => unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("CODEWHALE_SEARCH_PROVIDER") },
+        }
+        match prev {
+            Some(value) => unsafe { std::env::set_var("DEEPSEEK_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") },
+        }
+        match prev_tavily {
+            Some(value) => unsafe { std::env::set_var("TAVILY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("TAVILY_API_KEY") },
+        }
+
+        assert_eq!(line, "search_provider: tavily (source: tavily key)");
+        assert_eq!(report["provider"], "tavily");
+        assert_eq!(report["source"], "tavily key");
+        assert!(
+            report.get("missing_key").is_none(),
+            "missing-key is stdout-only: {report}"
+        );
+        // Autodetect is runtime-only; nothing was written to the config view.
+        assert_eq!(
+            config.search.as_ref().and_then(|search| search.provider),
+            None
+        );
+    }
+
+    #[test]
+    fn doctor_search_provider_line_reports_explicit_tavily_missing_key() {
+        let _guard = crate::test_support::lock_test_env();
+        let prev_code = std::env::var_os("CODEWHALE_SEARCH_PROVIDER");
+        let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
+        let prev_tavily = std::env::var_os("TAVILY_API_KEY");
+        unsafe {
+            std::env::remove_var("CODEWHALE_SEARCH_PROVIDER");
+            std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER");
+            std::env::remove_var("TAVILY_API_KEY");
+        }
+        let config = Config {
+            search: Some(crate::config::SearchConfig {
+                provider: Some(crate::config::SearchProvider::Tavily),
+                base_url: None,
+                api_key: None,
+                native: None,
+            }),
+            ..Default::default()
+        };
+
+        let line = doctor_search_provider_line(&config);
+
+        // The env-override arm of the same rule.
+        unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", "tavily") };
+        let env_line = doctor_search_provider_line(&Config::default());
+
+        match prev_code {
+            Some(value) => unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("CODEWHALE_SEARCH_PROVIDER") },
+        }
+        match prev {
+            Some(value) => unsafe { std::env::set_var("DEEPSEEK_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") },
+        }
+        match prev_tavily {
+            Some(value) => unsafe { std::env::set_var("TAVILY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("TAVILY_API_KEY") },
+        }
+
+        assert_eq!(
+            line,
+            "search_provider: tavily (source: config); missing TAVILY_API_KEY or [search] api_key"
+        );
+        assert_eq!(
+            env_line,
+            "search_provider: tavily (source: env override); missing TAVILY_API_KEY or [search] api_key"
+        );
+        // Missing-key is stdout-only.
+        assert!(
+            doctor_search_provider_json(&config)
+                .get("missing_key")
+                .is_none()
+        );
     }
 
     #[test]
@@ -14067,6 +16686,7 @@ mod doctor_endpoint_tests {
                 provider: Some(crate::config::SearchProvider::DuckDuckGo),
                 base_url: None,
                 api_key: None,
+                native: None,
             }),
             ..Default::default()
         };
@@ -14110,6 +16730,7 @@ mod doctor_endpoint_tests {
                 provider: Some(crate::config::SearchProvider::Bing),
                 base_url: None,
                 api_key: None,
+                native: None,
             }),
             ..Default::default()
         };
@@ -14157,3453 +16778,9 @@ mod terminal_mode_tests {
     use super::*;
     use clap::Parser;
 
-    fn parse_cli(args: &[&str]) -> Cli {
-        Cli::try_parse_from(args).expect("CLI args should parse")
-    }
-
-    #[test]
-    fn headless_consultant_authority_overrides_network_allow_and_disables_web_search() {
-        let config = Config {
-            network: Some(crate::config::NetworkPolicyToml {
-                default: "allow".to_string(),
-                audit: false,
-                ..crate::config::NetworkPolicyToml::default()
-            }),
-            ..Config::default()
-        };
-        let authority = crate::tools::spec::ToolAuthorityEnvelope {
-            schema_version: 1,
-            owner: "consultant-1".to_string(),
-            authority: crate::tools::spec::ToolMutationAuthority::ReadOnly,
-            network_access: Some(false),
-            shell: crate::tools::spec::ToolShellAuthority::None,
-            verification: crate::tools::spec::ToolVerificationAuthority::None,
-            writable_roots: Vec::new(),
-            writable_files: Vec::new(),
-            coordination_contracts: Vec::new(),
-        }
-        .normalized()
-        .expect("Consultant authority");
-
-        let policy = exec_network_policy(&config, authority.network_access)
-            .expect("explicit network=false always installs a policy");
-        assert_eq!(
-            policy.evaluate("example.com", "web_search"),
-            crate::network_policy::Decision::Deny,
-            "the permissive user config must not widen Consultant network authority"
-        );
-        let mut features = crate::features::Features::default();
-        features.enable(crate::features::Feature::ShellTool);
-        features.enable(crate::features::Feature::WebSearch);
-        apply_fleet_engine_feature_caps(
-            &mut features,
-            true,
-            authority.network_access,
-            authority.shell,
-        );
-        assert!(!features.enabled(crate::features::Feature::WebSearch));
-        assert!(!features.enabled(crate::features::Feature::ShellTool));
-
-        let worker_policy = exec_network_policy(&config, Some(true)).expect("configured policy");
-        assert_eq!(
-            worker_policy.evaluate("example.com", "web_search"),
-            crate::network_policy::Decision::Allow,
-            "a network-capable role keeps the configured policy"
-        );
-    }
-    #[test]
-    fn hidden_remote_control_flag_starts_the_interactive_handoff() {
-        let cli = parse_cli(&["codewhale-tui", "--remote-control"]);
-        assert!(cli.remote_control);
-    }
-
-    #[test]
-    fn plugin_registry_discovery_is_route_independent_and_read_only() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let codewhale_home = temp.path().join("home");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
-        let workspace_arg = workspace.to_string_lossy().into_owned();
-
-        for route in [
-            Vec::<&str>::new(),
-            vec!["resume", "--last"],
-            vec!["fork", "--last"],
-            vec!["exec", "hello"],
-            vec!["serve", "--mcp"],
-        ] {
-            let mut args = vec![
-                "codewhale-tui".to_string(),
-                "--workspace".to_string(),
-                workspace_arg.clone(),
-            ];
-            args.extend(route.into_iter().map(str::to_string));
-            let cli = Cli::try_parse_from(args).expect("route should parse");
-            let discovery = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv();
-            let registry = discovery
-                .registry_for_workspace(cli.workspace.as_deref().unwrap_or(workspace.as_path()));
-            assert_eq!(registry.workspace(), workspace.as_path());
-            assert!(
-                !codewhale_home.join("plugins/state.json").exists(),
-                "startup discovery must remain read-only"
-            );
-        }
-    }
-
-    fn custom_exec_config(active: &str) -> Config {
-        let mut custom = std::collections::HashMap::new();
-        for (name, base_url, model) in [
-            (
-                "custom-a",
-                "http://127.0.0.1:18181/v1",
-                crate::config::ZAI_GLM_5_2_MODEL,
-            ),
-            ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
-        ] {
-            custom.insert(
-                name.to_string(),
-                crate::config::ProviderConfig {
-                    kind: Some("openai-compatible".to_string()),
-                    base_url: Some(base_url.to_string()),
-                    model: Some(model.to_string()),
-                    api_key: Some("local-test-key".to_string()),
-                    ..Default::default()
-                },
-            );
-        }
-        Config {
-            provider: Some(active.to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                custom,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn doctor_json_surfaces_keep_exact_named_custom_provider() {
-        let config = custom_exec_config("custom-a");
-        let workspace = tempfile::tempdir().expect("doctor workspace");
-
-        let operate = doctor_operate_fleet_report_json(&config, workspace.path());
-        let provider_model = doctor_provider_model_report_json(&config);
-        let capability = provider_capability_report(&config);
-        let route = doctor_route_report(&config);
-
-        assert_eq!(operate["provider"]["id"], "custom-a");
-        assert_eq!(provider_model["provider"]["id"], "custom-a");
-        assert_eq!(capability["resolved_provider"], "custom-a");
-        assert_eq!(route["provider"], "custom-a");
-        assert_eq!(route["provider_config_table"], "providers.custom-a");
-        let serialized = serde_json::to_string(&serde_json::json!({
-            "operate": operate,
-            "provider_model": provider_model,
-            "capability": capability,
-            "route": route,
-        }))
-        .expect("doctor JSON");
-        assert!(!serialized.contains("local-test-key"));
-    }
-
-    #[test]
-    fn doctor_operate_fleet_json_lists_multi_layer_profile_paths() {
-        // #5098: doctor must name the winning layer and every losing path
-        // when project and personal both define the same id.
-        let _env_lock = crate::test_support::lock_test_env();
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let home = tmp.path().join("home");
-        let workspace = tmp.path().join("workspace");
-        let personal = home.join("agents");
-        let project = workspace.join(".codewhale").join("agents");
-        std::fs::create_dir_all(&personal).expect("personal agents");
-        std::fs::create_dir_all(&project).expect("project agents");
-        std::fs::write(
-            personal.join("builder.toml"),
-            "id = \"builder\"\nrole_hint = \"builder\"\nmodel = \"deepseek-v4-flash\"\n",
-        )
-        .expect("personal builder");
-        std::fs::write(
-            project.join("builder.toml"),
-            "id = \"builder\"\nrole_hint = \"builder\"\nmodel = \"deepseek-v4-pro\"\n",
-        )
-        .expect("project builder");
-        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
-
-        let operate = doctor_operate_fleet_report_json(&Config::default(), &workspace);
-        let layers = operate["roster"]["multi_layer"]
-            .as_array()
-            .expect("multi_layer array");
-        let builder = layers
-            .iter()
-            .find(|entry| entry["id"] == "builder")
-            .expect("builder multi-layer entry");
-        assert_eq!(builder["effective"], "project");
-        let paths: Vec<&str> = builder["layers"]
-            .as_array()
-            .expect("layers")
-            .iter()
-            .filter_map(|layer| layer["path"].as_str())
-            .collect();
-        assert!(
-            paths.iter().any(|path| path.ends_with("builder.toml")),
-            "layer paths include the profile files: {builder}"
-        );
-        assert!(
-            builder["layers"]
-                .as_array()
-                .expect("layers")
-                .iter()
-                .any(|layer| layer["origin"] == "personal" && layer["wins"] == false),
-            "personal layer is listed as ignored: {builder}"
-        );
-        assert!(
-            builder["layers"]
-                .as_array()
-                .expect("layers")
-                .iter()
-                .any(|layer| layer["origin"] == "project" && layer["wins"] == true),
-            "project layer wins: {builder}"
-        );
-    }
-
-    fn saved_exec_session(provider: &str, model: &str) -> session_manager::SavedSession {
-        let mut saved = session_manager::create_saved_session_with_mode(
-            &[],
-            model,
-            Path::new("/tmp/exec-resume"),
-            0,
-            None,
-            Some("exec"),
-        );
-        let kind = crate::config::ApiProvider::parse(provider)
-            .unwrap_or(crate::config::ApiProvider::Custom)
-            .as_str();
-        let exact_id = (!provider
-            .eq_ignore_ascii_case(crate::config::ApiProvider::Custom.as_str()))
-        .then_some(provider);
-        saved.metadata.set_model_provider_route(kind, exact_id);
-        saved
-    }
-
-    #[test]
-    fn prompt_flag_accepts_split_prompt_words_for_windows_cmd_shims() {
-        let cli = parse_cli(&["codewhale", "-p", "hello", "world"]);
-
-        assert_eq!(cli.prompt, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn prompt_flag_starts_interactive_submit_input() {
-        let cli = parse_cli(&["codewhale", "-p", "read", "the", "project"]);
-
-        assert_eq!(
-            top_level_prompt_initial_input(&cli.prompt),
-            Some(tui::InitialInput::Submit("read the project".to_string()))
-        );
-    }
-
-    #[test]
-    fn companion_binary_reports_its_own_name() {
-        assert_eq!(Cli::command().get_name(), "codewhale-tui");
-    }
-
-    #[test]
-    fn xai_device_auth_subcommand_parses() {
-        let cli = parse_cli(&["codewhale-tui", "auth", "xai-device"]);
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Auth(TuiAuthArgs {
-                command: TuiAuthCommand::XaiDevice
-            }))
-        ));
-    }
-
-    #[test]
-    fn chatgpt_auth_subcommand_parses() {
-        let cli = parse_cli(&["codewhale-tui", "auth", "chatgpt"]);
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Auth(TuiAuthArgs {
-                command: TuiAuthCommand::Chatgpt
-            }))
-        ));
-        let cli = parse_cli(&["codewhale-tui", "auth", "chatgpt-revoke"]);
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Auth(TuiAuthArgs {
-                command: TuiAuthCommand::ChatgptRevoke
-            }))
-        ));
-    }
-
-    #[test]
-    fn workflow_tool_internal_subcommand_parses_exact_json() {
-        let cli = parse_cli(&[
-            "codewhale-tui",
-            "workflow-tool",
-            "--approval-source",
-            "explicit-workflow-command",
-            "--input-json",
-            r#"{"action":"run","source_path":"workflows/demo.js"}"#,
-        ]);
-        let Some(Commands::WorkflowTool(args)) = cli.command else {
-            panic!("expected workflow-tool command");
-        };
-        assert!(args.input_json.contains("\"action\":\"run\""));
-    }
-
-    #[tokio::test]
-    async fn direct_workflow_tool_runs_without_an_operator_model_turn() {
-        use crate::tools::spec::ToolSpec;
-
-        let workspace = tempfile::tempdir().expect("workspace");
-        let config = Config {
-            provider: Some("vllm".to_string()),
-            mcp_config_path: Some(
-                workspace
-                    .path()
-                    .join("missing-mcp.json")
-                    .display()
-                    .to_string(),
-            ),
-            providers: Some(crate::config::ProvidersConfig {
-                vllm: crate::config::ProviderConfig {
-                    base_url: Some("http://127.0.0.1:9/v1".to_string()),
-                    model: Some("offline-test-model".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let route = CliAutoRoute {
-            provider: crate::config::ApiProvider::Vllm,
-            model: "offline-test-model".to_string(),
-            reasoning_effort: None,
-            auto_controls_reasoning: false,
-            auto_model: false,
-        };
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
-        let plugins = Arc::new(crate::plugins::PluginRegistry::empty(workspace.path()));
-        let (tool, context) =
-            build_direct_workflow_tool(&config, &route, workspace.path(), event_tx, plugins)
-                .await
-                .expect("build direct workflow runtime");
-
-        let result = tool
-            .execute(
-                serde_json::json!({
-                    "action": "run",
-                    "script": "phase('offline'); return { ok: true };",
-                    "token_budget": 1_000_000
-                }),
-                &context,
-            )
-            .await
-            .expect("model-free workflow run");
-        let payload: serde_json::Value =
-            serde_json::from_str(&result.content).expect("workflow JSON");
-
-        assert_eq!(payload["status"], "completed");
-        assert_eq!(payload["result"]["ok"], true);
-        assert_eq!(payload["child_ids"].as_array().map(Vec::len), Some(0));
-        assert_eq!(
-            payload["plan_approval"]["decision"],
-            "approved_explicit_cli_command"
-        );
-        assert!(!context.auto_approve);
-        assert!(!context.trust_mode);
-        assert_eq!(
-            context.shell_policy,
-            crate::worker_profile::ShellPolicy::None
-        );
-        assert!(matches!(
-            context.elevated_sandbox_policy,
-            Some(crate::sandbox::SandboxPolicy::WorkspaceWrite { .. })
-        ));
-        let mut event_types = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            if let crate::core::events::Event::WorkflowUi { event, .. } = event
-                && let Some(kind) = event["type"].as_str()
-            {
-                event_types.push(kind.to_string());
-            }
-        }
-        assert!(event_types.iter().any(|kind| kind == "run_started"));
-        assert!(event_types.iter().any(|kind| kind == "run_completed"));
-    }
-
-    #[tokio::test]
-    async fn direct_workflow_mcp_pool_applies_network_policy_before_connect() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let mcp_path = workspace.path().join("mcp.json");
-        std::fs::write(
-            &mcp_path,
-            r#"{
-                "mcpServers": {
-                    "blocked": { "url": "https://blocked.invalid/mcp" }
-                }
-            }"#,
-        )
-        .expect("write MCP config");
-        let config = Config {
-            mcp_config_path: Some(mcp_path.display().to_string()),
-            ..Default::default()
-        };
-        let policy = crate::network_policy::NetworkPolicyDecider::new(
-            crate::network_policy::NetworkPolicy {
-                default: crate::network_policy::DecisionToml::Deny,
-                allow: Vec::new(),
-                deny: Vec::new(),
-                proxy: Vec::new(),
-                proxy_fake_ip_cidrs: Vec::new(),
-                audit: false,
-            },
-            None,
-        );
-
-        let plugins = Arc::new(crate::plugins::PluginRegistry::empty(workspace.path()));
-        let (_pool, failures) =
-            initialize_direct_workflow_mcp_pool(&config, workspace.path(), Some(policy), plugins)
-                .await
-                .expect("MCP feature enabled");
-        assert_eq!(failures.len(), 1, "failures={failures:?}");
-        assert_eq!(failures[0].0, "blocked");
-        assert!(failures[0].1.contains("blocked by network policy"));
-    }
-
-    #[test]
-    fn exec_model_resolution_uses_provider_scoped_default() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
-        let _deepseek_model = crate::test_support::EnvVarGuard::remove("DEEPSEEK_MODEL");
-        let config = Config {
-            provider: Some("openrouter".to_string()),
-            default_text_model: Some("deepseek/deepseek-v4-pro".to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                openrouter: crate::config::ProviderConfig {
-                    model: Some("arcee-ai/trinity-large-thinking".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            resolve_exec_model(&config, None),
-            "arcee-ai/trinity-large-thinking"
-        );
-        assert_eq!(
-            resolve_exec_model(&config, Some("arcee-ai/trinity-large-thinking")),
-            "arcee-ai/trinity-large-thinking"
-        );
-    }
-
-    #[test]
-    fn exec_model_resolution_prefers_codewhale_model_env_override() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codewhale_model = crate::test_support::EnvVarGuard::set("CODEWHALE_MODEL", " auto ");
-        let _deepseek_model =
-            crate::test_support::EnvVarGuard::set("DEEPSEEK_MODEL", "stale-deepseek-model");
-        let config = Config {
-            default_text_model: Some("deepseek/deepseek-v4-pro".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(resolve_exec_model(&config, None), "auto");
-    }
-
-    #[test]
-    fn exec_model_resolution_uses_legacy_deepseek_model_env_override() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
-        let _deepseek_model = crate::test_support::EnvVarGuard::set("DEEPSEEK_MODEL", " auto ");
-        let config = Config {
-            default_text_model: Some("deepseek/deepseek-v4-pro".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(resolve_exec_model(&config, None), "auto");
-    }
-
-    #[test]
-    fn exec_model_resolution_uses_provider_safe_default_for_zai() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
-        let _deepseek_model = crate::test_support::EnvVarGuard::remove("DEEPSEEK_MODEL");
-        let config = Config {
-            provider: Some("zai".to_string()),
-            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            resolve_exec_model(&config, None),
-            crate::config::DEFAULT_ZAI_MODEL
-        );
-    }
-
-    #[test]
-    fn fresh_launch_uses_selected_fleet_operator_unless_route_is_explicit() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let fleets = workspace.path().join(".codewhale").join("fleets");
-        std::fs::create_dir_all(&fleets).expect("fleet directory");
-        std::fs::write(fleets.join("selected"), "Launch\n").expect("selection");
-        std::fs::write(
-            fleets.join("launch.toml"),
-            r#"schema = "fleet"
-schema_revision = 2
-name = "Launch"
-
-[operator]
-provider = "deepseek"
-model = "deepseek-v4-flash-vision-exp"
-reasoning = "high"
-"#,
-        )
-        .expect("fleet file");
-
-        let base = Config {
-            api_key: Some("test-key".to_string()),
-            provider: Some("openrouter".to_string()),
-            reasoning_effort: Some("off".to_string()),
-            ..Default::default()
-        };
-        let mut explicit = base.clone();
-        assert!(
-            !apply_selected_fleet_operator_for_launch(
-                &mut explicit,
-                workspace.path(),
-                true,
-                false,
-            )
-            .expect("explicit route bypasses Fleet operator")
-        );
-        assert_eq!(
-            explicit.api_provider(),
-            crate::config::ApiProvider::Openrouter
-        );
-
-        let mut selected = base;
-        assert!(
-            apply_selected_fleet_operator_for_launch(
-                &mut selected,
-                workspace.path(),
-                false,
-                false,
-            )
-            .expect("selected operator applies")
-        );
-        assert_eq!(
-            selected.api_provider(),
-            crate::config::ApiProvider::Deepseek
-        );
-        assert_eq!(selected.default_model(), "deepseek-v4-flash-vision-exp");
-        assert_eq!(selected.reasoning_effort(), Some("high"));
-        assert!(selected.fleet_operator_route_applied);
-        assert!(selected.fleet_operator_reasoning_applied);
-
-        let mut reasoning_override = Config {
-            api_key: Some("test-key".to_string()),
-            reasoning_effort: Some("off".to_string()),
-            ..Default::default()
-        };
-        apply_selected_fleet_operator_for_launch(
-            &mut reasoning_override,
-            workspace.path(),
-            false,
-            true,
-        )
-        .expect("explicit reasoning coexists with Fleet route");
-        assert_eq!(
-            reasoning_override.default_model(),
-            "deepseek-v4-flash-vision-exp"
-        );
-        assert_eq!(reasoning_override.reasoning_effort(), Some("off"));
-        assert!(reasoning_override.fleet_operator_route_applied);
-        assert!(!reasoning_override.fleet_operator_reasoning_applied);
-    }
-
-    #[test]
-    fn selected_fleet_operator_load_error_redacts_paths_excerpts_and_opaque_name() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let fleets = workspace.path().join(".codewhale").join("fleets");
-        std::fs::create_dir_all(&fleets).expect("fleet directory");
-        let secret_marker = "sk-live-abcdef0123456789abcdef";
-        std::fs::write(fleets.join("selected"), format!("{secret_marker}\n")).expect("selection");
-        std::fs::write(
-            fleets.join(format!("{secret_marker}.toml")),
-            format!("invalid TOML /Users/operator/private {secret_marker}\n"),
-        )
-        .expect("invalid Fleet");
-
-        let mut config = Config::default();
-        let message =
-            apply_selected_fleet_operator_for_launch(&mut config, workspace.path(), false, false)
-                .expect_err("invalid selected Fleet must fail")
-                .to_string();
-
-        assert!(!message.contains(&workspace.path().display().to_string()));
-        assert!(!message.contains("/Users/operator"));
-        assert!(!message.contains(secret_marker));
-        assert!(!message.contains("invalid TOML"));
-        assert!(message.chars().count() <= 700, "{message}");
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn explicit_exec_model_routes_to_unique_authenticated_provider_candidate() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
-        let _openrouter = crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY");
-        let config = Config {
-            provider: Some("deepseek".to_string()),
-            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
-            ..Default::default()
-        };
-
-        let route = resolve_cli_auto_route(&config, crate::config::ZAI_GLM_5_2_MODEL, "pong")
-            .await
-            .expect("explicit GLM should route to the configured Z.ai provider");
-
-        assert_eq!(route.provider, crate::config::ApiProvider::Zai);
-        assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
-        assert!(!route.auto_model);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn explicit_exec_model_reports_ambiguous_authenticated_provider_candidates() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
-        let _openrouter = crate::test_support::EnvVarGuard::set("OPENROUTER_API_KEY", "or-key");
-        let config = Config {
-            provider: Some("deepseek".to_string()),
-            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
-            ..Default::default()
-        };
-
-        let err = resolve_cli_auto_route(&config, crate::config::ZAI_GLM_5_2_MODEL, "pong")
-            .await
-            .expect_err("ambiguous GLM route should ask for an explicit provider");
-        let message = err.to_string();
-
-        assert!(message.contains("model `GLM-5.2` is available"));
-        assert!(message.contains("openrouter"));
-        assert!(message.contains("zai"));
-        assert!(message.contains("--provider"));
-        assert!(message.contains("/provider"));
-        assert!(message.contains("/model"));
-        assert!(message.contains("/setup"));
-    }
-
-    #[tokio::test]
-    async fn cli_auto_model_honors_a_fixed_reasoning_preference() {
-        let config = Config {
-            provider: Some("vllm".to_string()),
-            reasoning_effort: Some("low".to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                vllm: crate::config::ProviderConfig {
-                    base_url: Some("http://127.0.0.1:18190/v1".to_string()),
-                    model: Some("local-auto-model".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let route = resolve_cli_auto_route(&config, "auto", "debug a failing test")
-            .await
-            .expect("Auto model route");
-
-        assert!(route.auto_model);
-        assert_eq!(
-            route.reasoning_effort,
-            Some(crate::tui::app::ReasoningEffort::Low)
-        );
-        assert!(
-            !route.auto_controls_reasoning,
-            "a fixed saved tier must not be replaced per prompt"
-        );
-    }
-
-    #[test]
-    fn cli_route_execution_config_stamps_routed_model_into_provider_slot() {
-        let mut providers = crate::config::ProvidersConfig::default();
-        providers.deepseek.model = Some("deepseek-v4-pro".to_string());
-        let config = Config {
-            provider: Some("deepseek".to_string()),
-            providers: Some(providers),
-            ..Default::default()
-        };
-        let route = CliAutoRoute {
-            provider: crate::config::ApiProvider::Deepseek,
-            model: "deepseek-v4-flash".to_string(),
-            reasoning_effort: None,
-            auto_controls_reasoning: true,
-            auto_model: true,
-        };
-
-        let execution_config = config_for_cli_route(&config, &route);
-
-        assert_eq!(execution_config.default_model(), "deepseek-v4-flash");
-        assert_eq!(
-            execution_config
-                .provider_config_for(crate::config::ApiProvider::Deepseek)
-                .and_then(|entry| entry.model.as_deref()),
-            Some("deepseek-v4-flash")
-        );
-    }
-
-    #[test]
-    fn cli_route_execution_config_preserves_legacy_literal_custom_root_route() {
-        let _lock = crate::test_support::lock_test_env();
-        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
-        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
-        let config = Config {
-            provider: Some("custom".to_string()),
-            api_key: Some("legacy-root-key".to_string()),
-            base_url: Some("http://127.0.0.1:18183/v1".to_string()),
-            default_text_model: Some("legacy-model".to_string()),
-            ..Default::default()
-        };
-        let route = CliAutoRoute {
-            provider: crate::config::ApiProvider::Custom,
-            model: "routed-legacy-model".to_string(),
-            reasoning_effort: None,
-            auto_controls_reasoning: false,
-            auto_model: false,
-        };
-
-        let execution = config_for_cli_route(&config, &route);
-
-        assert!(execution.uses_legacy_literal_custom_route());
-        assert!(
-            execution
-                .providers
-                .as_ref()
-                .is_none_or(|providers| !providers.custom.contains_key("custom"))
-        );
-        assert_eq!(execution.provider.as_deref(), Some("custom"));
-        assert_eq!(execution.default_model(), "routed-legacy-model");
-        assert_eq!(execution.deepseek_base_url(), "http://127.0.0.1:18183/v1");
-        assert_eq!(execution.deepseek_api_key().unwrap(), "legacy-root-key");
-        for _ in 0..2 {
-            let identity = execution
-                .resolve_provider_identity("custom")
-                .expect("legacy identity remains repeatedly resolvable");
-            assert_eq!(identity.key, "custom");
-        }
-        let client =
-            crate::client::DeepSeekClient::new(&execution).expect("legacy execution client");
-        assert_eq!(client.base_url(), "http://127.0.0.1:18183/v1");
-    }
-
-    #[test]
-    fn exec_accepts_split_prompt_words_for_windows_cmd_shims() {
-        let cli = parse_cli(&["codewhale", "exec", "hello", "world"]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(args.prompt, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn exec_keeps_model_flag_before_split_prompt_words() {
-        let cli = parse_cli(&["codewhale", "exec", "--model", "auto", "hello", "world"]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(args.model.as_deref(), Some("auto"));
-        assert_eq!(args.prompt, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn exec_keeps_flags_before_split_prompt_words() {
-        let cli = parse_cli(&["codewhale", "exec", "--json", "hello", "world"]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert!(args.json);
-        assert_eq!(args.prompt, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn exec_parses_provider_flag_alongside_model() {
-        // #4093: Fleet threads `--provider <id>` so a worker launches on its
-        // profile-pinned provider even when the parent session is elsewhere.
-        let cli = parse_cli(&[
-            "codewhale",
-            "exec",
-            "--provider",
-            "openrouter",
-            "--model",
-            "glm-5.2",
-            "audit",
-        ]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(args.provider.as_deref(), Some("openrouter"));
-        assert_eq!(args.model.as_deref(), Some("glm-5.2"));
-        assert_eq!(args.prompt, vec!["audit"]);
-        // The threaded id round-trips through the provider vocabulary the exec
-        // handler validates against — never a model-id sniff (EPIC #2608).
-        assert_eq!(
-            crate::config::ApiProvider::parse(args.provider.as_deref().unwrap()),
-            Some(crate::config::ApiProvider::Openrouter)
-        );
-    }
-
-    #[test]
-    fn exec_provider_override_accepts_configured_custom_provider() {
-        let mut custom = std::collections::HashMap::new();
-        custom.insert(
-            "lm-studio".to_string(),
-            crate::config::ProviderConfig {
-                kind: Some("openai-compatible".to_string()),
-                base_url: Some("http://127.0.0.1:1234/v1".to_string()),
-                model: Some("qwen-2.5-7b".to_string()),
-                api_key: Some("lm-studio".to_string()),
-                ..Default::default()
-            },
-        );
-        let mut config = Config {
-            provider: Some("deepseek".to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                custom,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        apply_exec_provider_override(&mut config, "lm-studio")
-            .expect("configured custom provider should be accepted");
-
-        assert_eq!(config.provider.as_deref(), Some("lm-studio"));
-        assert_eq!(config.api_provider(), crate::config::ApiProvider::Custom);
-    }
-
-    #[test]
-    fn exec_provider_override_prefers_exact_case_colliding_custom_key() {
-        let mut config = Config {
-            provider: Some("deepseek".to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                custom: std::collections::HashMap::from([(
-                    "CUSTOM".to_string(),
-                    crate::config::ProviderConfig {
-                        kind: Some("openai-compatible".to_string()),
-                        base_url: Some("http://127.0.0.1:5678/v1".to_string()),
-                        model: Some("case-model".to_string()),
-                        api_key: Some("case-key".to_string()),
-                        ..Default::default()
-                    },
-                )]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        apply_exec_provider_override(&mut config, "CUSTOM")
-            .expect("exact case-colliding custom provider");
-        assert_eq!(config.provider.as_deref(), Some("CUSTOM"));
-        assert_eq!(config.api_provider(), crate::config::ApiProvider::Custom);
-        assert_eq!(
-            config.provider_identity_for(crate::config::ApiProvider::Custom),
-            "CUSTOM"
-        );
-        let route = crate::route_runtime::resolve_runtime_route(
-            &config,
-            crate::config::ApiProvider::Custom,
-            Some("case-model"),
-        )
-        .expect("resolve exact case-colliding route")
-        .validate()
-        .expect("preflight exact case-colliding route");
-        assert_eq!(route.identity.key, "CUSTOM");
-        assert_eq!(route.client.base_url(), "http://127.0.0.1:5678/v1");
-    }
-
-    #[test]
-    fn exec_provider_override_rejects_unknown_provider() {
-        let mut config = Config {
-            provider: Some("deepseek".to_string()),
-            ..Default::default()
-        };
-
-        let err = apply_exec_provider_override(&mut config, "lm-studio")
-            .expect_err("unconfigured custom provider should fail closed");
-        let message = err.to_string();
-
-        assert!(message.contains("Unrecognized --provider"));
-        assert!(message.contains("[providers.<name>] custom provider"));
-        assert_eq!(config.provider.as_deref(), Some("deepseek"));
-    }
-
-    #[test]
-    fn exec_resume_route_matrix_preserves_or_overrides_exact_provider_deliberately() {
-        let saved = saved_exec_session("custom-a", crate::config::ZAI_GLM_5_2_MODEL);
-
-        let mut restored = custom_exec_config("custom-b");
-        let model = resolve_exec_resume_route(&mut restored, &saved, false, None)
-            .expect("plain resume restores saved route");
-        assert_eq!(restored.provider.as_deref(), Some("custom-a"));
-        assert_eq!(model, crate::config::ZAI_GLM_5_2_MODEL);
-
-        let mut explicit_provider = custom_exec_config("custom-a");
-        apply_exec_provider_override(&mut explicit_provider, "custom-b").expect("custom B");
-        let model = resolve_exec_resume_route(&mut explicit_provider, &saved, true, None)
-            .expect("explicit provider wins");
-        assert_eq!(explicit_provider.provider.as_deref(), Some("custom-b"));
-        assert_eq!(model, "model-b");
-
-        let mut explicit_model = custom_exec_config("custom-b");
-        let model =
-            resolve_exec_resume_route(&mut explicit_model, &saved, false, Some("override-model"))
-                .expect("explicit model keeps saved provider");
-        assert_eq!(explicit_model.provider.as_deref(), Some("custom-a"));
-        assert_eq!(model, "override-model");
-
-        let mut missing = custom_exec_config("custom-b");
-        missing
-            .providers
-            .as_mut()
-            .expect("providers")
-            .custom
-            .remove("custom-a");
-        let before = missing.provider.clone();
-        let err = resolve_exec_resume_route(&mut missing, &saved, false, None)
-            .expect_err("removed saved provider must fail closed");
-        assert!(err.to_string().contains("will not fall back"), "{err}");
-        assert_eq!(missing.provider, before);
-    }
-
-    #[test]
-    fn exec_resume_honours_dispatcher_forwarded_launch_overrides() {
-        // `codewhale --provider X --model Y exec --resume ID ...` reaches this
-        // binary with X/Y only in CODEWHALE_PROVIDER / CODEWHALE_MODEL; a
-        // resume must treat them as explicit instead of restoring the saved
-        // route.
-        assert_eq!(
-            exec_resume_route_overrides(None, None, None, None),
-            (false, None)
-        );
-        assert_eq!(
-            exec_resume_route_overrides(None, None, Some("modelstudio-token-plan"), None),
-            (true, None)
-        );
-        assert_eq!(
-            exec_resume_route_overrides(None, None, None, Some("qwen3.8-flash")),
-            (false, Some("qwen3.8-flash".to_string()))
-        );
-        assert_eq!(
-            exec_resume_route_overrides(
-                None,
-                None,
-                Some("modelstudio-token-plan"),
-                Some(" qwen3.8-flash ")
-            ),
-            (true, Some("qwen3.8-flash".to_string()))
-        );
-        // Exec-level flags still win over the forwarded launch env.
-        assert_eq!(
-            exec_resume_route_overrides(
-                Some("deepseek"),
-                Some("deepseek-v4-pro"),
-                Some("x"),
-                Some("y")
-            ),
-            (true, Some("deepseek-v4-pro".to_string()))
-        );
-        // Blank values are not overrides.
-        assert_eq!(
-            exec_resume_route_overrides(None, None, Some("  "), Some("")),
-            (false, None)
-        );
-
-        let saved = saved_exec_session("custom-a", crate::config::ZAI_GLM_5_2_MODEL);
-        let mut launch_model_only = custom_exec_config("custom-b");
-        let (explicit_provider, explicit_model) =
-            exec_resume_route_overrides(None, None, None, Some("override-model"));
-        let model = resolve_exec_resume_route(
-            &mut launch_model_only,
-            &saved,
-            explicit_provider,
-            explicit_model.as_deref(),
-        )
-        .expect("launch model override keeps saved provider");
-        assert_eq!(launch_model_only.provider.as_deref(), Some("custom-a"));
-        assert_eq!(model, "override-model");
-
-        let mut launch_provider = custom_exec_config("custom-b");
-        let (explicit_provider, explicit_model) =
-            exec_resume_route_overrides(None, None, Some("custom-b"), None);
-        let model = resolve_exec_resume_route(
-            &mut launch_provider,
-            &saved,
-            explicit_provider,
-            explicit_model.as_deref(),
-        )
-        .expect("launch provider override keeps the launched route");
-        assert_eq!(launch_provider.provider.as_deref(), Some("custom-b"));
-        assert_eq!(model, "model-b");
-    }
-
-    #[test]
-    fn exec_resume_uses_dispatcher_env_route_loaded_by_config() {
-        // Exercise the production sequence without starting an Engine turn:
-        // `Config::load` applies the dispatcher-forwarded environment, then
-        // the resume seam must treat the same launch env as explicit and skip
-        // the unavailable persisted route rather than restoring it.
-        let _env_lock = crate::test_support::lock_test_env();
-        let _legacy_provider = crate::test_support::EnvVarGuard::remove("DEEPSEEK_PROVIDER");
-        let _legacy_model = crate::test_support::EnvVarGuard::remove("DEEPSEEK_MODEL");
-        let _provider = crate::test_support::EnvVarGuard::set("CODEWHALE_PROVIDER", "launch-route");
-        let _model = crate::test_support::EnvVarGuard::set("CODEWHALE_MODEL", "dispatcher-model");
-        let tmp = tempfile::tempdir().expect("config tempdir");
-        let codewhale_home = tmp.path().join("codewhale-home");
-        std::fs::create_dir_all(&codewhale_home).expect("isolated Codewhale home");
-        let _codewhale_home =
-            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"provider = "stored-route"
-
-[providers.launch-route]
-kind = "openai-compatible"
-base_url = "https://launch.example.test/v1"
-model = "configured-launch-model"
-api_key = "test-only-key"
-"#,
-        )
-        .expect("write config");
-
-        let mut config = Config::load(Some(config_path), None).expect("load launch config");
-        assert_eq!(config.provider.as_deref(), Some("launch-route"));
-        assert_eq!(config.default_model(), "dispatcher-model");
-
-        // The saved route deliberately has no live config table. This control
-        // proves that a non-explicit resume would fail closed instead of
-        // silently falling back; the dispatcher overrides must prevent that
-        // restore attempt.
-        let saved = saved_exec_session("stored-route", "stored-model");
-        let mut restore_attempt = config.clone();
-        let restore_error = resolve_exec_resume_route(&mut restore_attempt, &saved, false, None)
-            .expect_err("unavailable saved route must not be restored");
-        assert!(
-            restore_error.to_string().contains("stored-route"),
-            "{restore_error}"
-        );
-
-        let (explicit_provider, explicit_model) = exec_resume_route_overrides(
-            None,
-            None,
-            crate::config::explicit_launch_provider_override().as_deref(),
-            crate::config::explicit_launch_model_override().as_deref(),
-        );
-        assert!(explicit_provider);
-        assert_eq!(explicit_model.as_deref(), Some("dispatcher-model"));
-
-        let model = resolve_exec_resume_route(
-            &mut config,
-            &saved,
-            explicit_provider,
-            explicit_model.as_deref(),
-        )
-        .expect("dispatcher environment must keep the launch route on resume");
-        assert_eq!(config.provider.as_deref(), Some("launch-route"));
-        assert_eq!(model, "dispatcher-model");
-    }
-
-    #[test]
-    fn exec_model_reads_wait_for_foreign_test_env_overrides_to_restore() {
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        let (reader, expected_after_restore) = {
-            let lock = crate::test_support::lock_test_env();
-            let expected_after_restore = exec_model_env_override();
-            let temporary =
-                crate::test_support::EnvVarGuard::set("CODEWHALE_MODEL", "temporary-model");
-            let reader = std::thread::spawn(move || {
-                started_tx.send(()).expect("signal model read start");
-                tx.send(exec_model_env_override())
-                    .expect("send resolved model override");
-            });
-
-            started_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("reader reached model read");
-            assert!(
-                rx.recv_timeout(std::time::Duration::from_millis(50))
-                    .is_err(),
-                "a foreign reader observed another test's temporary model override"
-            );
-            drop(temporary);
-            drop(lock);
-            (reader, expected_after_restore)
-        };
-
-        let observed = rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("reader resumed after model override was restored");
-        reader.join().expect("reader thread");
-        assert_eq!(observed, expected_after_restore);
-    }
-
-    #[tokio::test]
-    async fn forced_exec_route_keeps_custom_provider_when_model_matches_builtin_catalog() {
-        let config = custom_exec_config("custom-a");
-
-        let route =
-            resolve_cli_exec_route(&config, crate::config::ZAI_GLM_5_2_MODEL, "audit", true)
-                .await
-                .expect("forced route");
-        let execution = config_for_cli_route(&config, &route);
-
-        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
-        assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
-        assert_eq!(execution.provider.as_deref(), Some("custom-a"));
-    }
-
-    #[tokio::test]
-    async fn no_flag_exec_keeps_configured_named_custom_route_for_matching_builtin_model() {
-        let mut config = custom_exec_config("custom-a");
-        config
-            .providers
-            .as_mut()
-            .expect("providers")
-            .custom
-            .get_mut("custom-a")
-            .expect("custom A")
-            .model = Some(crate::config::ZAI_GLM_5_2_MODEL.to_string());
-        let model = resolve_exec_model(&config, None);
-        let force = should_force_configured_exec_route(false, None, None);
-
-        assert!(force, "configured/default exec route must be authoritative");
-        assert!(!should_force_configured_exec_route(
-            false,
-            None,
-            Some(crate::config::ZAI_GLM_5_2_MODEL)
-        ));
-        assert!(should_force_configured_exec_route(
-            false,
-            Some("custom-a"),
-            Some(crate::config::ZAI_GLM_5_2_MODEL)
-        ));
-        assert!(should_force_configured_exec_route(
-            true,
-            None,
-            Some("override-model")
-        ));
-
-        let route = resolve_cli_exec_route(&config, &model, "audit", force)
-            .await
-            .expect("no-flag configured route");
-        let execution = config_for_cli_route(&config, &route);
-        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
-        assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
-        assert_eq!(execution.provider.as_deref(), Some("custom-a"));
-    }
-
-    #[tokio::test]
-    async fn configured_review_default_keeps_named_custom_route_and_exact_receipt() {
-        let mut config = custom_exec_config("custom-a");
-        config
-            .providers
-            .as_mut()
-            .expect("providers")
-            .custom
-            .get_mut("custom-a")
-            .expect("custom A")
-            .model = Some("model-a".to_string());
-        config.default_text_model = Some("stale-root-deepseek-model".to_string());
-        let model = resolve_review_model(&config, None);
-        assert_eq!(model, "model-a");
-        assert_eq!(
-            resolve_review_model(&config, Some("explicit-review-model")),
-            "explicit-review-model"
-        );
-
-        let route = resolve_cli_exec_route(&config, &model, "review diff", true)
-            .await
-            .expect("configured review route");
-        let execution = config_for_cli_route(&config, &route);
-        let provider = execution.provider_identity_for(route.provider);
-
-        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
-        assert_eq!(provider, "custom-a");
-        assert_eq!(execution.deepseek_base_url(), "http://127.0.0.1:18181/v1");
-        let output = crate::tools::review::ReviewOutput::from_str("{}");
-        let receipt = crate::tools::review::build_review_receipt(
-            "working tree",
-            "diff --git a/a b/a",
-            provider,
-            &route.model,
-            &output,
-            "{}",
-            Vec::new(),
-        );
-        assert_eq!(receipt.provider, "custom-a");
-        let serialized = serde_json::to_string(&receipt).expect("review receipt");
-        assert!(!serialized.contains("127.0.0.1"));
-        assert!(!serialized.contains("local-test-key"));
-    }
-
-    fn review_args(argv: &[&str]) -> ReviewArgs {
-        let cli = parse_cli(argv);
-        let Some(Commands::Review(args)) = cli.command else {
-            panic!("expected review command");
-        };
-        args
-    }
-
-    #[test]
-    fn review_parses_provider_flag_alongside_model() {
-        let args = review_args(&[
-            "codewhale",
-            "review",
-            "--pr",
-            "5709",
-            "--provider",
-            "zai",
-            "--model",
-            "GLM-5.3",
-        ]);
-
-        assert_eq!(args.provider.as_deref(), Some("zai"));
-        assert_eq!(args.model.as_deref(), Some("GLM-5.3"));
-        assert_eq!(args.pr, Some(5709));
-        // The threaded id round-trips through the provider vocabulary the
-        // override validates against — never a model-id sniff.
-        assert_eq!(
-            crate::config::ApiProvider::parse(args.provider.as_deref().unwrap()),
-            Some(crate::config::ApiProvider::Zai)
-        );
-    }
-
-    #[tokio::test]
-    async fn review_provider_flag_pins_route_for_multi_route_model() {
-        // A genuinely multi-route model: `shared-review-model` is the
-        // configured model of BOTH named routes below, while the active route
-        // (custom-a) does not offer it. (Two custom providers can never be
-        // ambiguous — the route inventory resolves only the active custom
-        // entry — so the multi-route pair has to be named providers.)
-        // Without `--provider`, an explicit `--model` lets cross-provider
-        // inventory inference run, and a model offered by more than one
-        // configured route hard-errors in `resolve_cli_auto_route`
-        // ("available from configured provider route(s): ..."). That error
-        // already tells the user to "Pass `--provider <provider>`" — until
-        // now `codewhale review` had no such flag to pass.
-        let mut config = custom_exec_config("custom-a");
-        {
-            let providers = config.providers.as_mut().expect("providers");
-            for entry in [&mut providers.deepseek, &mut providers.openrouter] {
-                *entry = crate::config::ProviderConfig {
-                    model: Some("shared-review-model".to_string()),
-                    api_key: Some("local-test-key".to_string()),
-                    ..Default::default()
-                };
-            }
-        }
-
-        let inferred = review_args(&["codewhale", "review", "--model", "shared-review-model"]);
-        let (inferred_config, inferred_force) =
-            review_execution_route(&config, &inferred).expect("model-only route");
-        assert!(
-            !inferred_force,
-            "an explicit model with no provider stays open to inventory inference"
-        );
-        assert_eq!(inferred_config.provider.as_deref(), Some("custom-a"));
-
-        // Without the flag the multi-route model must refuse to guess.
-        let err = resolve_cli_exec_route(
-            &inferred_config,
-            &resolve_review_model(&inferred_config, inferred.model.as_deref()),
-            "review diff",
-            inferred_force,
-        )
-        .await
-        .expect_err("a model offered by two configured routes must hard-error");
-        let message = err.to_string();
-        assert!(
-            message.contains("available from configured provider route(s)"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("deepseek") && message.contains("openrouter"),
-            "both candidate routes must be named: {message}"
-        );
-
-        // With the flag the same model pins to the named route and resolves.
-        let pinned = review_args(&[
-            "codewhale",
-            "review",
-            "--provider",
-            "deepseek",
-            "--model",
-            "shared-review-model",
-        ]);
-        let (pinned_config, pinned_force) =
-            review_execution_route(&config, &pinned).expect("pinned route");
-        assert!(pinned_force, "--provider makes the route authoritative");
-        assert_eq!(pinned_config.provider.as_deref(), Some("deepseek"));
-
-        let route = resolve_cli_exec_route(
-            &pinned_config,
-            &resolve_review_model(&pinned_config, pinned.model.as_deref()),
-            "review diff",
-            pinned_force,
-        )
-        .await
-        .expect("pinned review route");
-        let execution = config_for_cli_route(&pinned_config, &route);
-
-        assert_eq!(route.provider, crate::config::ApiProvider::Deepseek);
-        assert_eq!(route.model, "shared-review-model");
-        assert_eq!(
-            execution.provider_identity_for(route.provider),
-            "deepseek",
-            "the review runs on the provider the flag named"
-        );
-
-        // Pinning a configured custom provider (the workflow's
-        // CODEWHALE_REVIEW_PROVIDER="my-proxy" case) is equally authoritative
-        // for the same multi-route model.
-        let pinned_custom = review_args(&[
-            "codewhale",
-            "review",
-            "--provider",
-            "custom-b",
-            "--model",
-            "shared-review-model",
-        ]);
-        let (custom_config, custom_force) =
-            review_execution_route(&config, &pinned_custom).expect("pinned custom route");
-        assert!(custom_force);
-        let custom_route = resolve_cli_exec_route(
-            &custom_config,
-            &resolve_review_model(&custom_config, pinned_custom.model.as_deref()),
-            "review diff",
-            custom_force,
-        )
-        .await
-        .expect("pinned custom review route");
-        let custom_execution = config_for_cli_route(&custom_config, &custom_route);
-
-        assert_eq!(custom_route.provider, crate::config::ApiProvider::Custom);
-        assert_eq!(custom_route.model, "shared-review-model");
-        assert_eq!(
-            custom_execution.provider_identity_for(custom_route.provider),
-            "custom-b",
-            "the review runs on the custom provider the flag named"
-        );
-    }
-
-    #[test]
-    fn review_provider_flag_rejects_unknown_provider() {
-        let config = custom_exec_config("custom-a");
-        let args = review_args(&["codewhale", "review", "--provider", "not-a-provider"]);
-
-        let err = review_execution_route(&config, &args)
-            .expect_err("unknown provider must fail before any diff is fetched");
-        assert!(
-            err.to_string().contains("Unrecognized --provider"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn review_without_provider_flag_keeps_configured_route_authoritative() {
-        let config = custom_exec_config("custom-a");
-        let args = review_args(&["codewhale", "review"]);
-
-        let (resolved, force) = review_execution_route(&config, &args).expect("default route");
-        assert!(
-            force,
-            "the configured/default review route is authoritative"
-        );
-        assert_eq!(resolved.provider.as_deref(), Some("custom-a"));
-    }
-
-    fn review_issue(
-        severity: &str,
-        path: Option<&str>,
-        line: Option<u32>,
-    ) -> crate::tools::review::ReviewIssue {
-        crate::tools::review::ReviewIssue {
-            severity: severity.to_string(),
-            title: format!("{severity} finding"),
-            description: "detail".to_string(),
-            path: path.map(str::to_string),
-            line,
-        }
-    }
-
-    fn review_suggestion(
-        path: Option<&str>,
-        line: Option<u32>,
-        replacement: Option<&str>,
-    ) -> crate::tools::review::ReviewSuggestion {
-        crate::tools::review::ReviewSuggestion {
-            path: path.map(str::to_string),
-            line,
-            start_line: None,
-            end_line: None,
-            suggestion: "Use the checked variant".to_string(),
-            replacement: replacement.map(str::to_string),
-        }
-    }
-
-    fn review_with(
-        issues: Vec<crate::tools::review::ReviewIssue>,
-        suggestions: Vec<crate::tools::review::ReviewSuggestion>,
-    ) -> crate::tools::review::ReviewOutput {
-        crate::tools::review::ReviewOutput {
-            summary: "summary".to_string(),
-            issues,
-            suggestions,
-            overall_assessment: String::new(),
-        }
-    }
-
-    /// Two hunks in one file: right lines 10..=12 and 40..=41.
-    ///
-    /// Built from a slice, not one string literal: a `\` continuation strips
-    /// the leading space that marks a context line.
-    fn review_test_diff() -> String {
-        [
-            "diff --git a/crates/tui/src/lib.rs b/crates/tui/src/lib.rs",
-            "index 1111111..2222222 100644",
-            "--- a/crates/tui/src/lib.rs",
-            "+++ b/crates/tui/src/lib.rs",
-            "@@ -10,2 +10,3 @@ fn head() {",
-            " let a = 1;",
-            "+let b = a.unwrap();",
-            " let c = 2;",
-            "@@ -40,2 +40,2 @@ fn tail() {",
-            " let d = 3;",
-            "-let e = d;",
-            "+let e = d + 1;",
-            "",
-        ]
-        .join("\n")
-    }
-
-    #[test]
-    fn inline_review_comments_keep_only_hunk_locatable_issues() {
-        let review = review_with(
-            vec![
-                review_issue("error", Some("./crates/tui/src/lib.rs"), Some(11)),
-                review_issue("warning", Some("docs/NOT_IN_DIFF.md"), Some(3)),
-                review_issue("info", Some("crates/tui/src/lib.rs"), None),
-                review_issue("error", None, Some(7)),
-            ],
-            Vec::new(),
-        );
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        // GitHub rejects the entire review (422) when a comment's path is not
-        // part of the diff, and inline comments need a line to anchor to.
-        assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0]["path"], "crates/tui/src/lib.rs");
-        assert_eq!(comments[0]["line"], 11);
-        assert_eq!(comments[0]["side"], "RIGHT");
-    }
-
-    #[test]
-    fn inline_review_comments_drop_one_out_of_hunk_anchor_not_the_whole_review() {
-        // Line 25 is inside the file but between the two hunks. Before the
-        // hunk filter this single bad anchor 422'd the review and every inline
-        // comment was lost to the summary-only retry.
-        let review = review_with(
-            vec![
-                review_issue("error", Some("crates/tui/src/lib.rs"), Some(11)),
-                review_issue("error", Some("crates/tui/src/lib.rs"), Some(25)),
-                review_issue("warning", Some("crates/tui/src/lib.rs"), Some(41)),
-            ],
-            Vec::new(),
-        );
-        let plan = plan_inline_review_comments(&review, &review_test_diff());
-        let lines: Vec<_> = plan.comments.iter().map(|c| c["line"].clone()).collect();
-        assert_eq!(lines, vec![serde_json::json!(11), serde_json::json!(41)]);
-        // The loss is counted and reported, never silent.
-        assert_eq!(plan.dropped_out_of_hunk, 1);
-        assert_eq!(plan.dropped_untouched_file, 0);
-        assert!(
-            plan.receipt()
-                .expect("receipt")
-                .contains("no line inside a diff hunk")
-        );
-    }
-
-    #[test]
-    fn review_suggestion_with_replacement_posts_a_committable_block() {
-        let review = review_with(
-            Vec::new(),
-            vec![review_suggestion(
-                Some("crates/tui/src/lib.rs"),
-                Some(11),
-                Some("let b = a.unwrap_or_default();"),
-            )],
-        );
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        assert_eq!(comments.len(), 1);
-        let body = comments[0]["body"].as_str().expect("body");
-        assert!(body.starts_with("Use the checked variant"), "{body}");
-        assert!(
-            body.contains("```suggestion\nlet b = a.unwrap_or_default();\n```"),
-            "{body}"
-        );
-        assert_eq!(comments[0]["side"], "RIGHT");
-        // Single-line suggestions must not carry start_line.
-        assert!(comments[0].get("start_line").is_none());
-    }
-
-    #[test]
-    fn multi_line_review_suggestion_spans_start_line_to_line() {
-        let mut suggestion = review_suggestion(
-            Some("crates/tui/src/lib.rs"),
-            Some(12),
-            Some("let b = a.unwrap_or_default();\nlet c = 2;"),
-        );
-        suggestion.start_line = Some(11);
-        suggestion.end_line = Some(12);
-        let review = review_with(Vec::new(), vec![suggestion]);
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0]["start_line"], 11);
-        assert_eq!(comments[0]["start_side"], "RIGHT");
-        assert_eq!(comments[0]["line"], 12);
-        assert_eq!(comments[0]["side"], "RIGHT");
-    }
-
-    #[test]
-    fn review_suggestion_without_replacement_degrades_to_prose() {
-        // SAFETY: a committable suggestion is one click from being merged, so
-        // a suggestion the model did not back with literal code must never
-        // render as an applicable block.
-        let review = review_with(
-            Vec::new(),
-            vec![review_suggestion(
-                Some("crates/tui/src/lib.rs"),
-                Some(11),
-                None,
-            )],
-        );
-        let plan = plan_inline_review_comments(&review, &review_test_diff());
-        assert_eq!(plan.comments.len(), 1);
-        let body = plan.comments[0]["body"].as_str().expect("body");
-        assert_eq!(body, "Use the checked variant");
-        assert!(!body.contains("```suggestion"), "{body}");
-        assert_eq!(plan.degraded_to_prose, 1);
-    }
-
-    #[test]
-    fn review_suggestion_spanning_outside_a_hunk_degrades_to_prose() {
-        // Line 12 is in a hunk but line 13 is not, so the span cannot be
-        // committed. Keep the finding, drop the one-click apply.
-        let mut suggestion = review_suggestion(
-            Some("crates/tui/src/lib.rs"),
-            Some(12),
-            Some("let c = 2;\nlet d = 3;"),
-        );
-        suggestion.start_line = Some(12);
-        suggestion.end_line = Some(13);
-        let review = review_with(Vec::new(), vec![suggestion]);
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        // end_line 13 is outside every hunk, so there is no anchor at all.
-        assert!(comments.is_empty());
-
-        // Same replacement anchored at an in-hunk end line but with a start
-        // line outside the hunk: anchor is valid, span is not -> prose.
-        let mut suggestion = review_suggestion(
-            Some("crates/tui/src/lib.rs"),
-            Some(11),
-            Some("let a = 1;\nlet b = a.unwrap_or_default();"),
-        );
-        suggestion.start_line = Some(9);
-        suggestion.end_line = Some(11);
-        let review = review_with(Vec::new(), vec![suggestion]);
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        assert_eq!(comments.len(), 1);
-        let body = comments[0]["body"].as_str().expect("body");
-        assert!(!body.contains("```suggestion"), "{body}");
-        assert!(comments[0].get("start_line").is_none());
-    }
-
-    #[test]
-    fn review_suggestion_anchored_to_a_deleted_line_is_not_committable() {
-        // Right line 41 is `+let e = d + 1;`; the deleted `-let e = d;` has no
-        // RIGHT-side number, so a model that anchors at the pre-image line 42
-        // gets nothing rather than a suggestion on the wrong line.
-        let review = review_with(
-            Vec::new(),
-            vec![review_suggestion(
-                Some("crates/tui/src/lib.rs"),
-                Some(42),
-                Some("let e = d + 2;"),
-            )],
-        );
-        assert!(
-            plan_inline_review_comments(&review, &review_test_diff())
-                .comments
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn review_suggestion_replacement_containing_backticks_is_fenced_safely() {
-        let review = review_with(
-            Vec::new(),
-            vec![review_suggestion(
-                Some("crates/tui/src/lib.rs"),
-                Some(11),
-                Some("let b = \"```\";"),
-            )],
-        );
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        let body = comments[0]["body"].as_str().expect("body");
-        assert!(body.contains("````suggestion\n"), "{body}");
-        assert!(body.ends_with("\n````"), "{body}");
-    }
-
-    #[test]
-    fn review_suggestion_multi_line_replacement_without_span_degrades_to_prose() {
-        // SAFETY: with no start_line/end_line, GitHub would insert these two
-        // lines at line 11 and leave the original line 11 duplicated below.
-        let review = review_with(
-            Vec::new(),
-            vec![review_suggestion(
-                Some("crates/tui/src/lib.rs"),
-                Some(11),
-                Some("let b = a.unwrap_or_default();\nlet c = 2;"),
-            )],
-        );
-        let plan = plan_inline_review_comments(&review, &review_test_diff());
-        assert_eq!(plan.comments.len(), 1);
-        assert!(
-            !plan.comments[0]["body"]
-                .as_str()
-                .expect("body")
-                .contains("```suggestion")
-        );
-        assert_eq!(plan.degraded_to_prose, 1);
-    }
-
-    #[test]
-    fn review_suggestion_prose_fence_is_never_committable() {
-        // SAFETY: only the replacement this reviewer validated against the
-        // diff may be one click from merging. A fence the model wrote inside
-        // its explanation is downgraded to a plain code block.
-        let mut suggestion = review_suggestion(Some("crates/tui/src/lib.rs"), Some(11), None);
-        suggestion.suggestion =
-            "Try this:\n\n```suggestion\nlet b = a.unwrap_or_default();\n```".to_string();
-        let review = review_with(Vec::new(), vec![suggestion]);
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        let body = comments[0]["body"].as_str().expect("body");
-        assert!(!body.contains("```suggestion"), "{body}");
-        assert!(body.contains("```text"), "{body}");
-        assert!(body.contains("let b = a.unwrap_or_default();"), "{body}");
-    }
-
-    #[test]
-    fn review_suggestion_tilde_prose_fence_is_neutralized() {
-        let mut suggestion = review_suggestion(Some("crates/tui/src/lib.rs"), Some(11), None);
-        suggestion.suggestion = "  ~~~suggestion\n  x\n  ~~~".to_string();
-        let review = review_with(Vec::new(), vec![suggestion]);
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        let body = comments[0]["body"].as_str().expect("body");
-        assert!(body.contains("  ~~~text"), "{body}");
-    }
-
-    #[test]
-    fn suggestion_fence_behind_list_marker_or_blockquote_is_neutralized() {
-        // Whether GitHub renders a fence nested behind a list marker,
-        // blockquote cue, or ordered-list marker applicable is unverified,
-        // so those shapes are treated as live and downgraded too. Ordinary
-        // prose lines that merely start with a marker stay untouched.
-        let neutralized = neutralize_model_suggestion_fences(
-            "```suggestion\n- ```suggestion\n  rm -rf /\n> ```suggestion\n1. ```suggestion\n> - ~~~suggestion\n- fix the `foo` call",
-        );
-        assert_eq!(
-            neutralized,
-            "```text\n- ```text\n  rm -rf /\n> ```text\n1. ```text\n> - ~~~text\n- fix the `foo` call"
-        );
-    }
-
-    #[test]
-    fn inline_issue_comment_neutralizes_model_suggestion_fences_in_issue_text() {
-        // SAFETY: regression for a proven hole — the issue title and
-        // description are raw model text, and a ```suggestion fence in
-        // either used to reach the inline comment body verbatim: a
-        // one-click mergeable block that bypassed every span and size
-        // check. Only a replacement validated against the diff hunks may
-        // ever be committable.
-        let mut fenced_description = review_issue("error", Some("crates/tui/src/lib.rs"), Some(11));
-        fenced_description.title = "Cleanup script".to_string();
-        fenced_description.description = "Run this:\n\n```suggestion\nrm -rf /\n```\n".to_string();
-        let mut fenced_title = review_issue("warning", Some("crates/tui/src/lib.rs"), Some(12));
-        fenced_title.title = "Fix all\n```suggestion\nrm -rf ~\n```".to_string();
-        fenced_title.description = "detail".to_string();
-        let review = review_with(vec![fenced_description, fenced_title], Vec::new());
-
-        let comments = plan_inline_review_comments(&review, &review_test_diff()).comments;
-        assert_eq!(comments.len(), 2);
-        for comment in &comments {
-            let body = comment["body"].as_str().expect("body");
-            assert!(!body.contains("```suggestion"), "{body}");
-        }
-        let description_body = comments[0]["body"].as_str().expect("body");
-        assert!(
-            description_body.contains("```text\nrm -rf /"),
-            "{description_body}"
-        );
-        let title_body = comments[1]["body"].as_str().expect("body");
-        assert!(title_body.contains("```text\nrm -rf ~"), "{title_body}");
-    }
-
-    #[test]
-    fn pr_review_markdown_shows_the_computed_replacement() {
-        // A plain `codewhale review --pr` (no --post) computes and validates
-        // the literal fix; the local report must show it, not just the prose.
-        let view = GhPullRequest {
-            title: "T".to_string(),
-            body: String::new(),
-            base: "main".to_string(),
-            head: "feature".to_string(),
-            url: "https://example.invalid/pr/1".to_string(),
-            head_sha: "abc123".to_string(),
-        };
-        let mut single = review_suggestion(
-            Some("crates/tui/src/lib.rs"),
-            Some(11),
-            Some("let b = a.unwrap_or_default();"),
-        );
-        single.suggestion = "Use the checked variant".to_string();
-        let mut multi = review_suggestion(
-            Some("crates/tui/src/lib.rs"),
-            Some(11),
-            Some("let b = a.unwrap_or_default();\nlet c = 2;"),
-        );
-        multi.suggestion = "Replace both lines".to_string();
-        multi.start_line = Some(11);
-        multi.end_line = Some(12);
-        let review = review_with(Vec::new(), vec![single, multi]);
-
-        let local = render_pr_review_markdown(1, &view, &review, false);
-        assert!(local.contains("### Suggestions"), "{local}");
-        assert!(
-            local.contains("\n  ```suggestion\n  let b = a.unwrap_or_default();\n  ```\n"),
-            "{local}"
-        );
-        assert!(
-            local.contains(
-                "\n  ```suggestion\n  let b = a.unwrap_or_default();\n  let c = 2;\n  ```\n"
-            ),
-            "{local}"
-        );
-
-        // The posted body keeps the fix visible but never as a live
-        // one-click block: only diff-validated inline suggestion comments
-        // may carry those to GitHub.
-        let posted = render_pr_review_markdown(1, &view, &review, true);
-        assert!(
-            posted.contains("let b = a.unwrap_or_default();"),
-            "{posted}"
-        );
-        assert!(!posted.contains("```suggestion"), "{posted}");
-        assert!(posted.contains("```text"), "{posted}");
-    }
-
-    #[test]
-    fn oversized_review_suggestion_degrades_to_prose() {
-        use crate::tools::review::MAX_COMMITTABLE_SUGGESTION_LINES;
-
-        // A whole-hunk rewrite is not a mechanical fix, so it must not be
-        // committable even though every line is inside the diff.
-        let span = MAX_COMMITTABLE_SUGGESTION_LINES + 5;
-        let added: String = (1..=span).map(|i| format!("+line {i}\n")).collect();
-        let diff = format!(
-            "diff --git a/big.rs b/big.rs\nnew file mode 100644\n--- /dev/null\n\
-             +++ b/big.rs\n@@ -0,0 +1,{span} @@\n{added}"
-        );
-        let replacement: String = (1..=span)
-            .map(|i| format!("line {i} fixed"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let mut suggestion = review_suggestion(Some("big.rs"), Some(span), Some(&replacement));
-        suggestion.start_line = Some(1);
-        suggestion.end_line = Some(span);
-        let review = review_with(Vec::new(), vec![suggestion]);
-        let comments = plan_inline_review_comments(&review, &diff).comments;
-        assert_eq!(comments.len(), 1);
-        let body = comments[0]["body"].as_str().expect("body");
-        assert!(!body.contains("```suggestion"), "{body}");
-
-        // The same shape, trimmed to the budget, stays committable.
-        let mut suggestion = review_suggestion(
-            Some("big.rs"),
-            Some(MAX_COMMITTABLE_SUGGESTION_LINES),
-            Some("line 1 fixed"),
-        );
-        suggestion.start_line = Some(1);
-        suggestion.end_line = Some(MAX_COMMITTABLE_SUGGESTION_LINES);
-        let review = review_with(Vec::new(), vec![suggestion]);
-        let comments = plan_inline_review_comments(&review, &diff).comments;
-        assert!(
-            comments[0]["body"]
-                .as_str()
-                .expect("body")
-                .contains("```suggestion"),
-            "a span at the budget limit stays committable"
-        );
-    }
-
-    #[tokio::test]
-    async fn configured_workflow_default_keeps_named_custom_route() {
-        let config = custom_exec_config("custom-a");
-        let model = config.default_model();
-
-        let route = resolve_cli_exec_route(
-            &config,
-            &model,
-            "Run a checked-in Workflow through the host runtime",
-            true,
-        )
-        .await
-        .expect("configured workflow route");
-        let execution = config_for_cli_route(&config, &route);
-
-        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
-        assert_eq!(execution.provider_identity_for(route.provider), "custom-a");
-        assert_eq!(execution.deepseek_base_url(), "http://127.0.0.1:18181/v1");
-        let client = crate::client::DeepSeekClient::new(&execution).expect("workflow client");
-        assert_eq!(client.base_url(), "http://127.0.0.1:18181/v1");
-    }
-
-    #[test]
-    fn exec_json_receipts_keep_exact_named_custom_provider() {
-        let config = custom_exec_config("custom-a");
-        let provider = config.provider_identity_for(crate::config::ApiProvider::Custom);
-        let one_shot = one_shot_exec_json_receipt(
-            provider.clone(),
-            "model-a".to_string(),
-            "done".to_string(),
-            Some("end_turn".to_string()),
-            crate::models::Usage {
-                input_tokens: 12,
-                output_tokens: 3,
-                ..Default::default()
-            },
-        );
-        assert_eq!(one_shot["provider"], "custom-a");
-        assert_eq!(one_shot["success"], true);
-
-        let truncated = one_shot_exec_json_receipt(
-            provider.clone(),
-            "model-a".to_string(),
-            "partial".to_string(),
-            Some("max_output_tokens".to_string()),
-            crate::models::Usage {
-                input_tokens: 20,
-                output_tokens: 9,
-                ..Default::default()
-            },
-        );
-        assert_eq!(truncated["success"], false);
-        assert_eq!(truncated["stop_reason"], "max_output_tokens");
-        assert_eq!(truncated["usage"]["input_tokens"], 20);
-        assert_eq!(truncated["usage"]["output_tokens"], 9);
-        assert!(truncated["error"].as_str().is_some_and(|error| {
-            error.contains("Model response incomplete") && error.contains("max_output_tokens")
-        }));
-
-        let agent = serde_json::to_value(ExecSummary {
-            mode: "agent".to_string(),
-            provider,
-            model: "model-a".to_string(),
-            ..ExecSummary::default()
-        })
-        .expect("agent exec JSON receipt");
-        assert_eq!(agent["provider"], "custom-a");
-        let serialized = serde_json::to_string(&agent).expect("serialize receipt");
-        assert!(!serialized.contains("127.0.0.1"));
-        assert!(!serialized.contains("local-test-key"));
-    }
-
-    #[test]
-    fn exec_stream_provider_pair_preserves_named_literal_and_root_custom_provenance() {
-        let named = crate::config::ProviderIdentity {
-            provider: crate::config::ApiProvider::Custom,
-            key: "lm-studio".to_string(),
-            exact_id: Some("lm-studio".to_string()),
-            migrated_legacy_ollama_cloud_route: false,
-        };
-        let literal = crate::config::ProviderIdentity {
-            provider: crate::config::ApiProvider::Custom,
-            key: "custom".to_string(),
-            exact_id: Some("custom".to_string()),
-            migrated_legacy_ollama_cloud_route: false,
-        };
-        let root = crate::config::ProviderIdentity {
-            provider: crate::config::ApiProvider::Custom,
-            key: "custom".to_string(),
-            exact_id: None,
-            migrated_legacy_ollama_cloud_route: false,
-        };
-        let built_in = crate::config::ProviderIdentity {
-            provider: crate::config::ApiProvider::Deepseek,
-            key: "deepseek".to_string(),
-            exact_id: Some("deepseek".to_string()),
-            migrated_legacy_ollama_cloud_route: false,
-        };
-
-        assert_eq!(
-            exec_stream_provider_route(&named),
-            ("custom".to_string(), Some("lm-studio".to_string()))
-        );
-        assert_eq!(
-            exec_stream_provider_route(&literal),
-            ("custom".to_string(), Some("custom".to_string()))
-        );
-        assert_eq!(
-            exec_stream_provider_route(&root),
-            ("custom".to_string(), None)
-        );
-        assert_eq!(
-            exec_stream_provider_route(&built_in),
-            ("deepseek".to_string(), None)
-        );
-    }
-
-    #[test]
-    fn resumed_exec_persistence_updates_provider_and_model_as_one_route() {
-        let saved_a = saved_exec_session("custom-a", crate::config::ZAI_GLM_5_2_MODEL);
-        let mut config = custom_exec_config("custom-a");
-        apply_exec_provider_override(&mut config, "custom-b").expect("custom B");
-        let model = resolve_exec_resume_route(&mut config, &saved_a, true, None)
-            .expect("explicit provider route");
-        let mut persisted = saved_a;
-        stamp_exec_session_metadata(
-            &mut persisted,
-            &model,
-            crate::config::ApiProvider::Custom.as_str(),
-            Some("custom-b"),
-            Path::new("/tmp/exec-resume"),
-        );
-
-        let mut next_config = custom_exec_config("custom-a");
-        let resumed_model = resolve_exec_resume_route(&mut next_config, &persisted, false, None)
-            .expect("next plain resume");
-
-        assert_eq!(persisted.metadata.model_provider, "custom");
-        assert_eq!(
-            persisted.metadata.model_provider_id.as_deref(),
-            Some("custom-b")
-        );
-        assert_eq!(persisted.metadata.model, "model-b");
-        assert_eq!(next_config.provider.as_deref(), Some("custom-b"));
-        assert_eq!(resumed_model, "model-b");
-    }
-
-    #[test]
-    fn exec_persistence_omits_id_for_legacy_root_custom_route() {
-        let mut saved = session_manager::create_saved_session_with_mode(
-            &[],
-            "legacy-root-model",
-            Path::new("/tmp/exec-root"),
-            0,
-            None,
-            Some("exec"),
-        );
-        stamp_exec_session_metadata(
-            &mut saved,
-            "legacy-root-model",
-            crate::config::ApiProvider::Custom.as_str(),
-            None,
-            Path::new("/tmp/exec-root"),
-        );
-
-        assert_eq!(saved.metadata.model_provider, "custom");
-        assert_eq!(saved.metadata.model_provider_id, None);
-        assert!(
-            !serde_json::to_string(&saved)
-                .expect("serialize exec session")
-                .contains("model_provider_id")
-        );
-    }
-
-    #[test]
-    fn exec_parses_reasoning_effort_flag_alongside_provider() {
-        let cli = parse_cli(&[
-            "codewhale",
-            "exec",
-            "--provider",
-            "openrouter",
-            "--model",
-            "glm-5.2",
-            "--reasoning-effort",
-            "max",
-            "audit",
-        ]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(args.provider.as_deref(), Some("openrouter"));
-        assert_eq!(args.model.as_deref(), Some("glm-5.2"));
-        assert_eq!(args.reasoning_effort.as_deref(), Some("max"));
-        assert_eq!(args.prompt, vec!["audit"]);
-    }
-
-    #[test]
-    fn cli_reasoning_effort_normalizes_aliases_and_rejects_typos() {
-        // The thinking ladder split these: `xhigh` is a tier the CLI can now
-        // name, `ultracode` is still an alias and resolves to `ultra`.
-        assert_eq!(
-            normalize_cli_reasoning_effort("xhigh").unwrap().as_deref(),
-            Some("xhigh")
-        );
-        assert_eq!(
-            normalize_cli_reasoning_effort("ultracode")
-                .unwrap()
-                .as_deref(),
-            Some("ultra")
-        );
-        assert_eq!(normalize_cli_reasoning_effort("default").unwrap(), None);
-        assert!(normalize_cli_reasoning_effort("expensive").is_err());
-    }
-
-    #[test]
-    fn cli_prompt_paths_resolve_auto_before_k3_route_normalization() {
-        let config = Config {
-            provider: Some("moonshot".to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                moonshot: crate::config::ProviderConfig {
-                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
-                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        for (prompt, expected) in [
-            ("lookup the public docs", "low"),
-            ("debug this error", "max"),
-            ("review this ordinary change", "high"),
-        ] {
-            assert_eq!(
-                cli_reasoning_effort_value_for_prompt(
-                    &config,
-                    crate::config::KIMI_CODE_K3_MODEL,
-                    crate::tui::app::ReasoningEffort::Auto,
-                    prompt,
-                )
-                .as_deref(),
-                Some(expected),
-                "prompt selector must resolve Auto for `{prompt}`"
-            );
-        }
-
-        assert_eq!(
-            cli_reasoning_effort_value_for_prompt(
-                &config,
-                crate::config::KIMI_CODE_K3_MODEL,
-                crate::tui::app::ReasoningEffort::Off,
-                "debug must not override an explicit effort",
-            )
-            .as_deref(),
-            Some("low"),
-            "membership K3 still applies its exact-route always-thinking floor"
-        );
-    }
-
-    #[test]
-    fn cli_route_tracks_auto_reasoning_independently_from_auto_model() {
-        use crate::tui::app::ReasoningEffort;
-
-        let fixed_model_auto_reasoning = CliAutoRoute {
-            provider: crate::config::ApiProvider::Deepseek,
-            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
-            reasoning_effort: Some(ReasoningEffort::Auto),
-            auto_controls_reasoning: true,
-            auto_model: false,
-        };
-        let auto_model_fixed_reasoning = CliAutoRoute {
-            provider: crate::config::ApiProvider::OpenaiCodex,
-            model: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
-            reasoning_effort: Some(ReasoningEffort::High),
-            auto_controls_reasoning: false,
-            auto_model: true,
-        };
-
-        assert!(fixed_model_auto_reasoning.auto_controls_reasoning);
-        assert!(!fixed_model_auto_reasoning.auto_model);
-        assert!(!auto_model_fixed_reasoning.auto_controls_reasoning);
-        assert!(auto_model_fixed_reasoning.auto_model);
-    }
-
-    #[test]
-    fn saved_reasoning_preference_overrides_config_for_non_tui_runtimes() {
-        let mut config = Config {
-            reasoning_effort: Some("max".to_string()),
-            reasoning_effort_inferred_from_legacy_alias: true,
-            ..Default::default()
-        };
-        let settings = crate::settings::Settings {
-            reasoning_effort: Some("low".to_string()),
-            ..Default::default()
-        };
-
-        apply_saved_reasoning_preference(&mut config, &settings);
-
-        assert_eq!(config.reasoning_effort(), Some("low"));
-        assert!(config.reasoning_effort_is_explicit());
-    }
-
-    /// `run_exec_agent` must hand the engine a concrete tier, never the literal
-    /// `"auto"` sentinel, for a fixed-model Auto launch.
-    #[test]
-    fn fixed_model_exec_auto_resolves_to_a_concrete_tier_not_the_auto_sentinel() {
-        let config = Config {
-            provider: Some("zai".to_string()),
-            ..Default::default()
-        };
-
-        let resolved = cli_reasoning_effort_value_for_prompt(
-            &config,
-            crate::config::ZAI_GLM_5_2_MODEL,
-            crate::tui::app::ReasoningEffort::Auto,
-            "debug this failing integration test",
-        )
-        .expect("Auto must resolve to a concrete tier");
-
-        assert_ne!(
-            resolved, "auto",
-            "the literal auto sentinel must never reach a provider"
-        );
-        assert!(
-            matches!(resolved.as_str(), "off" | "low" | "medium" | "high" | "max"),
-            "unexpected resolved tier: {resolved}"
-        );
-    }
-
-    #[test]
-    fn exec_accepts_resume_session_flags_for_harnesses() {
-        let cli = parse_cli(&[
-            "codewhale",
-            "exec",
-            "--resume",
-            "abc123",
-            "--output-format",
-            "stream-json",
-            "follow up",
-        ]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(args.resume.as_deref(), Some("abc123"));
-        assert_eq!(args.output_format, ExecOutputFormat::StreamJson);
-        assert_eq!(args.prompt, vec!["follow up"]);
-    }
-
-    #[test]
-    fn exec_accepts_session_id_alias() {
-        let cli = parse_cli(&["codewhale", "exec", "--session-id", "abc123", "follow up"]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(args.session_id.as_deref(), Some("abc123"));
-        assert_eq!(args.output_format, ExecOutputFormat::Text);
-    }
-
-    #[test]
-    fn exec_parses_tool_gate_and_hardening_flags() {
-        let envelope = r#"{"schema_version":1,"owner":"fleet-worker-1","authority":"read_only"}"#;
-        let cli = parse_cli(&[
-            "codewhale",
-            "exec",
-            "--allowed-tools",
-            "File,Git",
-            "--disallowed-tools",
-            "Bash",
-            "--max-turns",
-            "7",
-            "--max-tool-calls",
-            "9",
-            "--append-system-prompt",
-            "extra rules",
-            "--tool-authority-json",
-            envelope,
-            "do the thing",
-        ]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(
-            args.allowed_tools.as_deref(),
-            Some(&["File".to_string(), "Git".to_string()][..])
-        );
-        assert_eq!(
-            args.disallowed_tools.as_deref(),
-            Some(&["Bash".to_string()][..])
-        );
-        assert_eq!(args.max_turns, Some(7));
-        assert_eq!(args.max_tool_calls, Some(9));
-        assert_eq!(args.append_system_prompt.as_deref(), Some("extra rules"));
-        assert_eq!(args.tool_authority_json.as_deref(), Some(envelope));
-        assert_eq!(args.prompt, vec!["do the thing"]);
-    }
-
-    #[test]
-    fn exec_rejects_zero_max_tool_calls() {
-        let err =
-            Cli::try_parse_from(["codewhale", "exec", "--max-tool-calls", "0", "do the thing"])
-                .expect_err("max-tool-calls must be >= 1");
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-    }
-
-    #[test]
-    fn fleet_tool_authority_cannot_cross_an_exec_resume_boundary() {
-        assert!(validate_exec_tool_authority_resume(None, true).is_ok());
-        assert!(validate_exec_tool_authority_resume(Some("{}"), false).is_ok());
-        let error = validate_exec_tool_authority_resume(Some("{}"), true)
-            .expect_err("authority must remain bound to its fresh Fleet launch")
-            .to_string();
-        assert!(error.contains("cannot be combined with exec --resume"));
-    }
-
-    #[test]
-    fn exec_auto_does_not_authorize_sandbox_elevation() {
-        let cli = parse_cli(&["codewhale", "exec", "--auto", "run it"]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert!(!exec_sandbox_elevation_authorized(
-            args.allow_sandbox_elevation,
-            args.sandbox.as_deref()
-        ));
-    }
-
-    #[test]
-    fn exec_explicit_sandbox_elevation_opt_ins_authorize_retry() {
-        let danger = parse_cli(&[
-            "codewhale",
-            "exec",
-            "--auto",
-            "--sandbox",
-            "danger-full-access",
-            "run it",
-        ]);
-        let Some(Commands::Exec(args)) = danger.command else {
-            panic!("expected exec command");
-        };
-        assert!(exec_sandbox_elevation_authorized(
-            args.allow_sandbox_elevation,
-            args.sandbox.as_deref()
-        ));
-
-        let flag = parse_cli(&[
-            "codewhale",
-            "exec",
-            "--auto",
-            "--allow-sandbox-elevation",
-            "run it",
-        ]);
-        let Some(Commands::Exec(args)) = flag.command else {
-            panic!("expected exec command");
-        };
-        assert!(exec_sandbox_elevation_authorized(
-            args.allow_sandbox_elevation,
-            args.sandbox.as_deref()
-        ));
-    }
-
-    #[test]
-    fn exec_sandbox_denial_stream_event_is_typed() {
-        let event = ExecStreamEvent::SandboxDenied {
-            tool_id: "call_1".to_string(),
-            tool_name: "exec_shell".to_string(),
-            reason: "write blocked".to_string(),
-            outcome: "approval_required".to_string(),
-        };
-        let value: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&event).expect("serializes"))
-                .expect("valid json");
-        assert_eq!(value["type"], "sandbox_denied");
-        assert_eq!(value["outcome"], "approval_required");
-    }
-
-    #[test]
-    fn exec_help_separates_agent_mode_from_sandbox_elevation() {
-        let mut cli = Cli::command();
-        let help = cli
-            .find_subcommand_mut("exec")
-            .expect("exec command")
-            .render_help()
-            .to_string();
-        assert!(help.contains("--auto"));
-        assert!(help.contains("--sandbox"));
-        assert!(help.contains("--allow-sandbox-elevation"));
-        assert!(help.contains("does not change the"));
-        assert!(help.contains("explicitly authorize sandbox elevation"));
-    }
-
-    #[test]
-    fn exec_shell_only_tool_surface_env_sets_shell_allowlist() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _surface =
-            crate::test_support::EnvVarGuard::set(CODEWHALE_TOOL_SURFACE_ENV, " shell-only ");
-
-        let allowed_tools = resolve_exec_allowed_tools(None, exec_tool_surface_from_env())
-            .expect("shell-only surface should set an allowlist");
-
-        assert_eq!(allowed_tools, vec!["bash".to_string()]);
-    }
-
-    #[test]
-    fn exec_explicit_allowed_tools_override_shell_only_env() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _surface =
-            crate::test_support::EnvVarGuard::set(CODEWHALE_TOOL_SURFACE_ENV, "shell-only");
-        let explicit = vec![" File ".to_string(), "GIT".to_string()];
-
-        let allowed_tools =
-            resolve_exec_allowed_tools(Some(&explicit), exec_tool_surface_from_env())
-                .expect("explicit allowlist should be preserved");
-
-        assert_eq!(allowed_tools, vec!["file".to_string(), "git".to_string()]);
-    }
-
-    #[test]
-    fn exec_full_tool_surface_env_leaves_allowlist_unset() {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _surface = crate::test_support::EnvVarGuard::set(CODEWHALE_TOOL_SURFACE_ENV, "full");
-
-        assert_eq!(
-            resolve_exec_allowed_tools(None, exec_tool_surface_from_env()),
-            None
-        );
-    }
-
-    #[test]
-    fn exec_unknown_tool_surface_env_warns_without_allowlist() {
-        assert!(should_warn_unknown_exec_tool_surface("shell_onyl"));
-        assert!(!should_warn_unknown_exec_tool_surface("shell-only"));
-        assert!(!should_warn_unknown_exec_tool_surface("native-tools"));
-        assert!(!should_warn_unknown_exec_tool_surface("full"));
-        assert!(!should_warn_unknown_exec_tool_surface(" "));
-        assert_eq!(parse_exec_tool_surface("shell_onyl"), None);
-    }
-
-    #[test]
-    fn exec_rejects_zero_max_turns() {
-        let err = Cli::try_parse_from(["codewhale", "exec", "--max-turns", "0", "hello"])
-            .expect_err("max-turns must be >= 1");
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-    }
-
-    /// R1: omitting `--max-turns` used to resolve to `u32::MAX`, i.e. a
-    /// headless run with no bound at all. It now resolves to the finite
-    /// default, and an explicit value still wins.
-    #[test]
-    fn exec_defaults_to_a_finite_headless_turn_cap() {
-        let cli = parse_cli(&["codewhale", "exec", "--auto", "benchmark this"]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(args.max_turns, None);
-        let defaulted = exec_max_steps(args.max_turns);
-        assert_eq!(
-            defaulted,
-            crate::core::engine::turn_budget::DEFAULT_EXEC_MAX_TURNS
-        );
-        assert!(defaulted < u32::MAX, "the headless default must be finite");
-        assert_eq!(exec_max_steps(Some(7)), 7);
-        assert_eq!(
-            exec_max_steps(Some(u32::MAX)),
-            crate::core::engine::turn_budget::MAX_MAX_MODEL_STEPS,
-            "even the largest override stays finite"
-        );
-    }
-
-    #[test]
-    fn exec_accepts_continue_for_latest_workspace_session() {
-        let cli = parse_cli(&["codewhale", "exec", "--continue", "follow up"]);
-        let Some(Commands::Exec(args)) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert!(args.continue_session);
-    }
-
-    #[test]
-    fn sessions_footer_points_to_resume_subcommand() {
-        let cli = parse_cli(&["codewhale", "resume", "abc123"]);
-        let Some(Commands::Resume { session_id, last }) = cli.command else {
-            panic!("expected resume command");
-        };
-
-        assert_eq!(session_id.as_deref(), Some("abc123"));
-        assert!(!last);
-        assert_eq!(sessions_resume_command(), "codewhale resume");
-        assert!(!sessions_resume_command().contains("--resume"));
-    }
-
-    #[test]
-    fn plugin_registry_initialization_precedes_dotenv_for_all_launch_paths() {
-        use std::cell::Cell;
-
-        #[derive(Clone, Copy)]
-        enum Expected {
-            Plain,
-            Resume,
-            Fork,
-            Exec,
-            Serve,
-        }
-
-        let cases: &[(&[&str], Expected)] = &[
-            (&["codewhale"], Expected::Plain),
-            (&["codewhale", "resume", "--last"], Expected::Resume),
-            (&["codewhale", "fork", "--last"], Expected::Fork),
-            (&["codewhale", "exec", "probe"], Expected::Exec),
-            (&["codewhale", "serve", "--mcp"], Expected::Serve),
-        ];
-
-        for (args, expected) in cases {
-            let phase = Cell::new(0);
-            let (_cli, command) = prepare_cli_startup(
-                parse_cli(args),
-                || {
-                    assert_eq!(phase.get(), 0, "plugin init order for {args:?}");
-                    phase.set(1);
-                },
-                || {
-                    assert_eq!(phase.get(), 1, "dotenv load order for {args:?}");
-                    phase.set(2);
-                },
-            );
-
-            assert_eq!(phase.get(), 2, "startup phases for {args:?}");
-            let correct_variant = matches!(
-                (expected, command.as_ref()),
-                (Expected::Plain, None)
-                    | (Expected::Resume, Some(Commands::Resume { .. }))
-                    | (Expected::Fork, Some(Commands::Fork { .. }))
-                    | (Expected::Exec, Some(Commands::Exec(_)))
-                    | (Expected::Serve, Some(Commands::Serve(_)))
-            );
-            assert!(correct_variant, "unexpected command for {args:?}");
-        }
-    }
-
-    #[test]
-    fn workspace_dotenv_loads_only_provider_credentials_and_preserves_shell_values() {
-        let _lock = crate::test_support::lock_test_env();
-        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
-        let _nvidia = crate::test_support::EnvVarGuard::set("NVIDIA_API_KEY", "shell-key");
-        let _home = crate::test_support::EnvVarGuard::remove("CODEWHALE_HOME");
-        let _config = crate::test_support::EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
-        let _shell = crate::test_support::EnvVarGuard::remove("DEEPSEEK_ALLOW_SHELL");
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(
-            &dotenv,
-            "DEEPSEEK_API_KEY=workspace-key\n\
-             NVIDIA_API_KEY=repo-must-not-override-shell\n\
-             CODEWHALE_HOME=./attacker-home\n\
-             CODEWHALE_CONFIG_PATH=./attacker.toml\n\
-             DEEPSEEK_ALLOW_SHELL=true\n",
-        )
-        .expect("write dotenv");
-
-        let report = load_workspace_dotenv_credentials_from_path(&dotenv).expect("safe load");
-
-        assert_eq!(
-            std::env::var("DEEPSEEK_API_KEY").as_deref(),
-            Ok("workspace-key")
-        );
-        assert_eq!(std::env::var("NVIDIA_API_KEY").as_deref(), Ok("shell-key"));
-        assert!(std::env::var_os("CODEWHALE_HOME").is_none());
-        assert!(std::env::var_os("CODEWHALE_CONFIG_PATH").is_none());
-        assert!(std::env::var_os("DEEPSEEK_ALLOW_SHELL").is_none());
-        assert_eq!(
-            report.loaded,
-            BTreeSet::from(["DEEPSEEK_API_KEY".to_string()])
-        );
-        assert_eq!(
-            report.ignored,
-            BTreeSet::from([
-                "CODEWHALE_CONFIG_PATH".to_string(),
-                "CODEWHALE_HOME".to_string(),
-                "DEEPSEEK_ALLOW_SHELL".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn workspace_dotenv_rejects_ambient_variable_substitution() {
-        let _lock = crate::test_support::lock_test_env();
-        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
-        let _ambient = crate::test_support::EnvVarGuard::set(
-            "CODEWHALE_JS_SECRET_LEAK_TEST",
-            "ambient-secret-must-not-expand",
-        );
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(
-            &dotenv,
-            "DEEPSEEK_API_KEY=${CODEWHALE_JS_SECRET_LEAK_TEST}\n",
-        )
-        .expect("write dotenv");
-
-        let error = load_workspace_dotenv_credentials_from_path(&dotenv)
-            .expect_err("expansion must fail closed")
-            .to_string();
-
-        assert!(error.contains("variable expansion"));
-        assert!(!error.contains("ambient-secret-must-not-expand"));
-        assert!(std::env::var_os("DEEPSEEK_API_KEY").is_none());
-    }
-
-    #[test]
-    fn workspace_dotenv_rejects_multiline_ambient_variable_substitution() {
-        let _lock = crate::test_support::lock_test_env();
-        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
-        let _ambient = crate::test_support::EnvVarGuard::set(
-            "CODEWHALE_JS_SECRET_LEAK_TEST",
-            "ambient-secret-must-not-expand",
-        );
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(
-            &dotenv,
-            "DEEPSEEK_API_KEY=\"prefix\n$CODEWHALE_JS_SECRET_LEAK_TEST=bar\nsuffix\"\n",
-        )
-        .expect("write dotenv");
-
-        let error = load_workspace_dotenv_credentials_from_path(&dotenv)
-            .expect_err("multiline expansion must fail closed")
-            .to_string();
-
-        assert!(error.contains("variable expansion"));
-        assert!(!error.contains("ambient-secret-must-not-expand"));
-        assert!(std::env::var_os("DEEPSEEK_API_KEY").is_none());
-    }
-
-    #[test]
-    fn workspace_dotenv_comment_quote_cannot_hide_later_expansion() {
-        let _lock = crate::test_support::lock_test_env();
-        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
-        let _ambient = crate::test_support::EnvVarGuard::set(
-            "CODEWHALE_JS_SECRET_LEAK_TEST",
-            "ambient-secret-must-not-expand",
-        );
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(
-            &dotenv,
-            "# unmatched quote in ignored comment: '\n\
-             DEEPSEEK_API_KEY=$CODEWHALE_JS_SECRET_LEAK_TEST\n",
-        )
-        .expect("write dotenv");
-
-        let error = load_workspace_dotenv_credentials_from_path(&dotenv)
-            .expect_err("comment quote must not hide expansion")
-            .to_string();
-
-        assert!(error.contains("variable expansion"));
-        assert!(!error.contains("ambient-secret-must-not-expand"));
-        assert!(std::env::var_os("DEEPSEEK_API_KEY").is_none());
-    }
-
-    #[test]
-    fn workspace_dotenv_allows_single_quoted_literal_dollar() {
-        let _lock = crate::test_support::lock_test_env();
-        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(&dotenv, "DEEPSEEK_API_KEY='$literal-value'\n").expect("write dotenv");
-
-        load_workspace_dotenv_credentials_from_path(&dotenv).expect("literal dollar load");
-
-        assert_eq!(
-            std::env::var("DEEPSEEK_API_KEY").as_deref(),
-            Ok("$literal-value")
-        );
-    }
-
-    #[test]
-    fn workspace_dotenv_parse_failure_applies_no_earlier_credentials() {
-        let _lock = crate::test_support::lock_test_env();
-        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(
-            &dotenv,
-            "DEEPSEEK_API_KEY=must-not-survive\nBROKEN=\"unterminated\n",
-        )
-        .expect("write dotenv");
-
-        let error = load_workspace_dotenv_credentials_from_path(&dotenv)
-            .expect_err("parse failure must be transactional")
-            .to_string();
-
-        assert!(error.contains("could not be parsed safely"), "{error}");
-        assert!(!error.contains("must-not-survive"));
-        assert!(std::env::var_os("DEEPSEEK_API_KEY").is_none());
-    }
-
-    #[test]
-    fn workspace_dotenv_credential_allowlist_excludes_control_plane_names() {
-        for provider in codewhale_config::provider::providers_sorted_for_display() {
-            for key in provider.env_vars() {
-                assert!(
-                    is_workspace_dotenv_credential_key(key),
-                    "provider credential {key} must remain supported"
-                );
-            }
-        }
-        for key in [
-            "CODEWHALE_HOME",
-            "CODEWHALE_CONFIG_PATH",
-            "DEEPSEEK_CONFIG_PATH",
-            "DEEPSEEK_PROFILE",
-            "DEEPSEEK_MANAGED_CONFIG_PATH",
-            "DEEPSEEK_REQUIREMENTS_PATH",
-            "DEEPSEEK_PROVIDER",
-            "DEEPSEEK_BASE_URL",
-            "DEEPSEEK_MODEL",
-            "DEEPSEEK_APPROVAL_POLICY",
-            "DEEPSEEK_SANDBOX_MODE",
-            "DEEPSEEK_ALLOW_SHELL",
-            "DEEPSEEK_YOLO",
-            "DEEPSEEK_MCP_CONFIG",
-            "CODEWHALE_RUNTIME_TOKEN",
-            "PATH",
-            "NODE_OPTIONS",
-            "PYTHONPATH",
-            "LD_PRELOAD",
-            "DYLD_INSERT_LIBRARIES",
-        ] {
-            assert!(
-                !is_workspace_dotenv_credential_key(key),
-                "control-plane variable {key} must not load from a workspace"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workspace_dotenv_does_not_follow_symbolic_links() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let external = tmp.path().join("external-credentials");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(&external, "DEEPSEEK_API_KEY=external-secret\n")
-            .expect("write external fixture");
-        symlink(&external, &dotenv).expect("create dotenv symlink");
-
-        let error = load_workspace_dotenv_credentials_from_path(&dotenv)
-            .expect_err("symlink must fail closed")
-            .to_string();
-
-        assert!(error.contains("securely open"), "{error}");
-        assert!(!error.contains("external-secret"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workspace_dotenv_rejects_hard_links_to_external_files() {
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let external = tmp.path().join("external-credentials");
-        let dotenv = tmp.path().join(".env");
-        std::fs::write(&external, "DEEPSEEK_API_KEY=external-secret\n")
-            .expect("write external fixture");
-        std::fs::hard_link(&external, &dotenv).expect("create dotenv hard link");
-
-        let error = load_workspace_dotenv_credentials_from_path(&dotenv)
-            .expect_err("hard link must fail closed")
-            .to_string();
-
-        assert!(error.contains("multiple filesystem links"), "{error}");
-        assert!(!error.contains("external-secret"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workspace_dotenv_rejects_fifo_without_blocking_startup() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let tmp = tempfile::TempDir::new().expect("temp workspace");
-        let dotenv = tmp.path().join(".env");
-        let c_path = CString::new(dotenv.as_os_str().as_bytes()).expect("fifo path");
-        // SAFETY: `c_path` is a live, NUL-terminated path and the requested
-        // mode grants access only to the current user.
-        let result = unsafe { libc::mkfifo(c_path.as_ptr(), libc::S_IRUSR | libc::S_IWUSR) };
-        assert_eq!(result, 0, "mkfifo failed: {}", io::Error::last_os_error());
-
-        let (tx, rx) = mpsc::channel();
-        let worker_path = dotenv.clone();
-        let worker = std::thread::spawn(move || {
-            let result = load_workspace_dotenv_credentials_from_path(&worker_path)
-                .map(|_| "unexpected success".to_string())
-                .unwrap_or_else(|error| error.to_string());
-            tx.send(result).expect("send loader result");
-        });
-
-        let error = match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(error) => error,
-            Err(timeout) => {
-                // Release a regressed blocking reader so the test can fail
-                // promptly instead of leaving a stuck process behind.
-                let _writer = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&dotenv)
-                    .expect("open fifo writer to release blocked reader");
-                let _ = rx.recv_timeout(Duration::from_secs(1));
-                worker.join().expect("join released loader");
-                panic!("workspace .env FIFO blocked startup: {timeout}");
-            }
-        };
-        worker.join().expect("join loader");
-
-        assert!(error.contains("not a regular file"), "{error}");
-    }
-
-    #[test]
-    fn exec_json_conflicts_with_stream_json_output() {
-        let err = Cli::try_parse_from([
-            "codewhale",
-            "exec",
-            "--json",
-            "--output-format",
-            "stream-json",
-            "hello",
-        ])
-        .expect_err("json summary and stream-json must not mix");
-
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn exec_stream_turn_usage_event_serializes_reported_fields() {
-        let event = ExecStreamEvent::TurnUsage {
-            turn: 2,
-            input_tokens: 1200,
-            output_tokens: 180,
-            reasoning_tokens: Some(90),
-            prompt_cache_hit_tokens: Some(900),
-            prompt_cache_miss_tokens: Some(300),
-            prompt_cache_write_tokens: Some(0),
-            reasoning_replay_tokens: Some(40),
-            duration_ms: 1834,
-        };
-
-        let value = exec_stream_value(&event).expect("serializes");
-        let json = serde_json::to_string(&value).expect("serializes");
-        assert!(!json.contains('\n'));
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed["type"], "turn_usage");
-        assert_eq!(parsed["schema"], "codewhale.exec-stream");
-        assert_eq!(parsed["schema_version"], 1);
-        assert_eq!(parsed["turn"], 2);
-        assert_eq!(parsed["input_tokens"], 1200);
-        assert_eq!(parsed["output_tokens"], 180);
-        assert_eq!(parsed["reasoning_tokens"], 90);
-        assert_eq!(parsed["prompt_cache_hit_tokens"], 900);
-        assert_eq!(parsed["prompt_cache_miss_tokens"], 300);
-        assert_eq!(parsed["prompt_cache_write_tokens"], 0);
-        assert_eq!(parsed["reasoning_replay_tokens"], 40);
-        assert_eq!(parsed["duration_ms"], 1834);
-    }
-
-    #[test]
-    fn exec_stream_turn_usage_event_omits_unreported_fields() {
-        // Honest absence: optional token fields the provider did not report
-        // are dropped from the object entirely — never emitted as null and
-        // never backfilled with fabricated zeros.
-        let event = ExecStreamEvent::TurnUsage {
-            turn: 1,
-            input_tokens: 11,
-            output_tokens: 3,
-            reasoning_tokens: None,
-            prompt_cache_hit_tokens: None,
-            prompt_cache_miss_tokens: None,
-            prompt_cache_write_tokens: None,
-            reasoning_replay_tokens: None,
-            duration_ms: 250,
-        };
-
-        let value = exec_stream_value(&event).expect("serializes");
-        let parsed = value;
-        assert_eq!(parsed["type"], "turn_usage");
-        assert_eq!(parsed["input_tokens"], 11);
-        assert_eq!(parsed["output_tokens"], 3);
-        assert_eq!(parsed["duration_ms"], 250);
-        let object = parsed.as_object().expect("event object");
-        for absent in [
-            "reasoning_tokens",
-            "prompt_cache_hit_tokens",
-            "prompt_cache_miss_tokens",
-            "prompt_cache_write_tokens",
-            "reasoning_replay_tokens",
-        ] {
-            assert!(!object.contains_key(absent), "{absent} leaked: {parsed}");
-        }
-    }
-
-    #[test]
-    fn exec_stream_pre_existing_event_type_tags_are_unchanged() {
-        // Contract guard for existing stream consumers (bench harness, fleet
-        // ledger): the pre-turn_usage event vocabulary keeps its exact tags.
-        let cases: Vec<(ExecStreamEvent, &str)> = vec![
-            (
-                ExecStreamEvent::Content {
-                    content: "hi".to_string(),
-                },
-                "content",
-            ),
-            (
-                ExecStreamEvent::ToolUse {
-                    name: "read_file".to_string(),
-                    id: "call_1".to_string(),
-                    input: serde_json::json!({}),
-                    started_at: "2026-08-03T00:00:00Z".to_string(),
-                },
-                "tool_use",
-            ),
-            (
-                ExecStreamEvent::ToolResult {
-                    id: "call_1".to_string(),
-                    name: "read_file".to_string(),
-                    output: "ok".to_string(),
-                    status: "success".to_string(),
-                    started_at: "2026-08-03T00:00:00Z".to_string(),
-                    completed_at: "2026-08-03T00:00:01Z".to_string(),
-                    duration_ms: 1,
-                    side_effect_status: "unknown".to_string(),
-                    error_category: None,
-                    truncated: None,
-                    artifact: None,
-                    result_metadata: None,
-                },
-                "tool_result",
-            ),
-            (
-                ExecStreamEvent::SandboxDenied {
-                    tool_id: "call_1".to_string(),
-                    tool_name: "exec_shell".to_string(),
-                    reason: "denied".to_string(),
-                    outcome: "approval_required".to_string(),
-                },
-                "sandbox_denied",
-            ),
-            (
-                ExecStreamEvent::WorkflowEvent {
-                    run_id: "workflow_1".to_string(),
-                    event: serde_json::json!({"type": "task_completed"}),
-                },
-                "workflow_event",
-            ),
-            (
-                ExecStreamEvent::SessionCapture {
-                    content: "x".to_string(),
-                },
-                "session_capture",
-            ),
-            (
-                ExecStreamEvent::Error {
-                    error: "boom".to_string(),
-                },
-                "error",
-            ),
-            (ExecStreamEvent::Done, "done"),
-        ];
-
-        for (event, expected_type) in cases {
-            let value = exec_stream_value(&event).expect("serializes");
-            assert_eq!(value["type"], expected_type, "event tag drifted");
-            assert_eq!(value["schema"], "codewhale.exec-stream");
-            assert_eq!(value["schema_version"], 1);
-        }
-    }
-
-    #[test]
-    fn exec_stream_events_are_json_lines() {
-        let event = ExecStreamEvent::ToolResult {
-            id: "call_1".to_string(),
-            name: "read_file".to_string(),
-            output: "line 1\nline 2".to_string(),
-            status: "success".to_string(),
-            started_at: "2026-07-13T00:00:00Z".to_string(),
-            completed_at: "2026-07-13T00:00:01Z".to_string(),
-            duration_ms: 1000,
-            side_effect_status: "not_started".to_string(),
-            error_category: None,
-            truncated: Some(false),
-            artifact: None,
-            result_metadata: None,
-        };
-
-        let value = exec_stream_value(&event).expect("serializes");
-        let json = serde_json::to_string(&value).expect("serializes");
-        assert!(!json.contains('\n'));
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed["type"], "tool_result");
-        assert_eq!(parsed["schema"], "codewhale.exec-stream");
-        assert_eq!(parsed["schema_version"], 1);
-        assert_eq!(parsed["duration_ms"], 1000);
-        assert_eq!(parsed["side_effect_status"], "not_started");
-    }
-
-    #[test]
-    fn workflow_receipt_stream_event_is_one_json_line() {
-        let event = ExecStreamEvent::WorkflowEvent {
-            run_id: "workflow_1234".to_string(),
-            event: serde_json::json!({
-                "type": "handoff_promoted",
-                "artifact_id": "workflow_1234:agent_1:review-gate:review_report",
-                "gate_id": "review-gate",
-                "kind": "review_report",
-                "from_role": "reviewer",
-                "to_role": "verifier",
-                "producer_task_id": "agent_1"
-            }),
-        };
-
-        let value = exec_stream_value(&event).expect("serializes");
-        let json = serde_json::to_string(&value).expect("serializes");
-        assert!(!json.contains('\n'));
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed["type"], "workflow_event");
-        assert_eq!(parsed["schema"], "codewhale.exec-stream");
-        assert_eq!(parsed["schema_version"], 1);
-        assert_eq!(parsed["run_id"], "workflow_1234");
-        assert_eq!(parsed["event"]["type"], "handoff_promoted");
-        assert_eq!(
-            parsed["event"]["artifact_id"],
-            "workflow_1234:agent_1:review-gate:review_report"
-        );
-        assert_eq!(parsed["event"]["gate_id"], "review-gate");
-        assert_eq!(parsed["event"]["kind"], "review_report");
-        assert_eq!(parsed["event"]["from_role"], "reviewer");
-        assert_eq!(parsed["event"]["to_role"], "verifier");
-        assert_eq!(parsed["event"]["producer_task_id"], "agent_1");
-        assert!(parsed["event"].get("payload").is_none(), "{parsed}");
-
-        let consumed = ExecStreamEvent::WorkflowEvent {
-            run_id: "workflow_1234".to_string(),
-            event: serde_json::json!({
-                "type": "handoff_consumed",
-                "artifact_id": "workflow_1234:agent_1:review-gate:review_report",
-                "kind": "review_report",
-                "from_role": "reviewer",
-                "to_role": "verifier",
-                "consumer_task_id": "agent_2"
-            }),
-        };
-        let consumed = exec_stream_value(&consumed).expect("serializes consumed receipt");
-        assert_eq!(consumed["type"], "workflow_event");
-        assert_eq!(consumed["schema"], "codewhale.exec-stream");
-        assert_eq!(consumed["schema_version"], 1);
-        assert_eq!(consumed["event"]["type"], "handoff_consumed");
-        assert_eq!(
-            consumed["event"]["artifact_id"],
-            "workflow_1234:agent_1:review-gate:review_report"
-        );
-        assert_eq!(consumed["event"]["consumer_task_id"], "agent_2");
-        assert!(consumed["event"].get("payload").is_none(), "{consumed}");
-    }
-
-    #[test]
-    fn exec_stream_metadata_redacts_resume_breadcrumbs() {
-        let raw_session_id = "abc123fullsecret";
-        let event = ExecStreamEvent::Metadata {
-            meta: Box::new(ExecStreamMeta {
-                receipt_kind: "terminal",
-                provider: "deepseek".to_string(),
-                provider_id: None,
-                model: "deepseek-v4-flash".to_string(),
-                route_source: "explicit_or_configured".to_string(),
-                input_tokens: Some(123),
-                output_tokens: Some(45),
-                prompt_cache_hit_tokens: Some(10),
-                prompt_cache_miss_tokens: None,
-                prompt_cache_write_tokens: None,
-                reasoning_tokens: Some(3),
-                codewhale_max_output_tokens: Some(384_000),
-                codewhale_max_output_tokens_source: Some("documented"),
-                duration_ms: 2500,
-                retry_count: None,
-                approval_posture: "ask".to_string(),
-                sandbox_posture: "configured_default".to_string(),
-                binary_sha256: Some("sha256:binary".to_string()),
-                config_sha256: None,
-                prompt_sha256: "sha256:prompt".to_string(),
-                tool_catalog_sha256: Some("sha256:tools".to_string()),
-                input_analysis: ExecStreamInputAnalysis::default(),
-                visible_final_answer_chars: 17,
-                session_id: exec_stream_session_ref(raw_session_id),
-                resume_command: exec_stream_resume_hint(raw_session_id),
-                workspace: "/tmp/work".to_string(),
-                message_count: 4,
-                status: Some("completed".to_string()),
-                termination_reason: Some("resolved".to_string()),
-                error_category: None,
-                error: None,
-            }),
-        };
-
-        let json = serde_json::to_string(&event).expect("serializes");
-        assert!(!json.contains('\n'));
-        assert!(!json.contains(raw_session_id));
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed["type"], "metadata");
-        assert_ne!(parsed["meta"]["session_id"], raw_session_id);
-        assert!(
-            parsed["meta"]["session_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("<redacted:")
-        );
-        assert_eq!(
-            parsed["meta"]["resume_command"],
-            "codewhale exec --resume <redacted-session-id>"
-        );
-        assert_eq!(parsed["meta"]["workspace"], "/tmp/work");
-        assert_eq!(parsed["meta"]["message_count"], 4);
-        assert_eq!(parsed["meta"]["visible_final_answer_chars"], 17);
-
-        let capture = ExecStreamEvent::SessionCapture {
-            content: exec_stream_session_ref(raw_session_id),
-        };
-        let capture_json = serde_json::to_string(&capture).expect("serializes");
-        assert!(!capture_json.contains(raw_session_id));
-        let parsed_capture: serde_json::Value =
-            serde_json::from_str(&capture_json).expect("valid json");
-        assert_eq!(parsed_capture["type"], "session_capture");
-        assert_ne!(parsed_capture["content"], raw_session_id);
-    }
-
-    #[test]
-    fn exec_stream_input_analysis_reports_prompt_composition() {
-        let system = SystemPrompt::Text("system rules".to_string());
-        let messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "run tests".to_string(),
-                    cache_control: None,
-                }],
-            },
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::thinking("checking context"),
-                    ContentBlock::Text {
-                        text: "working".to_string(),
-                        cache_control: None,
-                    },
-                    ContentBlock::ToolUse {
-                        id: "call-1".to_string(),
-                        name: "exec_shell".to_string(),
-                        input: serde_json::json!({"command": "cargo test"}),
-                        caller: None,
-                        thought_signature: None,
-                    },
-                ],
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call-1".to_string(),
-                    content: "stdout line\nstderr line".to_string(),
-                    is_error: Some(false),
-                    content_blocks: Some(vec![serde_json::json!({
-                        "type": "text",
-                        "text": "structured output"
-                    })]),
-                }],
-            },
-        ];
-
-        let analysis = exec_stream_input_analysis(&messages, Some(&system));
-
-        assert_eq!(analysis.user_message_count, 2);
-        assert_eq!(analysis.assistant_message_count, 1);
-        assert_eq!(analysis.tool_message_count, 0);
-        assert_eq!(analysis.tool_use_count, 1);
-        assert_eq!(analysis.tool_result_count, 1);
-        assert_eq!(analysis.thinking_chars, "checking context".chars().count());
-        assert!(analysis.text_chars >= "run testsworking".chars().count());
-        assert!(analysis.tool_use_input_chars > 0);
-        assert!(analysis.tool_result_chars >= "stdout line\nstderr line".chars().count());
-        assert!(analysis.estimated_system_tokens > 0);
-        assert!(analysis.estimated_message_content_tokens > 0);
-        assert!(
-            analysis.estimated_request_tokens
-                >= analysis.estimated_system_tokens
-                    + analysis.estimated_message_content_tokens
-                    + analysis.estimated_framing_tokens
-        );
-    }
-
-    #[test]
-    fn review_receipt_check_public_json_omits_private_details() {
-        let validation = crate::tools::review::ReviewReceiptValidation {
-            passed: false,
-            reason: "secret reason with /tmp/private/receipt.json".to_string(),
-            diff_fingerprint: "sha256:current".to_string(),
-            receipt_fingerprint: Some("sha256:current".to_string()),
-            receipt_path: Some(PathBuf::from("/tmp/private/receipt.json")),
-            unresolved_risk: Some(crate::tools::review::ReviewReceiptRisk {
-                unresolved: true,
-                level: "error".to_string(),
-                summary: "secret summary".to_string(),
-            }),
-        };
-
-        let public = review_receipt_validation_public_json(&validation);
-        let encoded = serde_json::to_string(&public).expect("public json");
-
-        assert_eq!(public["passed"], false);
-        assert_eq!(public["status"], "unresolved_risk");
-        assert_eq!(public["risk_level"], "error");
-        assert!(!encoded.contains("secret"));
-        assert!(!encoded.contains("/tmp/private"));
-    }
-
-    #[test]
-    fn exec_text_session_breadcrumbs_use_compact_ids() {
-        let session_id = "1234567890abcdef";
-
-        assert_eq!(exec_saved_session_line(session_id), "session: 12345678");
-        assert_eq!(
-            exec_resumed_session_line(session_id),
-            "resumed session: 12345678"
-        );
-        assert!(!exec_saved_session_line(session_id).contains(session_id));
-        assert!(!exec_resumed_session_line(session_id).contains(session_id));
-    }
-
-    #[test]
-    fn alternate_screen_defaults_on_in_auto_mode() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config::default();
-
-        assert_eq!(startup_screen_mode(&cli, &config), ScreenMode::Fullscreen);
-    }
-
-    #[test]
-    fn screen_mode_round_trips_through_its_own_vocabulary() {
-        for mode in [ScreenMode::Fullscreen, ScreenMode::Inline] {
-            assert_eq!(ScreenMode::parse(mode.as_str()), Some(mode));
-        }
-        // The `tui.alternate_screen` words the config file already documents.
-        assert_eq!(ScreenMode::parse("auto"), Some(ScreenMode::Fullscreen));
-        assert_eq!(ScreenMode::parse("always"), Some(ScreenMode::Fullscreen));
-        assert_eq!(ScreenMode::parse("never"), Some(ScreenMode::Inline));
-        assert_eq!(ScreenMode::parse("  INLINE "), Some(ScreenMode::Inline));
-        assert_eq!(ScreenMode::parse("sideways"), None);
-        assert!(ScreenMode::Fullscreen.uses_alt_screen());
-        assert!(!ScreenMode::Inline.uses_alt_screen());
-    }
-
-    #[test]
-    fn removed_no_alt_screen_flag_is_rejected() {
-        // Negative test: the retired compatibility flag must not be silently
-        // accepted and must not reach the alternate-screen decision at all.
-        let error = Cli::try_parse_from(["codewhale", "--no-alt-screen"])
-            .expect_err("--no-alt-screen must no longer parse");
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::UnknownArgument,
-            "retired flag should fail as an unknown argument, not be absorbed"
-        );
-    }
-
-    #[test]
-    fn config_never_selects_the_inline_screen() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
-                alternate_screen: Some("never".to_string()),
-                mouse_capture: None,
-                terminal_probe_timeout_ms: None,
-                stream_chunk_timeout_secs: None,
-                max_model_steps: None,
-                turn_wall_clock_secs: None,
-                stream_max_content_mb: None,
-                stream_max_duration_secs: None,
-                status_items: None,
-                osc8_links: None,
-                composer_arrows_scroll: None,
-                notification_condition: None,
-                header_items: None,
-            }),
-            ..Config::default()
-        };
-
-        assert_eq!(startup_screen_mode(&cli, &config), ScreenMode::Inline);
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn mouse_capture_defaults_on_when_alternate_screen_is_active() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config::default();
-
-        assert!(should_use_mouse_capture_with(
-            &cli, &config, true, None, None, None
-        ));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn mouse_capture_defaults_off_on_legacy_windows_console() {
-        // Legacy conhost (no `WT_SESSION` and no `ConEmuPID`) keeps the
-        // v0.8.x default-off behavior: mouse-mode reporting on legacy console
-        // can leak SGR escapes into the composer.
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config::default();
-
-        assert!(!should_use_mouse_capture_with(
-            &cli, &config, true, None, None, None
-        ));
-    }
-
-    // #1169: Windows Terminal sets `WT_SESSION` and handles mouse-mode
-    // reporting cleanly, so default-on there gives users in-app text
-    // selection (and the side-effect of clamping selection to the
-    // transcript region instead of the terminal painting across the
-    // sidebar via native selection).
-    #[test]
-    #[cfg(windows)]
-    fn mouse_capture_defaults_on_in_windows_terminal() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config::default();
-
-        assert!(should_use_mouse_capture_with(
-            &cli,
-            &config,
-            true,
-            None,
-            Some("{a3a3b3a8-aa00-0000-0000-000000000000}"),
-            None,
-        ));
-    }
-
-    // ConEmu/Cmder sets `ConEmuPID` and handles VT mouse-mode reporting
-    // cleanly; default mouse capture on there so users get in-app scrolling.
-    #[test]
-    #[cfg(windows)]
-    fn mouse_capture_defaults_on_in_conemu() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config::default();
-
-        assert!(should_use_mouse_capture_with(
-            &cli,
-            &config,
-            true,
-            None,
-            None,
-            Some("12345"),
-        ));
-    }
-
-    #[test]
-    fn no_mouse_capture_flag_disables_mouse_capture() {
-        let cli = parse_cli(&["codewhale", "--no-mouse-capture"]);
-        let config = Config::default();
-
-        assert!(!should_use_mouse_capture_with(
-            &cli, &config, true, None, None, None
-        ));
-    }
-
-    #[test]
-    fn config_can_disable_default_mouse_capture() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
-                alternate_screen: None,
-                mouse_capture: Some(false),
-                terminal_probe_timeout_ms: None,
-                stream_chunk_timeout_secs: None,
-                max_model_steps: None,
-                turn_wall_clock_secs: None,
-                stream_max_content_mb: None,
-                stream_max_duration_secs: None,
-                status_items: None,
-                osc8_links: None,
-                composer_arrows_scroll: None,
-                notification_condition: None,
-                header_items: None,
-            }),
-            ..Config::default()
-        };
-
-        assert!(!should_use_mouse_capture_with(
-            &cli, &config, true, None, None, None
-        ));
-    }
-
-    #[test]
-    fn mouse_capture_flag_enables_mouse_capture() {
-        let cli = parse_cli(&["codewhale", "--mouse-capture"]);
-        let config = Config::default();
-
-        assert!(should_use_mouse_capture_with(
-            &cli, &config, true, None, None, None
-        ));
-    }
-
-    #[test]
-    fn config_can_enable_mouse_capture() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
-                alternate_screen: None,
-                mouse_capture: Some(true),
-                terminal_probe_timeout_ms: None,
-                stream_chunk_timeout_secs: None,
-                max_model_steps: None,
-                turn_wall_clock_secs: None,
-                stream_max_content_mb: None,
-                stream_max_duration_secs: None,
-                status_items: None,
-                osc8_links: None,
-                composer_arrows_scroll: None,
-                notification_condition: None,
-                header_items: None,
-            }),
-            ..Config::default()
-        };
-
-        assert!(should_use_mouse_capture_with(
-            &cli, &config, true, None, None, None
-        ));
-    }
-
-    #[test]
-    fn mouse_capture_is_off_without_alternate_screen() {
-        let cli = parse_cli(&["codewhale", "--mouse-capture"]);
-        let config = Config::default();
-
-        assert!(!should_use_mouse_capture_with(
-            &cli, &config, false, None, None, None
-        ));
-    }
-
-    // Issue #878 / #898: JetBrains JediTerm advertises mouse support but
-    // forwards SGR mouse-event escapes as raw input characters, producing
-    // the "input box auto-fills with garbled characters when I move the
-    // mouse" failure mode in PyCharm/IDEA terminals. Default the capture
-    // off when we see TERMINAL_EMULATOR=JetBrains-JediTerm; explicit
-    // config / --mouse-capture still wins.
-
-    #[test]
-    fn mouse_capture_defaults_off_in_jetbrains_jediterm() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config::default();
-
-        assert!(!should_use_mouse_capture_with(
-            &cli,
-            &config,
-            true,
-            Some("JetBrains-JediTerm"),
-            None,
-            None,
-        ));
-    }
-
-    #[test]
-    fn jetbrains_default_off_is_case_insensitive() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config::default();
-
-        // JetBrains has occasionally varied the casing across releases;
-        // a case-insensitive match keeps the protection in place.
-        assert!(!should_use_mouse_capture_with(
-            &cli,
-            &config,
-            true,
-            Some("jetbrains-jediterm"),
-            None,
-            None,
-        ));
-    }
-
-    #[test]
-    fn mouse_capture_flag_overrides_jetbrains_default() {
-        let cli = parse_cli(&["codewhale", "--mouse-capture"]);
-        let config = Config::default();
-
-        assert!(should_use_mouse_capture_with(
-            &cli,
-            &config,
-            true,
-            Some("JetBrains-JediTerm"),
-            None,
-            None,
-        ));
-    }
-
-    #[test]
-    fn config_mouse_capture_true_overrides_jetbrains_default() {
-        let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
-                alternate_screen: None,
-                mouse_capture: Some(true),
-                terminal_probe_timeout_ms: None,
-                stream_chunk_timeout_secs: None,
-                max_model_steps: None,
-                turn_wall_clock_secs: None,
-                stream_max_content_mb: None,
-                stream_max_duration_secs: None,
-                status_items: None,
-                osc8_links: None,
-                composer_arrows_scroll: None,
-                notification_condition: None,
-                header_items: None,
-            }),
-            ..Config::default()
-        };
-
-        assert!(should_use_mouse_capture_with(
-            &cli,
-            &config,
-            true,
-            Some("JetBrains-JediTerm"),
-            None,
-            None,
-        ));
-    }
+    include!("lib/terminal_mode_test_cases_01.rs");
+    include!("lib/terminal_mode_test_cases_02.rs");
+    include!("lib/terminal_mode_test_cases_03.rs");
 }
 
 #[cfg(test)]
@@ -17631,6 +16808,1080 @@ mod interactive_startup_tests {
             interactive_tui_allow_shell(true, &disabled),
             "YOLO forces shell access for its no-guardrails contract"
         );
+    }
+}
+
+#[cfg(test)]
+mod mounted_history_tests {
+    use super::*;
+    use crate::runtime_threads::{
+        RuntimeThreadManager, RuntimeThreadManagerConfig, ThreadListFilter,
+    };
+    use crate::session_manager::{SavedSession, SessionGoalState, SessionWorkState};
+    use crate::session_tree::{SessionEntryKind, SessionJournal};
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    fn config() -> Config {
+        let mut config = Config {
+            provider: Some("CaseRoute".into()),
+            allow_shell: Some(false),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: std::collections::HashMap::from([(
+                    "CaseRoute".into(),
+                    crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".into()),
+                        base_url: Some("http://127.0.0.1:1/v1".into()),
+                        model: Some("mounted-fixture".into()),
+                        api_key: Some("owned-no-call-fixture".into()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        config.set_feature("mcp", false).unwrap();
+        config.set_feature("subagents", false).unwrap();
+        config
+    }
+
+    fn cli(workspace: &Path) -> Cli {
+        let mut cli = Cli::try_parse_from(["codewhale", "--no-project-config"]).unwrap();
+        cli.options.workspace = Some(workspace.to_path_buf());
+        let path = workspace.parent().unwrap().join("owned-config.toml");
+        std::fs::write(&path, "allow_shell = false\n").unwrap();
+        cli.options.config = Some(path);
+        cli
+    }
+
+    fn source(manager: &SessionManager, workspace: &Path) -> Result<(SavedSession, PathBuf)> {
+        let mut journal = SessionJournal::new();
+        let root = journal.append(SessionEntryKind::User {
+            text: "root request".into(),
+        });
+        let active = journal.append(SessionEntryKind::Assistant {
+            text: "active answer".into(),
+        });
+        journal.branch_to(&root).map_err(anyhow::Error::msg)?;
+        journal.append(SessionEntryKind::Assistant {
+            text: "unselected branch must survive".into(),
+        });
+        journal.branch_to(&active).map_err(anyhow::Error::msg)?;
+        let mut saved = create_saved_session(
+            &journal.to_messages(),
+            "mounted-fixture",
+            workspace,
+            41,
+            Some(&SystemPrompt::Text("original bounded guidance".into())),
+        );
+        saved
+            .metadata
+            .set_model_provider_route("custom", Some("CaseRoute"));
+        saved.metadata.mode = Some("agent".into());
+        saved.metadata.cost.session_cost_usd = 1.25;
+        saved.metadata.cost.priced_turns = 2;
+        saved.metadata.cost.coverage_recorded = true;
+        saved
+            .metadata
+            .cost
+            .route_receipts
+            .insert("owned-redacted-route-receipt".into());
+        saved.work_state = Some(SessionWorkState {
+            plan: crate::tools::plan::PlanSnapshot {
+                title: Some("Keep the original work".into()),
+                objective: Some("Full history across branches".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        saved.leaf_id = journal.leaf_id.clone();
+        saved.journal = Some(journal);
+        let path = manager.save_session(&saved)?;
+        // Use the protected on-disk projection as the exact test source.
+        let saved = manager.load_session_snapshot_bounded(
+            &saved.metadata.id,
+            codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES,
+        )?;
+        Ok((saved, path))
+    }
+
+    fn manager_config(config: &Config, workspace: &Path, id: &str) -> RuntimeThreadManagerConfig {
+        RuntimeThreadManagerConfig::for_session(
+            crate::task_manager::TaskManagerConfig::from_runtime(
+                config,
+                workspace.to_path_buf(),
+                None,
+                None,
+            )
+            .data_dir,
+            id,
+        )
+    }
+
+    fn plugins(workspace: &Path) -> Arc<crate::plugins::PluginRegistry> {
+        Arc::new(crate::plugins::PluginRegistry::empty(workspace))
+    }
+
+    #[tokio::test]
+    async fn mounted_resume_preserves_saved_identity_graph_goal_cost_and_releases_both_leases()
+    -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (original, _) = source(&manager, &workspace)?;
+        let goal: SessionGoalState = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"objective":"Resume the same objective","status":"paused",
+            "tokens_used":17,"continuation_count":2,"goal_id":"owned-goal"
+        }))?;
+        manager.save_session_goal(&original.metadata.id, Some(&goal))?;
+        let cli = cli(&workspace);
+        let (prepared, id) = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            original.metadata.id.clone(),
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await?;
+        assert_eq!(
+            id, original.metadata.id,
+            "resume must keep the original saved/cost scope"
+        );
+        let resumed = manager
+            .load_session_snapshot_bounded(&id, codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES)?;
+        assert_eq!(resumed.journal, original.journal);
+        assert_eq!(resumed.messages, original.messages);
+        assert_eq!(resumed.work_state, original.work_state);
+        assert_eq!(resumed.system_prompt, original.system_prompt);
+        assert_eq!(
+            serde_json::to_value(&resumed.metadata.cost)?,
+            serde_json::to_value(&original.metadata.cost)?
+        );
+        assert_eq!(
+            serde_json::to_value(manager.load_session_goal(&id)?)?,
+            serde_json::to_value(Some(&goal))?
+        );
+        assert_eq!(
+            resumed.metadata.model_provider_id.as_deref(),
+            Some("CaseRoute")
+        );
+        assert_eq!(
+            prepared
+                .config
+                .active_provider_identity()
+                .unwrap()
+                .key
+                .as_str(),
+            "CaseRoute"
+        );
+        let binding = resumed
+            .metadata
+            .runtime_store
+            .as_ref()
+            .context("canonical saved binding")?;
+        let runtime = RuntimeThreadManager::open_existing_session(
+            prepared.config.clone(),
+            workspace.clone(),
+            manager_config(&prepared.config, &workspace, &id),
+            plugins(&workspace),
+            binding,
+        )?;
+        let rows = runtime
+            .list_threads(ThreadListFilter::IncludeArchived, None)
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id.as_deref(), Some(id.as_str()));
+        assert_eq!(rows[0].model_provider_id.as_deref(), Some("CaseRoute"));
+        runtime.shutdown_and_wait().await?;
+        drop(runtime);
+        // These are the actual process/session guards mounted startup acquires.
+        drop(manager.reserve_session_for_attach(&id)?);
+        let (_, same_id) = prepare_mounted_session(
+            &cli,
+            prepared,
+            id.clone(),
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await?;
+        assert_eq!(
+            same_id, id,
+            "a later invocation reuses the unique canonical holder"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_forks_keep_every_branch_and_source_bytes_with_distinct_durable_ids()
+    -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (original, path) = source(&manager, &workspace)?;
+        let before = std::fs::read(&path)?;
+        let source_goal: SessionGoalState = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"objective":"Continue the original local objective","status":"active",
+            "token_budget":100000,"tokens_used":17,"time_used_seconds":9,"elapsed_seconds":20,
+            "continuation_count":3,"goal_id":"owned-fork-goal","last_gap_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repeated_gap_count":1,"last_gap_pass":2
+        }))?;
+        manager.save_session_goal(&original.metadata.id, Some(&source_goal))?;
+        let mut fork_goal = source_goal.clone();
+        fork_goal.status = crate::session_manager::SessionGoalStatus::Paused;
+        fork_goal.pause_reason = None;
+        let cli = cli(&workspace);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (prepared, id) = prepare_mounted_session(
+                &cli,
+                prepare_interactive_config(&cli, &config(), true)?,
+                original.metadata.id.clone(),
+                MountedHistoryIntent::Fork,
+                plugins(&workspace),
+            )
+            .await?;
+            let fork = manager.load_session_snapshot_bounded(
+                &id,
+                codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES,
+            )?;
+            let old = original.journal.as_ref().unwrap();
+            let full = fork.journal.as_ref().unwrap();
+            assert_eq!(
+                full.entries, old.entries,
+                "inactive branches cannot collapse into the current message projection"
+            );
+            assert_eq!(full.leaf_id, old.leaf_id);
+            assert_eq!(full.spawn_depth, old.spawn_depth + 1);
+            assert_eq!(fork.messages, original.messages);
+            assert_eq!(
+                fork.metadata.parent_session_id.as_deref(),
+                Some(original.metadata.id.as_str())
+            );
+            assert_eq!(
+                fork.metadata.model_provider_id.as_deref(),
+                Some("CaseRoute")
+            );
+            assert_eq!(fork.work_state, original.work_state);
+            assert_eq!(
+                serde_json::to_value(&fork.metadata.cost)?,
+                serde_json::to_value(&original.metadata.cost)?
+            );
+            assert_eq!(
+                prepared
+                    .config
+                    .active_provider_identity()
+                    .unwrap()
+                    .key
+                    .as_str(),
+                "CaseRoute"
+            );
+            assert_eq!(
+                serde_json::to_value(manager.load_session_goal(&id)?)?,
+                serde_json::to_value(Some(&fork_goal))?,
+                "actual local goal continuation is copied and paused without a provider turn"
+            );
+            assert_eq!(
+                serde_json::to_value(manager.load_session_goal(&original.metadata.id)?)?,
+                serde_json::to_value(Some(&source_goal))?,
+                "fork cannot consume or rewrite the source's local goal"
+            );
+            drop(manager.reserve_session_for_attach(&id)?);
+            assert_ne!(id, original.metadata.id);
+            ids.push(id);
+        }
+        assert_ne!(
+            ids[0], ids[1],
+            "new user invocations must not reuse the preceding fork operation"
+        );
+        assert_eq!(
+            std::fs::read(path)?,
+            before,
+            "fork never rewrites the source document"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_handoff_refuses_live_saved_session_without_copying_history() -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (saved, path) = source(&manager, &workspace)?;
+        let before = std::fs::read(&path)?;
+        let lease = manager.hold_live_lease_elsewhere(&saved.metadata.id);
+        let cli = cli(&workspace);
+        let error = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            saved.metadata.id,
+            MountedHistoryIntent::Fork,
+            plugins(&workspace),
+        )
+        .await
+        .err()
+        .context("live source must refuse")?;
+        assert!(format!("{error:#}").contains("open"), "{error:#}");
+        assert_eq!(manager.list_sessions()?.len(), 1);
+        assert_eq!(std::fs::read(path)?, before);
+        drop(lease);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_handoff_refuses_held_runtime_owner_before_history_mutation() -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (mut saved, _) = source(&manager, &workspace)?;
+        let runtime = RuntimeThreadManager::open_for_session(
+            config(),
+            workspace.clone(),
+            manager_config(&config(), &workspace, &saved.metadata.id),
+            plugins(&workspace),
+            None,
+        )?;
+        saved.metadata.runtime_store = Some(runtime.session_store_binding());
+        let path = manager.save_session(&saved)?;
+        let before = std::fs::read(&path)?;
+        let cli = cli(&workspace);
+        assert!(
+            prepare_mounted_session(
+                &cli,
+                prepare_interactive_config(&cli, &config(), true)?,
+                saved.metadata.id,
+                MountedHistoryIntent::Resume,
+                plugins(&workspace),
+            )
+            .await
+            .is_err(),
+            "a second actual owner cannot acquire the held store"
+        );
+        assert!(
+            runtime
+                .list_threads(ThreadListFilter::IncludeArchived, None)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(manager.list_sessions()?.len(), 1);
+        assert_eq!(std::fs::read(path)?, before);
+        runtime.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_missing_bound_store_refuses_without_recovered_empty_replacement() -> Result<()>
+    {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (mut saved, _) = source(&manager, &workspace)?;
+        let runtime = RuntimeThreadManager::open_for_session(
+            config(),
+            workspace.clone(),
+            manager_config(&config(), &workspace, &saved.metadata.id),
+            plugins(&workspace),
+            None,
+        )?;
+        let binding = runtime.session_store_binding();
+        runtime.shutdown_and_wait().await?;
+        drop(runtime);
+        saved.metadata.runtime_store = Some(binding.clone());
+        let path = manager.save_session(&saved)?;
+        let before = std::fs::read(&path)?;
+        std::fs::rename(
+            &binding.data_dir,
+            root.join("retained-missing-store-evidence"),
+        )?;
+        let cli = cli(&workspace);
+        assert!(
+            prepare_mounted_session(
+                &cli,
+                prepare_interactive_config(&cli, &config(), true)?,
+                saved.metadata.id,
+                MountedHistoryIntent::Resume,
+                plugins(&workspace),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !binding.data_dir.exists(),
+            "mounted resume cannot recover into an empty store"
+        );
+        assert_eq!(manager.list_sessions()?.len(), 1);
+        assert_eq!(std::fs::read(path)?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_handoff_reuses_captured_project_config_after_source_changes() -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let project = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+        std::fs::create_dir(&project)?;
+        let project_path = project.join("config.toml");
+        std::fs::write(&project_path, "allow_shell = false\n")?;
+        let manager = SessionManager::default_location()?;
+        let (saved, _) = source(&manager, &workspace)?;
+        let mut cli = cli(&workspace);
+        cli.options.no_project_config = false;
+        let prepared = prepare_interactive_config(&cli, &config(), true)?;
+        assert_eq!(prepared.config.allow_shell, Some(false));
+        std::fs::write(project_path, "allow_shell = true\n")?;
+        let (prepared, _) = prepare_mounted_session(
+            &cli,
+            prepared,
+            saved.metadata.id,
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await?;
+        assert_eq!(
+            prepared.config.allow_shell,
+            Some(false),
+            "the mounted entry must not re-read later ambient grants"
+        );
+        let identity = prepared.config.active_provider_identity().unwrap();
+        assert_eq!(identity.key.as_str(), "CaseRoute");
+        assert_eq!(
+            prepared
+                .config
+                .provider_config_for(&identity)
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("http://127.0.0.1:1/v1")
+        );
+        Ok(())
+    }
+    fn retained_operation_key(
+        binding: &crate::runtime_threads::RuntimeStoreBinding,
+    ) -> Result<String> {
+        // Read only this owned fixture's real, single durable history intent.
+        let files = std::fs::read_dir(binding.data_dir.join("turn-operations"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let files = files
+            .into_iter()
+            .filter(|row| row.file_name().to_string_lossy().starts_with("history_"))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            files.len() == 1,
+            "fixture expects exactly one history operation"
+        );
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
+        Ok(record["receipt"]["operation_key"]
+            .as_str()
+            .context("durable operation key")?
+            .to_string())
+    }
+
+    #[tokio::test]
+    async fn mounted_retained_fork_lookup_survives_changed_source_without_replay_or_wrong_intent_attach()
+    -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (mut saved, source_path) = source(&manager, &workspace)?;
+        let mut cli = cli(&workspace);
+        let (_, fork_id) = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            saved.metadata.id.clone(),
+            MountedHistoryIntent::Fork,
+            plugins(&workspace),
+        )
+        .await?;
+        let fork = manager.load_session_snapshot_bounded(
+            &fork_id,
+            codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES,
+        )?;
+        let key = retained_operation_key(fork.metadata.runtime_store.as_ref().unwrap())?;
+        let journal = saved.journal.as_mut().unwrap();
+        journal.append(SessionEntryKind::User {
+            text: "a genuine later append".into(),
+        });
+        saved.messages = journal.to_messages();
+        saved.leaf_id = journal.leaf_id.clone();
+        manager.save_session(&saved)?;
+        let changed_source = std::fs::read(&source_path)?;
+        cli.operation_key = Some(key.clone());
+        let (_, recovered_id) = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            saved.metadata.id.clone(),
+            MountedHistoryIntent::Fork,
+            plugins(&workspace),
+        )
+        .await?;
+        assert_eq!(
+            recovered_id, fork_id,
+            "the original key is looked up before the new document digest is proposed"
+        );
+        assert_eq!(manager.list_sessions()?.len(), 2);
+        let recovered = manager.load_session_snapshot_bounded(
+            &recovered_id,
+            codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES,
+        )?;
+        assert_eq!(recovered.journal, fork.journal);
+        assert_eq!(std::fs::read(&source_path)?, changed_source);
+        let error = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            saved.metadata.id.clone(),
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await
+        .err()
+        .context("Fork key cannot authorize Resume intent")?;
+        assert!(format!("{error:#}").contains(&key));
+        assert!(format!("{error:#}").contains("action/source"));
+        cli.operation_key = Some("owned-absent-key".into());
+        let error = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            saved.metadata.id,
+            MountedHistoryIntent::Fork,
+            plugins(&workspace),
+        )
+        .await
+        .err()
+        .context("absent key must not create a new fork")?;
+        assert!(format!("{error:#}").contains("owned-absent-key"));
+        assert_eq!(manager.list_sessions()?.len(), 2);
+        assert_eq!(std::fs::read(source_path)?, changed_source);
+        Ok(())
+    }
+
+    fn mark_published_operation_pending(
+        binding: &crate::runtime_threads::RuntimeStoreBinding,
+        key: &str,
+    ) -> Result<PathBuf> {
+        let files = std::fs::read_dir(binding.data_dir.join("turn-operations"))?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|row| row.file_name().to_string_lossy().starts_with("history_"))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            files.len() == 1,
+            "fixture expects one actual history operation"
+        );
+        let path = files[0].path();
+        let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        anyhow::ensure!(
+            record["receipt"]["operation_key"].as_str() == Some(key)
+                && record["committed"] == true
+                && record["target_document_digest"].is_string()
+                && record["journal_witness"].is_object(),
+            "fixture must retain actual prepared publication and complete witness"
+        );
+        // Simulate only interruption before the last intent commit in this
+        // owned fixture; all actual graph/document/checkpoint proofs stay exact.
+        record["committed"] = serde_json::json!(false);
+        std::fs::write(&path, serde_json::to_vec_pretty(&record)?)?;
+        Ok(path)
+    }
+
+    #[tokio::test]
+    async fn mounted_retained_pending_resume_finishes_published_source_once_without_reconstructing_intent()
+    -> Result<()> {
+        use crate::runtime_api::thread_history::saved_document_digest;
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (original, path) = source(&manager, &workspace)?;
+        let original_digest = saved_document_digest(&original)?;
+        let mut cli = cli(&workspace);
+        let (prepared, id) = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            original.metadata.id.clone(),
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await?;
+        let published = manager
+            .load_session_snapshot_bounded(&id, codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES)?;
+        assert_ne!(
+            saved_document_digest(&published)?,
+            original_digest,
+            "same-session publication changes source bytes before the final intent commit"
+        );
+        let binding = published
+            .metadata
+            .runtime_store
+            .as_ref()
+            .context("published owner binding")?;
+        let key = retained_operation_key(binding)?;
+        let record_path = mark_published_operation_pending(binding, &key)?;
+        let published_bytes = std::fs::read(&path)?;
+        cli.operation_key = Some(key.clone());
+        let wrong = prepare_mounted_session(
+            &cli,
+            PreparedInteractiveConfig {
+                config: prepared.config.clone(),
+                workspace: prepared.workspace.clone(),
+            },
+            id.clone(),
+            MountedHistoryIntent::Fork,
+            plugins(&workspace),
+        )
+        .await
+        .err()
+        .context("pending Resume cannot authorize Fork")?;
+        assert!(format!("{wrong:#}").contains("action/source"));
+        assert!(format!("{wrong:#}").contains(&key));
+        let pending: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path)?)?;
+        assert_eq!(pending["committed"], false);
+        let (recovered, same_id) = prepare_mounted_session(
+            &cli,
+            prepared,
+            id.clone(),
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await?;
+        assert_eq!(same_id, id);
+        assert_eq!(std::fs::read(&path)?, published_bytes);
+        let committed_bytes = std::fs::read(&record_path)?;
+        let committed: serde_json::Value = serde_json::from_slice(&committed_bytes)?;
+        assert_eq!(committed["committed"], true);
+        let (_, repeated_id) = prepare_mounted_session(
+            &cli,
+            PreparedInteractiveConfig {
+                config: recovered.config.clone(),
+                workspace: recovered.workspace.clone(),
+            },
+            id.clone(),
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await?;
+        assert_eq!(repeated_id, id);
+        assert_eq!(
+            std::fs::read(&record_path)?,
+            committed_bytes,
+            "completed same-key recovery must not mint or recommit another outcome"
+        );
+        assert_eq!(manager.list_sessions()?.len(), 1);
+        let runtime = RuntimeThreadManager::open_existing_session(
+            recovered.config.clone(),
+            workspace.clone(),
+            manager_config(&recovered.config, &workspace, &id),
+            plugins(&workspace),
+            binding,
+        )?;
+        let rows = runtime
+            .list_threads(ThreadListFilter::IncludeArchived, None)
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id.as_deref(), Some(id.as_str()));
+        runtime.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_pending_recovery_refuses_foreign_association_workspace_and_changed_prepared_history()
+    -> Result<()> {
+        use crate::runtime_api::thread_history::{
+            lookup_thread_history_operation_in_runtime, recover_thread_history_operation_in_runtime,
+        };
+        use codewhale_protocol::{
+            CanonicalThreadOperationKind, CanonicalThreadOperationLookup,
+            CanonicalThreadOperationRecovery, CanonicalThreadOperationStatus,
+        };
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        let foreign_workspace = root.join("foreign-workspace");
+        std::fs::create_dir(&workspace)?;
+        std::fs::create_dir(&foreign_workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (original, path) = source(&manager, &workspace)?;
+        let mut cli = cli(&workspace);
+        let (prepared, id) = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            original.metadata.id,
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await?;
+        let mut published = manager
+            .load_session_snapshot_bounded(&id, codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES)?;
+        let binding = published
+            .metadata
+            .runtime_store
+            .clone()
+            .context("published owner binding")?;
+        let key = retained_operation_key(&binding)?;
+        let record_path = mark_published_operation_pending(&binding, &key)?;
+        let pending_bytes = std::fs::read(&record_path)?;
+        let runtime = Arc::new(RuntimeThreadManager::open_existing_session(
+            prepared.config.clone(),
+            workspace.clone(),
+            manager_config(&prepared.config, &workspace, &id),
+            plugins(&workspace),
+            &binding,
+        )?);
+        let lookup = CanonicalThreadOperationLookup {
+            version: 1,
+            operation_key: key.clone(),
+            expected_data_dir: binding.data_dir.clone(),
+            expected_execution_scope: binding.execution_scope.clone(),
+            workspace: workspace.clone(),
+        };
+        let association = match lookup_thread_history_operation_in_runtime(
+            &runtime,
+            manager.sessions_dir(),
+            lookup.clone(),
+        )
+        .await?
+        {
+            CanonicalThreadOperationStatus::Pending { association, .. } => association,
+            _ => bail!("fixture must retain an uncommitted prepared intent"),
+        };
+        let mut wrong = association.clone();
+        wrong.kind = CanonicalThreadOperationKind::Fork;
+        let error = recover_thread_history_operation_in_runtime(
+            &runtime,
+            manager.sessions_dir(),
+            CanonicalThreadOperationRecovery {
+                operation: lookup.clone(),
+                association: wrong,
+            },
+        )
+        .await
+        .err()
+        .context("owner must reject changed action/source before write")?;
+        assert!(format!("{error:#}").contains("association"));
+        let mut wrong_workspace = lookup;
+        wrong_workspace.workspace = foreign_workspace;
+        let error = recover_thread_history_operation_in_runtime(
+            &runtime,
+            manager.sessions_dir(),
+            CanonicalThreadOperationRecovery {
+                operation: wrong_workspace,
+                association,
+            },
+        )
+        .await
+        .err()
+        .context("owner must reject another acknowledged workspace")?;
+        assert!(format!("{error:#}").contains("workspace"));
+        assert_eq!(std::fs::read(&record_path)?, pending_bytes);
+        assert_eq!(
+            runtime
+                .list_threads(ThreadListFilter::IncludeArchived, None)
+                .await?
+                .len(),
+            1
+        );
+        runtime.shutdown_and_wait().await?;
+        drop(runtime);
+        let journal = published.journal.as_mut().context("full prepared graph")?;
+        journal.append(SessionEntryKind::User {
+            text: "a successor makes pending preparation unsafe".into(),
+        });
+        published.messages = journal.to_messages();
+        published.leaf_id = journal.leaf_id.clone();
+        manager.save_session(&published)?;
+        let changed = std::fs::read(&path)?;
+        cli.operation_key = Some(key.clone());
+        let error = prepare_mounted_session(
+            &cli,
+            prepared,
+            id,
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await
+        .err()
+        .context("changed preparation must not be replayed or mounted")?;
+        assert!(format!("{error:#}").contains(&key));
+        assert_eq!(std::fs::read(&path)?, changed);
+        assert_eq!(std::fs::read(&record_path)?, pending_bytes);
+        assert_eq!(manager.list_sessions()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_retained_pending_intent_refuses_attach_without_creating_or_resuming_a_thread()
+    -> Result<()> {
+        use crate::runtime_threads::RuntimeHistoryWitness;
+        use codewhale_protocol::{
+            CanonicalThreadOperationAssociation, CanonicalThreadOperationKind,
+        };
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (saved, path) = source(&manager, &workspace)?;
+        let before = std::fs::read(&path)?;
+        let runtime = RuntimeThreadManager::open_for_session(
+            config(),
+            workspace.clone(),
+            manager_config(&config(), &workspace, &saved.metadata.id),
+            plugins(&workspace),
+            None,
+        )?;
+        let key = "owned-pending-intent";
+        let operation = runtime.reserve_history_operation_for_target(
+            key,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            None,
+        )?;
+        let journal = saved.journal.as_ref().unwrap();
+        runtime.bind_history_operation_witness(
+            operation,
+            RuntimeHistoryWitness {
+                entries_len: journal.entries.len(),
+                leaf_id: journal.leaf_id.clone(),
+                schema_version: journal.schema_version,
+                spawn_depth: journal.spawn_depth,
+                seed_from_message_index: 0,
+                workspace: workspace.clone(),
+            },
+            CanonicalThreadOperationAssociation {
+                kind: CanonicalThreadOperationKind::Fork,
+                source_runtime_thread_id: None,
+                source_session_id: Some(saved.metadata.id.clone()),
+            },
+        )?;
+        runtime.shutdown_and_wait().await?;
+        drop(runtime);
+        let mut cli = cli(&workspace);
+        cli.operation_key = Some(key.into());
+        let error = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            saved.metadata.id.clone(),
+            MountedHistoryIntent::Fork,
+            plugins(&workspace),
+        )
+        .await
+        .err()
+        .context("pending intent must refuse UI handoff")?;
+        assert!(format!("{error:#}").contains(key));
+        assert!(format!("{error:#}").contains("pending"));
+        let runtime = RuntimeThreadManager::open_existing_session_unbound(
+            config(),
+            workspace.clone(),
+            manager_config(&config(), &workspace, &saved.metadata.id),
+            plugins(&workspace),
+        )?;
+        assert!(
+            runtime
+                .list_threads(ThreadListFilter::IncludeArchived, None)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            !runtime
+                .lookup_history_operation_by_key(key)?
+                .unwrap()
+                .committed
+        );
+        runtime.shutdown_and_wait().await?;
+        assert_eq!(manager.list_sessions()?.len(), 1);
+        assert_eq!(std::fs::read(path)?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_retained_unbound_lookup_refuses_missing_store_without_minting_an_owner()
+    -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (saved, path) = source(&manager, &workspace)?;
+        let before = std::fs::read(&path)?;
+        let expected_dir = manager_config(&config(), &workspace, &saved.metadata.id).data_dir;
+        let mut cli = cli(&workspace);
+        cli.operation_key = Some("retained-unbound-key".into());
+        let error = prepare_mounted_session(
+            &cli,
+            prepare_interactive_config(&cli, &config(), true)?,
+            saved.metadata.id,
+            MountedHistoryIntent::Resume,
+            plugins(&workspace),
+        )
+        .await
+        .err()
+        .context("read-only recovery needs an existing owner")?;
+        assert!(format!("{error:#}").contains("retained-unbound-key"));
+        assert!(
+            !expected_dir.exists(),
+            "lookup must not create an empty replacement owner store"
+        );
+        assert_eq!(std::fs::read(path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn mounted_retained_key_is_explicitly_forwarded_after_resume_or_fork_subcommand() {
+        for action in ["resume", "fork"] {
+            let cli = Cli::try_parse_from([
+                "codewhale",
+                action,
+                "saved-source",
+                "--operation-key",
+                "owned-retained-key",
+            ])
+            .unwrap();
+            assert_eq!(cli.operation_key.as_deref(), Some("owned-retained-key"));
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Resume { .. } | Commands::Fork { .. })
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn mounted_foreign_workspace_refuses_before_owner_or_mutation_with_explicit_remedy()
+    -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let saved_workspace = root.join("saved-project");
+        let launch_workspace = root.join("different-project");
+        std::fs::create_dir(&saved_workspace)?;
+        std::fs::create_dir(&launch_workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (saved, path) = source(&manager, &saved_workspace)?;
+        let before = std::fs::read(&path)?;
+        let expected_store =
+            manager_config(&config(), &saved_workspace, &saved.metadata.id).data_dir;
+        let cli = cli(&launch_workspace);
+        for intent in [MountedHistoryIntent::Resume, MountedHistoryIntent::Fork] {
+            let error = prepare_mounted_session(
+                &cli,
+                prepare_interactive_config(&cli, &config(), true)?,
+                saved.metadata.id.clone(),
+                intent,
+                plugins(&launch_workspace),
+            )
+            .await
+            .err()
+            .context("a different project's captured grant must refuse")?;
+            assert!(format!("{error:#}").contains("--workspace"));
+            assert!(format!("{error:#}").contains(&saved_workspace.display().to_string()));
+            assert!(
+                !expected_store.exists(),
+                "scope refusal precedes owner acquisition"
+            );
+            assert_eq!(std::fs::read(&path)?, before);
+        }
+        assert_eq!(manager.list_sessions()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mounted_retained_key_foreign_workspace_refuses_before_lookup_and_keeps_exact_key()
+    -> Result<()> {
+        let _env = lock_test_env();
+        let _runtime_override = EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy_runtime_override = EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let saved_workspace = root.join("saved-project");
+        let launch_workspace = root.join("different-project");
+        std::fs::create_dir(&saved_workspace)?;
+        std::fs::create_dir(&launch_workspace)?;
+        let manager = SessionManager::default_location()?;
+        let (saved, path) = source(&manager, &saved_workspace)?;
+        let before = std::fs::read(&path)?;
+        let expected_store =
+            manager_config(&config(), &saved_workspace, &saved.metadata.id).data_dir;
+        let mut cli = cli(&launch_workspace);
+        cli.operation_key = Some("owned-original-operation".into());
+        for intent in [MountedHistoryIntent::Resume, MountedHistoryIntent::Fork] {
+            let error = prepare_mounted_session(
+                &cli,
+                prepare_interactive_config(&cli, &config(), true)?,
+                saved.metadata.id.clone(),
+                intent,
+                plugins(&launch_workspace),
+            )
+            .await
+            .err()
+            .context("lookup cannot attach under another project's captured scope")?;
+            assert!(format!("{error:#}").contains("--workspace"));
+            assert!(format!("{error:#}").contains("owned-original-operation"));
+            assert!(
+                !expected_store.exists(),
+                "scope refusal precedes existing-owner lookup too"
+            );
+            assert_eq!(std::fs::read(&path)?, before);
+        }
+        Ok(())
     }
 }
 
@@ -17670,7 +17921,10 @@ mod project_config_tests {
             ..Config::default()
         };
 
-        merge_project_config(&mut config, workspace.path());
+        let error =
+            merge_project_config_with_approval_baseline(&mut config, workspace.path(), None)
+                .expect_err("a symlinked primary project config must stop the launch");
+        assert!(error.to_string().contains("--no-project-config"), "{error}");
 
         assert_eq!(
             config.default_text_model.as_deref(),
@@ -17728,6 +17982,65 @@ mod project_config_tests {
     }
 
     #[test]
+    fn project_model_overrides_saved_selection_but_yields_to_actual_launch_models() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let _overrides: Vec<_> = [
+            "CODEWHALE_CONFIG_PATH",
+            "DEEPSEEK_CONFIG_PATH",
+            "CODEWHALE_PROVIDER",
+            "DEEPSEEK_PROVIDER",
+            "CODEWHALE_MODEL",
+            "DEEPSEEK_MODEL",
+            "DEEPSEEK_DEFAULT_TEXT_MODEL",
+            "OPENAI_MODEL",
+        ]
+        .into_iter()
+        .map(EnvVarGuard::remove)
+        .collect();
+        fs::write(
+            home.path().join("config.toml"),
+            "provider = 'openai'\n[providers.openai]\nmodel = 'gpt-5.6-sol'\n",
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("settings.toml"),
+            "[provider_models]\nopenai = 'gpt-5.6-terra'\n",
+        )
+        .unwrap();
+        let workspace = workspace_with_project_config("model = 'gpt-5.6-luna'\n");
+        let mut saved = Config::load(None, None).unwrap();
+        assert_eq!(saved.default_model(), "gpt-5.6-terra");
+        merge_project_config(&mut saved, workspace.path());
+        assert_eq!(saved.default_model(), "gpt-5.6-luna");
+        for key in [
+            "CODEWHALE_MODEL",
+            "DEEPSEEK_MODEL",
+            "DEEPSEEK_DEFAULT_TEXT_MODEL",
+            "OPENAI_MODEL",
+        ] {
+            // Equal to the saved model still counts as an explicit request.
+            let _model = EnvVarGuard::set(key, "gpt-5.6-terra");
+            let mut explicit = Config::load(None, None).unwrap();
+            merge_project_config(&mut explicit, workspace.path());
+            assert_eq!(explicit.default_model(), "gpt-5.6-terra", "{key}");
+            assert_eq!(
+                crate::route_runtime::resolve_runtime_route(
+                    &explicit,
+                    crate::config::ProviderKind::Openai,
+                    None
+                )
+                .unwrap()
+                .model,
+                "gpt-5.6-terra",
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn project_overlay_overrides_model_but_denies_provider() {
         // #417: `provider` is on the deny-list; only the `model`
         // override applies. The denied key emits a stderr warning
@@ -17769,20 +18082,22 @@ mcp_oauth_callback_url = "http://evil.example.com/callback"
 "#,
         );
         let mut config = Config {
-            api_key: Some("USER_KEY".to_string()),
-            base_url: Some("https://api.deepseek.com".to_string()),
             mcp_oauth_callback_port: Some(1455),
             mcp_oauth_callback_url: Some("http://127.0.0.1:1455/callback".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(
+            Some("USER_KEY".to_string()),
+            Some("https://api.deepseek.com".to_string()),
+        );
         merge_project_config(&mut config, tmp.path());
         assert_eq!(
-            config.api_key.as_deref(),
+            config.deepseek_table_api_key(),
             Some("USER_KEY"),
             "user api_key must survive project-config attack"
         );
         assert_eq!(
-            config.base_url.as_deref(),
+            config.deepseek_table_base_url(),
             Some("https://api.deepseek.com"),
             "user base_url must survive project-config attack"
         );
@@ -17818,6 +18133,21 @@ sandbox_mode = "read-only"
         merge_project_config(&mut config, tmp.path());
         assert_eq!(config.approval_policy.as_deref(), Some("never"));
         assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn project_overlay_ignores_notes_path() {
+        // The auto-approved `note` tool appends to `notes_path`; a project
+        // config must not choose that write target.
+        for value in ["~/.zshrc", "/etc/profile", "../../.bashrc", "docs/notes.md"] {
+            let tmp = workspace_with_project_config(&format!("notes_path = {value:?}\n"));
+            let mut config = Config::default();
+            merge_project_config(&mut config, tmp.path());
+            assert_eq!(
+                config.notes_path, None,
+                "project notes_path {value:?} must be ignored"
+            );
+        }
     }
 
     #[test]
@@ -17920,7 +18250,8 @@ approval_policy = "on-request"
         );
         let mut config = Config::default();
 
-        merge_project_config_with_approval_baseline(&mut config, tmp.path(), Some("full-access"));
+        merge_project_config_with_approval_baseline(&mut config, tmp.path(), Some("full-access"))
+            .expect("valid project config tightens the saved baseline");
 
         assert_eq!(
             config.approval_policy.as_deref(),
@@ -18201,14 +18532,22 @@ max_subagents = -3
     }
 
     #[test]
-    fn project_overlay_skips_malformed_toml() {
-        let tmp = workspace_with_project_config("this is not valid TOML !!");
+    fn project_overlay_refuses_malformed_toml_instead_of_dropping_its_restrictions() {
+        let tmp = workspace_with_project_config(
+            "approval_policy = \"on-request\"\nallow_shell = false\nthis is not valid TOML !!",
+        );
         let mut config = Config {
             provider: Some("codewhale".to_string()),
             ..Config::default()
         };
-        merge_project_config(&mut config, tmp.path());
-        // Untouched on parse error — better to fall back to global than crash.
+        // A broken file may be the one tightening this workspace; launching on
+        // the looser user baseline without it would fail open.
+        let error = merge_project_config_with_approval_baseline(&mut config, tmp.path(), None)
+            .expect_err("a malformed project config must stop the launch");
+        let message = error.to_string();
+        assert!(message.contains("invalid TOML at line 3"), "{message}");
+        assert!(message.contains("--no-project-config"), "{message}");
+        assert!(!message.contains("this is not valid"), "{message}");
         assert_eq!(config.provider.as_deref(), Some("codewhale"));
     }
 
@@ -18339,6 +18678,8 @@ mod doctor_mcp_tests {
             oauth: None,
             oauth_resource: None,
             reviewed_plugin: None,
+            runtime_added: false,
+            allow_private_network: false,
         }
     }
 
@@ -18533,12 +18874,12 @@ mod doctor_live_probe_tests {
     #[test]
     fn local_provider_probe_requires_explicit_opt_in() {
         assert!(!doctor_should_probe_api(
-            crate::config::ApiProvider::Ollama,
+            crate::config::ProviderKind::Ollama,
             "http://127.0.0.1:11434/v1",
             crate::doctor::DoctorProbeRequest::default(),
         ));
         assert!(doctor_should_probe_api(
-            crate::config::ApiProvider::Ollama,
+            crate::config::ProviderKind::Ollama,
             "http://127.0.0.1:11434/v1",
             crate::doctor::DoctorProbeRequest {
                 probe_local: true,
@@ -18551,12 +18892,12 @@ mod doctor_live_probe_tests {
     fn ollama_cloud_probe_uses_hosted_opt_in_not_local_opt_in() {
         let cloud = codewhale_config::provider::OLLAMA_CLOUD_BASE_URL;
         assert!(!doctor_should_probe_api(
-            crate::config::ApiProvider::OllamaCloud,
+            crate::config::ProviderKind::OllamaCloud,
             cloud,
             crate::doctor::DoctorProbeRequest::default(),
         ));
         assert!(doctor_should_probe_api(
-            crate::config::ApiProvider::OllamaCloud,
+            crate::config::ProviderKind::OllamaCloud,
             cloud,
             crate::doctor::DoctorProbeRequest {
                 probe_api: true,
@@ -18564,7 +18905,7 @@ mod doctor_live_probe_tests {
             },
         ));
         assert!(!doctor_should_probe_api(
-            crate::config::ApiProvider::OllamaCloud,
+            crate::config::ProviderKind::OllamaCloud,
             cloud,
             crate::doctor::DoctorProbeRequest {
                 probe_local: true,
@@ -18576,7 +18917,7 @@ mod doctor_live_probe_tests {
     #[test]
     fn custom_loopback_probe_also_requires_explicit_opt_in() {
         assert!(!doctor_should_probe_api(
-            crate::config::ApiProvider::Custom,
+            crate::config::ProviderKind::Custom,
             "http://localhost:8000/v1",
             crate::doctor::DoctorProbeRequest::default(),
         ));
@@ -18689,11 +19030,16 @@ mod setup_helper_tests {
     }
 
     #[test]
-    fn collect_clean_targets_finds_all_checkpoint_json_files() {
+    fn collect_clean_targets_preserves_offline_queues() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("latest.json"), "{}").unwrap();
         std::fs::write(dir.join("offline_queue.json"), "[]").unwrap();
+        std::fs::write(
+            dir.join("session.offline_queue.json"),
+            "invalid but valuable draft",
+        )
+        .unwrap();
         // Per-session crash checkpoint files are clean targets too.
         std::fs::write(dir.join("some-session-id.json"), "{}").unwrap();
         // Non-JSON files and subdirectories are left alone.
@@ -18701,10 +19047,11 @@ mod setup_helper_tests {
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
 
         let plan = collect_clean_targets(dir);
-        assert_eq!(plan.targets.len(), 3);
+        assert_eq!(plan.targets.len(), 2);
         assert!(plan.targets.iter().any(|p| p.ends_with("latest.json")));
         assert!(
-            plan.targets
+            !plan
+                .targets
                 .iter()
                 .any(|p| p.ends_with("offline_queue.json"))
         );
@@ -18727,9 +19074,9 @@ mod setup_helper_tests {
 
         let plan = collect_clean_targets(dir);
         let removed = execute_clean_plan(&plan).unwrap();
-        assert_eq!(removed.len(), 2);
+        assert_eq!(removed.len(), 1);
         assert!(!latest.exists());
-        assert!(!queue.exists());
+        assert_eq!(std::fs::read(&queue).unwrap(), b"[]");
     }
 
     #[test]
@@ -18743,14 +19090,30 @@ mod setup_helper_tests {
     }
 
     #[test]
-    fn run_setup_clean_force_removes_files() {
+    fn run_setup_clean_force_preserves_legacy_and_undecodable_drafts() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("latest.json"), "{}").unwrap();
         std::fs::write(dir.join("offline_queue.json"), "[]").unwrap();
+        let queued = [
+            (
+                "future.offline_queue.json",
+                "{\"schema_version\":999,\"draft\":\"keep me\"}",
+            ),
+            ("broken.offline_queue.json", "incomplete draft bytes"),
+        ];
+        for (name, bytes) in queued {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
         run_setup_clean(dir, true).unwrap();
         assert!(!dir.join("latest.json").exists());
-        assert!(!dir.join("offline_queue.json").exists());
+        assert_eq!(
+            std::fs::read(dir.join("offline_queue.json")).unwrap(),
+            b"[]"
+        );
+        for (name, bytes) in queued {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -18770,6 +19133,9 @@ mod setup_helper_tests {
             std::env::set_var("USERPROFILE", home);
         }
         let result = f();
+        // `--continue` recovery takes the recovered session's live lease for
+        // the process; release it with the temporary home it lives in.
+        crate::session_manager::set_live_session(None);
         unsafe {
             match prev_home {
                 Some(value) => std::env::set_var("HOME", value),
@@ -18903,6 +19269,72 @@ mod setup_helper_tests {
         });
     }
 
+    /// `--continue` in a second terminal must not take the session the first
+    /// terminal is still running: no promotion or clear of its checkpoint, no
+    /// silent swap to an older session, and the attach is refused by name.
+    #[test]
+    fn continue_leaves_a_session_live_in_another_terminal_alone() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        with_home(tmp.path(), || {
+            let manager = SessionManager::default_location().expect("manager");
+            let message = |text: &str| {
+                vec![Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: text.to_string(),
+                        cache_control: None,
+                    }],
+                }]
+            };
+            let older = create_saved_session(&message("older"), "test-model", &workspace, 0, None);
+            manager.save_session(&older).expect("save older");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let session =
+                create_saved_session(&message("still running"), "test-model", &workspace, 0, None);
+            let session_id = session.metadata.id.clone();
+            manager.save_session(&session).expect("save session");
+            manager.save_checkpoint(&session).expect("save checkpoint");
+
+            let lease = manager.hold_live_lease_elsewhere(&session_id);
+            let resolved = resolve_continue_session_id(&workspace, true);
+            assert_eq!(
+                resolved.as_deref(),
+                Some(session_id.as_str()),
+                "the newest session is named, not swapped for an older one"
+            );
+            assert!(
+                manager
+                    .load_session_checkpoint(&session_id)
+                    .expect("load checkpoint")
+                    .is_some(),
+                "the live session keeps its crash-recovery checkpoint"
+            );
+            let refusal = manager
+                .attach_session(&session_id)
+                .expect_err("attaching to it is refused");
+            assert_eq!(refusal.kind(), io::ErrorKind::ResourceBusy);
+            assert!(refusal.to_string().contains(&session_id), "{refusal}");
+            assert!(
+                load_exec_resume_session(&session_id)
+                    .expect_err("exec --continue is refused too")
+                    .to_string()
+                    .contains("open in another Codewhale window")
+            );
+            drop(lease);
+
+            // Once that session has exited, --continue recovers it as before.
+            assert_eq!(
+                resolve_continue_session_id(&workspace, true).as_deref(),
+                Some(session_id.as_str())
+            );
+            crate::session_manager::set_live_session(None);
+        });
+    }
+
     #[test]
     fn continue_without_interactive_terminal_leaves_checkpoint_for_a_real_launch() {
         // `codewhale --continue </dev/null` (and `run --continue`) used to
@@ -18964,6 +19396,80 @@ mod setup_helper_tests {
         std::fs::create_dir_all(&checkpoints).expect("create checkpoints dir");
         let content = serde_json::to_string_pretty(session).expect("serialize checkpoint");
         std::fs::write(checkpoints.join("latest.json"), content).expect("write legacy checkpoint");
+    }
+
+    /// The legacy `latest.json` slot names a session. When that session is
+    /// open in another terminal, neither `--continue` nor a plain launch may
+    /// promote the slot over its document, overwrite its per-session
+    /// checkpoint, or consume the slot.
+    #[test]
+    fn legacy_checkpoint_of_a_session_live_elsewhere_is_left_alone() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        with_home(tmp.path(), || {
+            let manager = SessionManager::default_location().expect("manager");
+            let message = |text: &str| {
+                vec![Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: text.to_string(),
+                        cache_control: None,
+                    }],
+                }]
+            };
+            let live =
+                create_saved_session(&message("live turn"), "test-model", &workspace, 0, None);
+            let session_id = live.metadata.id.clone();
+            let document = manager.save_session(&live).expect("save live document");
+            manager
+                .save_checkpoint(&live)
+                .expect("save live checkpoint");
+            let mut stale = live.clone();
+            stale.messages = message("stale legacy slot");
+            stale.metadata.updated_at = live.metadata.updated_at + chrono::Duration::seconds(60);
+            write_legacy_checkpoint(&manager, &stale);
+            let legacy = manager
+                .sessions_dir()
+                .join("checkpoints")
+                .join("latest.json");
+            let document_before = std::fs::read(&document).expect("document");
+            let checkpoint = || {
+                serde_json::to_string(
+                    &manager
+                        .load_session_checkpoint(&session_id)
+                        .expect("checkpoint")
+                        .expect("present")
+                        .messages,
+                )
+                .expect("serialize")
+            };
+            let checkpoint_before = checkpoint();
+
+            let lease = manager.hold_live_lease_elsewhere(&session_id);
+            let recovered = recover_interrupted_checkpoint_for_resume(&workspace);
+            preserve_interrupted_checkpoint_for_explicit_resume(&workspace);
+
+            assert_eq!(recovered, None, "nothing is recovered over a live session");
+            assert!(legacy.exists(), "the legacy slot is not consumed");
+            assert_eq!(
+                std::fs::read(&document).expect("document"),
+                document_before,
+                "the live document is not overwritten"
+            );
+            assert_eq!(
+                checkpoint(),
+                checkpoint_before,
+                "the live checkpoint is not replaced by the legacy slot"
+            );
+            assert!(
+                !crate::session_manager::is_live_session(&session_id),
+                "no claim was taken"
+            );
+            drop(lease);
+        });
     }
 
     #[test]
@@ -19143,7 +19649,9 @@ mod setup_helper_tests {
             include_str!("logging.rs"),
             include_str!("../../config/src/lib.rs"),
             include_str!("../../config/src/provider.rs"),
+            include_str!("../../config/assets/provider_descriptors.json"),
             include_str!("../../cli/src/main.rs"),
+            include_str!("../../secrets/src/lib.rs"),
         ]
         .join("\n");
 
@@ -19214,7 +19722,7 @@ mod setup_helper_tests {
 
         assert_eq!(resolve_api_key_source(&config), ApiKeySource::EnvDeclared);
         assert_eq!(
-            config.deepseek_api_key().expect("custom key"),
+            config.active_route_api_key().expect("custom key"),
             "declared-env-key"
         );
     }
@@ -19255,7 +19763,7 @@ mod setup_helper_tests {
         };
 
         assert_eq!(resolve_api_key_source(&config), ApiKeySource::Unknown);
-        assert!(config.deepseek_api_key().is_err());
+        assert!(config.active_route_api_key().is_err());
     }
 
     #[test]
@@ -19274,7 +19782,7 @@ mod setup_helper_tests {
         };
 
         assert_eq!(resolve_api_key_source(&config), ApiKeySource::Unknown);
-        assert!(config.deepseek_api_key().is_err());
+        assert!(config.active_route_api_key().is_err());
     }
 
     #[test]
@@ -19302,8 +19810,8 @@ mod setup_helper_tests {
         };
         let cloud = ollama_config(codewhale_config::provider::OLLAMA_CLOUD_BASE_URL);
         assert_eq!(
-            cloud.api_provider(),
-            crate::config::ApiProvider::OllamaCloud
+            cloud.active_provider_identity().unwrap().provider,
+            crate::config::ProviderKind::OllamaCloud
         );
         assert_eq!(
             resolve_api_key_source(&cloud),
@@ -19316,7 +19824,7 @@ mod setup_helper_tests {
         assert_eq!(doctor_auth_scheme(&cloud), "bearer");
         let report = doctor_route_report(&cloud);
         assert_eq!(report["provider"], "ollama-cloud");
-        assert_eq!(report["provider_config_table"], "ollama_cloud");
+        assert_eq!(report["provider_config_table"], "providers.ollama_cloud");
 
         let custom_remote = ollama_config("https://ollama-gateway.example.test/v1");
         assert_eq!(
@@ -19346,7 +19854,7 @@ mod setup_helper_tests {
         assert_eq!(resolve_api_key_source(&config), ApiKeySource::NoAuth);
         assert_eq!(doctor_api_key_source_label(ApiKeySource::NoAuth), "none");
         assert_eq!(doctor_auth_scheme(&config), "none");
-        assert_eq!(config.deepseek_api_key().expect("no-auth route"), "");
+        assert_eq!(config.active_route_api_key().expect("no-auth route"), "");
     }
 
     #[test]
@@ -19359,9 +19867,9 @@ mod setup_helper_tests {
             std::env::remove_var("DEEPSEEK_API_KEY_SOURCE");
         }
         let cfg = Config {
-            api_key: Some("fresh-config-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("fresh-config-key".to_string()), None);
         let source = resolve_api_key_source(&cfg);
         match prev {
             Some(value) => unsafe { std::env::set_var("DEEPSEEK_API_KEY", value) },
@@ -19413,7 +19921,7 @@ mod setup_helper_tests {
         let source = resolve_api_key_source(&cfg);
 
         assert_eq!(source, ApiKeySource::ExternalAuthDeclared);
-        assert!(cfg.deepseek_api_key().is_err());
+        assert!(cfg.active_route_api_key().is_err());
     }
 
     #[test]
@@ -19438,7 +19946,7 @@ mod setup_helper_tests {
         let source = resolve_api_key_source(&cfg);
 
         assert_eq!(source, ApiKeySource::ExternalAuthDeclared);
-        assert!(cfg.deepseek_api_key().is_err());
+        assert!(cfg.active_route_api_key().is_err());
     }
 
     #[test]
@@ -19449,9 +19957,9 @@ mod setup_helper_tests {
         let _openrouter_key = crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY");
         let cfg = Config {
             provider: Some("openrouter".to_string()),
-            api_key: Some("legacy-deepseek-root-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("legacy-deepseek-root-key".to_string()), None);
 
         let source = resolve_api_key_source(&cfg);
 
@@ -19461,12 +19969,12 @@ mod setup_helper_tests {
     #[test]
     fn provider_status_helpers_use_provider_metadata() {
         assert_eq!(
-            provider_config_table_key(crate::config::ApiProvider::Anthropic),
-            "anthropic"
+            provider_config_table_key(crate::config::ProviderKind::Anthropic),
+            "providers.anthropic"
         );
         assert_eq!(
-            provider_config_table_key(crate::config::ApiProvider::SiliconflowCn),
-            "siliconflow_cn"
+            provider_config_table_key(crate::config::ProviderKind::SiliconflowCN),
+            "providers.siliconflow_cn"
         );
     }
 
@@ -19503,3 +20011,63 @@ mod telemetry_surface_tests;
 #[cfg(test)]
 #[path = "tests/telemetry_counters.rs"]
 mod telemetry_counter_tests;
+
+#[cfg(test)]
+mod private_listing_tests {
+    use super::mcp_server_listing;
+    #[test]
+    fn mcp_listing_shared_vocabulary_never_echoes_flag_or_url_credentials() {
+        let args = [
+            "server.js",
+            "--privateKey",
+            "private-s10-synthetic",
+            "--clientSecret=client-s10-synthetic",
+            "--token-budget",
+            "4096",
+            "--port",
+            "8080",
+        ]
+        .map(str::to_string);
+        let listing = mcp_server_listing(Some("node"), &args, None);
+        assert!(!listing.contains("private-s10-synthetic"));
+        assert!(!listing.contains("client-s10-synthetic"));
+        assert!(listing.contains("--port 8080"));
+        assert!(listing.contains("--token-budget 4096"));
+        let url = mcp_server_listing(
+            None,
+            &[],
+            Some(
+                "https://user:url-s10-synthetic@mcp.example.com/sse?privateKey=query-s10-synthetic&team=core",
+            ),
+        );
+        assert!(!url.contains("url-s10-synthetic"));
+        assert!(!url.contains("query-s10-synthetic"));
+        assert!(url.contains("team=core"));
+    }
+}
+
+#[cfg(test)]
+mod mcp_add_arg_tests {
+    use super::*;
+    #[test]
+    fn mcp_add_arg_accepts_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "codewhale",
+            "mcp",
+            "add",
+            "srv",
+            "--command",
+            "npx",
+            "--arg",
+            "-y",
+        ])
+        .expect("mcp add parses hyphen-led --arg values");
+        let Some(Commands::Mcp { command }) = cli.command else {
+            panic!("expected mcp command");
+        };
+        let McpCommand::Add { args, .. } = command else {
+            panic!("expected mcp add subcommand");
+        };
+        assert_eq!(args, vec!["-y".to_string()]);
+    }
+}

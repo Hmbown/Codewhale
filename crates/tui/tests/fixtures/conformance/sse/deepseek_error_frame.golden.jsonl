@@ -1,0 +1,9 @@
+{"request":[{"method":"POST","path":"/v1/chat/completions"}]}
+{"type":"message_start","message":{"id":"","type":"message","role":"assistant","content":[],"model":"deepseek-v4-pro","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial"}}
+{"type":"error","error":{"message":"Model not exist.","type":"invalid_request_error","code":"invalid_request_error"}}
+{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" after the error"}}
+{"type":"content_block_stop","index":0}
+{"type":"message_delta","delta":{"stop_reason":"stop","stop_sequence":null}}
+{"type":"message_stop"}

@@ -22,6 +22,9 @@ codewhale-inference/
 !.env.example
 node_modules/
 .vscode/
+# The extension ships its own dev-loop config (F5 Extension Development Host).
+# Without this negation the bare `.vscode/` above swallows it silently.
+!/extensions/vscode/.vscode/
 .idea/
 *.swp
 *.swo
@@ -45,6 +48,8 @@ dist/
 *.log
 
 # Generated
+# Local design critiques and operator receipts do not ship with the product.
+/.impeccable/
 outputs/
 tmp/
 backup/
@@ -60,9 +65,11 @@ docs/*.pdf
 *.cmd
 !scripts/**
 !.github/scripts/**
-!.buildkite/**
 !web/public/install.sh
 !packaging/winget/**
+# Bridge launchers are shipped entry points (`npm run bridge`), not local dev
+# scripts; `!scripts/**` above only re-includes the repo-root scripts/ dir.
+!integrations/*/scripts/**
 test.txt
 TODO*.md
 todo*.md
@@ -89,6 +96,10 @@ project_overhaul_prompt.md
 .deepseek/
 **/session_*.json
 *.db
+
+# Chat bridge local state. `npm run bridge` writes the Weixin bot login token
+# (account.json) and the long-poll cursor here; these are live credentials.
+integrations/*-bridge/.state/
 npm/*/bin/downloads/
 
 # Companion app (tracked separately)
@@ -159,3 +170,13 @@ CODEWHALE_0_9_0_CUTOVER.md
 
 # Local playwright MCP artifacts
 .playwright-mcp/
+
+# computer-use plugin smoke receipts (per-run local evidence)
+crates/tui/plugins/computer-use/receipts/
+
+# OrcaRouter provider screenshot evidence (per-run local evidence)
+orca-evidence/
+
+# Portable pet build entry points are source.
+!pet/**/*.sh
+!pet/verify.sh

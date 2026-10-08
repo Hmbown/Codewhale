@@ -17,80 +17,48 @@ Related docs:
 - [Providers](PROVIDERS.md) — the model/key used to write the review
 - [Receipts](RECEIPTS.md) — how posted reviews are anchored to a head SHA
 
-## The review key is a Codewhale key, not a vendor key
+## Actions setup and model selection
 
-The canonical secret is **`CODEWHALE_API_KEY`**. It is the key for *your
-Codewhale account*, and the model behind it is whichever one you configure as
-your Codewhale agent for GitHub — it is not tied to any single vendor.
+Use [the reusable GitHub Action setup](GITHUB_ACTION.md) for the workflow,
+account machine key, exact model, release pin, limits, outcomes and retries.
+The repository workflow is now a thin caller of that action. It uses the
+Codewhale account relay and a checksummed release; it does not compile a PR's
+candidate source. BYOK is an explicit option in a user's own workflow.
 
-`.github/workflows/codewhale-review.yml` maps `CODEWHALE_API_KEY` into
-whatever environment variable the configured provider expects (a `case` over
-`CODEWHALE_REVIEW_PROVIDER`), so the secret name never has to change when you
-change models.
+## Review evidence and precision
 
-Bring-your-own-key still works: set the provider's own variable instead and
-the workflow uses it directly, with no mapping.
+The Actions-backed GitHub App and the `review` tool use the same PR review
+contract. Findings must explain an introduced defect's trigger, source evidence,
+impact and a useful fix. Generic requests for more tests, style preferences and
+unsupported compiler claims do not qualify as findings. An empty findings list
+is valid; unresolved assumptions belong in the assessment.
 
-If `CODEWHALE_API_KEY` and a provider's own secret are **both** set, the
-canonical account key wins: the workflow maps it onto the chosen provider's
-variable, overwriting the BYOK value.
+When the exact PR head is available locally, each pass also receives numbered
+source excerpts around its changed hunks and nearby module declarations. These
+come from regular Git blobs at the pinned head, never from dirty checkout files
+or symlink targets. Source is not executed and no additional model call is made.
+The excerpts use only the unused portion of `CODEWHALE_REVIEW_MAX_CHARS`, capped
+at 50000 characters and 32 files per pass; individual blobs above 128 KiB are
+omitted. The complete diff remains intact and remains the inline-comment scope.
 
-| Secret                | Role                                                        |
-|-----------------------|-------------------------------------------------------------|
-| `CODEWHALE_API_KEY`   | **canonical** — your Codewhale review key; wins over any BYOK secret that is also set |
-| `ZAI_API_KEY`         | BYOK fallback (z.ai Coding Plan / GLM)                       |
-| `DEEPSEEK_API_KEY`    | BYOK fallback (DeepSeek). This is the DeepSeek *provider* variable — it is not a generic bot key |
-| `OPENROUTER_API_KEY`  | BYOK fallback (OpenRouter)                                   |
-| `ANTHROPIC_API_KEY`   | BYOK fallback (Anthropic)                                    |
+The request explicitly records unavailable files and omitted context. It does
+not inspect unchanged caller files or run builds/tests, and a completed review
+does not establish either. These source and local-fixture guarantees do not
+establish a model's bug-detection rate or parity with another review product.
 
-Any **one** of these is enough. Until at least one exists, the workflow skips
-itself with a green notice, so it is safe to merge before setup is finished.
+## Output budget
 
-## Choosing which agent reviews
-
-Two repository variables (Settings → Secrets and variables → Actions →
-*Variables*) pick the route:
-
-| Variable                     | Example    | Effect                                        |
-|------------------------------|------------|-----------------------------------------------|
-| `CODEWHALE_REVIEW_PROVIDER`  | `zai`      | passed through as `codewhale review --provider zai` |
-| `CODEWHALE_REVIEW_MODEL`     | `GLM-5.3`  | passed through as `--model GLM-5.3`           |
-
-Both are optional. With neither set, the provider is inferred from which key is
-present (`CODEWHALE_API_KEY` alone defaults to the z.ai Coding Plan route) and
-the model is that provider's default — currently `GLM-5.3` against
-`https://api.z.ai/api/coding/paas/v4`.
-
-`--provider` matters because a model id can be reachable through more than one
-configured route. When it is, route resolution refuses to guess:
-
-```
-model `glm-5.3` is available from configured provider route(s): openrouter, zai.
-Pass `--provider <provider>` with `--model glm-5.3` to choose one explicitly.
-```
-
-In CI with exactly one key configured the ambiguity does not arise, but adding
-a second key would break the job. Setting `CODEWHALE_REVIEW_PROVIDER` pins the
-route so that never happens.
-
-## Output budget (reasoning models)
-
-GLM-5.3 is a reasoning model: it emits `reasoning_content` before any
-`content`, and both are charged against `max_tokens`. An undersized cap
-therefore produces an **empty** review rather than an error.
-
-The CLI's automatic cap (64K) already leaves plenty of room, so the workflow
-sets no override by default. To change it, set repository variable
-`CODEWHALE_REVIEW_MAX_OUTPUT_TOKENS`; the workflow exports it as
-`CODEWHALE_MAX_OUTPUT_TOKENS` and **rejects values below 8192** for exactly
-this reason. The run step also fails the job if the review comes back
-zero-length on a zero exit status, rather than reporting a clean review that
-never happened.
+`CODEWHALE_REVIEW_MAX_OUTPUT_TOKENS` optionally sets the CLI's output budget
+through `CODEWHALE_MAX_OUTPUT_TOKENS`. Without it, the CLI chooses its automatic
+cap. The workflow rejects values below **8192** to leave room for reasoning
+and the final review. Provider accounting and supported limits vary; an empty
+response is not proof of any one cause. A zero-exit review with empty output
+fails the job.
 
 ## One-time setup, five steps
 
-You need owner access to the GitHub repository once. After these five steps
-every non-draft pull request gets a Codewhale review posted as the App.
+You need owner access to the GitHub repository once. After setup, eligible non-draft
+same-repository pull requests can post reviews as the App.
 
 1. **Create the App.** GitHub → *Settings → Developer settings → GitHub Apps →
    New GitHub App*. Name it (e.g. `Codewhale Agent`), set a homepage URL, and
@@ -105,38 +73,40 @@ every non-draft pull request gets a Codewhale review posted as the App.
    private key*. Keep the `.pem` file secret; it is the App's credential.
 4. **Install the App** on your account (*Install App* on the same page) and
    select the repositories reviews should cover.
-5. **Add three repository settings.** GitHub → *Settings → Secrets and
+5. **Add repository settings.** GitHub → *Settings → Secrets and
    variables → Actions*:
 
    | Kind     | Name                        | Value                               |
    |----------|-----------------------------|-------------------------------------|
    | Variable | `CODEWHALE_APP_ID`          | the App ID shown on the App's page  |
    | Secret   | `CODEWHALE_APP_PRIVATE_KEY` | the full `.pem` file contents       |
-   | Secret   | `CODEWHALE_API_KEY`         | your Codewhale review key (or a BYOK provider key from the table above) |
+   | Secret   | `CODEWHALE_API_KEY`         | a Codewhale machine key for this repository workflow |
+   | Variable | `CODEWHALE_REVIEW_MODEL`    | exact account catalog `provider/model` id (required) |
+   | Variable | `CODEWHALE_REVIEW_VERSION` | exact released CLI tag; default v0.10.0 |
 
-   The review key is the only required one. Optional: variables
-   `CODEWHALE_REVIEW_PROVIDER`, `CODEWHALE_REVIEW_MODEL`, and
+   App settings control identity. Model access separately requires a review
+   key and, for account mode, the catalog model. Optional budget variables are
+   `CODEWHALE_REVIEW_MAX_CHARS`, `CODEWHALE_REVIEW_MAX_PASSES`, and
    `CODEWHALE_REVIEW_MAX_OUTPUT_TOKENS`.
 
 ## How the pieces connect
 
-`.github/workflows/codewhale-review.yml` runs on every non-draft PR. When
-`CODEWHALE_APP_ID` **and** `CODEWHALE_APP_PRIVATE_KEY` are both present, the
-job mints a short-lived installation token for the App
-(`actions/create-github-app-token`) and hands it to the CLI as `GH_TOKEN`.
-Otherwise it falls back to the workflow's own `github.token`. The CLI never
-stores the token; each run mints a fresh one.
+[The review workflow](../.github/workflows/codewhale-review.yml) uses
+`pull_request` and a manual `workflow_dispatch` recovery trigger. The action
+reads the PR's exact Git objects in a fresh repository without checking them
+out. Fork events receive no model key. Before any inference, the action
+rejects fork, draft and closed PRs and verifies their revisions, including
+on manual runs.
 
-The key-presence test lives in the job's `env:` block rather than its `if:`
-because the `secrets` context is not available in a job-level `if:`. Job-level
-`env` can read `secrets`, and step-level `if:` can read `env`, so every step
-gates on the non-secret string `env.HAS_ANY_KEY`. Only booleans about presence
-live at job scope; the key values are injected into the one step that runs the
-review.
+When both `CODEWHALE_APP_ID` and `CODEWHALE_APP_PRIVATE_KEY` are present, the
+workflow mints a short-lived installation token restricted to contents:read
+and pull_requests:write. Otherwise it uses `github.token`. The action emits
+one COMMENT review, never approval or a request for changes. CODEOWNERS stays
+the human authority. Setup or provider failures fail the optional review job
+and save a sanitized receipt; they do not post additional status comments.
 
-The review itself is one **COMMENT** review — a summary body plus inline line
-comments anchored to the PR head SHA. It never approves or requests changes;
-CODEOWNERS stays the human authority.
+The Actions-only App setup above does not describe the managed hosted App.
+Do not disable the webhook on an existing App that also serves hosted mentions.
 
 ## Running a review yourself
 
@@ -145,7 +115,17 @@ CODEOWNERS stays the human authority.
 codewhale review --pr 1234
 
 # pin the route when a model is reachable through more than one provider
-codewhale review --pr 1234 --provider zai --model GLM-5.3
+codewhale --provider deepseek --model MODEL_ID review --pr 1234
+
+# account mode: check the agent, then use an exact id from the account catalog
+codewhale --no-project-config account agent
+codewhale --no-project-config --provider codewhale --model PROVIDER/MODEL_ID review --pr 1234
+
+# explicitly increase a complete-diff input limit when needed
+codewhale review --pr 1234 --repo OWNER/REPO --max-chars 6000000
+
+# explicitly authorize at most 8 complete ordered model passes
+codewhale review --pr 1234 --repo OWNER/REPO --max-passes 8
 
 # publish it to GitHub as whichever identity GH_TOKEN carries
 codewhale review --pr 1234 --post
@@ -159,15 +139,22 @@ token (posts as the App). The `--post` flag is always opt-in.
 - **Review posts as you, not the bot.** The variable or the private-key secret
   is missing/empty; the job silently falls back to `github.token`. Check both
   names character-for-character.
-- **Workflow logs "No Codewhale review key is set — skipping".** Expected until
-  `CODEWHALE_API_KEY` (or one of the BYOK provider keys) exists.
+- **No model review completed.** Read the outcome receipt and the
+  [repair guide](GITHUB_ACTION.md#outcomes-and-recovery).
+- **Account model or provider error.** Set the provider to `codewhale` (or
+  unset it), choose the exact model from the account catalog, and check that
+  the machine key has the required scopes and the account has a configured
+  agent. A vendor key belongs in its own secret, never `CODEWHALE_API_KEY`.
+- **Complete diff exceeds the input limit.** Inspect the reported size and
+  model context capacity before raising `CODEWHALE_REVIEW_MAX_CHARS`. An 8 MiB
+  transport-bound failure cannot be bypassed with that variable.
+- **PR head changed or history is unavailable.** Rerun for the current
+  revision. The workflow refuses to review an unverified snapshot.
 - **"available from configured provider route(s): ...".** Two provider keys are
-  configured and the model is reachable from both. Set repository variable
-  `CODEWHALE_REVIEW_PROVIDER`.
-- **Empty review, job green.** A reasoning model spent its whole budget on
-  `reasoning_content`. Raise `CODEWHALE_REVIEW_MAX_OUTPUT_TOKENS` (or unset it
-  to use the CLI's automatic cap). The workflow now fails instead of passing
-  silently in this case.
+  configured and the model is reachable from both. Use an explicit provider in your own Action configuration.
+- **Empty review.** The job fails. Inspect provider errors and output-budget
+  receipts; increasing `CODEWHALE_REVIEW_MAX_OUTPUT_TOKENS` may help when
+  reasoning exhausted the budget, but does not diagnose the cause by itself.
 - **App token step fails.** The `.pem` was regenerated after the secret was
   set — paste the newest key into `CODEWHALE_APP_PRIVATE_KEY` again, and
   confirm the App is actually installed on the repository.

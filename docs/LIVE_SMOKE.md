@@ -1,5 +1,7 @@
 # Opt-in live smoke runs
 
+> 阅读简体中文版：[zh_hans/LIVE_SMOKE.md](zh_hans/LIVE_SMOKE.md)。
+
 This page is **manual, opt-in, and never automated.** Nothing in CI, no test,
 no build script, and no skill runs these commands. The repository's automated
 suite is provider-free by design; see

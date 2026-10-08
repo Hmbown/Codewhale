@@ -1,0 +1,7 @@
+command: /system
+is_error: false
+message:
+System Prompt (ACT mode):
+─────────────────────────────
+(no system prompt)
+action: <none>

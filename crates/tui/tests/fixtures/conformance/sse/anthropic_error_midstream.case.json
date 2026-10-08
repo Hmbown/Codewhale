@@ -1,0 +1,5 @@
+{
+  "description": "Anthropic Messages: a terminal `error` event mid-stream, followed by a stray delta. Pins what the adapter yields after the error frame (the engine stops consuming at the error).",
+  "route": "anthropic",
+  "model": "claude-sonnet-4-6"
+}

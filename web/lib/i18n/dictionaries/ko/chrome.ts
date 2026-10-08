@@ -11,10 +11,6 @@ import type { ChromeDict } from "../types";
  * "repository", 추론 is "reasoning", 권한 is "permission". Commands, package
  * names, and GitHub are left as-is per docs/VOICE.md.
  *
- * The secondary nav labels pair the Korean primary with a short English
- * label — the Han pair (文档 / 指引 / …) is the English edition's own
- * editorial device and is never hardcoded at a call site.
- *
  * Nav labels are kept to two–four syllables: they sit in one horizontal
  * masthead row. "FAQ" therefore renders as 질의응답 rather than the longer
  * 자주 묻는 질문, in both the nav and the footer so the two agree.
@@ -27,15 +23,11 @@ export const chrome: ChromeDict = {
   navCommunity: "커뮤니티",
   navContribute: "기여",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
+  navProduct: "제품",
+  navModels: "모델",
+  navPlugins: "플러그인",
 
   skipToContent: "본문으로 건너뛰기",
-
 
   navPrimaryAria: "기본 탐색",
   navHomeAria: "Codewhale 홈",
@@ -43,32 +35,8 @@ export const chrome: ChromeDict = {
   installCta: "설치 →",
 
   authSignIn: "로그인",
-  authRegister: "회원가입",
-  authGroupAria: "계정",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "어떤 모델이든, 당신의 머신에서",
-
-  // Newspaper dating: Korean papers write the issue date with the 자 suffix
-  // (8월 3일자), so the label is the date itself rather than "제N호".
-  issueLabel: "{date}자",
   dateLocale: "ko-KR",
-
-  starsAria: "GitHub 스타 수",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "실시간",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "병합됨",
-  tickerOpened: "열림",
-  tickerClosed: "닫힘",
-  tickerReleased: "릴리스",
-  tickerFirstContribution: "첫 기여",
-  tickerBy: "{handle} 님",
-  tickerAria: "저장소 최근 활동",
-
-  traceLabel: "추론 기록",
-  traceTabsAria: "세션 발췌",
 
   menuOpen: "메뉴 열기",
   menuClose: "메뉴 닫기",
@@ -76,11 +44,11 @@ export const chrome: ChromeDict = {
   themeAuto: "자동",
   themeLight: "밝게",
   themeDark: "어둡게",
-  themeAria: "문서 테마: {mode} (클릭하면 전환)",
-  themeTitle: "문서 테마 · 자동 / 밝게 / 어둡게",
+  themeAria: "테마: {mode} (클릭하면 전환)",
+  themeTitle: "테마 · 자동 / 밝게 / 어둡게",
 
   footerTagline:
-    "Codewhale이 깊은 곳으로 대신 잠수하니 당신은 잠수하지 않아도 됩니다 — 오픈 소스 런타임의 문서, 소스, 커뮤니티.",
+    "원하는 모델로 코드를 편집하고 테스트를 실행하며 변경 사항을 검토하세요.",
   footerProduct: "제품",
   footerProject: "프로젝트",
   footerDocs: "문서",
@@ -92,7 +60,6 @@ export const chrome: ChromeDict = {
   footerIssues: "이슈",
   footerContribute: "기여",
   footerLicense: "MIT 라이선스",
-  footerPricing: "가격",
   footerTerms: "이용약관",
   footerPrivacy: "개인정보처리방침",
   footerChangelog: "변경 로그",

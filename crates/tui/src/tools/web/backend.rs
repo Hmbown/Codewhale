@@ -4,21 +4,29 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
+use super::adapter::{self, AdapterFailure, AdapterResult};
 use super::contract::{BackendId, BackendSearch, DegradedReason, QueryCapabilities, SearchQuery};
 use super::contract::{CapabilityState as QueryCapabilityState, SearchResult};
 use crate::client::ProviderNativeSearchRequest;
 use crate::config::SearchProvider;
 use crate::tools::spec::{ToolContext, ToolError};
 
+const SEARCH_BACKEND_CONFIGURATION_HINT: &str = concat!(
+    "Check network access, or configure `[search] provider` and `[search] api_key` in ",
+    "config.toml. Keyed providers include tavily, bocha, metaso, baidu, volcengine, serply, ",
+    "and sofya; metaso also accepts METASO_API_KEY, tavily accepts TAVILY_API_KEY, baidu ",
+    "accepts BAIDU_SEARCH_API_KEY, volcengine accepts VOLCENGINE_API_KEY / ",
+    "VOLCENGINE_ARK_API_KEY / ARK_API_KEY, serply accepts SERPLY_API_KEY, and sofya ",
+    "accepts SOFYA_API_KEY. SearXNG needs a trusted self-hosted `[search] base_url`. For a ",
+    "keyless route, use the default `[search] provider = \"firecrawl\"` or ",
+    "`[search] provider = \"bing\"`."
+);
+
 #[async_trait]
 pub(crate) trait SearchBackend: Send + Sync {
     fn id(&self) -> BackendId;
     fn capabilities(&self) -> QueryCapabilities;
-    async fn search(
-        &self,
-        query: &SearchQuery,
-        deadline: Instant,
-    ) -> Result<BackendSearch, ToolError>;
+    async fn search(&self, query: &SearchQuery, deadline: Instant) -> AdapterResult<BackendSearch>;
 }
 
 #[derive(Clone, Copy)]
@@ -37,6 +45,7 @@ pub(crate) enum ConfiguredSearchBackend<'a> {
     Baidu(BackendContext<'a>),
     Volcengine(BackendContext<'a>),
     Sofya(BackendContext<'a>),
+    Serply(BackendContext<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -61,6 +70,7 @@ impl<'a> ConfiguredSearchBackend<'a> {
             SearchProvider::Baidu => Self::Baidu(backend),
             SearchProvider::Volcengine => Self::Volcengine(backend),
             SearchProvider::Sofya => Self::Sofya(backend),
+            SearchProvider::Serply => Self::Serply(backend),
         }
     }
 
@@ -76,6 +86,7 @@ impl<'a> ConfiguredSearchBackend<'a> {
             Self::Baidu(_) => SearchProvider::Baidu,
             Self::Volcengine(_) => SearchProvider::Volcengine,
             Self::Sofya(_) => SearchProvider::Sofya,
+            Self::Serply(_) => SearchProvider::Serply,
         }
     }
 
@@ -90,7 +101,8 @@ impl<'a> ConfiguredSearchBackend<'a> {
             | Self::Searxng(context)
             | Self::Baidu(context)
             | Self::Volcengine(context)
-            | Self::Sofya(context) => context,
+            | Self::Sofya(context)
+            | Self::Serply(context) => context,
         }
     }
 }
@@ -139,7 +151,7 @@ impl<'a> SearchBackendChain<'a> {
         deadline: Instant,
         first_attempt_budget: Option<Duration>,
         fallback_budget_after_first: Option<Duration>,
-    ) -> Result<ChainedSearch, ToolError> {
+    ) -> AdapterResult<ChainedSearch> {
         let backends = self
             .backends
             .iter()
@@ -176,7 +188,7 @@ async fn run_backend_chain(
     mut deadline: Instant,
     first_attempt_budget: Option<Duration>,
     fallback_budget_after_first: Option<Duration>,
-) -> Result<ChainedSearch, ToolError> {
+) -> AdapterResult<ChainedSearch> {
     let mut degraded = Vec::new();
     let mut last_empty = None;
     let mut attempted = Vec::new();
@@ -212,14 +224,28 @@ async fn run_backend_chain(
         .max(Duration::from_millis(1));
         let attempt_deadline = Instant::now() + attempt_budget;
 
-        let result = tokio::time::timeout(attempt_budget, backend.search(query, attempt_deadline))
-            .await
-            .map_err(|_| ToolError::Timeout {
+        let pending_host = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = tokio::time::timeout(
+            attempt_budget,
+            adapter::HOST_PENDING.scope(
+                std::sync::Arc::clone(&pending_host),
+                backend.search(query, attempt_deadline),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            let error = ToolError::Timeout {
                 seconds: u64::try_from(attempt_budget.as_millis())
                     .unwrap_or(u64::MAX)
                     .div_ceil(1_000),
-            })
-            .and_then(std::convert::identity);
+            };
+            if pending_host.load(std::sync::atomic::Ordering::SeqCst) {
+                AdapterFailure::host(error)
+            } else {
+                error.into()
+            }
+        })
+        .and_then(std::convert::identity);
 
         match result {
             Ok(mut raw) => {
@@ -236,7 +262,7 @@ async fn run_backend_chain(
                 degraded.append(&mut raw.degraded);
                 last_empty = Some((raw, capabilities));
             }
-            Err(error) if is_fail_closed(&error) => return Err(error),
+            Err(error) if !error.content() || is_fail_closed(&error.error) => return Err(error),
             Err(error) if backends.len() == 1 => return Err(error),
             Err(_) => degraded.push(DegradedReason::BackendUnavailable {
                 backend: backend_id,
@@ -250,7 +276,7 @@ async fn run_backend_chain(
     }
 
     if attempted.is_empty() {
-        return Err(ToolError::Timeout { seconds: 1 });
+        return Err((ToolError::Timeout { seconds: 1 }).into());
     }
 
     let backend_ids = attempted
@@ -258,9 +284,10 @@ async fn run_backend_chain(
         .map(BackendId::as_str)
         .collect::<Vec<_>>()
         .join(", ");
-    Err(ToolError::not_available(format!(
-        "web search backends unavailable: {backend_ids}"
+    Err((ToolError::not_available(format!(
+        "web search backends unavailable: {backend_ids}. {SEARCH_BACKEND_CONFIGURATION_HINT}"
     )))
+    .into())
 }
 
 const fn is_fail_closed(error: &ToolError) -> bool {
@@ -270,6 +297,7 @@ const fn is_fail_closed(error: &ToolError) -> bool {
             | ToolError::MissingField { .. }
             | ToolError::PathEscape { .. }
             | ToolError::Cancelled { .. }
+            | ToolError::Timeout { seconds: 0 }
             | ToolError::PermissionDenied { .. }
     )
 }
@@ -288,20 +316,39 @@ impl SearchBackend for ConfiguredSearchBackend<'_> {
             SearchProvider::Baidu => BackendId::Baidu,
             SearchProvider::Volcengine => BackendId::Volcengine,
             SearchProvider::Sofya => BackendId::Sofya,
+            SearchProvider::Serply => BackendId::Serply,
         }
     }
 
     fn capabilities(&self) -> QueryCapabilities {
-        // All current adapters enforce result count. Other knobs are either
-        // post-filtered by the shared harness or reported as not honored.
-        QueryCapabilities::count_only()
+        // All current adapters enforce result count. Recency and locale are
+        // forwarded where the backend's API takes them (see `QueryFilters` in
+        // `web_search.rs`) — and the keyless Bing and DuckDuckGo scrapes
+        // honor `locale` directly in the request (Bing mkt/setlang,
+        // DuckDuckGo kl, plus a matching Accept-Language); every other knob
+        // is post-filtered by the shared harness or reported as not honored.
+        let (recency, locale) = match self.provider() {
+            SearchProvider::Firecrawl | SearchProvider::Searxng => (true, true),
+            SearchProvider::Tavily => (true, false),
+            SearchProvider::Serply => (false, true),
+            SearchProvider::Bing | SearchProvider::DuckDuckGo => (false, true),
+            _ => (false, false),
+        };
+        let state = |supported: bool| {
+            if supported {
+                QueryCapabilityState::Supported
+            } else {
+                QueryCapabilityState::Unsupported
+            }
+        };
+        QueryCapabilities {
+            recency: state(recency),
+            locale: state(locale),
+            ..QueryCapabilities::count_only()
+        }
     }
 
-    async fn search(
-        &self,
-        query: &SearchQuery,
-        deadline: Instant,
-    ) -> Result<BackendSearch, ToolError> {
+    async fn search(&self, query: &SearchQuery, deadline: Instant) -> AdapterResult<BackendSearch> {
         crate::tools::web_search::run_backend_search(
             self.provider(),
             query,
@@ -332,16 +379,17 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
         &self,
         query: &SearchQuery,
         _deadline: Instant,
-    ) -> Result<BackendSearch, ToolError> {
+    ) -> AdapterResult<BackendSearch> {
         if !self
             .context
             .route_capabilities
             .server_side_web_search
             .is_supported()
         {
-            return Err(ToolError::not_available(
+            return Err((ToolError::not_available(
                 "active route does not report provider-native web search",
-            ));
+            ))
+            .into());
         }
         let client = self
             .context
@@ -355,18 +403,20 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
         // which honor domains natively or through post-filtering.
         let domain_limit = client.maximum_domain_count();
         if !query.domains.is_empty() && domain_limit == Some(0) {
-            return Err(ToolError::not_available(format!(
+            return Err((ToolError::not_available(format!(
                 "{} native web search cannot honor domain filters",
                 client.provider().as_str()
-            )));
+            )))
+            .into());
         }
         if let Some(maximum) = domain_limit
             && query.domains.len() > maximum
         {
-            return Err(ToolError::invalid_input(format!(
+            return Err((ToolError::invalid_input(format!(
                 "{} native web search accepts at most {maximum} domains",
                 client.provider().as_str()
-            )));
+            )))
+            .into());
         }
         let host = client.host().ok_or_else(|| {
             ToolError::execution_failed("provider-native search endpoint has no valid host")
@@ -388,20 +438,34 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
                     client.provider().as_str()
                 ))
             })?;
-        let results = response
+        let entries = response
             .citations
             .into_iter()
-            .enumerate()
-            .map(|(index, citation)| {
-                SearchResult::new(
-                    index + 1,
-                    citation.title,
-                    citation.url,
-                    citation.snippet,
-                    citation.published,
-                )
+            .map(|citation| super::contract::CapturedSearchEntry {
+                title: citation.title,
+                url: citation.url,
+                snippet: citation.snippet,
+                published: citation.published,
             })
             .collect();
+        let results = crate::tools::web_search::normalize_captured_entries(
+            entries,
+            self.context,
+            _deadline.saturating_duration_since(Instant::now()),
+        )
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            SearchResult::new(
+                index + 1,
+                entry.title,
+                entry.url,
+                entry.snippet,
+                entry.published,
+            )
+        })
+        .collect();
         Ok(BackendSearch {
             backend: BackendId::ProviderNative,
             source: format!(
@@ -411,7 +475,11 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
             ),
             backend_detail: Some(host),
             results,
-            degraded: Vec::new(),
+            degraded: if response.truncated {
+                vec![DegradedReason::AnswerCutByProvider]
+            } else {
+                Vec::new()
+            },
             note: response.answer,
         })
     }
@@ -448,7 +516,7 @@ mod tests {
             &self,
             _query: &SearchQuery,
             _deadline: Instant,
-        ) -> Result<BackendSearch, ToolError> {
+        ) -> AdapterResult<BackendSearch> {
             Ok(BackendSearch {
                 backend: self.id,
                 source: self.id.as_str().to_string(),
@@ -474,7 +542,7 @@ mod tests {
             &self,
             _query: &SearchQuery,
             deadline: Instant,
-        ) -> Result<BackendSearch, ToolError> {
+        ) -> AdapterResult<BackendSearch> {
             *self.observed_budget.lock().expect("budget lock") =
                 Some(deadline.saturating_duration_since(Instant::now()));
             tokio::time::sleep(self.delay).await;
@@ -516,6 +584,7 @@ mod tests {
             (SearchProvider::Baidu, BackendId::Baidu),
             (SearchProvider::Volcengine, BackendId::Volcengine),
             (SearchProvider::Sofya, BackendId::Sofya),
+            (SearchProvider::Serply, BackendId::Serply),
         ];
 
         for (provider, expected) in cases {
@@ -526,6 +595,39 @@ mod tests {
             assert_eq!(
                 backend.capabilities().max_results,
                 super::super::contract::CapabilityState::Supported
+            );
+        }
+    }
+
+    #[test]
+    fn keyless_scrape_backends_declare_locale_support() {
+        // The keyless Bing and DuckDuckGo scrapes honor the locale knob in
+        // their scrape requests; every other configured adapter must keep
+        // reporting locale per its own API so the receipt does not overclaim.
+        let cases = [
+            (SearchProvider::Bing, QueryCapabilityState::Supported),
+            (SearchProvider::DuckDuckGo, QueryCapabilityState::Supported),
+            (SearchProvider::Firecrawl, QueryCapabilityState::Supported),
+            (SearchProvider::Searxng, QueryCapabilityState::Supported),
+            (SearchProvider::Serply, QueryCapabilityState::Supported),
+            (SearchProvider::Tavily, QueryCapabilityState::Unsupported),
+            (SearchProvider::Bocha, QueryCapabilityState::Unsupported),
+            (SearchProvider::Metaso, QueryCapabilityState::Unsupported),
+            (SearchProvider::Baidu, QueryCapabilityState::Unsupported),
+            (
+                SearchProvider::Volcengine,
+                QueryCapabilityState::Unsupported,
+            ),
+            (SearchProvider::Sofya, QueryCapabilityState::Unsupported),
+        ];
+        for (provider, expected_locale) in cases {
+            let mut context = ToolContext::new(std::path::PathBuf::from("."));
+            context.search_provider = provider;
+            let backend = ConfiguredSearchBackend::from_provider(&context, provider);
+            assert_eq!(
+                backend.capabilities().locale,
+                expected_locale,
+                "{provider:?}"
             );
         }
     }
@@ -645,7 +747,8 @@ mod tests {
             codewhale_config::route::CapabilityState::Supported;
         context.provider_native_search = Some(
             crate::client::ProviderNativeSearchClient::new(
-                crate::client::DeepSeekClient::new(&moonshot_config).expect("test Moonshot client"),
+                crate::client::CodewhaleClient::new(&moonshot_config)
+                    .expect("test Moonshot client"),
             )
             .expect("Moonshot native adapter"),
         );
@@ -663,7 +766,7 @@ mod tests {
             .await
             .expect_err("Moonshot native search must decline domain-filtered queries");
         assert!(
-            matches!(error, ToolError::NotAvailable { .. }),
+            matches!(error.error, ToolError::NotAvailable { .. }),
             "declining must stay fallback-shaped, not fail-closed: {error:?}"
         );
 
@@ -685,7 +788,7 @@ mod tests {
             codewhale_config::route::CapabilityState::Supported;
         xai_context.provider_native_search = Some(
             crate::client::ProviderNativeSearchClient::new(
-                crate::client::DeepSeekClient::new(&xai_config).expect("test xAI client"),
+                crate::client::CodewhaleClient::new(&xai_config).expect("test xAI client"),
             )
             .expect("xAI native adapter"),
         );
@@ -716,7 +819,7 @@ mod tests {
         .await
         .expect_err("too many domains stays a typed user error");
         assert!(
-            matches!(error, ToolError::InvalidInput { .. }),
+            matches!(error.error, ToolError::InvalidInput { .. }),
             "over the provider limit must stay fail-closed: {error:?}"
         );
     }
@@ -779,7 +882,7 @@ mod tests {
         .await
         .expect_err("blocking fallback must stop at its own budget");
 
-        assert!(matches!(error, ToolError::NotAvailable { .. }));
+        assert!(matches!(error.error, ToolError::NotAvailable { .. }));
         let observed = observed_budget
             .lock()
             .expect("budget lock")
@@ -788,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_unavailable_returns_typed_error_with_backend_ids_only() {
+    async fn all_unavailable_returns_actionable_error_without_private_details() {
         let private_error = "secret provider response";
         let api = FakeBackend {
             id: BackendId::Bocha,
@@ -809,8 +912,36 @@ mod tests {
         .expect_err("all-down chain must fail");
         let message = error.to_string();
 
-        assert!(matches!(error, ToolError::NotAvailable { .. }));
+        assert!(matches!(error.error, ToolError::NotAvailable { .. }));
         assert!(message.contains("bocha, duckduckgo"));
+        for provider in [
+            "tavily",
+            "bocha",
+            "metaso",
+            "baidu",
+            "volcengine",
+            "serply",
+            "sofya",
+        ] {
+            assert!(
+                message.contains(provider),
+                "configuration hint must name {provider}: `{message}`"
+            );
+        }
+        assert!(message.contains("[search] provider"));
+        assert!(message.contains("[search] api_key"));
+        assert!(message.contains("config.toml"));
+        assert!(message.contains("METASO_API_KEY"));
+        assert!(message.contains("TAVILY_API_KEY"));
+        assert!(message.contains("BAIDU_SEARCH_API_KEY"));
+        assert!(message.contains("VOLCENGINE_API_KEY"));
+        assert!(message.contains("VOLCENGINE_ARK_API_KEY"));
+        assert!(message.contains("ARK_API_KEY"));
+        assert!(message.contains("SERPLY_API_KEY"));
+        assert!(message.contains("SOFYA_API_KEY"));
+        assert!(message.contains("[search] base_url"));
+        assert!(message.contains("provider = \"firecrawl\""));
+        assert!(message.contains("provider = \"bing\""));
         assert!(!message.contains(private_error));
         assert!(!message.contains("different private response"));
     }
@@ -834,9 +965,9 @@ mod tests {
                 &self,
                 _query: &SearchQuery,
                 _deadline: Instant,
-            ) -> Result<BackendSearch, ToolError> {
+            ) -> AdapterResult<BackendSearch> {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(ToolError::execution_failed("unexpected fallback"))
+                Err(ToolError::execution_failed("unexpected fallback").into())
             }
         }
 
@@ -858,7 +989,7 @@ mod tests {
         .await
         .expect_err("policy error must fail closed");
 
-        assert!(matches!(error, ToolError::PermissionDenied { .. }));
+        assert!(matches!(error.error, ToolError::PermissionDenied { .. }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -951,5 +1082,91 @@ mod tests {
                 to: BackendId::Searxng
             }
         )));
+    }
+    #[tokio::test]
+    async fn adapter_origins_and_selected_host_timeout_stop_backend_fallback() {
+        use super::super::adapter::FailureOrigin;
+        struct Refusal {
+            origin: FailureOrigin,
+            delay: bool,
+        }
+        #[async_trait]
+        impl SearchBackend for Refusal {
+            fn id(&self) -> BackendId {
+                BackendId::Tavily
+            }
+            fn capabilities(&self) -> QueryCapabilities {
+                QueryCapabilities::count_only()
+            }
+            async fn search(
+                &self,
+                _query: &SearchQuery,
+                _deadline: Instant,
+            ) -> AdapterResult<BackendSearch> {
+                if self.delay {
+                    if self.origin == FailureOrigin::Host {
+                        let _ = adapter::HOST_PENDING.try_with(|pending| {
+                            pending.store(true, std::sync::atomic::Ordering::SeqCst)
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                Err(AdapterFailure {
+                    origin: self.origin,
+                    error: ToolError::execution_failed(
+                        "No readable page content was found at fixture",
+                    ),
+                })
+            }
+        }
+        struct Count(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl SearchBackend for Count {
+            fn id(&self) -> BackendId {
+                BackendId::Bing
+            }
+            fn capabilities(&self) -> QueryCapabilities {
+                QueryCapabilities::count_only()
+            }
+            async fn search(
+                &self,
+                _query: &SearchQuery,
+                _deadline: Instant,
+            ) -> AdapterResult<BackendSearch> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BackendSearch {
+                    backend: BackendId::Bing,
+                    source: "bing".into(),
+                    backend_detail: None,
+                    results: vec![result()],
+                    degraded: vec![],
+                    note: None,
+                })
+            }
+        }
+        let query = SearchQuery::new("authorized".into(), 5, None, vec![], None);
+        for (origin, delay) in [
+            (FailureOrigin::Host, false),
+            (FailureOrigin::CaptureGuard, false),
+            (FailureOrigin::Host, true),
+            (FailureOrigin::ContentOrProvider, false),
+            (FailureOrigin::ContentOrProvider, true),
+        ] {
+            let first = Refusal { origin, delay };
+            let second = Count(std::sync::atomic::AtomicUsize::new(0));
+            let response = run_backend_chain(
+                &[&first, &second],
+                &query,
+                Instant::now() + Duration::from_millis(100),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.is_ok(), origin == FailureOrigin::ContentOrProvider);
+            assert_eq!(
+                second.0.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(origin == FailureOrigin::ContentOrProvider)
+            );
+        }
     }
 }

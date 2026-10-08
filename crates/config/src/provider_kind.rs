@@ -54,7 +54,15 @@ pub enum ProviderKind {
     Siliconflow,
     #[serde(alias = "arcee-ai", alias = "arcee_ai")]
     Arcee,
-    #[serde(alias = "siliconflow-cn", alias = "siliconflow-CN")]
+    // `rename_all = "kebab-case"` would spell this variant `siliconflow-c-n`,
+    // which is not the canonical id (`siliconflow-CN`) and which the config
+    // loader rejects. Serialize the canonical id; keep reading the old
+    // spelling so files written by earlier releases still load.
+    #[serde(
+        rename = "siliconflow-CN",
+        alias = "siliconflow-cn",
+        alias = "siliconflow-c-n"
+    )]
     SiliconflowCN,
     #[serde(alias = "moonshot-ai", alias = "moonshotai", alias = "moonshot_ai")]
     Moonshot,
@@ -113,7 +121,12 @@ pub enum ProviderKind {
     Deepinfra,
     #[serde(alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
     Sakana,
-    #[serde(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
+    #[serde(
+        rename = "longcat",
+        alias = "long-cat",
+        alias = "meituan-longcat",
+        alias = "meituan"
+    )]
     LongCat,
     #[serde(alias = "opencode_go", alias = "opencodego")]
     OpencodeGo,
@@ -191,11 +204,22 @@ pub enum ProviderKind {
         alias = "alibaba-coding-plan-anthropic"
     )]
     ModelstudioCodingPlanAnthropic,
-    /// Google Antigravity (`agy` CLI) — consent-gated read-only credential
-    /// import only; the cloud-code wire protocol is not implemented and
-    /// requests fail closed with an actionable message.
+    /// Legacy Antigravity configuration identity.
+    ///
+    /// Kept only so existing configuration can be read and cleared. It is not
+    /// a selectable or runnable provider; Gemini users should use [`Google`].
+    ///
+    /// [`Google`]: Self::Google
     #[serde(alias = "agy")]
     Antigravity,
+    /// ModelScope — Alibaba's ModelScope inference API (OpenAI-compatible).
+    #[serde(
+        alias = "model-scope",
+        alias = "model_scope",
+        alias = "modelscope-cn",
+        alias = "modelscope_cn"
+    )]
+    Modelscope,
     /// Google — Gemini OpenAI-compatible endpoint. Its own backend, not an
     /// OpenAI alias: thought signatures on tool calls are captured and
     /// replayed per Google's contract.
@@ -215,6 +239,28 @@ pub enum ProviderKind {
     /// namespaced wire ids over the OpenAI Chat Completions protocol.
     #[serde(alias = "eden-ai", alias = "eden_ai", alias = "edenai")]
     Edenai,
+    /// ZenMux — OpenAI-compatible AI gateway (aggregator).
+    ///
+    /// Serves ~200 upstream models under `provider/model` namespaced wire
+    /// ids over the OpenAI Chat Completions protocol at
+    /// `https://zenmux.ai/api/v1`. The `/models` catalog is keyless-readable.
+    #[serde(alias = "zen-mux", alias = "zen_mux")]
+    Zenmux,
+    /// CSDN 星图 (Starmap) — CSDN's hosted OpenAI-compatible model platform
+    /// and Coding Plan subscription.
+    ///
+    /// The plan model id `glm_for_coding` (GLM-5.2 underneath, 200k context
+    /// cap) bills against plan quota and requires the dedicated Coding Plan
+    /// key type; other marketplace model ids and general keys bill metered
+    /// through the same endpoint.
+    #[serde(
+        alias = "csdn-ai",
+        alias = "csdn_ai",
+        alias = "csdn-coding-plan",
+        alias = "csdn_coding_plan",
+        alias = "starmap"
+    )]
+    Csdn,
     /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
     ///
     /// Serves a broad catalog of upstream models over the OpenAI Responses
@@ -230,6 +276,22 @@ pub enum ProviderKind {
         alias = "concentrateai"
     )]
     Concentrate,
+    /// Codewhale API — account-backed model access over the customer's own
+    /// connected provider keys.
+    ///
+    /// One base URL, one `cwc_key_…` account API key with the `models:infer`
+    /// scope, and a per-model wire chosen from the account's live catalog:
+    /// `GET /v1/models` returns `provider/model` rows carrying
+    /// `codewhale.protocol` (`chat-completions`, `anthropic-messages`, or
+    /// `responses`). Every protocol authenticates with `Authorization: Bearer`
+    /// — the Anthropic passthrough does **not** take `x-api-key`.
+    #[serde(
+        alias = "codewhale-api",
+        alias = "codewhale_api",
+        alias = "cw-api",
+        alias = "codewhale-cloud"
+    )]
+    Codewhale,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// A single dynamic identity for arbitrary `[providers.<name>]
@@ -247,51 +309,7 @@ impl ProviderKind {
     /// stay on the enum for serde and `provider_for_kind`, but they are not
     /// first-class catalog rows. Plan is `mode` / base_url; dialect is
     /// `wire = openai|anthropic` on the primary provider config.
-    pub const ALL: [Self; 43] = [
-        Self::Deepseek,
-        Self::NvidiaNim,
-        Self::Openai,
-        Self::Atlascloud,
-        Self::WanjieArk,
-        Self::Volcengine,
-        Self::Openrouter,
-        Self::Orcarouter,
-        Self::XiaomiMimo,
-        Self::Novita,
-        Self::Fireworks,
-        Self::Siliconflow,
-        Self::Arcee,
-        Self::SiliconflowCN,
-        Self::Moonshot,
-        Self::Sglang,
-        Self::Vllm,
-        Self::Ollama,
-        Self::OllamaCloud,
-        Self::Huggingface,
-        Self::Together,
-        Self::Qianfan,
-        Self::OpenaiCodex,
-        Self::Anthropic,
-        Self::Openmodel,
-        Self::Zai,
-        Self::Stepfun,
-        Self::Minimax,
-        Self::Deepinfra,
-        Self::Sakana,
-        Self::LongCat,
-        Self::OpencodeGo,
-        Self::OpencodeZen,
-        Self::Meta,
-        Self::Xai,
-        Self::Mistral,
-        Self::Telecomjs,
-        Self::ModelstudioTokenPlan,
-        Self::Google,
-        Self::Antigravity,
-        Self::Edenai,
-        Self::Concentrate,
-        Self::Custom,
-    ];
+    pub const ALL: [Self; 46] = crate::descriptors::SELECTABLE_PROVIDER_KINDS;
 
     #[must_use]
     pub fn all() -> &'static [Self] {
@@ -315,13 +333,15 @@ impl ProviderKind {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         let trimmed = value.trim();
-        provider::all_providers()
-            .iter()
-            .find(|p| {
-                trimmed.eq_ignore_ascii_case(p.id())
-                    || p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a))
-            })
-            .map(|p| p.kind())
+        // Gated through `ALL`, not the full registry: the registry still holds
+        // retired tombstones so old config deserializes, and a selection
+        // surface must never be able to resolve one back into a route.
+        Self::all().iter().copied().find(|kind| {
+            let p = kind.provider();
+            crate::descriptors::builtin_provider_descriptor(*kind).selectable
+                && (trimmed.eq_ignore_ascii_case(p.id())
+                    || p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a)))
+        })
     }
 
     /// Parse a provider identifier for **config-table identity** — the kind
@@ -353,11 +373,23 @@ impl ProviderKind {
             })
             .map(|p| p.kind())
             .or_else(|| Self::parse(trimmed))
+            .or_else(|| Self::parse_retired_alias(trimmed))
     }
 
-    #[must_use]
-    pub fn is_siliconflow(self) -> bool {
-        matches!(self, Self::Siliconflow | Self::SiliconflowCN)
+    /// Alias lookup restricted to registry entries that are *not* in the
+    /// selectable catalog. Catalog aliases are handled by [`parse`](Self::parse)
+    /// and always take precedence.
+    ///
+    /// Retired kinds still need to answer to their aliases here so a selection
+    /// surface can *name* the tombstone and refuse it, instead of failing to
+    /// recognize `agy` and minting a fresh `[providers.agy]` table that serde
+    /// would fold straight back onto the legacy one.
+    fn parse_retired_alias(trimmed: &str) -> Option<Self> {
+        provider::all_providers()
+            .iter()
+            .filter(|p| !Self::all().contains(&p.kind()))
+            .find(|p| p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a)))
+            .map(|p| p.kind())
     }
 
     /// Canonical durable-credential slot in the local secret store.
@@ -375,14 +407,7 @@ impl ProviderKind {
     ///   one variant held the key.
     #[must_use]
     pub fn secret_store_slot(self) -> &'static str {
-        match self {
-            Self::SiliconflowCN => "siliconflow",
-            Self::ModelstudioTokenPlan
-            | Self::ModelstudioTokenPlanAnthropic
-            | Self::ModelstudioCodingPlan
-            | Self::ModelstudioCodingPlanAnthropic => "modelstudio-token-plan",
-            _ => self.as_str(),
-        }
+        crate::descriptors::builtin_provider_descriptor(self).secret_store_slot
     }
 
     /// Return the built-in metadata entry for this provider.

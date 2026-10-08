@@ -6,9 +6,9 @@
 
 use std::fmt::Write as _;
 
-use crate::localization::{Locale, MessageId, tr};
 use crate::tools::subagent::CoordinationDetailProjection;
 use crate::tools::subagent::coord::{DecisionStatus, ReconciliationReceipt};
+use codewhale_localization::{Locale, MessageId, tr};
 
 #[must_use]
 pub(crate) fn summary(locale: Locale, projection: &CoordinationDetailProjection) -> String {
@@ -307,6 +307,7 @@ mod tests {
                 },
                 sequence: 2,
                 isolated_worktree: false,
+                present_at_claim: Vec::new(),
             }],
             reconciliations: vec![ReconciliationReceipt {
                 reconciliation_id: "reconcile-ui".to_string(),

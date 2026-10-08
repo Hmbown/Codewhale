@@ -1,0 +1,40 @@
+/* The verified Markdown guide owns the content; this surface owns its
+   layout, on the shared prose measure. */
+.install-guide {
+  width: var(--container);
+  max-width: var(--measure-prose);
+  margin-inline: auto;
+  padding-bottom: var(--section-gap);
+  color: var(--text);
+  font-size: var(--text-prose);
+  line-height: var(--leading-prose);
+  overflow-wrap: anywhere;
+}
+.install-guide :is(h1, h2, h3, h4) { color: var(--text); line-height: 1.25; scroll-margin-top: 6rem; }
+.install-guide h1 { font-size: var(--text-display); margin-bottom: var(--space-5); }
+.install-guide h2 { font-size: var(--text-title); margin-top: var(--space-7); margin-bottom: var(--space-3); }
+.install-guide h3 { font-size: var(--text-heading); margin-top: var(--space-6); margin-bottom: var(--space-2); }
+.install-guide h4 { font-size: var(--text-body); margin-top: var(--space-5); margin-bottom: var(--space-2); }
+.install-guide :is(p, ul, ol, blockquote, .install-guide-table, pre) { margin-block: var(--space-4); }
+.install-guide p,
+.install-guide li { color: var(--text); max-width: var(--measure-text); }
+.install-guide > .code { margin-block: var(--space-5); }
+.install-guide :is(ul, ol) { padding-inline-start: 1.5rem; }
+.install-guide ul { list-style: disc; }
+.install-guide ol { list-style: decimal; }
+.install-guide li { margin-block: var(--space-1); }
+.install-guide ::marker { color: var(--muted); }
+.install-guide a { color: var(--accent); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); text-underline-offset: 0.2em; }
+.install-guide a:hover { text-decoration-color: var(--accent); }
+.install-guide a[id] { scroll-margin-top: 6rem; }
+.install-guide strong { font-weight: 600; }
+.install-guide blockquote { padding-inline-start: var(--space-4); border-inline-start: 2px solid var(--line-strong); color: var(--muted); }
+.install-guide hr { margin-block: var(--space-7); border: 0; border-top: 1px solid var(--line); }
+.install-guide :not(pre) > code { font-family: var(--font-mono); font-size: 0.875em; background: var(--surface); padding: 0.0625rem 0.3125rem; border-radius: var(--radius-control); }
+.install-guide pre { max-width: 100%; overflow-x: auto; white-space: pre; overflow-wrap: normal; }
+.install-guide pre:not(.code-block) { padding: var(--space-4); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-surface); font-size: var(--text-mono); }
+.install-guide-table { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-surface); }
+.install-guide table { width: 100%; border-collapse: collapse; font-size: var(--text-ui); }
+.install-guide :is(th, td) { padding: var(--space-3); min-width: 8rem; text-align: start; vertical-align: top; border-bottom: 1px solid var(--line); }
+.install-guide th { background: var(--panel); font-weight: 600; }
+.install-guide tr:last-child td { border-bottom: 0; }

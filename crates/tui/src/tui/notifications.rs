@@ -5,15 +5,15 @@
 //!   Ghostty, WezTerm, and tmux (with DCS passthrough).
 //! - **Kitty** — OSC 99 protocol with ST terminator (no audible beep).
 //! - **Ghostty** — OSC 777 notification protocol.
-//! - **BEL** — audible bell (`\x07`) as a last-resort fallback.
+//! - **BEL** — an explicit audio-only notification transport.
 //!
 //! When `method = "auto"`, the resolver picks the best method for the
 //! current terminal. Unknown terminals fail closed to `Off`; an audible BEL
-//! is emitted only when the user explicitly selects `method = "bel"`.
+//! is emitted only by an explicitly selected sound or `method = "bel"`.
 //!
 //! Every mechanism is fed a [`NotificationPayload`] — a typed, bounded,
 //! redaction-aware value — rather than a free-form `String` (#4834). See
-//! [`crate::tui::notification_payload`] for the per-kind disclosure
+//! [`crate::notify::payload`] for the per-kind disclosure
 //! policy.
 //!
 //! Delivery is governed by one [`NotificationGate`] (#5041):
@@ -21,108 +21,18 @@
 //! `[notifications.events]` disables individual categories, enforced at
 //! the emission path so no protocol can leak a suppressed event.
 
-#[cfg(target_os = "windows")]
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE;
-
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use super::notification_payload::NotificationKind;
-pub use super::notification_payload::NotificationPayload;
-
-#[cfg(target_os = "windows")]
-use std::os::windows::ffi::OsStrExt;
-#[cfg(target_os = "windows")]
-use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
-#[cfg(target_os = "windows")]
-use windows::core::PCWSTR;
-
-/// Notification delivery method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Method {
-    /// Automatically pick the best protocol for the current terminal.
-    /// See [`resolve_method`] for the canonical resolution table.
-    #[default]
-    Auto,
-    /// OSC 9 escape: `\x1b]9;<msg>\x07`
-    Osc9,
-    /// Plain BEL character: `\x07`
-    Bel,
-    /// macOS Notification Center via `osascript`.
-    ///
-    /// Only reachable through [`Method::Auto`], and only on the macOS
-    /// terminals that expose no notification escape of their own (Apple
-    /// Terminal, the VS Code and JetBrains embedded terminals, plain tmux
-    /// without `LC_TERMINAL`). iTerm2, WezTerm, Ghostty, and kitty are
-    /// matched earlier in [`resolve_method`] and never get here.
-    ///
-    /// Known limitation (#4834): `display notification` is a Standard
-    /// Additions command, so the banner is attributed to the *bundled*
-    /// host process. `/usr/bin/osascript` is unbundled, so macOS credits
-    /// `com.apple.ScriptEditor2` — which is what supplies the Script
-    /// Editor icon and owns the System Settings → Notifications entry
-    /// (alert style, previews, Do Not Disturb). `display notification`
-    /// takes no icon parameter; fixing the attribution requires shipping
-    /// a real `.app` bundle, not a change in this file.
-    MacOS,
-    /// Kitty notification protocol (OSC 99) with ST terminator.
-    /// Uses `ESC ] 99 ; params ST` — no audible beep, unlike BEL.
-    Kitty,
-    /// Ghostty notification protocol (OSC 777).
-    /// Uses `ESC ] 777 ; notify ; title ; message BEL`.
-    Ghostty,
-    /// Suppress all notifications.
-    Off,
-}
-
-/// Truthful result from one notification delivery attempt.
-///
-/// Callers that surface a receipt (notably the model-facing `notify` tool)
-/// use this instead of claiming a notification was sent when user policy,
-/// focus, or the configured delivery method suppressed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryOutcome {
-    /// The notification was handed to the resolved transport.
-    Delivered(Method),
-    /// The terminal is still in the foreground, or has only just lost focus.
-    SuppressedByAttention,
-    /// The event completed before the configured duration threshold.
-    SuppressedByThreshold,
-    /// Notification delivery is explicitly disabled.
-    SuppressedByMethod,
-    /// Quiet mode or the per-event allow-list suppressed this category.
-    SuppressedByGate,
-    /// The selected terminal protocol produced no transport bytes.
-    UnsupportedTransport,
-    /// The terminal transport could not be written.
-    DeliveryFailed,
-}
-
-impl DeliveryOutcome {
-    /// Short, stable receipt text for command/tool surfaces.
-    #[must_use]
-    pub fn receipt(self) -> &'static str {
-        match self {
-            Self::Delivered(_) => "notification sent",
-            Self::SuppressedByAttention => "notification not sent: attention policy blocked it",
-            Self::SuppressedByThreshold => "notification not sent: below the duration threshold",
-            Self::SuppressedByMethod => "notification not sent: notifications are off",
-            Self::SuppressedByGate => {
-                "notification not sent: quiet mode or event settings blocked it"
-            }
-            Self::UnsupportedTransport => {
-                "notification not sent: terminal transport is unsupported"
-            }
-            Self::DeliveryFailed => "notification not sent: terminal delivery failed",
-        }
-    }
-}
+use crate::notify::payload::NotificationKind;
+pub use crate::notify::payload::NotificationPayload;
+use crate::notify::{
+    AttentionCondition, DeliveryOutcome, Method, NotificationGate, attention_delivery_allowed_at,
+    settings_projection,
+};
 
 /// Process-wide configured delivery method. Installed before the event loop
 /// starts and updated by live Settings, so producers such as the model-facing
@@ -141,7 +51,10 @@ fn method_to_u8(method: Method) -> u8 {
     }
 }
 
-fn install_configured_method(method: Method) {
+/// Install `method` as the process-wide notification method for paths that
+/// do not resolve a method of their own (the `notify` tool); `pub(crate)`
+/// so the tool's tests can arrange the installed method.
+pub(crate) fn install_configured_method(method: Method) {
     CONFIGURED_METHOD.store(method_to_u8(method), Ordering::SeqCst);
 }
 
@@ -156,21 +69,6 @@ pub fn configured_method() -> Method {
         5 => Method::Ghostty,
         6 => Method::Off,
         _ => Method::Auto,
-    }
-}
-
-/// Emit a Windows system beep via `MessageBeep(MB_OK)`.
-///
-/// Writing BEL (`\\x07`) to the terminal is silent on most Windows
-/// terminals (Windows Terminal, Conhost, etc.), so we call the Win32
-/// API directly to produce the standard notification sound.
-#[cfg(target_os = "windows")]
-fn windows_bell() {
-    // MB_OK = 0x00000000 — plays the default system sound. Best-effort: a
-    // failed beep is not worth surfacing to the caller, so the Result is
-    // discarded.
-    unsafe {
-        let _ = MessageBeep(MESSAGEBOX_STYLE(0));
     }
 }
 
@@ -276,128 +174,14 @@ fn build_escape(method: Method, in_tmux: bool, msg: &str) -> Vec<u8> {
     }
 }
 
-// ── Notification gate (#5041) ────────────────────────────────────────
-//
-// One policy switchboard between "an event happened" and "the user's
-// desktop is interrupted". `[notifications].quiet` silences every
-// category; `[notifications.events]` disables individual categories. The
-// gate is installed from config by [`settings`] and consulted by
-// [`notify_done`] ahead of every delivery mechanism, so a disabled
-// category can never leak through one specific protocol.
-
-/// Which notification categories may reach the user's desktop.
-///
-/// The category set mirrors [`NotificationKind`] one-to-one. Default:
-/// everything enabled, quiet off — matching the pre-#5041 behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotificationGate {
-    /// Suppress every category when `true` (`[notifications].quiet`).
-    pub quiet: bool,
-    pub turn_complete: bool,
-    pub subagent_terminal: bool,
-    pub approval_needed: bool,
-    pub input_needed: bool,
-    pub elevation_needed: bool,
-    pub model_notify: bool,
-}
-
-impl Default for NotificationGate {
-    fn default() -> Self {
-        Self {
-            quiet: false,
-            turn_complete: true,
-            subagent_terminal: true,
-            approval_needed: true,
-            input_needed: true,
-            elevation_needed: true,
-            model_notify: true,
-        }
-    }
-}
-
-impl NotificationGate {
-    /// Project the `[notifications]` config block onto a gate.
-    #[must_use]
-    pub fn from_config(notif: &crate::config::NotificationsConfig) -> Self {
-        Self {
-            quiet: notif.quiet,
-            turn_complete: notif.events.turn_complete,
-            subagent_terminal: notif.events.subagent_terminal,
-            approval_needed: notif.events.approval_needed,
-            input_needed: notif.events.input_needed,
-            elevation_needed: notif.events.elevation_needed,
-            model_notify: notif.events.model_notify,
-        }
-    }
-
-    /// Whether an event of `kind` may be delivered under this gate.
-    #[must_use]
-    pub fn allows(self, kind: NotificationKind) -> bool {
-        if self.quiet {
-            return false;
-        }
-        match kind {
-            NotificationKind::TurnComplete => self.turn_complete,
-            NotificationKind::SubagentTerminal => self.subagent_terminal,
-            NotificationKind::ApprovalNeeded => self.approval_needed,
-            NotificationKind::InputNeeded => self.input_needed,
-            NotificationKind::ElevationNeeded => self.elevation_needed,
-            NotificationKind::ModelNotify => self.model_notify,
-        }
-    }
-
-    const QUIET_BIT: u8 = 1 << 0;
-    const TURN_COMPLETE_BIT: u8 = 1 << 1;
-    const SUBAGENT_TERMINAL_BIT: u8 = 1 << 2;
-    const APPROVAL_NEEDED_BIT: u8 = 1 << 3;
-    const INPUT_NEEDED_BIT: u8 = 1 << 4;
-    const ELEVATION_NEEDED_BIT: u8 = 1 << 5;
-    const MODEL_NOTIFY_BIT: u8 = 1 << 6;
-
-    const fn to_bits(self) -> u8 {
-        (self.quiet as u8 * Self::QUIET_BIT)
-            | (self.turn_complete as u8 * Self::TURN_COMPLETE_BIT)
-            | (self.subagent_terminal as u8 * Self::SUBAGENT_TERMINAL_BIT)
-            | (self.approval_needed as u8 * Self::APPROVAL_NEEDED_BIT)
-            | (self.input_needed as u8 * Self::INPUT_NEEDED_BIT)
-            | (self.elevation_needed as u8 * Self::ELEVATION_NEEDED_BIT)
-            | (self.model_notify as u8 * Self::MODEL_NOTIFY_BIT)
-    }
-
-    const fn from_bits(bits: u8) -> Self {
-        Self {
-            quiet: bits & Self::QUIET_BIT != 0,
-            turn_complete: bits & Self::TURN_COMPLETE_BIT != 0,
-            subagent_terminal: bits & Self::SUBAGENT_TERMINAL_BIT != 0,
-            approval_needed: bits & Self::APPROVAL_NEEDED_BIT != 0,
-            input_needed: bits & Self::INPUT_NEEDED_BIT != 0,
-            elevation_needed: bits & Self::ELEVATION_NEEDED_BIT != 0,
-            model_notify: bits & Self::MODEL_NOTIFY_BIT != 0,
-        }
-    }
-}
-
 /// Everything on, quiet off — the pre-#5041 behavior, and the effective
 /// policy until the first [`settings`] call installs the configured gate.
 const GATE_DEFAULT_BITS: u8 = 0b0111_1110;
 
 /// Process-wide gate, packed to one byte so reads on the emission path are
-/// a single atomic load (same pattern as `COMPLETION_SOUND_MODE`).
+/// a single atomic load.
 static NOTIFICATION_GATE: AtomicU8 = AtomicU8::new(GATE_DEFAULT_BITS);
 
-/// Attention delivery policy installed from `[tui].notification_condition`.
-///
-/// The default is background-only. A newly started TUI is treated as focused
-/// until the terminal explicitly reports `FocusLost`, so the safe startup
-/// behavior is silence rather than an unexpected banner or bell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttentionCondition {
-    Always = 0,
-    Unfocused = 1,
-    Never = 2,
-}
-
-const DEFAULT_UNFOCUSED_GRACE: Duration = Duration::from_secs(2);
 static ATTENTION_CONDITION: AtomicU8 = AtomicU8::new(AttentionCondition::Unfocused as u8);
 static UNFOCUSED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -420,25 +204,6 @@ fn current_attention_condition() -> AttentionCondition {
         0 => AttentionCondition::Always,
         2 => AttentionCondition::Never,
         _ => AttentionCondition::Unfocused,
-    }
-}
-
-#[must_use]
-fn attention_delivery_allowed_at(
-    condition: AttentionCondition,
-    focused: bool,
-    unfocused_since_ms: u64,
-    now_ms: u64,
-) -> bool {
-    match condition {
-        AttentionCondition::Always => true,
-        AttentionCondition::Never => false,
-        AttentionCondition::Unfocused => {
-            !focused
-                && unfocused_since_ms > 0
-                && now_ms.saturating_sub(unfocused_since_ms)
-                    >= DEFAULT_UNFOCUSED_GRACE.as_millis() as u64
-        }
     }
 }
 
@@ -470,6 +235,7 @@ pub fn current_notification_gate() -> NotificationGate {
 /// This variant takes a `W: Write` sink and an explicit gate for
 /// testability; production callers go through [`notify_done`], which
 /// loads the installed process-wide gate.
+#[cfg(test)]
 pub fn notify_done_to<W: Write>(
     method: Method,
     in_tmux: bool,
@@ -479,6 +245,48 @@ pub fn notify_done_to<W: Write>(
     gate: NotificationGate,
     sink: &mut W,
 ) -> DeliveryOutcome {
+    let mut policy = crate::notify::sound_policy::EventSoundPolicy::default();
+    notify_with_sinks(
+        method,
+        in_tmux,
+        payload,
+        threshold,
+        elapsed,
+        gate,
+        true,
+        sink,
+        &mut |kind, bell| policy.decide(crate::notify::sound_policy::event_for_kind(kind), 0, bell),
+        &mut crate::notify::audio::emit_terminal,
+        &mut |_| DeliveryOutcome::UnsupportedTransport,
+    )
+}
+
+/// All side effects sit behind injected sinks. A disallowed event reaches none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn notify_with_sinks(
+    method: Method,
+    in_tmux: bool,
+    payload: &NotificationPayload,
+    threshold: Duration,
+    elapsed: Duration,
+    gate: NotificationGate,
+    attention_allowed: bool,
+    sink: &mut dyn Write,
+    decide_sound: &mut dyn FnMut(
+        NotificationKind,
+        bool,
+    ) -> crate::notify::sound_policy::SoundDecision,
+    audio: &mut dyn FnMut(
+        &crate::notify::sound_policy::SoundCue,
+        &mut dyn Write,
+    ) -> crate::notify::audio::AudioOutcome,
+    native: &mut dyn FnMut(&NotificationPayload) -> DeliveryOutcome,
+) -> DeliveryOutcome {
+    use crate::notify::audio::AudioOutcome;
+    use crate::notify::sound_policy::SoundDecision;
+    if !attention_allowed {
+        return DeliveryOutcome::SuppressedByAttention;
+    }
     if elapsed < threshold {
         return DeliveryOutcome::SuppressedByThreshold;
     }
@@ -486,69 +294,71 @@ pub fn notify_done_to<W: Write>(
         return DeliveryOutcome::SuppressedByMethod;
     }
     if !gate.allows(payload.kind()) {
-        tracing::debug!(
-            kind = ?payload.kind(),
-            quiet = gate.quiet,
-            "notification suppressed by [notifications] gate"
-        );
         return DeliveryOutcome::SuppressedByGate;
     }
-    let effective = match method {
-        Method::Off => unreachable!("Method::Off returned before gate evaluation"),
-        Method::Auto => resolve_method(),
-        other => other,
+    let effective = if method == Method::Auto {
+        resolve_method()
+    } else {
+        method
     };
-
-    // "I get no notifications" and "the wrong app posted it" (#4834) are
-    // both diagnosed by knowing which kind resolved to which mechanism.
-    tracing::debug!(
-        kind = ?payload.kind(),
-        method = ?effective,
-        in_tmux,
-        "emitting desktop notification"
-    );
-
-    // Opt-in event-sound policy (#4817). A no-op unless
-    // `[notifications.event_sound].enabled = true`; errors are swallowed
-    // like every other best-effort terminal write in this module.
-    crate::tui::sound_policy::handle_notification_kind_to(
-        payload.kind(),
-        crate::tui::sound_policy::epoch_millis_now(),
-        sink,
-    );
-
-    // macOS Notification Center: handled via osascript, not terminal escapes.
-    #[cfg(target_os = "macos")]
-    if Method::MacOS == effective {
-        macos_display_notification(payload);
-        return DeliveryOutcome::Delivered(effective);
-    }
-
-    let bytes = build_escape(effective, in_tmux, &payload.render_inline());
-    if bytes.is_empty() {
+    if effective == Method::Off {
         return DeliveryOutcome::UnsupportedTransport;
     }
-    if sink.write_all(&bytes).and_then(|()| sink.flush()).is_err() {
-        return DeliveryOutcome::DeliveryFailed;
+    let banner = match effective {
+        Method::MacOS => native(payload),
+        Method::Bel => DeliveryOutcome::Delivered(effective),
+        _ => {
+            let bytes = build_escape(effective, in_tmux, &payload.render_inline());
+            if bytes.is_empty() {
+                return DeliveryOutcome::UnsupportedTransport;
+            }
+            if sink.write_all(&bytes).and_then(|()| sink.flush()).is_err() {
+                return DeliveryOutcome::DeliveryFailed;
+            }
+            DeliveryOutcome::Delivered(effective)
+        }
+    };
+    if !matches!(
+        banner,
+        DeliveryOutcome::Delivered(_) | DeliveryOutcome::Dispatched(_)
+    ) {
+        return banner;
     }
-
-    // On Windows, writing BEL (`\x07`) to the terminal is silent in most
-    // terminals (Windows Terminal, Conhost, etc.). Call MessageBeep to
-    // produce an actual notification sound via the system audio scheme.
-    #[cfg(target_os = "windows")]
-    if effective == Method::Bel {
-        windows_bell();
+    // BEL is itself audio: select and emit one cue instead of adding a
+    // transport bell to the chosen sound. Never fall back after suppression.
+    match decide_sound(payload.kind(), effective == Method::Bel) {
+        SoundDecision::Suppress(_) if effective == Method::Bel => {
+            DeliveryOutcome::SuppressedBySound
+        }
+        SoundDecision::Suppress(_) => banner,
+        SoundDecision::Play(cue) => match audio(&cue, sink) {
+            AudioOutcome::Emitted => banner,
+            AudioOutcome::Dispatched if effective == Method::Bel => {
+                DeliveryOutcome::Dispatched(effective)
+            }
+            AudioOutcome::Dispatched => banner,
+            AudioOutcome::Busy if effective == Method::Bel => DeliveryOutcome::SuppressedBySound,
+            AudioOutcome::Unsupported if effective == Method::Bel => {
+                DeliveryOutcome::UnsupportedTransport
+            }
+            AudioOutcome::Failed if effective == Method::Bel => DeliveryOutcome::DeliveryFailed,
+            AudioOutcome::Busy => banner,
+            AudioOutcome::Unsupported | AudioOutcome::Failed => {
+                if matches!(banner, DeliveryOutcome::Dispatched(_)) {
+                    DeliveryOutcome::DispatchedWithoutSound(effective)
+                } else {
+                    DeliveryOutcome::DeliveredWithoutSound(effective)
+                }
+            }
+        },
     }
-
-    DeliveryOutcome::Delivered(effective)
 }
 
 /// Emit a notification to **stdout** if `elapsed >= threshold`.
 ///
 /// With `method = Auto`, selects the best protocol for the current terminal
-/// (OSC 9, Kitty OSC 99, Ghostty OSC 777, or Bel). The unknown-terminal
-/// unknown-terminal fallback is `Off`, keeping banner selection independent
-/// from the explicit completion-sound control.
+/// (OSC 9, Kitty OSC 99, Ghostty OSC 777, or macOS). Unknown terminals
+/// remain unsupported; explicit method Off suppresses audio and banners.
 /// See [`resolve_method`] for the canonical resolution table. Pass
 /// `in_tmux = true` (i.e. `$TMUX` is non-empty at runtime) to wrap OSC
 /// sequences in a DCS passthrough.
@@ -559,23 +369,63 @@ pub fn notify_done(
     threshold: Duration,
     elapsed: Duration,
 ) -> DeliveryOutcome {
-    if !attention_delivery_allowed() {
-        tracing::debug!(
-            focused = TERMINAL_FOCUSED.load(Ordering::SeqCst),
-            condition = ?current_attention_condition(),
-            "notification suppressed by attention policy"
-        );
-        return DeliveryOutcome::SuppressedByAttention;
-    }
-    notify_done_to(
+    let reserved = std::cell::Cell::new(None);
+    notify_with_sinks(
         method,
         in_tmux,
         payload,
         threshold,
         elapsed,
         current_notification_gate(),
+        attention_delivery_allowed(),
         &mut io::stdout(),
+        &mut |kind, bell| {
+            let now_ms = crate::notify::sound_policy::epoch_millis_now();
+            let decision = crate::notify::sound_policy::decide(kind, now_ms, bell);
+            if matches!(
+                decision,
+                crate::notify::sound_policy::SoundDecision::Play(_)
+            ) {
+                reserved.set(Some((kind, now_ms)));
+            }
+            decision
+        },
+        &mut |cue, sink| {
+            let outcome = crate::notify::audio::dispatch(cue, sink);
+            // A cue that never played must not spend the category's repeat
+            // window: the next notification may try again (U06-m3).
+            if matches!(
+                outcome,
+                crate::notify::audio::AudioOutcome::Busy
+                    | crate::notify::audio::AudioOutcome::Unsupported
+                    | crate::notify::audio::AudioOutcome::Failed
+            ) && let Some((kind, reserved_ms)) = reserved.take()
+            {
+                crate::notify::sound_policy::release(kind, reserved_ms);
+            }
+            outcome
+        },
+        &mut dispatch_native,
     )
+}
+
+/// The `notify` tool's delivery: a typed model-notify payload through the
+/// configured method, installed gate and attention policy, threshold zero.
+pub(crate) fn notify_model(title: &str, body: Option<&str>) -> &'static str {
+    // #4834: model-authored text is the least trusted input that can reach
+    // Notification Center, so it goes through the typed payload like every
+    // other event kind: bounded, control-byte-stripped, and redacted for
+    // credentials, absolute paths, and raw tool JSON.
+    let payload = NotificationPayload::model_notify(title, body);
+    let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+    notify_done(
+        configured_method(),
+        in_tmux,
+        &payload,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .receipt()
 }
 
 /// Set the terminal taskbar progress state via OSC 9 ; 4.
@@ -927,15 +777,16 @@ pub fn set_terminal_focused(focused: bool) {
 /// processing finished. The marker is overwritten on the next turn by
 /// [`start_title_animation`].
 pub fn stop_title_animation() {
+    stop_title_animation_with(set_terminal_title);
+}
+
+fn stop_title_animation_with(set_title: impl FnOnce(&str)) {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
     TITLE_ANIMATION_GENERATION.fetch_add(1, Ordering::SeqCst);
     // Always show the completion marker so quiet-sound modes still communicate
     // finish state in the window title; interaction clears it.
     COMPLETION_MARKER_SHOWN.store(true, Ordering::SeqCst);
-    set_terminal_title(&decorate_title("✓ done"));
-    if !current_notification_gate().quiet && attention_delivery_allowed() {
-        play_completion_sound();
-    }
+    set_title(&decorate_title("✓ done"));
 }
 
 /// Stop the title animation without playing the completion sound.
@@ -959,118 +810,6 @@ pub fn reset_title_on_interaction() {
     }
 }
 
-/// Completion sound mode (0 = off, 1 = beep, 2 = bell, 3 = file).
-static COMPLETION_SOUND_MODE: AtomicU8 = AtomicU8::new(0);
-static COMPLETION_SOUND_FILE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-#[cfg(not(target_os = "windows"))]
-static COMPLETION_SOUND_FILE_UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
-static COMPLETION_SOUND_FILE_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
-
-fn completion_sound_file_slot() -> &'static Mutex<Option<PathBuf>> {
-    COMPLETION_SOUND_FILE.get_or_init(|| Mutex::new(None))
-}
-
-fn set_completion_sound(mode: crate::config::CompletionSound, sound_file: Option<PathBuf>) {
-    let val = match mode {
-        crate::config::CompletionSound::Off => 0u8,
-        crate::config::CompletionSound::Beep => 1u8,
-        crate::config::CompletionSound::Bell => 2u8,
-        crate::config::CompletionSound::File => 3u8,
-    };
-    COMPLETION_SOUND_MODE.store(val, Ordering::SeqCst);
-    if let Ok(mut slot) = completion_sound_file_slot().lock() {
-        if sound_file.is_some() {
-            COMPLETION_SOUND_FILE_MISSING_WARNED.store(false, Ordering::SeqCst);
-        }
-        *slot = sound_file;
-    }
-}
-
-/// Play the configured completion sound (if not `Off`).
-pub fn play_completion_sound() {
-    match COMPLETION_SOUND_MODE.load(Ordering::SeqCst) {
-        0 => {} // Off
-        1 => {
-            beep_sound();
-        }
-        2 => {
-            bell_sound();
-        }
-        3 => {
-            file_sound();
-        }
-        _ => {}
-    }
-}
-
-/// Play a short completion sound via the system beep.
-///
-/// On Windows uses `MessageBeep(MB_OK)` which plays the default system
-/// notification sound. On other platforms writes `BEL` (`\x07`) to stdout.
-#[cfg(target_os = "windows")]
-fn beep_sound() {
-    windows_bell();
-}
-
-/// Non-Windows: write BEL to stdout for the terminal bell.
-#[cfg(not(target_os = "windows"))]
-fn beep_sound() {
-    let _ = io::stdout().write_all(b"\x07");
-}
-
-/// Pure terminal BEL character.
-fn bell_sound() {
-    let _ = io::stdout().write_all(b"\x07");
-}
-
-fn configured_sound_file() -> Option<PathBuf> {
-    completion_sound_file_slot()
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-}
-
-#[cfg(target_os = "windows")]
-fn play_sound_file(path: &Path) {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // Best-effort and async: notification sound failure should not block or
-    // fail a completed agent turn.
-    unsafe {
-        let _ = PlaySoundW(
-            PCWSTR(wide.as_ptr()),
-            None,
-            SND_FILENAME | SND_ASYNC | SND_NODEFAULT,
-        );
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn play_sound_file(_path: &Path) {
-    if !COMPLETION_SOUND_FILE_UNSUPPORTED_WARNED.swap(true, Ordering::SeqCst) {
-        tracing::warn!("completion_sound = \"file\" is currently supported on Windows only");
-    }
-}
-
-fn file_sound() {
-    if let Some(path) = configured_sound_file() {
-        play_sound_file(&path);
-    } else if !COMPLETION_SOUND_FILE_MISSING_WARNED.swap(true, Ordering::SeqCst) {
-        tracing::warn!("completion_sound = \"file\" requires [notifications].sound_file");
-    }
-}
-
-#[cfg(test)]
-fn completion_sound_state_for_tests() -> (crate::config::CompletionSound, Option<PathBuf>) {
-    let mode = match COMPLETION_SOUND_MODE.load(Ordering::SeqCst) {
-        0 => crate::config::CompletionSound::Off,
-        1 => crate::config::CompletionSound::Beep,
-        2 => crate::config::CompletionSound::Bell,
-        3 => crate::config::CompletionSound::File,
-        _ => crate::config::CompletionSound::Off,
-    };
-    (mode, configured_sound_file())
-}
-
 /// Show a macOS Notification Center alert via `osascript`.
 ///
 /// Runs on a dedicated background thread so the caller is not blocked.
@@ -1080,8 +819,8 @@ fn completion_sound_state_for_tests() -> (crate::config::CompletionSound, Option
 /// - **Subtitle**: [`NotificationPayload::headline`] (≤ 80 chars)
 /// - **Body**: [`NotificationPayload::body`] (≤ 322 chars: a ≤ 120-char
 ///   detail, a separator, and a ≤ 200-char preview)
-/// - **Sound**: none; sound is controlled independently by
-///   `[notifications].completion_sound`
+/// - **Sound**: none in the AppleScript; the unified notification decision
+///   dispatches the selected audio cue.
 ///
 /// Both fields arrive already sanitized, redacted, and character-bounded
 /// by [`NotificationPayload`]; this function does not re-derive them from
@@ -1108,14 +847,14 @@ fn completion_sound_state_for_tests() -> (crate::config::CompletionSound, Option
 const MACOS_DISPLAY_NOTIFICATION_SCRIPT: &str =
     "display notification theBody with title \"Codewhale\" subtitle theSubtitle";
 
-#[cfg(target_os = "macos")]
-fn macos_display_notification(payload: &NotificationPayload) {
+#[cfg(all(target_os = "macos", not(test)))]
+fn macos_display_notification(payload: &NotificationPayload) -> DeliveryOutcome {
     let (subtitle, body) = macos_notification_parts(payload);
 
     // Spawn on a background thread so we don't block the caller.
     // osascript itself is fast (~50 ms), but spawning a subprocess
     // synchronously from an async context steals a tokio thread.
-    let _ = std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .name("osascript-notif".into())
         .spawn(move || {
             // Build AppleScript that receives the message via ARGV
@@ -1142,8 +881,7 @@ fn macos_display_notification(payload: &NotificationPayload) {
 
             match std::process::Command::new("osascript").args(&args).output() {
                 Ok(output) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!(stderr = %stderr, "osascript notification failed");
+                    tracing::warn!("osascript notification failed");
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "osascript notification error");
@@ -1151,6 +889,23 @@ fn macos_display_notification(payload: &NotificationPayload) {
                 _ => {}
             }
         });
+    if result.is_ok() {
+        DeliveryOutcome::Dispatched(Method::MacOS)
+    } else {
+        DeliveryOutcome::DeliveryFailed
+    }
+}
+
+fn dispatch_native(payload: &NotificationPayload) -> DeliveryOutcome {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        macos_display_notification(payload)
+    }
+    #[cfg(any(not(target_os = "macos"), test))]
+    {
+        let _ = payload;
+        DeliveryOutcome::UnsupportedTransport
+    }
 }
 
 /// Split a payload into the `(subtitle, body)` pair `display notification`
@@ -1167,70 +922,32 @@ fn macos_notification_parts(payload: &NotificationPayload) -> (String, String) {
 // *what message* to put in the body. The low-level dispatcher is
 // `notify_done`; everything in this block sits in front of it.
 
-use crate::localization::{Locale, MessageId, tr};
-use crate::models::{ContentBlock, Message};
 use crate::tools::subagent::SubAgentStatus;
 use crate::tui::app::App;
-
-/// Resolve the effective notification method/threshold/include-summary tuple
-/// for a completed turn, taking the high-level
-/// `[tui].notification_condition` override into account on top of the
-/// lower-level `[notifications]` block.
-///
-/// Returns `None` only when the high-level attention policy is `never`.
-/// `Method::Off` remains a valid projection because banner and completion
-/// sound are independent controls.
-#[must_use]
-pub fn settings_projection(config: &crate::config::Config) -> Option<(Method, Duration, bool)> {
-    let notif = config.notifications_config();
-    let method = match notif.method {
-        crate::config::NotificationMethod::Auto => Method::Auto,
-        crate::config::NotificationMethod::Osc9 => Method::Osc9,
-        crate::config::NotificationMethod::Bel => Method::Bel,
-        crate::config::NotificationMethod::Kitty => Method::Kitty,
-        crate::config::NotificationMethod::Ghostty => Method::Ghostty,
-        crate::config::NotificationMethod::Off => Method::Off,
-    };
-    match config
-        .tui
-        .as_ref()
-        .and_then(|tui| tui.notification_condition)
-        .unwrap_or(crate::config::NotificationCondition::Unfocused)
-    {
-        crate::config::NotificationCondition::Always => {
-            Some((method, Duration::ZERO, notif.include_summary))
-        }
-        crate::config::NotificationCondition::Unfocused => Some((
-            method,
-            Duration::from_secs(notif.threshold_secs),
-            notif.include_summary,
-        )),
-        crate::config::NotificationCondition::Never => None,
-    }
-}
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_models::{ContentBlock, Message};
 
 pub fn settings(config: &crate::config::Config) -> Option<(Method, Duration, bool)> {
-    let notif = config.notifications_config();
+    apply_settings(&config.notifications_config())
+}
+
+/// Install the process-wide method, gate, sound policy and attention
+/// condition from `[notifications]`; returns the resolved projection.
+pub(crate) fn apply_settings(
+    notif: &crate::config::NotificationsConfig,
+) -> Option<(Method, Duration, bool)> {
     // Install the category/quiet gate (#5041) so `notify_done` honors
     // `[notifications].quiet` and `[notifications.events]`.
-    install_notification_gate(NotificationGate::from_config(&notif));
-    // Initialize completion sound mode from config.
-    set_completion_sound(notif.completion_sound, notif.sound_file);
-    // Initialize the opt-in event-sound policy (#4817) from the sibling
-    // `[notifications.event_sound]` table. `completion_sound` active means
-    // the policy defers `turn-complete` to that channel (no double ding).
-    crate::tui::sound_policy::reconfigure(crate::tui::sound_policy::EventSoundPolicy::from_config(
-        &notif.event_sound,
-        notif.completion_sound != crate::config::CompletionSound::Off,
-    ));
-    let projection = settings_projection(config);
+    install_notification_gate(NotificationGate::from_config(notif));
+    crate::notify::sound_policy::reconfigure(
+        crate::notify::sound_policy::EventSoundPolicy::from_config(notif),
+    );
+    let projection = settings_projection(notif);
     let method = projection.map_or(Method::Off, |(method, _, _)| method);
     install_configured_method(method);
 
-    let condition = config
-        .tui
-        .as_ref()
-        .and_then(|tui| tui.notification_condition)
+    let condition = notif
+        .condition
         .unwrap_or(crate::config::NotificationCondition::Unfocused);
     match condition {
         crate::config::NotificationCondition::Always => {
@@ -1275,44 +992,24 @@ pub fn completed_turn_payload(
     NotificationPayload::turn_complete(&headline).with_preview(preview.as_deref())
 }
 
-/// Compose a notification payload for a terminal sub-agent outcome. The
-/// agent id is always the detail line; the child's first human-readable
-/// summary line, when there is one, becomes the (redacted, bounded)
-/// preview. The headline reflects the actual status so a Stop/failed
-/// worker is never announced as successfully complete (#4408).
-pub fn subagent_terminal_payload(
-    locale: Locale,
-    id: &str,
-    result: &str,
-    status: &SubAgentStatus,
-    include_summary: bool,
-    elapsed: Duration,
-) -> NotificationPayload {
-    let result_line = result
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("<codewhale:subagent.done>"));
-    let label = match status {
+pub(crate) fn subagent_terminal_label(status: &SubAgentStatus) -> MessageId {
+    match status {
         SubAgentStatus::Completed => MessageId::NotificationSubagentComplete,
         SubAgentStatus::Failed(_) => MessageId::NotificationSubagentFailed,
         SubAgentStatus::Interrupted(_) => MessageId::NotificationSubagentInterrupted,
         SubAgentStatus::Cancelled => MessageId::NotificationSubagentCancelled,
         SubAgentStatus::BudgetExhausted => MessageId::NotificationSubagentBudgetExhausted,
-        SubAgentStatus::Running => MessageId::NotificationSubagentComplete,
-    };
-    let headline = completion_status(&tr(locale, label), include_summary, elapsed, None);
-    let preview = result_line.and_then(text_summary);
-
-    NotificationPayload::subagent_terminal(&headline, id).with_preview(preview.as_deref())
+        SubAgentStatus::Running => MessageId::SubagentsStatusRunning,
+    }
 }
 
 /// Action-first approval banner (#5041): leads with the decision the user
 /// must make and names the tool it concerns. The tool *description* — the
 /// pending command — intentionally stays in the terminal (#4834).
 #[must_use]
-pub fn approval_needed_payload(tool_name: &str) -> NotificationPayload {
+pub fn approval_needed_payload(locale: Locale, tool_name: &str) -> NotificationPayload {
     NotificationPayload::approval_needed(
-        &format!("Approve or deny '{tool_name}' to continue"),
+        &tr(locale, MessageId::NotificationApprovalNeeded).replace("{tool}", tool_name),
         tool_name,
     )
 }
@@ -1320,22 +1017,26 @@ pub fn approval_needed_payload(tool_name: &str) -> NotificationPayload {
 /// Action-first blocked-on-input banner (#5041): says what to do and
 /// where. The question text itself never leaves the terminal (#4834).
 #[must_use]
-pub fn input_needed_payload() -> NotificationPayload {
-    NotificationPayload::input_needed("Answer the question in the terminal to continue")
+pub fn input_needed_payload(locale: Locale) -> NotificationPayload {
+    NotificationPayload::input_needed(&tr(locale, MessageId::NotificationInputNeeded))
 }
 
 /// Action-first sandbox-elevation banner (#5041): leads with the decision
 /// and names the blocked tool; the denial reason rides in the body.
 #[must_use]
-pub fn elevation_needed_payload(tool_name: &str, denial_reason: &str) -> NotificationPayload {
+pub fn elevation_needed_payload(
+    locale: Locale,
+    tool_name: &str,
+    denial_reason: &str,
+) -> NotificationPayload {
     NotificationPayload::elevation_needed(
-        &format!("Allow or deny elevated access for '{tool_name}'"),
+        &tr(locale, MessageId::NotificationElevationNeeded).replace("{tool}", tool_name),
         tool_name,
         denial_reason,
     )
 }
 
-fn completion_status(
+pub(crate) fn completion_status(
     label: &str,
     include_summary: bool,
     elapsed: Duration,
@@ -1361,7 +1062,8 @@ pub fn latest_assistant_text(messages: &[Message]) -> Option<String> {
         .iter()
         .rev()
         .find(|message| {
-            message.role == "assistant" || message.role == crate::models::INTERRUPTED_ASSISTANT_ROLE
+            message.role == "assistant"
+                || message.role == codewhale_models::INTERRUPTED_ASSISTANT_ROLE
         })
         .and_then(|message| {
             let text = message
@@ -1389,7 +1091,7 @@ pub fn latest_assistant_text(messages: &[Message]) -> Option<String> {
 pub fn text_summary(text: &str) -> Option<String> {
     const MAX_CHARS: usize = 360;
 
-    let sanitized = super::ui::sanitize_stream_chunk(text);
+    let sanitized = codewhale_secrets::sanitize::sanitize_stream_chunk(text);
     let collapsed = sanitized
         .lines()
         .map(str::trim)
@@ -1415,6 +1117,63 @@ pub fn text_summary(text: &str) -> Option<String> {
 mod tests {
 
     use super::*;
+    use crate::notify::DEFAULT_UNFOCUSED_GRACE;
+
+    /// Moved from `tools::notify`: the `notify` tool's emission chain, where
+    /// the installed method decides suppression before any sink write.
+    #[test]
+    fn configured_method_off_silences_the_tool_emission() {
+        let _lock = env_lock();
+        let _restore = ConfiguredMethodRestore::capture();
+        install_configured_method(Method::Off);
+
+        // The emission chain `execute` drives: the installed method decides
+        // suppression before any sink write, with the gate loaded from the
+        // process-wide state.
+        let payload = NotificationPayload::model_notify("done", None);
+        let mut sink = Vec::new();
+        notify_done_to(
+            configured_method(),
+            false,
+            &payload,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+            current_notification_gate(),
+            &mut sink,
+        );
+        assert!(
+            sink.is_empty(),
+            "configured method=off must silence the notify tool path"
+        );
+    }
+
+    /// The function the host port calls for the `notify` tool must read the
+    /// installed method: `[notifications] method = "off"` silences the tool
+    /// and the receipt says so. A `notify_model` that ignored
+    /// `configured_method()` would pass the test above but fail this one.
+    #[test]
+    fn notify_model_honors_the_installed_off_method() {
+        let _lock = env_lock();
+        let _method_restore = ConfiguredMethodRestore::capture();
+        let _gate_restore = NotificationGateRestore::capture();
+        let previous_condition = current_attention_condition();
+        // `condition = "always"` so the attention policy (checked first) lets
+        // the call reach the method check whatever the test runner's focus.
+        let off: crate::config::Config = toml::from_str(
+            r#"
+            [notifications]
+            method = "off"
+            condition = "always"
+            "#,
+        )
+        .expect("method=off config should parse");
+        let _ = settings(&off);
+
+        let receipt = notify_model("done", Some("all tests pass"));
+
+        install_attention_condition(previous_condition);
+        assert_eq!(receipt, DeliveryOutcome::SuppressedByMethod.receipt());
+    }
 
     #[test]
     fn title_whale_is_static_when_focused_or_motion_disabled() {
@@ -1587,6 +1346,7 @@ mod tests {
         for kind in [
             NotificationKind::TurnComplete,
             NotificationKind::SubagentTerminal,
+            NotificationKind::BackgroundTerminal,
             NotificationKind::ApprovalNeeded,
             NotificationKind::InputNeeded,
             NotificationKind::ElevationNeeded,
@@ -1605,6 +1365,7 @@ mod tests {
         for kind in [
             NotificationKind::TurnComplete,
             NotificationKind::SubagentTerminal,
+            NotificationKind::BackgroundTerminal,
             NotificationKind::ApprovalNeeded,
             NotificationKind::InputNeeded,
             NotificationKind::ElevationNeeded,
@@ -1707,7 +1468,7 @@ mod tests {
     /// filtered list somewhere upstream.
     #[test]
     fn gated_emission_produces_no_bytes() {
-        let payload = approval_needed_payload("bash");
+        let payload = approval_needed_payload(Locale::En, "bash");
 
         let quiet = NotificationGate {
             quiet: true,
@@ -1727,7 +1488,7 @@ mod tests {
 
     #[test]
     fn delivery_outcome_reports_why_nothing_was_sent() {
-        let payload = input_needed_payload();
+        let payload = input_needed_payload(Locale::En);
         let mut out = Vec::new();
         assert_eq!(
             DeliveryOutcome::SuppressedByAttention.receipt(),
@@ -1806,25 +1567,139 @@ mod tests {
         assert!(gate.turn_complete);
     }
 
+    /// Restores the process-wide configured method after a test mutates it.
+    struct ConfiguredMethodRestore(Method);
+
+    impl ConfiguredMethodRestore {
+        fn capture() -> Self {
+            Self(configured_method())
+        }
+    }
+
+    impl Drop for ConfiguredMethodRestore {
+        fn drop(&mut self) {
+            install_configured_method(self.0);
+        }
+    }
+
+    /// Same single-place contract as the gate: `settings()` must install the
+    /// configured `[notifications].method` so the `notify` tool (which has
+    /// no method of its own) honors it — including `off` (#1322 promise).
+    #[test]
+    fn settings_installs_configured_method_from_config() {
+        let _lock = env_lock();
+        let _method_restore = ConfiguredMethodRestore::capture();
+        let off: crate::config::Config = toml::from_str(
+            r#"
+            [notifications]
+            method = "off"
+            "#,
+        )
+        .expect("method=off config should parse");
+        let _ = settings(&off);
+        assert_eq!(configured_method(), Method::Off);
+
+        let osc9: crate::config::Config = toml::from_str(
+            r#"
+            [notifications]
+            method = "osc9"
+            "#,
+        )
+        .expect("method=osc9 config should parse");
+        let _ = settings(&osc9);
+        assert_eq!(configured_method(), Method::Osc9);
+    }
+
+    /// The installed encoding must round-trip every method so an install/read
+    /// pair can never silently fall back to `Auto`.
+    #[test]
+    fn configured_method_round_trips_every_variant() {
+        // Serialized with the tests that deliver through the installed method.
+        let _lock = env_lock();
+        let _restore = ConfiguredMethodRestore::capture();
+        for method in [
+            Method::Auto,
+            Method::Osc9,
+            Method::Bel,
+            Method::MacOS,
+            Method::Kitty,
+            Method::Ghostty,
+            Method::Off,
+        ] {
+            install_configured_method(method);
+            assert_eq!(configured_method(), method);
+        }
+    }
+
     /// #5041 copy contract: interactive banners lead with the action and
     /// name the subject, instead of a bare "Approval needed".
     #[test]
     fn interactive_banners_are_action_first_and_name_the_subject() {
-        let approval = approval_needed_payload("bash");
+        let approval = approval_needed_payload(Locale::En, "bash");
         assert_eq!(approval.headline(), "Approve or deny 'bash' to continue");
 
-        let input = input_needed_payload();
+        let input = input_needed_payload(Locale::En);
         assert_eq!(
             input.headline(),
             "Answer the question in the terminal to continue"
         );
 
-        let elevation = elevation_needed_payload("bash", "network blocked");
+        let elevation = elevation_needed_payload(Locale::En, "bash", "network blocked");
         assert_eq!(
             elevation.headline(),
             "Allow or deny elevated access for 'bash'"
         );
         assert!(elevation.body().contains("network blocked"));
+    }
+
+    #[test]
+    fn interactive_notification_locales_keep_action_severity_independent_of_tool_text() {
+        use crate::tui::app::{StatusToast, StatusToastLevel};
+        let _guard = crate::test_support::lock_test_env();
+        for &locale in Locale::shipped_complete() {
+            let mut app = App::new(
+                crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+                &crate::config::Config::default(),
+            );
+            app.ui_locale = locale;
+            let tool = "failed";
+            let payloads = [
+                (
+                    approval_needed_payload(locale, tool),
+                    MessageId::NotificationApprovalNeeded,
+                ),
+                (
+                    input_needed_payload(locale),
+                    MessageId::NotificationInputNeeded,
+                ),
+                (
+                    elevation_needed_payload(locale, tool, "network-policy"),
+                    MessageId::NotificationElevationNeeded,
+                ),
+            ];
+            for (index, (payload, key)) in payloads.into_iter().enumerate() {
+                assert_eq!(payload.headline(), tr(locale, key).replace("{tool}", tool));
+                app.push_status_toast_record(
+                    StatusToast::new(payload.headline(), StatusToastLevel::Warning, Some(12_000))
+                        .for_action(format!("request-{index}")),
+                );
+                app.status_message = Some(payload.headline().into());
+                app.sync_status_message_to_toasts();
+                assert_eq!(app.status_toasts.len(), index + 1);
+                let toast = app.status_toasts.back().unwrap();
+                assert_eq!(toast.level, StatusToastLevel::Warning);
+                assert_eq!(toast.ttl_ms, Some(12_000));
+                assert!(app.sticky_status.is_none());
+                let facts = crate::tui::phase_strip::tideline_footer_from_app(&mut app, 500);
+                assert_eq!(
+                    facts.right,
+                    Some((
+                        payload.headline().into(),
+                        codewhale_palette::ChromeInk::Attention
+                    ))
+                );
+            }
+        }
     }
 
     #[test]
@@ -1998,7 +1873,7 @@ mod tests {
         assert!(body.ends_with("..."));
         assert_eq!(
             body.chars().count(),
-            super::super::notification_payload::PREVIEW_MAX_CHARS
+            crate::notify::payload::PREVIEW_MAX_CHARS
         );
     }
 
@@ -2320,51 +2195,6 @@ mod tests {
         }
         assert_eq!(resolved, Method::Off);
     }
-
-    #[test]
-    fn settings_installs_custom_completion_sound_file() {
-        let _lock = env_lock();
-        let config: crate::config::Config = toml::from_str(
-            r#"
-            [notifications]
-            completion_sound = "file"
-            sound_file = "E:\\google\\downloads\\xm4114.wav"
-            "#,
-        )
-        .expect("custom completion sound config should parse");
-
-        let _ = settings(&config);
-
-        let (mode, file) = completion_sound_state_for_tests();
-        assert_eq!(mode, crate::config::CompletionSound::File);
-        assert_eq!(
-            file.as_deref(),
-            Some(std::path::Path::new("E:\\google\\downloads\\xm4114.wav"))
-        );
-    }
-
-    #[test]
-    fn setting_valid_sound_file_resets_missing_file_warning_latch() {
-        let _lock = env_lock();
-        COMPLETION_SOUND_FILE_MISSING_WARNED.store(true, Ordering::SeqCst);
-
-        set_completion_sound(
-            crate::config::CompletionSound::File,
-            Some(std::path::PathBuf::from(
-                "E:\\google\\downloads\\xm4114.wav",
-            )),
-        );
-
-        assert!(!COMPLETION_SOUND_FILE_MISSING_WARNED.load(Ordering::SeqCst));
-
-        set_completion_sound(crate::config::CompletionSound::File, None);
-        file_sound();
-
-        assert!(COMPLETION_SOUND_FILE_MISSING_WARNED.load(Ordering::SeqCst));
-
-        set_completion_sound(crate::config::CompletionSound::Beep, None);
-        COMPLETION_SOUND_FILE_MISSING_WARNED.store(false, Ordering::SeqCst);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2376,20 +2206,23 @@ mod tests {
 // projects `status_toasts`/`sticky_status` into it at the landing slice);
 // not wired into `ui/frame.rs` (#5698 gate).
 
+#[cfg(test)]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
 };
+#[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
-use crate::palette::{ChromeInk, UiTheme, chrome_style};
+#[cfg(test)]
+use codewhale_palette::{ChromeInk, UiTheme, chrome_style};
 
 /// One attention record: a typed projection of a status toast / sticky
 /// status / desktop payload. `at` is an injected clock string so renders
 /// stay deterministic (spec §5a: caller owns the wall clock).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub struct TidelineInboxRecord {
     pub kind: NotificationKind,
     pub title: String,
@@ -2400,6 +2233,7 @@ pub struct TidelineInboxRecord {
     pub read: bool,
 }
 
+#[cfg(test)]
 impl TidelineInboxRecord {
     /// Kind word — a noun, never "Error" (spec §7 failure microcopy rule).
     #[must_use]
@@ -2407,6 +2241,7 @@ impl TidelineInboxRecord {
         match self.kind {
             NotificationKind::TurnComplete => "turn done",
             NotificationKind::SubagentTerminal => "whale done",
+            NotificationKind::BackgroundTerminal => "work done",
             NotificationKind::ApprovalNeeded => "approval",
             NotificationKind::InputNeeded => "question",
             NotificationKind::ElevationNeeded => "sandbox",
@@ -2420,7 +2255,9 @@ impl TidelineInboxRecord {
     pub fn kind_ink(&self) -> ChromeInk {
         match self.kind {
             NotificationKind::TurnComplete => ChromeInk::Outcome,
-            NotificationKind::SubagentTerminal => ChromeInk::Info,
+            NotificationKind::SubagentTerminal | NotificationKind::BackgroundTerminal => {
+                ChromeInk::Info
+            }
             NotificationKind::ApprovalNeeded | NotificationKind::InputNeeded => {
                 ChromeInk::PermissionAsk
             }
@@ -2431,7 +2268,7 @@ impl TidelineInboxRecord {
 }
 
 /// What the caller owes the inbox render.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub struct TidelineInbox<'a> {
     pub theme: &'a UiTheme,
     pub records: &'a [TidelineInboxRecord],
@@ -2440,9 +2277,8 @@ pub struct TidelineInbox<'a> {
     pub ascii_safe: bool,
 }
 
-#[allow(dead_code)] // translation scaffolding: builder methods feed tests + the landing slice
+#[cfg(test)] // translation scaffolding: builder methods feed tests + the landing slice
 impl<'a> TidelineInbox<'a> {
-    #[allow(dead_code)] // translation scaffolding: wired by the landing slice
     #[must_use]
     pub fn new(theme: &'a UiTheme, records: &'a [TidelineInboxRecord]) -> Self {
         Self {
@@ -2483,10 +2319,12 @@ impl<'a> TidelineInbox<'a> {
     }
 }
 
+#[cfg(test)]
 fn chrome(theme: &UiTheme, ink: ChromeInk) -> Style {
     chrome_style(theme, ink)
 }
 
+#[cfg(test)]
 fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
     buf.set_stringn(x, y, text, text.width(), style);
 }
@@ -2494,7 +2332,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
 /// Paint the notifications inbox: header row (count of unread), then one
 /// row per record — unread gold ◆, read hollow ○, selected `▸`, kind word,
 /// title, injected time. Truncates, never wraps.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn render_tideline_inbox(area: Rect, buf: &mut Buffer, inbox: &TidelineInbox<'_>) {
     if area.width < 8 || area.height < 2 {
         return;
@@ -2582,6 +2420,7 @@ pub fn render_tideline_inbox(area: Rect, buf: &mut Buffer, inbox: &TidelineInbox
     }
 }
 
+#[cfg(test)]
 fn truncate_to_width_owned(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -2600,7 +2439,7 @@ fn truncate_to_width_owned(text: &str, width: usize) -> String {
 /// painted rows exactly — the selected record's body row belongs to its
 /// rect. Must be called with the same inputs as [`render_tideline_inbox`].
 #[must_use]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn tideline_inbox_hitboxes(area: Rect, inbox: &TidelineInbox<'_>) -> Vec<Rect> {
     let mut out = Vec::new();
     if area.width < 8 || area.height < 2 {
@@ -2628,3 +2467,287 @@ pub fn tideline_inbox_hitboxes(area: Rect, inbox: &TidelineInbox<'_>) -> Vec<Rec
 
 #[cfg(test)]
 mod tideline_tests;
+
+#[cfg(test)]
+mod unified_audio_tests {
+    use super::*;
+    use crate::config::{CompletionSound, NotificationConfigUpdate, NotificationsConfig};
+    use crate::notify::audio::AudioOutcome;
+    use crate::notify::sound_policy::{self, EventSoundPolicy, SoundCue, SoundDecision};
+
+    fn payloads() -> [NotificationPayload; 6] {
+        [
+            NotificationPayload::turn_complete("done"),
+            NotificationPayload::subagent_terminal("done", "a"),
+            NotificationPayload::approval_needed("approve", "shell"),
+            NotificationPayload::input_needed("answer"),
+            NotificationPayload::elevation_needed("access", "shell", "denied"),
+            NotificationPayload::model_notify("notice", None),
+        ]
+    }
+
+    #[test]
+    fn every_gate_blocks_terminal_native_audio_and_the_repeat_clock() {
+        for payload in payloads() {
+            let mut disabled = NotificationsConfig::default();
+            disabled
+                .apply_update(NotificationConfigUpdate::Event(
+                    sound_policy::event_for_kind(payload.kind()),
+                    false,
+                ))
+                .unwrap();
+            for method in [Method::Kitty, Method::MacOS, Method::Bel] {
+                for (selected, gate, attention, threshold, expected) in [
+                    (
+                        Method::Off,
+                        NotificationGate::default(),
+                        true,
+                        Duration::ZERO,
+                        DeliveryOutcome::SuppressedByMethod,
+                    ),
+                    (
+                        method,
+                        NotificationGate {
+                            quiet: true,
+                            ..Default::default()
+                        },
+                        true,
+                        Duration::ZERO,
+                        DeliveryOutcome::SuppressedByGate,
+                    ),
+                    (
+                        method,
+                        NotificationGate::from_config(&disabled),
+                        true,
+                        Duration::ZERO,
+                        DeliveryOutcome::SuppressedByGate,
+                    ),
+                    (
+                        method,
+                        NotificationGate::default(),
+                        false,
+                        Duration::ZERO,
+                        DeliveryOutcome::SuppressedByAttention,
+                    ),
+                    (
+                        method,
+                        NotificationGate::default(),
+                        true,
+                        Duration::from_secs(2),
+                        DeliveryOutcome::SuppressedByThreshold,
+                    ),
+                ] {
+                    let mut out = Vec::new();
+                    let result = notify_with_sinks(
+                        selected,
+                        false,
+                        &payload,
+                        threshold,
+                        Duration::from_secs(1),
+                        gate,
+                        attention,
+                        &mut out,
+                        &mut |_, _| panic!("suppressed event reached sound decision"),
+                        &mut |_, _| panic!("suppressed event reached audio"),
+                        &mut |_| panic!("suppressed event reached native banner"),
+                    );
+                    assert_eq!(result, expected);
+                    assert!(out.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_bell_transport_and_selected_whale_emit_only_one_cue() {
+        for payload in payloads() {
+            let mut policy = EventSoundPolicy::from_config(&NotificationsConfig {
+                sound: Some(CompletionSound::Whale),
+                ..Default::default()
+            });
+            let mut out = Vec::new();
+            let mut cues = Vec::new();
+            let result = notify_with_sinks(
+                Method::Bel,
+                false,
+                &payload,
+                Duration::ZERO,
+                Duration::ZERO,
+                NotificationGate::default(),
+                true,
+                &mut out,
+                &mut |kind, bell| policy.decide(sound_policy::event_for_kind(kind), 0, bell),
+                &mut |cue, _| {
+                    cues.push(cue.clone());
+                    AudioOutcome::Dispatched
+                },
+                &mut |_| panic!("audio-only transport reached native banner"),
+            );
+            assert_eq!(result, DeliveryOutcome::Dispatched(Method::Bel));
+            assert_eq!(cues, [SoundCue::Whale]);
+            assert!(out.is_empty(), "no second transport BEL");
+        }
+    }
+
+    #[test]
+    fn audio_off_keeps_banner_but_silences_bell_transport() {
+        for method in [Method::Kitty, Method::Bel] {
+            let mut policy = EventSoundPolicy::from_config(&NotificationsConfig {
+                sound: Some(CompletionSound::Off),
+                completion_sound: CompletionSound::Bell,
+                ..Default::default()
+            });
+            let mut out = Vec::new();
+            let result = notify_with_sinks(
+                method,
+                false,
+                &NotificationPayload::turn_complete("done"),
+                Duration::ZERO,
+                Duration::ZERO,
+                NotificationGate::default(),
+                true,
+                &mut out,
+                &mut |kind, bell| policy.decide(sound_policy::event_for_kind(kind), 0, bell),
+                &mut |_, _| panic!("off reached audio"),
+                &mut |_| panic!("unexpected native"),
+            );
+            assert_eq!(
+                result,
+                if method == Method::Bel {
+                    DeliveryOutcome::SuppressedBySound
+                } else {
+                    DeliveryOutcome::Delivered(method)
+                }
+            );
+            assert!(!out.contains(&7));
+        }
+    }
+
+    #[test]
+    fn unsupported_failed_and_busy_audio_have_truthful_receipts_without_fallback() {
+        for (audio_result, expected) in [
+            (
+                AudioOutcome::Unsupported,
+                DeliveryOutcome::UnsupportedTransport,
+            ),
+            (AudioOutcome::Failed, DeliveryOutcome::DeliveryFailed),
+            (AudioOutcome::Busy, DeliveryOutcome::SuppressedBySound),
+        ] {
+            let mut out = Vec::new();
+            let mut count = 0;
+            let result = notify_with_sinks(
+                Method::Bel,
+                false,
+                &NotificationPayload::input_needed("answer"),
+                Duration::ZERO,
+                Duration::ZERO,
+                NotificationGate::default(),
+                true,
+                &mut out,
+                &mut |_, _| SoundDecision::Play(SoundCue::Whale),
+                &mut |_, _| {
+                    count += 1;
+                    audio_result
+                },
+                &mut |_| panic!("unexpected native"),
+            );
+            assert_eq!(result, expected);
+            assert_eq!(count, 1);
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_failure_and_terminal_failure_do_not_trigger_orphan_audio() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for method in [Method::Kitty, Method::MacOS] {
+            let result = notify_with_sinks(
+                method,
+                false,
+                &NotificationPayload::input_needed("answer"),
+                Duration::ZERO,
+                Duration::ZERO,
+                NotificationGate::default(),
+                true,
+                &mut Broken,
+                &mut |_, _| panic!("failed delivery reached policy"),
+                &mut |_, _| panic!("failed delivery reached audio"),
+                &mut |_| DeliveryOutcome::DeliveryFailed,
+            );
+            assert_eq!(result, DeliveryOutcome::DeliveryFailed);
+        }
+    }
+
+    #[test]
+    fn native_worker_receipt_does_not_claim_os_acceptance() {
+        let mut out = Vec::new();
+        let mut cues = 0;
+        let result = notify_with_sinks(
+            Method::MacOS,
+            false,
+            &NotificationPayload::input_needed("answer"),
+            Duration::ZERO,
+            Duration::ZERO,
+            NotificationGate::default(),
+            true,
+            &mut out,
+            &mut |_, _| SoundDecision::Play(SoundCue::Whale),
+            &mut |_, _| {
+                cues += 1;
+                AudioOutcome::Dispatched
+            },
+            &mut |_| DeliveryOutcome::Dispatched(Method::MacOS),
+        );
+        assert_eq!(result.receipt(), "notification dispatch attempted");
+        assert_eq!(cues, 1);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn failed_audio_never_upgrades_native_dispatch_evidence() {
+        let mut out = Vec::new();
+        let result = notify_with_sinks(
+            Method::MacOS,
+            false,
+            &NotificationPayload::input_needed("answer"),
+            Duration::ZERO,
+            Duration::ZERO,
+            NotificationGate::default(),
+            true,
+            &mut out,
+            &mut |_, _| SoundDecision::Play(SoundCue::Whale),
+            &mut |_, _| AudioOutcome::Failed,
+            &mut |_| DeliveryOutcome::Dispatched(Method::MacOS),
+        );
+        assert_eq!(
+            result.receipt(),
+            "notification dispatch attempted; sound unavailable"
+        );
+    }
+
+    #[test]
+    fn title_completion_is_only_a_visual_marker_and_cannot_consume_audio() {
+        let _guard = crate::test_support::lock_test_env();
+        sound_policy::configure(EventSoundPolicy::from_config(&NotificationsConfig {
+            sound: Some(CompletionSound::Whale),
+            ..Default::default()
+        }));
+        let mut title = String::new();
+        stop_title_animation_with(|value| title = value.to_string());
+        assert!(title.contains("✓ done"));
+        assert_eq!(
+            sound_policy::decide(NotificationKind::TurnComplete, 0, false),
+            SoundDecision::Play(SoundCue::Whale)
+        );
+        sound_policy::configure(EventSoundPolicy::default());
+        COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
+    }
+}

@@ -25,12 +25,14 @@ use std::fmt::Write;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::tui::app::{App, MentionCompletionCache};
 use crate::tui::git_mention::{self, GitMentionCache, GitMentionKind};
 use crate::tui::mention_completion::{MentionDiscoveryBehavior, MentionDiscoveryKey};
 use crate::working_set::Workspace;
+use codewhale_core::{
+    ContextReference, ContextReferenceKind, ContextReferenceSource, MediaAttachmentReference,
+    media_attachment_references,
+};
 
 /// Maximum number of `@`-mentions whose contents are inlined into one user
 /// message. Beyond this we stop appending blocks but the raw `@token` text
@@ -54,48 +56,6 @@ pub struct FileMentionPreview {
     pub detail: Option<String>,
     pub included: bool,
     pub removable: bool,
-}
-
-/// Durable, compact metadata for a user-visible context reference.
-///
-/// The transcript keeps the user's compact text (`@path` or `[Attached ...]`)
-/// readable. This record preserves the exact target and inclusion state for
-/// the context inspector and for session resume without leaking raw metadata
-/// into the visible history cell.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextReference {
-    pub kind: ContextReferenceKind,
-    pub source: ContextReferenceSource,
-    /// Short badge for terminal display, e.g. `file`, `dir`, `image`.
-    pub badge: String,
-    /// Compact display label from the transcript, without the leading `@`.
-    pub label: String,
-    /// Resolved target path or URI-equivalent string.
-    pub target: String,
-    pub included: bool,
-    pub expanded: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextReferenceKind {
-    File,
-    Directory,
-    Missing,
-    Unsupported,
-    MediaMention,
-    MediaAttachment,
-    /// `@git` / `@diff` — curated git context rather than a path (#4067).
-    GitContext,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextReferenceSource {
-    AtMention,
-    Attachment,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +101,26 @@ pub fn partial_file_mention_at_cursor(input: &str, cursor_chars: usize) -> Optio
     let partial: String = chars[start_chars + 1..end_chars].iter().collect();
     let byte_start: usize = chars[..start_chars].iter().map(|c| c.len_utf8()).sum();
     Some((byte_start, partial))
+}
+
+/// The mention body for `path`: bare when [`extract_file_mentions`] reads
+/// it back unchanged, otherwise wrapped in the quoted form it also parses
+/// (`@"My Docs/notes.md"`). A bare path with a space would split into a
+/// missing-file mention for its first word.
+pub(crate) fn file_mention_body(path: &str) -> String {
+    let bare_round_trips = !path.is_empty()
+        && !path.chars().any(char::is_whitespace)
+        && !path.starts_with(['"', '\''])
+        && trim_unquoted_mention(path) == path;
+    if bare_round_trips {
+        path.to_string()
+    } else if !path.contains('"') {
+        format!("\"{path}\"")
+    } else if !path.contains('\'') {
+        format!("'{path}'")
+    } else {
+        path.to_string()
+    }
 }
 
 /// Cwd-aware completion entry point. Shares its walker with the future
@@ -346,7 +326,7 @@ pub fn apply_mention_menu_selection(app: &mut App, entries: &[String]) -> bool {
     // #441: bump this path's frecency before we splice it in. The store
     // persists asynchronously, so this never blocks input handling.
     super::file_frecency::record_mention(replacement);
-    replace_file_mention(app, byte_start, &partial, replacement);
+    replace_file_mention(app, byte_start, &partial, &file_mention_body(replacement));
     app.mention_menu_hidden = false;
     app.status_message = Some(format!("Attached @{replacement}"));
     true
@@ -377,12 +357,24 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
     if candidates.len() == 1 {
         // #441: a unique-match completion is also a "mention" for ranking.
         super::file_frecency::record_mention(&candidates[0]);
-        replace_file_mention(app, byte_start, &partial, &candidates[0]);
+        replace_file_mention(
+            app,
+            byte_start,
+            &partial,
+            &file_mention_body(&candidates[0]),
+        );
         app.status_message = Some(format!("Attached @{}", candidates[0]));
         return true;
     }
     let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    // Extend only up to the first whitespace: the partial token ends there,
+    // so `@My Do` would leave a missing `@My` mention and a dead next Tab.
+    // Paths with spaces are completed whole (and quoted) by the unique-match
+    // branch or the mention menu.
     let shared = longest_common_prefix(&candidate_refs);
+    let shared = shared
+        .find(char::is_whitespace)
+        .map_or(shared, |idx| &shared[..idx]);
     if shared.len() > partial.len() {
         replace_file_mention(app, byte_start, &partial, shared);
         app.status_message = Some(format!("@{shared}…"));
@@ -746,47 +738,6 @@ fn context_reference_for_mention(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaAttachmentReference {
-    pub kind: String,
-    pub path: String,
-    pub start_byte: usize,
-    pub end_byte: usize,
-}
-
-pub fn media_attachment_references(input: &str) -> Vec<MediaAttachmentReference> {
-    let mut out = Vec::new();
-    let mut offset = 0usize;
-    for line in input.split_inclusive('\n') {
-        let start_byte = offset;
-        let end_byte = offset + line.len();
-        offset = end_byte;
-        let trimmed = line.trim();
-        let Some(body) = trimmed
-            .strip_prefix("[Attached ")
-            .and_then(|value| value.strip_suffix(']'))
-        else {
-            continue;
-        };
-        let Some((kind, rest)) = body.split_once(": ") else {
-            continue;
-        };
-        let path = rest
-            .rsplit_once(" at ")
-            .map_or(rest, |(_, path)| path)
-            .trim();
-        if !path.is_empty() {
-            out.push(MediaAttachmentReference {
-                kind: kind.trim().to_string(),
-                path: path.to_string(),
-                start_byte,
-                end_byte,
-            });
-        }
-    }
-    out
-}
-
 fn extract_media_attachment_references(input: &str) -> Vec<MediaAttachmentReference> {
     media_attachment_references(input)
 }
@@ -796,13 +747,17 @@ fn extract_media_attachment_references(input: &str) -> Vec<MediaAttachmentRefere
 // ---------------------------------------------------------------------------
 //
 // macOS parks dragged-out screenshots under a per-capture temp directory like
-// `/var/folders/…/T/Temporary Items/NSIRD_screencaptureui_XXXX/` and deletes
+// `/var/folders/…/T/Temporary Items/NSIRD_screencaptureui_XXXX/` (recent
+// releases spell it `TemporaryItems`, without the space) and deletes
 // it minutes later. Inbound references to such files are copied to a stable
 // directory the moment the message is received, so the agent later reads a
 // path that still exists.
 
 /// Marker fragments of the macOS screencapture temp directory layout.
 const SCREENCAPTURE_TEMP_DIR_MARKERS: [&str; 2] = ["Temporary Items", "screencaptureui"];
+
+/// The `Temporary Items` component as recent macOS releases spell it.
+const SCREENCAPTURE_TEMP_DIR_COMPACT: &str = "TemporaryItems";
 
 /// Stable per-session directory for stabilized screencapture files. Follows
 /// the same home-first convention as `clipboard.rs`'s clipboard-images dir.
@@ -824,34 +779,60 @@ fn is_screencapture_temp_path(path: &Path) -> bool {
         .collect();
     components
         .iter()
-        .any(|c| c == SCREENCAPTURE_TEMP_DIR_MARKERS[0])
+        .any(|c| c == SCREENCAPTURE_TEMP_DIR_MARKERS[0] || c == SCREENCAPTURE_TEMP_DIR_COMPACT)
         && components
             .iter()
             .any(|c| c.contains(SCREENCAPTURE_TEMP_DIR_MARKERS[1]))
 }
 
-/// The `[Attached …]` parser splits at " at ", so a stable copy must not
-/// reintroduce that separator in its name.
+/// Keep " at " out of a stable copy's name: `[Attached …: <desc> at <path>]`
+/// uses it as the separator, and older parsers split at its last occurrence.
 fn stable_attachment_name(file_name: &std::ffi::OsStr) -> String {
     file_name.to_string_lossy().replace(" at ", "-")
 }
+
+/// Largest screenshot copied to a stable location.
+const MAX_STABLE_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Copy a screencapture temp file to `artifact_dir` and return the stable
 /// destination. Returns `None` when the path is not a screencapture temp
 /// file, not a regular file, or the copy fails — callers keep the original
 /// reference then. Idempotent: an existing destination is reused without a
 /// second copy.
+///
+/// `artifact_dir` is `<root>/<name>`: the destination is written through the
+/// pinned no-follow writer anchored at `root`, so a linked `artifact_dir`, a
+/// linked destination, or a dangling link at the destination name is refused
+/// instead of being written through. `root` itself may be a user-selected link
+/// (a relocated `~/.codewhale`).
 fn stabilize_screencapture_file(path: &Path, artifact_dir: &Path) -> Option<PathBuf> {
     if !is_screencapture_temp_path(path) || !path.is_file() {
         return None;
     }
-    let dest = artifact_dir.join(stable_attachment_name(path.file_name()?));
-    if !dest.exists()
-        && (std::fs::create_dir_all(artifact_dir).is_err() || std::fs::copy(path, &dest).is_err())
-    {
+    let name = stable_attachment_name(path.file_name()?);
+    let dest = artifact_dir.join(&name);
+    let relative = Path::new(artifact_dir.file_name()?).join(&name);
+    let target =
+        crate::fleet::files::WorkspaceFile::open(artifact_dir.parent()?, &relative, true).ok()?;
+    // An existing regular destination is reused; a link there fails to open.
+    if target.open_file().is_ok() {
+        return Some(dest);
+    }
+    if std::fs::metadata(path).ok()?.len() > MAX_STABLE_ATTACHMENT_BYTES {
         return None;
     }
-    Some(dest)
+    let bytes = std::fs::read(path).ok()?;
+    match target.publish(&bytes) {
+        Ok(()) => Some(dest),
+        // Lost a race to another writer of the same name: reuse only if what
+        // is there is a regular file we may open.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists && target.open_file().is_ok() =>
+        {
+            Some(dest)
+        }
+        Err(_) => None,
+    }
 }
 
 /// A path reference found in inbound text: its byte span, the path text, and
@@ -1423,20 +1404,24 @@ fn render_directory_mention_context(raw: &str, path: &Path, display_path: &str) 
         }
     };
 
-    let mut names = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| {
-            let marker = entry
-                .file_type()
-                .ok()
-                .filter(|ty| ty.is_dir())
-                .map_or("", |_| "/");
-            format!("{}{}", entry.file_name().to_string_lossy(), marker)
-        })
-        .collect::<Vec<_>>();
-    names.sort();
-    let total = names.len();
-    names.truncate(MAX_DIRECTORY_MENTION_ENTRIES);
+    // Keep only the first MAX entries in sort order while counting the rest:
+    // a max-heap of that size bounds memory to the output instead of
+    // materializing and sorting the whole directory (U07-03).
+    let mut total = 0usize;
+    let mut kept = std::collections::BinaryHeap::with_capacity(MAX_DIRECTORY_MENTION_ENTRIES + 1);
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        total += 1;
+        let marker = entry
+            .file_type()
+            .ok()
+            .filter(|ty| ty.is_dir())
+            .map_or("", |_| "/");
+        kept.push(format!("{}{}", entry.file_name().to_string_lossy(), marker));
+        if kept.len() > MAX_DIRECTORY_MENTION_ENTRIES {
+            kept.pop();
+        }
+    }
+    let names = kept.into_sorted_vec();
     let mut body = names.join("\n");
     if total > MAX_DIRECTORY_MENTION_ENTRIES {
         let omitted = total - MAX_DIRECTORY_MENTION_ENTRIES;
@@ -1447,13 +1432,15 @@ fn render_directory_mention_context(raw: &str, path: &Path, display_path: &str) 
 
 /// Bounded read of a mention's file content, optionally sliced to a line
 /// range. Returns `(text, truncated, beyond_eof)`: `truncated` mirrors the
-/// full-file byte bound; `beyond_eof` is set only when the requested range
-/// starts past the end of the file.
+/// full-file byte bound, except for a range that starts past that bound,
+/// where it says whether the streamed range itself was cut; `beyond_eof` is
+/// set only when the requested range starts past the end of the file.
 fn read_file_content(
     path: &Path,
     range: Option<FileRange>,
 ) -> std::io::Result<(String, bool, bool)> {
-    let (text, truncated) = read_text_prefix(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let (text, truncated) = read_text_prefix(&mut file)?;
     let Some(FileRange { start, end }) = range else {
         return Ok((text, truncated, false));
     };
@@ -1463,14 +1450,78 @@ fn read_file_content(
     }
     let start_idx = usize::try_from(start.saturating_sub(1)).unwrap_or(usize::MAX);
     if start_idx >= lines.len() {
+        if truncated {
+            // The prefix ended, not the file: read the range from the file
+            // itself instead of calling it past EOF (U07-04).
+            std::io::Seek::rewind(&mut file)?;
+            return read_line_range_past_prefix(file, u64::from(start), u64::from(end));
+        }
         return Ok((String::new(), truncated, true));
     }
     let end_idx = usize::try_from(end).unwrap_or(usize::MAX).min(lines.len());
     Ok((lines[start_idx..end_idx].join("\n"), truncated, false))
 }
 
-fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
-    let mut file = std::fs::File::open(path)?;
+/// Stream a 1-based inclusive line range that starts beyond the bounded
+/// prefix. Skipped lines are scanned, never stored; the range text itself is
+/// held to the same byte budget as a whole-file mention.
+fn read_line_range_past_prefix(
+    file: impl Read,
+    start: u64,
+    end: u64,
+) -> std::io::Result<(String, bool, bool)> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = 1u64;
+    while line < start {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok((String::new(), false, true));
+        }
+        let consumed = match buf.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                line += 1;
+                newline + 1
+            }
+            None => buf.len(),
+        };
+        reader.consume(consumed);
+    }
+    if reader.fill_buf()?.is_empty() {
+        return Ok((String::new(), false, true));
+    }
+    let budget = usize::try_from(MAX_MENTION_FILE_BYTES).unwrap_or(usize::MAX);
+    let mut buffer = Vec::new();
+    let mut truncated = false;
+    while line <= end {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        let (take, newline) = match buf.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => (newline + 1, true),
+            None => (buf.len(), false),
+        };
+        let room = budget - buffer.len();
+        if take > room {
+            buffer.extend_from_slice(&buf[..room]);
+            truncated = true;
+            break;
+        }
+        buffer.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if newline {
+            line += 1;
+        }
+    }
+    let mut text = decode_bounded_text(buffer, truncated)?;
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    Ok((text, truncated, false))
+}
+
+fn read_text_prefix(file: &mut impl Read) -> std::io::Result<(String, bool)> {
     let mut buffer = Vec::new();
     file.by_ref()
         .take(MAX_MENTION_FILE_BYTES + 1)
@@ -1478,6 +1529,13 @@ fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
     let truncated = buffer.len() as u64 > MAX_MENTION_FILE_BYTES;
     if truncated {
         buffer.truncate(MAX_MENTION_FILE_BYTES as usize);
+    }
+    Ok((decode_bounded_text(buffer, truncated)?, truncated))
+}
+
+/// Decode a budget-bounded read as UTF-8 text, rejecting binary content.
+fn decode_bounded_text(mut buffer: Vec<u8>, truncated: bool) -> std::io::Result<String> {
+    if truncated {
         // Round down to the nearest valid UTF-8 character boundary so a
         // multi-byte sequence (CJK, emoji, etc.) is never split at the cut point.
         // Only adjust when error_len() is None — that means truncation landed
@@ -1499,7 +1557,7 @@ fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
     let text = std::str::from_utf8(&buffer)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not UTF-8"))?
         .to_string();
-    Ok((text, truncated))
+    Ok(text)
 }
 
 fn is_media_path(path: &Path) -> bool {
@@ -1538,6 +1596,25 @@ fn is_media_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn inserted_mention_bodies_parse_back_to_the_whole_path() {
+        for path in [
+            "src/main.rs",
+            "My Docs/notes.md",
+            "Screenshot 2026-09-28 at 10.00.00.png",
+            "notes)",
+            "say \"hi\" now.md",
+        ] {
+            let input = format!("look at @{} please", file_mention_body(path));
+            assert_eq!(
+                extract_file_mentions(&input),
+                vec![path.to_string()],
+                "{input}"
+            );
+        }
+        assert_eq!(file_mention_body("src/main.rs"), "src/main.rs");
+    }
 
     /// #101 regression — workspace-vs-cwd divergence: `@bar.txt` typed from
     /// the cwd `<root>/sub` MUST resolve to `<root>/sub/bar.txt`, never to
@@ -1994,6 +2071,39 @@ mod tests {
         }
     }
 
+    /// U07-04: a range that starts past the bounded prefix is read from the
+    /// file, not reported as past EOF; a range past the real end still is.
+    #[test]
+    fn ranged_file_mention_reads_past_the_bounded_prefix() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("long.txt");
+        let body: String = (1..=20_000).map(|n| format!("line {n}\n")).collect();
+        assert!(body.len() as u64 > MAX_MENTION_FILE_BYTES);
+        std::fs::write(&path, body).expect("write");
+
+        let (text, truncated, beyond_eof) = read_file_content(
+            &path,
+            Some(FileRange {
+                start: 19_998,
+                end: 20_000,
+            }),
+        )
+        .expect("range read");
+        assert!(!beyond_eof, "the file has these lines");
+        assert!(!truncated, "three short lines fit the budget");
+        assert_eq!(text, "line 19998\nline 19999\nline 20000");
+
+        let (_, _, beyond_eof) = read_file_content(
+            &path,
+            Some(FileRange {
+                start: 20_001,
+                end: 20_002,
+            }),
+        )
+        .expect("range read");
+        assert!(beyond_eof, "the file really ends at line 20000");
+    }
+
     #[test]
     fn ranged_file_mention_slices_lines_and_reports_beyond_eof() {
         let tmp = TempDir::new().expect("tempdir");
@@ -2311,6 +2421,13 @@ mod tests {
         assert!(is_screencapture_temp_path(Path::new(
             "/var/folders/x/T/Temporary Items/NSIRD_screencaptureui_ABC/Shot.png"
         )));
+        // The spelling in the founder's failing drop (macOS 26).
+        assert!(is_screencapture_temp_path(Path::new(
+            "/var/folders/gc/x/T/TemporaryItems/NSIRD_screencaptureui_IqPorQ/Screenshot 2026-10-04 at 22.25.47.png"
+        )));
+        assert!(!is_screencapture_temp_path(Path::new(
+            "/tmp/TemporaryItems/Shot.png"
+        )));
         let (tmp, source, _) = screencapture_fixture();
         assert!(is_screencapture_temp_path(&source));
         // Only one marker is not a screencapture temp location.
@@ -2406,6 +2523,30 @@ mod tests {
     }
 
     #[test]
+    fn stabilizes_a_dropped_attachment_under_compact_temporary_items() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source_dir = tmp
+            .path()
+            .join("TemporaryItems")
+            .join("NSIRD_screencaptureui_IqPorQ");
+        std::fs::create_dir_all(&source_dir).expect("mkdir");
+        let source = source_dir.join("Screenshot 2026-10-04 at 22.25.47.png");
+        std::fs::write(&source, b"screenshot").expect("write");
+        let artifact_dir = tmp.path().join("attachments");
+        let input = format!("what is this?\n[Attached image: {}]\n", source.display());
+
+        let out = stabilize_screenshot_references(&input, &artifact_dir);
+
+        let stable = artifact_dir.join("Screenshot 2026-10-04-22.25.47.png");
+        assert!(stable.is_file(), "stable copy must exist");
+        assert!(
+            out.contains(&format!("[Attached image: {}]", stable.display())),
+            "got: {out}"
+        );
+        let _ = tmp;
+    }
+
+    #[test]
     fn handles_a_multibyte_final_filename_char() {
         let tmp = TempDir::new().expect("tempdir");
         let source_dir = tmp
@@ -2422,6 +2563,39 @@ mod tests {
         let stable = artifact_dir.join("截图");
         assert!(out.contains(&stable.display().to_string()), "got: {out}");
         assert!(!out.contains(&source.display().to_string()), "got: {out}");
+        let _ = tmp;
+    }
+
+    /// The stable copy is written through a no-follow writer: a dangling link
+    /// at the destination name, a linked destination, and a linked directory
+    /// are all refused, and nothing is created behind them.
+    #[cfg(unix)]
+    #[test]
+    fn stable_copies_are_never_written_through_a_link() {
+        use std::os::unix::fs::symlink;
+        let (tmp, source, artifact_dir) = screencapture_fixture();
+        let outside = TempDir::new().expect("outside");
+        let input = format!("see \"{}\"", source.display());
+        let name = "Screenshot 2026-08-10-01.09.39 截图.png";
+
+        // Dangling link at the destination name.
+        std::fs::create_dir_all(&artifact_dir).expect("mkdir");
+        let behind = outside.path().join("created-by-the-link");
+        symlink(&behind, artifact_dir.join(name)).expect("link");
+        assert_eq!(
+            stabilize_screenshot_references(&input, &artifact_dir),
+            input
+        );
+        assert!(
+            !behind.exists(),
+            "a dangling link must not be written through"
+        );
+
+        // A linked destination directory.
+        let linked_dir = tmp.path().join("linked-attachments");
+        symlink(outside.path(), &linked_dir).expect("link");
+        assert_eq!(stabilize_screenshot_references(&input, &linked_dir), input);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         let _ = tmp;
     }
 

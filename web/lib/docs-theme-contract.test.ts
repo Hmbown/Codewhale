@@ -1,70 +1,67 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { resolveWhale } from "./whale-tokens";
+import { siteCss } from "./site-css";
 
-const CSS = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
+const CSS = siteCss();
 
 function selectorBlock(selector: string): string {
-  const match = CSS.match(new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "s"));
+  const match = CSS.match(new RegExp(`(?:^|\n)${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "s"));
   if (!match) throw new Error(`Missing CSS selector: ${selector}`);
   return match[1];
 }
 
-function selectorVars(selector: string): Record<string, string> {
-  const block = selectorBlock(selector);
-  const vars: Record<string, string> = {};
-  // Values may be a literal hex or a `var(--whale-*)` reference into the
-  // generated app/tokens.css; non-color values (channel triples, lengths) are
-  // skipped, exactly as the hex-only regex used to skip them.
-  for (const match of block.matchAll(/--([\w-]+):\s*([^;]+);/g)) {
-    const value = resolveWhale(match[2].trim());
-    if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(value)) vars[match[1]] = value;
-  }
-  return vars;
+
+
+
+const PINNED_DARK = ':root[data-theme="dark"]';
+
+function allVars(selector: string): Record<string, string> {
+  return Object.fromEntries(
+    [...selectorBlock(selector).matchAll(/--([\w-]+):\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]),
+  );
 }
 
-function relativeLuminance(hex: string): number {
-  const full = hex.length === 4 ? hex.slice(1).split("").map((c) => c + c).join("") : hex.slice(1);
-  const channels = full
-    .match(/.{2}/g)!
-    .map((value) => Number.parseInt(value, 16) / 255)
-    .map((value) => (value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4));
-
-  return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
-}
-
-function contrastRatio(foreground: string, background: string): number {
-  const lighter = Math.max(relativeLuminance(foreground), relativeLuminance(background));
-  const darker = Math.min(relativeLuminance(foreground), relativeLuminance(background));
-  return (lighter + 0.05) / (darker + 0.05);
-}
-
-describe("docs theme contrast contract", () => {
-  // Tideline: dark is the site default (the bare `.docs-theme` block inherits
-  // the dark surface tokens from `:root`), and the light sheet is the opt-in
-  // override. Both are checked.
-  const themes = () => [
-    { ...selectorVars(":root"), ...selectorVars(".docs-theme") },
-    { ...selectorVars(":root"), ...selectorVars('html[data-theme="light"] .docs-theme') },
-  ];
-
-  it("keeps current and hover sidebar text at WCAG AA contrast", () => {
-    for (const theme of themes()) {
-      const accent = theme["docs-accent"];
-      const background = theme["paper"];
-      expect(contrastRatio(accent, background)).toBeGreaterThanOrEqual(4.5);
-    }
-    expect(CSS).toMatch(/\.docs-sidebar-link:hover,\s*\.docs-sidebar-link-current\s*{[^}]*color:\s*var\(--docs-accent\)/s);
+describe("site-wide theme contract", () => {
+  it("is paper by default; dark is a reader's pin, never the OS", () => {
+    // No region-scoped dark sheet: the docs portal follows the root theme.
+    expect(CSS).not.toMatch(/html\[data-theme="dark"\] \.docs-(portal|theme)/);
+    expect(CSS).toMatch(/(?:^|\n):root \{[^}]*color-scheme:\s*light;/);
+    expect(CSS).not.toMatch(/@media \(prefers-color-scheme: dark\)/);
+    expect(Object.keys(allVars(PINNED_DARK))).toContain("bg");
+    expect(selectorBlock(PINNED_DARK)).toMatch(/color-scheme:\s*dark/);
   });
 
-  it("keeps secondary button text at WCAG AA contrast", () => {
-    for (const theme of themes()) {
-      const text = theme["docs-button-text"];
-      const background = theme["docs-button-bg"];
-      expect(contrastRatio(text, background)).toBeGreaterThanOrEqual(4.5);
-    }
-    expect(selectorBlock(".docs-theme .portal-button-secondary")).toContain(
-      "color: var(--docs-button-text)",
+  it("re-inks the nav wordmark from the mark ink in every appearance", () => {
+    // wordmark.svg is fixed #142352 ink; the header draws it as a mask so
+    // --mark-ink (the page's text colour) paints it on paper and on the ocean.
+    expect(CSS).toMatch(/\.paper-wordmark-logo,\s*\.wordmark\s*\{[^}]*background: var\(--mark-ink\);/);
+  });
+
+  it("shows the toggle on every page with one light|dark storage contract", () => {
+    const toggle = readFileSync(new URL("../components/theme-toggle.tsx", import.meta.url), "utf8");
+    expect(toggle).not.toMatch(/isDocsPath|return null/);
+    expect(toggle).toMatch(/type Mode = "light" \| "dark"/);
+    expect(toggle).toContain('const KEY = "cw-theme"');
+    const layout = readFileSync(new URL("../app/[locale]/layout.tsx", import.meta.url), "utf8");
+    // The boot script pins only an explicit light/dark; anything else (a
+    // legacy "system" or "auto", nothing) stays on paper.
+    expect(layout).toContain("localStorage.getItem('cw-theme');if(t==='light'||t==='dark')");
+  });
+});
+
+describe("docs theme contrast contract", () => {
+  // The docs read the legacy names; they must resolve to the roles, whose
+  // contrast gpui-role-tokens.test.ts checks in every scheme.
+  it("points the docs accent and buttons at the role tokens", () => {
+    const root = Object.fromEntries(
+      [...CSS.matchAll(/(?:^|\n):root \{([^}]*)\}/g)].flatMap((m) =>
+        [...m[1].matchAll(/--([\w-]+):\s*([^;]+);/g)].map((v) => [v[1], v[2].trim()]),
+      ),
     );
+    expect(root["docs-accent"]).toBe("var(--accent)");
+    expect(root["docs-button-text"]).toBe("var(--text)");
+    expect(root["docs-button-bg"]).toBe("var(--panel)");
+    expect(CSS).toMatch(/\.docs-sidebar-link:hover,\s*\.docs-sidebar-link-current\s*{[^}]*color:\s*var\(--docs-accent\)/s);
+    expect(selectorBlock(".docs-theme .portal-button-secondary")).toContain("color: var(--docs-button-text)");
   });
 });

@@ -3,7 +3,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::palette;
+use codewhale_palette as palette;
 
 use super::{
     GenericToolCell, render_tool_header_with_family_and_summary, tool_status_label, truncate_text,
@@ -68,9 +68,15 @@ fn agent_inspection_action(cell: &GenericToolCell) -> Option<AgentCompactAction>
 
 pub(super) fn render_activity_group(cell: &GenericToolCell, width: u16) -> Vec<Line<'static>> {
     let summary = cell.input_summary.as_deref().unwrap_or("Updated metadata");
-    let budget = usize::from(width).max(1);
+    let suffix = cell
+        .output_summary
+        .as_deref()
+        .map_or(" ›".to_string(), |count| format!(" {count} ›"));
+    let budget = usize::from(width)
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(suffix.as_str()))
+        .max(1);
     vec![Line::from(Span::styled(
-        truncate_text(summary, budget),
+        format!("{}{suffix}", truncate_text(summary, budget)),
         Style::default().fg(palette::TEXT_MUTED),
     ))]
 }

@@ -1,0 +1,11 @@
+{
+  "direction": "core_to_host",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "refused": "name `read_file` collides with a built-in tool"
+    }
+  }
+}

@@ -35,6 +35,22 @@ describe("readBoundedUrlEncodedForm", () => {
     await expect(readBoundedUrlEncodedForm(req, 16)).rejects.toMatchObject({ status: 413 });
   });
 
+  it("preserves a split multibyte form value exactly at the byte limit", async () => {
+    const bytes = new TextEncoder().encode("token=鲸");
+    const makeRequest = () => new Request("https://codewhale.net/api/admin/login", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(bytes.slice(0, 7));
+        controller.enqueue(bytes.slice(7));
+        controller.close();
+      } }),
+      duplex: "half",
+    } as RequestInit);
+    expect((await readBoundedUrlEncodedForm(makeRequest(), 9)).get("token")).toBe("鲸");
+    await expect(readBoundedUrlEncodedForm(makeRequest(), 8)).rejects.toMatchObject({ name: "FormBodyError", status: 413 });
+  });
+
   it("rejects malformed Content-Length values", async () => {
     const req = request("token=value", { "content-length": "not-a-number" });
     await expect(readBoundedUrlEncodedForm(req, 64)).rejects.toMatchObject({ status: 400 });

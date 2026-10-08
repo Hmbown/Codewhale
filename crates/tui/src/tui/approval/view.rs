@@ -4,18 +4,20 @@
 //! persistent rules, preview formatting, and sandbox elevation remain separate
 //! authority boundaries.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use codewhale_config::ToolAskRule;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 use crate::config::ApprovalDefaultSelection;
-use crate::localization::{Locale, MessageId, tr};
 use crate::tools::canonical_action::canonical_action_alias;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, Renderable};
+use codewhale_localization::{Locale, MessageId, tr};
 
 #[cfg(test)]
 use super::RiskLevel;
@@ -47,6 +49,14 @@ impl ApprovalOption {
         ApprovalOption::Abort,
     ];
 
+    /// A child agent's card (approvals C1): the person can hide it, never
+    /// stop the parent's turn from it, so "Stop this turn" is not offered.
+    const CHILD_ORDER: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::ApproveAlways,
+        ApprovalOption::Deny,
+    ];
+
     /// Workflow elevated-plan card (#4126): Approve / Edit plan / Cancel.
     const WORKFLOW_ORDER: [ApprovalOption; 3] = [
         ApprovalOption::ApproveOnce,
@@ -57,6 +67,8 @@ impl ApprovalOption {
     fn order_for(request: &ApprovalRequest) -> &'static [ApprovalOption] {
         if request.tool_name == "workflow" {
             &Self::WORKFLOW_ORDER
+        } else if request.owner.is_some() {
+            &Self::CHILD_ORDER
         } else if request.can_save_allow_rule() {
             &Self::ORDER_WITH_PERSISTENT_ALLOW
         } else {
@@ -96,9 +108,14 @@ pub struct ApprovalView {
     request: ApprovalRequest,
     pub(super) selected: usize,
     pub(super) row_hitboxes: RefCell<Vec<Rect>>,
+    /// Whether the last paint showed the persistent-rule save preview. The
+    /// save offers (`[p]` and `s`) only work while it is on screen, so a
+    /// person never saves a rule without seeing what it covers. Starts
+    /// false: nothing is offered before the card has been painted.
+    save_preview_shown: Cell<bool>,
     locale: Locale,
     pub(super) timeout: Option<Duration>,
-    requested_at: Instant,
+    pub(super) requested_at: Instant,
     /// Whether the approval card is collapsed to a single-line banner.
     pub(crate) collapsed: bool,
 }
@@ -133,6 +150,7 @@ impl ApprovalView {
             request,
             selected,
             row_hitboxes: RefCell::new(Vec::new()),
+            save_preview_shown: Cell::new(false),
             locale,
             timeout: None,
             requested_at: Instant::now(),
@@ -140,18 +158,57 @@ impl ApprovalView {
         }
     }
 
+    /// Bound how long this card may wait (#6101). `Some(timeout)` resolves
+    /// the card to **deny** once the duration elapses (fail-closed); `None`
+    /// waits indefinitely. A zero duration is treated as `None` so the
+    /// config convention (`0` = wait forever) holds at this layer too.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout.filter(|timeout| !timeout.is_zero());
+        self
+    }
+
     pub(super) fn select_prev(&mut self) {
-        let len = ApprovalOption::order_for(&self.request).len();
-        self.selected = crate::tui::list_nav::wrap_index(self.selected, len, -1);
+        self.step_selection(-1);
     }
 
     pub(super) fn select_next(&mut self) {
-        let len = ApprovalOption::order_for(&self.request).len();
-        self.selected = crate::tui::list_nav::wrap_index(self.selected, len, 1);
+        self.step_selection(1);
+    }
+
+    /// Move the selection, skipping options the card is not offering.
+    fn step_selection(&mut self, delta: isize) {
+        let order = ApprovalOption::order_for(&self.request);
+        let mut selected = self.selected;
+        for _ in 0..order.len() {
+            selected = crate::tui::list_nav::wrap_index(selected, order.len(), delta);
+            if self.offers(order[selected]) {
+                break;
+            }
+        }
+        self.selected = selected;
+    }
+
+    /// Whether the card currently offers `option`. Saving a persistent allow
+    /// rule is offered only while its save preview is on screen.
+    pub(crate) fn offers(&self, option: ApprovalOption) -> bool {
+        option != ApprovalOption::AllowExactRepo || self.save_preview_shown.get()
+    }
+
+    /// Record whether the paint that just ran showed the save preview.
+    pub(crate) fn set_save_preview_shown(&self, shown: bool) {
+        self.save_preview_shown.set(shown);
     }
 
     pub(super) fn current_option(&self) -> ApprovalOption {
         ApprovalOption::from_index_for(&self.request, self.selected)
+    }
+
+    /// The agent that owns this card, when it is a child's request.
+    #[cfg(test)]
+    #[must_use]
+    pub fn owner(&self) -> Option<&super::ApprovalOwner> {
+        self.request.owner.as_ref()
     }
 
     /// Whether this approval is the elevated Workflow plan card (#4126).
@@ -187,6 +244,11 @@ impl ApprovalView {
 
     /// Commit the given option and close the approval modal.
     fn commit_option(&mut self, option: ApprovalOption) -> ViewAction {
+        if !self.offers(option) {
+            // Fail closed: a rule whose coverage is not on screen is never
+            // saved, and nothing else is decided in its place.
+            return ViewAction::None;
+        }
         self.selected = option.index_for(&self.request);
         if option == ApprovalOption::AllowExactRepo && self.request.can_save_allow_rule() {
             self.emit_decision_with_rules(
@@ -279,6 +341,17 @@ impl ModalView for ApprovalView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        if key.kind != KeyEventKind::Press {
+            return ViewAction::None;
+        }
+        // Details is the intentional modified-key action; it cannot grant
+        // authority. Editing/mode chords must never answer this card.
+        if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) {
+            return self.emit_params_pager();
+        }
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Tab => {
                 self.collapsed = !self.collapsed;
@@ -303,7 +376,9 @@ impl ModalView for ApprovalView {
             {
                 self.commit_option(ApprovalOption::ApproveAlways)
             }
-            KeyCode::Char('p') | KeyCode::Char('P') if self.request.can_save_allow_rule() => {
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if self.request.can_save_allow_rule() && self.save_preview_shown.get() =>
+            {
                 self.commit_option(ApprovalOption::AllowExactRepo)
             }
             // Workflow plan card (#4126): [2/e] Edit plan, [3/n/d] Cancel.
@@ -312,12 +387,15 @@ impl ModalView for ApprovalView {
             {
                 self.commit_option(ApprovalOption::Deny)
             }
-            KeyCode::Char('s') | KeyCode::Char('S') if self.request.can_save_ask_rule() => self
-                .emit_decision_with_rules(
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if self.request.can_save_ask_rule() && self.save_preview_shown.get() =>
+            {
+                self.emit_decision_with_rules(
                     ReviewDecision::Approved,
                     false,
                     self.request.persistent_ask_rules.clone(),
-                ),
+                )
+            }
             KeyCode::Char('n')
             | KeyCode::Char('N')
             | KeyCode::Char('d')
@@ -330,11 +408,16 @@ impl ModalView for ApprovalView {
                     self.commit_option(ApprovalOption::Deny)
                 }
             }
-            // Details is Alt+V / Option+V only; bare `v` is never a shortcut.
-            _ if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) => {
-                self.emit_params_pager()
-            }
+            // A child's card hides on Esc: the request stays pending (footer
+            // row, `/agents`) and the parent's turn is never cancelled.
+            KeyCode::Esc if self.request.owner.is_some() => ViewAction::Close,
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
+            KeyCode::Char('g') | KeyCode::Char('G') => match self.request.owner.as_ref() {
+                Some(owner) => ViewAction::Emit(ViewEvent::OpenAgentTranscript {
+                    agent_id: owner.agent_id.clone(),
+                }),
+                None => ViewAction::None,
+            },
             _ => ViewAction::None,
         }
     }

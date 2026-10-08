@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codewhale · OrcaRouter provider</title>
+    <style>
+      :root {
+        --bg: #0a1e33;
+        --panel: #0f2b47;
+        --ink: #f6f2e8;
+        --muted: #9fb3c8;
+        --line: #2b5177;
+        --accent: #4fd1c5;
+        --field: #08182a;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px/1.5 ui-monospace, "DejaVu Sans Mono", Menlo, monospace;
+      }
+      .frame { max-width: 1180px; margin: 0 auto; padding: 24px 28px 40px; }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      .sub { color: var(--muted); margin: 0 0 20px; }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 18px 20px;
+        margin-bottom: 20px;
+      }
+      .panel > h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
+      .choices { display: flex; gap: 14px; margin-bottom: 14px; }
+      .choice {
+        flex: 1;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px 14px;
+        background: var(--field);
+      }
+      .choice .name { font-weight: 700; margin-bottom: 4px; }
+      .choice .hint { color: var(--muted); font-size: 13px; }
+      .field { margin-top: 12px; }
+      .field label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+      input[type="text"], select {
+        width: 100%;
+        background: var(--field);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 9px 11px;
+        font: inherit;
+      }
+      .row { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+      button {
+        background: var(--accent);
+        color: #04222b;
+        border: 0;
+        border-radius: 6px;
+        padding: 9px 16px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button.quiet { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+      .status { color: var(--muted); font-size: 13px; }
+      .combo { position: relative; }
+      .combo .trigger { position: relative; }
+      .menu {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: calc(100% + 2px);
+        z-index: 5;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        max-height: 260px;
+        overflow: auto;
+        display: none;
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55);
+      }
+      .menu.open { display: block; }
+      .item { padding: 7px 11px; white-space: nowrap; }
+      .item.sel { background: var(--accent); color: #04222b; font-weight: 700; }
+      .item .badge { color: inherit; opacity: 0.75; font-size: 12px; margin-left: 8px; }
+    </style>
+  </head>
+  <body>
+    <main class="frame">
+      <h1>OrcaRouter — provider setup</h1>
+      <p class="sub">
+        Codewhale · <span id="cap">chat</span> capability · catalog
+        <span id="catalog-source"></span>
+      </p>
+
+      <section class="panel" id="auth-panel">
+        <h2>Authentication</h2>
+        <div class="choices">
+          <div class="choice" id="choice-api-key" aria-pressed="true">
+            <div class="name">OrcaRouter — API key</div>
+            <div class="hint">Paste an existing sk-orca-… key</div>
+          </div>
+          <div class="choice" id="choice-pkce" aria-pressed="false">
+            <div class="name">Connect with OrcaRouter</div>
+            <div class="hint">OAuth 2.0 + PKCE, no client secret</div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="key">API key</label>
+          <input id="key" type="text" value="sk-orca-••••••••••••••••••••••••" readonly />
+        </div>
+        <div class="row">
+          <button id="save">Save key</button>
+          <button class="quiet" id="connect">Connect with OrcaRouter</button>
+          <span class="status" id="auth-status">Stored in the secret store as slot “orcarouter”.</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Text model</h2>
+        <div class="combo" id="text-combo">
+          <input class="trigger" id="text-trigger" type="text" readonly value="loading…" />
+          <div class="menu" id="text-menu" role="listbox" aria-label="OrcaRouter chat models"></div>
+        </div>
+        <div class="row">
+          <span class="status" id="text-status"></span>
+        </div>
+      </section>
+
+      <section class="panel" id="vision-panel" hidden>
+        <h2>Image-input model</h2>
+        <div class="combo" id="vision-combo">
+          <input class="trigger" id="vision-trigger" type="text" readonly value="loading…" />
+          <div class="menu" id="vision-menu" role="listbox" aria-label="OrcaRouter image-input models"></div>
+        </div>
+        <div class="row">
+          <span class="status" id="vision-status"></span>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      // Real catalog data, written next to this page by the verification check
+      // from https://api.orcarouter.ai/v1/models?capability=chat. This page is a
+      // rendering harness for the provider picker, not the TUI itself.
+      const ORCA_CHAT_ENDPOINT_TYPES = ["openai", "anthropic", "gemini", "openai-response"];
+      window.orcaUi = { ready: false };
+
+      function isChat(model) {
+        const types = model.supported_endpoint_types;
+        return Array.isArray(types) && types.some((t) => ORCA_CHAT_ENDPOINT_TYPES.includes(t));
+      }
+      function hasImageInput(model) {
+        const modalities = (model.architecture || {}).input_modalities;
+        return Array.isArray(modalities) && modalities.includes("image");
+      }
+
+      function fill(menuEl, models, triggerEl) {
+        menuEl.replaceChildren();
+        for (const [index, model] of models.entries()) {
+          const row = document.createElement("div");
+          row.className = "item" + (index === 0 ? " sel" : "");
+          row.setAttribute("role", "option");
+          row.textContent = model.id;
+          const badge = document.createElement("span");
+          badge.className = "badge";
+          badge.textContent = (model.context_length ? model.context_length : "n/a") + " ctx";
+          row.append(badge);
+          menuEl.append(row);
+        }
+        if (models.length) triggerEl.value = models[0].id;
+      }
+
+      async function main() {
+        const response = await fetch("./orca-catalog.json");
+        const payload = await response.json();
+        const chat = (payload.data || []).filter(isChat);
+        const vision = chat.filter(hasImageInput);
+
+        document.getElementById("catalog-source").textContent = "(" + (payload.source || "") + ")";
+        document.getElementById("text-status").textContent =
+          chat.length + " chat models from the live catalog";
+        fill(document.getElementById("text-menu"), chat, document.getElementById("text-trigger"));
+
+        if (vision.length) {
+          document.getElementById("vision-panel").hidden = false;
+          document.getElementById("vision-status").textContent =
+            vision.length + " chat models declare an image input";
+          fill(
+            document.getElementById("vision-menu"),
+            vision,
+            document.getElementById("vision-trigger")
+          );
+        }
+
+        window.orcaUi = {
+          ready: true,
+          catalog_source: payload.source || "",
+          chat_count: chat.length,
+          image_count: vision.length,
+        };
+      }
+
+      window.orcaShowAuth = () => {
+        document.getElementById("key").value = "sk-orca-••••••••••••••••••••••••";
+        window.orcaUi = {
+          ...window.orcaUi,
+          api_key_visible: document.getElementById("choice-api-key") !== null,
+          pkce_visible: document.getElementById("choice-pkce") !== null,
+          secret_masked: document.getElementById("key").value.includes("•"),
+          controls_enabled:
+            !document.getElementById("save").disabled &&
+            !document.getElementById("connect").disabled,
+        };
+        return window.orcaUi;
+      };
+
+      window.orcaOpenDropdown = (which) => {
+        const menu = document.getElementById(which + "-menu");
+        const combo = document.getElementById(which + "-combo");
+        const trigger = document.getElementById(which + "-trigger");
+        menu.classList.add("open");
+        const panel = menu.getBoundingClientRect();
+        const triggerBox = trigger.getBoundingClientRect();
+        const style = getComputedStyle(menu);
+        const opaque =
+          style.backgroundColor !== "rgba(0, 0, 0, 0)" && style.backgroundColor !== "transparent";
+        const border = parseFloat(style.borderTopWidth) > 0;
+        window.orcaUi = {
+          ...window.orcaUi,
+          dropdown_open: true,
+          item_count: menu.querySelectorAll(".item").length,
+          opaque_background: opaque,
+          visible_border: border,
+          trigger_panel_right_delta: Math.abs(panel.right - triggerBox.right),
+          panel_left: panel.left,
+          panel_width: panel.width,
+          trigger_left: triggerBox.left,
+        };
+        return window.orcaUi;
+      };
+
+      main();
+    </script>
+  </body>
+</html>

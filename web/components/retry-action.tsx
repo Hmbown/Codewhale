@@ -45,7 +45,7 @@ export function RetryAction({
     <button
       type="button"
       onClick={run}
-      className={`portal-button portal-button-${variant} state-retry`}
+      className={`btn btn-${variant} state-retry`}
       aria-busy={inFlight}
       disabled={inFlight}
     >

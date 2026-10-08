@@ -56,18 +56,11 @@ pub fn handle_nav_key(
     match key.code {
         KeyCode::Esc => controller.request_cancel(),
         KeyCode::Enter => controller.request_commit(),
-        KeyCode::BackTab => {
-            controller.prev_tab();
-            PickerNavResult::Preview
-        }
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            controller.prev_tab();
-            PickerNavResult::Preview
-        }
-        KeyCode::Tab => {
-            controller.next_tab();
-            PickerNavResult::Preview
-        }
+        // A tab switch lands on whatever row the new tab keeps selected; it
+        // previews that row only when it is available, like ↑/↓ do.
+        KeyCode::BackTab => controller.prev_tab(),
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => controller.prev_tab(),
+        KeyCode::Tab => controller.next_tab(),
         KeyCode::Up | KeyCode::Char('k')
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -336,8 +329,26 @@ mod tests {
             false,
         );
 
-        assert_eq!(result, PickerNavResult::Preview);
+        // U09-m2: the last ("extra") tab lands on its disabled first row,
+        // which must not preview.
         assert_eq!(controller.active_tab(), controller.tabs().len() - 1);
+        assert_eq!(controller.selected_id(), Some("locked"));
+        assert_eq!(result, PickerNavResult::None);
+
+        assert_eq!(controller.move_down(), PickerNavResult::Preview);
+        assert_eq!(controller.selected_id(), Some("dracula"));
+        let result = handle_nav_key(
+            &mut controller,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            false,
+        );
+        assert_eq!(controller.active_tab_name(), "core");
+        assert_eq!(controller.selected_id(), Some("terminal"));
+        assert_eq!(
+            result,
+            PickerNavResult::Preview,
+            "an available row previews"
+        );
     }
 
     #[test]

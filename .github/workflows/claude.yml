@@ -16,6 +16,7 @@ jobs:
   authorize:
     name: Authorize maintainer command
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       issues: read

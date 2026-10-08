@@ -19,7 +19,11 @@ const {
   assertChecksumManifestIncludes,
   assertPackageVersionMatchesBinaryVersion,
   assertReleaseAssetsFresh,
+  downloadJson,
+  downloadText,
   findReleaseWorkflowRun,
+  limits,
+  requestStatus,
   parseChecksumManifest,
 } = require("../scripts/verify-release-assets");
 
@@ -307,4 +311,108 @@ test("full local release fixture satisfies the public asset inventory", () => {
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
+});
+
+test("downloadJson confines credentials to the GitHub API origin across redirects", async (t) => {
+  const https = require("node:https");
+  const { PassThrough } = require("node:stream");
+  const { EventEmitter } = require("node:events");
+  const previous = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-release-token";
+  t.after(() => {
+    if (previous === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previous;
+  });
+  const calls = [];
+  const replies = [
+    { status: 302, location: "/next" },
+    { status: 302, location: "https://downloads.example.test/metadata" },
+    { status: 200 },
+    { status: 302, location: "http://downloads.example.test/metadata" },
+    { status: 302, location: "ftp://downloads.example.test/metadata" },
+    { status: 200 },
+  ];
+  t.mock.method(https, "get", (url, options, callback) => {
+    calls.push({ url, headers: options.headers });
+    const reply = replies.shift();
+    assert.ok(reply, "unexpected metadata request");
+    const res = new PassThrough();
+    res.statusCode = reply.status;
+    res.headers = reply.location ? { location: reply.location } : {};
+    process.nextTick(() => { callback(res); res.end("{}"); });
+    return new EventEmitter();
+  });
+  t.mock.method(require("node:http"), "get", () => { throw new Error("unexpected HTTP request"); });
+  assert.deepEqual(await downloadJson("https://api.github.com/start"), {});
+  assert.equal(calls[0].headers.Authorization, "Bearer test-release-token");
+  assert.equal(calls[1].headers.Authorization, "Bearer test-release-token");
+  assert.equal(calls[2].headers.Authorization, undefined);
+  await assert.rejects(downloadJson("https://api.github.com/downgrade"), /requires HTTPS/);
+  await assert.rejects(downloadJson("https://api.github.com/other-scheme"), /requires HTTPS/);
+  assert.deepEqual(await downloadJson("https://api.github.com:444/metadata"), {});
+  assert.equal(calls.at(-1).headers.Authorization, undefined);
+  assert.equal(calls.length, 6);
+});
+
+function shrinkLimits(t, overrides) {
+  const previous = { ...limits };
+  Object.assign(limits, overrides);
+  t.after(() => Object.assign(limits, previous));
+}
+
+function listen(t, handler) {
+  const http = require("node:http");
+  const server = http.createServer(handler);
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  return new Promise((resolve) =>
+    server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${server.address().port}/x`)),
+  );
+}
+
+test("verifier requests give up on a server that never answers", async (t) => {
+  shrinkLimits(t, { idleMs: 150, totalMs: 5_000 });
+  const url = await listen(t, () => {});
+  await assert.rejects(requestStatus(url, "HEAD"), /timed out/);
+  await assert.rejects(downloadText(url), /timed out/);
+});
+
+test("verifier requests have a total deadline even while a body keeps trickling", async (t) => {
+  shrinkLimits(t, { idleMs: 5_000, totalMs: 300 });
+  const url = await listen(t, (req, res) => {
+    res.writeHead(200);
+    const timer = setInterval(() => res.write("x"), 50);
+    res.on("close", () => clearInterval(timer));
+  });
+  const started = Date.now();
+  await assert.rejects(downloadText(url), /exceeded/);
+  assert.ok(Date.now() - started < 3_000, "the deadline, not the server, ended the request");
+});
+
+test("verifier downloads refuse a body past the size cap and keep one within it", async (t) => {
+  shrinkLimits(t, { maxBodyBytes: 1024 });
+  const url = await listen(t, (req, res) => {
+    res.writeHead(200);
+    res.end("a".repeat(req.url.endsWith("big") ? 4096 : 512));
+  });
+  await assert.rejects(downloadText(`${url}big`), /exceeds 1024 bytes/);
+  assert.equal((await downloadText(url)).length, 512);
+});
+
+test("downloadJson destroys a metadata request that stalls", async (t) => {
+  const https = require("node:https");
+  const { EventEmitter } = require("node:events");
+  shrinkLimits(t, { idleMs: 40, totalMs: 5_000 });
+  let seen;
+  t.mock.method(https, "get", (url, options) => {
+    seen = options;
+    const req = new EventEmitter();
+    req.destroy = () => process.nextTick(() => req.emit("close"));
+    setTimeout(() => req.emit("timeout"), options.timeout);
+    return req;
+  });
+  await assert.rejects(downloadJson("https://api.github.com/stalled"), /timed out/);
+  assert.equal(seen.timeout, 40);
 });

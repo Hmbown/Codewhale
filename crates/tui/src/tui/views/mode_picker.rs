@@ -12,15 +12,15 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::localization::Locale;
-use crate::palette;
-use crate::tui::app::AppMode;
 use crate::tui::app::AppModeUi;
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
     render_modal_footer, render_modal_surface,
 };
+use codewhale_config::AppMode;
+use codewhale_localization::Locale;
+use codewhale_palette as palette;
 
 // Operate is visible because the engine now enforces a coordinator/worker
 // boundary while allowing ordinary conversation and asynchronous dispatch.
@@ -53,12 +53,21 @@ impl ModePickerView {
             .unwrap_or(AppMode::Agent)
     }
 
-    fn move_up(&mut self) {
-        self.cursor = crate::tui::list_nav::wrap_index(self.cursor, VISIBLE_MODES.len(), -1);
-    }
-
-    fn move_down(&mut self) {
-        self.cursor = crate::tui::list_nav::wrap_index(self.cursor, VISIBLE_MODES.len(), 1);
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Vertical motions cover the whole list —
+    /// Home/End and the page keys included. The horizontal axis has nowhere
+    /// to go on a single-column surface, so those motions are not consumed.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        let Some(next) = crate::tui::list_nav::apply(
+            self.cursor,
+            VISIBLE_MODES.len(),
+            VISIBLE_MODES.len(),
+            motion,
+        ) else {
+            return false;
+        };
+        self.cursor = next;
+        true
     }
 
     fn select_by_number(&mut self, number: char) -> Option<ViewAction> {
@@ -82,19 +91,20 @@ impl ModalView for ModePickerView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        // Movement keys come from the shared vocabulary (#6290), so
+        // `j`/`k`, Home/End and the page keys mean here exactly what they
+        // mean on every other list. This match owns only the keys the
+        // vocabulary does not claim.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Esc => ViewAction::Close,
             KeyCode::Enter => ViewAction::EmitAndClose(ViewEvent::ModeSelected {
                 mode: self.selected_mode(),
             }),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                ViewAction::None
-            }
             KeyCode::Char(number) => self.select_by_number(number).unwrap_or(ViewAction::None),
             _ => ViewAction::None,
         }
@@ -103,11 +113,11 @@ impl ModalView for ModePickerView {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.move_up();
+                self.apply_motion(crate::tui::list_nav::Motion::Prev);
                 ViewAction::None
             }
             MouseEventKind::ScrollDown => {
-                self.move_down();
+                self.apply_motion(crate::tui::list_nav::Motion::Next);
                 ViewAction::None
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -177,12 +187,17 @@ impl ModalView for ModePickerView {
             // Pad by terminal columns, not scalar count, so wide (CJK) mode
             // names keep the hint column aligned.
             let pad = " ".repeat(8usize.saturating_sub(UnicodeWidthStr::width(&*name)));
+            let prefix = format!("{pointer} {}. {name}{pad}", mode.number());
+            // A hint is prose: the pane edge used to cut it mid-word
+            // (`ask f`, `before ac`). Truncate at a word joint instead —
+            // a clipped clause reads as a sentence, a clipped word reads
+            // as a bug.
+            let hint_width =
+                usize::from(content.width).saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+            let hint = crate::tui::ui_text::semantic_truncate(hint.as_ref(), hint_width);
 
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{pointer} {}. {name}{pad}", mode.number()),
-                    row_style,
-                ),
+                Span::styled(prefix, row_style),
                 Span::styled(hint, hint_style),
             ]));
             self.row_hitboxes.borrow_mut().push(Rect::new(

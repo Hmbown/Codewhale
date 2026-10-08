@@ -14,6 +14,7 @@
 //! *tools* belong in `coord.rs`.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -69,6 +70,12 @@ pub struct DecisionRecord {
 ///
 /// Declares expected repo-relative paths/trees and named contracts.
 /// This is coordination metadata, not another approval system.
+///
+/// An `exact_files` entry beneath a declared root binds that root to the
+/// files listed under it (#6278): peers may then share the root with
+/// disjoint file claims, and the claim's authorized surface is what
+/// [`WriteScopeClaim::contains_path`] and [`WriteScopeClaim::overlaps`]
+/// both see.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriteScopeClaim {
     pub owner: String,
@@ -78,12 +85,27 @@ pub struct WriteScopeClaim {
 }
 
 impl WriteScopeClaim {
+    /// Roots that authorize their whole tree. A root with declared
+    /// `exact_files` beneath it is bound to those files instead: the files
+    /// are the real exclusion boundary, so peers may share one root while
+    /// claiming disjoint outputs (#6278). A root carrying no declared file
+    /// keeps tree-wide authority, and an exact file outside every root
+    /// stands alone.
+    fn open_roots(&self) -> impl Iterator<Item = &String> {
+        self.roots.iter().filter(|root| {
+            !self
+                .exact_files
+                .iter()
+                .any(|file| paths_overlap_by_containment(root, file))
+        })
+    }
+
     /// Check whether this claim overlaps with another. A claim overlaps when
-    /// either normalized tree contains the other or exact files collide.
+    /// either normalized open tree contains the other or exact files collide.
     #[must_use]
     pub fn overlaps(&self, other: &WriteScopeClaim) -> bool {
-        for root_a in &self.roots {
-            for root_b in &other.roots {
+        for root_a in self.open_roots() {
+            for root_b in other.open_roots() {
                 if paths_overlap_by_containment(root_a, root_b)
                     || paths_overlap_by_containment(root_b, root_a)
                 {
@@ -97,8 +119,7 @@ impl WriteScopeClaim {
                 .iter()
                 .any(|file| paths_overlap_equal(file, file_a))
                 || other
-                    .roots
-                    .iter()
+                    .open_roots()
                     .any(|root| paths_overlap_by_containment(root, file_a))
             {
                 return true;
@@ -106,8 +127,7 @@ impl WriteScopeClaim {
         }
         for file_b in &other.exact_files {
             if self
-                .roots
-                .iter()
+                .open_roots()
                 .any(|root| paths_overlap_by_containment(root, file_b))
             {
                 return true;
@@ -126,7 +146,7 @@ impl WriteScopeClaim {
     #[must_use]
     pub fn contains_path(&self, path: &str) -> bool {
         self.exact_files.iter().any(|file| file == path)
-            || self.roots.iter().any(|root| path_contains(root, path))
+            || self.open_roots().any(|root| path_contains(root, path))
     }
 }
 
@@ -154,6 +174,42 @@ pub struct PersistedWriteClaim {
     pub sequence: u64,
     #[serde(default)]
     pub isolated_worktree: bool,
+    /// Which of this claim's roots/exact files existed on disk when it was
+    /// registered (#5906).
+    ///
+    /// Recorded because "the claimed path is gone" and "the claimed path does
+    /// not exist yet" look identical from a later `exists()` call and mean
+    /// opposite things. A claim on a worktree that has since been removed
+    /// describes work nobody can be doing and must stop refusing claimants; a
+    /// claim on a directory its owner is about to create is exactly the
+    /// forward-looking reservation the ledger exists to honor, and disarming
+    /// that would let two writers into the same new tree.
+    ///
+    /// Empty for claims persisted before this field existed and for claims
+    /// that named nothing on disk at the time — both mean "no evidence of
+    /// disappearance", so neither is ever treated as stale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present_at_claim: Vec<String>,
+}
+
+impl PersistedWriteClaim {
+    /// Whether every path this claim was recorded as actually covering has
+    /// since disappeared from disk (#5906).
+    ///
+    /// Isolated-worktree claims are excluded because they never contend at
+    /// all — the answer would be unused, and their paths are not resolved
+    /// against the coordination root.
+    pub fn names_only_vanished_paths<F>(&self, mut path_exists: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        !self.isolated_worktree
+            && !self.present_at_claim.is_empty()
+            && !self
+                .present_at_claim
+                .iter()
+                .any(|path| path_exists(path.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +342,51 @@ fn default_process_lock_held() -> bool {
     true
 }
 
+/// Attribution minted from an owner-admitted directory. Serialized data never
+/// admits that directory: the manager requires its current held identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CoordinationClaimScope {
+    pub canonical_root: PathBuf,
+    pub platform: String,
+    pub volume: u64,
+    pub index: u64,
+}
+
+impl CoordinationClaimScope {
+    pub(crate) fn validate_shape(&self) -> Result<(), String> {
+        if !self.canonical_root.is_absolute()
+            || self.canonical_root.as_os_str().len() > 32768
+            || self.canonical_root.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            || !matches!(self.platform.as_str(), "unix" | "windows")
+        {
+            return Err("coordination root attribution is not bounded and canonical".into());
+        }
+        Ok(())
+    }
+}
+
+fn projected_claim(claim: &WriteScopeClaim, root: &Path) -> WriteScopeClaim {
+    let project = |path: &String| {
+        let joined = if path == "." {
+            root.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        joined.to_string_lossy().replace('\\', "/")
+    };
+    WriteScopeClaim {
+        owner: claim.owner.clone(),
+        roots: claim.roots.iter().map(project).collect(),
+        exact_files: claim.exact_files.iter().map(project).collect(),
+        contracts: claim.contracts.clone(),
+    }
+}
+
 /// Durable, bounded coordination state owned by `SubAgentManager`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinationLedger {
@@ -310,6 +411,11 @@ pub struct CoordinationLedger {
     /// never guessed by active-session views.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub record_sessions: HashMap<u64, String>,
+    /// One bounded sequence-root map for shared claims and path-qualified
+    /// decisions. The historical wire name stays stable; original schema1
+    /// omits it, and scope-bearing schema2 never guesses an absent map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) claim_scopes: Option<HashMap<u64, CoordinationClaimScope>>,
 }
 
 impl Default for CoordinationLedger {
@@ -323,6 +429,7 @@ impl Default for CoordinationLedger {
             projections: Vec::new(),
             contentions: Vec::new(),
             record_sessions: HashMap::new(),
+            claim_scopes: None,
         }
     }
 }
@@ -333,11 +440,27 @@ impl CoordinationLedger {
         self.sequence
     }
 
-    pub fn record_decision(
+    #[cfg(test)]
+    pub fn record_decision(&mut self, decision: DecisionRecord) -> Result<DecisionRecord, String> {
+        self.record_decision_in_scope(decision, None)
+    }
+
+    pub(crate) fn record_decision_in_scope(
         &mut self,
         mut decision: DecisionRecord,
+        scope: Option<CoordinationClaimScope>,
     ) -> Result<DecisionRecord, String> {
         self.validate_schema()?;
+        if let Some(scope) = &scope {
+            scope.validate_shape()?;
+            if self
+                .claim_scopes
+                .as_ref()
+                .is_some_and(|scopes| scopes.len() >= COORDINATION_RECORD_LIMIT)
+            {
+                return Err("coordination root attribution capacity reached".into());
+            }
+        }
         decision.decision_id = decision.decision_id.trim().to_string();
         if !decision.decision_id.is_empty() {
             decision.decision_id = bounded_coordination_atom("decision id", &decision.decision_id)?;
@@ -414,6 +537,13 @@ impl CoordinationLedger {
                 );
             }
         }
+        self.prune_claim_scopes();
+        if let Some(scope) = scope {
+            self.schema_version = 2;
+            self.claim_scopes
+                .get_or_insert_with(HashMap::new)
+                .insert(decision.sequence, scope);
+        }
         Ok(decision)
     }
 
@@ -462,24 +592,92 @@ impl CoordinationLedger {
                 existing.decision_id, existing.owner
             ));
         }
+        let previous_sequence = self.decisions[index].sequence;
+        let previous_scope = self.claim_scope(previous_sequence).cloned();
         let sequence = self.next_sequence();
         let decision = &mut self.decisions[index];
         decision.status = status;
         decision.version = decision.version.saturating_add(1);
         decision.sequence = sequence;
-        Ok(decision.clone())
+        let result = decision.clone();
+        if let Some(scopes) = &mut self.claim_scopes {
+            scopes.remove(&previous_sequence);
+            if let Some(scope) = previous_scope {
+                scopes.insert(sequence, scope);
+            }
+        }
+        Ok(result)
     }
 
+    /// Register a bounded write claim.
+    ///
+    /// `owner_is_active` is the caller's whole answer to "may this existing
+    /// claim refuse a new claimant" — liveness and, since #5906, whether the
+    /// claim's recorded paths still exist. The ledger has no filesystem of its
+    /// own; [`super::SubAgentManager::admissible_coordination_owners`] resolves
+    /// both before calling, and stamps
+    /// [`PersistedWriteClaim::present_at_claim`] on the record afterwards.
+    #[cfg(test)]
     pub fn register_claim<F>(
+        &mut self,
+        claim: WriteScopeClaim,
+        isolated_worktree: bool,
+        owner_is_active: F,
+    ) -> Result<PersistedWriteClaim, String>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.register_claim_in_scope(claim, isolated_worktree, None, None, owner_is_active)
+    }
+
+    pub(crate) fn claim_scope(&self, sequence: u64) -> Option<&CoordinationClaimScope> {
+        self.claim_scopes
+            .as_ref()
+            .and_then(|scopes| scopes.get(&sequence))
+    }
+
+    pub(in crate::tools::subagent) fn prune_claim_scopes(&mut self) {
+        if let Some(scopes) = &mut self.claim_scopes {
+            scopes.retain(|sequence, _| {
+                self.write_claims
+                    .iter()
+                    .any(|claim| claim.sequence == *sequence)
+                    || self
+                        .decisions
+                        .iter()
+                        .any(|decision| decision.sequence == *sequence)
+            });
+        }
+    }
+
+    pub(crate) fn register_claim_in_scope<F>(
         &mut self,
         mut claim: WriteScopeClaim,
         isolated_worktree: bool,
+        scope: Option<CoordinationClaimScope>,
+        original_root: Option<&Path>,
         mut owner_is_active: F,
     ) -> Result<PersistedWriteClaim, String>
     where
         F: FnMut(&str) -> bool,
     {
         self.validate_schema()?;
+        if let Some(scope) = &scope {
+            scope.validate_shape()?;
+            if isolated_worktree || original_root.is_none() {
+                return Err(
+                    "attributed claims require the held original root and shared execution".into(),
+                );
+            }
+        }
+        if self
+            .claim_scopes
+            .as_ref()
+            .is_some_and(|scopes| !scopes.is_empty())
+            && original_root.is_none()
+        {
+            return Err("attributed coordination state requires its held original root".into());
+        }
         claim.owner = bounded_coordination_atom("write claim owner", &claim.owner)?;
         claim.roots = normalize_claim_paths(&claim.roots)?;
         claim.exact_files = normalize_claim_paths(&claim.exact_files)?;
@@ -494,6 +692,17 @@ impl CoordinationLedger {
             .write_claims
             .iter()
             .any(|existing| existing.claim.owner == claim.owner);
+        if scope.is_some()
+            && self
+                .claim_scopes
+                .as_ref()
+                .is_some_and(|scopes| scopes.len() >= COORDINATION_RECORD_LIMIT)
+            && !self.write_claims.iter().any(|existing| {
+                existing.claim.owner == claim.owner && self.claim_scope(existing.sequence).is_some()
+            })
+        {
+            return Err("coordination root attribution capacity reached".into());
+        }
         if !replacing_existing_owner && self.write_claims.len() >= COORDINATION_RECORD_LIMIT {
             let mut inactive = Vec::new();
             for existing in &self.write_claims {
@@ -509,6 +718,7 @@ impl CoordinationLedger {
                 self.write_claims
                     .retain(|existing| existing.claim.owner != owner);
             }
+            self.prune_claim_scopes();
             if self.write_claims.len() >= COORDINATION_RECORD_LIMIT {
                 return Err(format!(
                     "write-claim capacity is {COORDINATION_RECORD_LIMIT} active owners; complete, serialize, or isolate existing work before admitting another writer"
@@ -523,7 +733,19 @@ impl CoordinationLedger {
                     !existing.isolated_worktree
                         && existing.claim.owner != claim.owner
                         && owner_is_active(&existing.claim.owner)
-                        && existing.claim.overlaps(&claim)
+                        && match original_root {
+                            Some(original) => {
+                                let existing_root = self
+                                    .claim_scope(existing.sequence)
+                                    .map_or(original, |scope| scope.canonical_root.as_path());
+                                let candidate_root = scope
+                                    .as_ref()
+                                    .map_or(original, |scope| scope.canonical_root.as_path());
+                                projected_claim(&existing.claim, existing_root)
+                                    .overlaps(&projected_claim(&claim, candidate_root))
+                            }
+                            None => existing.claim.overlaps(&claim),
+                        }
                 })
                 .cloned()
         {
@@ -540,8 +762,11 @@ impl CoordinationLedger {
             self.contentions.push(receipt);
             trim_front(&mut self.contentions, COORDINATION_RECORD_LIMIT);
             return Err(format!(
-                "write-scope contention with {} (roots: {:?}, files: {:?}, contracts: {:?}); serialize the work, narrow the claim, or use worktree isolation",
+                "write-scope contention with {}: requested roots {:?}, files {:?}, contracts {:?} overlap its writable roots {:?}, files {:?}, contracts {:?}. Claim disjoint sibling write_roots (for example tmp/scan/worker-a and tmp/scan/worker-b) or exact_files for each output. A read-only worker uses write_authority=read_only without a write claim. Otherwise serialize the writers (wait for that owner to settle, or cancel it) or use worktree isolation; a nested path inside an existing writable root still overlaps.",
                 existing.claim.owner,
+                claim.roots,
+                claim.exact_files,
+                claim.contracts,
                 existing.claim.roots,
                 existing.claim.exact_files,
                 existing.claim.contracts
@@ -553,6 +778,8 @@ impl CoordinationLedger {
             claim,
             sequence: self.next_sequence(),
             isolated_worktree,
+            // Stamped by the caller, which owns the filesystem.
+            present_at_claim: Vec::new(),
         };
         for contention in &mut self.contentions {
             if contention.claimant == record.claim.owner
@@ -563,6 +790,13 @@ impl CoordinationLedger {
             }
         }
         self.write_claims.push(record.clone());
+        self.prune_claim_scopes();
+        if let Some(scope) = scope {
+            self.schema_version = 2;
+            self.claim_scopes
+                .get_or_insert_with(HashMap::new)
+                .insert(record.sequence, scope);
+        }
         Ok(record)
     }
 
@@ -604,6 +838,7 @@ impl CoordinationLedger {
         // stamped by the caller stay coherent (coordinator contract).
         if !released.is_empty() {
             self.next_sequence();
+            self.prune_claim_scopes();
         }
         Ok(released)
     }
@@ -760,11 +995,23 @@ impl CoordinationLedger {
         Ok(receipt)
     }
 
+    #[cfg(test)]
     pub fn project_relevant_decisions(
         &mut self,
         child_id: &str,
         claim: Option<&WriteScopeClaim>,
         capabilities: &[String],
+    ) -> (String, ContextProjectionReceipt) {
+        self.project_relevant_decisions_in_scope(child_id, claim, capabilities, None, None)
+    }
+
+    pub(crate) fn project_relevant_decisions_in_scope(
+        &mut self,
+        child_id: &str,
+        claim: Option<&WriteScopeClaim>,
+        capabilities: &[String],
+        claim_root: Option<&Path>,
+        original_root: Option<&Path>,
     ) -> (String, ContextProjectionReceipt) {
         const HEADER: &str = "Accepted coordination decisions relevant to this child (bounded):\n";
         let mut seen_constraint_facts = BTreeSet::new();
@@ -778,7 +1025,17 @@ impl CoordinationLedger {
             .iter()
             .rev()
             .filter(|decision| decision.status == DecisionStatus::Accepted)
-            .filter(|decision| decision_is_relevant(decision, claim, capabilities))
+            .filter(|decision| {
+                decision_is_relevant(
+                    decision,
+                    claim,
+                    capabilities,
+                    claim_root,
+                    self.claim_scope(decision.sequence)
+                        .map(|scope| scope.canonical_root.as_path())
+                        .or(original_root),
+                )
+            })
         {
             if decision_ids.len() >= COORDINATION_PROJECTION_DECISION_LIMIT {
                 omitted = omitted.saturating_add(1);
@@ -927,6 +1184,29 @@ impl CoordinationLedger {
             }
         }
 
+        if let Some(scopes) = &self.claim_scopes {
+            if scopes.len() > COORDINATION_RECORD_LIMIT {
+                return Err("coordination root attribution exceeds claim capacity".into());
+            }
+            for (sequence, scope) in scopes {
+                scope.validate_shape()?;
+                if !self
+                    .write_claims
+                    .iter()
+                    .any(|claim| claim.sequence == *sequence && !claim.isolated_worktree)
+                    && !self
+                        .decisions
+                        .iter()
+                        .any(|decision| decision.sequence == *sequence)
+                {
+                    return Err(
+                        "coordination root attribution has no matching shared claim or decision"
+                            .into(),
+                    );
+                }
+            }
+        }
+
         for receipt in &self.reconciliations {
             validate_sequence(
                 receipt.sequence,
@@ -1005,13 +1285,18 @@ impl CoordinationLedger {
     }
 
     fn validate_schema(&self) -> Result<(), String> {
-        if self.schema_version != COORDINATION_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported coordination schema {}; expected {}",
-                self.schema_version, COORDINATION_SCHEMA_VERSION
-            ));
+        match (self.schema_version, self.claim_scopes.as_ref()) {
+            (COORDINATION_SCHEMA_VERSION, None) | (2, Some(_)) => Ok(()),
+            (2, None) => {
+                Err("coordination schema 2 requires explicit root attribution state".into())
+            }
+            (COORDINATION_SCHEMA_VERSION, Some(_)) => {
+                Err("legacy coordination schema cannot contain attributed roots".into())
+            }
+            (version, _) => Err(format!(
+                "unsupported coordination schema {version}; expected 1 or 2"
+            )),
         }
-        Ok(())
     }
 }
 
@@ -1245,7 +1530,32 @@ fn decision_is_relevant(
     decision: &DecisionRecord,
     claim: Option<&WriteScopeClaim>,
     capabilities: &[String],
+    claim_root: Option<&Path>,
+    decision_root: Option<&Path>,
 ) -> bool {
+    let relevant_path = |claim: &WriteScopeClaim, value: &str| match (claim_root, decision_root) {
+        (Some(claim_root), Some(decision_root)) => {
+            let Ok(relative) = normalize_claim_path(value) else {
+                return false;
+            };
+            let path = if relative == "." {
+                decision_root.to_path_buf()
+            } else {
+                decision_root.join(relative)
+            };
+            let contained = path
+                .strip_prefix(claim_root)
+                .ok()
+                .is_some_and(|relative| claim.contains_path(&relative.to_string_lossy()));
+            contained
+                || claim
+                    .roots
+                    .iter()
+                    .chain(&claim.exact_files)
+                    .any(|relative| claim_root.join(relative).starts_with(&path))
+        }
+        _ => claim_reaches_path(claim, value),
+    };
     if decision.scope.is_empty() {
         return true;
     }
@@ -1259,12 +1569,12 @@ fn decision_is_relevant(
             "contract" => {
                 claim.is_some_and(|claim| claim.contracts.iter().any(|contract| contract == value))
             }
-            "path" => claim.is_some_and(|claim| claim_reaches_path(claim, value)),
+            "path" => claim.is_some_and(|claim| relevant_path(claim, value)),
             _ => {
                 capabilities.iter().any(|capability| capability == value)
                     || claim.is_some_and(|claim| {
                         claim.contracts.iter().any(|contract| contract == value)
-                            || claim_reaches_path(claim, value)
+                            || relevant_path(claim, value)
                     })
             }
         }
@@ -1304,6 +1614,138 @@ fn trim_front<T>(records: &mut Vec<T>, limit: usize) {
 mod records_tests {
     use super::*;
     use serde_json::json;
+
+    fn scoped_root(path: impl AsRef<Path>) -> CoordinationClaimScope {
+        CoordinationClaimScope {
+            canonical_root: path.as_ref().to_path_buf(),
+            platform: if cfg!(windows) { "windows" } else { "unix" }.into(),
+            volume: 1,
+            index: 1,
+        }
+    }
+
+    fn root_claim(owner: &str, path: &str, contract: Option<&str>) -> WriteScopeClaim {
+        WriteScopeClaim {
+            owner: owner.into(),
+            roots: vec![path.into()],
+            exact_files: Vec::new(),
+            contracts: contract.map(String::from).into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn attributed_claims_project_nested_and_alias_roots_and_keep_contracts_global() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let original = root.join("original");
+        let mut ledger = CoordinationLedger::default();
+        ledger
+            .register_claim_in_scope(
+                root_claim("a", "src", None),
+                false,
+                Some(scoped_root(root.join("shared"))),
+                Some(&original),
+                |_| true,
+            )
+            .unwrap();
+        assert!(
+            ledger
+                .register_claim_in_scope(
+                    root_claim("nested", ".", None),
+                    false,
+                    Some(scoped_root(root.join("shared/src"))),
+                    Some(&original),
+                    |_| true
+                )
+                .is_err()
+        );
+        assert!(
+            ledger
+                .register_claim_in_scope(
+                    root_claim("alias", "src", None),
+                    false,
+                    Some(scoped_root(root.join("shared"))),
+                    Some(&original),
+                    |_| true
+                )
+                .is_err()
+        );
+        ledger
+            .register_claim_in_scope(
+                root_claim("disjoint", "src", Some("release")),
+                false,
+                Some(scoped_root(root.join("other"))),
+                Some(&original),
+                |_| true,
+            )
+            .unwrap();
+        assert!(
+            ledger
+                .register_claim_in_scope(
+                    root_claim("global-contract", "unrelated", Some("release")),
+                    false,
+                    None,
+                    Some(&original),
+                    |_| true
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn attributed_schema_is_sticky_and_absent_map_or_orphan_receipt_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let original = root.join("original");
+        let mut legacy = CoordinationLedger::default();
+        legacy
+            .register_claim(root_claim("legacy", "src", None), false, |_| false)
+            .unwrap();
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(
+            !String::from_utf8(legacy_bytes.clone())
+                .unwrap()
+                .contains("claim_scopes")
+        );
+        let mut decoded: CoordinationLedger = serde_json::from_slice(&legacy_bytes).unwrap();
+        decoded.validate_replay().unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), legacy_bytes);
+        decoded
+            .register_claim_in_scope(
+                root_claim("extra", "src", None),
+                false,
+                Some(scoped_root(root.join("other"))),
+                Some(&original),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(decoded.schema_version, 2);
+        decoded.release_stale_claims(None, |_| false).unwrap();
+        assert!(decoded.claim_scopes.as_ref().unwrap().is_empty());
+        assert_eq!(decoded.schema_version, 2);
+        decoded.validate_replay().unwrap();
+        decoded.claim_scopes = None;
+        assert!(
+            decoded
+                .validate_replay()
+                .unwrap_err()
+                .contains("requires explicit")
+        );
+        decoded.claim_scopes = Some(HashMap::from([(100, scoped_root(root.join("other")))]));
+        assert!(
+            decoded
+                .validate_replay()
+                .unwrap_err()
+                .contains("matching shared claim")
+        );
+        decoded.schema_version = 1;
+        assert!(
+            decoded
+                .validate_replay()
+                .unwrap_err()
+                .contains("legacy coordination schema")
+        );
+    }
 
     #[test]
     fn overlapping_roots_detected() {
@@ -1459,6 +1901,88 @@ mod records_tests {
         };
         assert!(!root.overlaps(&sibling));
         assert!(root.overlaps(&child_file));
+    }
+
+    #[test]
+    fn disjoint_exact_files_share_a_root() {
+        // #6278: N workers, one results directory, one disjoint file each.
+        let a = WriteScopeClaim {
+            owner: "agent-a".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/a.txt".into()],
+            contracts: vec![],
+        };
+        let b = WriteScopeClaim {
+            owner: "agent-b".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/b.txt".into()],
+            contracts: vec![],
+        };
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
+        // The bound root is the file boundary: the shared tree and the
+        // peer's file are outside this claim's authorized surface.
+        assert!(a.contains_path("tmp/scan/a.txt"));
+        assert!(!a.contains_path("tmp/scan/b.txt"));
+        assert!(!a.contains_path("tmp/scan/scratch.txt"));
+    }
+
+    #[test]
+    fn file_bound_roots_still_refuse_real_overlap() {
+        let a = WriteScopeClaim {
+            owner: "agent-a".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/a.txt".into()],
+            contracts: vec![],
+        };
+        // The same file under the shared root still contends.
+        let same_file = WriteScopeClaim {
+            owner: "agent-b".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/a.txt".into()],
+            contracts: vec![],
+        };
+        assert!(a.overlaps(&same_file));
+        // An open root — no files declared beneath it — keeps tree-wide
+        // authority and still contends with a file beneath it.
+        let open_root = WriteScopeClaim {
+            owner: "agent-c".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec![],
+            contracts: vec![],
+        };
+        assert!(a.overlaps(&open_root));
+        // A root whose files sit elsewhere stays open: union claims are
+        // unchanged for files outside the claimed trees.
+        let mixed = WriteScopeClaim {
+            owner: "agent-d".into(),
+            roots: vec!["src".into()],
+            exact_files: vec!["README.md".into()],
+            contracts: vec![],
+        };
+        assert!(mixed.contains_path("src/lib.rs"));
+        assert!(mixed.contains_path("README.md"));
+    }
+
+    #[test]
+    fn disjoint_file_claims_under_one_root_both_register() {
+        let mut ledger = CoordinationLedger::default();
+        for (owner, file) in [("agent-a", "tmp/scan/a.txt"), ("agent-b", "tmp/scan/b.txt")] {
+            ledger
+                .register_claim(
+                    WriteScopeClaim {
+                        owner: owner.into(),
+                        roots: vec!["tmp/scan".into()],
+                        exact_files: vec![file.into()],
+                        contracts: vec![],
+                    },
+                    false,
+                    |_| true,
+                )
+                .expect("disjoint files under a shared root register");
+        }
+        assert_eq!(ledger.write_claims.len(), 2);
+        assert!(ledger.contentions.is_empty());
     }
 
     #[test]
@@ -1703,7 +2227,7 @@ mod records_tests {
     #[test]
     fn coordination_schema_drift_fails_closed_before_mutation() {
         let mut ledger = CoordinationLedger {
-            schema_version: COORDINATION_SCHEMA_VERSION + 1,
+            schema_version: COORDINATION_SCHEMA_VERSION + 2,
             ..CoordinationLedger::default()
         };
         let error = ledger

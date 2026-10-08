@@ -7,13 +7,14 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::localization::Locale;
 use crate::sandbox::SandboxPolicy;
+use crate::tui::shell_key_routing::{self, Focus, ShellBindingId};
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ElevationWidget, Renderable};
+use codewhale_localization::Locale;
 
 /// Options for elevating sandbox permissions after a denial.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,16 +45,12 @@ impl ElevationOption {
     #[cfg(test)]
     pub fn description(&self) -> &'static str {
         match self {
-            ElevationOption::WithNetwork => {
-                "Retry this tool call with outbound network access for downloads and HTTP requests"
-            }
-            ElevationOption::WithWriteAccess(_) => {
-                "Retry this tool call with additional writable filesystem scope"
-            }
+            ElevationOption::WithNetwork => "Retry with outbound network (downloads and HTTP)",
+            ElevationOption::WithWriteAccess(_) => "Retry with a wider writable scope",
             ElevationOption::FullAccess => {
                 "Retry without sandbox limits; grants unrestricted filesystem and network access"
             }
-            ElevationOption::Abort => "Cancel this tool execution",
+            ElevationOption::Abort => "Cancel this run",
         }
     }
 
@@ -117,7 +114,7 @@ impl ElevationRequest {
     }
 
     /// Create a generic elevation request.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn generic(tool_id: &str, tool_name: &str, denial_reason: &str) -> Self {
         Self {
             tool_id: tool_id.to_string(),
@@ -144,9 +141,16 @@ pub struct ElevationView {
 
 impl ElevationView {
     pub fn new(request: ElevationRequest, locale: Locale) -> Self {
+        // Every request offers Abort. A reflexive Enter must never broaden
+        // access before the person deliberately navigates to another option.
+        let selected = request
+            .options
+            .iter()
+            .position(|option| matches!(option, ElevationOption::Abort))
+            .expect("elevation requests offer Abort");
         Self {
             request,
-            selected: 0,
+            selected,
             locale,
             row_hitboxes: RefCell::new(Vec::new()),
         }
@@ -175,13 +179,13 @@ impl ElevationView {
     }
 
     /// Get the request for rendering.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn request(&self) -> &ElevationRequest {
         &self.request
     }
 
     /// Get the currently selected index.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn selected(&self) -> usize {
         self.selected
     }
@@ -192,33 +196,34 @@ impl ModalView for ElevationView {
         ModalKind::Elevation
     }
 
+    fn tool_decision_request_id(&self) -> Option<&str> {
+        Some(&self.request.tool_id)
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+        if key.kind != KeyEventKind::Press {
+            return ViewAction::None;
+        }
+        // Ordinary text may have been intended for the composer. Even
+        // selecting on a letter would make that text followed by Enter grant
+        // access, so only deliberate navigation changes the selected option.
+        match shell_key_routing::route(Focus::Modal(ModalKind::Elevation), &key) {
+            Some(ShellBindingId::ElevationUp) => {
                 self.select_prev();
                 ViewAction::None
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some(ShellBindingId::ElevationDown) => {
                 self.select_next();
                 ViewAction::None
             }
-            KeyCode::Enter => self.emit_decision(self.current_option().clone()),
-            KeyCode::Char('n') => self.emit_decision(ElevationOption::WithNetwork),
-            KeyCode::Char('w') => {
-                // Find the write access option if available
-                for opt in &self.request.options {
-                    if matches!(opt, ElevationOption::WithWriteAccess(_)) {
-                        return self.emit_decision(opt.clone());
-                    }
-                }
-                ViewAction::None
+            Some(ShellBindingId::ElevationConfirm) => {
+                self.emit_decision(self.current_option().clone())
             }
-            KeyCode::Char('f') => self.emit_decision(ElevationOption::FullAccess),
-            KeyCode::Esc | KeyCode::Char('a') => self.emit_decision(ElevationOption::Abort),
+            Some(ShellBindingId::ElevationAbort) => self.emit_decision(ElevationOption::Abort),
             _ => ViewAction::None,
         }
     }

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 INSTALL_DIR = "/tmp/vf-codewhale"
 DEFAULT_BINARY = f"{INSTALL_DIR}/bin/codewhale"
-RELEASE_ROOT = "https://github.com/Hmbown/CodeWhale/releases/download"
+RELEASE_ROOT = "https://github.com/codewhale-hq/CodeWhale/releases/download"
 STREAM_SCHEMA = "codewhale.exec-stream"
 STREAM_SCHEMA_VERSION = 1
 MAX_TERMINAL_RECEIPT_BYTES = 8_192

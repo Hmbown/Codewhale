@@ -359,6 +359,13 @@ fn catalogue_has_unique_entries_and_the_complete_block_fits_the_prompt_budget() 
             "budget overflow must advertise complete on-demand discovery"
         );
     }
+    // Budget headroom (docs/SKILLS.md): the shipped pack alone must render
+    // every eligible skill with no omission line, so user skills are never
+    // silently displaced by the bundle.
+    assert!(
+        !block.contains("additional skills omitted"),
+        "shipped pack alone must not truncate the ambient catalogue"
+    );
 
     // No entry may smuggle newlines or an oversized description into the
     // prompt prefix — that is how a catalogue line would poison context.
@@ -392,7 +399,7 @@ fn every_shipped_locale_falls_back_to_canonical_english_routing_descriptions() {
              to this test instead of relying on the English-fallback contract",
             skill.name
         );
-        for locale in crate::localization::Locale::shipped() {
+        for locale in codewhale_localization::Locale::shipped() {
             assert_eq!(
                 skill.description_for_locale(locale.tag()),
                 skill.description,
@@ -408,7 +415,7 @@ fn every_shipped_locale_falls_back_to_canonical_english_routing_descriptions() {
 fn rendered_catalogue_is_identical_across_every_shipped_locale() {
     let (tmp, registry) = installed_registry();
     let english = rendered_catalogue(&registry, "en", tmp.path());
-    for locale in crate::localization::Locale::shipped() {
+    for locale in codewhale_localization::Locale::shipped() {
         let localized = rendered_catalogue(&registry, locale.tag(), tmp.path());
         assert_eq!(
             localized,
@@ -454,7 +461,7 @@ description_zh-hant: 繁體路由說明\n\
     }
 
     // Every shipped locale tag must resolve to *some* non-empty description.
-    for locale in crate::localization::Locale::shipped() {
+    for locale in codewhale_localization::Locale::shipped() {
         assert!(
             !skill.description_for_locale(locale.tag()).is_empty(),
             "{} must resolve to a non-empty routing description",

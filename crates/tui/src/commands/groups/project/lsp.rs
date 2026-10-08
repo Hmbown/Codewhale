@@ -84,9 +84,7 @@ fn lsp(project: &mut dyn CommandProjectContext, arg: Option<&str>) -> CommandRes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codewhale_command_contract::facets::{
-        ProjectGoalState, ProjectGoalStatus, ProjectShareProjection,
-    };
+    use codewhale_command_contract::facets::{ProjectGoalState, ProjectGoalStatus};
 
     /// Deterministic fake project facet over portable values only.
     struct FakeProject {
@@ -101,15 +99,6 @@ mod tests {
         fn lsp_set(&mut self, enabled: bool) -> Result<(), String> {
             self.lsp_enabled = enabled;
             Ok(())
-        }
-
-        fn share_projection(&self) -> ProjectShareProjection {
-            ProjectShareProjection {
-                history_is_empty: true,
-                history_len: 0,
-                model: String::new(),
-                mode_label: String::new(),
-            }
         }
 
         fn goal_state(&self) -> ProjectGoalState {

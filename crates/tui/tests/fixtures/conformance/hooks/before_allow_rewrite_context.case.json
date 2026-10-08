@@ -1,0 +1,24 @@
+{
+  "description": "tool_call_before: two hooks — one allows and rewrites the input, one asks for approval and adds context. Pins the fold: ask wins over allow, the last rewrite wins, contexts join in order.",
+  "event": "tool_call_before",
+  "model": "deepseek-v4-pro",
+  "tool": {
+    "name": "Bash",
+    "call_id": "call_hook_rewrite",
+    "input": {
+      "command": "cargo test"
+    }
+  },
+  "hooks": [
+    {
+      "event": "tool_call_before",
+      "name": "rewrite",
+      "command": "{{capture}} rewrite; printf '%s' '{\"decision\":\"allow\",\"updatedInput\":{\"command\":\"cargo test --locked\"},\"additionalContext\":\"lockfile enforced\"}'"
+    },
+    {
+      "event": "tool_call_before",
+      "name": "ask",
+      "command": "{{capture}} ask; printf '%s' '{\"decision\":\"ask\",\"additionalContext\":\"CI is the gate\"}'"
+    }
+  ]
+}

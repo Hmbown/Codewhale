@@ -1,0 +1,11 @@
+command: /system
+is_error: false
+message:
+System Prompt (ACT mode):
+─────────────────────────────
+First block
+
+---
+
+Second block
+action: <none>

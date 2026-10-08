@@ -77,7 +77,6 @@ impl ActiveCell {
 
     /// Number of entries (each rendered as its own [`HistoryCell`]).
     #[must_use]
-    #[allow(dead_code)] // Public surface used by tests and future renderers.
     pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
@@ -189,7 +188,6 @@ impl ActiveCell {
 
     /// Look up the entry index that holds the given tool id.
     #[must_use]
-    #[allow(dead_code)] // Reserved for the Codex-style "exec end target" lookup.
     pub fn entry_index_for_tool(&self, tool_id: &str) -> Option<usize> {
         self.tool_to_entry.get(tool_id).copied()
     }

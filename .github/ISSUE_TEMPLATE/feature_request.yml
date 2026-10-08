@@ -1,0 +1,64 @@
+name: Feature request
+description: Suggest an idea or an improvement. 功能建议。
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. English or 中文 are both fine. Short is good.
+
+        If someone already asked for this, add a 👍 to their issue instead.
+        Want to talk it through first? Use [Discussions](https://github.com/codewhale-hq/CodeWhale/discussions) or [Discord](https://discord.gg/37gfS3ksug).
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched existing issues and this is not a duplicate. 我已搜索过现有 issue。
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve? 要解决什么问题？
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What should Codewhale do? 希望 Codewhale 怎么做？
+      description: The behavior you want. Commands, key presses, or config are welcome.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where? 在哪里？
+      multiple: true
+      options:
+        - TUI (terminal interface)
+        - CLI command (codewhale exec, ...)
+        - Desktop app
+        - Web (codewhale web or app.codewhale.net)
+        - Plugins / extension host
+        - MCP
+        - Providers and models
+        - Docs
+        - Other / not sure
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds or other tools (optional)
+      description: What you do today, or how another tool handles it.
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I would like to open a pull request for this. 我愿意提交 PR。

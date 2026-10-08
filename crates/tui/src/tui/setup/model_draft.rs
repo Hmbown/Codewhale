@@ -22,11 +22,11 @@
 use codewhale_config::{UntrustedDraftParse, UserConstitution, user_constitution::MAX_NOTES_LEN};
 
 use crate::llm_client::LlmClient;
-use crate::localization::Locale;
-use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
+use codewhale_localization::Locale;
+use codewhale_models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
 use super::{GuidedConstitutionDraft, autonomy_label};
-use crate::models::Role;
+use codewhale_models::Role;
 
 /// Output budget for the one-shot draft. Roomy enough for a full constitution
 /// (bounds cap the persisted form far below this), small enough to be a real
@@ -178,10 +178,10 @@ pub(crate) async fn draft_constitution_with_model<C: LlmClient>(
         .create_message(request)
         .await
         .map_err(|err| format!("request failed: {err:#}"))?;
-    if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+    if codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
         return Err(format!(
             "the draft reply was incomplete (provider stop reason `{}`)",
-            crate::models::stop_reason_detail(response.stop_reason.as_deref())
+            codewhale_models::stop_reason_detail(response.stop_reason.as_deref())
         ));
     }
     let text = draft_response_text(&response.content);
@@ -198,9 +198,9 @@ pub(crate) async fn draft_constitution_with_model<C: LlmClient>(
 mod tests {
     use super::*;
     use crate::llm_client::mock::MockLlmClient;
-    use crate::models::{MessageResponse, Usage};
     use codewhale_config::AutonomyPreference;
     use codewhale_config::user_constitution::MAX_NOTES_LEN;
+    use codewhale_models::{MessageResponse, Usage};
 
     fn text_response(text: &str) -> MessageResponse {
         MessageResponse {

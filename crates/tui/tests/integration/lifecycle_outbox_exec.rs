@@ -112,7 +112,11 @@ fn preserve_host_env(command: &mut Command) {
 /// Any `__OUTBOX_PATH__` token in it is replaced with the isolated home's
 /// absolute outbox path. Returns the isolated home and workspace dirs (the
 /// latter so callers can assert the outbox `payload.workspace` exactly).
-fn run_exec_with_outbox_config(server: &MockServer, outbox_toml: &str) -> (TempDir, TempDir) {
+fn run_exec_with_outbox_config(
+    server: &MockServer,
+    outbox_toml: &str,
+    expected_exit_code: i32,
+) -> (TempDir, TempDir) {
     let workspace = TempDir::new().expect("workspace tempdir");
     let home = TempDir::new().expect("home tempdir");
     let outbox_path = home_outbox_path(&home);
@@ -126,7 +130,7 @@ fn run_exec_with_outbox_config(server: &MockServer, outbox_toml: &str) -> (TempD
     )
     .expect("write exec config");
 
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace.path())
@@ -160,14 +164,11 @@ fn run_exec_with_outbox_config(server: &MockServer, outbox_toml: &str) -> (TempD
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 
-    let status = match child
-        .wait_timeout(RUN_TIMEOUT)
-        .expect("wait for codewhale-tui")
-    {
+    let status = match child.wait_timeout(RUN_TIMEOUT).expect("wait for codewhale") {
         Some(status) => status,
         None => {
             let _ = child.kill();
@@ -175,7 +176,7 @@ fn run_exec_with_outbox_config(server: &MockServer, outbox_toml: &str) -> (TempD
             let stdout = join_pipe_reader(stdout_reader, "stdout");
             let stderr = join_pipe_reader(stderr_reader, "stderr");
             panic!(
-                "codewhale-tui exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
+                "codewhale exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
             );
@@ -184,9 +185,10 @@ fn run_exec_with_outbox_config(server: &MockServer, outbox_toml: &str) -> (TempD
 
     let stdout = join_pipe_reader(stdout_reader, "stdout");
     let stderr = join_pipe_reader(stderr_reader, "stderr");
-    assert!(
-        status.success(),
-        "codewhale-tui exec failed\nstdout:\n{}\nstderr:\n{}",
+    assert_eq!(
+        status.code(),
+        Some(expected_exit_code),
+        "codewhale exec returned the wrong exit status\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
@@ -224,23 +226,6 @@ fn read_outbox_lines(path: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
-}
-
 fn home_outbox_path(home: &TempDir) -> PathBuf {
     home.path()
         .join(".codewhale")
@@ -254,6 +239,7 @@ async fn exec_emits_turn_start_and_turn_end_to_the_configured_outbox() {
     let (home, workspace) = run_exec_with_outbox_config(
         &server,
         &format!("[lifecycle_outbox]\npath = {}\n", json!(OUTBOX_PATH_TOKEN)),
+        0,
     );
 
     let outbox_path = home_outbox_path(&home);
@@ -301,7 +287,7 @@ async fn exec_emits_turn_start_and_turn_end_to_the_configured_outbox() {
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_without_outbox_config_writes_no_file() {
     let server = start_mock_llm().await;
-    let (home, _workspace) = run_exec_with_outbox_config(&server, "");
+    let (home, _workspace) = run_exec_with_outbox_config(&server, "", 0);
 
     assert!(
         !home_outbox_path(&home).exists(),
@@ -317,6 +303,7 @@ async fn outbox_seq_recovers_across_processes() {
     let (home, _workspace) = run_exec_with_outbox_config(
         &server,
         &format!("[lifecycle_outbox]\npath = {}\n", json!(OUTBOX_PATH_TOKEN)),
+        0,
     );
     let shared_outbox = home_outbox_path(&home);
 
@@ -327,6 +314,7 @@ async fn outbox_seq_recovers_across_processes() {
             "[lifecycle_outbox]\npath = {}\n",
             json!(shared_outbox.display().to_string())
         ),
+        0,
     );
 
     let lines = read_outbox_lines(&shared_outbox);
@@ -340,4 +328,29 @@ async fn outbox_seq_recovers_across_processes() {
         vec![1, 2, 3, 4],
         "seq must be monotonic across processes"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_exec_persists_the_terminal_receipt_without_changing_its_exit() {
+    let server = start_mock_llm().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream model failure"))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let (home, _workspace) = run_exec_with_outbox_config(
+        &server,
+        &format!("[lifecycle_outbox]\npath = {}\n", json!(OUTBOX_PATH_TOKEN)),
+        1,
+    );
+    let lines = read_outbox_lines(&home_outbox_path(&home));
+    assert_eq!(lines.len(), 2, "failed turn retains both boundaries");
+    assert_eq!(lines[0]["event"], "turn_start");
+    assert_eq!(lines[0]["seq"], 1);
+    assert_eq!(lines[1]["event"], "turn_end");
+    assert_eq!(lines[1]["kind"], "turn.failed");
+    assert_eq!(lines[1]["seq"], 2);
+    assert_eq!(lines[1]["payload"]["status"], "failed");
+    assert!(!lines[1]["payload"]["error"].as_str().unwrap().is_empty());
 }

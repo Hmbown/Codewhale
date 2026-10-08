@@ -1,8 +1,8 @@
 # Command Dispatch Architecture
 
 **Target branch:** `main`
-**Related EPIC:** [#2870](https://github.com/Hmbown/CodeWhale/issues/2870)
-**Related issue:** [#2791](https://github.com/Hmbown/CodeWhale/issues/2791)
+**Related EPIC:** [#2870](https://github.com/codewhale-hq/CodeWhale/issues/2870)
+**Related issue:** [#2791](https://github.com/codewhale-hq/CodeWhale/issues/2791)
 **EPIC-002 (Command Single Responsibility Extraction):** Layer 4.x (FEAT-006 through FEAT-008)
 
 This document records the command-dispatch ownership model after the
@@ -21,7 +21,7 @@ intentional:
 | Step | Source | Behavior |
 |------|--------|----------|
 | 0 | `$skill` compatibility | `$name` is resolved as `/skill name` before slash parsing. |
-| 1 | User commands | `user_registry::try_dispatch()` checks workspace and global markdown commands first, so user commands can shadow built-ins. |
+| 1 | User commands | `user_registry::try_dispatch()` checks workspace and global markdown commands first, so user commands can shadow built-ins. Workspace commands (`.codewhale`, `.deepseek`, `.claude`, `.cursor`) load only in a trusted workspace and never under the name or alias of a protected built-in — the commands that grant or revoke authority, hold credentials, or undo work, such as `/trust`, `/undo`, `/permissions`, `/mode`, `/config` (`PROTECTED_BUILTINS` in `user_registry.rs`); such a definition is skipped with a load error. |
 | 2 | Permanent mode compatibility aliases | `/jihua` and `/zidong` route through config mode dispatch so each selects its fixed legacy mode. They remain registered aliases for discovery, but bypass normal `/mode` execution. |
 | 3 | Built-in registry | `CommandRegistry` resolves group-owned built-in commands by canonical name or alias. |
 | 4 | Legacy migration hints | Retired commands such as `/set` and `/deepseek` return targeted replacement guidance. |
@@ -77,7 +77,7 @@ Supported frontmatter fields:
 | `argument-hint` | Backward-compatible palette/completion hint for expected arguments. It remains the display fallback when `usage` is absent. |
 | `allowed-tools` | Restricts command execution tools. An explicit empty value blocks all tools. |
 | `pausable` | Marks the command as pause/resume capable. |
-| `alias` / `aliases` | Additional user-command names that can shadow built-in aliases. |
+| `alias` / `aliases` | Additional user-command names. A workspace command's alias cannot claim a protected built-in. |
 | `hidden` | Hides the command from palette/completion while allowing direct dispatch. |
 
 The canonical name defaults to the normalized markdown filename. A valid

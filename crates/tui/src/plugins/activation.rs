@@ -19,7 +19,87 @@ pub const CAPABILITY_HASH_DOMAIN_V2: &[u8] = b"codewhale-plugin-capabilities-v2\
 /// receipt. Kept so discovery can prove a v1 receipt no longer matches.
 pub const CAPABILITY_HASH_DOMAIN_V1: &[u8] = b"codewhale-plugin-capabilities-v1\0";
 
-pub const ACTIVATION_POLICY_VERSION: u32 = 3;
+pub const ACTIVATION_POLICY_VERSION: u32 = 5;
+
+/// Policy version selected when `[features] extension_host` is on: `Native`
+/// (host code run by the TypeScript extension host) moves from inactive to
+/// supported. Every receipt reviewed under v5 fails closed as
+/// `CapabilitiesChanged` under v6 and the reverse, so toggling the flag in
+/// either direction re-reviews every plugin. That is intended.
+pub const EXTENSION_HOST_POLICY_VERSION: u32 = 6;
+
+/// Process-wide policy selection, set once at boot from config
+/// (`install_extension_host_policy`). A config reload never flips it
+/// mid-process; unset means the shipping v5 policy, which also covers tests.
+static EXTENSION_HOST_POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread override so one test can exercise v6 without
+    /// changing the policy every other (parallel) test observes.
+    static TEST_POLICY_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Select the activation policy for this process. The first call wins.
+pub fn install_extension_host_policy(extension_host_enabled: bool) {
+    let _ = EXTENSION_HOST_POLICY.set(extension_host_enabled);
+}
+
+/// Whether this process activates `Native` (extension host) components.
+#[must_use]
+pub fn extension_host_policy_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(value) = TEST_POLICY_OVERRIDE.with(std::cell::Cell::get) {
+        return value;
+    }
+    EXTENSION_HOST_POLICY.get().copied().unwrap_or(false)
+}
+
+/// Carries the calling thread's policy into a `spawn_blocking` closure. In
+/// production the policy is process-wide, so this is a no-op; under test it
+/// re-applies the per-thread override on the blocking thread.
+pub(crate) struct PolicyScope {
+    #[cfg(test)]
+    _guard: TestPolicyGuard,
+}
+
+impl PolicyScope {
+    #[must_use]
+    pub(crate) fn propagate(extension_host_enabled: bool) -> Self {
+        #[cfg(test)]
+        {
+            Self {
+                _guard: TestPolicyGuard::extension_host(extension_host_enabled),
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = extension_host_enabled;
+            Self {}
+        }
+    }
+}
+
+/// Test guard selecting the v6 (or v5) policy on the current thread only.
+#[cfg(test)]
+pub(crate) struct TestPolicyGuard {
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl TestPolicyGuard {
+    pub(crate) fn extension_host(enabled: bool) -> Self {
+        let previous = TEST_POLICY_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestPolicyGuard {
+    fn drop(&mut self) {
+        TEST_POLICY_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
 
 /// A runtime adapter or inventoried capability that a bundle may declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -32,6 +112,7 @@ pub enum PluginActivationCapability {
     Hooks,
     Lsp,
     Native,
+    Providers,
     FilesystemRoots,
     LifecycleMutation,
 }
@@ -46,6 +127,7 @@ impl PluginActivationCapability {
         Self::Hooks,
         Self::Lsp,
         Self::Native,
+        Self::Providers,
         Self::FilesystemRoots,
         Self::LifecycleMutation,
     ];
@@ -61,6 +143,7 @@ impl PluginActivationCapability {
             Self::Hooks => "hooks",
             Self::Lsp => "lsp",
             Self::Native => "native",
+            Self::Providers => "providers",
             Self::FilesystemRoots => "filesystem-roots",
             Self::LifecycleMutation => "lifecycle-mutation",
         }
@@ -78,8 +161,44 @@ pub struct PluginActivationPolicy {
 }
 
 impl PluginActivationPolicy {
+    /// The policy this process runs under: v5, or v6 when the experimental
+    /// extension host is enabled (see [`install_extension_host_policy`]).
     #[must_use]
-    pub const fn current() -> Self {
+    pub fn current() -> Self {
+        if extension_host_policy_enabled() {
+            Self::extension_host()
+        } else {
+            Self::v3()
+        }
+    }
+
+    /// v6: identical to v5 except `Native` (host code) is supported.
+    #[must_use]
+    pub const fn extension_host() -> Self {
+        Self {
+            version: EXTENSION_HOST_POLICY_VERSION,
+            supported: &[
+                PluginActivationCapability::Skills,
+                PluginActivationCapability::McpStdio,
+                PluginActivationCapability::McpRemote,
+                PluginActivationCapability::Commands,
+                PluginActivationCapability::Agents,
+                PluginActivationCapability::Hooks,
+                PluginActivationCapability::Providers,
+                PluginActivationCapability::Native,
+            ],
+            inactive: &[
+                PluginActivationCapability::Lsp,
+                PluginActivationCapability::FilesystemRoots,
+                PluginActivationCapability::LifecycleMutation,
+            ],
+        }
+    }
+
+    /// Shipping declarative policy (v5). The historical `v3` method name is
+    /// retained; providers intentionally invalidate older review receipts.
+    #[must_use]
+    pub const fn v3() -> Self {
         Self {
             version: ACTIVATION_POLICY_VERSION,
             supported: &[
@@ -89,6 +208,7 @@ impl PluginActivationPolicy {
                 PluginActivationCapability::Commands,
                 PluginActivationCapability::Agents,
                 PluginActivationCapability::Hooks,
+                PluginActivationCapability::Providers,
             ],
             inactive: &[
                 PluginActivationCapability::Lsp,
@@ -135,6 +255,49 @@ mod tests {
             assert_ne!(
                 supported, inactive,
                 "{capability:?} must be supported or inactive, not both or neither"
+            );
+        }
+    }
+
+    fn policy_digest(policy: PluginActivationPolicy) -> String {
+        let mut hasher = sha2::Sha256::new();
+        policy.write_hash_material(&mut hasher);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Pin the shipping provider-aware policy independently of the optional
+    /// native extension host; changes require deliberate receipt migration.
+    #[test]
+    fn flag_off_policy_hashes_exactly_as_shipping_provider_policy() {
+        let _guard = TestPolicyGuard::extension_host(false);
+        let current = PluginActivationPolicy::current();
+        assert_eq!(current, PluginActivationPolicy::v3());
+        assert_eq!(
+            policy_digest(current),
+            "f0584fdb007b7987b0934517c8723b96190137771795ed33b38499b9353aa7cf"
+        );
+        assert!(!current.is_supported(PluginActivationCapability::Native));
+    }
+
+    #[test]
+    fn flag_on_policy_supports_native_and_moves_the_hash() {
+        let _guard = TestPolicyGuard::extension_host(true);
+        let current = PluginActivationPolicy::current();
+        assert_eq!(current.version, EXTENSION_HOST_POLICY_VERSION);
+        assert!(current.is_supported(PluginActivationCapability::Native));
+        assert_ne!(
+            policy_digest(current),
+            policy_digest(PluginActivationPolicy::v3())
+        );
+        for capability in PluginActivationCapability::ALL {
+            assert_ne!(
+                current.supported.contains(capability),
+                current.inactive.contains(capability),
+                "{capability:?}"
             );
         }
     }

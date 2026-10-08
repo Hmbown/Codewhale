@@ -1,0 +1,5 @@
+# This exact fixture is a deliberately public TEST-ONLY signing key.
+# It is never a production trust anchor and signs only local test payloads.
+# No other key files are excluded.
+paths-ignore:
+  - docs/cloud-facts/fixtures/test-only-signing-key.pem

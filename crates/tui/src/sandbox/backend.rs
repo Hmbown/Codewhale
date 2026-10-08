@@ -28,6 +28,8 @@ pub enum SandboxKind {
     None,
     /// Alibaba OpenSandbox remote execution.
     OpenSandbox,
+    /// Configured backend is unavailable; execution is refused.
+    Unsupported,
 }
 
 impl SandboxKind {
@@ -47,6 +49,7 @@ impl SandboxKind {
         match self {
             Self::None => "none",
             Self::OpenSandbox => "opensandbox",
+            Self::Unsupported => "unsupported",
         }
     }
 }
@@ -58,6 +61,8 @@ impl SandboxKind {
 /// `Arc` and shared across async tasks.
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
+    /// Backend identity used by tool receipts.
+    fn kind(&self) -> SandboxKind;
     /// Execute a shell command and return its output.
     ///
     /// `cmd` is the full shell command string (e.g. `"ls -la"`).
@@ -74,14 +79,14 @@ use crate::config::Config;
 /// is set, constructs an [`OpenSandboxBackend`](super::opensandbox::OpenSandboxBackend) using `sandbox_url` and
 /// `sandbox_api_key`.
 pub fn create_backend(config: &Config) -> Result<Option<Box<dyn SandboxBackend>>> {
-    let kind = config
-        .sandbox_backend
-        .as_deref()
-        .and_then(SandboxKind::parse)
-        .unwrap_or(SandboxKind::None);
+    let Some(kind) = SandboxKind::parse(config.sandbox_backend.as_deref().unwrap_or("none")) else {
+        // Old or misspelled remote settings must never select local execution.
+        return Ok(Some(Box::new(UnsupportedBackend)));
+    };
 
     match kind {
         SandboxKind::None => Ok(None),
+        SandboxKind::Unsupported => Ok(Some(Box::new(UnsupportedBackend))),
         SandboxKind::OpenSandbox => {
             let base_url = config
                 .sandbox_url
@@ -90,6 +95,52 @@ pub fn create_backend(config: &Config) -> Result<Option<Box<dyn SandboxBackend>>
             let api_key = config.sandbox_api_key.clone();
             let backend = super::opensandbox::OpenSandboxBackend::new(base_url, api_key, 30)?;
             Ok(Some(Box::new(backend)))
+        }
+    }
+}
+
+/// A configured execution boundary that is no longer supported. Keep it present
+/// in the tool context so every shell call is refused instead of running locally.
+struct UnsupportedBackend;
+
+#[async_trait]
+impl SandboxBackend for UnsupportedBackend {
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Unsupported
+    }
+    async fn exec(&self, _cmd: &str, _env: &HashMap<String, String>) -> Result<SandboxOutput> {
+        anyhow::bail!(
+            "Unsupported sandbox_backend setting. Choose opensandbox, or explicitly set none for local execution."
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_backend_refuses_execution_instead_of_falling_back_to_local() {
+        for name in ["shannon", "shannonnet", "shannon-net", "levee", "unknown"] {
+            let config = Config {
+                sandbox_backend: Some(name.into()),
+                ..Config::default()
+            };
+            let backend = create_backend(&config)
+                .unwrap()
+                .expect("retain execution boundary");
+            let error = backend
+                .exec("echo must-not-run", &HashMap::new())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Unsupported sandbox_backend"));
+        }
+        for name in [None, Some("none"), Some("")] {
+            let config = Config {
+                sandbox_backend: name.map(str::to_owned),
+                ..Config::default()
+            };
+            assert!(create_backend(&config).unwrap().is_none());
         }
     }
 }

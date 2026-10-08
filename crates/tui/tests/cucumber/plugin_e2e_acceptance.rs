@@ -2,7 +2,9 @@
 //!
 //! Tests the plugin frontmatter scanner end-to-end from the binary level:
 //! - Scripts with valid `# name:` frontmatter are discovered
-//! - Approval levels (auto, suggest, required) are parsed correctly
+//! - Approval levels (suggest, required) are parsed correctly, and a script's
+//!   `approval: auto` falls back to suggest (D4: script tools cannot approve
+//!   themselves)
 //! - Hidden files and README.md are ignored
 //! - Empty and missing directories are handled gracefully
 //! - The distributed binary still loads after the plugin module migration
@@ -51,7 +53,6 @@ struct TestPluginMeta {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TestApproval {
-    Auto,
     Suggest,
     Required,
 }
@@ -83,8 +84,8 @@ fn parse_frontmatter(content: &str) -> Option<TestPluginMeta> {
         return None;
     }
 
+    // D4: `auto` is not honoured for script tools; it gets the default.
     let approval = match approval_str.to_lowercase().as_str() {
-        "auto" => TestApproval::Auto,
         "required" => TestApproval::Required,
         _ => TestApproval::Suggest,
     };
@@ -321,7 +322,6 @@ fn scanned_plugin_should_have_approval(
         .unwrap_or_else(|| panic!("plugin \"{name}\" not found in scan results"));
 
     let actual = match meta.approval {
-        TestApproval::Auto => "auto",
         TestApproval::Suggest => "suggest",
         TestApproval::Required => "required",
     };
@@ -364,14 +364,14 @@ fn scanner_should_report_missing_path(world: &mut PluginE2EWorld) {
 /// Prove the binary still loads after the plugin module extraction.
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_module_does_not_break_binary_load() {
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .arg("--version")
         .output()
-        .expect("codewhale-tui --version should start");
+        .expect("codewhale --version should start");
 
     assert!(
         output.status.success(),
-        "codewhale-tui --version failed\nstderr:\n{}",
+        "codewhale --version failed\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -683,32 +683,6 @@ fn submit_tui_command(tui: &mut Harness, text: &str) {
 }
 
 #[cfg(all(unix, feature = "long-running-tests"))]
-fn visible_review_confirmation(tui: &mut Harness) -> Option<String> {
-    tui.pump();
-    review_confirmation_in_text(&tui.frame().text())
-}
-
-#[cfg(all(unix, feature = "long-running-tests"))]
-fn review_confirmation_in_text(text: &str) -> Option<String> {
-    // The confirmation is `/plugin trust demo <64-hex>.<64-hex>` (129 chars).
-    // Transcript cards wrap well before that, so a single rendered line no
-    // longer holds the token. Join trimmed lines and recover the two digests.
-    let joined: String = text.lines().map(str::trim).collect();
-    let marker = "/plugin trust demo ";
-    let start = joined.find(marker)?;
-    let token: String = joined[start + marker.len()..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_hexdigit() || *ch == '.')
-        .collect();
-    let (content, capability) = token.split_once('.')?;
-    (content.len() == 64
-        && capability.len() == 64
-        && content.chars().all(|ch| ch.is_ascii_hexdigit())
-        && capability.chars().all(|ch| ch.is_ascii_hexdigit()))
-    .then(|| format!("{marker}{content}.{capability}"))
-}
-
-#[cfg(all(unix, feature = "long-running-tests"))]
 fn sanitize_diag_line(line: &str) -> String {
     line.chars()
         .map(|ch| {
@@ -780,9 +754,9 @@ fn wait_for_composer_ready(tui: &mut Harness) {
         .wait_for(
             |frame| {
                 let (row, _) = frame.cursor();
-                // The composer's cursor row sits above its bottom rule, the
-                // posture row, and the info line — four rows from the end.
-                frame.any_visible_text() && row >= frame.rows().saturating_sub(4)
+                // Density and user drafts change the composer's height. Its
+                // prompt owns the focused row, not a fixed bottom offset.
+                frame.any_visible_text() && frame.row(row).contains('❯')
             },
             BINARY_ACCEPTANCE_TIMEOUT,
         )
@@ -804,9 +778,10 @@ fn begin_new_session_from_startup(tui: &mut Harness) {
     expect_visible(tui, "New session", "show the launch card");
     // Typing goes straight to the composer; Enter sends the first message
     // and the session begins (the card dissolved on the first keystroke).
-    tui.send("start the session")
-        .expect("type the first prompt");
-    tui.send(keys::key::enter()).expect("send the first prompt");
+    // type_line, not send+enter: a zero-gap PTY write is paste-classified
+    // and the immediate Enter would be absorbed as a pasted newline.
+    tui.type_line("start the session")
+        .expect("type and send the first prompt");
     if tui
         .wait_for(
             |frame| !frame.text().contains('\u{2442}'),
@@ -841,6 +816,38 @@ fn wait_for_log(tui: &mut Harness, path: &std::path::Path, needle: &str) {
     }
 }
 
+/// A focused composer and a streamed answer can both appear before the turn
+/// settles. Use the runtime's terminal receipt, not either paint, to admit the
+/// next prompt; otherwise this fixture exercises the busy-turn queue by accident.
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn wait_for_turn_receipt(tui: &mut Harness, outbox: &std::path::Path, count: usize, kind: &str) {
+    let receipt = || {
+        std::fs::read_to_string(outbox)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "turn_end")
+            .collect::<Vec<_>>()
+    };
+    if tui
+        .wait_for(|_| receipt().len() >= count, BINARY_ACCEPTANCE_TIMEOUT)
+        .is_err()
+    {
+        panic!(
+            "terminal turn receipt {count} not observed within {:?}\n{}",
+            qa_harness::harness::ci_scaled(BINARY_ACCEPTANCE_TIMEOUT),
+            short_diagnostics(tui, Some(outbox)),
+        );
+    }
+    let events = receipt();
+    assert_eq!(
+        events.len(),
+        count,
+        "one terminal receipt per submitted turn"
+    );
+    assert_eq!(events[count - 1]["kind"], kind, "terminal turn outcome");
+}
+
 /// Exercise the distributed binary through a real PTY and a sealed home. The
 /// only socket is a test-owned loopback model endpoint; plugin execution is
 /// stdio-only and receives no real credentials or ambient secret environment.
@@ -854,8 +861,16 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     let workspace = make_sealed_workspace().expect("sealed workspace");
     let bundle = write_reviewed_bundle_fixture(workspace.workspace());
     let mcp_log = workspace.home().join(".codewhale/plugin-acceptance.log");
+    let outbox = workspace.home().join(".codewhale/lifecycle-outbox.jsonl");
+    let config_path = workspace.home().join(".codewhale/config.toml");
+    let mut config = std::fs::read_to_string(&config_path).expect("sealed config");
+    config.push_str(&format!(
+        "\n[lifecycle_outbox]\npath = {}\n",
+        serde_json::json!(outbox.to_string_lossy()),
+    ));
+    std::fs::write(config_path, config).expect("configure sealed lifecycle receipt");
     let (base_url, shutdown_tx, model_thread) = spawn_hermetic_model_server();
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -881,6 +896,7 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     // The binary begins at Tideline Startup, so choose its real New Session
     // action before exercising the existing-session plugin contract.
     begin_new_session_from_startup(&mut tui);
+    wait_for_turn_receipt(&mut tui, &outbox, 1, "turn.completed");
     wait_for_composer_ready(&mut tui);
     submit_tui_command(&mut tui, "/plugin show demo");
     expect_visible(
@@ -897,26 +913,11 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     );
 
     submit_tui_command(&mut tui, "/plugin trust demo");
-    if tui
-        .wait_for(
-            |frame| review_confirmation_in_text(&frame.text()).is_some(),
-            BINARY_ACCEPTANCE_TIMEOUT,
-        )
-        .is_err()
-    {
-        panic!(
-            "review confirmation not visible within {:?}\n{}",
-            qa_harness::harness::ci_scaled(BINARY_ACCEPTANCE_TIMEOUT),
-            short_diagnostics(&mut tui, None)
-        );
-    }
-    let confirmation = visible_review_confirmation(&mut tui).unwrap_or_else(|| {
-        panic!(
-            "review confirmation not visible\n{}",
-            short_diagnostics(&mut tui, None)
-        )
-    });
-    submit_tui_command(&mut tui, &confirmation);
+    expect_visible(&mut tui, "Confirm", "token-bound plugin review control");
+    tui.send(keys::key::ch('y')).expect("arm reviewed trust");
+    expect_visible(&mut tui, "y/Enter", "armed review control");
+    tui.send(keys::key::enter())
+        .expect("confirm reviewed trust");
     expect_visible(&mut tui, "Plugin bundle 'demo': trusted.", "trust receipt");
 
     submit_tui_command(&mut tui, "/plugin enable demo");
@@ -941,12 +942,12 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
         "binary plugin call complete",
         "plugin tool result returned to model",
     );
+    wait_for_turn_receipt(&mut tui, &outbox, 2, "turn.completed");
 
     submit_tui_command(&mut tui, "hang plugin call");
     wait_for_log(&mut tui, &mcp_log, "call:hang");
     tui.send([0x03]).expect("interrupt hanging plugin turn");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    tui.pump();
+    wait_for_turn_receipt(&mut tui, &outbox, 3, "turn.interrupted");
     tui.send([0x15])
         .expect("clear the interrupted prompt restored into the composer");
     submit_tui_command(&mut tui, "/plugin revoke demo");
@@ -963,26 +964,22 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     assert!(state.contains("\"trust\": null"));
     assert!(bundle.join("server.py").exists(), "source bundle preserved");
 
+    submit_tui_command(&mut tui, "/exit");
+    assert_eq!(
+        tui.wait_for_exit(BINARY_ACCEPTANCE_TIMEOUT),
+        Some(0),
+        "the TUI must exit gracefully after revoking the plugin",
+    );
+    let receipts = std::fs::read_to_string(&outbox).expect("outbox after process exit");
+    let final_event: serde_json::Value =
+        serde_json::from_str(receipts.lines().last().expect("final receipt"))
+            .expect("complete final JSONL event");
+    assert_eq!(final_event["event"], "session_end");
+    assert_eq!(final_event["kind"], "session.ended");
+
     let _ = tui.shutdown();
     let _ = shutdown_tx.send(());
     let _ = model_thread.join();
-}
-
-#[cfg(all(unix, feature = "long-running-tests"))]
-#[test]
-fn review_confirmation_survives_transcript_wrap() {
-    let content = "a".repeat(64);
-    let capability = "b".repeat(64);
-    let wrapped = format!(
-        "  /plugin trust demo {head}\n  {mid}\n  {tail}\n",
-        head = &format!("{content}.{capability}")[..40],
-        mid = &format!("{content}.{capability}")[40..90],
-        tail = &format!("{content}.{capability}")[90..],
-    );
-    assert_eq!(
-        review_confirmation_in_text(&wrapped),
-        Some(format!("/plugin trust demo {content}.{capability}"))
-    );
 }
 
 #[cfg(unix)]
@@ -1107,19 +1104,77 @@ async fn run_scenario(name: &'static str, expected_steps: usize) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
+/// A continued session must stay resumable: resume it, run a turn, quit, and
+/// resume again, twice. The second resume used to fail for good with "saved
+/// holder checkpoint does not cover the full source" (0.10.1 QA), because the
+/// runtime holder mounted by the first resume stayed behind the document the
+/// resumed turn was saved to.
+#[cfg(all(unix, feature = "long-running-tests"))]
+#[test]
+fn a_continued_session_resumes_again_after_each_turn() {
+    let workspace = make_sealed_workspace().expect("sealed workspace");
+    let (base_url, shutdown_tx, model_thread) = spawn_hermetic_model_server();
+    let launch = |args: &[&str]| {
+        Harness::builder(Harness::codewhale_binary())
+            .cwd(workspace.workspace())
+            .clear_env()
+            .seal_home(workspace.home())
+            .env("DEEPSEEK_API_KEY", "sealed-resume-acceptance-key")
+            .env("DEEPSEEK_BASE_URL", &base_url)
+            .env("DEEPSEEK_MODEL", "deepseek-v4-pro")
+            .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
+            .env("CODEWHALE_NO_UPDATE_CHECK", "1")
+            .env("NO_ANIMATIONS", "1")
+            .env("RUST_LOG", "warn")
+            .args(args.iter().copied())
+            .size(40, 160)
+            .spawn()
+            .expect("start TUI")
+    };
+    let workspace_arg = workspace.workspace().to_str().expect("workspace UTF-8");
+    let mut tui = launch(&[
+        "--workspace",
+        workspace_arg,
+        "--no-project-config",
+        "--skip-onboarding",
+        "--fresh",
+    ]);
+    begin_new_session_from_startup(&mut tui);
+    expect_visible(&mut tui, "binary fixture acknowledged", "first reply");
+    wait_for_composer_ready(&mut tui);
+    submit_tui_command(&mut tui, "/exit");
+    assert_eq!(tui.wait_for_exit(BINARY_ACCEPTANCE_TIMEOUT), Some(0));
+    let _ = tui.shutdown();
 
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
+    for round in 1..=2 {
+        let mut tui = launch(&["resume", "--last"]);
+        if tui
+            .wait_for_text("Resumed session", BINARY_ACCEPTANCE_TIMEOUT)
+            .is_err()
+        {
+            panic!(
+                "resume {round} of a continued session failed\n{}",
+                short_diagnostics(&mut tui, None)
+            );
+        }
+        wait_for_composer_ready(&mut tui);
+        let prompt = format!("continue round {round}");
+        tui.type_line(&prompt).expect("send the resumed turn");
+        expect_visible(&mut tui, &prompt, "resumed prompt");
+        tui.wait_for_idle(
+            std::time::Duration::from_millis(500),
+            BINARY_ACCEPTANCE_TIMEOUT,
+        )
+        .expect("resumed turn settles");
+        wait_for_composer_ready(&mut tui);
+        submit_tui_command(&mut tui, "/exit");
+        assert_eq!(
+            tui.wait_for_exit(BINARY_ACCEPTANCE_TIMEOUT),
+            Some(0),
+            "round {round} exits cleanly"
+        );
+        let _ = tui.shutdown();
     }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
+    let _ = shutdown_tx.send(());
+    let _ = model_thread.join();
 }

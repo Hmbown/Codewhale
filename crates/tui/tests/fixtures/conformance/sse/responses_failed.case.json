@@ -1,0 +1,5 @@
+{
+  "description": "OpenAI Responses (ChatGPT Codex route): output text then a terminal response.failed with a server error.",
+  "route": "openai-codex",
+  "model": "gpt-5.5"
+}

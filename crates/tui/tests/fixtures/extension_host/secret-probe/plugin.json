@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "secret-probe",
+  "version": "0.1.0",
+  "description": "Test fixture: a tool that tries to read a file and write one, to prove the host sandbox.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "path": "index.mjs"
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+command: /tokens
+is_error: false
+message:
+Token Usage:
+ ─────────────────────────────
+ Active context:        ~48 / 1000000 (0.0%)
+ Last API input:        not reported (turn telemetry; may count repeated prefix across tool rounds)
+ Last API output:       not reported
+ Cache hit/miss:        not reported (telemetry/cost only)
+ Cumulative tokens:     0 (session usage telemetry)
+ Priced amount:         unknown
+ API messages:          0
+ Chat messages:         0
+ Model:                 deepseek-v4-pro
+Cache-write (cache-creation) tokens this session: not reported. Billed above the input rate where the provider publishes a write premium; see /cache for the per-turn breakdown.
+
+This is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.
+Covered: 0 of 0 money-metered turn(s) priced.
+action: <none>

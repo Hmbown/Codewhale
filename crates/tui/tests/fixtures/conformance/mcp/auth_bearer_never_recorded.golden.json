@@ -1,0 +1,127 @@
+{
+  "requests_summary": {
+    "authorization_shapes": [
+      "<bearer>"
+    ],
+    "rpcs": [
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+      "tools/list"
+    ],
+    "statuses": [
+      200,
+      202,
+      401,
+      500
+    ]
+  },
+  "server_received": [
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "echo"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "echo_credential"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "revoked"
+    }
+  ],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "A buggy server: answers 500 and repeats the Authorization header.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo_credential"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "The token stops being accepted mid-session.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_revoked"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "authenticated",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP Streamable HTTP rejected (transport=http url=<SERVER_URL> status=500 Internal Server Error): upstream failure while handling Authorization: Bearer ***",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_echo_credential"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": "MCP tool failed: MCP server 'conformance' requires authentication (◆ auth required); MCP server 'conformance' authenticates with the environment variable CODEWHALE_CONFORMANCE_MCP_TOKEN; the server rejected that credential. Correct it, then run `/mcp reload`.",
+          "content_blocks": [],
+          "metadata": {
+            "mcp_catalog_changed": true
+          },
+          "success": false
+        }
+      },
+      "tool": "mcp_conformance_revoked"
+    },
+    {
+      "op": "catalog",
+      "tools": []
+    }
+  ]
+}

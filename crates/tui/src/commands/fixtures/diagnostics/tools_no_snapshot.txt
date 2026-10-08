@@ -1,0 +1,5 @@
+command: /tools
+is_error: false
+message:
+Tool request snapshot unavailable — no model request has been captured for the latest turn.
+action: <none>

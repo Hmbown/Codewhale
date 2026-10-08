@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use codewhale_config::{ResolvedRuntimeOptions, SetupState};
+use codewhale_config::{ResolvedRuntimeOptions, SetupState, TelemetrySource};
 
 use crate::buffer;
 use crate::event::Surface;
@@ -214,7 +214,7 @@ pub fn decide(
 /// A genuinely missing record is a fresh installation and therefore uses the
 /// documented default. An existing record that cannot be read or parsed may
 /// contain a durable decline, so it fails closed instead of being replaced by
-/// a default-on value.
+/// a fresh default.
 #[must_use]
 pub fn load_setup_state_for_decision() -> Option<SetupState> {
     let path = SetupState::path().ok()?;
@@ -242,11 +242,10 @@ pub fn load_setup_state_for_decision_at(path: &Path) -> Option<SetupState> {
 ///    by the former opt-in notice.
 /// 3. No resolvable home → `ForcedOff`.
 /// 4. Endpoint configured but refused by [`validate_endpoint`] → `ForcedOff`.
-/// 5. Otherwise `Enabled`.
+/// 5. Otherwise `Enabled`, including an absent configuration preference.
 ///
-/// The notice is only ever *rendered* on a TTY. The interactive TUI draws a
-/// localized nonblocking disclosure before telemetry is armed; headless
-/// surfaces use the same documented default and kill switches.
+/// The disclosure is policy metadata, not a consent gate. Every armed surface
+/// presents a startup disclosure; the TUI also has a localized notice.
 pub fn decide_in_home(
     home: Option<&Path>,
     resolved: &ResolvedRuntimeOptions,
@@ -285,7 +284,12 @@ fn evaluate_in_home(
     // 1. An explicit persistent "off" is an opt-out and wipes. Run-scoped or
     //    invalid-value false is only a kill switch and leaves disk alone.
     if !resolved.telemetry {
-        if resolved.telemetry_explicit_off {
+        if resolved.telemetry_explicit_off
+            || (resolved.telemetry_source == TelemetrySource::Default
+                && setup.telemetry_opted_out())
+        {
+            // A run-scoped preference must not hide a durable decline in
+            // the sidecar when the config register was never written.
             return TelemetryEvaluation::OptedOut(root);
         }
         return TelemetryEvaluation::ForcedOff;
@@ -297,7 +301,7 @@ fn evaluate_in_home(
         return TelemetryEvaluation::OptedOut(root);
     }
 
-    // 3. Nowhere to keep an install id or a buffer.
+    // Nowhere to keep an install id or a buffer.
     let Some(root) = root else {
         return TelemetryEvaluation::ForcedOff;
     };

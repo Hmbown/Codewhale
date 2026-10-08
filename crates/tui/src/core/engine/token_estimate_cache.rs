@@ -1,6 +1,13 @@
-//! Process-local memoization for [`crate::compaction::estimate_input_tokens_conservative`].
+//! Process-local memoization for [`crate::compaction::estimate_input_tokens_for_pressure`].
 //!
-//! The token estimator walks the full [`crate::models::Message`] history and the
+//! This is the engine's one pressure number: the same un-inflated estimate the
+//! auto-compaction gate, the compaction preflight, the TUI context meter and
+//! the `/context` headline read, so compaction receipts and the context-budget
+//! snapshot agree with them (0.10.1 item 9). The 1.5x-inflated
+//! `estimate_input_tokens_conservative` is request-overflow protection only
+//! and is deliberately not cached here.
+//!
+//! The token estimator walks the full [`codewhale_models::Message`] history and the
 //! active system prompt, which is by far the most expensive per-turn CPU cost
 //! in the engine hot path. The same input data is queried from at least five
 //! sites per turn: capacity pre/post tool checkpoints, error escalation,
@@ -20,15 +27,15 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::compaction::estimate_input_tokens_conservative;
-use crate::models::{Message, SystemPrompt};
+use crate::compaction::estimate_input_tokens_for_pressure;
+use codewhale_models::{Message, SystemPrompt};
 
 /// Default capacity for the rolling audit ring. Sized so a 64-entry window
 /// covers a full capacity controller observation cycle without unbounded
 /// growth on long-running sessions.
 const AUDIT_RING_CAPACITY: usize = 64;
 
-/// Process-local memoization for `estimate_input_tokens_conservative`.
+/// Process-local memoization for `estimate_input_tokens_for_pressure`.
 ///
 /// The cache is keyed on the `(messages_revision, system_fingerprint)`
 /// pair, both of which the engine bumps on every content change. On a hit
@@ -85,7 +92,7 @@ impl TokenEstimateCache {
             return tokens;
         }
 
-        let tokens = estimate_input_tokens_conservative(messages, system_prompt);
+        let tokens = estimate_input_tokens_for_pressure(messages, system_prompt);
         self.messages_revision = messages_revision;
         self.system_fingerprint = system_fingerprint;
         self.cached_tokens = Some(tokens);
@@ -166,8 +173,8 @@ fn fingerprint_system_prompt(system: Option<&SystemPrompt>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Role;
-    use crate::models::{ContentBlock, SystemBlock};
+    use codewhale_models::Role;
+    use codewhale_models::{ContentBlock, SystemBlock};
 
     fn user_text(s: &str) -> Message {
         Message {

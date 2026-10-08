@@ -11,9 +11,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::tui::app::App;
 use crate::tui::pager::PagerView;
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 

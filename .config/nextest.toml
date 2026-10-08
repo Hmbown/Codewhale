@@ -1,10 +1,12 @@
 # cargo-nextest profile for contributors (`cargo nextest run --workspace`).
 #
-# `cargo test --workspace --all-features --locked` remains the authoritative
-# release gate. nextest is a faster local loop: it runs each test in its own
-# process, so the 10k-test codewhale-tui unit suite finishes in well under
-# half the wall-clock time of libtest on a multi-core machine, and slow or
-# hanging tests are named instead of stalling the whole binary.
+# Required GitHub CI and RC/release parity use nextest plus Cargo doctests.
+# nextest runs each test in its own process; that does not establish a pass
+# under libtest's shared-process globals. GH6698 separately requires two full
+# `cargo test --workspace --all-features --locked -- --format=pretty` passes
+# at one exact revision. CI's manual `shared-process-twice` mode records that
+# evidence; adding the mode or passing nextest does not satisfy the issue.
+# nextest also remains a faster local loop with named slow/hanging tests.
 #
 # Because tests no longer share a process, integration suites that serialize
 # on in-process locks must be bounded here when they contend for mock-server
@@ -34,6 +36,20 @@ telemetry-contract = { max-threads = 1 }
 # parallel load the file never appears (#5355). Serialize them; do not drop
 # the tests.
 exec-persistent-service = { max-threads = 1 }
+# Fleet manager lifecycle tests start real `/bin/sh` workers under setsid and
+# wait 10-15 s for the child's first line. Under full macOS CI load that line
+# never ran for three overlapping tests (#6424, #6428 runs), while each
+# passed alone from the same binary in under 1.2 s. Serialize the module; do
+# not lengthen its deadlines or drop tests. The product side of the load
+# (a durable heartbeat and a `ps` sample on every scheduler tick) is now
+# bounded to once a second per worker.
+fleet-manager-lifecycle = { max-threads = 1 }
+# Extension fixtures launch real Node hosts, and the production handshake
+# deadline is 30 s (`HANDSHAKE_DEADLINE`, raised from 5 s: Windows full-suite
+# runs on #6776/#6780 reported ordinary hosts missing the old one). Bound
+# contention across nextest processes; keep production deadlines and the
+# explicit hang-detection tests unchanged.
+extension-host = { max-threads = 1 }
 
 # First matching test-group override wins. Keep these more-specific
 # integration filters before binary(integration) so they are not stolen
@@ -41,6 +57,30 @@ exec-persistent-service = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^telemetry_contract::/)'
 test-group = 'telemetry-contract'
+
+# Same hazard, different binary. `telemetry_kill_switch_dispatch` is a
+# codewhale-cli integration binary, not `integration`, so none of the filters
+# below ever matched it and it ran at full parallelism beside ~15.7k tests.
+# Each of its cases spawns the real binary, which gives a detached writer
+# thread only CLI_PERSIST_TIMEOUT (250 ms, crates/telemetry/src/lib.rs) to
+# re-read config from disk and fsync its batch before the process exits. Under
+# Ubuntu CI load that deadline is missed and the dry-run receipt never lands —
+# observed at telemetry_kill_switch_dispatch.rs:180 on PR #6104 (2026-09-12)
+# and again on PR #6267 (2026-09-16), both Ubuntu-only, both on changes that
+# touch neither telemetry nor the CLI.
+[[profile.default.overrides]]
+filter = 'binary(telemetry_kill_switch_dispatch)'
+test-group = 'telemetry-contract'
+
+[[profile.default.overrides]]
+filter = 'package(codewhale-tui) & kind(lib) & test(/^fleet::manager::tests::/)'
+test-group = 'fleet-manager-lifecycle'
+
+[[profile.default.overrides]]
+# DSH preparation also launches the isolated host against the shared hermetic
+# home. Keep its ACL grants/retirement in this existing serial lane.
+filter = 'package(codewhale-tui) & kind(lib) & (test(/^extension_host::/) | test(/^core::engine::.*extension/) | test(/^plugins::install::dsh::/) | test(/^plugins::tests::dsh_/) | test(/^runtime_api::tests::dsh_package_preview_then_exact_install_over_http$/) | test(/^commands::contract::tests::plugin_adapter_dsh_preview_runs_from_live_runtime$/) | test(/^commands::groups::plugins::tests::dsh_import_reviews_without_installing_then_installs_the_exact_bundle$/))'
+test-group = 'extension-host'
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^exec_persistent_service::/)'
@@ -55,6 +95,21 @@ test-group = 'spawns-binaries'
 # slow test in full so the run log is enough to diagnose without rerunning.
 [profile.ci]
 retries = 0
+# A test that runs past ten minutes is a hang, not a slow test: terminate it
+# and surface its captured output instead of letting the job die at the
+# runner's 90-minute limit with no diagnostics (v0.9.12 Windows candidate).
+slow-timeout = { period = "60s", terminate-after = 10 }
 fail-fast = false
 final-status-level = "slow"
 failure-output = "immediate-final"
+
+# Exact compiled-image Native delivery receipt comes from this same full run.
+# Only the fixed containment and memory marker/output is retained on success; the rest
+# of the workspace keeps its existing output policy.
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "codewhale-native-host"
+
+[[profile.ci.overrides]]
+filter = 'package(codewhale-tui) & kind(lib) & (test(/^extension_host::tests::compiled_native_host_cannot_read_secrets_or_write_outside_its_data_dir$/) | test(/^extension_host::tests::compiled_native_host_memory_cap_is_enforced$/))'
+junit.store-success-output = true

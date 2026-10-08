@@ -19,9 +19,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use codewhale_models::{ContentBlock, Message};
+
 use crate::{
     core::events::{Event as EngineEvent, TurnOutcomeStatus},
-    models::{ContentBlock, Message},
     runtime_chat_relay::{
         RuntimeChatControlScope, RuntimeChatProjection, RuntimeChatPrompt, RuntimeChatRelayHost,
     },
@@ -334,6 +335,7 @@ impl ClassicSessionOwnerLock {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd as _;
+            // SAFETY: `file` is open and live.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(CLASSIC_LEASE_SCOPE_ERROR.to_string());
             }
@@ -342,11 +344,38 @@ impl ClassicSessionOwnerLock {
         {
             use std::os::windows::io::AsRawHandle as _;
             use windows_sys::Win32::Storage::FileSystem::LockFile;
+            // SAFETY: `file` is open and live.
             if unsafe { LockFile(file.as_raw_handle() as _, 0, 0, u32::MAX, u32::MAX) } == 0 {
                 return Err(CLASSIC_LEASE_SCOPE_ERROR.to_string());
             }
         }
         Ok(Self { _file: file })
+    }
+}
+
+impl Drop for ClassicSessionOwnerLock {
+    fn drop(&mut self) {
+        // close() alone does not release the lock while a descriptor
+        // duplicated into a child spawned between fork and exec still shares
+        // this open file description; unlocking first lets a same-process
+        // reopen proceed (#5735, #6698), as the relay and runtime store locks do.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: Drop runs only while `_file` still owns this descriptor.
+            unsafe {
+                libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+            // SAFETY: Drop runs only while `_file` still owns this handle.
+            unsafe {
+                UnlockFile(self._file.as_raw_handle() as _, 0, 0, u32::MAX, u32::MAX);
+            }
+        }
     }
 }
 
@@ -1601,6 +1630,20 @@ impl RemoteControlController {
         }
     }
 
+    /// Test-only: advertise a validated live session link without a control
+    /// plane. Mirrors the shape the runner-lease parser installs (`Connected`
+    /// plus validated links) so `/rc link`/`/rc open` routing can be exercised
+    /// deterministically offline.
+    #[cfg(test)]
+    pub(crate) fn install_live_link_for_test(&mut self, run_url: &str, computer_url: Option<&str>) {
+        self.status = Status::Connected;
+        self.status_detail = "test link".to_string();
+        self.links = RemoteLinks {
+            run_url: Some(run_url.to_string()),
+            computer_url: computer_url.map(str::to_string),
+        };
+    }
+
     pub fn status_line(&self) -> String {
         match self.status {
             Status::Off => "Remote control: off".to_string(),
@@ -1665,6 +1708,21 @@ impl RemoteControlController {
     /// instead of double-answering the engine. First decision wins; the
     /// other surface is told.
     pub fn resolve_pending_approval(&mut self, tool_id: &str, approved: bool) -> bool {
+        self.settle_pending_approval(
+            tool_id,
+            if approved { "approved" } else { "denied" },
+            "terminal",
+        )
+    }
+
+    /// The request's wait ended without a decision from any surface — its
+    /// agent's work ended, or it was answered through another path. Retire
+    /// the web's copy as `withdrawn`, never as a person's denial.
+    pub fn withdraw_pending_approval(&mut self, tool_id: &str) -> bool {
+        self.settle_pending_approval(tool_id, "withdrawn", "agent")
+    }
+
+    fn settle_pending_approval(&mut self, tool_id: &str, decision: &str, decided_by: &str) -> bool {
         let gate = projected_approval_id(tool_id);
         if self.pending_approvals.remove(&gate).is_none() {
             return false;
@@ -1677,8 +1735,8 @@ impl RemoteControlController {
                 json!({
                     "id": gate,
                     "approval_id": gate,
-                    "decision": if approved { "approved" } else { "denied" },
-                    "decided_by": "terminal",
+                    "decision": decision,
+                    "decided_by": decided_by,
                 }),
             );
         }
@@ -2215,6 +2273,12 @@ impl RemoteControlController {
             );
         }
         gate
+    }
+
+    pub fn pending_approval_tool_id(&self, gate: &str) -> Option<String> {
+        self.pending_approvals
+            .get(gate)
+            .map(|approval| approval.tool_id.clone())
     }
 
     pub fn take_pending_approval(&mut self, gate: &str) -> Option<String> {
@@ -3169,7 +3233,7 @@ async fn relay_worker(
     phase: &mut RelayPhase,
 ) -> Result<(), String> {
     let base = runner_control_plane_base()?;
-    let client = Client::builder()
+    let client = crate::tls::reqwest_client_builder()
         .https_only(!cfg!(debug_assertions))
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
@@ -3225,8 +3289,16 @@ async fn relay_worker(
     runtime_upload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut runtime_chat_tick = tokio::time::interval(RUNTIME_UPLOAD_RETRY_INTERVAL);
     runtime_chat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // One deadline across loop iterations. Reconstructing `sleep(SYNC_INTERVAL)`
+    // lets the 250ms Runtime Chat tick reset poll/heartbeat/token refresh.
+    let mut sync_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + SYNC_INTERVAL, SYNC_INTERVAL);
+    sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut runtime_retry_delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
     let mut runtime_retry_not_before = Instant::now();
+    // One credential refresh per rejection streak (see
+    // `RUNTIME_REFRESHED_CREDENTIAL_REFUSED`).
+    let mut runtime_refreshed_since_accept = false;
 
     loop {
         tokio::select! {
@@ -3349,11 +3421,15 @@ async fn relay_worker(
                     RuntimeFlushOutcome::Accepted { run_id, cursor } => {
                         runtime_retry_delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
                         runtime_retry_not_before = Instant::now();
+                        runtime_refreshed_since_accept = false;
                         event_tx
                             .send(RemoteEvent::RuntimeCursor { run_id, cursor })
                             .map_err(|_| "The terminal remote-control owner stopped.".to_string())?;
                     }
                     RuntimeFlushOutcome::AccessTokenExpired => {
+                        if std::mem::replace(&mut runtime_refreshed_since_accept, true) {
+                            return Err(RUNTIME_REFRESHED_CREDENTIAL_REFUSED.to_string());
+                        }
                         refresh_enrollment_and_reconnect(
                             &client,
                             &mut enrollment,
@@ -3375,7 +3451,7 @@ async fn relay_worker(
                         .map_err(|_| "The terminal remote-control owner stopped.".to_string())?;
                 }
             }
-            () = tokio::time::sleep(SYNC_INTERVAL) => {
+            _ = sync_tick.tick() => {
                 if enrollment_needs_refresh(&enrollment) {
                     // Proactive refresh before expiry; reconnect to keep runner lease valid.
                     match refresh_enrollment(&client, enrollment.persisted.clone()).await {
@@ -3631,6 +3707,12 @@ impl RuntimeTransportOutbox {
     }
 }
 
+/// A runtime event refused (401/403) again right after a successful
+/// credential refresh is a terminal rejection, not an expired token: a
+/// revoked runner or a run this runner may not write. Refreshing again would
+/// loop at the upload retry interval forever.
+const RUNTIME_REFRESHED_CREDENTIAL_REFUSED: &str = "The remote-control server refused runtime events again with a freshly refreshed credential; stopping instead of retrying.";
+
 /// Flushes every queued runtime envelope through the server-confirmed cursor
 /// before a stop may be acknowledged. Emits `RuntimeCursor` events so the
 /// controller compacts its journal as acknowledgements land. Failing to drain
@@ -3647,6 +3729,7 @@ async fn drain_runtime_outbox_for_stop(
     deadline: Instant,
 ) -> Result<(), String> {
     let mut delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
+    let mut refreshed_since_accept = false;
     while !outbox.events.is_empty() {
         if Instant::now() >= deadline {
             return Err(
@@ -3658,6 +3741,7 @@ async fn drain_runtime_outbox_for_stop(
             RuntimeFlushOutcome::Idle => break,
             RuntimeFlushOutcome::Accepted { run_id, cursor } => {
                 delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
+                refreshed_since_accept = false;
                 let _ = event_tx.send(RemoteEvent::RuntimeCursor { run_id, cursor });
             }
             RuntimeFlushOutcome::Retryable => {
@@ -3665,6 +3749,9 @@ async fn drain_runtime_outbox_for_stop(
                 delay = delay.saturating_mul(2).min(RUNTIME_UPLOAD_MAX_BACKOFF);
             }
             RuntimeFlushOutcome::AccessTokenExpired => {
+                if std::mem::replace(&mut refreshed_since_accept, true) {
+                    return Err(RUNTIME_REFRESHED_CREDENTIAL_REFUSED.to_string());
+                }
                 refresh_enrollment_and_reconnect(client, enrollment, runner_id, start, event_tx)
                     .await?;
             }
@@ -4390,6 +4477,9 @@ fn parse_remote_command(value: &Value, expected_run_id: &str) -> Result<RemoteCo
     }
     match value.get("type").and_then(Value::as_str) {
         Some("prompt.request") => {
+            if value.get("images").is_some() && value.get("runtimeBindingId").is_none() {
+                return Err("Image input is unavailable for legacy remote Work; use native Runtime or Runtime Chat.".to_string());
+            }
             let exact_legacy_prompt = value.as_object().is_some_and(|record| {
                 record.len() == 4
                     && ["type", "runId", "turnId", "prompt"]
@@ -4571,7 +4661,12 @@ async fn runner_request(
             None => format!("The remote-control server rejected a request ({status})."),
         });
     }
-    read_bounded_json(response).await
+    let limit = if segments.last() == Some(&"commands") {
+        codewhale_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
+    read_bounded_json_with_limit(response, limit).await
 }
 
 async fn public_request(
@@ -4642,18 +4737,29 @@ fn sanitized_rejection_excerpt(body: &[u8]) -> Option<String> {
 }
 
 async fn read_bounded_json(response: reqwest::Response) -> Result<Value, String> {
+    read_bounded_json_with_limit(response, MAX_RESPONSE_BYTES).await
+}
+
+async fn read_bounded_json_with_limit(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Value, String> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
         return Err("Codewhale returned an oversized remote-control response.".to_string());
     }
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| "Codewhale returned an unreadable response.".to_string())?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err("Codewhale returned an oversized remote-control response.".to_string());
+        .map_err(|_| "Codewhale returned an unreadable response.".to_string())?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err("Codewhale returned an oversized remote-control response.".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes)
         .map_err(|_| "Codewhale returned an invalid remote-control response.".to_string())
@@ -4966,8 +5072,11 @@ fn epoch_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Role;
-    use std::sync::{Arc, Mutex};
+    use codewhale_models::Role;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use wiremock::{
         Mock, MockServer, Request, Respond, ResponseTemplate,
         matchers::{body_json, method, path, query_param},
@@ -4976,6 +5085,18 @@ mod tests {
     #[derive(Clone, Default)]
     struct AmbiguousRuntimeResponder {
         bodies: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct ControlPollCounter {
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl Respond for ControlPollCounter {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({ "runs": [] }))
+        }
     }
 
     impl Respond for AmbiguousRuntimeResponder {
@@ -5072,8 +5193,8 @@ mod tests {
     #[test]
     fn observed_git_repo_is_owner_name_not_a_path() {
         assert_eq!(
-            normalize_observed_git_repo("git@github.com:Hmbown/CodeWhale.git").as_deref(),
-            Some("Hmbown/CodeWhale")
+            normalize_observed_git_repo("git@github.com:codewhale-hq/CodeWhale.git").as_deref(),
+            Some("codewhale-hq/CodeWhale")
         );
         assert_eq!(
             normalize_observed_git_repo("https://github.com/Hmbown/cwc.git").as_deref(),
@@ -5103,9 +5224,9 @@ mod tests {
     fn connect_body_can_carry_an_observed_repo_without_a_path() {
         let enrollment = fixture_enrollment("https://api.codewhale.net/");
         let mut start = fixture_start();
-        start.git_remote = Some("git@github.com:Hmbown/CodeWhale.git".to_string());
+        start.git_remote = Some("git@github.com:codewhale-hq/CodeWhale.git".to_string());
         let body = connect_runner_body(&enrollment, &start);
-        assert_eq!(body["gitRemote"], "Hmbown/CodeWhale");
+        assert_eq!(body["gitRemote"], "codewhale-hq/CodeWhale");
         assert!(body.get("workspacePath").is_none());
         assert!(body.get("path").is_none());
     }
@@ -5698,6 +5819,107 @@ mod tests {
         assert!(!host.projection_is_claimed_for_tests("thr_claimed", 7));
     }
 
+    #[tokio::test]
+    async fn idle_runtime_chat_ticks_cannot_starve_the_control_poll() {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let _env = crate::test_support::lock_test_env();
+        let secrets_root = tempfile::tempdir().expect("isolated remote-control secrets");
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", secrets_root.path());
+        let server = MockServer::start().await;
+        let plane = format!("{}/", server.uri().trim_end_matches('/'));
+        let _control_plane =
+            crate::test_support::EnvVarGuard::set("CWC_RUNNER_CONTROL_PLANE_BASE", &plane);
+        let base = runner_control_plane_base().expect("loopback control plane");
+        save_persisted_enrollment(&fixture_enrollment(&base).persisted)
+            .expect("persist matching enrollment");
+
+        let access_token = crate::test_support::future_test_jwt(&"a".repeat(40));
+        Mock::given(method("POST"))
+            .and(path("/api/runner/enrollments/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "enrollment": {
+                    "id": "enrollment_fixture",
+                    "userId": "account_fixture",
+                    "deviceId": "device_fixture",
+                    "runtimeVersion": "0.9.6",
+                    "runtimeCommit": "a".repeat(40),
+                    "capabilities": CAPABILITIES,
+                },
+                "credential": { "accessToken": access_token },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/local-runners/connect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture_connection_response()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/local-runners/runner_fixture/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let polls = ControlPollCounter::default();
+        Mock::given(method("GET"))
+            .and(path("/api/local-runners/runner_fixture/runs"))
+            .respond_with(polls.clone())
+            .mount(&server)
+            .await;
+
+        let runtime_root = tempfile::tempdir().expect("idle Runtime Chat host");
+        let host = RuntimeChatRelayHost::open(
+            crate::config::Config::default(),
+            Arc::new(crate::plugins::PluginRegistry::empty(runtime_root.path())),
+            runtime_root.path().to_path_buf(),
+            "target_fixture".to_string(),
+            "session_fixture".to_string(),
+        )
+        .expect("open idle Runtime Chat host");
+        let start = fixture_start();
+        let (_worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(async move {
+            let mut phase = RelayPhase::Enrolling;
+            relay_worker(start, Some(host), worker_rx, event_tx, &mut phase).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(RemoteEvent::Connected { .. }) => break,
+                    Some(RemoteEvent::Notice(_)) => {}
+                    Some(RemoteEvent::Failed(error)) => {
+                        panic!("relay worker failed before attach: {error}");
+                    }
+                    Some(RemoteEvent::FailedPreLease(error)) => {
+                        panic!("relay worker failed before attach: {error}");
+                    }
+                    Some(_) => panic!("relay worker emitted an unexpected event before attach"),
+                    None => panic!("relay worker stopped before attach"),
+                }
+            }
+        })
+        .await
+        .expect("relay worker should attach");
+
+        tokio::time::sleep(RUNTIME_UPLOAD_RETRY_INTERVAL.saturating_mul(2)).await;
+        assert_eq!(
+            polls.hits.load(Ordering::SeqCst),
+            0,
+            "the first control poll must still wait SYNC_INTERVAL while idle chat ticks fire"
+        );
+        tokio::time::sleep(SYNC_INTERVAL).await;
+        assert!(
+            polls.hits.load(Ordering::SeqCst) >= 1,
+            "idle Runtime Chat ticks must not reset the control poll"
+        );
+        worker.abort();
+        let _ = worker.await;
+    }
+
     #[test]
     fn preattachment_failure_cannot_release_a_recovered_unsettled_turn() {
         let root = tempfile::tempdir().unwrap();
@@ -5835,7 +6057,6 @@ mod tests {
 
     #[tokio::test]
     async fn connect_request_opts_into_runtime_chat_without_exposing_local_state() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         let enrollment = fixture_enrollment(&format!("{}/", server.uri()));
         let start = fixture_start();
@@ -5870,7 +6091,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -6224,6 +6445,7 @@ mod tests {
             content: "existing turn output".to_string(),
         });
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_existing".to_string(),
             name: "shell".to_string(),
             input: json!({ "never": "relayed" }),
@@ -6313,6 +6535,7 @@ mod tests {
             turn_id: "turn_started_later".to_string(),
             created_at: chrono::Utc::now(),
             route: None,
+            submission_id: None,
         });
         let WorkerCommand::Upload { envelopes, .. } =
             worker_rx.try_recv().expect("one typed turn start")
@@ -6575,7 +6798,6 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_success_retries_the_identical_runtime_event_until_cursor_acceptance() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         let responder = AmbiguousRuntimeResponder::default();
         Mock::given(method("POST"))
@@ -6587,7 +6809,7 @@ mod tests {
             .mount(&server)
             .await;
         let enrollment = fixture_enrollment(&format!("{}/", server.uri()));
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -7273,19 +7495,20 @@ mod tests {
         let mut stack = ViewStack::new();
         stack.push(card);
         assert!(
-            stack.top_matches_approval_gate(&gate_a),
-            "the matching gate must match"
-        );
-        assert!(
-            !stack.top_matches_approval_gate(&gate_b),
+            !stack.remove_approval_for_gate(&gate_b),
             "a different gate must NEVER match this card — the whole point of identity-aware dismissal"
         );
-        assert!(!stack.top_matches_approval_gate("local_approval_missing"));
+        assert!(!stack.remove_approval_for_gate("local_approval_missing"));
+        assert!(!stack.is_empty());
+        assert!(
+            stack.remove_approval_for_gate(&gate_a),
+            "the matching gate must match"
+        );
+        assert!(stack.is_empty());
     }
 
     #[tokio::test]
     async fn enrollment_rejection_carries_a_sanitized_actionable_reason() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/oauth/device"))
@@ -7295,7 +7518,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .https_only(false)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
@@ -7426,7 +7649,6 @@ mod tests {
 
     #[tokio::test]
     async fn cwc_runner_wire_contract_preserves_pending_and_recovery_commands() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/local-runners/runner-1/runs/run-1/commands"))
@@ -7492,7 +7714,7 @@ mod tests {
             },
             access_token: "fixture-runner-access-token".to_string(),
         };
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -7542,7 +7764,9 @@ mod tests {
 
     fn turn_complete_event() -> EngineEvent {
         EngineEvent::TurnComplete {
-            usage: crate::models::Usage::default(),
+            usage: codewhale_models::Usage::default(),
+            parent_route_usage: codewhale_models::Usage::default(),
+            routed_usage_dropped_records: 0,
             status: TurnOutcomeStatus::Completed,
             error: None,
             tool_catalog: None,
@@ -7682,7 +7906,6 @@ mod tests {
 
     #[tokio::test]
     async fn stop_drain_flushes_runtime_outbox_with_byte_identical_retries() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         let responder = AmbiguousRuntimeResponder::default();
         Mock::given(method("POST"))
@@ -7695,7 +7918,7 @@ mod tests {
             .await;
         let mut enrollment = fixture_enrollment(&format!("{}/", server.uri()));
         let mut runner_id = "runner_fixture".to_string();
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -7741,8 +7964,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_drain_stops_when_a_fresh_credential_is_refused_again() {
+        let _env = crate::test_support::lock_test_env();
+        let secrets_root = tempfile::tempdir().expect("isolated remote-control secrets");
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", secrets_root.path());
+        let server = MockServer::start().await;
+        // A terminal refusal: the runner may not write this run, and a new
+        // access token does not change that.
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/local-runners/runner_fixture/runs/run_fixture/events",
+            ))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let access_token = crate::test_support::future_test_jwt(&"a".repeat(40));
+        Mock::given(method("POST"))
+            .and(path("/api/runner/enrollments/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "enrollment": {
+                    "id": "enrollment_fixture",
+                    "userId": "account_fixture",
+                    "deviceId": "device_fixture",
+                    "runtimeVersion": "0.9.6",
+                    "runtimeCommit": "a".repeat(40),
+                    "capabilities": CAPABILITIES,
+                },
+                "credential": { "accessToken": access_token },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/local-runners/connect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture_connection_response()))
+            .mount(&server)
+            .await;
+        let mut enrollment = fixture_enrollment(&format!("{}/", server.uri()));
+        let mut runner_id = "runner_fixture".to_string();
+        let client = crate::tls::reqwest_client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("fixture client");
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut outbox = RuntimeTransportOutbox::default();
+        outbox
+            .enqueue(
+                "run_fixture",
+                runtime_envelope(
+                    1,
+                    "turn.completed",
+                    Some("turn_fixture"),
+                    "2026-08-08T12:00:00Z".to_string(),
+                    json!({ "turn": { "status": "completed", "usage": {} } }),
+                ),
+            )
+            .expect("queue terminal envelope");
+
+        let error = drain_runtime_outbox_for_stop(
+            &client,
+            &mut enrollment,
+            &mut runner_id,
+            &fixture_start(),
+            &event_tx,
+            &mut outbox,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a refusal that survives a refresh must end the drain");
+        assert_eq!(error, RUNTIME_REFRESHED_CREDENTIAL_REFUSED);
+        assert!(
+            !outbox.events.is_empty(),
+            "the refused envelope stays queued for a later, authorized resend"
+        );
+    }
+
+    #[tokio::test]
     async fn stop_drain_deadline_failure_refuses_to_confirm_stop() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(
@@ -7753,7 +8053,7 @@ mod tests {
             .await;
         let mut enrollment = fixture_enrollment(&format!("{}/", server.uri()));
         let mut runner_id = "runner_fixture".to_string();
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -8022,13 +8322,15 @@ mod tests {
         assert!(controller.has_active_run());
         assert!(controller.start(fixture_start()).is_err());
 
-        let usage = crate::models::Usage {
+        let usage = codewhale_models::Usage {
             input_tokens: 17,
             output_tokens: 5,
-            ..crate::models::Usage::default()
+            ..codewhale_models::Usage::default()
         };
         controller.observe_engine_event(&EngineEvent::TurnComplete {
             usage: usage.clone(),
+            parent_route_usage: usage.clone(),
+            routed_usage_dropped_records: 0,
             status: TurnOutcomeStatus::Completed,
             error: None,
             tool_catalog: None,
@@ -8200,6 +8502,24 @@ mod tests {
             .as_str()
             .unwrap();
         assert_ne!(first_recovery_turn, second_recovery_turn);
+    }
+
+    /// #6698: a process spawned between fork and exec while a journal is open
+    /// holds a duplicate of the lock descriptor. Dropping the journal must
+    /// still release the session lock, or the next same-process reopen fails
+    /// with the unfinished-account-turn error.
+    #[cfg(unix)]
+    #[test]
+    fn classic_session_lock_releases_while_a_duplicated_descriptor_survives() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("active_classic_fixture.lock");
+        let lock = ClassicSessionOwnerLock::acquire(&path).unwrap();
+        let inherited = lock._file.try_clone().unwrap();
+        drop(lock);
+        let reopened = ClassicSessionOwnerLock::acquire(&path)
+            .expect("dropping the owner releases the lock despite a surviving duplicate");
+        drop(reopened);
+        drop(inherited);
     }
 
     #[test]
@@ -8584,6 +8904,7 @@ mod tests {
         );
 
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_fixture".to_string(),
             name: "shell".to_string(),
             input: json!({}),
@@ -8610,5 +8931,60 @@ mod tests {
             panic!("the UI poll hands the deferred delta to the transport");
         };
         assert_eq!(envelopes[0]["payload"]["delta"], "again");
+    }
+    #[test]
+    fn runtime_image_legacy_work_never_downgrades_to_text() {
+        let image = crate::image_attach::tests::runtime_image_fixture(1);
+        let command = json!({"type":"prompt.request","runId":"run_fixture","turnId":"turn_fixture","prompt":"look","images":[image]});
+        assert!(
+            parse_remote_command(&command, "run_fixture")
+                .unwrap_err()
+                .contains("legacy remote Work")
+        );
+        let mut text = command;
+        text.as_object_mut().unwrap().remove("images");
+        assert!(matches!(
+            parse_remote_command(&text, "run_fixture").unwrap(),
+            RemoteCommand::Prompt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_image_command_response_has_bounded_larger_budget() {
+        use axum::{Router, routing::get};
+        let payload = serde_json::to_string(
+            &json!({"commands":[],"fixture": "x".repeat(MAX_RESPONSE_BYTES + 1)}),
+        )
+        .unwrap();
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let payload = payload.clone();
+                async move { payload }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = crate::tls::reqwest_client();
+        let url = format!("http://{addr}/");
+        assert!(
+            read_bounded_json(client.get(&url).send().await.unwrap())
+                .await
+                .is_err()
+        );
+        let parsed = read_bounded_json_with_limit(
+            client.get(&url).send().await.unwrap(),
+            codewhale_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parsed["fixture"].as_str().unwrap().len(),
+            MAX_RESPONSE_BYTES + 1
+        );
+        server.abort();
     }
 }

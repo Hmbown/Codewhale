@@ -30,6 +30,11 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 pub const SLOW_DOWN_STEP_SECS: u64 = 5;
 /// Never poll faster than once a second, whatever the server asks for.
 const MINIMUM_INTERVAL: Duration = Duration::from_secs(1);
+/// Longest lifetime a run honours. `expires_in` is untrusted server input, and
+/// `Instant + Duration` panics when the sum is unrepresentable, so a hostile
+/// or corrupt value is clamped here rather than at every caller. No real
+/// device grant lives anywhere near a day.
+const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What one poll of the token endpoint told us.
 ///
@@ -65,7 +70,7 @@ impl DeviceCodePoll {
         Self {
             interval: Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
             max_interval: None,
-            lifetime,
+            lifetime: lifetime.min(MAX_LIFETIME),
             wait_before_first_poll: false,
             timeout_message: timeout_message.into(),
             slow_down_timeout_message: None,
@@ -150,9 +155,9 @@ impl DeviceCodePoll {
                     // the clock drifts (WSL, suspended VMs).
                     interval = match interval_seconds.filter(|seconds| *seconds > 0) {
                         Some(seconds) => self.clamp_interval(Duration::from_secs(seconds)),
-                        None => {
-                            self.clamp_interval(interval + Duration::from_secs(SLOW_DOWN_STEP_SECS))
-                        }
+                        None => self.clamp_interval(
+                            interval.saturating_add(Duration::from_secs(SLOW_DOWN_STEP_SECS)),
+                        ),
                     };
                 }
             }
@@ -207,7 +212,7 @@ pub fn validate_browser_verification_uri(raw: &str, context: &str) -> Result<Str
 
 /// Minimal scheme/host/credential split, so this module stays free of a URL
 /// dependency (`codewhale-config` deliberately has no `reqwest`/`url`).
-fn url_scheme_and_host(raw: &str) -> Result<(String, String, bool), ()> {
+pub(crate) fn url_scheme_and_host(raw: &str) -> Result<(String, String, bool), ()> {
     let (scheme, rest) = raw.split_once("://").ok_or(())?;
     if scheme.is_empty()
         || !scheme
@@ -240,7 +245,7 @@ fn url_scheme_and_host(raw: &str) -> Result<(String, String, bool), ()> {
     ))
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     if host == "localhost" || host == "::1" {
         return true;
     }
@@ -267,6 +272,29 @@ mod tests {
             .expect("first poll completes");
         assert_eq!(value, "token");
         assert!(slept.borrow().is_empty(), "no sleep before the first poll");
+    }
+
+    /// `expires_in` and `interval` are untrusted: a hostile maximum must not
+    /// panic the deadline (`Instant + Duration`) or the `slow_down` step.
+    #[test]
+    fn untrusted_maximum_lifetime_and_interval_do_not_panic() {
+        let slept = RefCell::new(Vec::new());
+        let mut polls = 0;
+        let value = DeviceCodePoll::new(Duration::MAX, "timed out")
+            .interval_seconds(Some(u64::MAX))
+            .run(recording_sleep(&slept), || {
+                polls += 1;
+                Ok(if polls == 1 {
+                    DevicePollOutcome::SlowDown {
+                        interval_seconds: None,
+                    }
+                } else {
+                    DevicePollOutcome::Complete("token")
+                })
+            })
+            .expect("a clamped run still completes");
+        assert_eq!(value, "token");
+        assert!(slept.borrow().iter().all(|d| *d <= MAX_LIFETIME));
     }
 
     #[test]

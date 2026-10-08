@@ -1,0 +1,2 @@
+- name: ../../common.mjs
+  config: {text: A}

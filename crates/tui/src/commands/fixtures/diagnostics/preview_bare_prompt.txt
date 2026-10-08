@@ -1,0 +1,5 @@
+command: /preview-request --prompt
+is_error: false
+message:
+`--prompt` needs text after it. Usage: /preview-request [json] [--prompt <text>] | base-prompt  (flags first; --prompt takes the rest)
+action: <none>

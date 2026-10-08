@@ -207,8 +207,90 @@ fn apply_pure(
             }
             next.activities.push_bounded(event.clone());
         }
+        WorkGraphChange::PruneEndedOperations { keep } => {
+            prune_ended_operations(&mut next, *keep);
+        }
     }
     Ok(next)
+}
+
+/// Operation nodes that may be evicted: ended (not live, not `Stale` — a
+/// stale shell can still be recovered by a late owner report), bound to a
+/// non-durable owner, touched by no edge except an incoming `Contains`, and
+/// referenced by no activity or pending proposal.
+pub(crate) fn evictable_operations(g: &WorkGraphSnapshot) -> Vec<&WorkNode> {
+    use std::collections::HashSet;
+    let mut pinned: HashSet<&WorkNodeId> = HashSet::new();
+    for edge in &g.edges {
+        if edge.kind != EdgeKind::Contains {
+            pinned.insert(&edge.from);
+            pinned.insert(&edge.to);
+        } else {
+            pinned.insert(&edge.from);
+        }
+    }
+    for activity in g.activities.iter() {
+        let WorkActivityEvent::ReasoningEffortChanged { operation, .. } = activity;
+        if let Some(operation) = operation {
+            pinned.insert(operation);
+        }
+    }
+    for proposal in &g.proposals {
+        pinned.extend(proposal.removed_nodes.iter());
+        pinned.extend(proposal.updated_nodes.iter().map(|update| &update.id));
+        for edge in &proposal.added_edges {
+            pinned.insert(&edge.from);
+            pinned.insert(&edge.to);
+        }
+    }
+    g.nodes
+        .iter()
+        .filter(|node| {
+            node.kind == NodeKind::Operation
+                && matches!(
+                    node.state,
+                    NodeState::Completed
+                        | NodeState::Failed
+                        | NodeState::Cancelled
+                        | NodeState::Superseded
+                        | NodeState::Verified
+                )
+                && node
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| !binding.durable)
+                && !pinned.contains(&node.id)
+        })
+        .collect()
+}
+
+/// Keep the newest `keep` evictable operations (by `updated_at`, then
+/// insertion order, so the result is deterministic) and remove the rest with
+/// their `Contains` edges.
+fn prune_ended_operations(next: &mut WorkGraphSnapshot, keep: usize) {
+    let positions: std::collections::HashMap<&WorkNodeId, usize> = next
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(position, node)| (&node.id, position))
+        .collect();
+    let mut evictable: Vec<(i64, usize, WorkNodeId)> = evictable_operations(next)
+        .into_iter()
+        .map(|node| (node.updated_at, positions[&node.id], node.id.clone()))
+        .collect();
+    drop(positions);
+    let Some(excess) = evictable.len().checked_sub(keep).filter(|n| *n > 0) else {
+        return;
+    };
+    evictable.sort();
+    let evicted: std::collections::HashSet<WorkNodeId> = evictable
+        .into_iter()
+        .take(excess)
+        .map(|(_, _, id)| id)
+        .collect();
+    next.nodes.retain(|node| !evicted.contains(&node.id));
+    next.edges
+        .retain(|edge| !evicted.contains(&edge.from) && !evicted.contains(&edge.to));
 }
 
 fn add_node(next: &mut WorkGraphSnapshot, node: WorkNode) -> Result<(), ValidationReport> {

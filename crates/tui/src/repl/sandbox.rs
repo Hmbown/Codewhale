@@ -5,32 +5,62 @@
 //! `FINAL(...)` and routing sub-LLM RPCs are handled inside the runtime via
 //! a stdin/stdout protocol — no scraping required here.
 
-/// Check if a string contains a `` ```repl `` fenced code block.
-pub fn has_repl_block(text: &str) -> bool {
-    text.contains("```repl")
+const REPL_FENCE: &str = "```repl";
+
+/// Byte offset of the first opening `` ```repl `` fence at or after `from`.
+///
+/// A fence must open its own line (up to three spaces of indent, as in
+/// Markdown) and carry no other info string. Prose that mentions the fence
+/// mid-line, or a `` ```repl-output `` block, is not code to execute.
+fn next_repl_fence(text: &str, from: usize) -> Option<usize> {
+    let mut line_start = if from == 0 || text.as_bytes().get(from - 1) == Some(&b'\n') {
+        from
+    } else {
+        from + text[from..].find('\n')? + 1
+    };
+    loop {
+        let line_end = text[line_start..]
+            .find('\n')
+            .map_or(text.len(), |offset| line_start + offset);
+        let line = &text[line_start..line_end];
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent <= 3
+            && line[indent..]
+                .strip_prefix(REPL_FENCE)
+                .is_some_and(|info| info.trim().is_empty())
+        {
+            return Some(line_start + indent);
+        }
+        if line_end >= text.len() {
+            return None;
+        }
+        line_start = line_end + 1;
+    }
 }
 
-/// Extract every `` ```repl `` block from `text` with byte offsets.
+/// Check if a string contains a `` ```repl `` fence that opens its own line.
+pub fn has_repl_block(text: &str) -> bool {
+    next_repl_fence(text, 0).is_some()
+}
+
+/// Extract every line-anchored `` ```repl `` block from `text` with byte offsets.
 pub fn extract_repl_blocks(text: &str) -> Vec<ReplBlock> {
     let mut blocks = Vec::new();
-    let mut rest = text;
+    let mut search_from = 0;
 
-    while let Some(start_idx) = rest.find("```repl") {
-        let after_fence = &rest[start_idx..];
+    while let Some(start) = next_repl_fence(text, search_from) {
+        let after_fence = &text[start..];
         let code_start = after_fence.find('\n').unwrap_or(after_fence.len());
         let code_region = &after_fence[code_start..];
         let Some(end_offset) = code_region.find("\n```") else {
             break;
         };
-        let code = code_region[..end_offset].to_string();
-        let global_start = text.len() - rest.len() + start_idx;
-        let global_end = global_start + code_start + end_offset + 3;
         blocks.push(ReplBlock {
-            code,
-            start_offset: global_start,
-            end_offset: global_end,
+            code: code_region[..end_offset].to_string(),
+            start_offset: start,
+            end_offset: start + code_start + end_offset + 3,
         });
-        rest = &after_fence[code_start + end_offset + 4..];
+        search_from = start + code_start + end_offset + 4;
     }
 
     blocks
@@ -50,7 +80,8 @@ mod tests {
 
     #[test]
     fn has_repl_block_detects_fence() {
-        assert!(has_repl_block("some text ```repl\ncode\n``` more"));
+        assert!(has_repl_block("some text\n```repl\ncode\n``` more"));
+        assert!(has_repl_block("  ```repl  \r\ncode\n```"));
         assert!(!has_repl_block("no repl here ```python\ncode\n```"));
         assert!(!has_repl_block("just text"));
     }
@@ -76,5 +107,23 @@ mod tests {
     fn extract_repl_blocks_empty_when_none() {
         let blocks = extract_repl_blocks("no blocks here");
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn mid_line_mention_is_not_a_fence() {
+        let text = "a ```repl mention\n```\nx\n```";
+        assert!(!has_repl_block(text));
+        assert!(extract_repl_blocks(text).is_empty());
+        assert!(!has_repl_block("```repl-output\nx\n```"));
+        assert!(!has_repl_block("    ```repl\nindented code block\n```"));
+    }
+
+    #[test]
+    fn mid_line_mention_does_not_hide_a_later_fence() {
+        let text = "see ```repl here\n```repl\nprint(1)\n```";
+        let blocks = extract_repl_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code.trim(), "print(1)");
+        assert_eq!(&text[blocks[0].start_offset..][..7], "```repl");
     }
 }

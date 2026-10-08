@@ -1,0 +1,6 @@
+{
+  "description": "Anthropic Messages: signed thinking, then text with multi-byte UTF-8, cache usage in message_start and output usage in message_delta. 11-byte transport chunks split lines and code points.",
+  "route": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "chunk_bytes": 11
+}

@@ -67,3 +67,14 @@ messages should start with the Codewhale prefix `/cw`, for example:
 ```text
 /cw check git status and tell me what is dirty
 ```
+
+
+## Restart access checks
+
+Recovered deliveries require a saved, previously admitted sender identity that
+still matches the current allowlist and group policy. Removing access and
+restarting the bridge also stops recovery messages to that chat. Legacy state
+without this identity stays detached; it does not cancel the runtime turn.
+Use an authorized chat to inspect or interrupt that turn. A fresh admitted
+message records identity for subsequent restart recovery. Keep allow-unlisted
+mode off when operating with private workspace or runtime data.

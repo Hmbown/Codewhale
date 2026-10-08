@@ -7,7 +7,8 @@
   "main": "src/index.mjs",
   "scripts": {
     "start": "node src/index.mjs",
-    "check": "node --check src/index.mjs && node --check src/lib.mjs",
+    "bridge": "bash scripts/dev-up.sh",
+    "check": "node --check src/index.mjs && node --check src/lib.mjs && node --check src/qr.mjs && bash -n scripts/dev-up.sh",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {

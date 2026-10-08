@@ -11,6 +11,7 @@ permissions:
 jobs:
   label:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Auto-label by title and body
         uses: actions/github-script@v9

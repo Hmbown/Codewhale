@@ -8,9 +8,9 @@ use std::borrow::Cow;
 
 use serde_json::Value;
 
-use crate::localization::{Locale, MessageId, tr};
 use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 use crate::tools::canonical_action::canonical_action_alias;
+use codewhale_localization::{Locale, MessageId, tr};
 
 pub(super) fn file_write_preview_lines(tool_name: &str, params: &Value) -> Option<Vec<String>> {
     match canonical_action_alias(tool_name, params) {
@@ -302,6 +302,10 @@ pub(super) fn localize_detail_label(label: &str, locale: Locale) -> Cow<'static,
             "Shell" => "Shell".into(),
             "Network" => "网络".into(),
             "Budget" => "预算".into(),
+            "Trust mode" => "信任模式".into(),
+            "Auto-approve" => "自动批准".into(),
+            "Mode" => "模式".into(),
+            "Workspace" => "工作区".into(),
             _ => label.to_string().into(),
         },
         _ => label.to_string().into(),
@@ -417,6 +421,15 @@ struct PrintfWriteFilePreview {
 }
 
 fn parse_printf_write_file_command(command: &str) -> Option<PrintfWriteFilePreview> {
+    // A chained or substituted command is not a plain file write: collapsing
+    // it into `printf > target` would hide everything after the operator
+    // from the approval card. Scan the whole command (not the halves around
+    // the redirect) so quote state is never read from a mid-string split.
+    // shlex and the scanners below only understand POSIX quoting. Bash's
+    // ANSI-C and locale quotes need their original command shown in full.
+    if command.contains("$'") || command.contains("$\"") || has_unquoted_shell_control(command) {
+        return None;
+    }
     let (before_redirect, after_redirect) = split_unquoted_redirect(command)?;
     let before_redirect = before_redirect.trim();
     if !before_redirect.starts_with("printf") {
@@ -476,6 +489,44 @@ fn format_printf_write_file_preview(preview: PrintfWriteFilePreview) -> Vec<Stri
     out
 }
 
+/// Whether `text` holds shell syntax that runs or chains another command:
+/// an unquoted `;`, `&`, `|`, newline, `(` (subshell, `$(`, `<(`), or a
+/// command substitution (`$(` / backtick) even inside double quotes.
+fn has_unquoted_shell_control(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev: Option<char> = None;
+    for ch in text.chars() {
+        if escaped {
+            escaped = false;
+            prev = None;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => match ch {
+                '\\' => escaped = true,
+                '"' => quote = None,
+                '`' => return true,
+                '(' if prev == Some('$') => return true,
+                _ => {}
+            },
+            None => match ch {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(ch),
+                ';' | '&' | '|' | '`' | '(' | '\n' | '\r' => return true,
+                _ => {}
+            },
+        }
+        prev = Some(ch);
+    }
+    false
+}
+
 fn split_unquoted_redirect(command: &str) -> Option<(&str, &str)> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
@@ -484,7 +535,7 @@ fn split_unquoted_redirect(command: &str) -> Option<(&str, &str)> {
             escaped = false;
             continue;
         }
-        if ch == '\\' {
+        if ch == '\\' && quote != Some('\'') {
             escaped = true;
             continue;
         }

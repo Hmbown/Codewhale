@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { draftStorageKey, type AgentDraft } from "@/lib/community-agent";
+import { draftStorageKey, reviewedBodyHash, type AgentDraft } from "@/lib/community-agent";
 
 interface Props {
   drafts: AgentDraft[];
@@ -17,13 +17,17 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
   const [editBody, setEditBody] = useState("");
   const [loading, setLoading] = useState<string | null>(null);
 
-  const handleAction = async (draftKey: string, action: "post" | "discard", editedBody?: string) => {
+  const handleAction = async (draft: AgentDraft, action: "post" | "discard", editedBody?: string) => {
+    const draftKey = draftStorageKey(draft);
     setLoading(draftKey);
     try {
+      // Binds the action to the text shown here; the route refuses it if the
+      // stored draft was regenerated since this page loaded.
+      const reviewedSha256 = await reviewedBodyHash(isZh ? draft.bodyZh : draft.bodyEn);
       const res = await fetch("/api/admin/post", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, draftKey, editedBody, lang: isZh ? "zh" : "en" }),
+        body: JSON.stringify({ action, draftKey, editedBody, lang: isZh ? "zh" : "en", reviewedSha256 }),
       });
       const data = await res.json();
       if (data.ok) {
@@ -37,6 +41,9 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
           }
         }
         setEditing(null);
+        // The post went through but something after it did not (draft state
+        // not saved, or the digest was not published on /digest).
+        if (typeof data.warning === "string") alert(data.warning);
       } else {
         alert(`Error: ${data.error}`);
       }
@@ -65,10 +72,10 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
             const key = draftStorageKey(draft);
             const label = typeLabels[draft.type] ?? { en: draft.type, zh: draft.type };
             return (
-              <div key={key} className="hairline-t hairline-b hairline-l hairline-r bg-paper">
+              <div key={key} className="group-card">
                 <div className="bg-paper-deep text-ink px-4 py-2 flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <span className="font-mono text-xs uppercase tracking-wider text-indigo">
+                    <span className="text-xs text-indigo">
                       {isZh ? label.zh : label.en}
                     </span>
                     {draft.targetNumber && (
@@ -86,19 +93,19 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                       <textarea
                         value={editBody}
                         onChange={(e) => setEditBody(e.target.value)}
-                        className="w-full h-48 p-3 bg-paper-deep hairline-t hairline-b hairline-l hairline-r font-mono text-sm resize-y"
+                        className="field-input h-48 py-3 font-mono text-sm resize-y"
                       />
                       <div className="flex gap-2">
                         <button
-                          onClick={() => handleAction(key, "post", editBody)}
+                          onClick={() => handleAction(draft, "post", editBody)}
                           disabled={loading === key}
-                          className="px-4 py-2 bg-indigo text-paper font-mono text-xs uppercase tracking-wider hover:bg-indigo-deep transition-colors disabled:opacity-50"
+                          className="btn btn-primary disabled:opacity-50"
                         >
                           {isZh ? "确认发布" : "Post edited"}
                         </button>
                         <button
                           onClick={() => setEditing(null)}
-                          className="px-4 py-2 hairline-t hairline-b hairline-l hairline-r font-mono text-xs uppercase tracking-wider hover:bg-paper-deep transition-colors"
+                          className="btn btn-secondary"
                         >
                           {isZh ? "取消" : "Cancel"}
                         </button>
@@ -111,22 +118,22 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                       </div>
                       <div className="flex gap-2 flex-wrap">
                         <button
-                          onClick={() => handleAction(key, "post")}
+                          onClick={() => handleAction(draft, "post")}
                           disabled={loading === key}
-                          className="px-4 py-2 bg-indigo text-paper font-mono text-xs uppercase tracking-wider hover:bg-indigo-deep transition-colors disabled:opacity-50"
+                          className="btn btn-primary disabled:opacity-50"
                         >
                           {isZh ? "发布评论" : "Post as comment"}
                         </button>
                         <button
                           onClick={() => startEdit(draft)}
-                          className="px-4 py-2 hairline-t hairline-b hairline-l hairline-r font-mono text-xs uppercase tracking-wider hover:bg-paper-deep transition-colors"
+                          className="btn btn-secondary"
                         >
                           {isZh ? "编辑后发布" : "Edit & post"}
                         </button>
                         <button
-                          onClick={() => handleAction(key, "discard")}
+                          onClick={() => handleAction(draft, "discard")}
                           disabled={loading === key}
-                          className="px-4 py-2 font-mono text-xs uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors disabled:opacity-50"
+                          className="btn btn-danger"
                         >
                           {isZh ? "丢弃" : "Discard"}
                         </button>
@@ -152,13 +159,13 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
             return (
               <div key={key} className="hairline-t py-3 px-4 opacity-60">
                 <div className="flex items-center gap-3 mb-1">
-                  <span className="font-mono text-xs uppercase tracking-wider text-ink-mute">
+                  <span className="text-xs text-ink-mute">
                     {isZh ? label.zh : label.en}
                   </span>
                   {draft.targetNumber && (
                     <span className="font-mono text-xs text-ink-mute tabular">#{draft.targetNumber}</span>
                   )}
-                  <span className="ml-auto pill pill-jade text-[0.6rem]">{isZh ? "已发布" : "posted"}</span>
+                  <span className="ml-auto status status-ready"><span className="status-dot" aria-hidden="true" />{isZh ? "已发布" : "posted"}</span>
                 </div>
                 <p className="text-xs text-ink-mute line-clamp-2">{(isZh ? draft.bodyZh : draft.bodyEn).slice(0, 120)}…</p>
               </div>

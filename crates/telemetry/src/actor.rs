@@ -93,8 +93,18 @@ impl Handle {
     }
 
     /// Persist queued events locally and stop without making a network request.
-    pub(crate) fn persist_local(&self, deadline: Duration) -> FlushOutcome {
-        self.round_trip(deadline, Message::PersistLocal)
+    ///
+    /// Unlike [`Handle::shutdown`], this waits without a deadline: the local
+    /// path performs only bounded disk work, and racing it against a clock is
+    /// what lost dry-run receipts on slow hosts (#6269). The writer always
+    /// acknowledges — even on panic — so the only way out without an outcome
+    /// is a writer that is already gone, which fails open as `TimedOut`.
+    pub(crate) fn persist_local(&self) -> FlushOutcome {
+        let (ack_tx, ack_rx) = sync_channel::<FlushOutcome>(1);
+        if self.tx.send(Message::PersistLocal(ack_tx)).is_err() {
+            return FlushOutcome::TimedOut;
+        }
+        ack_rx.recv().unwrap_or(FlushOutcome::TimedOut)
     }
 
     fn round_trip(
@@ -126,7 +136,18 @@ fn run(context: &Context, rx: &Receiver<Message>) {
                 None
             }
             Message::PersistLocal(ack) => {
-                let _ = ack.send(persist_local(context));
+                // The caller joins this without a deadline (#6269), so the
+                // acknowledgement must be unconditional: a panic here would
+                // otherwise hang a short CLI command at exit. The outer
+                // `catch_unwind` still guards the other arms.
+                let outcome = match catch_unwind(AssertUnwindSafe(|| persist_local(context))) {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        tracing::debug!("telemetry local persist recovered from a panic");
+                        FlushOutcome::Dropped
+                    }
+                };
+                let _ = ack.send(outcome);
                 Some(())
             }
             Message::Shutdown(ack) => {
@@ -218,6 +239,7 @@ fn flush(context: &Context) -> FlushOutcome {
 
     let batch = Batch {
         schema_version: SCHEMA_VERSION,
+        notice_version: crate::event::NOTICE_VERSION,
         sent_at: envelope::now_rfc3339(),
         install_id: install.install_id,
         app_version: context.app_version.clone(),
@@ -264,4 +286,43 @@ pub(crate) fn parse_events(lines: &[String]) -> Vec<Event> {
         }
     }
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_persistence_joins_the_writer_without_a_deadline() {
+        // The caller blocks on a mock writer that answers on its own
+        // schedule: no sleep, no timing assertion, no race with the clock.
+        let (tx, rx) = channel();
+        let handle = Handle { tx };
+        handle.record(Event::SessionStart {
+            source: crate::SessionSource::Unknown,
+        });
+        let waiter = std::thread::spawn(move || handle.persist_local());
+        assert!(matches!(rx.try_recv(), Ok(Message::Event(_))));
+        let Message::PersistLocal(ack) = rx.recv().expect("local persistence request") else {
+            panic!("short CLI persistence must not request a network shutdown flush");
+        };
+        ack.send(FlushOutcome::Buffered)
+            .expect("the caller is still joined");
+        assert_eq!(waiter.join().expect("waiter"), FlushOutcome::Buffered);
+        assert!(
+            rx.try_recv().is_err(),
+            "one persist request enqueues exactly one message"
+        );
+    }
+
+    #[test]
+    fn local_persistence_fails_open_when_the_writer_is_gone() {
+        // The writer thread exits after a persist or shutdown request; a
+        // second caller must fail open, not hang on a dead receiver. Send
+        // fails deterministically here, so no timing assertion is needed.
+        let (tx, rx) = channel::<Message>();
+        drop(rx);
+        let handle = Handle { tx };
+        assert_eq!(handle.persist_local(), FlushOutcome::TimedOut);
+    }
 }

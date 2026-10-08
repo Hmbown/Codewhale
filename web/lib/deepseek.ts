@@ -1,7 +1,7 @@
 import type { CuratedDispatch, FeedItem, RepoStats } from "./types";
 
 const FALLBACK_BASE = "https://api.deepseek.com";
-const FALLBACK_MODEL = "deepseek-v4-flash";
+const FALLBACK_MODEL = "deepseek-flash";
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -27,6 +27,8 @@ export async function chat(
   const model = dsEnv?.model ?? process.env.DEEPSEEK_MODEL ?? FALLBACK_MODEL;
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
+    // Same bound as agentChat: a stalled provider must not hold the cron run.
+    signal: AbortSignal.timeout(180_000),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
@@ -100,7 +102,7 @@ export async function curate(
   }));
 
   const userPayload = {
-    repo: "Hmbown/CodeWhale",
+    repo: "codewhale-hq/CodeWhale",
     stats: {
       stars: stats.stars,
       forks: stats.forks,
@@ -126,7 +128,7 @@ export async function curate(
 }
 
 const SAFE_HREF_RE = /^https:\/\/(?:github\.com|api\.github\.com|codewhale\.net|crates\.io|www\.npmjs\.com|docs\.rs)\//;
-const FALLBACK_HREF = "https://github.com/Hmbown/CodeWhale";
+const FALLBACK_HREF = "https://github.com/codewhale-hq/CodeWhale";
 
 function safeHref(u: unknown): string {
   return typeof u === "string" && SAFE_HREF_RE.test(u) ? u : FALLBACK_HREF;

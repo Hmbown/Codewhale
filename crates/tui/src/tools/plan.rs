@@ -24,7 +24,6 @@ pub enum StepStatus {
 }
 
 impl StepStatus {
-    #[allow(dead_code)]
     #[must_use]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_lowercase().as_str() {
@@ -35,8 +34,8 @@ impl StepStatus {
         }
     }
 
-    #[allow(dead_code)]
     #[must_use]
+    #[expect(dead_code)]
     pub fn symbol(&self) -> &'static str {
         match self {
             StepStatus::Pending => "○",

@@ -6,6 +6,8 @@
 //! '--resume <id>' found`, exit 2). A non-TTY launch must now get past
 //! argument parsing and fail only on the interactive-terminal contract, and
 //! must not create session state under a sealed HOME on the way out.
+//! Fresh-session and mouse flags exercise the same boundary: an unrecognized
+//! `--fresh` previously swallowed the remaining flags as one prompt value.
 
 #![cfg(unix)]
 
@@ -39,6 +41,7 @@ fn isolated_command(home: &Path, codewhale_home: &Path, workspace: &Path) -> Com
         .env("CODEWHALE_HOME", codewhale_home)
         .env("CODEWHALE_SECRET_BACKEND", "file")
         .env("CODEWHALE_NO_UPDATE_CHECK", "1")
+        .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
         .env("CODEWHALE_TELEMETRY", "0")
         .env("NO_COLOR", "1")
         .current_dir(workspace)
@@ -49,22 +52,26 @@ fn isolated_command(home: &Path, codewhale_home: &Path, workspace: &Path) -> Com
 }
 
 #[test]
-fn root_resume_flags_reach_the_tui_launch_contract_without_touching_state() {
+fn root_session_flags_reach_the_tui_launch_contract_without_touching_state() {
     for argv in [
         &["--resume", "800596e6"][..],
         &["--resume=800596e6"][..],
         &["-r", "800596e6"][..],
         &["--session-id", "800596e6"][..],
         &["--continue"][..],
+        &["--no-project-config", "--fresh", "--mouse-capture"][..],
+        &["--no-project-config", "--mouse-capture", "--fresh"][..],
     ] {
         let fixture = TempDir::new().expect("fixture root");
         let home = fixture.path().join("sealed-home");
         let codewhale_home = fixture.path().join("sealed-codewhale-home");
-        let workspace = fixture.path().join("workspace");
+        let workspace = fixture.path().join("workspace with spaces");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&workspace).expect("workspace");
 
         let output = isolated_command(&home, &codewhale_home, &workspace)
+            .arg("--workspace")
+            .arg(&workspace)
             .args(argv)
             .output()
             .expect("run codewhale");

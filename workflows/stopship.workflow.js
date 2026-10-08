@@ -6,6 +6,11 @@
 // tokens. Budget 24k per intended evidence turn, then add token-neutral
 // max_steps headroom for the required final verdict. The token ceiling
 // remains independent and the five role caps still total 360k.
+// Scout repair: the read-only catalog carries no `File` (hidden replay-only
+// alias, filtered from every model-visible surface), so the scout now
+// activates `grep_files` with one `tool_search` call before searching. The
+// evidence turn spans three responses (activate, search, verdict) inside the
+// unchanged step/token caps.
 export default workflow({
   "id": "stopship-release-acceptance",
   "goal": "Verify the current Codewhale Fleet, Workflow, Lane, Runtime, and gate receipt path without changing the workspace",
@@ -74,7 +79,7 @@ export default workflow({
           {
             "agent": {
               "id": "explore-runtime",
-              "prompt": "Verify the runtime release-orchestration owners using only the five files in File scope. The host's typed run_started receipt already owns the compiled Workflow id and source path; do not re-verify the Workflow alias. You have at most six model responses and must reserve the verdict. Response 1 must make exactly one `File` call with `action` set to `search_content`, `path` set to `.`, and `include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`, `crates/lane/src/runtime.rs`], using this high-signal alternation pattern: `name = \"stopship\"|load_named_fleet|start_lane|resolve_workflow_agent|record_task_started|WorkflowUiEventKind::GateUpdated|WorkflowUiEventKind::RunCompleted|terminal_completed_receipt|process_exit_receipt|lane_reconciled|tmux_reconcile_folds_detached_process_exit_into_lane_status|stopship_acceptance_fixture_emits_role_gate_and_terminal_receipts`. Set at most 80 results and 2 context lines. Matches outside that exact include list do not count. Do not add generic field names such as `resolved_profile` or `exit_code` to the pattern. Do not call `File` more than once and do not use any action except `search_content` or call any other tool. Response 2 must return the verdict with no tool calls; any later reserved response must do the same instead of gathering more evidence. Treat an exact match naming a call site, typed event constructor, reconciliation branch, or test assertion in a scoped file as source-owner evidence. Apply this decision rule literally: if you can populate all seven required SOURCE EVIDENCE entries from the search result, return APPROVE; never return BLOCK after citing all seven. Return BLOCK only when at least one named owner has no matching citation, and identify each missing owner as MISSING. The first non-empty line of your response must be exactly APPROVE or exactly BLOCK. Do not put any words before that verdict: no confirmation, summary, heading, or phrase such as `Here is the verdict`. After the verdict, include a `SOURCE EVIDENCE` section with concise `path: symbol` evidence for named Fleet loading, role-to-profile resolution, tmux Lane launch, typed task_started, gate_updated, terminal run_completed, and tmux process-exit reconciliation receipts. The terminal run_completed entry must carry both the `WorkflowUiEventKind::RunCompleted` constructor and the `terminal_completed_receipt` integration assertion. A bare verdict is invalid. Do not edit files, create branches, run shell commands, access GitHub, or infer success where source evidence is absent.",
+              "prompt": "Verify the runtime release-orchestration owners using only the five files in scope. The host's typed run_started receipt already owns the compiled Workflow id and source path; do not re-verify the Workflow alias. You have at most six model responses and must reserve the verdict. Response 1 must make exactly one `tool_search` call with `query` set to `grep_files`; the content-search tool is deferred, so this activation is required before it can be called. Response 2 must make exactly one `grep_files` call with `path` set to `.`, `include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow/mod.rs`, `crates/lane/src/runtime.rs`], and `pattern` set to this high-signal alternation: `name = \"stopship\"|load_named_fleet|start_lane|resolve_workflow_agent|record_task_started|WorkflowUiEventKind::GateUpdated|WorkflowUiEventKind::RunCompleted|terminal_completed_receipt|process_exit_receipt|lane_reconciled|tmux_reconcile_folds_detached_process_exit_into_lane_status|stopship_acceptance_fixture_emits_role_gate_and_terminal_receipts`. Set `max_results` to 80 and `context_lines` to 2. Matches outside that exact include list do not count. Do not add generic field names such as `resolved_profile` or `exit_code` to the pattern. Make no other tool calls: exactly one `tool_search` call, then exactly one `grep_files` call, nothing else. Response 3 must return the verdict with no tool calls; any later reserved response must do the same instead of gathering more evidence. Treat an exact match naming a call site, typed event constructor, reconciliation branch, or test assertion in a scoped file as source-owner evidence. Apply this decision rule literally: if you can populate all seven required SOURCE EVIDENCE entries from the search result, return APPROVE; never return BLOCK after citing all seven. Return BLOCK only when at least one named owner has no matching citation, and identify each missing owner as MISSING. The first non-empty line of your response must be exactly APPROVE or exactly BLOCK. Do not put any words before that verdict: no confirmation, summary, heading, or phrase such as `Here is the verdict`. After the verdict, include a `SOURCE EVIDENCE` section with concise `path: symbol` evidence for named Fleet loading, role-to-profile resolution, tmux Lane launch, typed task_started, gate_updated, terminal run_completed, and tmux process-exit reconciliation receipts. The terminal run_completed entry must carry both the `WorkflowUiEventKind::RunCompleted` constructor and the `terminal_completed_receipt` integration assertion. A bare verdict is invalid. Do not edit files, create branches, run shell commands, access GitHub, or infer success where source evidence is absent.",
               "agent_type": "explore",
               "role": "explore",
               "mode": "read_only",
@@ -82,7 +87,7 @@ export default workflow({
                 "fleets/stopship.toml",
                 "crates/cli/src/lib.rs",
                 "crates/workflow/src/role_resolve.rs",
-                "crates/tui/src/tools/workflow.rs",
+                "crates/tui/src/tools/workflow/mod.rs",
                 "crates/lane/src/runtime.rs"
               ],
               "budget": { "max_steps": 6, "timeout_secs": 480, "max_tokens": 96000 }
@@ -100,7 +105,7 @@ export default workflow({
                 "fleets/stopship.toml",
                 "crates/cli/src/lib.rs",
                 "crates/workflow/src/role_resolve.rs",
-                "crates/tui/src/tools/workflow.rs",
+                "crates/tui/src/tools/workflow/mod.rs",
                 "crates/lane/src/runtime.rs"
               ],
               "budget": { "max_steps": 4, "timeout_secs": 420, "max_tokens": 72000 }
@@ -118,7 +123,7 @@ export default workflow({
                 "fleets/stopship.toml",
                 "crates/cli/src/lib.rs",
                 "crates/workflow/src/role_resolve.rs",
-                "crates/tui/src/tools/workflow.rs",
+                "crates/tui/src/tools/workflow/mod.rs",
                 "crates/lane/src/runtime.rs"
               ],
               "budget": { "max_steps": 4, "timeout_secs": 420, "max_tokens": 72000 }
@@ -136,7 +141,7 @@ export default workflow({
                 "fleets/stopship.toml",
                 "crates/cli/src/lib.rs",
                 "crates/workflow/src/role_resolve.rs",
-                "crates/tui/src/tools/workflow.rs",
+                "crates/tui/src/tools/workflow/mod.rs",
                 "crates/lane/src/runtime.rs"
               ],
               "budget": { "max_steps": 4, "timeout_secs": 420, "max_tokens": 72000 }
@@ -154,7 +159,7 @@ export default workflow({
                 "fleets/stopship.toml",
                 "crates/cli/src/lib.rs",
                 "crates/workflow/src/role_resolve.rs",
-                "crates/tui/src/tools/workflow.rs",
+                "crates/tui/src/tools/workflow/mod.rs",
                 "crates/lane/src/runtime.rs"
               ],
               "budget": { "max_steps": 3, "timeout_secs": 300, "max_tokens": 48000 }

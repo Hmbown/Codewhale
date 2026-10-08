@@ -43,19 +43,19 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 use crate::dependencies::ExternalTool;
 use crate::features::Feature;
 use crate::llm_client::LlmClient;
-use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Usage};
-use crate::tui::app::ReasoningEffort;
+use crate::reasoning_preference::ReasoningEffort;
 use crate::utils::truncate_with_ellipsis;
+use codewhale_models::{ContentBlock, Message, MessageRequest, SystemPrompt, Usage};
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_str, required_str,
 };
-use crate::models::Role;
+use codewhale_models::Role;
 
 /// Total evidence budget handed to the critic. Kept well under a turn so the
 /// critic has room to reason. Large diffs/files are truncated with a marker.
@@ -275,7 +275,7 @@ struct CritiqueRun {
 
 /// Agent-callable adversarial self-critique tool.
 pub struct VerifyTool {
-    client: Option<DeepSeekClient>,
+    client: Option<CodewhaleClient>,
     model: String,
     /// Reasoning tier the critic runs at, independent of the session tier.
     critic_effort: ReasoningEffort,
@@ -284,7 +284,7 @@ pub struct VerifyTool {
 impl VerifyTool {
     /// Construct with the default critic effort ([`ReasoningEffort::Max`]).
     #[must_use]
-    pub fn new(client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn new(client: Option<CodewhaleClient>, model: String) -> Self {
         Self {
             client,
             model,
@@ -296,8 +296,8 @@ impl VerifyTool {
     /// `High` — elevated reasoning is the whole point of this tool. This is the
     /// seam for a future `[verify] critic_effort` config knob; production
     /// registration currently uses the `Max` default from [`Self::new`].
-    #[allow(dead_code)]
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn with_critic_effort(mut self, effort: ReasoningEffort) -> Self {
         self.critic_effort = clamp_to_elevated(effort);
         self
@@ -513,8 +513,8 @@ async fn run_critique<C: LlmClient>(
         .await
         .map_err(|e| ToolError::execution_failed(format!("verify critic request failed: {e}")))?;
     let incomplete_stop_reason =
-        crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()).then(|| {
-            crate::models::stop_reason_detail(response.stop_reason.as_deref()).to_string()
+        codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()).then(|| {
+            codewhale_models::stop_reason_detail(response.stop_reason.as_deref()).to_string()
         });
     let text = extract_text(&response.content);
     Ok(CritiqueRun {
@@ -627,13 +627,16 @@ async fn gather_diff_evidence(
     staged: bool,
     base: Option<&str>,
 ) -> Result<Vec<EvidenceBlock>, ToolError> {
-    let base = base.filter(|b| !b.trim().is_empty());
+    let base = match base.filter(|b| !b.trim().is_empty()) {
+        Some(base) => Some(super::git::resolve_commit_ref(workspace, base).await?),
+        None => None,
+    };
     let mut blocks = Vec::new();
 
     if staged {
         // Staged scope: the index (optionally vs an explicit base).
         let mut args: Vec<String> = vec!["--cached".to_string()];
-        if let Some(base) = base {
+        if let Some(base) = &base {
             args.push(base.to_string());
         }
         if let Some(diff) = run_git_diff(workspace, &args).await? {
@@ -674,20 +677,25 @@ async fn gather_diff_evidence(
 /// Run `git diff <args>` in `workspace`. Returns `Ok(None)` for an empty diff or
 /// when git is unavailable, and `Err` when git runs but reports failure.
 async fn run_git_diff(workspace: &Path, args: &[String]) -> Result<Option<String>, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Git::command() else {
+    if !crate::dependencies::Git::available() {
         // git not installed: degrade gracefully rather than failing the tool.
         return Ok(None);
-    };
-    cmd.arg("diff");
-    for arg in args {
-        cmd.arg(arg);
     }
-    cmd.current_dir(workspace);
-
-    let output = tokio::task::spawn_blocking(move || cmd.output())
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("git diff task panicked: {e}")))?
-        .map_err(|e| ToolError::execution_failed(format!("failed to run git diff: {e}")))?;
+    let workspace = workspace.to_path_buf();
+    let args = args.to_vec();
+    let output = tokio::task::spawn_blocking(move || {
+        // The review command keeps the workspace's fsmonitor, hooks and
+        // filters from running during the diff.
+        let mut cmd = super::git::read_only_git_command(&workspace)?;
+        cmd.arg("diff")
+            .args(crate::dependencies::Git::REVIEW_DIFF_ARGS)
+            .args(&args)
+            .arg("--");
+        cmd.output()
+            .map_err(|e| ToolError::execution_failed(format!("failed to run git diff: {e}")))
+    })
+    .await
+    .map_err(|e| ToolError::execution_failed(format!("git diff task panicked: {e}")))??;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ToolError::execution_failed(format!(
@@ -837,8 +845,8 @@ mod tests {
         ToolContext::new(Path::new("."))
     }
 
-    fn text_response(model: &str, body: &str) -> crate::models::MessageResponse {
-        crate::models::MessageResponse {
+    fn text_response(model: &str, body: &str) -> codewhale_models::MessageResponse {
+        codewhale_models::MessageResponse {
             id: "msg_test".to_string(),
             r#type: "message".to_string(),
             role: "assistant".to_string(),
@@ -1123,6 +1131,126 @@ mod tests {
             out.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_base_cannot_inject_options_or_run_diff_helpers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("sentinel");
+        std::fs::write(&marker, "untouched").unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.email", "t@example.com"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        run_git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("f.txt"), "original\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "*.txt diff=hostile\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-q", "-m", "base"]);
+        run_git(
+            repo,
+            &[
+                "config",
+                "diff.hostile.textconv",
+                "definitely-missing-helper",
+            ],
+        );
+        run_git(
+            repo,
+            &["config", "diff.external", "definitely-missing-helper"],
+        );
+        std::fs::write(repo.join("f.txt"), "changed-marker\n").unwrap();
+        run_git(repo, &["add", "f.txt"]);
+        for staged in [false, true] {
+            for base in [
+                format!("--output={}", marker.display()),
+                format!("--out={}", marker.display()),
+                "--ext-diff".into(),
+                "HEAD --output=bad".into(),
+                "HEAD\n--output=bad".into(),
+            ] {
+                assert!(
+                    gather_diff_evidence(repo, staged, Some(&base))
+                        .await
+                        .is_err(),
+                    "{staged}: {base}"
+                );
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "untouched");
+            }
+            let blocks = gather_diff_evidence(repo, staged, Some("HEAD"))
+                .await
+                .unwrap();
+            assert!(
+                blocks
+                    .iter()
+                    .any(|block| block.body.contains("changed-marker"))
+            );
+        }
+    }
+
+    /// The working-tree evidence read must not run the repository's clean
+    /// filter, which `--no-ext-diff`/`--no-textconv` do not cover.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_diff_evidence_runs_no_clean_filter() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("marker");
+        let clean = outside.path().join("clean.sh");
+        std::fs::write(
+            &clean,
+            format!("#!/bin/sh\necho clean >> '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&clean, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.email", "t@example.com"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        run_git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("f.txt"), "original\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "f.txt filter=x\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-q", "-m", "base"]);
+        run_git(
+            repo,
+            &["config", "filter.x.clean", &clean.display().to_string()],
+        );
+        std::fs::write(repo.join("f.txt"), "changed-marker\n").unwrap();
+
+        let blocks = gather_diff_evidence(repo, false, None).await.unwrap();
+        assert!(
+            !marker.exists(),
+            "the evidence read ran the clean filter: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.body.contains("+changed-marker")),
+            "{:?}",
+            blocks.iter().map(|block| &block.body).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_without_base_remains_usable_on_unborn_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q"]);
+        assert!(
+            gather_diff_evidence(tmp.path(), false, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            gather_diff_evidence(tmp.path(), true, None)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

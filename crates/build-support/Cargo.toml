@@ -6,8 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Shared build-script helpers for embedding Codewhale build metadata"
+# This workspace regression compiles neighboring CLI/TUI build-script sources.
+exclude = ["tests/build_script_relocation.rs"]
 
 [lints]
 workspace = true
 
-[dependencies]
+[dev-dependencies]
+tempfile.workspace = true

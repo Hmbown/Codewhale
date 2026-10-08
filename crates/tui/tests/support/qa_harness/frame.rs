@@ -183,6 +183,40 @@ impl Frame {
         None
     }
 
+    /// Actual terminal cells for opt-in visual evidence, including the
+    /// otherwise invisible trailing selection fill and SGR attributes.
+    pub fn capture_cells(&self) -> serde_json::Value {
+        let styles = self.term.grid.styles();
+        let color = |c| match c {
+            Color::Default => serde_json::Value::Null,
+            Color::Idx(i) => serde_json::json!(i),
+            Color::Rgb(r, g, b) => serde_json::json!([r, g, b]),
+        };
+        let cells: Vec<_> = self
+            .term
+            .visible_rows()
+            .iter()
+            .map(|row| {
+                (0..self.cols())
+                    .map(|col| {
+                        let square = row[Column(usize::from(col))];
+                        let (fg, bg) = square_colors(square, styles);
+                        let flags = if square.content_tag() == ContentTag::Codepoint {
+                            styles
+                                .get(square.style_id() as usize)
+                                .map_or(0, |s| s.flags.bits())
+                        } else {
+                            0
+                        };
+                        serde_json::json!({"x":col, "text":square_contents(square),
+                    "fg":color(fg), "bg":color(bg), "flags":flags})
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        serde_json::json!({"rows":self.rows(), "cols":self.cols(), "cells":cells})
+    }
+
     /// Whether any painted cell carries a 24-bit color. The palette adapter
     /// downgrades every truecolor before it reaches crossterm on terminals
     /// that only advertise 256 or 16 colors, so this is the parsed-ANSI proof

@@ -1,0 +1,5 @@
+command: /context bogus
+is_error: true
+message:
+Error: Unknown /context subcommand: bogus. Use report, json, prompt-json, or summary.
+action: <none>

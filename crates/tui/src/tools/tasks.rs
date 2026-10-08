@@ -1,7 +1,6 @@
 //! Durable task, gate, and PR-attempt tools.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -10,7 +9,6 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::command_safety::{SafetyLevel, analyze_command};
 use crate::dependencies::ExternalTool;
 use crate::task_manager::{
     NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskCancelDisposition, TaskGateRecord,
@@ -25,6 +23,7 @@ use crate::work_graph::{
     CancelOutcome, OperationIntent, OperationObservation, OperationOwnerSnapshot, OwnerState,
     task_owner_snapshot,
 };
+use codewhale_execpolicy::command_safety::{SafetyLevel, analyze_command};
 
 const MAX_SUMMARY_CHARS: usize = 900;
 const DEFAULT_GATE_TIMEOUT_MS: u64 = 120_000;
@@ -33,18 +32,20 @@ const MAX_GATE_TIMEOUT_MS: u64 = 600_000;
 fn build_gate_command_parts(command: &str) -> (String, Vec<String>) {
     (
         "/bin/sh".to_string(),
-        vec!["-lc".to_string(), command.to_string()],
+        vec!["-c".to_string(), command.to_string()],
     )
 }
 
-fn build_gate_command(command: &str, cwd: &Path) -> Command {
+/// Gate commands run workspace code, so they start like an `exec_shell`
+/// command: inside this session's sandbox, from the sanitized environment.
+fn build_gate_command(
+    command: &str,
+    cwd: &Path,
+    context: &ToolContext,
+    timeout: std::time::Duration,
+) -> Result<Command, ToolError> {
     let (program, args) = build_gate_command_parts(command);
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd
+    crate::tools::shell::sandboxed_runner_command(context, &program, args, cwd, timeout)
 }
 
 fn task_shell_wait_input(mut input: Value) -> Value {
@@ -184,23 +185,23 @@ impl ToolSpec for TasksTool {
                 "Cancel a queued or running durable task through TaskManager. Requires approval because it changes work state."
             }
             Some("gate_run") => {
-                "Run an approved verification gate command and return structured evidence. When inside a durable task, the gate result and log artifact are attached to that task."
+                "Run an approved verification gate command and return structured evidence. When inside a durable task, the gate result and log artifact are attached to that task. Dangerous commands are BLOCKED unless auto-approve is enabled; default timeout 120s."
             }
             Some("pr_attempt_record") => {
-                "Capture current git diff as a durable PR work attempt with patch artifact, changed files, and verification notes."
+                "Capture current git diff as a durable PR work attempt with patch artifact, changed files, and verification notes. Requires approval because it records work state."
             }
             Some("pr_attempt_list") => "List PR attempts recorded on a durable task.",
             Some("pr_attempt_read") => {
                 "Read one recorded PR attempt and its patch artifact reference."
             }
             Some("pr_attempt_preflight") => {
-                "Run `git apply --check` for a recorded attempt patch. This is a no-mutation preflight; actual apply remains explicit and approval-gated elsewhere."
+                "Run `git apply --check` for a recorded attempt patch. This is a no-mutation preflight and itself requires approval; the actual apply stays a separate explicit step."
             }
             _ if self.read_only => {
                 "Inspect durable tasks and their PR attempts. Actions: \"list\", \"read\", \"pr_attempt_list\", \"pr_attempt_read\"."
             }
             _ => {
-                "Manage durable background tasks through TaskManager. Durable tasks are restart-aware executable work, distinct from sub-agents. Actions: \"create\" (enqueue; approval), \"list\", \"read\", \"cancel\" (approval), \"gate_run\" (run an approved verification gate command and return structured evidence; approval), \"pr_attempt_record\", \"pr_attempt_list\", \"pr_attempt_read\", \"pr_attempt_preflight\". Use task_shell_start for long-running shell work."
+                "Manage durable background tasks through TaskManager. Durable tasks are restart-aware executable work, distinct from sub-agents. Actions: \"create\" (enqueue; approval), \"list\", \"read\", \"cancel\" (approval), \"gate_run\" (run an approved verification gate command and return structured evidence; approval), \"pr_attempt_record\" (approval), \"pr_attempt_list\", \"pr_attempt_read\", \"pr_attempt_preflight\" (approval). Use task_shell_start for long-running shell work."
             }
         }
     }
@@ -223,6 +224,18 @@ impl ToolSpec for TasksTool {
             properties.insert(
                 "prompt".to_string(),
                 json!({ "type": "string", "description": "Work prompt for the durable task (action=create)." }),
+            );
+            properties.insert(
+                "name".to_string(),
+                json!({ "type": "string", "description": "Short run name shown in queues; omit to derive from the prompt. (action=create)" }),
+            );
+            properties.insert(
+                "model_provider".to_string(),
+                json!({ "type": "string", "description": "Provider kind for the pinned model. Omit to inherit the configured provider." }),
+            );
+            properties.insert(
+                "model_provider_id".to_string(),
+                json!({ "type": "string", "description": "Exact configured provider id, including named custom routes. Keeps the model on that route." }),
             );
             properties.insert(
                 "model".to_string(),
@@ -351,6 +364,11 @@ impl ToolSpec for TasksTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        crate::core::engine::tool_catalog::enforce_tool_denial(
+            context,
+            self.name(),
+            &json!({"action": self.resolve_action(&input)?}),
+        )?;
         match self.resolve_action(&input)? {
             "create" => self.execute_create(&input, context).await,
             "list" => self.execute_list(&input, context).await,
@@ -377,6 +395,8 @@ fn legacy_action_schema(action: &str) -> Value {
             "properties": {
                 "prompt": { "type": "string", "description": "Work prompt for the durable task." },
                 "model": { "type": "string" },
+                "model_provider": { "type": "string", "description": "Provider kind for the pinned model." },
+                "model_provider_id": { "type": "string", "description": "Exact configured provider id." },
                 "workspace": { "type": "string", "description": "Workspace path; defaults to current workspace." },
                 "mode": { "type": "string", "enum": ["agent", "plan", "operate"] },
                 "allow_shell": { "type": "boolean" },
@@ -454,25 +474,44 @@ impl TasksTool {
             .task_manager
             .as_ref()
             .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
-        let workspace = optional_str(input, "workspace")?
-            .map(PathBuf::from)
-            .unwrap_or_else(|| context.workspace.clone());
+        // A task may run in another directory only where this session could
+        // already reach: inside its workspace, or anywhere in trust mode.
+        let workspace = match optional_str(input, "workspace")? {
+            Some(raw) => context.resolve_path(raw)?,
+            None => context.workspace.clone(),
+        };
         let prompt = required_str(input, "prompt")?.to_string();
+        // Authority declarations: read strictly (a malformed value that
+        // silently reads as "unset" is a restriction that evaporates), then
+        // capped at what this session holds.
+        let (allow_shell, trust_mode, auto_approve) = context.cap_delegated_authority(
+            optional_bool_opt(input, "allow_shell")?,
+            optional_bool_opt(input, "trust_mode")?,
+            optional_bool_opt(input, "auto_approve")?,
+        );
         let req = NewTaskRequest {
             prompt: prompt.clone(),
+            name: optional_str(input, "name")?.map(ToString::to_string),
             model: optional_str(input, "model")?.map(ToString::to_string),
+            model_provider: optional_str(input, "model_provider")?.map(ToString::to_string),
+            model_provider_id: optional_str(input, "model_provider_id")?.map(ToString::to_string),
             workspace: Some(workspace),
             mode: optional_str(input, "mode")?.map(ToString::to_string),
-            // Authority declarations: read strictly. A malformed value that
-            // silently reads as "unset" is a restriction that evaporates.
-            allow_shell: optional_bool_opt(input, "allow_shell")?,
-            trust_mode: optional_bool_opt(input, "trust_mode")?,
-            auto_approve: optional_bool_opt(input, "auto_approve")?,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            // The task runs on the posture this session is in. The bits above
+            // are declarations the engine only reads when no posture is given,
+            // and a task started from a session must not run under authority
+            // that session was never granted.
+            permission_posture: Some(
+                crate::runtime_policy::approval_wire(context.approval_mode).to_string(),
+            ),
             owner_session_id: Some(context.state_namespace.clone()),
         };
         let task_id = crate::task_manager::TaskManager::new_task_id();
-        if let Some(work) = context.runtime.work.as_ref() {
-            work.register_operation(
+        if let Some(work) = context.runtime.work.as_ref()
+            && let Err(err) = work.register_operation(
                 &context.state_namespace,
                 OperationIntent::new(
                     format!("task:{task_id}"),
@@ -482,7 +521,15 @@ impl TasksTool {
                     &task_id,
                 ),
             )
-            .map_err(ToolError::execution_failed)?;
+        {
+            // Bookkeeping must not veto the task: every later reconcile is
+            // guarded by `has_operation_binding`, so an unbound task merely
+            // goes unreported on the Work surface.
+            tracing::warn!(
+                task_id = %task_id,
+                error = %err,
+                "task work-graph registration skipped; running unbound"
+            );
         }
         let task = match manager.add_task_with_id(req, task_id.clone()).await {
             Ok(task) => task,
@@ -521,7 +568,8 @@ impl TasksTool {
         let limit = optional_u64(input, "limit", 20)?.clamp(1, 100) as usize;
         let tasks = manager
             .list_tasks_for_owner(Some(limit), None, &context.state_namespace)
-            .await;
+            .await
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?;
         ToolResult::json(&json!({
             "summary": format!("{} durable task(s)", tasks.len()),
             "tasks": tasks,
@@ -597,6 +645,12 @@ impl TasksTool {
         input: &Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        crate::core::engine::tool_catalog::enforce_tool_denial(context, "task_gate_run", input)?;
+        if context.shell_policy != crate::worker_profile::ShellPolicy::Full {
+            return Err(ToolError::permission_denied(
+                "Gate commands require full shell permission.",
+            ));
+        }
         let gate = required_str(input, "gate")?.to_string();
         let command = required_str(input, "command")?.to_string();
         let timeout_ms = optional_u64(input, "timeout_ms", DEFAULT_GATE_TIMEOUT_MS)?
@@ -617,27 +671,41 @@ impl TasksTool {
         }
 
         let started = Instant::now();
-        let mut cmd = build_gate_command(&command, &cwd);
-        let output =
-            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), cmd.output()).await;
+        let mut cmd = build_gate_command(
+            &command,
+            &cwd,
+            context,
+            std::time::Duration::from_millis(timeout_ms),
+        )?;
+        // Contained: when the timeout elapses the gate's whole process tree
+        // is killed, instead of leaving it running behind a "timeout" result,
+        // and what it wrote until then still reaches the log.
+        let output = crate::process_tree::contained_output_until(
+            &mut cmd,
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)),
+        )
+        .await;
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (exit_code, stdout, stderr, timed_out, spawn_error) = match output {
-            Ok(Ok(out)) => (
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout).to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-                false,
+            Ok(run) => (
+                if run.stopped {
+                    None
+                } else {
+                    run.output.status.code()
+                },
+                String::from_utf8_lossy(&run.output.stdout).to_string(),
+                String::from_utf8_lossy(&run.output.stderr).to_string(),
+                run.stopped,
                 None,
             ),
-            Ok(Err(err)) => (
+            Err(err) => (
                 None,
                 String::new(),
                 String::new(),
                 false,
                 Some(err.to_string()),
             ),
-            Err(_) => (None, String::new(), String::new(), true, None),
         };
 
         let full_log = format!(
@@ -717,18 +785,12 @@ impl TasksTool {
         let branch = git_output(&context.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
             .await
             .ok();
-        let diff = git_output(&context.workspace, &["diff", "--binary", "--no-color"]).await?;
+        let (diff, changed_files) = attempt_diff(&context.workspace).await?;
         if diff.trim().is_empty() {
             return Ok(ToolResult::error(
                 "No working-tree diff to record as an attempt.",
             ));
         }
-        let changed_files = git_output(&context.workspace, &["diff", "--name-only"])
-            .await?
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
         let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff).await?;
         let attempt = TaskAttemptRecord {
             id: format!("attempt_{}", &Uuid::new_v4().to_string()[..8]),
@@ -873,7 +935,7 @@ impl ToolSpec for TaskShellStartTool {
             "properties": {
                 "command": { "type": "string" },
                 "cwd": { "type": "string", "description": "Optional working directory within the workspace." },
-                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000 },
+                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "description": "Accepted for interface compatibility but not enforced: the command always starts in the background and is not bounded by this timeout. A running shell task can be stopped from the model surface via exec_shell with action=cancel and the returned task_id; otherwise it ends when the command finishes." },
                 "stdin": { "type": "string" },
                 "tty": { "type": "boolean" }
             },
@@ -898,6 +960,7 @@ impl ToolSpec for TaskShellStartTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        crate::core::engine::tool_catalog::enforce_tool_denial(context, self.name(), &input)?;
         let mut shell_input = json!({
             "command": required_str(&input, "command")?,
             "background": true,
@@ -937,7 +1000,7 @@ impl ToolSpec for TaskShellWaitTool {
         json!({
             "type": "object",
             "properties": {
-                "task_id": { "type": "string", "description": "Background shell task id returned by task_shell_start or `Bash`." },
+                "task_id": { "type": "string", "description": "Background shell task id returned by task_shell_start." },
                 "wait": { "type": "boolean", "default": false },
                 "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000 },
                 "gate": { "type": "string", "enum": ["fmt", "check", "clippy", "test", "custom"] },
@@ -949,14 +1012,30 @@ impl ToolSpec for TaskShellWaitTool {
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
+        vec![
+            ToolCapability::WritesFiles,
+            ToolCapability::RequiresApproval,
+        ]
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+        ApprovalRequirement::Required
+    }
+
+    fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
+        if self.is_read_only_for(input) {
+            ApprovalRequirement::Auto
+        } else {
+            ApprovalRequirement::Required
+        }
+    }
+
+    fn is_read_only_for(&self, input: &Value) -> bool {
+        input.get("gate").is_none_or(Value::is_null)
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        crate::core::engine::tool_catalog::enforce_tool_denial(context, self.name(), &input)?;
         let shell_input = task_shell_wait_input(input.clone());
         let result = BashTool::alias("exec_shell_wait", "wait")
             .execute(shell_input, context)
@@ -1059,6 +1138,7 @@ fn task_result_with_lifecycle_warning(
         "summary": format!("{label}: {} ({:?})", task.id, task.status),
         "task": task,
         "lifecycle_warning": lifecycle_warning,
+        "execution_ownership": if task.execution_scope.is_some() { "scope_bound" } else { "unverified" },
     }))
     .map_err(|e| ToolError::execution_failed(e.to_string()))
 }
@@ -1205,12 +1285,37 @@ fn task_id_schema() -> Value {
     })
 }
 
+/// The working-tree patch and changed paths an attempt records, read without
+/// running repository-configured diff drivers or filters.
+async fn attempt_diff(workspace: &Path) -> Result<(String, Vec<String>), ToolError> {
+    let review = crate::dependencies::Git::REVIEW_DIFF_ARGS;
+    let diff = git_output(
+        workspace,
+        &[&["diff", "--binary", "--no-color"][..], &review[..]].concat(),
+    )
+    .await?;
+    let changed_files = git_output(
+        workspace,
+        &[&["diff", "--name-only"][..], &review[..]].concat(),
+    )
+    .await?
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(ToString::to_string)
+    .collect();
+    Ok((diff, changed_files))
+}
+
 async fn git_output(workspace: &Path, args: &[&str]) -> Result<String, ToolError> {
     let args_owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
     let cwd = workspace.to_path_buf();
+    // Reads repository content, so repository-configured filters, fsmonitor
+    // and hooks stay off.
     let out = tokio::task::spawn_blocking(move || {
-        let arg_refs: Vec<&str> = args_owned.iter().map(String::as_str).collect();
-        crate::dependencies::Git::output(&arg_refs, &cwd)
+        crate::dependencies::Git::review_command(&cwd)
+            .map_err(|e| std::io::Error::other(format!("{e:#}")))?
+            .args(&args_owned)
+            .output()
     })
     .await
     .map_err(|e| {
@@ -1298,6 +1403,62 @@ fn sanitize_filename(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::tools::spec::ToolSpec;
+
+    /// Recording an attempt reads the working-tree patch; repository diff
+    /// drivers and clean filters must not run, and the patch stays a patch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attempt_diff_runs_no_repository_configured_commands() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let marker = outside.path().join("marker");
+        let script = |name: &str, body: &str| {
+            let path = outside.path().join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho {name} >> '{}'\n{body}", marker.display()),
+            )
+            .expect("write script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            path.display().to_string()
+        };
+        let clean = script("clean.sh", "cat\n");
+        let external = script("external.sh", "");
+        let textconv = script("textconv.sh", "cat \"$1\"\n");
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            let status = crate::dependencies::Git::status(args, repo).expect("git should spawn");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            repo.join(".gitattributes"),
+            "a.md diff=conv\nf.txt filter=x\n",
+        )
+        .expect("attrs");
+        std::fs::write(repo.join("a.md"), "one\n").expect("write");
+        std::fs::write(repo.join("f.txt"), "one\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["config", "filter.x.clean", &clean]);
+        git(&["config", "diff.conv.textconv", &textconv]);
+        std::fs::write(repo.join("a.md"), "two\n").expect("modify");
+        std::fs::write(repo.join("f.txt"), "two\n").expect("modify");
+        git(&["config", "diff.external", &external]);
+
+        let (diff, changed) = attempt_diff(repo).await.expect("attempt diff");
+        assert!(
+            !marker.exists(),
+            "recording ran a repository-configured command: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        assert!(diff.contains("+two"), "{diff}");
+        assert_eq!(changed, vec!["a.md".to_string(), "f.txt".to_string()]);
+    }
 
     #[test]
     fn durable_task_schema_requires_prompt() {
@@ -1448,6 +1609,66 @@ mod tests {
         assert!(wait_schema["properties"]["gate"].is_object());
     }
 
+    // `timeout_ms` rides along for interface compatibility only: the shell
+    // always starts in the background, where no deadline enforces it. The
+    // schema must say so instead of implying a bounded run.
+    #[test]
+    fn background_shell_timeout_disclosure_admits_it_is_not_enforced() {
+        let schema = TaskShellStartTool.input_schema();
+        let timeout_ms = schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .expect("timeout_ms must carry a description");
+        assert!(
+            timeout_ms.contains("not enforced"),
+            "timeout_ms must disclose that the background run is unbounded: {timeout_ms}"
+        );
+        assert!(
+            timeout_ms.contains("cancel"),
+            "timeout_ms must point at the exec_shell cancel path that can stop the run: {timeout_ms}"
+        );
+    }
+
+    // The gate blocks dangerous commands unless auto-approve is on, and the
+    // description is where the model learns that before composing a command.
+    #[test]
+    fn gate_run_description_discloses_dangerous_command_block_and_budget() {
+        let gate_run = TasksTool::alias("task_gate_run", "gate_run");
+        let description = gate_run.description();
+        assert!(
+            description.contains("BLOCKED") && description.contains("auto-approve"),
+            "gate_run description must disclose the dangerous-command block: {description}"
+        );
+        assert!(
+            description.contains("120s"),
+            "gate_run description must disclose the default gate timeout: {description}"
+        );
+    }
+
+    #[test]
+    fn runtime_surface_hardening_task_gate_recording_requires_approval() {
+        let tool = TaskShellWaitTool;
+        for input in [
+            json!({"task_id": "shell_1"}),
+            json!({"task_id": "shell_1", "gate": null}),
+        ] {
+            assert_eq!(
+                tool.approval_requirement_for(&input),
+                ApprovalRequirement::Auto
+            );
+            assert!(tool.is_read_only_for(&input));
+        }
+        for gate in ["fmt", "check", "clippy", "test", "custom"] {
+            let input = json!({"task_id": "shell_1", "gate": gate, "command": "cargo check"});
+            assert_eq!(
+                tool.approval_requirement_for(&input),
+                ApprovalRequirement::Required
+            );
+            assert!(!tool.is_read_only_for(&input));
+        }
+        assert!(tool.capabilities().contains(&ToolCapability::WritesFiles));
+        assert!(!tool.is_read_only());
+    }
+
     #[test]
     fn task_shell_wait_keeps_its_documented_nonblocking_default() {
         assert_eq!(
@@ -1515,10 +1736,204 @@ mod tests {
             .expect("cancel background shell");
     }
 
+    /// Creating a task from a session runs it on the posture that session
+    /// holds: `auto_approve` is a legacy bit the engine only reads when no
+    /// posture is given, so a task cannot talk itself into more authority than
+    /// the session that asked for it was granted.
+    #[tokio::test]
+    async fn create_pins_the_session_posture_on_the_task() {
+        struct NoopExecutor;
+
+        #[async_trait::async_trait]
+        impl crate::task_manager::TaskExecutor for NoopExecutor {
+            async fn execute(
+                &self,
+                _task: crate::task_manager::ExecutionTask,
+                _events: tokio::sync::mpsc::Sender<crate::task_manager::TaskExecutionEvent>,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> crate::task_manager::TaskExecutionResult {
+                crate::task_manager::TaskExecutionResult {
+                    status: crate::task_manager::TaskStatus::Completed,
+                    result_text: Some("noop".to_string()),
+                    error: None,
+                    terminal_reason: crate::task_manager::TaskTerminalReason::Completed,
+                }
+            }
+        }
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let manager = crate::task_manager::TaskManager::start_with_executor(
+            crate::task_manager::TaskManagerConfig {
+                data_dir: workspace.path().to_path_buf(),
+                worker_count: 1,
+                default_workspace: workspace.path().to_path_buf(),
+                default_model: "deepseek-v4-pro".to_string(),
+                default_mode: "agent".to_string(),
+                allow_shell: false,
+                trust_mode: false,
+                execution_limits: crate::task_manager::TaskExecutionLimits::default(),
+            },
+            std::sync::Arc::new(NoopExecutor),
+        )
+        .await
+        .expect("task manager");
+
+        let mut context = ToolContext::new(workspace.path());
+        context.approval_mode = codewhale_execpolicy::ApprovalMode::Auto;
+        context.shell_policy = crate::worker_profile::ShellPolicy::None;
+        context.runtime.task_manager = Some(manager.clone());
+
+        TasksTool::new("tasks")
+            .execute(
+                json!({
+                    "action": "create",
+                    "prompt": "run the sweep",
+                    "auto_approve": true,
+                    "trust_mode": true,
+                    "allow_shell": true,
+                    "mode": "yolo"
+                }),
+                &context,
+            )
+            .await
+            .expect("create accepted");
+
+        let queued = manager.list_tasks(Some(1)).await.expect("queued task");
+        let created = manager.get_task(&queued[0].id).await.expect("created task");
+        assert_eq!(
+            created.permission_posture.as_deref(),
+            Some("auto_review"),
+            "the task runs under its session's posture, not the model's legacy bit"
+        );
+        // Requested authority the session does not hold is not stored.
+        assert!(!created.auto_approve);
+        assert!(!created.trust_mode);
+        assert!(!created.allow_shell);
+
+        // The turn the task starts runs under the pinned posture: neither the
+        // legacy bit nor a legacy full-access mode alias can re-derive one.
+        let turn = crate::task_manager::ExecutionTask::from(&created).turn_request();
+        assert_eq!(turn.permission_posture.as_deref(), Some("auto_review"));
+        assert_eq!(turn.auto_approve, None);
+        let policy = crate::runtime_policy::RuntimePolicyProjection::from_request(
+            turn.mode.as_deref().expect("mode"),
+            turn.permission_posture.as_deref(),
+            turn.auto_approve,
+        )
+        .expect("policy");
+        assert_eq!(policy.permission, codewhale_execpolicy::ApprovalMode::Auto);
+
+        // A workspace outside what the session can reach is refused.
+        let outside = TasksTool::new("tasks")
+            .execute(
+                json!({"action": "create", "prompt": "look", "workspace": "/"}),
+                &context,
+            )
+            .await;
+        assert!(
+            outside.is_err(),
+            "a workspace outside the session is refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_gate_run_kills_the_gate_process_tree() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let context = ToolContext::new(workspace.path())
+            .with_shell_policy(crate::worker_profile::ShellPolicy::Full);
+        let result = TasksTool::new("tasks")
+            .execute(
+                json!({
+                    "action": "gate_run",
+                    "gate": "test",
+                    "command": "echo gate-started; sleep 300 & echo $! > gate-child.pid; wait",
+                    "timeout_ms": 5_000
+                }),
+                &context,
+            )
+            .await
+            .expect("gate runs");
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["timed_out"], true, "{metadata}");
+        // What the gate wrote before the timeout is kept.
+        assert!(
+            result.content.contains("gate-started"),
+            "{}",
+            result.content
+        );
+        let child = crate::process_tree::read_pid_file(
+            &workspace.path().join("gate-child.pid"),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            crate::process_tree::wait_for_pid_exit(child, std::time::Duration::from_secs(5)),
+            "the timed-out gate's process is still running"
+        );
+    }
+
     #[test]
-    fn gate_command_uses_login_shell_invocation() {
+    fn gate_command_uses_non_login_shell_invocation() {
+        // A login shell would source profile files that can re-export
+        // credentials the sanitized child environment just removed.
         let (program, args) = build_gate_command_parts("echo hello");
         assert_eq!(program, "/bin/sh");
-        assert_eq!(args, vec!["-lc".to_string(), "echo hello".to_string()]);
+        assert_eq!(args, vec!["-c".to_string(), "echo hello".to_string()]);
+    }
+
+    /// A gate command is workspace code: under a read-only posture it either
+    /// runs inside the enforcing sandbox, where its write fails, or is refused
+    /// outright where no enforcing sandbox exists. It never runs raw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_command_is_confined_by_the_session_sandbox() {
+        let tmp = crate::test_support::sandbox_visible_tempdir();
+        let written = tmp.path().join("written-by-gate.txt");
+        let mut context = ToolContext::new(tmp.path());
+        context.elevated_sandbox_policy = Some(crate::sandbox::SandboxPolicy::ReadOnly);
+        let command = format!(
+            "printf ran; printf x > '{}' 2>/dev/null; true",
+            written.display()
+        );
+        match build_gate_command(
+            &command,
+            tmp.path(),
+            &context,
+            std::time::Duration::from_secs(30),
+        ) {
+            Ok(mut cmd) => {
+                let output = cmd.output().await.expect("sandboxed gate command runs");
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "ran");
+            }
+            Err(error) => assert!(
+                error.to_string().contains("nothing was run"),
+                "only a missing enforcing sandbox may refuse: {error}"
+            ),
+        }
+        assert!(!written.exists(), "a read-only posture must stop the write");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_command_does_not_inherit_parent_secret_env() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _env_lock = lock_test_env();
+        let _secret = EnvVarGuard::set("CODEWHALE_TEST_GATE_SECRET", "gate-secret-value");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = build_gate_command(
+            "printf 'secret=%s\\n' \"${CODEWHALE_TEST_GATE_SECRET-unset}\"; printf 'path-ok\\n'",
+            tmp.path(),
+            &ToolContext::new(tmp.path()),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("gate command builds")
+        .output()
+        .await
+        .expect("gate command runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(stdout.contains("secret=unset"), "{stdout}");
+        assert!(!stdout.contains("gate-secret-value"), "{stdout}");
+        assert!(stdout.contains("path-ok"), "{stdout}");
     }
 }

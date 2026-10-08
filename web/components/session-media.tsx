@@ -19,15 +19,15 @@
  */
 
 import { REDUCED_MOTION_POLICY, type MediaAsset } from "@/lib/media-manifest";
-import { pickText } from "@/lib/i18n/dictionaries";
+import { getDocsShell, pickText } from "@/lib/i18n/dictionaries";
 import { StatusBadge } from "./status-badge";
 
 const MEDIA_PLAN_DOC =
-  "https://github.com/Hmbown/CodeWhale/blob/main/docs/releases/v0.9.2-media-plan.md";
-const REPO_BLOB_BASE = "https://github.com/Hmbown/CodeWhale/blob/main";
+  "https://github.com/codewhale-hq/CodeWhale/blob/main/docs/releases/v0.9.2-media-plan.md";
+const REPO_BLOB_BASE = "https://github.com/codewhale-hq/CodeWhale/blob/main";
 
 export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; locale?: string }) {
-  const isZh = locale === "zh";
+  const t = getDocsShell(locale);
 
   if (asset.status === "pending") {
     return (
@@ -40,16 +40,14 @@ export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; loca
         <div className="session-media-stage">
           <StatusBadge kind="pending" locale={locale} label={asset.pendingLabel} />
           <p className="session-media-pending-note">
-            {isZh
-              ? "还没有录像。录好之后会放在这里，附字幕、文字稿和可选的 GIF 下载。"
-              : "There is no recording yet. When there is, it goes here with captions, a transcript, and an optional GIF download."}
+            {t.mediaPendingNote}
           </p>
         </div>
         <figcaption className="session-media-caption">
           <strong>{pickText(asset.title, locale)}</strong>
           <span>{pickText(asset.description, locale)}</span>
           <a href={MEDIA_PLAN_DOC} target="_blank" rel="noreferrer">
-            {isZh ? "录制计划与验收清单 ↗" : "Recording plan and acceptance checklist ↗"}
+            {t.mediaPlanLink}
           </a>
         </figcaption>
       </figure>
@@ -62,6 +60,9 @@ export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; loca
   const poster = asset.poster!;
   const video = asset.video!;
   const captions = asset.captions ?? [];
+  // The track matching the page's language is the default; English only
+  // when the page's language has no captions.
+  const defaultCaption = captions.some((track) => track.srclang === locale) ? locale : "en";
 
   return (
     <figure
@@ -86,7 +87,7 @@ export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; loca
             src={`/${track.src}`}
             srcLang={track.srclang}
             label={track.label}
-            default={track.srclang === "en"}
+            default={track.srclang === defaultCaption}
           />
         ))}
       </video>
@@ -95,12 +96,12 @@ export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; loca
         <span>{pickText(asset.description, locale)}</span>
         {asset.gifFallback && (
           <a href={`/${asset.gifFallback.src}`}>
-            {isZh ? "GIF 下载回退（无视频环境）" : "GIF fallback download (no-video environments)"}
+            {t.mediaGifFallback}
           </a>
         )}
         {asset.transcript && (
           <a href={`${REPO_BLOB_BASE}/${asset.transcript}`} target="_blank" rel="noreferrer">
-            {isZh ? "文字稿 ↗" : "Transcript ↗"}
+            {t.mediaTranscript}
           </a>
         )}
       </figcaption>

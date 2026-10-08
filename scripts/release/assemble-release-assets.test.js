@@ -246,6 +246,7 @@ test("bundle helper emits reproducible timestamped tar and zip archives from pat
       "codewhale-windows-x64/codewhale.bat",
       "codewhale-windows-x64/codewhale.exe",
       "codewhale-windows-x64/install.bat",
+      "codewhale-windows-x64/install.ps1",
     ]);
     assert.deepEqual(zipListing("codewhale-windows-arm64.zip"), [
       "codewhale-windows-arm64/",
@@ -253,6 +254,7 @@ test("bundle helper emits reproducible timestamped tar and zip archives from pat
       "codewhale-windows-arm64/codewhale.bat",
       "codewhale-windows-arm64/codewhale.exe",
       "codewhale-windows-arm64/install.bat",
+      "codewhale-windows-arm64/install.ps1",
     ]);
     const portableEntries = zipListing("codewhale-windows-arm64-portable.zip");
     assert.deepEqual(portableEntries, [
@@ -290,7 +292,11 @@ test("bundle helper emits reproducible timestamped tar and zip archives from pat
           Buffer.from(expectedInstallBat, "utf8"),
           `${archive} install.bat must be staged with CRLF`,
         );
-        assert.match(installBat.toString("utf8"), /codewhale\.bat/);
+        assert.match(installBat.toString("utf8"), /powershell\.exe -NoProfile.*install\.ps1/);
+        const installPs = zipFile(archive, `${prefix}/install.ps1`);
+        assert.deepEqual(installPs, Buffer.from(toCrlf(fs.readFileSync(path.join(repoRoot, "scripts/release/install.ps1"), "utf8"))));
+        assert.match(installPs.toString("utf8"), /codewhale\.bat/);
+        assert.match(installPs.toString("utf8"), /Rollback incomplete; recovery files retained/);
       }
     }
 

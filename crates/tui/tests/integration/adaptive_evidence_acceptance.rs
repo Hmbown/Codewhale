@@ -41,6 +41,12 @@ async fn headless_bash_success_and_failure_are_distinct_bounded_exact_evidence()
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let events: Vec<Value> = std::str::from_utf8(&output.stdout)
+        .expect("UTF-8 stream events")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("valid stream event"))
+        .collect();
 
     let requests = server.received_requests().await.expect("recorded requests");
     let success_receipt =
@@ -113,8 +119,27 @@ async fn headless_bash_success_and_failure_are_distinct_bounded_exact_evidence()
         .count();
     assert_eq!(payloads, 2, "exactly one evidence payload per result");
 
-    let success = assert_exact_artifact(&artifact_dir, SUCCESS_CALL_ID, SUCCESS_SENTINEL, "Bash");
-    let failure = assert_exact_artifact(&artifact_dir, FAILURE_CALL_ID, FAILURE_SENTINEL, "Bash");
+    assert_ne!(
+        quoted_after(&success_receipt, "ref=\""),
+        quoted_after(&failure_receipt, "ref=\""),
+        "separate executions retain separate evidence handles"
+    );
+    let success = assert_exact_artifact(
+        &artifact_dir,
+        SUCCESS_CALL_ID,
+        &success_receipt,
+        &events,
+        SUCCESS_SENTINEL,
+        "success",
+    );
+    let failure = assert_exact_artifact(
+        &artifact_dir,
+        FAILURE_CALL_ID,
+        &failure_receipt,
+        &events,
+        FAILURE_SENTINEL,
+        "error",
+    );
     assert_ne!(
         success, failure,
         "success and failure bytes must stay distinct"
@@ -123,11 +148,40 @@ async fn headless_bash_success_and_failure_are_distinct_bounded_exact_evidence()
 
 fn assert_exact_artifact(
     artifact_dir: &Path,
-    call_id: &str,
+    provider_id: &str,
+    receipt: &str,
+    events: &[Value],
     sentinel: &str,
-    tool_name: &str,
+    status: &str,
 ) -> Vec<u8> {
-    let handle = format!("art_{call_id}");
+    let handle = quoted_after(receipt, "ref=\"").expect("model-visible artifact handle");
+    let call_id = handle.strip_prefix("art_").expect("tool artifact handle");
+    uuid::Uuid::parse_str(call_id).expect("artifact belongs to a host execution");
+    assert_ne!(call_id, provider_id);
+    for kind in ["tool_use", "tool_result"] {
+        let matching = events
+            .iter()
+            .filter(|event| event["type"] == kind && event["id"] == call_id)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "one {kind} for this exact execution");
+        let event = matching[0];
+        assert_eq!(event["name"], "Bash");
+        if kind == "tool_use" {
+            assert!(
+                event["input"]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains(sentinel)
+            );
+        } else {
+            // Model history trims the preview; stream events preserve it verbatim.
+            assert_eq!(
+                event["output"].as_str().expect("stream output").trim(),
+                receipt
+            );
+            assert_eq!(event["status"], status);
+        }
+    }
     let exact =
         std::fs::read(artifact_dir.join(format!("{handle}.txt"))).expect("exact evidence bytes");
     assert!(
@@ -145,7 +199,7 @@ fn assert_exact_artifact(
         .collect::<String>();
     assert_eq!(metadata["handle"], handle);
     assert_eq!(metadata["call_id"], call_id);
-    assert_eq!(metadata["tool_name"], tool_name);
+    assert_eq!(metadata["tool_name"], "Bash");
     assert_eq!(metadata["digest"], digest);
     assert_eq!(metadata["size_bytes"], exact.len() as u64);
     assert_eq!(metadata["generation"], 1);
@@ -216,7 +270,7 @@ impl Respond for EvidenceScenario {
 }
 
 /// Read the recovery ref the truncation footer hands the model, e.g. the
-/// `art_call_bash_failure` inside `… call retrieve_tool_result with ref="…"`.
+/// `art_<execution-id>` inside `… call retrieve_tool_result with ref="…"`.
 fn quoted_after<'a>(receipt: &'a str, marker: &str) -> Option<&'a str> {
     let rest = &receipt[receipt.find(marker)? + marker.len()..];
     rest.get(..rest.find('"')?)
@@ -230,7 +284,7 @@ fn run_exec(workspace: &Path, home: &Path, server: &MockServer) -> std::process:
         "allow_shell = true\n\n[retry]\nenabled = false\n",
     )
     .expect("headless test config");
-    let mut command = Command::new(binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace)
@@ -257,6 +311,9 @@ fn run_exec(workspace: &Path, home: &Path, server: &MockServer) -> std::process:
         .env("CODEWHALE_BASE_URL", server.uri())
         .env("DEEPSEEK_MODEL", MODEL)
         .env("CODEWHALE_MODEL", MODEL)
+        // The adaptive evidence lane is an explicit opt-in; this test exists
+        // to prove it end to end, so the spawned binary runs opted in.
+        .env("CODEWHALE_ADAPTIVE_OUTPUT_ROUTING", "1")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -408,14 +465,6 @@ fn sse_response(body: String) -> ResponseTemplate {
 
 fn json_response(value: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(value)
-}
-
-fn binary() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_codewhale-tui")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/codewhale-tui")
-        })
 }
 
 fn preserve_host_env(command: &mut Command) {

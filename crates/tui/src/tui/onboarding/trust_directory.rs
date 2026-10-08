@@ -7,9 +7,9 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::localization::MessageId;
-use crate::palette;
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
+use codewhale_palette as palette;
 
 /// Wrap a path-bearing line at `/` boundaries so a deep workspace never
 /// hard-splits mid-component under ratatui's whitespace-only `Wrap`.
@@ -120,7 +120,7 @@ mod tests {
             ..crate::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
         };
         let mut app = App::new(options, &Config::default());
-        app.ui_locale = crate::localization::Locale::En;
+        app.ui_locale = codewhale_localization::Locale::En;
         let body = lines(&app, 70)
             .into_iter()
             .flat_map(|line| line.spans.into_iter().map(|span| span.content.to_string()))
@@ -148,7 +148,7 @@ mod tests {
             },
             &Config::default(),
         );
-        app.ui_locale = crate::localization::Locale::En;
+        app.ui_locale = codewhale_localization::Locale::En;
         app.onboarding = crate::tui::app::OnboardingState::TrustDirectory;
 
         let rail = super::super::action_hints(&app)
@@ -179,8 +179,8 @@ mod tests {
 mod narrow_terminal_tests {
     use super::*;
     use crate::config::Config;
-    use crate::localization::{Locale, MessageId, tr};
     use crate::tui::app::TuiOptions;
+    use codewhale_localization::{Locale, MessageId, tr};
     use std::path::PathBuf;
     use unicode_width::UnicodeWidthStr;
 

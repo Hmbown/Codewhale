@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Export the TUI whale palette to the other Codewhale clients.
+"""Export the Codewhale palettes to the other Codewhale clients.
 
-`crates/tui/src/palette/tokens.rs` is the single source for the whale colors.
-This script parses its `WHALE_*_RGB` consts (aliases included) and writes the
-same values as CSS custom properties so the web app stops hand-copying hexes.
+The versioned `vendor/codewhale-design/tokens.json` snapshot owns the GPUI
+colors, radii, typography fallbacks and focus geometry. The adapter preserves
+this site's existing light/OS-dark/pinned-dark roles. The portable artifact's
+own generator checks its digest before exporting. Update the entire vendored
+folder from the app's design package; never edit its JSON here.
+
+`crates/palette/src/rgb.rs` still owns the terminal's WHALE, LIGHT and
+SHORELINE presets. They remain available to terminal-specific illustrations;
+the public site's GPUI aliases no longer copy the Rust palette's mirrors.
 
 Target: <repo>/web/app/tokens.css. This script writes nothing outside this
 repository.
@@ -16,20 +22,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-TOKENS_RS = REPO / "crates/tui/src/palette/tokens.rs"
-SOURCE_LABEL = "crates/tui/src/palette/tokens.rs"
+TOKENS_RS = REPO / "crates/palette/src/rgb.rs"
+SOURCE_LABEL = "crates/palette/src/rgb.rs + vendor/codewhale-design/tokens.json"
+GPUI_DIR = REPO / "vendor/codewhale-design"
 
 CONST_RE = re.compile(
-    r"^pub const (WHALE_[A-Z0-9_]+)_RGB: \(u8, u8, u8\) = "
-    r"(?:\((\d+), (\d+), (\d+)\)|(WHALE_[A-Z0-9_]+)_RGB);",
+    r"^pub const ((?:SHORELINE_LIGHT|SHORELINE|WHALE|LIGHT)_[A-Z0-9_]+)_RGB: \(u8, u8, u8\) = "
+    r"(?:\((\d+), (\d+), (\d+)\)|((?:SHORELINE_LIGHT|SHORELINE|WHALE|LIGHT)_[A-Z0-9_]+)_RGB);",
     re.MULTILINE,
 )
-
 
 
 def parse_tokens(text: str) -> list[tuple[str, tuple[int, int, int] | str]]:
@@ -47,11 +56,24 @@ def parse_tokens(text: str) -> list[tuple[str, tuple[int, int, int] | str]]:
             tokens.append((name, (int(m.group(2)), int(m.group(3)), int(m.group(4)))))
         known.add(name)
     if not tokens:
-        raise SystemExit(f"no WHALE_*_RGB consts found in {TOKENS_RS}")
+        raise SystemExit(f"no palette RGB consts found in {TOKENS_RS}")
     return tokens
 
 
 def css_name(name: str) -> str:
+    """Keep the website's existing names while replacing their source."""
+    if name.startswith("GPUI_LIGHT_"):
+        return "--gpui-light-" + name.removeprefix("GPUI_LIGHT_").lower().replace("_", "-")
+    if name.startswith("GPUI_"):
+        return "--gpui-dark-" + name.removeprefix("GPUI_").lower().replace("_", "-")
+    if name.startswith("SHORELINE_LIGHT_"):
+        return "--shoreline-light-" + name.removeprefix("SHORELINE_LIGHT_").lower().replace(
+            "_", "-"
+        )
+    if name.startswith("SHORELINE_"):
+        return "--shoreline-" + name.removeprefix("SHORELINE_").lower().replace("_", "-")
+    if name.startswith("LIGHT_"):
+        return "--light-" + name.removeprefix("LIGHT_").lower().replace("_", "-")
     return "--whale-" + name.removeprefix("WHALE_").lower().replace("_", "-")
 
 
@@ -75,13 +97,45 @@ def render_css(tokens) -> str:
     return "\n".join(lines) + "\n"
 
 
+def gpui_tokens(data):
+    aliases = {
+        "BG": "background", "TEXT": "foreground", "PANEL": "surface",
+        "TEXT_MUTED": "muted_foreground", "BORDER": "border", "SIDEBAR": "sidebar",
+        "PRIMARY": "primary", "ON_PRIMARY": "primary_foreground", "ACCENT": "hover",
+        "LIST_ACTIVE": "selected", "ATTENTION": "attention", "LIVE": "live",
+        "DANGER": "danger", "BORDER_STRONG": "border_strong",
+    }
+    return [
+        (f"{prefix}_{name}", tuple(bytes.fromhex(palette[key])))
+        for mode, prefix in [("dark", "GPUI"), ("light", "GPUI_LIGHT")]
+        for palette in [data["colors"][mode]]
+        for name, key in aliases.items()
+    ]
+
+
+def gpui_geometry(data, digest):
+    lines = [f"/* GPUI design {data['version']}; sha256 {digest}. */", ":root {"]
+    for section in ["radius", "focus", "spacing"]:
+        for name, value in data[section].items():
+            lines.append(f"  --gpui-{section}-{name}: {value}px;")
+    for name in ["selection_opacity", "primary_hover_opacity"]:
+        lines.append(f"  --gpui-{name.replace('_', '-')}: {data[name]};")
+    fallbacks = ", ".join(json.dumps(v) for v in data["typography"]["fallbacks"])
+    lines += [f"  --gpui-font-fallbacks: {fallbacks};",
+              f"  --gpui-mono-size: {data['typography']['mono_px'] / 16:g}rem;", "}"]
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="verify instead of write")
     args = ap.parse_args()
 
-    tokens = parse_tokens(TOKENS_RS.read_text(encoding="utf-8"))
-    css = render_css(tokens)
+    subprocess.run([sys.executable, str(GPUI_DIR / "generate.py"), "--check"], check=True)
+    source = (GPUI_DIR / "tokens.json").read_bytes()
+    data = json.loads(source)
+    tokens = parse_tokens(TOKENS_RS.read_text(encoding="utf-8")) + gpui_tokens(data)
+    css = render_css(tokens) + gpui_geometry(data, hashlib.sha256(source).hexdigest())
 
     targets: list[tuple[Path, str]] = [(REPO / "web/app/tokens.css", css)]
 

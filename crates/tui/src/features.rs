@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Feature flags and metadata for codewhale.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,8 +11,6 @@ pub enum Stage {
     Experimental,
     Beta,
     Stable,
-    Deprecated,
-    Removed,
 }
 
 impl Stage {
@@ -23,8 +19,6 @@ impl Stage {
             Self::Experimental => "experimental",
             Self::Beta => "beta",
             Self::Stable => "stable",
-            Self::Deprecated => "deprecated",
-            Self::Removed => "removed",
         }
     }
 }
@@ -48,6 +42,30 @@ pub enum Feature {
     VisionModel,
     /// Enable the agent-callable `verify` adversarial self-critique tool (#4196).
     Verify,
+    /// Expose `execute_tools` eagerly so the model composes by default (CodeMode).
+    CodeMode,
+    /// Run reviewed plugins' `native` host code in the TypeScript extension
+    /// host (experimental). Toggling it changes the plugin activation policy,
+    /// so every plugin is re-reviewed after a restart, in either direction.
+    ExtensionHost,
+    /// Use the pinned TypeScript finance normalization adapter; no runtime fallback.
+    FinanceHost,
+    /// Use the pinned TypeScript data validation presenter; no runtime fallback.
+    DataHost,
+    /// Use pinned speech preparation for the CLI and tool; no runtime fallback.
+    SpeechHost,
+    /// Pinned PDF outcome orchestration; Core retains process and document bytes.
+    PdfHost,
+    /// Pinned Native/Tesseract selection; Core retains image/process authority.
+    OcrHost,
+    /// Pinned web query/provider adapters; Core retains all HTTP and policy.
+    WebSearchHost,
+    /// Pinned HTML region selection; complete document bytes stay in Core.
+    WebExtractHost,
+    /// Pinned GitHub and local report presentation; Core retains effects and disclosure.
+    GithubHost,
+    /// Captured review presentation; Core retains provider, evidence and publication.
+    ReviewHost,
 }
 
 impl fmt::Display for Stage {
@@ -232,6 +250,76 @@ pub const FEATURES: &[FeatureSpec] = &[
         stage: Stage::Stable,
         default_enabled: true,
     },
+    FeatureSpec {
+        id: Feature::CodeMode,
+        key: "code_mode",
+        // Stays listed as experimental so `/config` shows the escape hatch.
+        stage: Stage::Experimental,
+        // #6562: code mode is the default way MCP and plugin tools compose.
+        // `[features] code_mode = false` is the escape hatch: execute_tools
+        // goes back to deferred (reachable through tool_search).
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::FinanceHost,
+        key: "finance_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::DataHost,
+        key: "data_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::SpeechHost,
+        key: "speech_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::PdfHost,
+        key: "pdf_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::OcrHost,
+        key: "ocr_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GithubHost,
+        key: "github_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WebSearchHost,
+        key: "web_search_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WebExtractHost,
+        key: "web_extract_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ReviewHost,
+        key: "review_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ExtensionHost,
+        key: "extension_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
 ];
 
 #[cfg(test)]
@@ -252,6 +340,24 @@ mod tests {
         assert!(!features.enabled(Feature::Mcp));
         assert!(!features.enabled(Feature::ShellTool));
         assert_eq!(feature_from_key("not_real"), None);
+    }
+
+    #[test]
+    fn code_mode_flag_parses_and_defaults_on_with_an_off_switch() {
+        assert_eq!(feature_from_key("code_mode"), Some(Feature::CodeMode));
+        let mut features = Features::with_defaults();
+        assert!(features.enabled(Feature::CodeMode));
+        features.apply_map(&BTreeMap::from([("code_mode".to_string(), false)]));
+        assert!(!features.enabled(Feature::CodeMode));
+    }
+
+    #[test]
+    fn extension_host_flag_parses_and_defaults_off() {
+        assert_eq!(
+            feature_from_key("extension_host"),
+            Some(Feature::ExtensionHost)
+        );
+        assert!(!Features::with_defaults().enabled(Feature::ExtensionHost));
     }
 
     #[test]

@@ -31,7 +31,10 @@ import {
   createRuntimeClient,
   readJsonSafe,
   readSse,
-  ThreadStore as CoreThreadStore
+  ThreadStore as CoreThreadStore,
+  ApprovalOwnershipError,
+  decideApproval as decideRuntimeApproval,
+  settleStoredApproval
 } from "../../bridge-core/src/lib.mjs";
 
 const TYPING_INTERVAL_MS = 2000;
@@ -211,7 +214,14 @@ async function handleIncomingUpdate(update) {
   }
 
   const command = parseCommand(scoped.text);
-  await handleCommand(identity.chatId, command);
+  await rememberAuthorizedIdentity(identity);
+  await handleCommand(identity.chatId, command, identity);
+}
+
+async function rememberAuthorizedIdentity({ chatId, chatType, userId, username, isBot }) {
+  await threadStore.patchChat(chatId, {
+    authorizedIdentity: { chatId, chatType, userId, username, isBot }
+  });
 }
 
 async function isReplayCallbackUpdate(update) {
@@ -219,7 +229,7 @@ async function isReplayCallbackUpdate(update) {
   return threadStore.recordMessage(`callback:${update.update_id}`);
 }
 
-async function handleCommand(chatId, command) {
+async function handleCommand(chatId, command, identity) {
   const action = commandAction(command);
   switch (action.kind) {
     case "help":
@@ -249,13 +259,13 @@ async function handleCommand(chatId, command) {
       await compactThread(chatId);
       return;
     case "approval":
-      await decideApproval(chatId, action);
+      await decideApproval(chatId, action, identity);
       return;
     case "set_model":
       await setChatModel(chatId, action.modelName);
       return;
     case "prompt":
-      startPromptTurn(chatId, action.prompt);
+      startPromptTurn(chatId, action.prompt, identity);
       return;
     default:
       await sendText(chatId, helpText(), { replyMarkup: controlKeyboard() });
@@ -293,13 +303,14 @@ async function handleCallbackQuery(query) {
     return;
   }
 
+  await rememberAuthorizedIdentity(identity);
   answerCallback(query.id, "Working...").catch((error) => {
     console.warn("failed to acknowledge Telegram callback", error);
   });
-  await handleModalAction(identity.chatId, action, query);
+  await handleModalAction(identity.chatId, action, query, identity);
 }
 
-async function handleModalAction(chatId, action, query = null) {
+async function handleModalAction(chatId, action, query = null, identity = null) {
   switch (action.kind) {
     case "help":
       await sendText(chatId, helpText(), { replyMarkup: controlKeyboard() });
@@ -325,22 +336,25 @@ async function handleModalAction(chatId, action, query = null) {
       await setChatModel(chatId, action.modelName);
       return;
     case "stored_action":
-      await handleStoredAction(chatId, action, query);
+      await handleStoredAction(chatId, action, query, identity);
       return;
     default:
       await sendText(chatId, helpText(), { replyMarkup: controlKeyboard() });
   }
 }
 
-async function handleStoredAction(chatId, action, query = null) {
-  const stored = await threadStore.getAction(action.token);
+async function handleStoredAction(chatId, action, query = null, identity = null) {
+  // Approval buttons also belong to the thread still bound to this chat.
+  const state = await threadStore.getChat(chatId);
+  const owner = { chatId, threadId: state?.threadId, actorId: turnActor(identity) };
+  const stored = await threadStore.getAction(action.token, owner);
   if (!stored) {
     await sendText(chatId, "That action expired. Open /menu and try again.");
     return;
   }
 
   if (stored.kind === "resume") {
-    await threadStore.takeAction(action.token);
+    await threadStore.takeAction(action.token, owner);
     await resumeThread(chatId, stored.threadId);
     return;
   }
@@ -349,12 +363,17 @@ async function handleStoredAction(chatId, action, query = null) {
     const suffix = action.suffix || "";
     const decision = suffix === "deny" ? "deny" : "allow";
     const remember = suffix === "remember";
-    await threadStore.takeAction(action.token);
-    await decideApproval(chatId, {
-      decision,
-      approvalId: stored.approvalId,
-      remember
-    });
+    // The token is consumed only after the Runtime accepted the decision.
+    try {
+      await settleStoredApproval(threadStore, action.token, owner, async () => {
+        if (!(await decideApproval(chatId, { decision, approvalId: stored.approvalId, remember, turnId: stored.owner.turnId }, identity))) {
+          throw new ApprovalOwnershipError("not delivered");
+        }
+      });
+    } catch (error) {
+      if (error instanceof ApprovalOwnershipError) return;
+      throw error;
+    }
     if (query?.message?.message_id) {
       await editMessageReplyMarkup(chatId, query.message.message_id, null).catch(() => {});
     }
@@ -408,7 +427,7 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   return state;
 }
 
-function startPromptTurn(chatId, prompt) {
+function startPromptTurn(chatId, prompt, identity) {
   if (activeTurnTasks.has(chatId)) {
     void sendText(chatId, "Thread already has an active turn. Wait for it to finish or send /interrupt.", {
       replyMarkup: activeTurnKeyboard()
@@ -421,7 +440,7 @@ function startPromptTurn(chatId, prompt) {
   const controller = new AbortController();
   const task = { controller };
   activeTurnTasks.set(chatId, task);
-  void runPrompt(chatId, prompt, { signal: controller.signal })
+  void runPrompt(chatId, prompt, { signal: controller.signal, actorId: turnActor(identity) })
     .catch((error) => {
       console.error("failed to run Telegram bridge prompt", error);
     })
@@ -468,11 +487,16 @@ function startTrackedTurnStream(chatId, threadId, turnId, sinceSeq) {
   return true;
 }
 
+function turnActor(identity) {
+  return identity?.userId && !identity.isBot ? `telegram-user:${identity.userId}` : "";
+}
+
 async function runPrompt(chatId, prompt, options = {}) {
   if (!prompt.trim()) {
     await sendText(chatId, helpText(), { replyMarkup: controlKeyboard() });
     return;
   }
+  if (!options.actorId) throw new ApprovalOwnershipError("turn needs its initiating human");
   const state = await ensureThread(chatId);
   const effectiveModel = state?.model || config.model;
   const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(state.threadId)}`);
@@ -507,6 +531,11 @@ async function runPrompt(chatId, prompt, options = {}) {
   );
 
   const turnId = turnResponse.turn?.id;
+  // A turn the Runtime accepted keeps streaming even when its origin cannot be
+  // recorded; its approvals then fail closed and are decided from the TUI.
+  if (turnId && options.actorId) {
+    await threadStore.recordTurnOrigin(chatId, state.threadId, turnId, options.actorId);
+  }
   await threadStore.patchChat(chatId, {
     activeTurnId: turnId || null,
     lastSeq: sinceSeq,
@@ -528,6 +557,13 @@ async function runPrompt(chatId, prompt, options = {}) {
 async function reattachActiveTurns() {
   for (const [chatId, state] of threadStore.listChats()) {
     if (!state?.threadId || !state.activeTurnId) continue;
+    const identity = state.authorizedIdentity;
+    // Legacy state has no verified sender provenance. Never recover delivery
+    // under a previous allowlist or group policy, even to report completion.
+    if (!identity || identity.chatId !== chatId || identity.isBot ||
+        !["private", "group", "supergroup"].includes(identity.chatType) ||
+        (isGroupChat(identity.chatType) && !config.allowGroups) ||
+        !isAllowed(identity, config.allowlist, config.allowUnlisted)) continue;
 
     const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(state.threadId)}`);
     const runningTurn = latestRunningTurn(detail);
@@ -663,10 +699,15 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
           );
           continue;
         }
-        const actionToken = await threadStore.putAction({
-          kind: "approval",
-          approvalId
-        });
+        const origin = threadStore.turnOrigin(chatId, threadId, turnId);
+        if (!origin) {
+          await sendTurnText(chatId, "Approval has no recorded initiating human; decide from the TUI.");
+          continue;
+        }
+        const actionToken = await threadStore.putAction(
+          { kind: "approval", approvalId },
+          { chatId, threadId, turnId, actorId: origin.actorId }
+        );
         await sendTurnText(
           chatId,
           [
@@ -759,10 +800,10 @@ async function sendThreads(chatId) {
   }
   const actions = [];
   for (const [index, thread] of threads.slice(0, 8).entries()) {
-    const token = await threadStore.putAction({
-      kind: "resume",
-      threadId: thread.id
-    });
+    const token = await threadStore.putAction(
+      { kind: "resume", threadId: thread.id },
+      { chatId }
+    );
     actions.push({ token, label: `Resume ${index + 1}` });
   }
   await sendText(
@@ -832,7 +873,8 @@ async function compactThread(chatId) {
   });
 }
 
-async function decideApproval(chatId, action) {
+/** Deliver a decision for an approval pending on this chat's thread. */
+async function decideApproval(chatId, action, identity) {
   const decision = action.decision;
   const { approvalId, remember } = action;
   if (!approvalId) {
@@ -840,13 +882,17 @@ async function decideApproval(chatId, action) {
       chatId,
       `Usage: /${decision} <approval_id>${decision === "allow" ? " [remember]" : ""}`
     );
-    return;
+    return false;
   }
-  await runtimeJson(`/v1/approvals/${encodeURIComponent(approvalId)}`, {
-    method: "POST",
-    body: { decision, remember }
-  });
+  try {
+    await decideRuntimeApproval(runtimeJson, { store: threadStore, chatId, actorId: turnActor(identity), approvalId, decision, remember, turnId: action.turnId });
+  } catch (error) {
+    if (!(error instanceof ApprovalOwnershipError)) throw error;
+    await sendText(chatId, `Approval ${approvalId} is not waiting in this chat.`);
+    return false;
+  }
   await sendText(chatId, `Approval ${approvalId}: ${decision}${remember ? " and remember" : ""}`);
+  return true;
 }
 
 async function setChatModel(chatId, modelName) {

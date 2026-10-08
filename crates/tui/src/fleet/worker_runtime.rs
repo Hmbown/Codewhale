@@ -23,13 +23,14 @@ use codewhale_protocol::fleet::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::identity::resolve_member_in_profiles;
+use super::identity::{FleetSelectorError, resolve_member_in_profiles};
 use super::profile::{
     AgentProfile, FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions,
     FleetRole as FleetProfileRole, FleetSlot, ProfileOrigin, canonical_public_role_name,
 };
-use crate::config::{ApiProvider, Config};
-use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
+use super::role::runtime_role_for_member;
+use crate::config::{Config, ProviderKind};
+use crate::route_runtime::resolve_route_candidate;
 use crate::tools::subagent::{AgentWorkerSpec, AgentWorkerToolProfile, FleetRole};
 use crate::worker_profile::{ChildLaunchManifest, ModelRoute, ToolScope, WorkerRuntimeProfile};
 
@@ -57,6 +58,8 @@ struct FrozenFleetMember {
     reasoning_effort: Option<String>,
     max_spawn_depth: Option<u32>,
     origin: ProfileOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_preset: Option<crate::extension_host::composition_scope::NativePresetRef>,
 }
 
 impl FrozenFleetMember {
@@ -77,6 +80,7 @@ impl FrozenFleetMember {
             reasoning_effort: profile.profile.reasoning_effort.clone(),
             max_spawn_depth: profile.profile.delegation.max_spawn_depth,
             origin: profile.origin,
+            native_preset: profile.native_preset.clone(),
         }
     }
 
@@ -86,6 +90,7 @@ impl FrozenFleetMember {
         }
         Ok(AgentProfile {
             id: self.id,
+            native_preset: self.native_preset,
             display_name: self.display_name,
             description: self.description,
             requires: self.requires,
@@ -135,7 +140,9 @@ pub fn validate_task_agent_profiles(
 /// exact routes. The durable task stores the selected member's canonical id and
 /// the identity/route inputs used for launch. Legacy `worker.role` remains a
 /// posture when it does not name exactly one member; explicit
-/// `worker.agent_profile` selectors fail closed when unknown or ambiguous.
+/// `worker.agent_profile` selectors fail closed when unknown or ambiguous, and
+/// when the task's `worker.role` names a posture other than the selected
+/// member's role.
 pub(crate) fn freeze_fleet_task_members(
     tasks: &mut [FleetTaskSpec],
     agent_profiles: &[AgentProfile],
@@ -209,6 +216,28 @@ pub(crate) fn freeze_fleet_task_members(
         if let Some(profile) = selected {
             validate_selected_member_model(task, profile)?;
             let snapshot = FrozenFleetMember::from_profile(profile);
+            // A task carries exactly one posture. When an explicit member
+            // selector is present, `worker.role` may only restate that
+            // member's role (any casing or legacy alias); naming a different
+            // posture is an authoring error, not a tie to arbitrate later.
+            // Failing closed here is what keeps the launch-time resolver
+            // honest: a read-only label can never widen to a member's write
+            // authority, and a member's read-only slot can never be widened by
+            // a write-capable label (#5945).
+            if explicit_selector.is_some()
+                && let Some(label) = legacy_role_selector.as_deref()
+            {
+                let label = canonical_public_role_name(label);
+                if label != snapshot.role {
+                    bail!(
+                        "Fleet task {} selects member {:?} whose role is {:?}, but worker.role names a different posture {:?}; a task has one posture — drop worker.role or select a member with that role",
+                        task.id,
+                        profile.id,
+                        snapshot.role,
+                        label
+                    );
+                }
+            }
             task.metadata.insert(
                 FROZEN_FLEET_MEMBER_METADATA_KEY.to_string(),
                 serde_json::to_value(&snapshot)?,
@@ -262,8 +291,8 @@ pub fn validate_fleet_task_routes(
         }
         if config.is_none()
             && let Some(provider_id) = explicit_provider.as_deref()
-            && ApiProvider::parse(provider_id)
-                .is_none_or(|provider| provider == ApiProvider::Custom)
+            && ProviderKind::parse(provider_id)
+                .is_none_or(|provider| provider == ProviderKind::Custom)
         {
             bail!(
                 "Fleet task `{}` names custom provider=`{provider_id}`, but a provider name alone does not prove its endpoint or model; attach the live route config before creating the run",
@@ -272,7 +301,10 @@ pub fn validate_fleet_task_routes(
         }
         if pinned_model && explicit_provider.is_none() {
             let config = config.expect("provider authority checked above");
-            let (provider, base_url) = (config.api_provider(), config.deepseek_base_url());
+            let identity = config
+                .active_provider_identity()
+                .map_err(anyhow::Error::msg)?;
+            let (provider, base_url) = (identity.provider, config.base_url_for_route(&identity));
             if let Err(reason) =
                 crate::route_runtime::validate_unpinned_model_provider(provider, &model, &base_url)
             {
@@ -338,7 +370,7 @@ fn validate_fleet_reasoning_effort(
         // the more useful provider/model diagnosis.
         return Ok(());
     };
-    let provider = ApiProvider::parse(&route.provider_kind).unwrap_or(ApiProvider::Custom);
+    let provider = ProviderKind::parse(&route.provider_kind).unwrap_or(ProviderKind::Custom);
     let capability = crate::config::provider_capability(provider, &route.wire_model_id);
     if capability.thinking_supported {
         return Ok(());
@@ -391,7 +423,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let agent_profile = agent_profile.as_deref();
     let worker_profile = task_spec.worker.as_ref();
     let role = effective_fleet_role(worker_profile, agent_profile);
-    let agent_type = fleet_role_to_agent_type(role.as_deref());
+    let agent_type = runtime_role_for_member(role.as_deref().unwrap_or_default());
     let tool_profile = fleet_tool_profile(worker_profile);
     let objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
     let max_spawn_depth = codewhale_config::FleetExecConfig::default().max_spawn_depth;
@@ -442,10 +474,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         writable_files: Vec::new(),
         coordination_contracts,
         expected_artifact: None,
-        token_budget: task_spec
-            .budget
-            .as_ref()
-            .and_then(|budget| budget.max_tokens),
+        deliverables: Vec::new(),
         resume_identity: Some(session_name.clone()),
         generation: 1,
         resume_from_agent_id: None,
@@ -461,6 +490,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         worker_id: worker_id.to_string(),
         run_id: run_id.to_string(),
         parent_run_id: None,
+        workflow_run_id: None,
         session_name: Some(session_name),
         objective,
         role,
@@ -473,7 +503,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         tool_profile,
         runtime_profile: runtime_profile.clone(),
         max_steps,
-        spawn_depth: 0,
+        spawn_depth: runtime_profile.spawn_depth,
         max_spawn_depth: runtime_profile.max_spawn_depth,
         child_route: None,
         launch_manifest: Some(launch_manifest),
@@ -663,32 +693,39 @@ pub(crate) fn resolve_fleet_route_with_config(
     let (candidate, provider_id, provider_exact_id, route_source) = if let Some(config) = config {
         let identity = match explicit_provider_id.as_deref() {
             Some(provider_id) => config.resolve_provider_identity(provider_id).ok()?,
-            None => config
-                .resolve_provider_identity(&config.provider_identity_for(config.api_provider()))
-                .ok()?,
+            None => config.active_provider_identity().ok()?,
         };
-        let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
-        let route = resolve_runtime_route(&scoped, identity.provider, model_selector)
-            .ok()?
-            .validate()
-            .ok()?;
-        let provider_exact_id = (route.identity.provider == ApiProvider::Custom)
-            .then_some(route.identity.exact_id)
-            .flatten();
+        let route = crate::route_runtime::resolve_runtime_route_for_identity(
+            config,
+            &identity,
+            model_selector,
+        )
+        .ok()?
+        .validate()
+        .ok()?;
+        let provider_exact_id = route.identity.persisted_id().map(str::to_string);
         (
             route.candidate,
-            route.identity.key,
+            route.identity.key.to_string(),
             provider_exact_id,
             "runtime_route",
         )
     } else {
         let provider_id = explicit_provider_id.as_deref()?;
-        let provider = ApiProvider::parse(provider_id)?;
-        if provider == ApiProvider::Custom {
+        let metadata = codewhale_config::descriptors::compatibility_for_selector(provider_id)?;
+        let provider = metadata.kind;
+        if provider == ProviderKind::Custom {
             return None;
         }
-        let candidate = resolve_route_candidate(provider, model_selector, None, None, None).ok()?;
+        let candidate = resolve_route_candidate(
+            provider,
+            model_selector,
+            Some(metadata.default_model),
+            Some(metadata.base_url.to_owned()),
+            None,
+            None,
+        )
+        .ok()?;
         let provider_id = candidate.provider_id().as_str().to_string();
         (candidate, provider_id, None, "resolver")
     };
@@ -743,8 +780,8 @@ pub(crate) fn resolve_fleet_route_from_worker_report(
         Some(provider_exact_id) => Some(non_empty_trimmed(provider_exact_id)?),
         None => None,
     };
-    let provider_kind = ApiProvider::parse(provider)?;
-    if provider_exact_id.is_some() && provider_kind != ApiProvider::Custom {
+    let provider_kind = ProviderKind::parse(provider)?;
+    if provider_exact_id.is_some() && provider_kind != ProviderKind::Custom {
         return None;
     }
     let provider_id = provider_exact_id.unwrap_or(provider);
@@ -877,25 +914,72 @@ fn fleet_task_prompt_with_profile(
         }
     }
 
-    if let Some(agent_profile) = agent_profile {
-        prompt.push_str("\nFleet profile: ");
-        prompt.push_str(&agent_profile.id);
-        if let Some(display_name) = agent_profile.display_name.as_deref() {
-            prompt.push_str(" (");
-            prompt.push_str(display_name);
-            prompt.push(')');
-        }
-        if let Some(description) = agent_profile.description.as_deref() {
-            prompt.push_str("\nProfile description:\n");
-            prompt.push_str(description);
-        }
-        if let Some(instructions) = agent_profile.profile.role.instructions.as_deref() {
-            prompt.push_str("\nProfile instructions:\n");
-            prompt.push_str(instructions);
-        }
+    if let Some(profile) = agent_profile {
+        append_agent_profile_prompt(&mut prompt, profile);
     }
 
     prompt
+}
+
+/// Shared saved-profile instructions for direct and durable Fleet children.
+pub(crate) fn append_agent_profile_prompt(prompt: &mut String, agent_profile: &AgentProfile) {
+    prompt.push_str("\nFleet profile: ");
+    prompt.push_str(&agent_profile.id);
+    if let Some(display_name) = agent_profile.display_name.as_deref() {
+        prompt.push_str(" (");
+        prompt.push_str(display_name);
+        prompt.push(')');
+    }
+    if let Some(description) = agent_profile.description.as_deref() {
+        prompt.push_str("\nProfile description:\n");
+        prompt.push_str(description);
+    }
+    if let Some(instructions) = agent_profile.profile.role.instructions.as_deref() {
+        prompt.push_str("\nProfile instructions:\n");
+        prompt.push_str(instructions);
+    }
+}
+
+/// Find a saved role pin without letting a member id shadow a second member
+/// with the same semantic role. Built-in inherited postures are not pins.
+pub(crate) fn resolve_pinned_role_profile(
+    agent_profiles: &[AgentProfile],
+    role: &str,
+) -> Result<Option<AgentProfile>, FleetSelectorError> {
+    let pinned = agent_profiles
+        .iter()
+        .filter(|profile| {
+            profile.origin != ProfileOrigin::BuiltIn
+                && profile
+                    .profile
+                    .model
+                    .as_deref()
+                    .and_then(non_empty_trimmed)
+                    .is_some_and(|model| !model.eq_ignore_ascii_case("auto"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    resolve_member_in_profiles(
+        &pinned,
+        &format!("role:{}", canonical_public_role_name(role)),
+    )
+    .map(|member| member.cloned())
+}
+
+/// Compare only the known route pair; never infer a provider from a wire id's
+/// namespace. A qualified task selector may restate that same exact pair.
+pub(crate) fn requested_model_matches_pin(
+    requested: &str,
+    model: &str,
+    provider: Option<&str>,
+) -> bool {
+    let requested = requested.trim();
+    let model = model.trim();
+    requested == model
+        || provider
+            .and_then(non_empty_trimmed)
+            .and_then(|provider| requested.strip_prefix(&format!("{provider}/")))
+            .is_some_and(|requested_model| requested_model == model)
 }
 
 fn resolve_task_agent_profile<'a>(
@@ -969,24 +1053,24 @@ fn validate_selected_member_model(task_spec: &FleetTaskSpec, profile: &AgentProf
     else {
         return Ok(());
     };
-    let Some(profile_provider) = profile
-        .profile
-        .provider
-        .as_deref()
-        .and_then(non_empty_trimmed)
-    else {
-        return Ok(());
-    };
     let Some(profile_model) = profile.profile.model.as_deref().and_then(non_empty_trimmed) else {
         return Ok(());
     };
-    if !task_model.eq_ignore_ascii_case(profile_model) {
+    if profile_model.eq_ignore_ascii_case("auto") {
+        return Ok(());
+    }
+    let profile_provider = profile
+        .profile
+        .provider
+        .as_deref()
+        .and_then(non_empty_trimmed);
+    if !requested_model_matches_pin(task_model, profile_model, profile_provider) {
         bail!(
-            "Fleet task {} selects member {:?} with frozen route {}/{}; worker.model {:?} conflicts with that member route",
+            "Fleet task {} selects member {:?} with pinned model {} on {}; worker.model {:?} conflicts with that member route",
             task_spec.id,
             profile.id,
-            profile_provider,
             profile_model,
+            profile_provider.unwrap_or("the session provider"),
             task_model
         );
     }
@@ -1004,36 +1088,43 @@ fn effective_fleet_role_with_source(
     worker_profile: Option<&FleetTaskWorkerProfile>,
     agent_profile: Option<&AgentProfile>,
 ) -> (Option<String>, Option<&'static str>) {
-    // When legacy `worker.role` deterministically selected a roster member,
-    // use that member's semantic role as the runtime posture. A display name,
-    // model label, or route selector must never become a posture string.
-    if worker_profile
-        .and_then(|worker| worker.agent_profile.as_deref())
-        .and_then(non_empty_trimmed)
-        .is_none()
-        && let Some(profile) = agent_profile
-    {
+    // A resolved roster member is authoritative for the runtime posture: its
+    // canonical slot (reviewer/builder/...) defines shell/write/network
+    // authority. The resolved `AgentProfile` always carries a canonical
+    // `role.name` — a display name, model label, or route selector is already
+    // collapsed onto the member during profile resolution, never surfaced as a
+    // raw posture string here.
+    //
+    // Preferring the member over legacy `worker.role` is what makes a task
+    // whose role label is "manager" but whose agent_profile selects
+    // `member:reviewer` actually run with reviewer authority. Previously the
+    // first branch required `worker.agent_profile` to be empty, so a present
+    // agent_profile fell through to `worker.role` and silently discarded the
+    // member's slot (fleet-e12f3160: task stayed a manager-coordinator and was
+    // never leased).
+    //
+    // This is not where a conflict gets arbitrated. `freeze_fleet_task_members`
+    // rejects a spec whose `worker.role` names a posture other than the
+    // selected member's role before the task is persisted, so by the time a
+    // member reaches this function its role and the task label agree (#5945).
+    if let Some(profile) = agent_profile {
         return (
             Some(canonical_public_role_name(&profile.profile.role.name)),
             Some("agent_profile.role"),
         );
     }
+    // No member resolved (no agent_profile selector, no frozen snapshot, and
+    // worker.role was not a deterministic member selector). Keep the legacy
+    // role label so existing v1 tasks retain their historical posture. A
+    // receipt whose `role_source` reads "task.role" therefore means exactly
+    // that: no roster member was resolved for the task at all.
     worker_profile
         .and_then(|worker| worker.role.as_deref())
         .map(str::trim)
         .filter(|role| !role.is_empty())
         .map(canonical_public_role_name)
         .map(|role| (Some(role), Some("task.role")))
-        .unwrap_or_else(|| {
-            agent_profile
-                .map(|profile| {
-                    (
-                        Some(canonical_public_role_name(&profile.profile.role.name)),
-                        Some("agent_profile.role"),
-                    )
-                })
-                .unwrap_or((None, None))
-        })
+        .unwrap_or((None, None))
 }
 
 fn effective_fleet_loadout(
@@ -1087,13 +1178,10 @@ fn effective_fleet_model_with_source(
     worker_profile: Option<&FleetTaskWorkerProfile>,
     agent_profile: Option<&AgentProfile>,
 ) -> (String, &'static str) {
-    if agent_profile
-        .and_then(|profile| profile.profile.provider.as_deref())
+    if let Some(model) = agent_profile
+        .and_then(|profile| profile.profile.model.as_deref())
         .and_then(non_empty_trimmed)
-        .is_some()
-        && let Some(model) = agent_profile
-            .and_then(|profile| profile.profile.model.as_deref())
-            .and_then(non_empty_trimmed)
+        .filter(|model| !model.eq_ignore_ascii_case("auto"))
     {
         return (model.to_string(), "agent_profile.model");
     }
@@ -1115,7 +1203,7 @@ fn effective_fleet_model_with_source(
 /// The provider id a resolved agent profile EXPLICITLY pins, if any (#4093).
 ///
 /// This preserves user-named OpenAI-compatible custom providers such as
-/// `lm-studio` instead of collapsing them through [`ApiProvider`]. Runtime
+/// `lm-studio` instead of collapsing them through [`ProviderKind`]. Runtime
 /// launch paths can set `Config.provider` to this exact id so the normal config
 /// resolver finds `[providers.<id>]` (#3965).
 ///
@@ -1145,10 +1233,12 @@ pub(crate) fn explicit_fleet_provider_id(agent_profile: Option<&AgentProfile>) -
 /// instead of re-deriving it and risking a second, divergent policy. User-named
 /// custom providers intentionally return `None` here; launch paths that can
 /// carry strings should use [`explicit_fleet_provider_id`].
-pub(crate) fn explicit_fleet_provider(agent_profile: Option<&AgentProfile>) -> Option<ApiProvider> {
+pub(crate) fn explicit_fleet_provider(
+    agent_profile: Option<&AgentProfile>,
+) -> Option<ProviderKind> {
     explicit_fleet_provider_id(agent_profile)
         .as_deref()
-        .and_then(ApiProvider::parse)
+        .and_then(ProviderKind::parse)
 }
 
 pub(crate) fn effective_fleet_reasoning_effort(
@@ -1167,7 +1257,8 @@ fn effective_fleet_reasoning_effort_for_role(
 ) -> Option<String> {
     effective_fleet_reasoning_effort(agent_profile).or_else(|| {
         let role = effective_fleet_role(worker_profile, agent_profile);
-        WorkerRuntimeProfile::for_role(fleet_role_to_agent_type(role.as_deref())).reasoning_effort
+        WorkerRuntimeProfile::for_role(runtime_role_for_member(role.as_deref().unwrap_or_default()))
+            .reasoning_effort
     })
 }
 
@@ -1250,51 +1341,15 @@ fn fleet_route_model_selector_with_source(
     }
 }
 
-/// Map a fleet role name to a `FleetRole`. Unknown roles default to `General`.
-pub(crate) fn fleet_role_to_agent_type(role: Option<&str>) -> FleetRole {
-    match role {
-        Some("smoke-runner") => FleetRole::Verifier,
-        Some("explore") | Some("scout") => FleetRole::Scout,
-        Some("read-only") => FleetRole::Scout,
-        Some("reviewer") => FleetRole::Reviewer,
-        Some("implement") | Some("builder") => FleetRole::Builder,
-        Some("test") | Some("verifier") | Some("tester") => FleetRole::Verifier,
-        // Every canonical dispatch posture is also a seeded roster member
-        // (#5285); the explicit arms keep the roster→runtime mapping 1:1.
-        Some("planner") => FleetRole::Planner,
-        Some("custom") => FleetRole::Custom,
-        // Advisory counsel (#4752). `oracle` and `consultant` are compatibility
-        // aliases for the canonical public role name, `advisor`.
-        Some("consultant") | Some("oracle") | Some("advisor") => FleetRole::Consultant,
-        Some("explorer") => FleetRole::Scout,
-        // Coordination happens through delegation, which needs the full
-        // General surface (#fleet-roster cutover (v0.8.67)). The operator is
-        // the helm of the overall work (it assigns managers to Workflows);
-        // the manager is the middle manager of one Workflow. Both coordinate,
-        // so both get the General surface — explicitly, not by fall-through.
-        Some("manager") | Some("coordinator") | Some("operator") => FleetRole::Worker,
-        // Synthesis is read-only (planner posture: network reads and
-        // read-only probes, never workspace writes). It must never fall
-        // through to General's full-write posture (#fleet-roster cutover
-        // (v0.8.67)).
-        Some("synthesizer") | Some("summarizer") | Some("reducer") => FleetRole::Planner,
-        Some("general") | None => FleetRole::Worker,
-        Some(other) => {
-            // Try parsing as a FleetRole directly
-            FleetRole::from_str(other).unwrap_or(FleetRole::Worker)
-        }
-    }
-}
-
 /// Runtime agent type for a roster member: role name first, falling back to
 /// the org-chart slot name when the role name is empty (#fleet-roster cutover
 /// (v0.8.67)).
 pub(crate) fn roster_member_agent_type(member: &AgentProfile) -> FleetRole {
     let role_name = member.profile.role.name.trim();
     if role_name.is_empty() {
-        fleet_role_to_agent_type(Some(member.profile.slot.as_str()))
+        runtime_role_for_member(member.profile.slot.as_str())
     } else {
-        fleet_role_to_agent_type(Some(role_name))
+        runtime_role_for_member(role_name)
     }
 }
 
@@ -1323,7 +1378,8 @@ fn fleet_worker_runtime_profile(
     } else {
         ModelRoute::Fixed(model.to_string())
     };
-    profile.max_spawn_depth = max_spawn_depth.saturating_sub(spawn_depth);
+    profile.max_spawn_depth = max_spawn_depth;
+    profile.spawn_depth = spawn_depth;
     profile.background = true;
     profile
 }
@@ -1386,9 +1442,11 @@ pub(crate) fn fleet_model_route_for_loadout(
 
 /// Apply exec hardening to a worker spec from fleet config (#3027).
 ///
-/// Filters tools against allowed/disallowed lists, caps max_steps to
-/// config's max_turns, and returns the objective with system prompt
-/// appended when configured.
+/// Filters tools against allowed/disallowed lists and caps max_steps to
+/// config's max_turns. `append_system_prompt` is deliberately not folded into
+/// the objective: the worker command delivers it once, as system prompt text,
+/// via `--append-system-prompt`, and the objective must stay identical to the
+/// persisted launch manifest prompt.
 pub fn apply_exec_hardening(
     mut spec: AgentWorkerSpec,
     exec: &codewhale_config::FleetExecConfig,
@@ -1401,10 +1459,13 @@ pub fn apply_exec_hardening(
             spec.max_steps.min(exec.max_turns)
         };
     }
-    spec.max_spawn_depth = exec
+    spec.max_spawn_depth = spec
         .max_spawn_depth
+        .min(spec.runtime_profile.max_spawn_depth)
+        .min(exec.max_spawn_depth)
         .min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
-    spec.runtime_profile.max_spawn_depth = spec.max_spawn_depth.saturating_sub(spec.spawn_depth);
+    spec.runtime_profile.max_spawn_depth = spec.max_spawn_depth;
+    spec.runtime_profile.spawn_depth = spec.spawn_depth;
 
     // Apply tool filtering
     if !exec.allowed_tools.is_empty() || !exec.disallowed_tools.is_empty() {
@@ -1423,14 +1484,6 @@ pub fn apply_exec_hardening(
         if !spec.runtime_profile.denied_tools.contains(rule) {
             spec.runtime_profile.denied_tools.push(rule.clone());
         }
-    }
-
-    // Append system prompt
-    if !exec.append_system_prompt.is_empty() {
-        spec.objective = format!(
-            "{}\n\n[Policy]\n{}",
-            spec.objective, exec.append_system_prompt
-        );
     }
 
     spec
@@ -1494,7 +1547,7 @@ pub(crate) fn network_posture_warning_for_task(
     let agent_profile = agent_profile.as_deref();
     let worker_profile = task.worker.as_ref();
     let role = effective_fleet_role(worker_profile, agent_profile);
-    let agent_type = fleet_role_to_agent_type(role.as_deref());
+    let agent_type = runtime_role_for_member(role.as_deref().unwrap_or_default());
     let tool_profile = fleet_tool_profile(worker_profile);
     let (model, model_source) = effective_fleet_model_with_source(
         session_model.unwrap_or("auto"),
@@ -1530,6 +1583,7 @@ fn profile_origin_label(origin: crate::fleet::roster::ProfileOrigin) -> &'static
         crate::fleet::roster::ProfileOrigin::Config => "config",
         crate::fleet::roster::ProfileOrigin::Personal => "personal",
         crate::fleet::roster::ProfileOrigin::Workspace => "workspace",
+        crate::fleet::roster::ProfileOrigin::ClaudeCode => "claude",
     }
 }
 
@@ -1579,9 +1633,9 @@ mod tests {
     fn explicit_deepseek_config() -> Config {
         Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("test-key".to_string()),
             ..Config::default()
         }
+        .with_legacy_root(Some("test-key".to_string()), None)
     }
 
     #[test]
@@ -1849,6 +1903,7 @@ mod tests {
         loadout: codewhale_config::FleetLoadout,
     ) -> AgentProfile {
         AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: Some(format!("{role} profile")),
             description: Some(format!("{role} description")),
@@ -1875,48 +1930,38 @@ mod tests {
 
     #[test]
     fn fleet_role_smoke_runner_maps_to_verifier() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("smoke-runner")),
-            FleetRole::Verifier
-        );
+        assert_eq!(runtime_role_for_member("smoke-runner"), FleetRole::Verifier);
     }
 
     #[test]
     fn fleet_role_read_only_maps_to_explore() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("read-only")),
-            FleetRole::Scout
-        );
+        assert_eq!(runtime_role_for_member("read-only"), FleetRole::Scout);
     }
 
     #[test]
     fn fleet_role_reviewer_maps_to_review() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("reviewer")),
-            FleetRole::Reviewer
-        );
+        assert_eq!(runtime_role_for_member("reviewer"), FleetRole::Reviewer);
     }
 
     #[test]
     fn fleet_role_builder_maps_to_implementer() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("builder")),
-            FleetRole::Builder
-        );
+        assert_eq!(runtime_role_for_member("builder"), FleetRole::Builder);
     }
 
+    /// An *absent* role is not an *unknown* role: a Fleet task with no `role`
+    /// field has always run on the documented general default, and #5575's
+    /// fail-closed rule is about labels nobody declared, not about the
+    /// unspecified case.
     #[test]
-    fn fleet_role_none_maps_to_general() {
-        assert_eq!(fleet_role_to_agent_type(None), FleetRole::Worker);
+    fn an_unspecified_role_still_maps_to_general() {
+        assert_eq!(runtime_role_for_member(""), FleetRole::Worker);
+        assert_eq!(runtime_role_for_member("   "), FleetRole::Worker);
     }
 
     #[test]
     fn fleet_role_manager_and_coordinator_map_to_general() {
-        assert_eq!(fleet_role_to_agent_type(Some("manager")), FleetRole::Worker);
-        assert_eq!(
-            fleet_role_to_agent_type(Some("coordinator")),
-            FleetRole::Worker
-        );
+        assert_eq!(runtime_role_for_member("manager"), FleetRole::Worker);
+        assert_eq!(runtime_role_for_member("coordinator"), FleetRole::Worker);
     }
 
     #[test]
@@ -1924,9 +1969,177 @@ mod tests {
         // The operator coordinates the overall work (assigns managers to
         // workflows), so it needs the full General surface — by an explicit
         // match arm, not the unknown-role fall-through.
+        assert_eq!(runtime_role_for_member("operator"), FleetRole::Worker);
+    }
+
+    #[test]
+    fn agent_profile_member_slot_overrides_legacy_role_label() {
+        // Regression (fleet-e12f3160): a task whose legacy role label is
+        // "manager" but whose agent_profile selects `member:reviewer` must run
+        // with reviewer authority, not fall through to the "manager" label and
+        // get stuck as a write-capable worker that never leases.
+        let reviewer = agent_profile(
+            "reviewer",
+            "reviewer",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        let task = fleet_task(
+            "conflict",
+            Some(worker_profile(
+                Some("member:reviewer"),
+                Some("manager"),
+                None,
+                None,
+                None,
+                vec!["read_file"],
+            )),
+        );
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let spec = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &task,
+            &worker,
+            "auto",
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            &[reviewer],
+            None,
+        )
+        .expect("member selector resolves to the reviewer roster profile");
+
         assert_eq!(
-            fleet_role_to_agent_type(Some("operator")),
-            FleetRole::Worker
+            spec.role.as_deref(),
+            Some("reviewer"),
+            "the selected member's slot must win over the legacy role label"
+        );
+        assert_eq!(
+            spec.agent_type,
+            FleetRole::Reviewer,
+            "reviewer authority must not be silently widened to a write-capable worker"
+        );
+    }
+
+    #[test]
+    fn legacy_role_label_never_widens_into_a_member_write_slot() {
+        // Mirror of the regression above (#5945 review): member `alice` sits
+        // in the write-capable `implement` slot while the task's legacy label
+        // says `reviewer`. Letting the member win unconditionally would turn a
+        // read-only task into a write-capable one; letting the label win would
+        // re-open the original bug. Neither is a posture — the spec is
+        // rejected before anything is persisted.
+        let alice = agent_profile(
+            "alice",
+            "implement",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        let mut task = fleet_task(
+            "mirror-conflict",
+            Some(worker_profile(
+                Some("member:alice"),
+                Some("reviewer"),
+                None,
+                None,
+                None,
+                vec!["read_file"],
+            )),
+        );
+
+        let error = freeze_fleet_task_members(std::slice::from_mut(&mut task), &[alice], false)
+            .expect_err("a read-only label must not become a write-capable member slot");
+        assert!(error.to_string().contains("\"implement\""), "{error:#}");
+        assert!(error.to_string().contains("\"reviewer\""), "{error:#}");
+        assert!(
+            !task.metadata.contains_key(FROZEN_FLEET_MEMBER_METADATA_KEY),
+            "a rejected spec must not persist a member snapshot"
+        );
+        assert_eq!(
+            task.worker.as_ref().unwrap().role.as_deref(),
+            Some("reviewer"),
+            "the rejected task keeps its authored label untouched"
+        );
+    }
+
+    #[test]
+    fn conflicting_member_and_role_label_is_rejected_at_freeze_naming_both_postures() {
+        // The original fleet-e12f3160 spec: `member:reviewer` plus a
+        // `manager` label. It is an authoring error, and the message must name
+        // both postures so the author can see which one to drop.
+        let reviewer = agent_profile(
+            "reviewer",
+            "reviewer",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        let mut task = fleet_task(
+            "conflict",
+            Some(worker_profile(
+                Some("member:reviewer"),
+                Some("manager"),
+                None,
+                None,
+                None,
+                vec!["read_file"],
+            )),
+        );
+
+        let error = freeze_fleet_task_members(std::slice::from_mut(&mut task), &[reviewer], true)
+            .expect_err("a task cannot carry two postures");
+        let message = error.to_string();
+        assert!(message.contains("selects member \"reviewer\""), "{error:#}");
+        assert!(message.contains("whose role is \"reviewer\""), "{error:#}");
+        assert!(
+            message.contains("worker.role names a different posture \"manager\""),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn role_label_alias_of_the_selected_member_role_is_not_a_conflict() {
+        // Casing and legacy aliases are spelling, not posture: `Code-Review`
+        // canonicalizes to `reviewer`, which is exactly the member's role.
+        let reviewer = agent_profile(
+            "reviewer",
+            "reviewer",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        let mut task = fleet_task(
+            "alias",
+            Some(worker_profile(
+                Some("member:reviewer"),
+                Some("Code-Review"),
+                None,
+                None,
+                None,
+                vec!["read_file"],
+            )),
+        );
+
+        let profiles = [reviewer];
+        freeze_fleet_task_members(std::slice::from_mut(&mut task), &profiles, true)
+            .expect("an alias of the member's own role must freeze cleanly");
+        let worker = task.worker.as_ref().unwrap();
+        assert_eq!(worker.agent_profile.as_deref(), Some("member:reviewer"));
+        assert_eq!(worker.role.as_deref(), Some("reviewer"));
+        assert!(task.metadata.contains_key(FROZEN_FLEET_MEMBER_METADATA_KEY));
+
+        let resolved = resolve_task_agent_profile(&task, &profiles)
+            .unwrap()
+            .expect("frozen member");
+        assert_eq!(
+            effective_fleet_role_with_source(task.worker.as_ref(), Some(&resolved)),
+            (Some("reviewer".to_string()), Some("agent_profile.role"))
         );
     }
 
@@ -1934,7 +2147,7 @@ mod tests {
     fn consultant_and_legacy_advisory_aliases_share_the_consultant_posture() {
         for role in ["consultant", "oracle", "advisor"] {
             assert_eq!(
-                fleet_role_to_agent_type(Some(role)),
+                runtime_role_for_member(role),
                 FleetRole::Consultant,
                 "role {role}"
             );
@@ -1944,10 +2157,10 @@ mod tests {
     #[test]
     fn fleet_role_synthesizer_family_maps_to_read_only_plan() {
         // A synthesizer must never fall through to General's full-write
-        // posture; Plan is read-only with no shell.
+        // posture; Planner is read-only (reads plus read-only shell probes).
         for role in ["synthesizer", "summarizer", "reducer"] {
             assert_eq!(
-                fleet_role_to_agent_type(Some(role)),
+                runtime_role_for_member(role),
                 FleetRole::Planner,
                 "role {role}"
             );
@@ -2005,12 +2218,63 @@ mod tests {
         }
     }
 
+    /// #5575: an undeclared role name must not be able to hand a worker write
+    /// authority. Before this fix the durable driver answered `Worker` here and
+    /// the exact driver answered `Custom` — two different tables, both
+    /// write-capable and full-shell, for a string nobody declared.
     #[test]
-    fn unknown_role_maps_to_general() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("nonexistent-role")),
-            FleetRole::Worker
-        );
+    fn unknown_role_fails_closed_to_the_read_only_explore_posture() {
+        for unknown in ["nonexistent-role", "audit-lead", "release-checker"] {
+            assert_eq!(
+                runtime_role_for_member(unknown),
+                FleetRole::Scout,
+                "unknown role {unknown:?} must fail closed, never to a write-capable posture"
+            );
+            assert!(
+                !WorkerRuntimeProfile::for_role(runtime_role_for_member(unknown))
+                    .permissions
+                    .write,
+                "unknown role {unknown:?} must never carry write authority"
+            );
+        }
+
+        // The escape hatch is a *declared* role, not a typo: an operator who
+        // wants "inherit whatever the parent has" spells it `custom`.
+        assert_eq!(runtime_role_for_member("custom"), FleetRole::Custom);
+    }
+
+    /// #5575: both Fleet drivers resolve names through the same mapper, so the
+    /// aliases the durable driver used to own privately now resolve to the same
+    /// posture on the exact/named-Fleet driver — which previously dropped every
+    /// one of them into write-capable `custom`.
+    #[test]
+    fn the_two_fleet_drivers_agree_on_every_member_role_alias() {
+        let session = codewhale_workflow::PermissionCeiling {
+            write: true,
+            network_tool: true,
+            shell: codewhale_workflow::ShellCeiling::Full,
+            delegation_depth: 2,
+            tools: true,
+        };
+        for (role, expected, expected_write) in [
+            ("smoke-runner", FleetRole::Verifier, "read_only"),
+            ("read-only", FleetRole::Scout, "read_only"),
+            ("synthesizer", FleetRole::Planner, "read_only"),
+            ("summarizer", FleetRole::Planner, "read_only"),
+            ("reducer", FleetRole::Planner, "read_only"),
+            ("manager", FleetRole::Worker, "workspace_write"),
+            ("coordinator", FleetRole::Worker, "workspace_write"),
+            ("operator", FleetRole::Worker, "workspace_write"),
+        ] {
+            assert_eq!(runtime_role_for_member(role), expected, "role {role}");
+            // The exact driver's authority comes from the same mapper.
+            assert_eq!(
+                crate::fleet::role::ChildAuthority::from_runtime_role(role, session)
+                    .write_authority,
+                expected_write,
+                "role {role} must resolve the same authority on the exact driver"
+            );
+        }
     }
 
     #[test]
@@ -2034,7 +2298,9 @@ mod tests {
         assert!(!route.provider_id.is_empty());
         assert!(!route.provider_kind.is_empty());
         assert!(!route.wire_model_id.is_empty());
-        assert_eq!(route.protocol, "chat_completions");
+        // DeepSeek Flash rides Responses since a1c1741afa (see bundled_offerings):
+        // the default route follows the shipped transport, not the old pin.
+        assert_eq!(route.protocol, "responses");
         assert_eq!(route.role.as_deref(), Some("implement"));
         assert_eq!(route.loadout.as_deref(), Some("fast"));
         assert_eq!(route.model_class, None);
@@ -2908,8 +3174,9 @@ mod tests {
         // provider actually drove resolution, whatever wire id/aggregator
         // mapping the resolver's catalog assigns.
         let openrouter_candidate = resolve_route_candidate(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some("deepseek-v4-flash"),
+            None,
             None,
             None,
             None,
@@ -2982,8 +3249,9 @@ mod tests {
             .expect("saved cross-provider profile route should resolve");
 
         let openrouter_candidate = resolve_route_candidate(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some("deepseek-v4-flash"),
+            None,
             None,
             None,
             None,
@@ -3471,7 +3739,11 @@ mod tests {
             Some("reviewer")
         );
         assert_eq!(
-            fleet_role_to_agent_type(effective_fleet_role(task.worker.as_ref(), None).as_deref()),
+            runtime_role_for_member(
+                effective_fleet_role(task.worker.as_ref(), None)
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
             FleetRole::Reviewer
         );
     }
@@ -3657,8 +3929,186 @@ mod tests {
 
         let error = validate_task_agent_profiles(&[task], &[profile])
             .expect_err("conflicting task model must fail before lease");
-        assert!(error.to_string().contains("frozen route"), "{error:#}");
+        assert!(error.to_string().contains("pinned model"), "{error:#}");
         assert!(error.to_string().contains("worker.model"), "{error:#}");
+    }
+
+    #[test]
+    fn pinned_role_lookup_ignores_builtins_and_rejects_semantic_ambiguity() {
+        let mut builtin = agent_profile("reviewer", "reviewer", None, FleetLoadout::Inherit);
+        builtin.origin = ProfileOrigin::BuiltIn;
+        builtin.profile.model = Some("builtin-default".into());
+        let mut first = agent_profile("review-choice", "reviewer", None, FleetLoadout::Inherit);
+        first.profile.provider = Some("openrouter".into());
+        first.profile.model = Some("qwen/qwen3.7-plus".into());
+        let selected = resolve_pinned_role_profile(&[builtin.clone(), first.clone()], "review")
+            .unwrap()
+            .expect("the unique saved role wins over the builtin posture");
+        assert_eq!(selected.id, "review-choice");
+        assert_eq!(selected.profile.provider.as_deref(), Some("openrouter"));
+        assert_eq!(selected.profile.model.as_deref(), Some("qwen/qwen3.7-plus"));
+
+        let mut second = first.clone();
+        second.id = "reviewer".into();
+        second.profile.provider = Some("TeamA".into());
+        second.profile.model = Some("private-reviewer".into());
+        for profiles in [
+            vec![builtin.clone(), first.clone(), second.clone()],
+            vec![second, first, builtin],
+        ] {
+            let error = resolve_pinned_role_profile(&profiles, "reviewer")
+                .expect_err("an exact member id must not hide a second same-role pin");
+            assert!(error.to_string().contains("ambiguous"), "{error:#}");
+            assert!(error.to_string().contains("review-choice"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn pinned_model_comparison_preserves_exact_provider_identity_and_wire_namespace() {
+        assert!(requested_model_matches_pin(
+            "model-x",
+            "model-x",
+            Some("TeamA")
+        ));
+        assert!(requested_model_matches_pin(
+            "TeamA/model-x",
+            "model-x",
+            Some("TeamA")
+        ));
+        assert!(!requested_model_matches_pin(
+            "TeamA/MODEL-X",
+            "model-x",
+            Some("TeamA")
+        ));
+        assert!(!requested_model_matches_pin(
+            "teama/model-x",
+            "model-x",
+            Some("TeamA")
+        ));
+        assert!(!requested_model_matches_pin(
+            "TeamA/model-x",
+            "model-x",
+            Some("teama")
+        ));
+        assert!(requested_model_matches_pin(
+            "org/model-x",
+            "org/model-x",
+            Some("TeamA")
+        ));
+        assert!(requested_model_matches_pin(
+            "TeamA/org/model-x",
+            "org/model-x",
+            Some("TeamA")
+        ));
+        assert!(!requested_model_matches_pin(
+            "Other/org/model-x",
+            "org/model-x",
+            Some("TeamA")
+        ));
+        assert!(!requested_model_matches_pin(
+            "TeamA/model-x",
+            "model-x",
+            None
+        ));
+    }
+
+    #[test]
+    fn saved_case_distinct_model_conflict_is_rejected_before_freeze() {
+        for provider in [None, Some("TeamA")] {
+            let mut profile =
+                agent_profile("review-choice", "reviewer", None, FleetLoadout::Inherit);
+            profile.profile.model = Some("Preview-fixture".into());
+            profile.profile.provider = provider.map(str::to_string);
+            for requested in ["Preview-fixture", "preview-fixture"] {
+                let mut selectors = vec![requested.to_string()];
+                if let Some(provider) = provider {
+                    selectors.push(format!("{provider}/{requested}"));
+                }
+                for selector in selectors {
+                    let mut task = fleet_task(
+                        "review",
+                        Some(worker_profile(
+                            Some("review-choice"),
+                            None,
+                            None,
+                            None,
+                            Some(&selector),
+                            vec![],
+                        )),
+                    );
+                    let result = freeze_fleet_task_members(
+                        std::slice::from_mut(&mut task),
+                        &[profile.clone()],
+                        false,
+                    );
+                    if requested == "Preview-fixture" {
+                        result.unwrap();
+                        assert!(task.metadata.contains_key(FROZEN_FLEET_MEMBER_METADATA_KEY));
+                    } else {
+                        assert!(result.unwrap_err().to_string().contains("conflicts"));
+                        assert!(!task.metadata.contains_key(FROZEN_FLEET_MEMBER_METADATA_KEY));
+                    }
+                    assert_eq!(profile.profile.model.as_deref(), Some("Preview-fixture"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn providerless_saved_profile_pin_refuses_conflicts_before_freeze() {
+        let mut profile = agent_profile("review-choice", "reviewer", None, FleetLoadout::Inherit);
+        profile.profile.model = Some("deepseek-v4-flash".into());
+        let mut conflict = fleet_task(
+            "review",
+            Some(worker_profile(
+                Some("review-choice"),
+                None,
+                None,
+                None,
+                Some("deepseek-v4-pro"),
+                vec![],
+            )),
+        );
+        let error = freeze_fleet_task_members(
+            std::slice::from_mut(&mut conflict),
+            &[profile.clone()],
+            false,
+        )
+        .expect_err("providerless saved models are still explicit profile pins");
+        assert!(error.to_string().contains("conflicts"), "{error:#}");
+        assert!(
+            !conflict
+                .metadata
+                .contains_key(FROZEN_FLEET_MEMBER_METADATA_KEY)
+        );
+
+        let mut agreeing = fleet_task(
+            "review",
+            Some(worker_profile(
+                Some("review-choice"),
+                None,
+                None,
+                None,
+                Some("deepseek-v4-flash"),
+                vec![],
+            )),
+        );
+        freeze_fleet_task_members(
+            std::slice::from_mut(&mut agreeing),
+            &[profile.clone()],
+            false,
+        )
+        .unwrap();
+        assert!(
+            agreeing
+                .metadata
+                .contains_key(FROZEN_FLEET_MEMBER_METADATA_KEY)
+        );
+        assert_eq!(
+            fleet_worker_launch_route(&agreeing, &[profile], "deepseek-v4-pro"),
+            ("deepseek-v4-flash".into(), None),
+            "freezing a model-only pin never fabricates provider authority"
+        );
     }
 
     #[test]
@@ -3697,7 +4147,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_worker_spec_uses_profile_model_and_task_model_precedence() {
+    fn fleet_worker_spec_keeps_profile_pins_and_unpinned_task_choices() {
         let mut profile = agent_profile(
             "reviewer",
             "reviewer",
@@ -3744,6 +4194,32 @@ mod tests {
             ModelRoute::Fixed("glm-5.2".to_string())
         );
 
+        let conflicting_task = fleet_task(
+            "review",
+            Some(worker_profile(
+                Some("reviewer"),
+                None,
+                None,
+                None,
+                Some("deepseek-v4-pro"),
+                vec![],
+            )),
+        );
+        let error = fleet_task_to_worker_spec_with_profiles(
+            "worker-2",
+            "run-1",
+            &conflicting_task,
+            &worker,
+            "auto",
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp"),
+            &[profile.clone()],
+            None,
+        )
+        .expect_err("a task cannot replace a providerless saved profile pin");
+        assert!(error.to_string().contains("conflicts"), "{error:#}");
+
+        profile.profile.model = None;
         let task_model_spec = fleet_task_to_worker_spec_with_profiles(
             "worker-2",
             "run-1",
@@ -3833,11 +4309,12 @@ mod tests {
             spec.runtime_profile.reasoning_effort.as_deref(),
             Some("max")
         );
-        assert_eq!(spec.runtime_profile.max_spawn_depth, 2);
+        assert_eq!(spec.runtime_profile.max_spawn_depth, 3);
+        assert_eq!(spec.runtime_profile.spawn_depth, 1);
     }
 
     #[test]
-    fn fleet_worker_spec_model_route_precedence_is_task_profile_role_then_session() {
+    fn fleet_worker_spec_model_route_precedence_is_profile_unpinned_task_then_session() {
         let worker = FleetWorkerSpec {
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
@@ -3852,6 +4329,8 @@ mod tests {
         let mut profile =
             agent_profile("scout", "scout", None, codewhale_config::FleetLoadout::Fast);
         profile.profile.model = Some("deepseek-v4-flash".to_string());
+        let mut unpinned_profile = profile.clone();
+        unpinned_profile.profile.model = None;
 
         let task_model = fleet_task_to_worker_spec_with_profiles(
             "worker-task",
@@ -3871,7 +4350,7 @@ mod tests {
             run_model,
             std::path::Path::new("/tmp"),
             std::path::Path::new("/tmp"),
-            &[profile.clone()],
+            &[unpinned_profile],
             None,
         )
         .unwrap();
@@ -4004,7 +4483,8 @@ mod tests {
             ToolScope::Explicit(vec!["read_file".to_string()])
         );
         assert_eq!(spec.runtime_profile.model, ModelRoute::Inherit);
-        assert_eq!(spec.max_spawn_depth, 1);
+        assert_eq!(spec.max_spawn_depth, 2);
+        assert_eq!(spec.spawn_depth, 1);
 
         let permissions = crate::fleet::role::fleet_effective_permissions(
             &spec.agent_type,
@@ -4021,7 +4501,7 @@ mod tests {
         assert_eq!(permissions.tool_scope, "explicit");
         assert_eq!(permissions.tools, vec!["read_file".to_string()]);
         assert!(permissions.background);
-        assert_eq!(permissions.max_spawn_depth, 1);
+        assert_eq!(permissions.max_spawn_depth, 2);
         assert_eq!(permissions.source, "worker_runtime_profile");
     }
 
@@ -4229,7 +4709,7 @@ mod tests {
 
     #[test]
     fn fleet_route_parity_uses_shared_router_candidates() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
         use crate::model_routing::{RouterCandidates, provider_router_candidates};
 
         // Fleet emits the SAME `ModelRoute` seam the sub-agent assignment path
@@ -4280,7 +4760,7 @@ mod tests {
             ModelRoute::Inherit => parent.to_string(),
         };
 
-        let deepseek = provider_router_candidates(ApiProvider::Deepseek, parent);
+        let deepseek = provider_router_candidates(ProviderKind::Deepseek, parent);
         assert_eq!(
             resolve(
                 &fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Fast),
@@ -4292,7 +4772,7 @@ mod tests {
 
         // A provider with no known fast sibling must keep children on the parent
         // model rather than fabricating a cloud id (#3166 route assertion).
-        let no_sibling = provider_router_candidates(ApiProvider::Anthropic, parent);
+        let no_sibling = provider_router_candidates(ProviderKind::Anthropic, parent);
         assert_eq!(no_sibling.cheap, None);
         assert_eq!(
             resolve(
@@ -4310,6 +4790,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4341,6 +4822,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4351,10 +4833,13 @@ mod tests {
             context_mode: "fresh".to_string(),
             fork_context: false,
             tool_profile: AgentWorkerToolProfile::Inherited,
-            runtime_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
+            runtime_profile: WorkerRuntimeProfile {
+                max_spawn_depth: codewhale_config::MAX_SPAWN_DEPTH_CEILING,
+                ..WorkerRuntimeProfile::for_role(FleetRole::Worker)
+            },
             max_steps: 1000,
             spawn_depth: 0,
-            max_spawn_depth: 0,
+            max_spawn_depth: codewhale_config::MAX_SPAWN_DEPTH_CEILING,
             child_route: None,
             launch_manifest: None,
         };
@@ -4443,11 +4928,12 @@ mod tests {
     }
 
     #[test]
-    fn exec_hardening_appends_system_prompt() {
+    fn exec_hardening_leaves_policy_prompt_out_of_the_objective() {
         let spec = AgentWorkerSpec {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "do the thing".to_string(),
             role: None,
@@ -4470,8 +4956,8 @@ mod tests {
             ..Default::default()
         };
         let hardened = apply_exec_hardening(spec, &exec);
-        assert!(hardened.objective.contains("do the thing"));
-        assert!(hardened.objective.contains("[Policy]"));
-        assert!(hardened.objective.contains("never push to main"));
+        // The policy travels as system prompt text on the worker command
+        // (`--append-system-prompt`), never duplicated into the task prompt.
+        assert_eq!(hardened.objective, "do the thing");
     }
 }

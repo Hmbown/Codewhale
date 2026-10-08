@@ -1,8 +1,8 @@
                                                                                                                         
-   Config  ──────────────────────────────────────────────────────────────────────────────────────────────────────────── 
+   Settings  ────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         
    Appearance   Models & providers   Work   Tools & MCP   Trust   Motion   Advanced                                     
-   Search: type to filter  (16/51)                                                                                      
+   Search: type to filter  (17/71)                                                                                      
   ❯ Display         │  Display                                                │Theme                                    
                     │❯Theme                              terminal       ‹ ›   │theme                                    
                     │ Language                           auto           ‹ ›   │                                         
@@ -11,11 +11,12 @@
                     │ Model reasoning in chat            Off            [ ]   │startup   terminal                       
                     │ Thinking Default Expanded          Off            [ ]   │source    settings.toml                  
                     │ Thinking Preview Lines             2              ✎     │scope     SAVED                          
-                    │ Reasoning background highlight     On             [x]   │apply     applies on save                
+                    │ Thinking background highlight      On             [x]   │apply     applies on save                
                     │ Help Expand Groups                 Off            [ ]   │kind      choice                         
-                    │ Pin Last Prompt                    On             [x]   │available not observed this session      
-                    │ Tool detail level                  Off            [ ]   │                                         
-                    │ Inline file changes                Full diff      ‹ ›   │system | terminal | underwater |         
+                    │ Contextual tips                    On             [x]   │available not observed this session      
+                    │ Pin Last Prompt                    On             [x]   │                                         
+                    │ Tool detail level                  Off            [ ]   │system | terminal | shoreline |          
+                    │ Inline file changes                Full diff      ‹ ›   │shoreline-light | underwater |           
                     │ Output pacing                      auto           ‹ ›   │underwater-retro | dark | light |        
                     │ Cost currency                      usd            ‹ ›   │grayscale | catppuccin-mocha |           
                     │ Transcript spacing                 comfortable    ‹ ›   │tokyo-night | dracula | gruvbox-dark |   
@@ -24,9 +25,8 @@
                     │                                                         │choices                                  
                     │                                                         │                                         
                     │                                                         │                                         
-  system | terminal | underwater | underwater-retro | dark | light | grayscale | catppuccin-mocha | tokyo-night |…      
-  Preview: ▶▶ ask · agent                                                                                               
-  type=filter, Up/Down=select, Enter/e=edit, Esc/q=close                                                                
-                                                                                                                        
+  system | terminal | shoreline | shoreline-light | underwater | underwater-retro | dark | light | grayscale |…         
+  Preview:  ● ask   agent                                                                                               
+  type=filter, Up/Down=select, Enter=edit, Esc=close                                                                    
  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         

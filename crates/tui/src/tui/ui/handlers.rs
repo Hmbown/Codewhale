@@ -17,7 +17,7 @@ pub(crate) fn sync_fleet_roster(app: &mut App, config: &Config, engine_handle: &
     let roster = crate::fleet::identity::load_effective_roster(
         &config.fleet_config(),
         &app.workspace,
-        Some(app.plugin_registry.as_ref()),
+        Some(app.extension_plugin_view().as_ref()),
     );
     if let Some(error) = roster.load_error() {
         app.set_sticky_status(error.to_string(), StatusToastLevel::Error, None);
@@ -25,6 +25,151 @@ pub(crate) fn sync_fleet_roster(app: &mut App, config: &Config, engine_handle: &
     let _ = engine_handle.try_send(Op::SetFleetRoster {
         roster: std::sync::Arc::new(roster),
     });
+}
+
+/// Refresh the Fleet roster when it is parked on top of the stack after a
+/// store mutation (#5954).
+///
+/// The roster now stays open underneath the saved-teams list, so selecting or
+/// deleting a team has to update the view the user pops back to — otherwise
+/// it keeps painting the pre-change team. Cursor and detail scroll survive,
+/// because losing them is the disruption the back path exists to avoid.
+pub(crate) fn refresh_parked_fleet_roster(app: &mut App, config: &Config) {
+    if app.view_stack.top_kind() != Some(ModalKind::FleetRoster) {
+        return;
+    }
+    let Some(mut view) = app.view_stack.pop() else {
+        return;
+    };
+    if let Some(roster) = view
+        .as_any_mut()
+        .downcast_mut::<crate::tui::views::fleet_roster::FleetRosterView>()
+    {
+        roster.reload(app, config);
+    }
+    app.view_stack.push_boxed(view);
+}
+
+/// Rebuild the open model picker from live state and show `notice` inside
+/// it. The picker covers the status line, so a receipt written only there
+/// made ⇧P and ⇧F look like they did nothing (#6500). Returns whether a
+/// picker was open.
+pub(super) fn refresh_open_model_picker(
+    app: &mut App,
+    config: &Config,
+    notice: Option<(String, StatusToastLevel)>,
+) -> bool {
+    if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
+        return false;
+    }
+    let Some(mut boxed) = app.view_stack.pop() else {
+        return false;
+    };
+    if let Some(picker) = boxed
+        .as_any_mut()
+        .downcast_mut::<crate::tui::model_picker::ModelPickerView>()
+    {
+        picker.re_resolve_from_app(app, config);
+        if let Some((text, level)) = notice {
+            picker.set_notice(text, level);
+        }
+    }
+    app.view_stack.push_boxed(boxed);
+    true
+}
+
+/// The picker's ⇧P: toggle the exact route in `settings.toml`'s pins.
+pub(super) fn toggle_model_picker_pin(
+    app: &mut App,
+    config: &Config,
+    provider_key: &str,
+    model: &str,
+) {
+    let locale = app.ui_locale;
+    let route = format!("{provider_key}/{model}");
+    let (receipt, level) = match crate::settings::Settings::transact(|settings| {
+        Ok(settings.toggle_pinned_model(provider_key, model))
+    }) {
+        Ok(true) => (
+            tr(locale, MessageId::ModelPickerPinned).replace("{route}", &route),
+            StatusToastLevel::Success,
+        ),
+        Ok(false) => (
+            tr(locale, MessageId::ModelPickerUnpinned).replace("{route}", &route),
+            StatusToastLevel::Success,
+        ),
+        Err(error) => (
+            tr(locale, MessageId::ModelPickerPinFailed).replace("{error}", &error.to_string()),
+            StatusToastLevel::Error,
+        ),
+    };
+    if let Ok(settings) = crate::settings::Settings::load_persisted() {
+        app.pinned_models = settings.pinned_models;
+    }
+    app.status_message = Some(receipt.clone());
+    refresh_open_model_picker(app, config, Some((receipt, level)));
+    app.needs_redraw = true;
+}
+
+/// The picker's ⇧F: add the exact route to the selected Fleet, or remove the
+/// shortlist row it added. Same provider gate as `/fleet add`.
+pub(super) fn toggle_model_picker_fleet(
+    app: &mut App,
+    config: &Config,
+    provider_key: &str,
+    model: &str,
+) {
+    use crate::fleet::members::{FleetModelChange, change_receipt, toggle_fleet_model};
+    let locale = app.ui_locale;
+    let (receipt, level) = if let Some(rejection) =
+        crate::commands::fleet_provider_rejection(app, config, provider_key)
+    {
+        app.set_sticky_status(rejection.clone(), StatusToastLevel::Error, None);
+        (rejection, StatusToastLevel::Error)
+    } else {
+        match toggle_fleet_model(&app.workspace, provider_key, model) {
+            Ok(change) => {
+                let level = if matches!(change, FleetModelChange::Unchanged { .. }) {
+                    StatusToastLevel::Info
+                } else {
+                    app.fleet_roster_stale = true;
+                    StatusToastLevel::Success
+                };
+                let receipt = change_receipt(locale, provider_key, model, &change);
+                app.push_status_toast(receipt.clone(), level, Some(FLEET_TOGGLE_TOAST_TTL_MS));
+                (receipt, level)
+            }
+            Err(error) => {
+                let message = tr(locale, MessageId::FleetToggleFailed)
+                    .replace("{error}", &error.message(locale));
+                app.set_sticky_status(message.clone(), StatusToastLevel::Error, None);
+                (message, StatusToastLevel::Error)
+            }
+        }
+    };
+    refresh_open_model_picker(app, config, Some((receipt, level)));
+    app.needs_redraw = true;
+}
+
+pub(super) fn dismiss_fleet_assignment(app: &mut App, editor_id: uuid::Uuid) {
+    if let Some(mut boxed) = app.view_stack.pop() {
+        let remove = if let Some(view) = boxed
+            .as_any_mut()
+            .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>(
+        ) {
+            view.route_selection(editor_id).is_some()
+        } else if let Some(view) = boxed
+            .as_any_mut()
+            .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>(
+        ) {
+            view.is_direct_assignment(editor_id)
+        } else {
+            false
+        };
+        if !remove {
+            app.view_stack.push_boxed(boxed);
+        }
+    }
 }
 
 /// Once per event-loop iteration: deliver a pending fleet mutation to the
@@ -89,7 +234,9 @@ pub(crate) fn handle_bracketed_paste(app: &mut App, text: &str) {
     } else if !app.view_stack.is_empty() {
         // A non-consumed modal is open — don't leak paste into composer.
     } else {
-        // Paste into main input.
+        // Main-input paste takes the same keyboard ownership as typed text.
+        // Otherwise the visible composer command's Enter stays with the dock.
+        crate::tui::work_surface::release_focus(app);
         app.insert_paste_text(text);
     }
 }
@@ -131,9 +278,12 @@ pub(crate) fn handle_reasoning_effort_key(app: &mut App, key: &event::KeyEvent) 
     true
 }
 
-/// Let the transcript remain reviewable while an approval card owns focus.
-pub(crate) fn handle_approval_transcript_key(app: &mut App, key: &event::KeyEvent) -> bool {
-    if app.view_stack.top_kind() != Some(ModalKind::Approval) {
+/// Let the transcript remain reviewable while a decision prompt owns focus.
+pub(crate) fn handle_prompt_transcript_key(app: &mut App, key: &event::KeyEvent) -> bool {
+    if !matches!(
+        app.view_stack.top_kind(),
+        Some(ModalKind::Approval | ModalKind::UserInput)
+    ) {
         return false;
     }
 
@@ -162,83 +312,6 @@ pub(crate) fn handle_approval_transcript_key(app: &mut App, key: &event::KeyEven
     true
 }
 
-/// Route only non-text controls to a focused workflow panel.
-///
-/// Returning `false` for every character is deliberate: the caller then lets
-/// the normal composer path insert it. A prior bare-letter contract used
-/// t/c/j/k here, which made the first matching letter of a new chat disappear
-/// after the user clicked the workflow card.
-pub(crate) fn handle_workflow_panel_key(app: &mut App, key: &event::KeyEvent) -> bool {
-    if !app
-        .workflow_panel
-        .as_ref()
-        .is_some_and(|panel| panel.keyboard_focus)
-    {
-        return false;
-    }
-
-    if matches!(key.code, KeyCode::Char(_)) {
-        if let Some(panel) = app.workflow_panel.as_mut() {
-            panel.keyboard_focus = false;
-        }
-        app.needs_redraw = true;
-        return false;
-    }
-
-    if !key.modifiers.is_empty() && key.code != KeyCode::Esc {
-        return false;
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            if let Some(panel) = app.workflow_panel.as_mut() {
-                panel.keyboard_focus = false;
-            }
-            app.needs_redraw = true;
-            true
-        }
-        KeyCode::Enter => {
-            if let Some(panel) = app.workflow_panel.as_mut() {
-                let _ = panel.toggle_expanded();
-            }
-            app.needs_redraw = true;
-            true
-        }
-        KeyCode::Down => {
-            if let Some(panel) = app.workflow_panel.as_mut() {
-                panel.select_next_phase();
-            }
-            app.needs_redraw = true;
-            true
-        }
-        KeyCode::Up => {
-            if let Some(panel) = app.workflow_panel.as_mut() {
-                panel.select_prev_phase();
-            }
-            app.needs_redraw = true;
-            true
-        }
-        KeyCode::Delete => {
-            let Some(run_id) = app
-                .workflow_panel
-                .as_ref()
-                .and_then(|panel| panel.lifecycle.is_running().then(|| panel.run_id.clone()))
-            else {
-                return false;
-            };
-            app.input = format!("/workflow cancel {run_id}");
-            app.cursor_position = app.input.chars().count();
-            app.status_message = Some(app.tr(MessageId::SidebarDestructiveArmed).into_owned());
-            if let Some(panel) = app.workflow_panel.as_mut() {
-                panel.keyboard_focus = false;
-            }
-            app.needs_redraw = true;
-            true
-        }
-        _ => false,
-    }
-}
-
 /// One-shot "draft my constitution" call against the user's first configured
 /// model, requested by `A` on the setup Constitution card. Runs inline in the
 /// event loop like [`fetch_available_models`] (the wizard modal stays open
@@ -254,14 +327,14 @@ pub(crate) async fn handle_setup_constitution_model_draft(
     config: &Config,
     draft: crate::tui::setup::GuidedConstitutionDraft,
     freeform_note: Option<String>,
-    locale: crate::localization::Locale,
+    locale: codewhale_localization::Locale,
 ) {
     // Spawn the draft off the event loop (same pattern as the fleet drafter,
     // #3757 review): awaiting it inline parked the whole TUI for up to the
     // timeout. The loop polls constitution_draft_cell and delivers the result.
     const DRAFT_TIMEOUT: Duration = Duration::from_secs(20);
     let model_label = app.model_display_label();
-    let client = match DeepSeekClient::new(config) {
+    let client = match CodewhaleClient::new(config) {
         Ok(client) => client,
         Err(err) => {
             deliver_constitution_draft_result(
@@ -278,7 +351,7 @@ pub(crate) async fn handle_setup_constitution_model_draft(
     let spawn_label = model_label.clone();
     let request_gen = app.next_draft_gen();
     app.status_message = Some(match locale {
-        crate::localization::Locale::ZhHans => {
+        codewhale_localization::Locale::ZhHans => {
             format!(
                 "{model_label} 正在生成协作准则草案……（最多 {}s）",
                 DRAFT_TIMEOUT.as_secs()
@@ -322,7 +395,7 @@ pub(crate) async fn handle_fleet_profile_model_draft(
     model: String,
     provider: Option<String>,
     reasoning_effort: Option<String>,
-    locale: crate::localization::Locale,
+    locale: codewhale_localization::Locale,
 ) {
     // The route the operator actually picked at `m`-press time (#4093). A
     // model draft always comes back `provider: None` (the untrusted gate
@@ -337,7 +410,7 @@ pub(crate) async fn handle_fleet_profile_model_draft(
     // the wizard interactive with a drafting status.
     const DRAFT_TIMEOUT: Duration = Duration::from_secs(20);
     let model_label = app.model_display_label();
-    let client = match DeepSeekClient::new(config) {
+    let client = match CodewhaleClient::new(config) {
         Ok(client) => client,
         Err(err) => {
             deliver_fleet_draft_result(
@@ -357,7 +430,7 @@ pub(crate) async fn handle_fleet_profile_model_draft(
     let request_gen = app.next_draft_gen();
     let workspace = app.workspace.clone();
     app.status_message = Some(match locale {
-        crate::localization::Locale::ZhHans => {
+        codewhale_localization::Locale::ZhHans => {
             format!(
                 "{model_label} 正在起草配置……（最多 {}s）",
                 DRAFT_TIMEOUT.as_secs()
@@ -421,18 +494,382 @@ pub(crate) async fn handle_bang_shell_input(
         }
     };
 
-    engine_handle
-        .send(Op::RunShellCommand {
-            command: command.to_string(),
-            mode: app.mode,
-            allow_shell: app.allow_shell,
-            trust_mode: app.trust_mode,
-            auto_approve: app_auto_approve_enabled(app),
-            approval_mode: app.approval_mode,
-        })
-        .await?;
-    app.status_message = Some(format!("Shell command submitted: {command}"));
+    // #6150: composer input never awaits a full op channel — a saturated
+    // engine reports busy instead of freezing the loop.
+    match engine_handle.tx_op.clone().try_reserve_owned() {
+        Ok(permit) => {
+            engine_handle.send_reserved_op(
+                permit,
+                Op::RunShellCommand {
+                    command: command.to_string(),
+                    mode: app.mode,
+                    allow_shell: app.allow_shell,
+                    trust_mode: app.trust_mode,
+                    auto_approve: app_auto_approve_enabled(app),
+                    approval_mode: app.approval_mode,
+                },
+            );
+            app.status_message = Some(format!("Shell command submitted: {command}"));
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            app.status_message =
+                Some("Engine busy — shell command not sent; try again".to_string());
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err(anyhow::anyhow!("engine channel closed"));
+        }
+    }
     Ok(true)
+}
+
+fn report_mcp_login(app: &mut App, message: String, level: StatusToastLevel) {
+    app.push_status_toast(message.clone(), level, Some(12_000));
+    add_mcp_message(app, message);
+    app.needs_redraw = true;
+}
+
+fn start_mcp_login(app: &mut App, config: &Config, name: String, scopes: Vec<String>) {
+    use crate::tui::app::{McpLoginProgress, PendingMcpLogin};
+
+    if let Some(pending) = &app.mcp_login {
+        let server = pending.server.clone();
+        report_mcp_login(
+            app,
+            app.tr(MessageId::McpLoginInProgress)
+                .replace("{server}", &server)
+                .replace("{cancel_key}", "Esc"),
+            StatusToastLevel::Info,
+        );
+        return;
+    }
+
+    let path = app.mcp_config_path.clone();
+    let workspace = app.workspace.clone();
+    let plugin_registry = Arc::clone(&app.plugin_registry);
+    let network_policy = config.network.clone().map(|network| {
+        crate::network_policy::NetworkPolicyDecider::with_default_audit(network.into_runtime())
+    });
+    let callback_port = config.mcp_oauth_callback_port;
+    let callback_url = config.mcp_oauth_callback_url.clone();
+    let locale = app.ui_locale;
+    let pending = PendingMcpLogin {
+        server: name.clone(),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        progress: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let cancel = pending.cancel.clone();
+    let progress = Arc::clone(&pending.progress);
+    app.mcp_login = Some(pending);
+    report_mcp_login(
+        app,
+        app.tr(MessageId::McpLoginStarting)
+            .replace("{server}", &name)
+            .replace("{cancel_key}", "Esc"),
+        StatusToastLevel::Info,
+    );
+
+    tokio::spawn(async move {
+        let handshake = async {
+            let cfg = crate::mcp::load_config_with_workspace_and_plugins(
+                &path,
+                &workspace,
+                plugin_registry.as_ref(),
+            )?;
+            let server = cfg.servers.get(&name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    codewhale_localization::tr(locale, MessageId::McpLoginServerNotFound)
+                        .replace("{server}", &name)
+                )
+            })?;
+            crate::mcp::oauth::begin_oauth_login_for_server_tool(
+                &name,
+                server,
+                (!scopes.is_empty()).then_some(scopes),
+                callback_port,
+                callback_url.as_deref(),
+                network_policy.as_ref(),
+            )
+            .await
+        };
+        let operation = async {
+            // Bound the whole handshake as well as each guarded HTTP request.
+            // The timeout is in the background: even an unresponsive issuer
+            // cannot delay redraw, input or cancellation.
+            let login = tokio::time::timeout(Duration::from_secs(15), handshake)
+                .await
+                .with_context(|| {
+                    codewhale_localization::tr(locale, MessageId::McpLoginHandshakeTimeout)
+                        .into_owned()
+                })??;
+            if let Ok(mut cell) = progress.lock() {
+                *cell = Some(McpLoginProgress::AuthorizationUrl(
+                    login.authorization_url().to_string(),
+                ));
+            }
+            login.finish().await
+        };
+        let outcome = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            result = operation => result.map_err(|error| {
+                crate::mcp::oauth::mask_oauth_secrets(&format!("{error:#}"))
+            }),
+        };
+        if let Ok(mut cell) = progress.lock() {
+            *cell = Some(McpLoginProgress::Finished(outcome));
+        }
+    });
+}
+
+pub(crate) fn poll_mcp_login(app: &mut App) {
+    use crate::tui::app::McpLoginProgress;
+
+    let delivery = app.mcp_login.as_ref().and_then(|pending| {
+        pending
+            .progress
+            .try_lock()
+            .ok()
+            .and_then(|mut cell| cell.take())
+            .map(|progress| (pending.server.clone(), progress))
+    });
+    let Some((server, progress)) = delivery else {
+        return;
+    };
+    let (message, level) = match progress {
+        McpLoginProgress::AuthorizationUrl(url) => (
+            app.tr(MessageId::McpLoginBrowser)
+                .replace("{server}", &server)
+                .replace("{cancel_key}", "Esc")
+                .replace("{url}", &url),
+            StatusToastLevel::Info,
+        ),
+        McpLoginProgress::Finished(outcome) => {
+            app.mcp_login = None;
+            match outcome {
+                Ok(()) => (
+                    app.tr(MessageId::McpLoginStored)
+                        .replace("{server}", &server)
+                        .replace("{command}", "/mcp reload"),
+                    StatusToastLevel::Success,
+                ),
+                Err(error) => (
+                    app.tr(MessageId::McpLoginFailed)
+                        .replace("{server}", &server)
+                        .replace("{error}", &error),
+                    StatusToastLevel::Error,
+                ),
+            }
+        }
+    };
+    report_mcp_login(app, message, level);
+}
+
+pub(crate) fn handle_mcp_login_key(app: &mut App, key: &KeyEvent) -> bool {
+    if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc && app.mcp_login.is_some() {
+        cancel_mcp_login(app);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn cancel_mcp_login(app: &mut App) {
+    if let Some(pending) = app.mcp_login.take() {
+        // Drop cancels before the next input event; future writes belong only
+        // to this abandoned mailbox, even if the same server starts again.
+        let server = pending.server.clone();
+        drop(pending);
+        report_mcp_login(
+            app,
+            app.tr(MessageId::McpLoginCancelled)
+                .replace("{server}", &server),
+            StatusToastLevel::Info,
+        );
+    }
+}
+
+/// The config file that owns `name`, for a mutation that must land where the
+/// server is actually declared.
+///
+/// A plugin-contributed server has no config file: it is switched off by
+/// disabling the plugin that carries it, so say that instead of writing a
+/// stray entry into the user's file under the synthesized name.
+fn mcp_scoped_config_path(
+    app: &App,
+    global_path: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let scope = crate::mcp::resolve_server_scope(global_path, &app.workspace, name);
+    scope.config_path(global_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCP server '{name}' is provided by a plugin, not by a config file. \
+             Disable the plugin that contributes it from /plugins."
+        )
+    })
+}
+
+/// Whether a turn (or its compaction work) owns the engine. The engine
+/// services ops only between turns, so an op sent now waits for that turn.
+fn mcp_engine_busy(app: &App) -> bool {
+    app.is_loading
+        || app.dispatch_in_flight
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || app.is_compacting
+        || app.manual_compaction_queued
+}
+
+/// Rebuild the open Extensions panel from live state, so a row's pending or
+/// settled retry shows without waiting for the next MCP generation.
+fn refresh_open_extensions(app: &mut App) {
+    if app.view_stack.extensions_is_top() {
+        let snapshot = crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+        app.view_stack.refresh_extensions(snapshot);
+    }
+    app.needs_redraw = true;
+}
+
+/// Reconnect one MCP server through the engine-owned pool without awaiting it
+/// on the UI loop. While a turn runs, the op waits in the engine mailbox and
+/// runs as soon as the turn ends — the person asked once, so they are not
+/// told to ask again.
+fn start_mcp_retry(app: &mut App, engine_handle: &EngineHandle, name: String) {
+    use crate::tui::app::PendingMcpRetry;
+
+    let already = app
+        .mcp_retries
+        .iter()
+        .find(|pending| pending.server == name);
+    let queued = already.map_or_else(|| mcp_engine_busy(app), |pending| pending.queued);
+    if already.is_none() {
+        tracing::info!(target: "mcp", server = %name, queued, "MCP server retry requested");
+        let result = Arc::new(std::sync::Mutex::new(None));
+        app.mcp_retries.push(PendingMcpRetry {
+            server: name.clone(),
+            queued,
+            result: Arc::clone(&result),
+        });
+        let handle = engine_handle.clone();
+        let server = name.clone();
+        tokio::spawn(async move {
+            let outcome = handle
+                .retry_mcp_server(server)
+                .await
+                .map_err(|error| crate::mcp::format_mcp_error_for_display(&error));
+            if let Ok(mut cell) = result.lock() {
+                *cell = Some(outcome);
+            }
+        });
+    }
+    let message = if queued {
+        app.tr(MessageId::McpRetryDeferredWhileTurnRuns)
+    } else {
+        app.tr(MessageId::McpRetryStarted)
+    }
+    .replace("{server}", &name);
+    report_mcp_login(app, message, StatusToastLevel::Info);
+    refresh_open_extensions(app);
+}
+
+/// Deliver every settled `/mcp retry`: apply its snapshot and say what
+/// happened to that server — connected, needs a login, or why it failed.
+pub(crate) fn poll_mcp_retries(app: &mut App) {
+    if app.mcp_retries.is_empty() {
+        return;
+    }
+    let mut settled = Vec::new();
+    app.mcp_retries.retain(|pending| {
+        match pending
+            .result
+            .try_lock()
+            .ok()
+            .and_then(|mut cell| cell.take())
+        {
+            Some(outcome) => {
+                settled.push((pending.server.clone(), outcome));
+                false
+            }
+            None => true,
+        }
+    });
+    if settled.is_empty() {
+        return;
+    }
+    for (server, outcome) in settled {
+        let (message, level) = match outcome {
+            Ok(update) => {
+                let receipt = mcp_retry_receipt(app, &server, &update.snapshot);
+                apply_mcp_session_boot_event(
+                    app,
+                    update.generation,
+                    update.snapshot,
+                    Vec::new(),
+                    true,
+                );
+                receipt
+            }
+            Err(error) => {
+                tracing::warn!(target: "mcp", server = %server, error = %error, "MCP server retry could not run");
+                (
+                    app.tr(MessageId::McpRetryFailed)
+                        .replace("{server}", &server)
+                        .replace("{error}", &error),
+                    StatusToastLevel::Error,
+                )
+            }
+        };
+        report_mcp_login(app, message, level);
+    }
+    refresh_open_extensions(app);
+}
+
+/// The one-line outcome of a retry for `server`, read from the snapshot the
+/// engine returned for it.
+fn mcp_retry_receipt(
+    app: &App,
+    server: &str,
+    snapshot: &crate::mcp::McpManagerSnapshot,
+) -> (String, StatusToastLevel) {
+    let Some(observed) = snapshot.servers.iter().find(|row| row.name == server) else {
+        return (
+            app.tr(MessageId::McpRetryFailed)
+                .replace("{server}", server)
+                .replace(
+                    "{error}",
+                    &app.tr(MessageId::McpLoginServerNotFound)
+                        .replace("{server}", server),
+                ),
+            StatusToastLevel::Error,
+        );
+    };
+    if observed.connected {
+        (
+            app.tr(MessageId::McpRetryConnected)
+                .replace("{server}", server)
+                .replace("{tools}", &observed.tools.len().to_string()),
+            StatusToastLevel::Success,
+        )
+    } else if observed.auth_required {
+        (
+            app.tr(MessageId::McpRetryNeedsLogin)
+                .replace("{server}", server)
+                .replace(
+                    "{command}",
+                    &crate::mcp::McpRecoveryKind::Reauth.slash_command(server),
+                ),
+            StatusToastLevel::Warning,
+        )
+    } else {
+        let error = observed
+            .error
+            .clone()
+            .unwrap_or_else(|| app.tr(MessageId::ExtensionsStateDisconnected).into_owned());
+        (
+            app.tr(MessageId::McpRetryFailed)
+                .replace("{server}", server)
+                .replace("{error}", &error),
+            StatusToastLevel::Error,
+        )
+    }
 }
 
 pub(crate) async fn handle_mcp_ui_action(
@@ -447,14 +884,34 @@ pub(crate) async fn handle_mcp_ui_action(
     let mut changed = false;
     let mut message = None;
     let is_reload = matches!(&action, crate::tui::app::McpUiAction::Reload);
-    let retry_name = match &action {
-        crate::tui::app::McpUiAction::Retry { name } => Some(name.clone()),
-        _ => None,
-    };
+    // A reload already running owns the live surface, and starting a second
+    // pass restarts every server the first one is still connecting. `Extensions`
+    // rows read `[connecting]` while that happens and answer no key, so a user
+    // who presses Enter again gets another full reconnect and another receipt —
+    // four presses became four overlapping 12-server reloads and a wall of
+    // duplicate notes. The flag was already tracked; nothing ever read it.
+    if is_reload && app.mcp_reload_in_flight {
+        add_mcp_message(app, app.tr(MessageId::McpReloadAlreadyRunning).into_owned());
+        return;
+    }
+    // A retry never runs on this path: it is an engine op, and awaiting it
+    // here parked input behind the connect (or behind a running turn,
+    // #6159). It goes to the engine from a background task instead, so a
+    // running turn simply queues it; `poll_mcp_retries` reports the outcome.
+    if let crate::tui::app::McpUiAction::Retry { name } = &action {
+        start_mcp_retry(app, engine_handle, name.clone());
+        return;
+    }
     let snapshot_live_pool = matches!(&action, crate::tui::app::McpUiAction::Show);
     let discover = mcp_ui_action_refreshes_discovery(&action);
 
+    let approve_import = matches!(&action, crate::tui::app::McpUiAction::ImportApprove { .. });
     let action_result = match action {
+        crate::tui::app::McpUiAction::Diagnose { name } => {
+            let receipt = mcp_server_diagnosis(app, &name);
+            report_mcp_login(app, receipt, StatusToastLevel::Info);
+            return;
+        }
         crate::tui::app::McpUiAction::Show => Ok(()),
         crate::tui::app::McpUiAction::Init { force } => {
             changed = true;
@@ -496,49 +953,34 @@ pub(crate) async fn handle_mcp_ui_action(
             mcp::add_server_config(&path, name.clone(), None, Some(url), Vec::new(), transport)
                 .map(|()| message = Some(format!("Added MCP HTTP/SSE server '{name}'")))
         }
+        // Write where the server actually lives. `path` is the user's global
+        // file; a workspace-scoped server is declared in the trusted
+        // workspace's own file and overrides a same-named global entry, so
+        // editing the global file here reported success on the wrong server
+        // or failed with "not found" on a row the panel had just offered.
         crate::tui::app::McpUiAction::Enable { name } => {
             changed = true;
-            mcp::set_server_enabled(&path, &name, true)
+            mcp_scoped_config_path(app, &path, &name)
+                .and_then(|owner| mcp::set_server_enabled(&owner, &name, true))
                 .map(|()| message = Some(format!("Enabled MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Disable { name } => {
             changed = true;
-            mcp::set_server_enabled(&path, &name, false)
+            mcp_scoped_config_path(app, &path, &name)
+                .and_then(|owner| mcp::set_server_enabled(&owner, &name, false))
                 .map(|()| message = Some(format!("Disabled MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Remove { name } => {
             changed = true;
-            mcp::remove_server_config(&path, &name)
+            mcp_scoped_config_path(app, &path, &name)
+                .and_then(|owner| mcp::remove_server_config(&owner, &name))
                 .map(|()| message = Some(format!("Removed MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Login { name, scopes } => {
-            let result = async {
-                let cfg = mcp::load_config_with_workspace_and_plugins(
-                    &path,
-                    &app.workspace,
-                    app.plugin_registry.as_ref(),
-                )?;
-                let server = cfg
-                    .servers
-                    .get(&name)
-                    .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
-                let explicit_scopes = (!scopes.is_empty()).then_some(scopes);
-                mcp::oauth::perform_oauth_login_for_server(
-                    &name,
-                    server,
-                    explicit_scopes,
-                    config.mcp_oauth_callback_port,
-                    config.mcp_oauth_callback_url.as_deref(),
-                )
-                .await
-            }
-            .await;
-            result.map(|()| {
-                changed = true;
-                message = Some(format!(
-                    "Stored OAuth credentials for MCP server '{name}'. Run /mcp reload to reconnect it."
-                ));
-            })
+            start_mcp_login(app, config, name, scopes);
+            // Login owns its background discovery. Do not start a second
+            // discovery here or await network work on the input loop.
+            return;
         }
         crate::tui::app::McpUiAction::Logout { name } => {
             let result = (|| {
@@ -557,7 +999,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 changed = deleted;
                 message = Some(if deleted {
                     format!(
-                        "Deleted stored OAuth credentials for MCP server '{name}'. Run /mcp reload to reconnect it."
+                        "Deleted locally stored OAuth credentials for MCP server '{name}'. That clears this machine only — the provider may keep its grant; the next /mcp login re-prompts for consent. Run /mcp reload to reconnect."
                     )
                 } else {
                     format!("No stored OAuth credentials found for MCP server '{name}'.")
@@ -565,30 +1007,51 @@ pub(crate) async fn handle_mcp_ui_action(
             })
         }
         crate::tui::app::McpUiAction::ImportList => {
-            let text = mcp_external_import_status_text(&app.workspace);
-            message = Some(text);
-            Ok(())
-        }
-        crate::tui::app::McpUiAction::ImportApprove { name } => {
-            match mcp_import_apply(&app.workspace, &path, &name, true) {
-                Ok(msg) => {
-                    changed = msg.contains("Imported");
-                    message = Some(msg);
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp_external_import_status_text(&workspace, &path, plugins.as_ref())
+            })
+            .await
+            {
+                Ok(text) => {
+                    message = Some(text);
                     Ok(())
                 }
-                Err(err) => Err(err),
+                Err(_) => Err(anyhow::anyhow!("MCP import preview failed")),
             }
         }
-        crate::tui::app::McpUiAction::ImportDecline { name } => {
-            match mcp_import_apply(&app.workspace, &path, &name, false) {
-                Ok(msg) => {
+        crate::tui::app::McpUiAction::ImportApprove { name }
+        | crate::tui::app::McpUiAction::ImportDecline { name } => {
+            let approve = approve_import;
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp_import_apply(&workspace, &path, plugins.as_ref(), &name, approve)
+            })
+            .await
+            {
+                Ok(Ok(msg)) => {
+                    changed = approve;
                     message = Some(msg);
                     Ok(())
                 }
-                Err(err) => Err(err),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(anyhow::anyhow!("MCP import failed")),
             }
         }
         crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
+        // Dispatched before this match.
         crate::tui::app::McpUiAction::Retry { .. } => Ok(()),
     };
 
@@ -604,18 +1067,54 @@ pub(crate) async fn handle_mcp_ui_action(
         add_mcp_message(app, message);
     }
 
+    // Every branch below is an engine round-trip, and the engine services ops
+    // only between turns (`Engine::run` runs a turn inline and never polls
+    // `rx_op` mid-turn): awaiting one from this UI path parked every keypress
+    // and repaint behind the running turn — a full console freeze (#6159).
+    // While a turn (or its compaction work) owns the engine, serve the last
+    // known snapshot and say so; mutations name the deferral instead of
+    // freezing. `reject_inline_inference_while_runtime_chat_owns_run`
+    // (apply.rs) is the same fail-closed rule for inline inference.
+    let engine_busy = mcp_engine_busy(app);
+    if engine_busy && (snapshot_live_pool || is_reload || changed) {
+        if snapshot_live_pool {
+            match app.mcp_snapshot.clone() {
+                Some(snapshot) => {
+                    app.mcp_configured_count = snapshot.servers.len();
+                    app.mcp_snapshot = Some(snapshot);
+                    app.mcp_initializing = false;
+                    app.mcp_connecting.clear();
+                    app.hotbar_actions
+                        .replace_mcp_tools(app.mcp_snapshot.as_ref());
+                    add_mcp_message(
+                        app,
+                        app.tr(MessageId::McpShowCachedWhileTurnRuns).into_owned(),
+                    );
+                    open_mcp_extensions(app);
+                }
+                None => add_mcp_message(
+                    app,
+                    app.tr(MessageId::McpShowUnavailableWhileTurnRuns)
+                        .into_owned(),
+                ),
+            }
+        } else {
+            add_mcp_message(
+                app,
+                app.tr(MessageId::McpLivePoolRefreshDeferredWhileTurnRuns)
+                    .into_owned(),
+            );
+        }
+        return;
+    }
+
     // A successful MCP mutation is an explicit request to change the tools
     // available to this running session. Apply it to the engine-owned pool in
     // the same operation instead of leaving Extensions and `/mcp` users on a
     // second, easy-to-miss reload step. The standalone reload action remains
     // the retry/compatibility path for externally edited configuration.
     let rebuild_live_pool = is_reload || changed;
-    let snapshot_result = if let Some(name) = retry_name.as_deref() {
-        engine_handle
-            .retry_mcp_server(name)
-            .await
-            .map(|update| (update.snapshot, Some(update.generation)))
-    } else if snapshot_live_pool {
+    let snapshot_result = if snapshot_live_pool {
         engine_handle
             .bootstrap_mcp()
             .await
@@ -623,9 +1122,31 @@ pub(crate) async fn handle_mcp_ui_action(
     } else if rebuild_live_pool {
         match engine_handle.reload_mcp(path.clone()).await {
             Ok(update) => {
+                // The reload no longer waits for the connect batch. The
+                // engine's supervised pass owns the live surface from here:
+                // apply the interim snapshot without invalidating its own
+                // generation, leave connecting/initializing to the pass's
+                // progress events, and let its finished event post the
+                // counts. A config mutation keeps its own receipt instead of
+                // the reload-started line.
                 app.mcp_reload_required = false;
-                add_mcp_message(app, mcp_reload_summary(&update.snapshot));
-                Ok((update.snapshot, Some(update.generation)))
+                app.mcp_reload_in_flight = true;
+                if is_reload {
+                    add_mcp_message(
+                        app,
+                        format!(
+                            "MCP reload started in the background: {} configured server(s) reconnecting. The status bar tracks progress; the next model turn uses the catalog as it settles.",
+                            update.snapshot.servers.len()
+                        ),
+                    );
+                }
+                app.mcp_configured_count = update.snapshot.servers.len();
+                app.mcp_snapshot_generation = update.generation;
+                app.mcp_snapshot_generation_invalidated = false;
+                app.hotbar_actions.replace_mcp_tools(Some(&update.snapshot));
+                app.mcp_snapshot = Some(update.snapshot);
+                open_mcp_extensions(app);
+                return;
             }
             Err(error) => {
                 app.mcp_reload_required = true;
@@ -642,6 +1163,7 @@ pub(crate) async fn handle_mcp_ui_action(
             network_policy,
             app.mcp_reload_required,
             std::sync::Arc::clone(&app.plugin_registry),
+            mcp::McpBackend::from_config(config),
         )
         .await
         .map(|snapshot| (snapshot, None))
@@ -677,12 +1199,8 @@ pub(crate) async fn handle_mcp_ui_action(
             // #2068: keep the hotbar's MCP-tool actions in sync with the tools
             // that are actually loaded; the hotbar never connects on its own.
             app.hotbar_actions.replace_mcp_tools(Some(&snapshot));
-            open_mcp_manager_pager(app, &snapshot);
+            open_mcp_extensions(app);
         }
-        Err(err) if retry_name.is_some() => add_mcp_message(
-            app,
-            format!("MCP server retry failed; the live tool pool is unchanged: {err}"),
-        ),
         Err(err) if rebuild_live_pool => add_mcp_message(
             app,
             format!("MCP reload failed; the live tool pool is unchanged: {err}"),
@@ -883,7 +1401,6 @@ pub(crate) async fn handle_config_updated(
     config: &mut Config,
     task_manager: &SharedTaskManager,
     engine_handle: &mut EngineHandle,
-    web_config_session: &mut Option<WebConfigSession>,
     key: String,
     value: String,
     persist: bool,
@@ -920,17 +1437,8 @@ pub(crate) async fn handle_config_updated(
     ) {
         app.force_next_full_repaint = true;
     }
-    if apply_command_result(
-        terminal,
-        app,
-        engine_handle,
-        task_manager,
-        config,
-        web_config_session,
-        result,
-    )
-    .await?
-    {
+    let rejected = result.is_error;
+    if apply_command_result(terminal, app, engine_handle, task_manager, config, result).await? {
         return Ok(true);
     }
 
@@ -939,7 +1447,7 @@ pub(crate) async fn handle_config_updated(
     } else {
         &key
     };
-    refresh_config_view_if_open(app, focus_key);
+    refresh_config_view_after_commit(app, focus_key, rejected);
     if let Some((message, level)) = telemetry_toast {
         // The modal stays open, so a transcript-only command receipt would be
         // invisible. Keep the durable disk truth in the rebuilt row and show
@@ -956,7 +1464,6 @@ async fn handle_theme_selection_updated(
     config: &mut Config,
     task_manager: &SharedTaskManager,
     engine_handle: &mut EngineHandle,
-    web_config_session: &mut Option<WebConfigSession>,
     theme: String,
     persist: bool,
 ) -> Result<bool> {
@@ -967,17 +1474,7 @@ async fn handle_theme_selection_updated(
     // The theme owns the shell paint and must bypass ratatui's incremental
     // cell diff, including an Esc rollback.
     app.force_next_full_repaint = true;
-    if apply_command_result(
-        terminal,
-        app,
-        engine_handle,
-        task_manager,
-        config,
-        web_config_session,
-        result,
-    )
-    .await?
-    {
+    if apply_command_result(terminal, app, engine_handle, task_manager, config, result).await? {
         return Ok(true);
     }
     refresh_config_view_if_open(app, "theme");
@@ -991,7 +1488,6 @@ pub(crate) async fn handle_view_events(
     config: &mut Config,
     task_manager: &SharedTaskManager,
     engine_handle: &mut EngineHandle,
-    web_config_session: &mut Option<WebConfigSession>,
     events: Vec<ViewEvent>,
 ) -> Result<bool> {
     for event in events {
@@ -1004,12 +1500,20 @@ pub(crate) async fn handle_view_events(
                         engine_handle,
                         task_manager,
                         config,
-                        &mut *web_config_session,
                         &command,
                     )
                     .await?
                     {
                         return Ok(true);
+                    }
+                    // A command review confirmed over the Extensions panel
+                    // (the plugin trust digest) closes its pager and lands
+                    // back on the list, which must show the state the
+                    // confirmation just changed.
+                    if app.view_stack.extensions_is_top() {
+                        let snapshot =
+                            crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+                        app.view_stack.refresh_extensions(snapshot);
                     }
                 }
                 crate::tui::views::CommandPaletteAction::InsertText { text } => {
@@ -1023,16 +1527,59 @@ pub(crate) async fn handle_view_events(
                     open_text_pager(app, title, content);
                 }
             },
+            ViewEvent::ExecutePanelCommand {
+                command,
+                pager_title,
+            } => {
+                // The Extensions panel stays open for this command. Inspect
+                // rows divert their text output into a pager stacked on the
+                // panel instead of a transcript dump; mutations keep their
+                // transcript receipt either way.
+                let mut result = crate::commands::execute_with_config(&command, app, config);
+                if let Some(title) = pager_title
+                    && let Some(text) = result.message.take()
+                {
+                    open_text_pager(app, title, text);
+                }
+                if apply_command_result(terminal, app, engine_handle, task_manager, config, result)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                // The row the user just changed re-reads live state, and so
+                // does every sibling — a plugin enable, an MCP retry, or an
+                // install lands on the still-open list instead of leaving it
+                // stale until reopen.
+                let snapshot = crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+                app.view_stack.refresh_extensions(snapshot);
+            }
+            ViewEvent::RefreshExtensions {
+                mcp_generation,
+                mcp_initializing,
+            } => {
+                // Bounded poll from the open panel: rebuild only when the
+                // MCP generation or the initializing flag moved past what
+                // the panel's snapshot last saw.
+                if app.view_stack.extensions_is_top()
+                    && (mcp_generation != app.mcp_snapshot_generation
+                        || app.mcp_snapshot_generation_invalidated
+                        || mcp_initializing != app.mcp_initializing)
+                {
+                    let snapshot = crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+                    app.view_stack.refresh_extensions(snapshot);
+                }
+            }
             ViewEvent::OpenTextPager { title, content } => {
                 open_text_pager(app, title, content);
             }
             ViewEvent::CopyToClipboard { text, label } => {
                 if text.is_empty() {
                     app.status_message = Some(format!("{label} is empty"));
-                } else if app.clipboard.write_text(&text).is_ok() {
-                    app.status_message = Some(format!("{label} copied"));
                 } else {
-                    app.status_message = Some(format!("Copy failed ({label})"));
+                    app.status_message = Some(match app.clipboard.write_text_status(&text) {
+                        Ok(transport) => copy_receipt(app, transport, format!("{label} copied")),
+                        Err(_) => format!("Copy failed ({label})"),
+                    });
                 }
             }
             ViewEvent::ApprovalDecision {
@@ -1062,7 +1609,7 @@ pub(crate) async fn handle_view_events(
 
                 if timed_out {
                     app.add_message(HistoryCell::System {
-                        content: "Approval request timed out - denied".to_string(),
+                        content: app.tr(MessageId::ApprovalTimedOutDenied).into_owned(),
                     });
                 }
             }
@@ -1072,64 +1619,64 @@ pub(crate) async fn handle_view_events(
                 option,
             } => {
                 use crate::tui::approval::ElevationOption;
-                match option {
+                let result = match option {
                     ElevationOption::Abort => {
-                        let _ = engine_handle.deny_tool_call(tool_id).await;
                         app.add_message(HistoryCell::System {
                             content: format!("Sandbox elevation aborted for {tool_name}"),
                         });
+                        engine_handle.deny_tool_call(tool_id.clone()).await
                     }
                     ElevationOption::WithNetwork => {
                         app.add_message(HistoryCell::System {
                             content: format!("Retrying {tool_name} with network access enabled"),
                         });
                         let policy = option.to_policy(&app.workspace);
-                        let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
+                        engine_handle
+                            .retry_tool_with_policy(tool_id.clone(), policy)
+                            .await
                     }
                     ElevationOption::WithWriteAccess(_) => {
                         app.add_message(HistoryCell::System {
                             content: format!("Retrying {tool_name} with write access enabled"),
                         });
                         let policy = option.to_policy(&app.workspace);
-                        let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
+                        engine_handle
+                            .retry_tool_with_policy(tool_id.clone(), policy)
+                            .await
                     }
                     ElevationOption::FullAccess => {
                         app.add_message(HistoryCell::System {
                             content: format!("Retrying {tool_name} with full access (no sandbox)"),
                         });
                         let policy = option.to_policy(&app.workspace);
-                        let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
+                        engine_handle
+                            .retry_tool_with_policy(tool_id.clone(), policy)
+                            .await
                     }
+                };
+                if result.is_ok() {
+                    note_human_decision_delivered(app, &tool_id);
+                    app.retire_action_notices(Some(&tool_id));
                 }
             }
             ViewEvent::UserInputSubmitted { tool_id, response } => {
-                match engine_handle
+                let result = engine_handle
                     .submit_user_input(tool_id.clone(), response)
-                    .await
-                {
-                    Ok(()) => {
-                        app.pending_user_input_prompt = None;
-                    }
-                    Err(err) => {
-                        tracing::warn!(tool_id = %tool_id, error = %err, "user input submit failed");
-                        if let Some((id, request)) = app.pending_user_input_prompt.clone() {
-                            app.view_stack.push(UserInputView::new(id, request));
-                        }
-                        app.push_status_toast(
-                            format!("Failed to submit response: {err}"),
-                            StatusToastLevel::Error,
-                            None,
-                        );
-                        app.status_message =
-                            Some(format!("Failed to submit response: {err} — try again"));
-                    }
-                }
+                    .await;
+                apply_user_input_submission_result(app, &tool_id, result);
             }
             ViewEvent::UserInputCancelled { tool_id } => {
-                let _ = engine_handle.cancel_user_input(tool_id).await;
-                app.add_message(HistoryCell::System {
-                    content: "User input cancelled".to_string(),
-                });
+                // A cancel is an answer too: when it cannot reach the engine
+                // the question is still pending there, so reopen it the way a
+                // failed submit does instead of recording a cancel (U02-04).
+                let result = engine_handle.cancel_user_input(tool_id.clone()).await;
+                let delivered = result.is_ok();
+                apply_user_input_submission_result(app, &tool_id, result);
+                if delivered {
+                    app.add_message(HistoryCell::System {
+                        content: "User input cancelled".to_string(),
+                    });
+                }
             }
             ViewEvent::SessionSelected { session_id } => {
                 let manager = match SessionManager::default_location() {
@@ -1141,24 +1688,44 @@ pub(crate) async fn handle_view_events(
                     }
                 };
 
-                match manager.load_session(&session_id) {
-                    Ok(session) => {
+                // Another window's open session is refused, not attached
+                // as a second autosaving writer.
+                match manager.attach_session(&session_id) {
+                    Ok((recovery, lease)) => {
+                        let session = recovery.session;
                         let next_config = config.clone();
+                        let message_count = session.metadata.message_count;
+                        // Keep the saved-store confinement check a pure
+                        // comparison on this runtime (#6522).
+                        crate::runtime_threads::prepare_canonical_sessions_root().await;
                         let respawn = match apply_loaded_session_config_snapshot(
                             app,
                             config,
-                            &session,
+                            session,
                             next_config,
                             false,
                         ) {
-                            Ok(outcome) => outcome,
+                            Ok(outcome) => {
+                                // Only now does this window give up the
+                                // session it had open; a failed restore
+                                // above keeps that session's lease.
+                                lease.commit();
+                                outcome
+                            }
                             Err(err) => {
-                                app.status_message =
-                                    Some(format!("Failed to restore session: {err}"));
+                                crate::tui::ui::session_state::surface_session_load_failure(
+                                    app,
+                                    format!("Failed to restore session: {err}"),
+                                );
                                 continue;
                             }
                         };
                         sync_runtime_workspace_state(task_manager, app.workspace.clone()).await;
+                        // #6150 audit: these sends may await a full op channel,
+                        // and that await is load-bearing — the session switch
+                        // is already committed UI-side, so each op must land in
+                        // order (drop = engine/UI desync). A wedge is possible
+                        // only while a saturated engine finishes its turn.
                         if respawn {
                             let _ = engine_handle.send(Op::Shutdown).await;
                             *engine_handle =
@@ -1175,7 +1742,7 @@ pub(crate) async fn handle_view_events(
                         let _ = engine_handle
                             .send(Op::SyncSession {
                                 session_id: app.current_session_id.clone(),
-                                messages: app.api_messages.clone(),
+                                messages: app.api_messages.as_ref().clone(),
                                 system_prompt: app.system_prompt.clone(),
                                 system_prompt_override: false,
                                 model: app.model.clone(),
@@ -1194,20 +1761,23 @@ pub(crate) async fn handle_view_events(
                         let loaded_message = format!(
                             "Session loaded (ID: {}, {} messages)",
                             crate::session_manager::truncate_id(&session_id),
-                            session.metadata.message_count
+                            message_count
                         );
                         app.add_message(HistoryCell::System {
                             content: loaded_message.clone(),
                         });
                         app.status_message = Some(loaded_message);
-                        app.launch.visible = false;
+                        app.launch.dismiss();
                         app.launch.status = None;
                     }
                     Err(err) => {
-                        app.status_message = Some(format!(
-                            "Failed to load session {}: {err}",
-                            crate::session_manager::truncate_id(&session_id)
-                        ));
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!(
+                                "Failed to load session {}: {err}",
+                                crate::session_manager::truncate_id(&session_id)
+                            ),
+                        );
                     }
                 }
             }
@@ -1290,7 +1860,6 @@ pub(crate) async fn handle_view_events(
                     config,
                     task_manager,
                     engine_handle,
-                    web_config_session,
                     key,
                     value,
                     persist,
@@ -1307,7 +1876,6 @@ pub(crate) async fn handle_view_events(
                     config,
                     task_manager,
                     engine_handle,
-                    web_config_session,
                     theme,
                     persist,
                 )
@@ -1385,14 +1953,89 @@ pub(crate) async fn handle_view_events(
                 )
                 .await;
             }
+            ViewEvent::FleetRosterOpenCoordinatorRequested => {
+                app.view_stack.push(
+                    crate::tui::model_picker::ModelPickerView::new(app, config)
+                        .with_assignment_context("Coordinator", "Current session"),
+                );
+            }
+            ViewEvent::FleetProfileRoutePickRequested { editor_id } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let selection = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
+                        .and_then(|view| {
+                            view.route_selection(editor_id)
+                                .map(|selection| (selection, view.assignment_context()))
+                        });
+                    app.view_stack.push_boxed(boxed);
+                    if let Some((selection, (role, scope))) = selection {
+                        app.view_stack.push(
+                            crate::tui::model_picker::ModelPickerView::new_for_fleet_profile(
+                                app, config, editor_id, selection,
+                            )
+                            .with_assignment_context(role, scope),
+                        );
+                    }
+                }
+            }
+            ViewEvent::FleetProfileRoutePicked {
+                editor_id,
+                provider,
+                provider_id,
+                model,
+                reasoning,
+            } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    if let Some(view) = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>(
+                    ) {
+                        view.accept_route(
+                            editor_id,
+                            provider_id.unwrap_or_else(|| provider.as_str().into()),
+                            model,
+                            reasoning,
+                        );
+                    }
+                    app.view_stack.push_boxed(boxed);
+                }
+            }
+            ViewEvent::FleetProfileRouteCommitRequested { editor_id } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let result = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
+                        .map(|view| view.commit_route_assignment(editor_id, app, config));
+                    match result {
+                        Some(Ok(message)) => {
+                            sync_fleet_roster(app, config, engine_handle);
+                            refresh_parked_fleet_roster(app, config);
+                            app.push_status_toast(message, StatusToastLevel::Success, Some(8_000));
+                        }
+                        Some(Err(reason)) => {
+                            app.view_stack.push_boxed(boxed);
+                            app.set_sticky_status(reason, StatusToastLevel::Error, None);
+                        }
+                        None => app.view_stack.push_boxed(boxed),
+                    }
+                }
+            }
+            ViewEvent::FleetAssignmentPickerDismissed { editor_id } => {
+                dismiss_fleet_assignment(app, editor_id);
+                refresh_parked_fleet_roster(app, config);
+            }
             ViewEvent::FleetRosterOpenSetupRequested { member_id } => {
                 // The shared router opens the selected v2 Fleet's exact editor
                 // (focused on this member) or the legacy wizard when no named
                 // Fleet is selected.
                 open_fleet_setup_target(app, config, Some(&member_id));
-            }
-            ViewEvent::FleetRosterOpenModelRequested { member_id } => {
-                open_fleet_model_target(app, config, &member_id);
             }
             ViewEvent::FleetListOpenDetailRequested { name, scope } => {
                 if app.view_stack.top_kind() != Some(ModalKind::FleetDetail) {
@@ -1403,7 +2046,7 @@ pub(crate) async fn handle_view_events(
                     } else {
                         app.set_sticky_status(
                             format!(
-                                "Could not open Fleet `{name}` ({}) — the file may have moved or become unreadable.",
+                                "Could not open team `{name}` ({}) — the file may have moved or become unreadable.",
                                 scope.label()
                             ),
                             crate::tui::app::StatusToastLevel::Error,
@@ -1412,23 +2055,126 @@ pub(crate) async fn handle_view_events(
                     }
                 }
             }
+            // Enter on a Fleet editor row: the standard `/model` picker opens
+            // on top of the editor, and its pick comes back below as
+            // `FleetRoutePicked` to land on the editor still on the stack.
+            ViewEvent::FleetDetailRoutePickRequested { target, editor_id } => {
+                let selection = if app.view_stack.top_kind() == Some(ModalKind::FleetDetail)
+                    && let Some(mut editor) = app.view_stack.pop()
+                {
+                    let selection = editor
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
+                        .and_then(|view| {
+                            view.route_selection(editor_id, target)
+                                .map(|selection| (selection, view.assignment_context()))
+                        });
+                    app.view_stack.push_boxed(editor);
+                    selection
+                } else {
+                    None
+                };
+                if let Some((selection, (role, scope))) = selection {
+                    app.view_stack.push(
+                        crate::tui::model_picker::ModelPickerView::new_for_fleet_route(
+                            app, config, target, editor_id, selection,
+                        )
+                        .with_assignment_context(role, scope),
+                    );
+                }
+            }
+            ViewEvent::FleetRoutePicked {
+                target,
+                editor_id,
+                provider,
+                provider_id,
+                model,
+                reasoning,
+            } => {
+                let provider_key = provider_id.unwrap_or_else(|| provider.as_str().to_string());
+                // The picker's `auto` row is "inherit": the Fleet row follows
+                // the session route again.
+                let pin = (model != "auto").then_some((provider_key, model));
+                if let Some((provider_key, _)) = &pin
+                    && let Some(rejection) =
+                        crate::commands::fleet_provider_rejection(app, config, provider_key)
+                {
+                    // Same gate as `/fleet add` and ⇧F: an unconfigured route
+                    // never enters a team from the picker.
+                    app.set_sticky_status(rejection, StatusToastLevel::Error, None);
+                } else if app.view_stack.top_kind() == Some(ModalKind::FleetDetail)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let outcome = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
+                        .map(|view| {
+                            let (provider, model) = match pin {
+                                Some((provider, model)) => (Some(provider), Some(model)),
+                                None => (None, None),
+                            };
+                            view.apply_picked_route(editor_id, target, provider, model, reasoning)
+                        });
+                    app.view_stack.push_boxed(boxed);
+                    match outcome {
+                        Some(Ok(message)) => {
+                            if let Some(mut editor) = app.view_stack.pop() {
+                                let direct = editor.as_any_mut().downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
+                                    .is_some_and(|view| view.is_direct_assignment(editor_id));
+                                if !direct {
+                                    app.view_stack.push_boxed(editor);
+                                }
+                            }
+                            app.push_status_toast(message, StatusToastLevel::Success, Some(8_000));
+                            sync_fleet_roster(app, config, engine_handle);
+                            refresh_parked_fleet_roster(app, config);
+                        }
+                        Some(Err(reason)) => {
+                            app.set_sticky_status(reason, StatusToastLevel::Error, None);
+                        }
+                        None => {}
+                    }
+                } else {
+                    app.set_sticky_status(
+                        codewhale_localization::tr(
+                            app.ui_locale,
+                            codewhale_localization::MessageId::FleetRoutePickUnavailable,
+                        )
+                        .into_owned(),
+                        StatusToastLevel::Error,
+                        None,
+                    );
+                }
+                app.needs_redraw = true;
+            }
             ViewEvent::FleetStoreChanged { message } => {
                 app.status_message = Some(message);
                 sync_fleet_roster(app, config, engine_handle);
+                refresh_parked_fleet_roster(app, config);
             }
+            // #5954: the roster emits (rather than emit-and-closes) these, so
+            // it is still on the stack right underneath. Pushing on top makes
+            // the three Fleet views one stack: `Esc` pops back to the roster,
+            // and only closes the window at the root.
             ViewEvent::FleetRosterOpenFleetsRequested => {
                 if app.view_stack.top_kind() != Some(ModalKind::FleetList) {
-                    app.view_stack
-                        .push(crate::tui::views::fleet_list::FleetListView::new(
-                            app, config,
-                        ));
+                    let over_roster = app.view_stack.top_kind() == Some(ModalKind::FleetRoster);
+                    let mut view = crate::tui::views::fleet_list::FleetListView::new(app, config);
+                    if over_roster {
+                        view = view.over_fleet_roster();
+                    }
+                    app.view_stack.push(view);
                 }
             }
             ViewEvent::FleetRosterOpenWorkersRequested => {
                 if app.view_stack.top_kind() != Some(ModalKind::SubAgents) {
+                    let over_roster = app.view_stack.top_kind() == Some(ModalKind::FleetRoster);
                     let agents = subagent_view_agents(app, &app.subagent_cache);
-                    app.view_stack
-                        .push(crate::tui::views::SubAgentsView::for_app(app, agents));
+                    let mut view = crate::tui::views::SubAgentsView::for_app(app, agents);
+                    if over_roster {
+                        view = view.over_fleet_roster();
+                    }
+                    app.view_stack.push(view);
                 }
                 app.status_message =
                     Some(tr(app.ui_locale, MessageId::SubagentsFetching).to_string());
@@ -1441,28 +2187,42 @@ pub(crate) async fn handle_view_events(
                 // config has the target provider active so credential discovery
                 // succeeds, but the parent session provider/model are never
                 // mutated.
-                let Some(provider) = ApiProvider::parse(&provider_id) else {
-                    app.set_sticky_status(
-                        format!("Fleet route activation failed: unknown provider `{provider_id}`"),
-                        crate::tui::app::StatusToastLevel::Error,
-                        None,
-                    );
-                    app.needs_redraw = true;
-                    continue;
+                let identity = match config.resolve_provider_selection_identity(&provider_id) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        app.set_sticky_status(
+                            format!("Team route activation failed: {error}"),
+                            crate::tui::app::StatusToastLevel::Error,
+                            None,
+                        );
+                        app.needs_redraw = true;
+                        continue;
+                    }
                 };
-                let provider_label = provider.display_name();
+                let provider_label = identity
+                    .compatibility()
+                    .map_or(identity.key.as_str(), |row| row.label);
                 let mut scoped = config.clone();
-                scoped.provider = Some(provider_id.clone());
-                let validation =
-                    crate::route_runtime::resolve_runtime_route(&scoped, provider, Some(&model))
-                        .and_then(|route| route.validate().map_err(|err| err.to_string()));
+                let validation = scoped
+                    .scope_to_provider_identity(&identity)
+                    .and_then(|()| {
+                        crate::route_runtime::resolve_runtime_route_for_identity(
+                            &scoped,
+                            &identity,
+                            Some(&model),
+                        )
+                    })
+                    .and_then(|route| route.validate().map_err(|err| err.to_string()));
                 match validation {
                     Ok(validated) => {
-                        app.provider_health
-                            .record_success(&scoped, provider, &validated.model);
+                        app.provider_health.record_success(
+                            &scoped,
+                            &validated.client.turn_route_receipt(),
+                            &validated.model,
+                        );
                         app.push_status_toast(
                             format!(
-                                "{provider_label} route activated for Fleet: {}",
+                                "{provider_label} route activated for team: {}",
                                 validated.model
                             ),
                             crate::tui::app::StatusToastLevel::Success,
@@ -1477,8 +2237,18 @@ pub(crate) async fn handle_view_events(
                             "route_validation_failed",
                             &error,
                         );
-                        app.provider_health
-                            .record_failure(&scoped, provider, &model, &envelope);
+                        if let Some(generation) =
+                            scoped.readonly_health_credential_generation(&identity)
+                        {
+                            app.provider_health.record_models_probe_failure(
+                                &scoped,
+                                &identity,
+                                &model,
+                                generation,
+                                envelope.category,
+                                &envelope.message,
+                            );
+                        }
                         app.push_status_toast(
                             format!("{provider_label} route activation failed: {error}"),
                             crate::tui::app::StatusToastLevel::Error,
@@ -1530,7 +2300,7 @@ pub(crate) async fn handle_view_events(
                         Ok(dir) => dir,
                         Err(err) => {
                             app.set_sticky_status(
-                                format!("Fleet {} scope is unavailable: {err:#}", scope.label()),
+                                format!("Team {} scope is unavailable: {err:#}", scope.label()),
                                 StatusToastLevel::Error,
                                 None,
                             );
@@ -1577,20 +2347,33 @@ pub(crate) async fn handle_view_events(
                 // after the pick) could still name an unconfigured one — which
                 // would fail loudly at launch. Catch it at save time with a
                 // clear message, reusing the SAME predicate the picker uses.
-                if let Some(provider_id) = draft.provider.as_deref()
-                    && let Some(provider) = crate::config::ApiProvider::parse(provider_id)
-                    && !crate::config::provider_is_configured_for_active(
-                        config,
-                        provider,
-                        app.api_provider,
-                    )
-                {
-                    let message = tr(app.ui_locale, MessageId::FleetProfileProviderUnconfigured)
-                        .replace("{provider}", provider_id)
-                        .replace("{env}", &provider.env_vars_label());
-                    app.set_sticky_status(message, StatusToastLevel::Error, None);
-                    app.needs_redraw = true;
-                    continue;
+                if let Some(provider_id) = draft.provider.as_deref() {
+                    let checked =
+                        config
+                            .resolve_provider_pin_identity(provider_id)
+                            .and_then(|identity| {
+                                let active = app.admitted_provider_identity()?;
+                                if crate::config::provider_is_configured_for_active(
+                                    config, &identity, active,
+                                ) {
+                                    Ok(())
+                                } else {
+                                    Err(tr(
+                                        app.ui_locale,
+                                        MessageId::FleetProfileProviderUnconfigured,
+                                    )
+                                    .replace("{provider}", provider_id)
+                                    .replace(
+                                        "{env}",
+                                        &identity.provider.provider().env_vars().join(" / "),
+                                    ))
+                                }
+                            });
+                    if let Err(message) = checked {
+                        app.set_sticky_status(message, StatusToastLevel::Error, None);
+                        app.needs_redraw = true;
+                        continue;
+                    }
                 }
                 let mut txn = codewhale_config::persistence::SetupTransaction::new();
                 txn.stage(target.clone(), draft.render_toml().into_bytes());
@@ -1600,34 +2383,34 @@ pub(crate) async fn handle_view_events(
                             std::sync::Arc::new(crate::fleet::identity::load_effective_roster(
                                 &config.fleet_config(),
                                 &app.workspace,
-                                Some(app.plugin_registry.as_ref()),
+                                Some(app.extension_plugin_view().as_ref()),
                             ));
                         let roster_refresh_failed = engine_handle
                             .try_send(Op::SetFleetRoster { roster })
                             .is_err();
-                        let zh = app.ui_locale == crate::localization::Locale::ZhHans;
+                        let zh = app.ui_locale == codewhale_localization::Locale::ZhHans;
                         app.add_message(HistoryCell::System {
                             content: if zh {
-                                format!("已保存 Fleet 配置：{}", target.display())
+                                format!("已保存团队配置：{}", target.display())
                             } else {
                                 format!(
-                                    "Fleet {} profile saved: {}",
+                                    "Team {} profile saved: {}",
                                     scope.label(),
                                     target.display()
                                 )
                             },
                         });
                         app.status_message = Some(if zh {
-                            format!("已保存 Fleet 配置：{}", draft.file_name())
+                            format!("已保存团队配置：{}", draft.file_name())
                         } else if roster_refresh_failed {
                             format!(
-                                "Fleet {} profile saved, but the live roster could not refresh; restart before dispatching {}",
+                                "Team {} profile saved, but the live roster could not refresh; restart before dispatching {}",
                                 scope.label(),
                                 draft.id
                             )
                         } else {
                             format!(
-                                "Fleet {} profile saved: {}",
+                                "Team {} profile saved: {}",
                                 scope.label(),
                                 draft.file_name()
                             )
@@ -1635,10 +2418,10 @@ pub(crate) async fn handle_view_events(
                     }
                     Err(err) => {
                         app.status_message =
-                            Some(if app.ui_locale == crate::localization::Locale::ZhHans {
-                                format!("无法保存 Fleet 配置：{err:#}")
+                            Some(if app.ui_locale == codewhale_localization::Locale::ZhHans {
+                                format!("无法保存团队配置：{err:#}")
                             } else {
-                                format!("Fleet profile could not be saved: {err:#}")
+                                format!("Team profile could not be saved: {err:#}")
                             });
                     }
                 }
@@ -1664,7 +2447,9 @@ pub(crate) async fn handle_view_events(
                     app.view_stack.push(
                         crate::tui::provider_picker::ProviderPickerView::new_for_setup(
                             app.api_provider,
-                            Some(app.api_provider),
+                            app.admitted_provider_identity()
+                                .ok()
+                                .map(|identity| identity.key.clone()),
                             config,
                             runtime_status,
                         )
@@ -1677,7 +2462,9 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::SetupOpenModelRequested => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
-                    open_model_picker_for_provider(app, config, app.api_provider);
+                    if let Ok(identity) = app.admitted_provider_identity().cloned() {
+                        open_model_picker_for_provider(app, config, &identity);
+                    }
                     app.status_message =
                         Some("Model route picker opened from /setup readiness.".to_string());
                 }
@@ -1724,25 +2511,19 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::SidebarAgentCancel { agent_id } => {
                 app.status_message = Some(format!("Cancelling {agent_id}..."));
+                // #6150: the input path never awaits a full op channel. The
+                // cancel is retryable; a rejected send surfaces immediately.
                 if engine_handle
-                    .send(Op::CancelSubAgent {
+                    .try_send(Op::CancelSubAgent {
                         agent_id: agent_id.clone(),
                     })
-                    .await
                     .is_err()
                 {
                     app.status_message = Some(format!("Could not cancel {agent_id}"));
                 }
             }
             ViewEvent::OpenAgentTranscript { agent_id } => {
-                // One agent, one destination: focus the worker so its full
-                // transcript owns the main area and the composer addresses
-                // its fork. The register modal closes so the focus is visible.
-                if app.view_stack.top_kind() == Some(ModalKind::SubAgents) {
-                    app.view_stack.pop();
-                }
-                crate::tui::agent_focus::focus_agent(app, &agent_id);
-                app.needs_redraw = true;
+                open_agent_transcript(app, config, &agent_id);
             }
             ViewEvent::AgentDetailsClosed { agent_id } => {
                 crate::tui::work_surface::agent_details_closed(app, &agent_id);
@@ -1762,15 +2543,14 @@ pub(crate) async fn handle_view_events(
                     insertion.push(' ');
                 }
                 insertion.push('@');
-                insertion.push_str(&path);
+                insertion.push_str(&crate::tui::file_mention::file_mention_body(&path));
                 insertion.push(' ');
                 app.insert_str(&insertion);
                 app.status_message = Some(format!("Attached @{path}"));
             }
             ViewEvent::ModelPickerApplied {
                 model,
-                provider,
-                provider_id,
+                identity,
                 effort,
                 previous_model,
                 previous_effort,
@@ -1781,14 +2561,14 @@ pub(crate) async fn handle_view_events(
                     engine_handle,
                     config,
                     model,
-                    provider,
-                    provider_id,
+                    identity,
                     effort,
                     previous_model,
                     previous_effort,
                     save_as_startup_default,
                 )
                 .await;
+                refresh_parked_fleet_roster(app, config);
             }
             ViewEvent::ModelPickerDismissed {
                 catalog_view,
@@ -1801,28 +2581,21 @@ pub(crate) async fn handle_view_events(
                     view: Some(view),
                     selected_row_id,
                 });
+                refresh_parked_fleet_roster(app, config);
             }
             ViewEvent::ModelPickerRefresh => {
                 // Re-resolve readiness from the live credential state and
                 // rebuild catalog rows. Non-destructive: never clears the list
                 // when a refresh fails; just re-project from current config.
                 sync_config_provider_from_app(config, app);
-                if app.view_stack.top_kind() == Some(ModalKind::ModelPicker)
-                    && let Some(mut boxed) = app.view_stack.pop()
-                {
-                    if let Some(picker) = boxed
-                        .as_any_mut()
-                        .downcast_mut::<crate::tui::model_picker::ModelPickerView>(
-                    ) {
-                        picker.re_resolve_from_app(app, config);
-                        app.status_message =
-                            Some("Model readiness refreshed · catalog rows rebuilt".into());
-                    }
-                    app.view_stack.push_boxed(boxed);
+                let refreshed =
+                    tr(app.ui_locale, MessageId::ModelPickerReadinessRefreshed).into_owned();
+                let notice = Some((refreshed.clone(), StatusToastLevel::Info));
+                app.status_message = Some(if refresh_open_model_picker(app, config, notice) {
+                    refreshed
                 } else {
-                    app.status_message =
-                        Some("Open /model to refresh readiness and catalog".into());
-                }
+                    tr(app.ui_locale, MessageId::ModelPickerOpenToRefresh).into_owned()
+                });
                 app.needs_redraw = true;
             }
             ViewEvent::ModelPickerToggleFleet {
@@ -1830,49 +2603,8 @@ pub(crate) async fn handle_view_events(
                 provider_id,
                 model,
             } => {
-                use crate::fleet::members::{FleetModelChange, change_receipt, toggle_fleet_model};
                 let provider_key = provider_id.unwrap_or_else(|| provider.as_str().to_string());
-                let locale = app.ui_locale;
-                // Same gate as `/fleet add`, against the live config: a
-                // locked or unauthenticated provider row never enters the
-                // fleet from the picker either.
-                if let Some(rejection) =
-                    crate::commands::fleet_provider_rejection(app, config, &provider_key)
-                {
-                    app.set_sticky_status(rejection, StatusToastLevel::Error, None);
-                } else {
-                    match toggle_fleet_model(&app.workspace, &provider_key, &model) {
-                        Ok(change) => {
-                            let level = if matches!(change, FleetModelChange::Unchanged { .. }) {
-                                StatusToastLevel::Info
-                            } else {
-                                app.fleet_roster_stale = true;
-                                StatusToastLevel::Success
-                            };
-                            app.push_status_toast(
-                                change_receipt(locale, &provider_key, &model, &change),
-                                level,
-                                Some(FLEET_TOGGLE_TOAST_TTL_MS),
-                            );
-                        }
-                        Err(error) => app.set_sticky_status(
-                            tr(locale, MessageId::FleetToggleFailed)
-                                .replace("{error}", &error.message(locale)),
-                            StatusToastLevel::Error,
-                            None,
-                        ),
-                    }
-                }
-                if let Some(mut boxed) = app.view_stack.pop() {
-                    if let Some(picker) = boxed
-                        .as_any_mut()
-                        .downcast_mut::<crate::tui::model_picker::ModelPickerView>(
-                    ) {
-                        picker.re_resolve_from_app(app, config);
-                    }
-                    app.view_stack.push_boxed(boxed);
-                }
-                app.needs_redraw = true;
+                toggle_model_picker_fleet(app, config, &provider_key, &model);
             }
             ViewEvent::ModelPickerTogglePin {
                 provider,
@@ -1880,30 +2612,7 @@ pub(crate) async fn handle_view_events(
                 model,
             } => {
                 let provider_key = provider_id.unwrap_or_else(|| provider.as_str().to_string());
-                match crate::settings::Settings::transact(|settings| {
-                    Ok(settings.toggle_pinned_model(&provider_key, &model))
-                }) {
-                    Ok(true) => app.status_message = Some(format!("Pinned {provider_key}/{model}")),
-                    Ok(false) => {
-                        app.status_message = Some(format!("Unpinned {provider_key}/{model}"))
-                    }
-                    Err(error) => {
-                        app.status_message = Some(format!("Could not update pin: {error}"))
-                    }
-                }
-                if let Ok(settings) = crate::settings::Settings::load_persisted() {
-                    app.pinned_models = settings.pinned_models;
-                }
-                if let Some(mut boxed) = app.view_stack.pop() {
-                    if let Some(picker) = boxed
-                        .as_any_mut()
-                        .downcast_mut::<crate::tui::model_picker::ModelPickerView>(
-                    ) {
-                        picker.re_resolve_from_app(app, config);
-                    }
-                    app.view_stack.push_boxed(boxed);
-                }
-                app.needs_redraw = true;
+                toggle_model_picker_pin(app, config, &provider_key, &model);
             }
             ViewEvent::ModelPickerMovePin {
                 provider,
@@ -1922,25 +2631,30 @@ pub(crate) async fn handle_view_events(
                     Ok(None) => {}
                     Ok(Some(pinned_models)) => {
                         app.pinned_models = pinned_models;
-                        app.status_message = Some("Pinned model order updated".into());
-                        if let Some(mut boxed) = app.view_stack.pop() {
-                            if let Some(picker) = boxed
-                                .as_any_mut()
-                                .downcast_mut::<crate::tui::model_picker::ModelPickerView>(
-                            ) {
-                                picker.re_resolve_from_app(app, config);
-                            }
-                            app.view_stack.push_boxed(boxed);
-                        }
+                        let receipt =
+                            tr(app.ui_locale, MessageId::ModelPickerPinOrderUpdated).into_owned();
+                        app.status_message = Some(receipt.clone());
+                        refresh_open_model_picker(
+                            app,
+                            config,
+                            Some((receipt, StatusToastLevel::Success)),
+                        );
                     }
                     Err(error) => {
-                        app.status_message = Some(format!("Could not reorder pin: {error}"));
+                        let receipt = tr(app.ui_locale, MessageId::ModelPickerPinReorderFailed)
+                            .replace("{error}", &error.to_string());
+                        app.status_message = Some(receipt.clone());
+                        refresh_open_model_picker(
+                            app,
+                            config,
+                            Some((receipt, StatusToastLevel::Error)),
+                        );
                     }
                 }
                 app.needs_redraw = true;
             }
             ViewEvent::ModelPickerNeedsAuth {
-                provider,
+                identity,
                 model,
                 reason,
             } => {
@@ -1953,7 +2667,7 @@ pub(crate) async fn handle_view_events(
                 if let Some(picker) =
                     crate::tui::provider_picker::ProviderPickerView::new_for_missing_auth(
                         app.api_provider,
-                        provider,
+                        &identity,
                         config,
                         None,
                     )
@@ -1961,7 +2675,8 @@ pub(crate) async fn handle_view_events(
                     app.view_stack.push(picker);
                 } else {
                     app.status_message = Some(format!(
-                        "🔒 {model} needs {provider:?} credentials — open /provider to authenticate."
+                        "🔒 {model} needs {} credentials — open /provider to authenticate.",
+                        identity.key
                     ));
                 }
                 app.needs_redraw = true;
@@ -1972,6 +2687,12 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::TopbarRoutePickerRequested => {
                 open_provider_picker(app, config, engine_handle).await;
+            }
+            ViewEvent::TopbarModelPickerRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
+                    app.view_stack
+                        .push(crate::tui::model_picker::ModelPickerView::new(app, config));
+                }
             }
             ViewEvent::ProviderPickerDismissed {
                 catalog_view,
@@ -1992,28 +2713,23 @@ pub(crate) async fn handle_view_events(
                     back_from_provider_onboarding(app);
                 }
             }
-            ViewEvent::ProviderPickerApplied {
-                provider,
-                provider_id,
-            } => {
-                if let Some(provider_id) = provider_id {
-                    set_active_custom_provider_in_memory(config, &provider_id);
-                }
-                let model_override = provider_picker_model_override(app, config, provider);
+            ViewEvent::ProviderPickerApplied { identity } => {
+                let provider = identity.provider;
+                let model_override = provider_picker_model_override(app, config, &identity);
                 let switched =
-                    switch_provider(app, engine_handle, config, provider, model_override).await;
+                    switch_provider(app, engine_handle, config, identity, model_override).await;
                 if switched && app.onboarding == OnboardingState::Provider {
                     complete_provider_picker_onboarding(app, provider);
                 }
                 refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerApiKeySubmitted {
-                provider,
-                provider_id,
+                identity,
                 api_key,
                 base_url,
             } => {
-                let identity = picker_provider_identity(config, provider, provider_id.as_deref())
+                config
+                    .verify_provider_identity(&identity)
                     .map_err(anyhow::Error::msg)?;
                 apply_provider_picker_api_key(
                     app,
@@ -2027,15 +2743,16 @@ pub(crate) async fn handle_view_events(
                 refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerSetupConfirmed {
-                provider,
-                provider_id,
+                identity,
                 api_key,
                 model,
                 context_window,
                 base_url,
             } => {
-                let identity = picker_provider_identity(config, provider, provider_id.as_deref())
+                config
+                    .verify_provider_identity(&identity)
                     .map_err(anyhow::Error::msg)?;
+                let provider = identity.provider;
                 let completed = apply_provider_picker_setup_confirmed(
                     app,
                     engine_handle,
@@ -2068,20 +2785,34 @@ pub(crate) async fn handle_view_events(
                     api_key_env,
                 )
                 .await;
-                complete_provider_picker_onboarding_if_switched(app, ApiProvider::Custom, switched);
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Custom,
+                    switched,
+                );
                 refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 let switched =
                     run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
-                complete_provider_picker_onboarding_if_switched(app, ApiProvider::Xai, switched);
+                complete_provider_picker_onboarding_if_switched(app, ProviderKind::Xai, switched);
             }
             ViewEvent::ProviderPickerChatgptOAuthRequested => {
                 let switched =
                     run_chatgpt_pkce_login_from_tui(terminal, app, engine_handle, config).await?;
                 complete_provider_picker_onboarding_if_switched(
                     app,
-                    ApiProvider::OpenaiCodex,
+                    ProviderKind::OpenaiCodex,
+                    switched,
+                );
+            }
+            ViewEvent::ProviderPickerOrcarouterOAuthRequested => {
+                let switched =
+                    run_orcarouter_pkce_login_from_tui(terminal, app, engine_handle, config)
+                        .await?;
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Orcarouter,
                     switched,
                 );
             }
@@ -2090,45 +2821,54 @@ pub(crate) async fn handle_view_events(
                 consent_provider,
                 source,
                 path,
-            } => match persist_external_credential_consent_for_at(
-                app.config_path.as_deref(),
-                config,
-                provider,
-                consent_provider,
-                source,
-                &path,
-            ) {
-                Ok(_) => {
-                    let toast = app
-                        .tr(MessageId::ProviderExternalGrantedToast)
-                        .replace("{owner}", source.owner_label())
-                        .replace("{provider}", provider.as_str());
-                    app.push_status_toast(toast, StatusToastLevel::Success, Some(8_000));
-                    let model_override = provider_picker_model_override(app, config, provider);
-                    let switched =
-                        switch_provider(app, engine_handle, config, provider, model_override).await;
-                    // #4763: reusing an external CLI grant completes provider
-                    // onboarding exactly like a submitted key or an applied
-                    // route. Without this the picker closes on success and
-                    // the user is returned to the provider step they just
-                    // satisfied — the second half of the reported loop.
-                    if switched && app.onboarding == OnboardingState::Provider {
-                        complete_provider_picker_onboarding(app, provider);
+            } => {
+                let identity = config
+                    .builtin_provider_identity(provider)
+                    .map_err(anyhow::Error::msg)?;
+                match persist_external_credential_consent_for_at(
+                    app.config_path.as_deref(),
+                    config,
+                    &identity,
+                    consent_provider,
+                    source,
+                    &path,
+                ) {
+                    Ok(_) => {
+                        let toast = app
+                            .tr(MessageId::ProviderExternalGrantedToast)
+                            .replace("{owner}", source.owner_label())
+                            .replace("{provider}", provider.as_str());
+                        app.push_status_toast(toast, StatusToastLevel::Success, Some(8_000));
+                        let model_override = provider_picker_model_override(app, config, &identity);
+                        let switched =
+                            switch_provider(app, engine_handle, config, identity, model_override)
+                                .await;
+                        // #4763: reusing an external CLI grant completes provider
+                        // onboarding exactly like a submitted key or an applied
+                        // route. Without this the picker closes on success and
+                        // the user is returned to the provider step they just
+                        // satisfied — the second half of the reported loop.
+                        if switched && app.onboarding == OnboardingState::Provider {
+                            complete_provider_picker_onboarding(app, provider);
+                        }
+                        refresh_config_view_if_open(app, "provider");
                     }
-                    refresh_config_view_if_open(app, "provider");
+                    Err(error) => app.push_status_toast(
+                        app.tr(MessageId::ProviderExternalSaveFailedToast)
+                            .replace("{error}", &error.to_string()),
+                        StatusToastLevel::Error,
+                        None,
+                    ),
                 }
-                Err(error) => app.push_status_toast(
-                    app.tr(MessageId::ProviderExternalSaveFailedToast)
-                        .replace("{error}", &error.to_string()),
-                    StatusToastLevel::Error,
-                    None,
-                ),
-            },
+            }
             ViewEvent::ProviderPickerExternalConsentRevoked { provider } => {
+                let identity = config
+                    .builtin_provider_identity(provider)
+                    .map_err(anyhow::Error::msg)?;
                 match revoke_external_credential_consent_for_at(
                     app.config_path.as_deref(),
                     config,
-                    provider,
+                    &identity,
                 ) {
                     Ok(_) => app.push_status_toast(
                         app.tr(MessageId::ProviderExternalRevokedToast)
@@ -2145,22 +2885,15 @@ pub(crate) async fn handle_view_events(
                 }
                 refresh_config_view_if_open(app, "provider");
             }
-            ViewEvent::ProviderPickerOpenModels {
-                provider,
-                provider_id,
-            } => {
-                if let Some(provider_id) = provider_id {
-                    set_active_custom_provider_in_memory(config, &provider_id);
-                }
-                open_model_picker_for_provider(app, config, provider);
+            ViewEvent::ProviderPickerOpenModels { identity } => {
+                open_model_picker_for_provider(app, config, &identity);
             }
             ViewEvent::ProviderPickerTestConnection {
-                provider,
-                provider_id,
+                identity,
                 catalog_view,
             } => {
-                match picker_provider_identity(config, provider, provider_id.as_deref()) {
-                    Ok(identity) => {
+                match config.verify_provider_identity(&identity) {
+                    Ok(()) => {
                         apply_provider_picker_test_connection(
                             app,
                             engine_handle,
@@ -2168,10 +2901,10 @@ pub(crate) async fn handle_view_events(
                             identity,
                             catalog_view,
                         )
-                        .await;
+                        .await
                     }
                     Err(error) => {
-                        app.push_status_toast(error, StatusToastLevel::Error, Some(8_000));
+                        app.push_status_toast(error, StatusToastLevel::Error, Some(8_000))
                     }
                 }
                 refresh_config_view_if_open(app, "provider");
@@ -2190,20 +2923,53 @@ pub(crate) async fn handle_view_events(
                     update_backtrack_overlay_selection(app, idx);
                 }
             }
+            // Apply the accepted choice now, for keyboard and mouse alike.
+            // Parking it in pending_launch_action left keyboard confirmation
+            // waiting for an unrelated mouse event to drain that queue.
+            ViewEvent::LaunchResumeConfirmed { session_id } => {
+                let result = resume_launch_session(app, &session_id);
+                if apply_command_result(terminal, app, engine_handle, task_manager, config, result)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                app.needs_redraw = true;
+            }
             ViewEvent::BacktrackConfirm => {
                 if let Some(depth) = app.backtrack.confirm() {
-                    apply_backtrack(app, depth);
-                    let _ = engine_handle
-                        .send(Op::SyncSession {
-                            session_id: app.current_session_id.clone(),
-                            messages: app.api_messages.clone(),
-                            system_prompt: app.system_prompt.clone(),
-                            system_prompt_override: false,
-                            model: app.model.clone(),
-                            workspace: app.workspace.clone(),
-                            mode: app.mode,
-                        })
-                        .await;
+                    // Reserve the slot before mutating history (#6150): the
+                    // loop must not await a full op channel, and applying the
+                    // backtrack without delivering SyncSession would desync
+                    // the engine's messages from ours.
+                    match engine_handle.tx_op.clone().try_reserve_owned() {
+                        Ok(permit) => {
+                            apply_backtrack(app, depth);
+                            engine_handle.send_reserved_op(
+                                permit,
+                                Op::SyncSession {
+                                    session_id: app.current_session_id.clone(),
+                                    messages: app.api_messages.as_ref().clone(),
+                                    system_prompt: app.system_prompt.clone(),
+                                    system_prompt_override: false,
+                                    model: app.model.clone(),
+                                    workspace: app.workspace.clone(),
+                                    mode: app.mode,
+                                },
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            app.status_message = Some(
+                                "Engine busy — backtrack not applied; try again in a moment"
+                                    .to_string(),
+                            );
+                            app.needs_redraw = true;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            app.status_message =
+                                Some("Engine stopped — backtrack not applied".to_string());
+                            app.needs_redraw = true;
+                        }
+                    }
                 }
             }
             ViewEvent::BacktrackCancel => {
@@ -2211,24 +2977,36 @@ pub(crate) async fn handle_view_events(
                 app.status_message = Some("Backtrack canceled".to_string());
                 app.needs_redraw = true;
             }
-            ViewEvent::ContextMenuSelected {
-                action: ContextMenuAction::ExecuteCommand { command },
-            } => {
-                if execute_command_input(
-                    terminal,
-                    app,
-                    engine_handle,
-                    task_manager,
-                    config,
-                    &mut *web_config_session,
-                    &command,
-                )
-                .await?
-                {
-                    return Ok(true);
+            ViewEvent::ContextMenuSelected { action } => {
+                match apply_context_menu_action(app, action) {
+                    ContextMenuOutcome::Done => {}
+                    ContextMenuOutcome::Events(events) => {
+                        if handle_view_events_boxed(
+                            terminal,
+                            app,
+                            config,
+                            task_manager,
+                            engine_handle,
+                            events,
+                        )
+                        .await?
+                        {
+                            return Ok(true);
+                        }
+                    }
+                    ContextMenuOutcome::OpenInEditor { path, line } => {
+                        open_file_in_editor(terminal, app, &path, line);
+                    }
                 }
             }
-            ViewEvent::ContextMenuSelected { action } => handle_context_menu_action(app, action),
+            ViewEvent::OpenContextMenu {
+                title,
+                entries,
+                column,
+                row,
+            } => {
+                push_context_menu(app, entries, column, row, title);
+            }
             ViewEvent::SkillMutationRequested { request } => {
                 handle_skill_mutation_requested(app, request).await;
             }
@@ -2262,7 +3040,6 @@ pub(crate) fn handle_view_events_boxed<'a>(
     config: &'a mut Config,
     task_manager: &'a SharedTaskManager,
     engine_handle: &'a mut EngineHandle,
-    web_config_session: &'a mut Option<WebConfigSession>,
     events: Vec<ViewEvent>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + 'a>> {
     Box::pin(async move {
@@ -2279,7 +3056,6 @@ pub(crate) fn handle_view_events_boxed<'a>(
                         config,
                         task_manager,
                         engine_handle,
-                        web_config_session,
                         key,
                         value,
                         persist,
@@ -2296,7 +3072,6 @@ pub(crate) fn handle_view_events_boxed<'a>(
                         config,
                         task_manager,
                         engine_handle,
-                        web_config_session,
                         theme,
                         persist,
                     )
@@ -2312,7 +3087,6 @@ pub(crate) fn handle_view_events_boxed<'a>(
                         config,
                         task_manager,
                         engine_handle,
-                        web_config_session,
                         vec![other],
                     ))
                     .await?
@@ -2324,4 +3098,23 @@ pub(crate) fn handle_view_events_boxed<'a>(
         }
         Ok(false)
     })
+}
+
+/// `/agents` → an agent, or "Go to agent" on its card. One agent, one
+/// destination: focus the worker so its full transcript owns the main area
+/// and the composer addresses its fork; the register modal closes so the
+/// focus is visible. A hidden approval card for this agent comes back on top
+/// of its transcript so the person can answer it (approvals C1).
+pub(super) fn open_agent_transcript(app: &mut App, config: &Config, agent_id: &str) {
+    if app.view_stack.top_kind() == Some(ModalKind::SubAgents) {
+        app.view_stack.pop();
+    }
+    crate::tui::agent_focus::focus_agent(app, agent_id);
+    crate::tui::pending_requests::repush_for_agent(
+        app,
+        agent_id,
+        config.approval_default_selection(),
+        config.approval_timeout(),
+    );
+    app.needs_redraw = true;
 }

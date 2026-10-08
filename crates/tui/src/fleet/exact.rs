@@ -52,10 +52,10 @@ use super::role::{
     NETWORK_DENIAL_SENTINEL, NETWORK_TOOL_DENYLIST, RAW_SHELL_SENTINEL, is_posture_denial,
     session_shell_ceiling,
 };
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::llm_client::LlmClient;
-use crate::models::Role;
-use crate::tui::app::ReasoningEffort;
+use crate::reasoning_preference::ReasoningEffort;
+use codewhale_models::Role;
 
 /// Where exact Fleet definitions and Reasoning Router profiles are looked up,
 /// labelled so an identity can be qualified (`workspace/glm-pair`) instead of
@@ -68,23 +68,288 @@ pub(crate) fn personal_fleet_definitions_dir() -> anyhow::Result<std::path::Path
     Ok(personal_fleet_root()?.join("fleets"))
 }
 
+/// The workspace has two origins. `workspace` is `<workspace>/.codewhale`, the
+/// directory the Fleet store saves workspace-scoped Fleets to, so a Fleet
+/// saved from the Fleet UI is found by name. `workspace_root` is the workspace
+/// directory itself, which keeps checked-in `fleets/<name>.toml` rosters
+/// loading as they always have.
 #[must_use]
 pub(crate) fn fleet_search_roots(workspace: &std::path::Path) -> Vec<FleetSearchRoot> {
     let mut roots = Vec::new();
     if let Ok(home) = personal_fleet_root() {
         roots.push(FleetSearchRoot::new("codewhale_home", home));
     }
-    roots.push(FleetSearchRoot::new("workspace", workspace.to_path_buf()));
+    roots.push(FleetSearchRoot::new(
+        "workspace",
+        workspace.join(".codewhale"),
+    ));
+    roots.push(FleetSearchRoot::new(
+        "workspace_root",
+        workspace.to_path_buf(),
+    ));
     roots
 }
 
 /// Load a Fleet document by (optionally qualified) name from the standard
 /// roots. Ambiguity between origins is surfaced, never resolved by shadowing.
+///
+/// Saved v2 Fleets (`schema = "fleet"`, from `.codewhale/fleets/` or
+/// `$CODEWHALE_HOME/fleets/`) are looked up first and frozen into an exact
+/// snapshot here — see [`freeze_saved_fleet`]. A miss falls through to the
+/// workflow crate's legacy/exact loader. A bare name that exists both as a v2
+/// Fleet and as a legacy/exact file is ambiguous: neither shadows the other,
+/// and the error names every path. v2 Fleets qualify as `user/<name>` and
+/// `folder/<name>` (the store's own scope labels); a search-root origin
+/// (`codewhale_home/`, `workspace/`, `workspace_root/`) reads that root's file
+/// in whichever form it is.
+///
+/// `config` is the session config the caller preflights with: inheriting
+/// members resolve against it at this point, immediately before the same
+/// config preflights the frozen routes, so a receipt names the route that ran.
+///
+/// Synchronous file loading: async callers must run this on the blocking pool.
 pub(crate) fn load_fleet_document(
     name: &str,
     workspace: &std::path::Path,
+    config: Option<&Config>,
 ) -> Result<(FleetDocument, QualifiedFleetId), NamedFleetError> {
-    FleetDocument::load_by_name(name, &fleet_search_roots(workspace))
+    use super::store::{self, FleetScope};
+
+    let roots = fleet_search_roots(workspace);
+    // Validates the bare name before any path below is built from it.
+    let (origin, bare) = codewhale_workflow::split_qualified_fleet_name(name)?;
+    let store_error = |error: store::FleetStoreError| match error {
+        store::FleetStoreError::NotFound(what) => NamedFleetError::NotFound(what),
+        store::FleetStoreError::Io { path, message } => NamedFleetError::Io { path, message },
+        store::FleetStoreError::Parse { path, message } => NamedFleetError::Parse { path, message },
+        other => NamedFleetError::Parse {
+            path: bare.to_string(),
+            message: other.to_string(),
+        },
+    };
+    let v2_scope = match origin.map(str::to_ascii_lowercase).as_deref() {
+        None => None,
+        Some("user" | "personal") => Some(FleetScope::Personal),
+        Some("folder") => Some(FleetScope::Workspace),
+        // Any other origin names a legacy/exact search root. A saved v2
+        // Fleet can live there too (the personal `fleets/` directory is
+        // shared), so the qualified file is read in whichever form it is.
+        Some(origin) => {
+            let saved = roots
+                .iter()
+                .find(|root| root.origin.eq_ignore_ascii_case(origin))
+                .map(|root| {
+                    root.root
+                        .join(store::FLEET_DIR)
+                        .join(format!("{bare}.toml"))
+                })
+                .filter(|path| store::declares_v2_schema(path));
+            let Some(path) = saved else {
+                return FleetDocument::load_by_name(name, &roots);
+            };
+            let (fleet, scope) = store::load_fleet_at(&path).map_err(store_error)?;
+            return freeze_saved_fleet(&fleet, scope, &path, config);
+        }
+    };
+
+    if let Some(scope) = v2_scope {
+        let (fleet, path) =
+            store::load_fleet_in_scope(bare, scope, workspace).map_err(store_error)?;
+        return freeze_saved_fleet(&fleet, scope, &path, config);
+    }
+
+    // Legacy/exact files under the same bare name, in any root. A v2 file in
+    // the shared personal directory is the store's, not a second Fleet.
+    let file_name = format!("{bare}.toml");
+    let other_forms: Vec<String> = roots
+        .iter()
+        .filter_map(|root| {
+            let path = root.root.join(store::FLEET_DIR).join(&file_name);
+            let schema = store::read_declared_schema(&path)?;
+            (schema.as_deref() != Some(store::FLEET_SCHEMA_KIND))
+                .then(|| format!("{}/{bare} ({})", root.origin, path.display()))
+        })
+        .collect();
+
+    let v2_candidates = store::v2_fleet_candidates(bare, workspace);
+    let v2_labels = || {
+        v2_candidates
+            .iter()
+            .map(|(scope, path)| format!("{}/{bare} ({})", scope.label(), path.display()))
+    };
+    if v2_candidates.len() > 1 || (!v2_candidates.is_empty() && !other_forms.is_empty()) {
+        return Err(NamedFleetError::AmbiguousFleet {
+            name: bare.to_string(),
+            origins: v2_labels().chain(other_forms).collect(),
+        });
+    }
+    match store::load_fleet(bare, workspace) {
+        Ok((fleet, scope, path)) => freeze_saved_fleet(&fleet, scope, &path, config),
+        Err(store::FleetStoreError::NotFound(_)) => FleetDocument::load_by_name(name, &roots),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+/// Freeze a saved v2 Fleet into an exact snapshot document.
+///
+/// Every executable member leaves here with one concrete provider/model and
+/// one concrete reasoning request: an explicit member pin wins, then the
+/// Fleet's operator route, then the live session route from `config`. The
+/// result is rendered as an exact document and parsed by the workflow crate's
+/// own exact parser, so it passes the same validation as a hand-written exact
+/// file, and the snapshot hash covers what was frozen. Editing the v2 file
+/// afterwards changes only the next Workflow.
+///
+/// Member `instructions` and `requires` are refused rather than dropped: the
+/// exact snapshot has no field for either, and a Workflow that silently ran a
+/// member without its instructions or capability requirement would not be the
+/// saved Fleet.
+fn freeze_saved_fleet(
+    fleet: &super::store::FleetFile,
+    scope: super::store::FleetScope,
+    path: &std::path::Path,
+    config: Option<&Config>,
+) -> Result<(FleetDocument, QualifiedFleetId), NamedFleetError> {
+    #[derive(serde::Serialize)]
+    struct FrozenFleet {
+        schema: &'static str,
+        schema_revision: u32,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        members: Vec<FrozenMember>,
+    }
+    #[derive(serde::Serialize)]
+    struct FrozenMember {
+        id: String,
+        role: String,
+        provider: String,
+        model: String,
+        reasoning: String,
+    }
+
+    let slug = fleet.file_slug();
+    let fail = |message: String| NamedFleetError::Parse {
+        path: path.display().to_string(),
+        message,
+    };
+    let operator = fleet.operator.as_ref();
+    // A saved Fleet stores reasoning in the session vocabulary (`xhigh`,
+    // `ultra`, `minimal`, ... — what an imported agent profile carries); the
+    // exact schema names tiers. Map through the same effort-to-tier table the
+    // preflight uses, keep an explicit `auto` as a Router request, and treat a
+    // blank value as absent (inherit), as the selected-Fleet path does.
+    let frozen_reasoning = |raw: Option<&str>| -> Result<Option<String>, String> {
+        let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let effort =
+            ReasoningEffort::parse_strict(value).map_err(|error| format!("reasoning: {error}"))?;
+        Ok(Some(
+            tier_of(effort)
+                .map_or("auto", ReasoningTier::as_str)
+                .to_string(),
+        ))
+    };
+    let session_route = config
+        .map(|config| {
+            config
+                .active_provider_identity()
+                .map(|identity| (identity.key.to_string(), config.default_model()))
+        })
+        .transpose()
+        .map_err(fail)?;
+    let session_reasoning = || {
+        let effort = config
+            .and_then(Config::reasoning_effort)
+            .map(ReasoningEffort::from_setting)
+            .unwrap_or_default();
+        // A session-level `auto` is per-turn adaptivity, not a Router
+        // request; a frozen member takes the concrete default tier instead.
+        tier_of(effort)
+            .unwrap_or(ReasoningTier::Max)
+            .as_str()
+            .to_string()
+    };
+
+    let mut unsupported = Vec::new();
+    let mut members = Vec::new();
+    for member in fleet.members.iter().filter(|member| !member.shortlist) {
+        let id = member.id.trim().to_string();
+        if member
+            .instructions
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        {
+            unsupported.push(format!("`{id}` has instructions"));
+        }
+        if !member.requires.is_empty() {
+            unsupported.push(format!("`{id}` has requires"));
+        }
+        let (provider, model) = match (&member.provider, &member.model, operator, &session_route) {
+            (Some(provider), Some(model), _, _) => (provider.clone(), model.clone()),
+            (None, None, Some(operator), _) => (operator.provider.clone(), operator.model.clone()),
+            (None, None, None, Some((provider, model))) => (provider.clone(), model.clone()),
+            (None, None, None, None) => {
+                return Err(fail(format!(
+                    "member `{id}` inherits the session route, but no session config is \
+                     available to resolve it"
+                )));
+            }
+            _ => {
+                return Err(fail(format!(
+                    "member `{id}` has a partial provider/model pin"
+                )));
+            }
+        };
+        let reasoning = match frozen_reasoning(member.reasoning.as_deref())
+            .map_err(|error| fail(format!("member `{id}` {error}")))?
+        {
+            Some(tier) => tier,
+            None => frozen_reasoning(operator.and_then(|operator| operator.reasoning.as_deref()))
+                .map_err(|error| fail(format!("operator {error}")))?
+                .unwrap_or_else(session_reasoning),
+        };
+        members.push(FrozenMember {
+            role: member.role_label().to_string(),
+            id,
+            provider,
+            model,
+            reasoning,
+        });
+    }
+    if !unsupported.is_empty() {
+        return Err(fail(format!(
+            "saved Fleet `{}` cannot run as a Workflow Fleet yet: {}. Workflow snapshots freeze \
+             each member's route and reasoning only; remove those fields or run the members \
+             with `agent`.",
+            fleet.name,
+            unsupported.join(", ")
+        )));
+    }
+
+    let frozen = FrozenFleet {
+        schema: codewhale_workflow::EXACT_FLEET_SCHEMA_KIND,
+        schema_revision: codewhale_workflow::EXACT_FLEET_SCHEMA_REVISION,
+        name: slug.clone(),
+        description: fleet.description.clone(),
+        members,
+    };
+    let text = toml::to_string(&frozen)
+        .map_err(|error| fail(format!("failed to freeze saved Fleet: {error}")))?;
+    let document = FleetDocument::from_frozen_saved_fleet(&text, path).map_err(|error| {
+        fail(format!(
+            "saved Fleet `{}` cannot run as a Workflow Fleet: {error}",
+            fleet.name
+        ))
+    })?;
+    Ok((
+        document,
+        QualifiedFleetId {
+            name: slug,
+            origin: scope.label().to_string(),
+        },
+    ))
 }
 
 // ── Preflight: freeze the route, and check it while freezing ─────────────────
@@ -100,7 +365,7 @@ pub(crate) fn load_fleet_document(
 /// provider-native adaptive for a route whose body does not say so.
 #[must_use]
 pub(crate) fn reasoning_capability_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
 ) -> ReasoningCapability {
@@ -204,7 +469,7 @@ fn tier_of(effort: ReasoningEffort) -> Option<ReasoningTier> {
 /// receipt describing each other.
 #[must_use]
 pub(crate) fn route_reasoning_setting(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
     tier: ReasoningTier,
@@ -249,22 +514,28 @@ pub(crate) fn preflight_route(
     let wire_model = crate::config::requested_model_for_provider(identity.provider, model.trim())
         .ok_or_else(|| PreflightError::ModelUnresolved {
         member: member_id.to_string(),
-        provider: identity.key.clone(),
+        provider: identity.key.to_string(),
         model: model.to_string(),
         detail: "not a known model for this provider".to_string(),
     })?;
     crate::config::validate_route(identity.provider, &wire_model).map_err(|detail| {
         PreflightError::ModelUnresolved {
             member: member_id.to_string(),
-            provider: identity.key.clone(),
+            provider: identity.key.to_string(),
             model: wire_model.clone(),
             detail,
         }
     })?;
 
     let mut scoped = config.clone();
-    scoped.scope_to_provider_identity(&identity);
-    let base_url = scoped.deepseek_base_url();
+    scoped
+        .scope_to_provider_identity(&identity)
+        .map_err(|detail| PreflightError::ProviderUnresolved {
+            member: member_id.to_string(),
+            provider: provider.to_string(),
+            detail,
+        })?;
+    let base_url = scoped.active_route_base_url();
 
     // Locally decided. A concrete loopback/self-hosted route is keyless by
     // design, and that is a valid, first-class state — not a downgrade and
@@ -273,7 +544,7 @@ pub(crate) fn preflight_route(
     let credential =
         if crate::config::provider_route_is_keyless_self_hosted(identity.provider, &base_url) {
             CredentialReadiness::KeylessLocal
-        } else if crate::config::has_api_key_for(&scoped, identity.provider) {
+        } else if crate::config::has_api_key_for(&scoped, &identity) {
             CredentialReadiness::Configured
         } else {
             // The discriminant only. `Missing { detail }` names the provider table
@@ -287,11 +558,11 @@ pub(crate) fn preflight_route(
 
     Ok(PreflightedRoute {
         member_id: member_id.to_string(),
-        provider_id: identity.key.clone(),
+        provider_id: identity.key.to_string(),
         provider_config_id: identity
             .migrated_legacy_ollama_cloud_route
             .then(|| provider.trim().to_string()),
-        provider_kind: if identity.provider == ApiProvider::OllamaCloud {
+        provider_kind: if identity.provider == ProviderKind::OllamaCloud {
             identity.provider.as_str().to_string()
         } else {
             format!("{:?}", identity.provider).to_ascii_lowercase()
@@ -319,8 +590,8 @@ pub(crate) fn preflight_route(
 fn validate_route_client(route: &PreflightedRoute, config: &Config) -> Result<(), String> {
     let mut scoped = config.clone();
     let identity = config.resolve_provider_identity(route.provider_config_id())?;
-    scoped.scope_to_provider_identity(&identity);
-    crate::client::DeepSeekClient::new(&scoped)
+    scoped.scope_to_provider_identity(&identity)?;
+    crate::client::CodewhaleClient::new(&scoped)
         .map(|_| ())
         .map_err(|error| {
             format!(
@@ -348,14 +619,14 @@ pub(crate) trait FleetRouterCaller: Send + Sync + std::fmt::Debug {
 /// A Reasoning Router bound to its own exact preflighted route.
 #[derive(Clone)]
 pub(crate) struct LiveFleetRouter {
-    client: crate::client::DeepSeekClient,
+    client: crate::client::CodewhaleClient,
     captured: CapturedReasoningRouter,
     route: PreflightedRoute,
     /// The Router route's provider kind and base URL, kept so the call's
     /// reasoning value can be shaped by the *actual* configured route rather
     /// than by a generic tier label. Never serialized — the base URL can carry
     /// a credential and receipts are durable.
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: String,
     /// What the Router call is actually made at, plus the four-sided disclosure
     /// for the receipt. Configured by the operator (`off` or `low`), normalized
@@ -407,10 +678,12 @@ impl LiveFleetRouter {
                 ),
             })?;
         let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
-        let base_url = scoped.deepseek_base_url();
+        scoped
+            .scope_to_provider_identity(&identity)
+            .map_err(|reason| RouterBindError { reason })?;
+        let base_url = scoped.active_route_base_url();
         let client =
-            crate::client::DeepSeekClient::new(&scoped).map_err(|error| RouterBindError {
+            crate::client::CodewhaleClient::new(&scoped).map_err(|error| RouterBindError {
                 reason: format!(
                     "reasoning router provider `{}` client could not be built: {error}",
                     route.provider_id
@@ -452,7 +725,7 @@ impl FleetRouterCaller for LiveFleetRouter {
     }
 
     async fn decide(&self, input: &RouterCallInput) -> Result<String, String> {
-        use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
+        use codewhale_models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
         // The bounded, redacted summary is transmitted exactly once, in the
         // user turn. The system prompt carries the contract and the frozen
@@ -495,10 +768,10 @@ impl FleetRouterCaller for LiveFleetRouter {
             .create_message(request)
             .await
             .map_err(|error| error.to_string())?;
-        if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+        if codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
             return Err(format!(
                 "reasoning router response incomplete: provider stop reason `{}`",
-                crate::models::stop_reason_detail(response.stop_reason.as_deref())
+                codewhale_models::stop_reason_detail(response.stop_reason.as_deref())
             ));
         }
         let text = response
@@ -523,8 +796,9 @@ impl FleetRouterCaller for LiveFleetRouter {
 ///
 /// The snapshot and the preflight are immutable for the life of the run:
 /// editing `fleets/<name>.toml` afterwards changes only the next Workflow.
-/// There is no run-scoped roster projection: durable runs bind members
-/// straight from the snapshot, and in-process spawns resolve roles only.
+/// Durable runs and in-process spawns bind the same frozen member. The
+/// in-process path projects only that member onto its existing profile binder;
+/// it does not read or replace the currently selected Fleet.
 #[derive(Clone)]
 pub(crate) struct ExactFleetWorkflow {
     snapshot: Arc<FleetSnapshot>,
@@ -541,6 +815,77 @@ impl std::fmt::Debug for ExactFleetWorkflow {
             .field("router", &self.router.is_some())
             .finish()
     }
+}
+
+/// Whether `tool` is removed by a deny entry (exact, case-insensitive, or a
+/// trailing-`*` prefix glob).
+fn tool_denied_by(tool: &str, denied: &[String]) -> bool {
+    denied.iter().any(|entry| match entry.strip_suffix('*') {
+        Some(prefix) => tool
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase()),
+        None => entry.eq_ignore_ascii_case(tool),
+    })
+}
+
+/// Refuse a task whose explicitly requested tools do not all survive the
+/// role ceiling and deny list (SHA-6734). The error names the requested
+/// tools, what the role allows, and what was dropped, so the caller can fix
+/// the request instead of launching a child that flounders without tools.
+fn refuse_dropped_requested_tools(
+    member_id: &str,
+    member_role: &str,
+    requested: &[String],
+    ceiling: &ChildAuthority,
+    authority: &ChildAuthority,
+) -> Result<(), String> {
+    let mut requested: Vec<String> = requested.to_vec();
+    requested.sort();
+    requested.dedup();
+    if requested.is_empty() {
+        // An explicit empty list is a deliberate tool-free child.
+        return Ok(());
+    }
+    let survives = |tool: &String| {
+        authority
+            .allowed_tools
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(tool))
+            && !tool_denied_by(tool, &authority.disallowed_tools)
+    };
+    let dropped: Vec<&String> = requested.iter().filter(|tool| !survives(tool)).collect();
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    let kept = requested.len() - dropped.len();
+    let role_allows = match ceiling.allowed_tools.as_ref() {
+        Some(allowed) if allowed.is_empty() => "no tools".to_string(),
+        Some(allowed) => format!("[{}]", allowed.join(", ")),
+        None if ceiling.disallowed_tools.is_empty() => "all inherited tools".to_string(),
+        None => format!(
+            "all inherited tools except [{}]",
+            ceiling.disallowed_tools.join(", ")
+        ),
+    };
+    let join = |tools: &[&String]| {
+        tools
+            .iter()
+            .map(|tool| tool.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let requested_refs: Vec<&String> = requested.iter().collect();
+    let headline = if kept == 0 {
+        format!("Agent '{member_id}' (role {member_role}) would start with no tools")
+    } else {
+        format!("Agent '{member_id}' (role {member_role}) would lose requested tools")
+    };
+    Err(format!(
+        "{headline}: requested [{}], role allows {role_allows}, dropped [{}]. Request only tools \
+         the role allows, or pick a member whose role carries them.",
+        join(&requested_refs),
+        join(&dropped),
+    ))
 }
 
 /// One member, resolved and admitted — but **not yet routed**.
@@ -567,6 +912,123 @@ pub(crate) struct ExactMemberBinding {
     /// concurrency slot, a router call); recomputing is what makes a stale or
     /// tampered authority detectable rather than merely improbable.
     pub(crate) session: PermissionCeiling,
+    /// Source layer captured with the snapshot, never refreshed at spawn.
+    profile_origin: super::roster::ProfileOrigin,
+    task_allowed_tools: Option<Vec<String>>,
+    task_disallowed_tools: Vec<String>,
+    task_worktree_write: bool,
+}
+
+impl ExactMemberBinding {
+    /// Task options may narrow the Runtime/parent envelope, never replace the
+    /// frozen identity or grant authority. Preserve the narrowing for the
+    /// independent launch-time recomputation and its durable fingerprint.
+    pub(crate) fn narrow_for_task(
+        &mut self,
+        write_authority: Option<&str>,
+        allowed_tools: Option<&[String]>,
+        disallowed_tools: &[String],
+        max_depth: Option<u32>,
+    ) -> Result<(), String> {
+        match write_authority {
+            Some("read_only") => self.session.write = false,
+            Some("workspace_write" | "worktree_write") if !self.authority.ceiling.write => {
+                return Err(format!(
+                    "member `{}` is read-only under its Runtime/parent ceiling; a task cannot request write authority via `write_authority`",
+                    self.member_id,
+                ));
+            }
+            Some("workspace_write") if self.task_worktree_write => {
+                return Err("a task cannot remove its worktree isolation".to_string());
+            }
+            Some("worktree_write") => self.task_worktree_write = true,
+            Some("workspace_write") | None => {}
+            Some(other) => return Err(format!("invalid task `write_authority` value `{other}`")),
+        }
+        if let Some(depth) = max_depth {
+            self.session.delegation_depth = self.session.delegation_depth.min(depth);
+        }
+        if let Some(tools) = allowed_tools {
+            let mut tools = tools.to_vec();
+            if let Some(previous) = self.task_allowed_tools.as_ref() {
+                tools.retain(|tool| previous.contains(tool));
+            }
+            tools.sort();
+            tools.dedup();
+            self.task_allowed_tools = Some(tools);
+        }
+        self.task_disallowed_tools
+            .extend_from_slice(disallowed_tools);
+        self.task_disallowed_tools.sort();
+        self.task_disallowed_tools.dedup();
+        let authority = self.recompute_authority(&self.member_role);
+        // SHA-6734: narrowing an explicit request against the role ceiling
+        // used to be silent and could start a child with no tools at all.
+        // Every tool the caller asked for by name must survive, or the spawn
+        // is refused with what was asked, allowed, and dropped.
+        if let Some(requested) = allowed_tools {
+            let ceiling = ChildAuthority::from_runtime_role(&self.member_role, self.session);
+            refuse_dropped_requested_tools(
+                &self.member_id,
+                &self.member_role,
+                requested,
+                &ceiling,
+                &authority,
+            )?;
+        }
+        self.authority = authority;
+        Ok(())
+    }
+
+    fn recompute_authority(&self, role: &str) -> ChildAuthority {
+        let mut authority = ChildAuthority::from_runtime_role(role, self.session);
+        if let Some(tools) = self.task_allowed_tools.as_ref() {
+            let mut tools = tools.clone();
+            if let Some(ceiling) = authority.allowed_tools.as_ref() {
+                tools.retain(|tool| ceiling.contains(tool));
+            }
+            authority.allowed_tools = Some(tools);
+        }
+        if !self.task_disallowed_tools.is_empty() {
+            authority
+                .disallowed_tools
+                .extend(self.task_disallowed_tools.iter().cloned());
+            authority.disallowed_tools.sort();
+            authority.disallowed_tools.dedup();
+        }
+        if authority.ceiling.write && self.task_worktree_write {
+            authority.write_authority = "worktree_write";
+        }
+        authority
+    }
+
+    /// Project one preflighted member into the existing profile binder. The
+    /// saved provider configuration key stays paired with the canonical wire
+    /// model (including compatibility-migrated provider identities).
+    pub(crate) fn spawn_profile(&self) -> super::profile::AgentProfile {
+        super::profile::AgentProfile {
+            native_preset: None,
+            id: self.member_id.clone(),
+            display_name: None,
+            description: None,
+            requires: Vec::new(),
+            profile: codewhale_config::FleetProfile {
+                slot: codewhale_config::FleetSlot::from_name(&self.member_role),
+                role: codewhale_config::FleetRole {
+                    name: self.member_role.clone(),
+                    ..Default::default()
+                },
+                provider: Some(self.route.provider_config_id().to_string()),
+                model: Some(self.route.wire_model.clone()),
+                ..Default::default()
+            },
+            // Snapshot identity is recorded on the Workflow receipt; profile
+            // application performs no source-file lookup.
+            source: std::path::PathBuf::new(),
+            origin: self.profile_origin,
+            plugin_authority: None,
+        }
+    }
 }
 
 /// What a launched exact member resolves to, after routing.
@@ -843,6 +1305,14 @@ impl ExactFleetWorkflow {
             requires_router: member.requested_reasoning.is_auto(),
             authority: ChildAuthority::from_runtime_role(&member.role, session),
             session,
+            profile_origin: match self.snapshot.fleet().origin.as_str() {
+                "workspace" => super::roster::ProfileOrigin::Workspace,
+                "codewhale_home" => super::roster::ProfileOrigin::Personal,
+                _ => super::roster::ProfileOrigin::Config,
+            },
+            task_allowed_tools: None,
+            task_disallowed_tools: Vec::new(),
+            task_worktree_write: false,
         })
     }
 
@@ -895,7 +1365,7 @@ impl ExactFleetWorkflow {
         // launch below is the value the spawn path consumes, so it must be the
         // recomputed one; the equality check is what turns a divergence into a
         // refused launch instead of a silently widened child.
-        let authority = ChildAuthority::from_runtime_role(&member.role, binding.session);
+        let authority = binding.recompute_authority(&member.role);
         if authority != binding.authority {
             return Err(format!(
                 "Fleet `{}`: member `{}` resolved a different permission envelope at launch than \
@@ -1765,8 +2235,17 @@ permissions = "read_only"
         }
     }
 
+    /// #5575: a free-form member role keeps its identity and **fails closed**.
+    ///
+    /// This test previously asserted the opposite — `posture_role == "custom"`
+    /// and `write_authority == "workspace_write"` — which is exactly the defect:
+    /// `audit-lead` is a name nobody declared, and the exact driver answered it
+    /// with the widest posture there is while the durable driver answered the
+    /// same class of name with `general`. Identity is still preserved verbatim
+    /// (`member_role`), but an undeclared label now buys the narrowest useful
+    /// posture, not write authority.
     #[test]
-    fn a_free_form_member_role_maps_to_runtime_custom_without_losing_identity() {
+    fn a_free_form_member_role_fails_closed_without_losing_identity() {
         const AUDIT_FLEET: &str = r#"
 name = "audit"
 schema = "exact"
@@ -1784,11 +2263,17 @@ permissions = "read_only"
             .expect("bind");
 
         assert_eq!(binding.member_role, "audit-lead");
-        assert_eq!(binding.authority.posture_role, "custom");
+        assert_eq!(binding.authority.posture_role, "explore");
         assert_eq!(
-            binding.authority.write_authority, "workspace_write",
-            "authority comes from Runtime custom under the session ceiling; \
-             the Fleet permissions block grants nothing"
+            binding.authority.write_authority, "read_only",
+            "an undeclared role name must never grant write authority; an \
+             operator who wants the parent's posture spells the role `custom`"
+        );
+
+        // The escape hatch is a declared role, not a typo.
+        assert_eq!(
+            ChildAuthority::from_runtime_role("custom", full_session()).write_authority,
+            "workspace_write"
         );
     }
 
@@ -1796,6 +2281,60 @@ permissions = "read_only"
 
     /// `tools = false` means zero model tools — an empty allowlist, which the
     /// child registry treats as "nothing is visible and nothing is callable".
+    #[test]
+    fn spawn_refuses_empty_effective_toolset() {
+        let authority = ChildAuthority::clamp(PermissionCeiling::ROUTER, full_session());
+        let err = refuse_dropped_requested_tools(
+            "router",
+            "advisor",
+            &["read_file".to_string(), "grep_files".to_string()],
+            &authority,
+            &authority,
+        )
+        .expect_err("a child that would start with no tools is refused");
+        assert!(
+            err.contains("Agent 'router' (role advisor) would start with no tools"),
+            "{err}"
+        );
+        assert!(err.contains("requested [grep_files, read_file]"), "{err}");
+        assert!(err.contains("role allows no tools"), "{err}");
+        // An explicit empty request stays a deliberate tool-free child.
+        refuse_dropped_requested_tools("router", "advisor", &[], &authority, &authority)
+            .expect("explicit empty toolset is allowed");
+    }
+
+    #[test]
+    fn spawn_error_names_dropped_tools() {
+        let workflow = workflow_with(None, GLM_FLEET);
+        let mut binding = workflow
+            .bind_member(None, Some("reviewer"), full_session())
+            .expect("role lookup");
+        let err = binding
+            .narrow_for_task(
+                None,
+                Some(&["read_file".to_string(), "exec_shell".to_string()]),
+                &[],
+                None,
+            )
+            .expect_err("a requested tool the role denies is refused");
+        assert!(err.contains("would lose requested tools"), "{err}");
+        assert!(err.contains("dropped [exec_shell]"), "{err}");
+        assert!(err.contains("requested [exec_shell, read_file]"), "{err}");
+        assert!(
+            err.contains("role allows all inherited tools except ["),
+            "{err}"
+        );
+
+        // Tools the role allows narrow cleanly.
+        binding
+            .narrow_for_task(None, Some(&["read_file".to_string()]), &[], None)
+            .expect("an allowed narrowing succeeds");
+        assert_eq!(
+            binding.authority.allowed_tools.as_deref(),
+            Some(&["read_file".to_string()] as &[String])
+        );
+    }
+
     #[test]
     fn tools_false_yields_an_empty_tool_surface() {
         let authority = ChildAuthority::clamp(PermissionCeiling::ROUTER, full_session());
@@ -2189,7 +2728,7 @@ permissions = "read_only"
     #[test]
     fn glm_routes_report_an_enabled_disabled_provider_control() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_2_MODEL,
         );
@@ -2214,7 +2753,7 @@ permissions = "read_only"
     #[test]
     fn a_route_that_varies_its_wire_value_reports_distinct_tiers() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4-pro",
         );
@@ -2229,7 +2768,7 @@ permissions = "read_only"
     #[test]
     fn a_deepseek_route_reports_low_as_low_and_medium_as_high() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4-pro",
         );
@@ -2282,7 +2821,7 @@ permissions = "read_only"
     #[test]
     fn a_route_that_collapses_low_onto_high_says_so_instead_of_reporting_low() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Siliconflow,
+            ProviderKind::Siliconflow,
             crate::config::DEFAULT_SILICONFLOW_BASE_URL,
             "deepseek-ai/DeepSeek-V4-Pro",
         );
@@ -2506,7 +3045,7 @@ call_reasoning = "low"
             .expect("legacy Cloud Router binds its source table and secret");
         assert_eq!(live.route.provider_id, "ollama-cloud");
         assert_eq!(live.route.provider_config_id.as_deref(), Some("ollama"));
-        assert_eq!(live.client.api_provider(), ApiProvider::OllamaCloud);
+        assert_eq!(live.client.api_provider(), ProviderKind::OllamaCloud);
         assert_eq!(
             live.client.base_url(),
             codewhale_config::provider::OLLAMA_CLOUD_BASE_URL
@@ -2529,7 +3068,7 @@ call_reasoning = "low"
         ] {
             assert_eq!(
                 route_reasoning_setting(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     crate::config::DEFAULT_DEEPSEEK_BASE_URL,
                     "deepseek-v4-pro",
                     tier,
@@ -2540,16 +3079,17 @@ call_reasoning = "low"
         }
 
         // Codex is the case a bare tier label gets wrong in both directions:
-        // it has no `off`, and its top tier is spelled `xhigh`.
+        // it has no `off`, and its ladder now spells three separate top rungs
+        // (`xhigh`, `max`, `ultra`) that the roster publishes per model.
         let codex = |tier| {
             route_reasoning_setting(
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 "https://chatgpt.com/backend-api/codex",
                 "gpt-5.6-codex",
                 tier,
             )
         };
-        assert_eq!(codex(ReasoningTier::Max), "xhigh");
+        assert_eq!(codex(ReasoningTier::Max), "max");
         assert_eq!(codex(ReasoningTier::Low), "low");
         assert_ne!(
             codex(ReasoningTier::Off),
@@ -2649,7 +3189,8 @@ call_reasoning = "low"
     /// A member's semantic role and its Runtime posture are separate
     /// facts and the receipt keeps both. An operator who named a member
     /// `auditor` must see `auditor` on the receipt, while the surface actually
-    /// selected (`custom`) is disclosed rather than substituted for the name.
+    /// selected (`explore`, the fail-closed posture an undeclared role gets
+    /// since #5575) is disclosed rather than substituted for the name.
     #[tokio::test]
     async fn a_receipt_records_the_posture_without_renaming_the_members_role() {
         const AUDIT_FLEET: &str = r#"
@@ -2671,7 +3212,7 @@ permissions = "read_only"
 
         // Enforcement uses the posture; it is not the operator's role name.
         assert_eq!(binding.member_role, "auditor");
-        assert_eq!(binding.authority.posture_role, "custom");
+        assert_eq!(binding.authority.posture_role, "explore");
 
         let launch = workflow
             .route_admitted_task(&binding, "review the queue")
@@ -2680,9 +3221,407 @@ permissions = "read_only"
         let receipt = &launch.receipt;
 
         assert_eq!(receipt.member_role, "auditor");
-        assert_eq!(receipt.posture_role.as_deref(), Some("custom"));
+        assert_eq!(receipt.posture_role.as_deref(), Some("explore"));
         let line = receipt.line();
         assert!(line.contains("(role auditor)"), "{line}");
-        assert!(line.contains("posture=custom"), "{line}");
+        assert!(line.contains("posture=explore"), "{line}");
+    }
+
+    // ── Search roots: where a workspace Fleet lives ────────────────────────
+
+    /// The Fleet store saves workspace Fleets under `<workspace>/.codewhale`,
+    /// so that is the primary `workspace` origin; the workspace root stays a
+    /// second origin for checked-in `fleets/<name>.toml` rosters.
+    #[test]
+    fn workspace_fleets_load_from_dot_codewhale_and_the_legacy_root() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::tempdir().expect("workspace");
+
+        let saved = ws.path().join(".codewhale").join("fleets");
+        std::fs::create_dir_all(&saved).expect("saved fleets dir");
+        std::fs::write(saved.join("glm-pair.toml"), GLM_FLEET).expect("write saved");
+        let (document, id) =
+            load_fleet_document("glm-pair", ws.path(), None).expect("saved fleet loads");
+        assert_eq!(document.name(), "glm-pair");
+        assert_eq!(id.origin, "workspace");
+
+        let checked_in = ws.path().join("fleets");
+        std::fs::create_dir_all(&checked_in).expect("checked-in fleets dir");
+        std::fs::write(
+            checked_in.join("stopship.toml"),
+            "name = \"stopship\"\n\n[roles]\nscout = \"scout\"\n",
+        )
+        .expect("write checked-in");
+        let (document, id) =
+            load_fleet_document("stopship", ws.path(), None).expect("checked-in fleet still loads");
+        assert_eq!(document.name(), "stopship");
+        assert_eq!(id.origin, "workspace_root");
+
+        // An exact Fleet in both workspace origins is ambiguous, and each
+        // origin can be named explicitly.
+        std::fs::write(checked_in.join("glm-pair.toml"), GLM_FLEET).expect("write twin");
+        assert!(matches!(
+            load_fleet_document("glm-pair", ws.path(), None),
+            Err(NamedFleetError::AmbiguousFleet { .. })
+        ));
+        let (_, id) =
+            load_fleet_document("workspace_root/glm-pair", ws.path(), None).expect("qualified");
+        assert_eq!(id.origin, "workspace_root");
+    }
+
+    #[test]
+    fn fleet_names_that_leave_the_fleets_directory_are_refused() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let outer = tempfile::tempdir().expect("outer");
+        let ws = outer.path().join("ws");
+        std::fs::create_dir_all(ws.join("fleets")).expect("fleets dir");
+        std::fs::write(outer.path().join("outside.toml"), GLM_FLEET).expect("outside");
+        let absolute = outer.path().join("outside");
+
+        for name in [
+            absolute.to_string_lossy().to_string(),
+            "workspace_root/../../outside".to_string(),
+            "codewhale_home/../outside".to_string(),
+            "user/../outside".to_string(),
+        ] {
+            let err = load_fleet_document(&name, &ws, None).expect_err(&name);
+            assert!(
+                matches!(err, NamedFleetError::InvalidName),
+                "{name}: expected InvalidName, got {err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                !message.contains(outer.path().to_string_lossy().as_ref()),
+                "{message}"
+            );
+        }
+    }
+
+    /// A Fleet saved through the store at workspace scope is found by the
+    /// Workflow loader instead of being reported missing. Today the store's
+    /// `schema = "fleet"` revision-2 document is not a schema the Workflow
+    /// loader parses, so the load names that exact file and its schema; if a
+    /// v2 bridge lands, the same call succeeds from the `workspace` origin.
+    #[test]
+    fn a_store_saved_workspace_fleet_is_found_by_load_fleet_document() {
+        use crate::fleet::store::{FleetFile, FleetScope, save_fleet};
+
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::tempdir().expect("workspace");
+
+        let fleet = FleetFile::new("Folder Pair".to_string(), None).expect("fleet");
+        let path = save_fleet(&fleet, FleetScope::Workspace, ws.path()).expect("save");
+
+        match load_fleet_document(&fleet.file_slug(), ws.path(), None) {
+            // A v2 bridge may label the store scope `folder` rather than the
+            // `workspace` search-root origin; either names this workspace.
+            Ok((_, id)) => assert!(
+                matches!(id.origin.as_str(), "workspace" | "folder"),
+                "{}",
+                id.origin
+            ),
+            Err(err) => {
+                assert!(
+                    !matches!(err, NamedFleetError::NotFound(_)),
+                    "the saved Fleet must be found, got {err}"
+                );
+                let message = err.to_string();
+                assert!(message.contains(&path.display().to_string()), "{message}");
+            }
+        }
+    }
+}
+
+/// `workflow(fleet:)` resolving saved v2 Fleets (store-first lookup, freeze
+/// into an exact snapshot, ambiguity against legacy/exact files).
+#[cfg(test)]
+mod saved_fleet_tests {
+    use super::*;
+    use crate::fleet::store::{FleetFile, FleetMember, FleetOperator, FleetScope, save_fleet};
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    fn member(id: &str, pin: Option<(&str, &str)>) -> FleetMember {
+        FleetMember {
+            id: id.to_string(),
+            display_name: None,
+            shortlist: false,
+            role: String::new(),
+            model: pin.map(|(_, model)| model.to_string()),
+            provider: pin.map(|(provider, _)| provider.to_string()),
+            reasoning: None,
+            instructions: None,
+            requires: Vec::new(),
+        }
+    }
+
+    fn fleet(name: &str, members: Vec<FleetMember>) -> FleetFile {
+        let mut fleet = FleetFile::new(name.to_string(), None).expect("fleet");
+        fleet.members = members;
+        fleet
+    }
+
+    fn zai_session() -> Config {
+        Config {
+            provider: Some("zai".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn session_ceiling() -> PermissionCeiling {
+        PermissionCeiling {
+            write: true,
+            network_tool: true,
+            shell: codewhale_workflow::ShellCeiling::Full,
+            delegation_depth: codewhale_config::DEFAULT_SPAWN_DEPTH,
+            tools: true,
+        }
+    }
+
+    #[test]
+    fn a_personal_saved_fleet_loads_as_a_frozen_exact_document() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::tempdir().expect("workspace");
+        let config = zai_session();
+        let saved = fleet(
+            "My fleet",
+            vec![
+                member("builder", Some(("zai", crate::config::ZAI_GLM_5_2_MODEL))),
+                member("reviewer", None),
+            ],
+        );
+        let path = save_fleet(&saved, FleetScope::Personal, ws.path()).expect("save");
+
+        let (document, id) =
+            load_fleet_document("My fleet", ws.path(), Some(&config)).expect("v2 loads");
+
+        assert_eq!(id.origin, "user");
+        assert_eq!(id.name, "my-fleet");
+        assert_eq!(document.source_path(), Some(path.as_path()));
+        let exact = document.exact().expect("frozen into the exact schema");
+        let builder = exact.member("builder").expect("builder");
+        assert_eq!(
+            (builder.provider.as_str(), builder.model.as_str()),
+            ("zai", crate::config::ZAI_GLM_5_2_MODEL)
+        );
+        // No pin and no operator: the member inherits the live session route
+        // and tier, resolved now rather than left open.
+        let reviewer = exact.member("reviewer").expect("reviewer");
+        assert_eq!(
+            reviewer.provider,
+            config.active_provider_identity().unwrap().key.as_str()
+        );
+        assert_eq!(reviewer.model, config.default_model());
+        assert_eq!(reviewer.reasoning.as_str(), "high");
+
+        // The slug also resolves, and so does the qualified store scope.
+        load_fleet_document("my-fleet", ws.path(), Some(&config)).expect("slug loads");
+        load_fleet_document("user/My fleet", ws.path(), Some(&config)).expect("user/ loads");
+    }
+
+    #[test]
+    fn a_workspace_saved_fleet_loads_and_members_follow_the_operator_route() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::tempdir().expect("workspace");
+        let mut saved = fleet("reviewers", vec![member("auditor", None)]);
+        saved.operator = Some(FleetOperator {
+            provider: "zai".to_string(),
+            model: crate::config::ZAI_GLM_5_2_MODEL.to_string(),
+            reasoning: Some("low".to_string()),
+        });
+        let path = save_fleet(&saved, FleetScope::Workspace, ws.path()).expect("save");
+        assert!(path.starts_with(ws.path().join(".codewhale").join("fleets")));
+
+        // No session config is needed: nothing inherits the session route.
+        let (document, id) = load_fleet_document("reviewers", ws.path(), None).expect("loads");
+        assert_eq!(id.origin, "folder");
+        let auditor = document.exact().unwrap().member("auditor").unwrap();
+        assert_eq!(auditor.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert_eq!(auditor.reasoning.as_str(), "low");
+    }
+
+    #[test]
+    fn a_saved_fleet_colliding_with_an_exact_file_is_ambiguous_and_names_both_paths() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::tempdir().expect("workspace");
+        let saved_path = save_fleet(
+            &fleet("glm-pair", vec![member("builder", None)]),
+            FleetScope::Personal,
+            ws.path(),
+        )
+        .expect("save");
+        let exact_dir = ws.path().join("fleets");
+        std::fs::create_dir_all(&exact_dir).unwrap();
+        let exact_path = exact_dir.join("glm-pair.toml");
+        std::fs::write(
+            &exact_path,
+            "name = \"glm-pair\"\nschema = \"exact\"\n\n[[members]]\nid = \"builder\"\nprovider = \"zai\"\nmodel = \"glm-5\"\n",
+        )
+        .unwrap();
+
+        let error = load_fleet_document("glm-pair", ws.path(), Some(&zai_session()))
+            .expect_err("a v2 and an exact Fleet of one name must not shadow each other");
+        let message = error.to_string();
+        assert!(
+            matches!(error, NamedFleetError::AmbiguousFleet { .. }),
+            "{message}"
+        );
+        assert!(
+            message.contains(&saved_path.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&exact_path.display().to_string()),
+            "{message}"
+        );
+
+        // Qualifying either side resolves it.
+        let (document, _) =
+            load_fleet_document("user/glm-pair", ws.path(), Some(&zai_session())).expect("v2");
+        assert_eq!(document.source_path(), Some(saved_path.as_path()));
+    }
+
+    /// Saved Fleets carry session-vocabulary reasoning (an imported agent
+    /// profile stores `ultra`, `xhigh`, `minimal`); freezing maps it onto an
+    /// exact tier instead of failing the exact parser, a blank value inherits,
+    /// and an unknown value is refused with the member named.
+    #[test]
+    fn saved_fleet_reasoning_in_session_vocabulary_freezes_to_exact_tiers() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::tempdir().expect("workspace");
+        let pin = Some(("zai", crate::config::ZAI_GLM_5_2_MODEL));
+        let mut ultra = member("ultra", pin);
+        ultra.reasoning = Some("ultra".to_string());
+        let mut minimal = member("minimal", pin);
+        minimal.reasoning = Some("minimal".to_string());
+        let mut blank = member("blank", pin);
+        blank.reasoning = Some("  ".to_string());
+        let mut saved = fleet("tiers", vec![ultra, minimal, blank]);
+        saved.operator = Some(FleetOperator {
+            provider: "zai".to_string(),
+            model: crate::config::ZAI_GLM_5_2_MODEL.to_string(),
+            reasoning: Some("xhigh".to_string()),
+        });
+        save_fleet(&saved, FleetScope::Workspace, ws.path()).expect("save");
+
+        let (document, _) = load_fleet_document("tiers", ws.path(), None).expect("freezes");
+        let exact = document.exact().expect("exact");
+        let tier = |id: &str| exact.member(id).expect(id).reasoning.as_str();
+        assert_eq!(tier("ultra"), "max");
+        assert_eq!(tier("minimal"), "low");
+        // Blank inherits the operator's `xhigh`, which is the `max` tier.
+        assert_eq!(tier("blank"), "max");
+
+        let mut bad = member("bad", pin);
+        bad.reasoning = Some("turbo".to_string());
+        save_fleet(
+            &fleet("bad-tier", vec![bad]),
+            FleetScope::Workspace,
+            ws.path(),
+        )
+        .expect("save");
+        let error = load_fleet_document("bad-tier", ws.path(), None).expect_err("refused");
+        assert!(
+            error.to_string().contains("member `bad` reasoning"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn member_instructions_are_refused_rather_than_silently_dropped() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::tempdir().expect("workspace");
+        let mut coach = member("coach", Some(("zai", crate::config::ZAI_GLM_5_2_MODEL)));
+        coach.instructions = Some("Always cite sources.".to_string());
+        save_fleet(
+            &fleet("coached", vec![coach]),
+            FleetScope::Workspace,
+            ws.path(),
+        )
+        .expect("save");
+
+        let error = load_fleet_document("coached", ws.path(), None).expect_err("refused");
+        assert!(
+            error.to_string().contains("`coach` has instructions"),
+            "{error}"
+        );
+    }
+
+    /// The frozen snapshot is what runs: editing the saved file after capture
+    /// moves nothing, and the inherited member's preflighted route is the same
+    /// session route the snapshot names.
+    #[test]
+    fn frozen_routes_survive_a_mid_run_edit_and_inherit_matches_preflight() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let _key = EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let ws = tempfile::tempdir().expect("workspace");
+        let config = zai_session();
+        let mut saved = fleet(
+            "release",
+            vec![
+                member("builder", Some(("zai", crate::config::ZAI_GLM_5_2_MODEL))),
+                member("reviewer", None),
+            ],
+        );
+        save_fleet(&saved, FleetScope::Workspace, ws.path()).expect("save");
+
+        let (document, id) =
+            load_fleet_document("release", ws.path(), Some(&config)).expect("loads");
+        let roots = fleet_search_roots(ws.path());
+        let workflow = ExactFleetWorkflow::capture(
+            &document,
+            id,
+            "2026-09-22T00:00:00Z",
+            Some(&config),
+            &roots,
+        )
+        .expect("capture");
+
+        // Edit the saved Fleet mid-run.
+        saved.members[0].model = Some("glm-4.6".to_string());
+        save_fleet(&saved, FleetScope::Workspace, ws.path()).expect("re-save");
+
+        let builder = workflow
+            .bind_member(Some("builder"), None, session_ceiling())
+            .expect("bind builder");
+        assert_eq!(builder.route.wire_model, crate::config::ZAI_GLM_5_2_MODEL);
+
+        let reviewer = workflow
+            .bind_member(Some("reviewer"), None, session_ceiling())
+            .expect("bind reviewer");
+        let frozen = workflow
+            .snapshot()
+            .members()
+            .iter()
+            .find(|member| member.id == "reviewer")
+            .expect("reviewer in snapshot");
+        assert_eq!(frozen.route.model, config.default_model());
+        assert_eq!(reviewer.route.frozen().model, reviewer.route.wire_model);
+        assert_eq!(
+            reviewer.route.wire_model,
+            crate::config::requested_model_for_provider(
+                config.active_provider_identity().unwrap().provider,
+                &config.default_model()
+            )
+            .expect("session model is a known route")
+        );
     }
 }

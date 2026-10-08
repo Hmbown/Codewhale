@@ -7,10 +7,12 @@
 //! with path validation to prevent escaping the workspace boundary.
 
 use super::diff_format::make_unified_diff;
+use super::rust_format::{NORMALIZED_NOTE, normalize_edit};
 use super::spec::{
     ApprovalRequirement, RichToolResult, ToolCapability, ToolContext, ToolError, ToolResult,
     ToolSpec, lsp_diagnostics_for_paths, optional_str, optional_u64, required_str,
 };
+use super::syntax_check::guard_edit;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -148,6 +150,33 @@ const fn alias(alias: &'static str, canonical: &'static str) -> ParamAlias {
 /// widespread enough in training data to be worth accepting everywhere.
 pub(super) const PATH_ALIASES: &[ParamAlias] =
     &[alias("file_path", "path"), alias("filePath", "path")];
+
+/// `input` with [`PATH_ALIASES`] folded onto `path`, exactly as the file
+/// tools' `execute` does before touching disk.
+///
+/// Policy gates (typed file rules, the workspace-write carve-out, repo law,
+/// Auto-Review) must judge the path the tool will act on. Reading only the
+/// raw `path` key misses accepted `file_path`/`filePath` spellings. A
+/// conflicting pair, which `execute` refuses, is returned unchanged.
+pub(crate) fn with_canonical_path_argument(input: &Value) -> Cow<'_, Value> {
+    if !PATH_ALIASES
+        .iter()
+        .any(|ParamAlias { alias, .. }| input.get(*alias).is_some())
+    {
+        return Cow::Borrowed(input);
+    }
+    let mut folded = input.clone();
+    match apply_param_aliases(&mut folded, PATH_ALIASES, "path") {
+        Ok(()) => Cow::Owned(folded),
+        Err(_) => Cow::Borrowed(input),
+    }
+}
+
+/// `path` and every spelling [`PATH_ALIASES`] folds onto it, for gates that
+/// deliberately over-collect candidate targets.
+pub(crate) fn path_argument_keys() -> impl Iterator<Item = &'static str> {
+    std::iter::once("path").chain(PATH_ALIASES.iter().map(|ParamAlias { alias, .. }| *alias))
+}
 
 /// Edit-specific spellings. Ordered most- to least-common.
 const EDIT_ALIASES: &[ParamAlias] = &[
@@ -419,13 +448,68 @@ fn is_config_or_backup(candidate: &Path, config_path: &Path) -> bool {
     candidate == config_path || candidate == backup_path
 }
 
-/// Return whether `read_file` must refuse a CodeWhale-owned credential file.
+/// Resolve a model-supplied path for an in-process read, applying every read
+/// guard in the one safe order: the deny-list on the caller's raw spelling
+/// (so a denial never names a symlink target), then `resolve_path`, then the
+/// credential-store check and the deny-list again on the resolved path.
 ///
-/// This is deliberately scoped to the active config, the two conventional
-/// config locations (including one-time backups), and CodeWhale's file-backed
-/// secret-store directories. Other dotfiles remain readable. Model-bound
-/// redaction is still required because shell tools can read these files and
-/// arbitrary commands can print credentials without reading a file at all.
+/// Every tool that reads a file's content in-process and hands it (or a
+/// derivative) to the model goes through this.
+pub(crate) fn resolve_guarded_read_path(
+    context: &ToolContext,
+    raw: &str,
+    tool: &str,
+) -> Result<PathBuf, ToolError> {
+    enforce_read_denylist(Path::new(raw), tool)?;
+    let path = context.resolve_path(raw)?;
+    if is_codewhale_credential_path(&path) {
+        return Err(ToolError::permission_denied(format!(
+            "{tool} cannot expose Codewhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection"
+        )));
+    }
+    enforce_read_denylist(&path, tool)?;
+    Ok(path)
+}
+
+/// Workspace-escape fallback for the read-only image tools (`read`,
+/// `read_media`): admit `raw` only when it is exactly an image the user
+/// attached in this session's prompts. See
+/// [`crate::image_attach::resolve_user_attached_image`] for the admission
+/// rule; the credential and deny-list guards still apply here. `Ok(None)`
+/// means "not admitted" and the caller keeps its original refusal.
+///
+/// Known limit: a path the user mentioned only in prose, never attached, is
+/// not admitted; `/trust add` remains the way to open a directory.
+pub(crate) async fn user_attached_image_read_path(
+    context: &ToolContext,
+    raw: &str,
+    tool: &str,
+) -> Result<Option<PathBuf>, ToolError> {
+    let Some(snapshot) = context.session_objects.as_ref() else {
+        return Ok(None);
+    };
+    let references = crate::image_attach::user_attached_image_references(&snapshot.messages);
+    if references.is_empty() {
+        return Ok(None);
+    }
+    let raw_owned = raw.to_string();
+    let admitted = tokio::task::spawn_blocking(move || {
+        crate::image_attach::resolve_user_attached_image(&references, &raw_owned)
+    })
+    .await
+    .map_err(|error| ToolError::execution_failed(format!("Failed to resolve {raw}: {error}")))?;
+    let Some(path) = admitted else {
+        return Ok(None);
+    };
+    if is_codewhale_credential_path(&path) {
+        return Err(ToolError::permission_denied(format!(
+            "{tool} cannot expose Codewhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection"
+        )));
+    }
+    enforce_read_denylist(&path, tool)?;
+    Ok(Some(path))
+}
+
 /// Refuse a read the sandbox read deny-list blocks (S1).
 ///
 /// `read_file`, `read`, and `read_media` all run *in-process*: they call
@@ -435,9 +519,26 @@ fn is_config_or_backup(candidate: &Path, config_path: &Path) -> bool {
 /// result, which would read as "the file is empty" and invite the model to
 /// probe siblings.
 pub(crate) fn enforce_read_denylist(path: &Path, tool: &str) -> Result<(), ToolError> {
-    match crate::sandbox::read_guard::active().check(path) {
+    // Expand the user's home before authorization, retaining the spelling they
+    // supplied in every denial. This shares the file tools' path resolution;
+    // expansion grants no additional access and never exposes a symlink target.
+    let home_path = path
+        .to_str()
+        .map(super::spec::resolve_home_path)
+        .transpose()?
+        .flatten();
+    if home_path
+        .as_deref()
+        .is_some_and(is_codewhale_credential_path)
+    {
+        return Err(ToolError::permission_denied(format!(
+            "{tool} cannot expose Codewhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection"
+        )));
+    }
+    match crate::sandbox::read_guard::active().check(home_path.as_deref().unwrap_or(path)) {
         Ok(()) => Ok(()),
-        Err(denial) => {
+        Err(mut denial) => {
+            denial.requested = path.to_path_buf();
             let message = denial.message(tool);
             tracing::warn!(
                 target: "codewhale::sandbox::read_guard",
@@ -451,6 +552,13 @@ pub(crate) fn enforce_read_denylist(path: &Path, tool: &str) -> Result<(), ToolE
     }
 }
 
+/// Return whether `read_file` must refuse a CodeWhale-owned credential file.
+///
+/// This is deliberately scoped to the active config, the two conventional
+/// config locations (including one-time backups), and CodeWhale's file-backed
+/// secret-store directories. Other dotfiles remain readable. Model-bound
+/// redaction is still required because shell tools can read these files and
+/// arbitrary commands can print credentials without reading a file at all.
 pub(crate) fn is_codewhale_credential_path(path: &Path) -> bool {
     let candidate = canonical_path_for_credential_guard(path);
 
@@ -460,11 +568,21 @@ pub(crate) fn is_codewhale_credential_path(path: &Path) -> bool {
         return true;
     }
 
-    let roots = [
-        codewhale_config::codewhale_home(),
-        codewhale_config::legacy_deepseek_home(),
-    ];
-    for root in roots.into_iter().flatten() {
+    // `CODEWHALE_HOME` relocates the *runtime* home; it is not a licence to read
+    // the user's real `~/.codewhale/config.toml`. `codewhale_home()` returns the
+    // override when one is set, so relying on it alone left the ambient store
+    // unguarded whenever that variable pointed elsewhere. Keep the ambient root
+    // in the set alongside the override, mirroring the deliberately
+    // unconditional `~/.codewhale/secrets` entry in `sandbox::read_guard`
+    // (read_guard.rs:481-487). `legacy_deepseek_home()` is already ambient by
+    // construction (paths/src/lib.rs:183-185), so it needs no counterpart.
+    let mut roots: Vec<PathBuf> = Vec::with_capacity(3);
+    roots.extend(codewhale_config::codewhale_home().ok());
+    roots.extend(codewhale_config::legacy_deepseek_home().ok());
+    roots.extend(
+        codewhale_paths::user_home().map(|home| home.join(codewhale_config::CODEWHALE_APP_DIR)),
+    );
+    for root in roots {
         if is_config_or_backup(&candidate, &root.join(codewhale_config::CONFIG_FILE_NAME)) {
             return true;
         }
@@ -480,20 +598,138 @@ pub(crate) fn is_codewhale_credential_path(path: &Path) -> bool {
 
 // === small-contract-compatible primitive implementation helpers ===
 
-const READ_MAX_LINES: usize = 2_000;
-const READ_MAX_BYTES: usize = 50 * 1024;
+/// Default model-visible byte budget for one `read` call.
+///
+/// Bytes are the *only* default bound: there is no line cap, so an ordinary
+/// source or prose file comes back whole in one call instead of being paged
+/// at some arbitrary line count with most of the budget unspent.
+const READ_DEFAULT_MAX_BYTES: usize = 100_000;
+/// Hard ceiling on a budget the *model* asks for with `max_bytes`. A larger
+/// request clamps down to this; it is never an error.
+const READ_REQUEST_MAX_BYTES: usize = 500_000;
+/// Outer bound on the operator's process-wide `[workshop] read_result_max_bytes`
+/// override, and therefore on any read result.
 const READ_RESULT_ABSOLUTE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
-fn effective_read_max_bytes() -> usize {
-    crate::tools::large_output_router::WorkshopConfig::active_read_result_max_bytes()
-        .map(|n| n.clamp(READ_MAX_BYTES, READ_RESULT_ABSOLUTE_MAX_BYTES))
-        .unwrap_or(READ_MAX_BYTES)
+/// Whole-source processing bound, independent of the model-visible read budget.
+/// The lowercase primitives accept only regular, single-link files. Hidden
+/// compatibility readers and PDF extraction keep their existing contracts.
+const CONTRACT_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn check_contract_file_size(size: usize) -> Result<(), ToolError> {
+    if size > CONTRACT_FILE_MAX_BYTES {
+        return Err(ToolError::execution_failed(
+            "File content exceeds the supported 16 MiB processing cap. Split or export a smaller file, or use an appropriate separately authorized tool.",
+        ));
+    }
+    Ok(())
 }
 
-fn effective_read_max_lines() -> usize {
-    match crate::tools::large_output_router::WorkshopConfig::active_read_result_max_bytes() {
-        Some(bytes) if bytes > READ_MAX_BYTES => (bytes / 80).clamp(READ_MAX_LINES, 20_000),
-        _ => READ_MAX_LINES,
+fn check_contract_cancelled(token: Option<&CancellationToken>) -> Result<(), ToolError> {
+    if token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolError::cancelled("Operation aborted"));
+    }
+    Ok(())
+}
+
+/// Read at most cap+1 actual bytes, including files that grow after metadata.
+/// Cancellation is polled between bounded reads; it cannot interrupt an OS
+/// syscall already in progress. This worker never mutates the file.
+pub(super) fn read_contract_source(
+    reader: &mut impl std::io::Read,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<u8>, ToolError> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        check_contract_cancelled(cancel)?;
+        let remaining = CONTRACT_FILE_MAX_BYTES + 1 - bytes.len();
+        let read_len = remaining.min(chunk.len());
+        let count = match reader.read(&mut chunk[..read_len]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "Failed to read file: {error}"
+                )));
+            }
+        };
+        check_contract_cancelled(cancel)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        check_contract_file_size(bytes.len())?;
+    }
+}
+
+async fn load_contract_source(
+    path: &Path,
+    writable: bool,
+    context: &ToolContext,
+) -> Result<Option<Vec<u8>>, ToolError> {
+    check_file_operation_cancelled(context)?;
+    let path = path.to_path_buf();
+    let cancel = context.cancel_token.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        check_contract_cancelled(cancel.as_ref())?;
+        let open_error = |error| {
+            if writable {
+                ToolError::execution_failed(format!(
+                    "Could not edit file {}: target must be readable and writable ({error})",
+                    path.display()
+                ))
+            } else {
+                ToolError::execution_failed(format!("Failed to read {}: {error}", path.display()))
+            }
+        };
+        let Some(mut file) = crate::plugins::registry::open_existing_regular_file(&path, writable)
+            .map_err(open_error)?
+        else {
+            return Ok(None);
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| open_error(error.to_string()))?;
+        if metadata.len() > CONTRACT_FILE_MAX_BYTES as u64 {
+            check_contract_file_size(CONTRACT_FILE_MAX_BYTES + 1)?;
+        }
+        read_contract_source(&mut file, cancel.as_ref()).map(Some)
+    });
+    let result = if let Some(cancel) = context.cancel_token.as_ref() {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(ToolError::cancelled("Operation aborted")),
+            result = &mut worker => result,
+        }
+    } else {
+        worker.await
+    };
+    result.map_err(|error| ToolError::execution_failed(format!("File read task: {error}")))?
+}
+
+/// Resolve the byte budget for one `read` call from the three layers that can
+/// set it, highest wins:
+///
+/// 1. **The model's own request** — `max_bytes` on this call, clamped to
+///    [`READ_REQUEST_MAX_BYTES`] (500 000).
+/// 2. **The operator's process-wide override** — `[workshop]
+///    read_result_max_bytes`, clamped into
+///    `[READ_DEFAULT_MAX_BYTES, READ_RESULT_ABSOLUTE_MAX_BYTES]` (2 MiB).
+/// 3. **The default** — [`READ_DEFAULT_MAX_BYTES`] (100 000).
+///
+/// The result is `max(1, 2-or-3)`. Both raising layers can only raise: a model
+/// request never shrinks a budget the operator widened, and an operator who
+/// widened it process-wide keeps that floor when the model asks for less.
+fn effective_read_max_bytes(requested: Option<usize>) -> usize {
+    let baseline =
+        crate::tools::large_output_router::WorkshopConfig::active_read_result_max_bytes()
+            .map_or(READ_DEFAULT_MAX_BYTES, |configured| {
+                configured.clamp(READ_DEFAULT_MAX_BYTES, READ_RESULT_ABSOLUTE_MAX_BYTES)
+            });
+    match requested {
+        Some(requested) => baseline.max(requested.min(READ_REQUEST_MAX_BYTES)),
+        None => baseline,
     }
 }
 
@@ -535,23 +771,48 @@ async fn acquire_file_mutation(
     }
 }
 
-fn check_file_operation_cancelled(context: &ToolContext) -> Result<(), ToolError> {
-    if context
-        .cancel_token
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        return Err(ToolError::cancelled("Operation aborted"));
-    }
+/// Atomic workspace write on the blocking pool: temp create plus fsync plus
+/// rename (and a retry loop on Windows) must not park a Tokio worker
+/// (blocking-call convention, #6149). Error shape matches the historical
+/// inline call.
+async fn run_blocking_write_atomic(path: &Path, contents: Vec<u8>) -> Result<(), ToolError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::utils::write_atomic_workspace(&path, &contents).map_err(|e| {
+            ToolError::execution_failed(format!("Failed to write {}: {e}", path.display()))
+        })
+    })
+    .await
+    .map_err(|e| ToolError::execution_failed(format!("File write task: {e}")))??;
     Ok(())
 }
 
+fn check_file_operation_cancelled(context: &ToolContext) -> Result<(), ToolError> {
+    check_contract_cancelled(context.cancel_token.as_ref())
+}
+
+/// One `mutation.files[]` receipt entry. `size` and `sha256` describe the
+/// exact bytes this call wrote, recorded where they were written so a turn's
+/// artifact reference never has to re-read (and race) the disk. `sha256` is
+/// plain lowercase hex: the same value `GET /v1/workspace/files/read` reports
+/// as `revision`.
+pub(crate) fn mutation_file_entry(path: &str, outcome: &str, written: Option<&[u8]>) -> Value {
+    let mut entry = json!({ "path": path, "outcome": outcome });
+    if let Some(bytes) = written {
+        entry["size"] = json!(bytes.len());
+        entry["sha256"] = json!(crate::hashing::sha256_hex(bytes));
+    }
+    entry
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn contract_mutation_result(
     context: &ToolContext,
     file_path: &Path,
     requested_path: &str,
     before: &str,
     after: &str,
+    written: &[u8],
     outcome: &str,
     summary: String,
 ) -> ToolResult {
@@ -562,7 +823,7 @@ async fn contract_mutation_result(
         "lsp_diagnostics": diagnostics,
         "mutation": {
             "diff": make_unified_diff(requested_path, before, after),
-            "files": [{ "path": requested_path, "outcome": outcome }],
+            "files": [mutation_file_entry(requested_path, outcome, Some(written))],
             "renames": []
         }
     }))
@@ -586,12 +847,11 @@ fn reject_primitive_unknown(input: &Value, tool: &str, allowed: &[&str]) -> Resu
     )))
 }
 
-fn contract_line_number(input: &Value, key: &str) -> Result<Option<usize>, ToolError> {
+fn contract_nonnegative_int(input: &Value, key: &str) -> Result<Option<usize>, ToolError> {
     let Some(value) = input.get(key) else {
         return Ok(None);
     };
-    let number = value
-        .as_u64()
+    let number = codewhale_tools::json_nonnegative_integer(value)
         .ok_or_else(|| ToolError::invalid_input(format!("{key} must be a non-negative integer")))?;
     usize::try_from(number)
         .map(Some)
@@ -617,63 +877,52 @@ fn contract_format_size(bytes: usize) -> String {
 struct ContractReadWindow {
     content: String,
     shown_lines: usize,
-    truncated_by_bytes: bool,
-    truncated_by_lines: bool,
+    truncated: bool,
     first_line_too_large: bool,
 }
 
-/// Retain only complete lines from the head, stopping at its own independent
-/// line and UTF-8 byte budgets. A terminal newline is content but does not add
-/// a phantom line to the truncation counter.
-fn contract_read_window(content: &str) -> ContractReadWindow {
-    let mut lines = if content.is_empty() {
-        Vec::new()
-    } else {
-        content.split('\n').collect::<Vec<_>>()
-    };
-    if content.ends_with('\n') {
-        let _ = lines.pop();
-    }
-    let max_bytes = effective_read_max_bytes();
-    let max_lines = effective_read_max_lines();
-    if lines.first().is_some_and(|line| line.len() > max_bytes) {
+/// Retain only complete lines from the head, stopping at `max_bytes`. A
+/// terminal newline is content but does not add a phantom line to the
+/// truncation counter.
+///
+/// The byte budget is the single bound. There is no line cap to fragment a
+/// file that fits: every retained line costs at least its own newline, so
+/// `max_bytes` already bounds the line count as well.
+fn contract_read_window(content: &str, max_bytes: usize) -> ContractReadWindow {
+    if content
+        .split('\n')
+        .next()
+        .is_some_and(|line| line.len() > max_bytes)
+    {
         return ContractReadWindow {
             content: String::new(),
             shown_lines: 0,
-            truncated_by_bytes: true,
-            truncated_by_lines: false,
+            truncated: true,
             first_line_too_large: true,
         };
     }
-
-    if lines.len() <= max_lines && content.len() <= max_bytes {
+    if content.len() <= max_bytes {
         return ContractReadWindow {
             content: content.to_string(),
-            shown_lines: lines.len(),
-            truncated_by_bytes: false,
-            truncated_by_lines: false,
+            shown_lines: content.split_terminator('\n').count(),
+            truncated: false,
             first_line_too_large: false,
         };
     }
-
-    let mut kept = Vec::new();
+    let mut shown_lines = 0;
     let mut bytes = 0usize;
-    let mut truncated_by_bytes = false;
-    for line in lines.iter().take(max_lines) {
-        let next = line.len() + usize::from(!kept.is_empty());
+    for line in content.split_terminator('\n') {
+        let next = line.len() + usize::from(shown_lines > 0);
         if bytes.saturating_add(next) > max_bytes {
-            truncated_by_bytes = true;
             break;
         }
-        kept.push(*line);
+        shown_lines += 1;
         bytes += next;
     }
-    let shown_lines = kept.len();
     ContractReadWindow {
-        content: kept.join("\n"),
+        content: content[..bytes].to_string(),
         shown_lines,
-        truncated_by_bytes,
-        truncated_by_lines: !truncated_by_bytes,
+        truncated: true,
         first_line_too_large: false,
     }
 }
@@ -688,10 +937,11 @@ impl ReadFileTool {
         input: Value,
         context: &ToolContext,
     ) -> Result<RichToolResult, ToolError> {
-        reject_primitive_unknown(&input, "read", &["path", "offset", "limit"])?;
+        reject_primitive_unknown(&input, "read", &["path", "offset", "limit", "max_bytes"])?;
         let path_str = required_str(&input, "path")?;
-        let offset = contract_line_number(&input, "offset")?;
-        let limit = contract_line_number(&input, "limit")?;
+        let offset = contract_nonnegative_int(&input, "offset")?;
+        let limit = contract_nonnegative_int(&input, "limit")?;
+        let max_bytes = effective_read_max_bytes(contract_nonnegative_int(&input, "max_bytes")?);
         // S1/F2: check the caller's own spelling BEFORE `resolve_path`
         // canonicalizes it. A workspace symlink `notes.txt` -> a denied vault
         // file resolves to the secret's absolute location, and a denial raised
@@ -701,21 +951,39 @@ impl ReadFileTool {
         // raw spelling still matches by its target; the resolved check after
         // `resolve_path` stays as defense in depth for callers whose process
         // cwd is not the workspace.
-        enforce_read_denylist(Path::new(path_str), "read")?;
-        let file_path = context.resolve_path(path_str)?;
-        if is_codewhale_credential_path(&file_path) {
-            return Err(ToolError::permission_denied(
-                "read cannot expose Codewhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection",
-            ));
-        }
-        enforce_read_denylist(&file_path, "read")?;
+        let file_path = match resolve_guarded_read_path(context, path_str, "read") {
+            Ok(path) => path,
+            Err(error @ ToolError::PathEscape { .. }) => {
+                user_attached_image_read_path(context, path_str, "read")
+                    .await?
+                    .ok_or(error)?
+            }
+            Err(error) => return Err(error),
+        };
         check_file_operation_cancelled(context)?;
-        let bytes = fs::read(&file_path).map_err(|error| {
-            ToolError::execution_failed(format!("Failed to read {}: {error}", file_path.display()))
-        })?;
+        let bytes = load_contract_source(&file_path, false, context)
+            .await?
+            .ok_or_else(|| {
+                ToolError::execution_failed(format!(
+                    "Failed to read {}: file not found",
+                    file_path.display()
+                ))
+            })?;
+        // #6283: every read response carries the file's byte size, line
+        // count, and truncation flag so the caller can page deliberately
+        // instead of discovering a huge file one window at a time.
+        let size_bytes = bytes.len();
         check_file_operation_cancelled(context)?;
         if let Some(mime_type) = primitive_image_mime(&bytes) {
-            let prepared = crate::image_attach::prepare_tool_image_bytes(&bytes, mime_type);
+            // Decoding and any downscale are CPU-bound; keep them off the
+            // runtime worker (#6149).
+            let prepared = tokio::task::spawn_blocking(move || {
+                crate::image_attach::prepare_tool_image_bytes(&bytes, mime_type)
+            })
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!("Failed to prepare image: {error}"))
+            })?;
             context.note_file_read(&file_path);
             return Ok(RichToolResult::with_content_blocks(
                 ToolResult::success(prepared.note).with_metadata(json!({
@@ -728,57 +996,81 @@ impl ReadFileTool {
         // The small-contract reader decodes non-image buffers as UTF-8 text with replacement
         // characters instead of refusing the whole read on one invalid byte.
         let text = String::from_utf8_lossy(&bytes);
-        let all_lines = text.split('\n').collect::<Vec<_>>();
+        // Count and select with byte boundaries, without a pointer per newline.
+        let line_count = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
         let requested_offset = offset.unwrap_or(1);
         let start = requested_offset.saturating_sub(1);
-        if start >= all_lines.len() {
+        if start >= line_count {
             return Err(ToolError::execution_failed(format!(
-                "Offset {requested_offset} is beyond end of file ({} lines total)",
-                all_lines.len()
+                "Offset {requested_offset} is beyond end of file ({line_count} lines total)"
             )));
         }
-
-        let available = &all_lines[start..];
-        let selected = match limit {
-            Some(limit) => &available[..available.len().min(limit)],
-            None => available,
+        let start_byte = if start == 0 {
+            0
+        } else {
+            text.match_indices('\n')
+                .nth(start - 1)
+                .expect("line count validated offset")
+                .0
+                + 1
         };
-        let selected_content = selected.join("\n");
-        let window = contract_read_window(&selected_content);
+        let selected_lines = limit.unwrap_or(usize::MAX).min(line_count - start);
+        let end_byte = if selected_lines == 0 {
+            start_byte
+        } else {
+            text[start_byte..]
+                .match_indices('\n')
+                .nth(selected_lines - 1)
+                .map_or(text.len(), |(index, _)| start_byte + index)
+        };
+        let selected_content = &text[start_byte..end_byte];
+        let window = contract_read_window(selected_content, max_bytes);
+        // Truncated means the file holds more than this response shows:
+        // either the byte budget cut the window, or a bounded range stopped
+        // before EOF. A whole file that fits is never truncated.
+        let truncated = window.truncated || limit.is_some() && start + selected_lines < line_count;
         let first_display = start + 1;
         let mut output = if window.first_line_too_large {
-            let size = selected.first().map_or(0, |line| line.len());
+            let size = selected_content.split('\n').next().map_or(0, str::len);
             format!(
-                "[Line {first_display} is {}, exceeds {} limit. Use bash: sed -n '{first_display}p' {path_str} | head -c {READ_MAX_BYTES}]",
-                contract_format_size(size),
-                contract_format_size(READ_MAX_BYTES)
+                "[Line {first_display} is {}, exceeds the {max_bytes}-byte output budget for this call. Use bash: sed -n '{first_display}p' {path_str} | head -c {max_bytes}]",
+                contract_format_size(size)
             )
         } else {
             window.content
         };
 
-        if !window.first_line_too_large && (window.truncated_by_bytes || window.truncated_by_lines)
-        {
+        if !window.first_line_too_large && window.truncated {
             let last_display = first_display + window.shown_lines.saturating_sub(1);
             let next_offset = last_display + 1;
-            if window.truncated_by_bytes {
-                output.push_str(&format!(
-                    "\n\n[Showing lines {first_display}-{last_display} of {} (50KB limit). Use offset={next_offset} to continue.]",
-                    all_lines.len()
-                ));
-            } else {
-                output.push_str(&format!(
-                    "\n\n[Showing lines {first_display}-{last_display} of {}. Use offset={next_offset} to continue.]",
-                    all_lines.len()
-                ));
+            // Continuation must be exact: name the next offset, and when the
+            // caller asked for a bounded range, the part of that range still
+            // unread. `max_bytes` is only offered while it can still go up.
+            let mut hint = format!("offset={next_offset}");
+            if let Some(limit) = limit {
+                let remaining = limit.saturating_sub(window.shown_lines);
+                if remaining > 0 {
+                    hint.push_str(&format!(" limit={remaining}"));
+                }
             }
+            let raise = if max_bytes < READ_REQUEST_MAX_BYTES {
+                format!(", or max_bytes up to {READ_REQUEST_MAX_BYTES} to read more per call")
+            } else {
+                String::new()
+            };
+            output.push_str(&format!(
+                "\n\n[Showing lines {first_display}-{last_display} of {} ({} total, {max_bytes}-byte output budget). Use {hint} to continue{raise}.]",
+                line_count,
+                contract_format_size(size_bytes)
+            ));
         } else if limit.is_some() {
-            let consumed = selected.len();
-            if start + consumed < all_lines.len() {
-                let remaining = all_lines.len() - (start + consumed);
+            let consumed = selected_lines;
+            if start + consumed < line_count {
+                let remaining = line_count - (start + consumed);
                 let next_offset = start + consumed + 1;
                 output.push_str(&format!(
-                    "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
+                    "\n\n[{remaining} more lines in file ({} total). Use offset={next_offset} to continue.]",
+                    contract_format_size(size_bytes)
                 ));
             }
         }
@@ -789,7 +1081,17 @@ impl ReadFileTool {
         context.note_file_read(&file_path);
         Ok(RichToolResult::plain(
             ToolResult::success(output).with_metadata(json!({
-                "evidence_routing": "inline"
+                "evidence_routing": "inline",
+                // The budget this call actually enforced. The context
+                // compactor honors it so an already-bounded read is never
+                // truncated a second time on its way into the conversation.
+                "read_budget_bytes": max_bytes,
+                // #6283: paging contract. `size` is the whole file in bytes,
+                // `line_count` its total lines, `truncated` whether the file
+                // holds more than this response shows.
+                "size": size_bytes,
+                "truncated": truncated,
+                "line_count": line_count
             })),
         ))
     }
@@ -806,7 +1108,7 @@ impl ToolSpec for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `Bash` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit` will make a narrow in-place edit. Text reads report the whole file's `content_hash=\"sha256:…\"`; pass that value back as `expected_hash` on a later `write`, `edit`, or `patch` to have the write refused if the file changed in between. Codewhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are text-extracted when the optional `pdftotext` executable (Poppler) is installed. Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns up to 500 lines or 16KB, whichever comes first. If `truncated=\"true\"` and `next_start_line` is present, continue reading from there; a byte-limited window instead shows head + tail with a `[CONTENT TRUNCATED]` marker and its note says how to narrow the range. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
+        "Read a UTF-8 file from the workspace. Compared with `cat`, `head`, `tail`, or `sed -n '..p'` in `Bash`, it is faster, sandbox-aware, and needs no approval prompt. Plain text is returned as-is and records the file snapshot required before `edit` will make a narrow in-place edit. Text reads report the whole file's `content_hash=\"sha256:…\"`; pass that value back as `expected_hash` on a later `write`, `edit`, or `patch` to have the write refused if the file changed in between. Codewhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are text-extracted when the optional `pdftotext` executable (Poppler) is installed. Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns up to 500 lines or 16KB, whichever comes first. If `truncated=\"true\"` and `next_start_line` is present, continue reading from there; a byte-limited window instead shows head + tail with a `[CONTENT TRUNCATED]` marker and its note says how to narrow the range. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
 
     fn input_schema(&self) -> Value {
@@ -815,7 +1117,7 @@ impl ToolSpec for ReadFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file (relative to workspace or absolute). Alias: `file_path`"
+                    "description": "Path to the file (relative to workspace, absolute, or ~/ home-relative). Alias: `file_path`"
                 },
                 "start_line": {
                     "type": "integer",
@@ -852,36 +1154,42 @@ impl ToolSpec for ReadFileTool {
         // S1/F2: raw spelling first, resolved path after — see the matching
         // comment in `execute_contract_read`. Only the raw-spelling denial can
         // promise an error that never names the symlink target's location.
-        enforce_read_denylist(Path::new(path_str), "read_file")?;
-        let file_path = context.resolve_path(path_str)?;
-        if is_codewhale_credential_path(&file_path) {
-            return Err(ToolError::permission_denied(
-                "File `read` cannot expose Codewhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection",
-            ));
-        }
-        enforce_read_denylist(&file_path, "read_file")?;
+        let file_path = resolve_guarded_read_path(context, path_str, "read_file")?;
         let pages = optional_str(&input, "pages")?;
 
         if let Some(result) = read_pdf_if_detected(
             &file_path,
             pages,
-            super::pdf::PdfTextCommand::system(context.cancel_token.as_ref()),
+            super::pdf::PdfTextCommand::system(Some(context)),
         )
         .await?
         {
             return Ok(result);
         }
         if is_image_for_ocr(&file_path) {
-            return read_image_via_ocr(&file_path, path_str);
+            return read_image_via_ocr(&file_path, path_str, context).await;
         }
 
         // Open before parameter parsing so a missing file keeps the
         // historical "Failed to read …" error shape regardless of the other
-        // arguments.
-        let file = fs::File::open(&file_path).map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read {}: {}", file_path.display(), e))
-        })?;
-        let file_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(u64::MAX);
+        // arguments. The open and size probe run on the blocking pool —
+        // tool handlers execute on the Tokio runtime (blocking-call
+        // convention, #6149).
+        let file_bytes = tokio::task::spawn_blocking({
+            let file_path = file_path.clone();
+            move || {
+                let file = fs::File::open(&file_path).map_err(|e| {
+                    ToolError::execution_failed(format!(
+                        "Failed to read {}: {}",
+                        file_path.display(),
+                        e
+                    ))
+                })?;
+                Ok::<_, ToolError>(file.metadata().map(|meta| meta.len()).unwrap_or(u64::MAX))
+            }
+        })
+        .await
+        .map_err(|e| ToolError::execution_failed(format!("File open task: {e}")))??;
 
         let explicit_range = input
             .get("start_line")
@@ -892,8 +1200,7 @@ impl ToolSpec for ReadFileTool {
         // explicit range — otherwise an explicit `start_line = 5` on a
         // tiny file would silently ignore the request.
         if !explicit_range && file_bytes <= SMALL_FILE_BYTES as u64 {
-            drop(file);
-            let contents = fs::read_to_string(&file_path).map_err(|e| {
+            let contents = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
                 ToolError::execution_failed(format!(
                     "Failed to read {}: {}",
                     file_path.display(),
@@ -971,28 +1278,44 @@ impl ToolSpec for ReadFileTool {
         // Bounded read for ranged/large files: skip and take lines through a
         // BufReader instead of materializing the whole file. The stream still
         // runs to EOF so the total line count and whole-file UTF-8 validation
-        // match the historical read_to_string behavior.
-        let (window, total_lines) =
-            read_window_streaming(file, start_line, max_lines).map_err(|e| {
-                ToolError::execution_failed(format!(
-                    "Failed to read {}: {}",
-                    file_path.display(),
-                    e
-                ))
-            })?;
+        // match the historical read_to_string behavior. Open, stream, and hash
+        // all run on the blocking pool (blocking-call convention, #6149).
+        let (window, total_lines, hash) = tokio::task::spawn_blocking({
+            let file_path = file_path.clone();
+            move || {
+                let file = fs::File::open(&file_path).map_err(|e| {
+                    ToolError::execution_failed(format!(
+                        "Failed to read {}: {}",
+                        file_path.display(),
+                        e
+                    ))
+                })?;
+                let (window, total_lines) = read_window_streaming(file, start_line, max_lines)
+                    .map_err(|e| {
+                        ToolError::execution_failed(format!(
+                            "Failed to read {}: {}",
+                            file_path.display(),
+                            e
+                        ))
+                    })?;
+                // The window is a slice; the guard needs the whole file. A
+                // second streaming pass digests the rest without ever
+                // materializing it. A failure here only costs the guard — the
+                // read itself already succeeded, so the window is still
+                // returned, just without a hash to pass back to `edit`.
+                // Special files are skipped: reopening a FIFO or device can
+                // block indefinitely (or re-consume a one-shot stream), and a
+                // stream has no stable content an edit guard could pin.
+                let hash = match fs::metadata(&file_path) {
+                    Ok(meta) if meta.is_file() => hash_file_streaming(&file_path).ok(),
+                    _ => None,
+                };
+                Ok::<_, ToolError>((window, total_lines, hash))
+            }
+        })
+        .await
+        .map_err(|e| ToolError::execution_failed(format!("File read task: {e}")))??;
         context.note_file_read(&file_path);
-
-        // The window is a slice; the guard needs the whole file. A second
-        // streaming pass digests the rest without ever materializing it. A
-        // failure here only costs the guard — the read itself already
-        // succeeded, so the window is still returned, just without a hash to
-        // pass back to `edit`. Special files are skipped: reopening a FIFO or
-        // device can block indefinitely (or re-consume a one-shot stream),
-        // and a stream has no stable content an edit guard could pin.
-        let hash = match fs::metadata(&file_path) {
-            Ok(meta) if meta.is_file() => hash_file_streaming(&file_path).ok(),
-            _ => None,
-        };
 
         // `start_line > total_lines` is not an error — it lets the model
         // page past the end without raising. Returns an empty-content
@@ -1190,18 +1513,18 @@ fn render_line_window(
             // combination can ever reveal the elided middle, so the note must
             // not pretend otherwise — name the escape hatch that works.
             output.push_str(&format!(
-                "\n[TRUNCATED] Line {shown_first} alone exceeds 50KB; showing its head + tail. No line window can reveal the middle of one line — use a searched shell slice when needed.\n"
+                "\n[TRUNCATED] Line {shown_first} alone exceeds the {visible_bytes}-byte output budget; showing its head + tail. No line window can reveal the middle of one line — use a searched shell slice when needed.\n"
             ));
         } else {
             let narrower = (shown_last - shown_first).div_ceil(2).max(1);
             output.push_str(&format!(
-                "\n[TRUNCATED] The selected range exceeded 50KB; showing head + tail of lines {shown_first}-{shown_last}. Re-read narrower windows to see the middle, e.g. offset={shown_first} limit={narrower}, then advance offset.\n"
+                "\n[TRUNCATED] The selected range exceeded the {visible_bytes}-byte output budget; showing head + tail of lines {shown_first}-{shown_last}. Re-read narrower windows to see the middle, e.g. offset={shown_first} limit={narrower}, then advance offset.\n"
             ));
         }
     }
     output.push_str("</file>");
 
-    // The file tool self-bounds at 50 KiB and carries its own continuation
+    // The file tool self-bounds at its own byte budget and carries its own continuation
     // contract (`next_start_line`), so the large-output spillover envelope
     // must never re-wrap a read result with a second, weaker truncation.
     ToolResult::success(output).with_metadata(json!({
@@ -1210,28 +1533,32 @@ fn render_line_window(
     }))
 }
 
-fn read_image_via_ocr(path: &Path, requested_path: &str) -> Result<ToolResult, ToolError> {
-    let text = crate::tools::image_ocr::ocr_image_path(path)?;
+async fn read_image_via_ocr(
+    path: &Path,
+    requested_path: &str,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let text = crate::tools::image_ocr::ocr_image_path(path, context).await?;
     Ok(ToolResult::success(format!(
         "<image_ocr path=\"{requested_path}\">\n{text}\n</image_ocr>"
     )))
 }
 
 /// Detect an existing PDF by extension or by sniffing `%PDF` magic bytes.
-fn is_pdf(path: &Path) -> Result<bool, ToolError> {
+async fn is_pdf(path: &Path) -> Result<bool, ToolError> {
     let extension_matches = path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
-    let mut file = fs::File::open(path).map_err(|error| {
+    let mut file = tokio::fs::File::open(path).await.map_err(|error| {
         ToolError::execution_failed(format!("Failed to read {}: {error}", path.display()))
     })?;
     if extension_matches {
         return Ok(true);
     }
     let mut buf = [0u8; 4];
-    use std::io::Read;
-    Ok(file.read_exact(&mut buf).is_ok() && &buf == b"%PDF")
+    use tokio::io::AsyncReadExt;
+    Ok(file.read_exact(&mut buf).await.is_ok() && &buf == b"%PDF")
 }
 
 fn is_image_for_ocr(path: &Path) -> bool {
@@ -1316,7 +1643,7 @@ async fn read_pdf_if_detected(
     pages: Option<&str>,
     command: super::pdf::PdfTextCommand<'_>,
 ) -> Result<Option<ToolResult>, ToolError> {
-    if !is_pdf(path)? {
+    if !is_pdf(path).await? {
         return Ok(None);
     }
     // Validate the `pages` spec once, up front, so both extractor paths
@@ -1364,20 +1691,18 @@ impl WriteFileTool {
         reject_primitive_unknown(&input, "write", &["path", "content"])?;
         let path_str = required_str(&input, "path")?;
         let file_content = required_str(&input, "content")?;
+        check_contract_file_size(file_content.len())?;
         let file_path = context.resolve_path(path_str)?;
         let mutation_guard = acquire_file_mutation(&file_path, context).await?;
         check_file_operation_cancelled(context)?;
 
-        let existed_before = file_path.exists();
-        let prior_bytes = if existed_before {
-            fs::read(&file_path).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let prior = load_contract_source(&file_path, false, context).await?;
+        let existed_before = prior.is_some();
+        let prior_bytes = prior.unwrap_or_default();
         let prior_contents = String::from_utf8_lossy(&prior_bytes);
 
         if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 ToolError::execution_failed(format!(
                     "Failed to create directory {}: {error}",
                     parent.display()
@@ -1385,26 +1710,49 @@ impl WriteFileTool {
             })?;
         }
         check_file_operation_cancelled(context)?;
-        crate::utils::write_atomic_workspace(&file_path, file_content.as_bytes()).map_err(
-            |error| {
-                ToolError::execution_failed(format!(
-                    "Failed to write {}: {error}",
-                    file_path.display()
-                ))
-            },
+        // Preserve the existing file's line-ending style on overwrite (see
+        // `preserve_prior_line_endings`); otherwise a CRLF (Windows) file is
+        // silently rewritten with LF line endings.
+        let mut written = if prior_contents.is_empty() {
+            file_content.to_string()
+        } else {
+            let normalized = normalize_contract_line_endings(file_content);
+            let ending = contract_line_ending(&prior_contents);
+            let extra = if ending == "\r\n" {
+                normalized.bytes().filter(|byte| *byte == b'\n').count()
+            } else {
+                0
+            };
+            check_contract_file_size(normalized.len().saturating_add(extra))?;
+            restore_contract_line_endings(&normalized, ending)
+        };
+        guard_edit(
+            &file_path,
+            path_str,
+            existed_before.then(|| prior_contents.as_ref()),
+            &written,
         )?;
+        if existed_before
+            && let Some(normalized) = normalize_edit(&file_path, &prior_contents, &written).await
+        {
+            written = normalized;
+        }
+        check_contract_file_size(written.len())?;
         check_file_operation_cancelled(context)?;
+        // Once replacement starts, report its actual completion even if cancelled.
+        run_blocking_write_atomic(&file_path, written.clone().into_bytes()).await?;
         context.note_file_read(&file_path);
         drop(mutation_guard);
 
         let outcome = if existed_before { "updated" } else { "created" };
-        let utf16_units = file_content.encode_utf16().count();
+        let utf16_units = written.encode_utf16().count();
         Ok(contract_mutation_result(
             context,
             &file_path,
             path_str,
             prior_contents.as_ref(),
-            file_content,
+            &written,
+            written.as_bytes(),
             outcome,
             format!("Successfully wrote {utf16_units} bytes to {path_str}"),
         )
@@ -1423,7 +1771,7 @@ impl ToolSpec for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Write content to a UTF-8 file in the workspace. Use this instead of heredocs (`cat <<EOF > file`) or `echo > file` in `Bash` — diffs render inline and approval is handled cleanly. Creates or overwrites; parent directories are auto-created. Pass `expected_hash` (the `content_hash` from a prior `read`) to have the overwrite refused if the file changed since that read."
+        "Write content to a UTF-8 file in the workspace. Unlike heredocs (`cat <<EOF > file`) or `echo > file` in `Bash`, its diffs render inline and its approval shows the change. Creates or overwrites; parent directories are auto-created. Pass `expected_hash` (the `content_hash` from a prior `read`) to have the overwrite refused if the file changed since that read."
     }
 
     fn input_schema(&self) -> Value {
@@ -1471,10 +1819,24 @@ impl ToolSpec for WriteFileTool {
         let file_path = context.resolve_path(path_str)?;
 
         // Snapshot the existing contents (if any) before we overwrite — used
-        // to render an inline diff in the tool result.
-        let existed_before = file_path.exists();
+        // to render an inline diff in the tool result. Only a genuinely
+        // absent path is "new": a stat that fails for any other reason must
+        // not let an existing file be overwritten as if it were empty.
+        let existed_before = tokio::fs::try_exists(&file_path).await.map_err(|error| {
+            ToolError::execution_failed(format!(
+                "Failed to inspect {}: {error}",
+                file_path.display()
+            ))
+        })?;
         let prior_contents = if existed_before {
-            fs::read_to_string(&file_path).unwrap_or_default()
+            tokio::fs::read_to_string(&file_path)
+                .await
+                .map_err(|error| {
+                    ToolError::execution_failed(format!(
+                        "Failed to read {}: {error}",
+                        file_path.display()
+                    ))
+                })?
         } else {
             String::new()
         };
@@ -1495,7 +1857,7 @@ impl ToolSpec for WriteFileTool {
 
         // Create parent directories if needed
         if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 ToolError::execution_failed(format!(
                     "Failed to create directory {}: {}",
                     parent.display(),
@@ -1504,17 +1866,32 @@ impl ToolSpec for WriteFileTool {
             })?;
         }
 
-        crate::utils::write_atomic_workspace(&file_path, file_content.as_bytes()).map_err(|e| {
-            ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
-        })?;
+        // Preserve the existing file's line-ending style on overwrite (see
+        // `preserve_prior_line_endings`); a full `write_file` over a CRLF
+        // (Windows) file otherwise silently rewrites every line ending to LF.
+        let mut written = preserve_prior_line_endings(file_content, &prior_contents);
+
+        guard_edit(
+            &file_path,
+            path_str,
+            existed_before.then(|| prior_contents.as_ref()),
+            &written,
+        )?;
+        if existed_before
+            && let Some(normalized) = normalize_edit(&file_path, &prior_contents, &written).await
+        {
+            written = normalized;
+        }
+
+        run_blocking_write_atomic(&file_path, written.clone().into_bytes()).await?;
         context.note_file_read(&file_path);
 
         let display = file_path.display().to_string();
-        let diff = make_unified_diff(&display, &prior_contents, file_content);
+        let diff = make_unified_diff(&display, &prior_contents, &written);
         let summary = if existed_before {
-            format!("Wrote {} bytes to {}", file_content.len(), display)
+            format!("Wrote {} bytes to {}", written.len(), display)
         } else {
-            format!("Created {} ({} bytes)", display, file_content.len())
+            format!("Created {} ({} bytes)", display, written.len())
         };
         let body = if diff.is_empty() {
             format!("{summary}\n(no changes)")
@@ -1533,12 +1910,12 @@ impl ToolSpec for WriteFileTool {
         let outcome = if existed_before { "updated" } else { "created" };
         // Keep the execution-owned receipt workspace-relative even though the
         // legacy model-facing output above retains its resolved-path wording.
-        let receipt_diff = make_unified_diff(path_str, &prior_contents, file_content);
+        let receipt_diff = make_unified_diff(path_str, &prior_contents, &written);
         Ok(ToolResult::success(full_body).with_metadata(json!({
             "event": "file.mutation",
             "mutation": {
                 "diff": receipt_diff,
-                "files": [{ "path": path_str, "outcome": outcome }],
+                "files": [mutation_file_entry(path_str, outcome, Some(written.as_bytes()))],
                 "renames": []
             }
         })))
@@ -1584,16 +1961,209 @@ fn restore_contract_line_endings(text: &str, ending: &str) -> String {
     }
 }
 
+/// First code point of the placeholder range that carries one non-UTF-8 byte
+/// through a text edit (Supplementary Private Use Area-A, U+F0000..=U+F00FF).
+const RAW_BYTE_PLACEHOLDER_BASE: u32 = 0xF_0000;
+
+fn is_raw_byte_placeholder(ch: char) -> bool {
+    (RAW_BYTE_PLACEHOLDER_BASE..=RAW_BYTE_PLACEHOLDER_BASE + 0xFF).contains(&u32::from(ch))
+}
+
+/// Decode `bytes` for a text edit without losing any of them: valid UTF-8 is
+/// kept as text and each invalid byte becomes a placeholder code point that
+/// [`encode_lossless_text`] turns back into the same byte. A file that is not
+/// UTF-8 and already uses the placeholder range (or edits that do) cannot be
+/// round-tripped, so the edit is refused rather than risk a silent rewrite.
+///
+/// The flag is `true` only when placeholders were introduced. A valid UTF-8
+/// file keeps its characters as they are, including any in the placeholder
+/// range (Nerd Font icons live there), and is written back as plain UTF-8.
+fn decode_bytes_losslessly(
+    bytes: &[u8],
+    edits: &[ContractEdit],
+    path: &str,
+) -> Result<(String, bool), ToolError> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok((text.to_string(), false));
+    }
+    let refuse = || {
+        ToolError::execution_failed(format!(
+            "Could not edit file {path}: it is not valid UTF-8 and uses characters Codewhale needs to keep its raw bytes intact. The file was not changed; use File `patch` or a shell tool for this file."
+        ))
+    };
+    if edits.iter().any(|edit| {
+        edit.old_text.chars().any(is_raw_byte_placeholder)
+            || edit.new_text.chars().any(is_raw_byte_placeholder)
+    }) {
+        return Err(refuse());
+    }
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        if chunk.valid().chars().any(is_raw_byte_placeholder) {
+            return Err(refuse());
+        }
+        out.push_str(chunk.valid());
+        for &byte in chunk.invalid() {
+            out.push(
+                char::from_u32(RAW_BYTE_PLACEHOLDER_BASE + u32::from(byte))
+                    .expect("placeholder range holds valid code points"),
+            );
+        }
+    }
+    Ok((out, true))
+}
+
+/// Inverse of [`decode_bytes_losslessly`] for a file it decoded with
+/// placeholders. Never call it on text from a valid UTF-8 file.
+fn encode_lossless_text(text: &str) -> Vec<u8> {
+    if !text.chars().any(is_raw_byte_placeholder) {
+        return text.as_bytes().to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len());
+    let mut buf = [0_u8; 4];
+    for ch in text.chars() {
+        if is_raw_byte_placeholder(ch) {
+            out.push((u32::from(ch) - RAW_BYTE_PLACEHOLDER_BASE) as u8);
+        } else {
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+// Raw-byte placeholders use four UTF-8 bytes in memory but encode as one.
+fn contract_encoded_size(text: &str, has_raw_bytes: bool) -> usize {
+    if has_raw_bytes {
+        text.chars()
+            .map(|ch| {
+                if is_raw_byte_placeholder(ch) {
+                    1
+                } else {
+                    ch.len_utf8()
+                }
+            })
+            .sum()
+    } else {
+        text.len()
+    }
+}
+
+fn append_contract_text(
+    result: &mut String,
+    encoded_size: &mut usize,
+    text: &str,
+    has_raw_bytes: bool,
+) -> Result<(), ToolError> {
+    let next = encoded_size.saturating_add(contract_encoded_size(text, has_raw_bytes));
+    check_contract_file_size(next)?;
+    result.push_str(text);
+    *encoded_size = next;
+    Ok(())
+}
+
+/// The line terminator of each line in `text`, in order (`\r\n`, `\n` or a
+/// lone `\r`). The k-th entry ends the k-th line of the LF-normalized text.
+fn line_terminators(text: &str) -> Vec<&'static str> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                out.push("\r\n");
+                index += 2;
+            }
+            b'\r' => {
+                out.push("\r");
+                index += 1;
+            }
+            b'\n' => {
+                out.push("\n");
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    out
+}
+
+/// Give every line an edit left alone its original terminator back, and the
+/// file's dominant `fallback` terminator to lines the edit wrote (B6). The
+/// edit ran on LF-normalized text; restoring one style for the whole file
+/// rewrote mixed-ending files on lines nobody touched.
+fn restore_line_endings_per_line(
+    original: &str,
+    normalized_original: &str,
+    updated: &str,
+    fallback: &str,
+    has_raw_bytes: bool,
+) -> Result<String, ToolError> {
+    let terminators = line_terminators(original);
+    if terminators.iter().all(|ending| *ending == fallback) {
+        let extra = if fallback == "\r\n" {
+            updated.bytes().filter(|byte| *byte == b'\n').count()
+        } else {
+            0
+        };
+        check_contract_file_size(
+            contract_encoded_size(updated, has_raw_bytes).saturating_add(extra),
+        )?;
+        return Ok(restore_contract_line_endings(updated, fallback));
+    }
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_secs(1))
+        .diff_lines(normalized_original, updated);
+    let mut out = String::new();
+    let mut encoded_size = 0;
+    for change in diff.iter_all_changes() {
+        let ending = match change.tag() {
+            similar::ChangeTag::Delete => continue,
+            similar::ChangeTag::Equal => change
+                .old_index()
+                .and_then(|index| terminators.get(index).copied())
+                .unwrap_or(fallback),
+            similar::ChangeTag::Insert => fallback,
+        };
+        let line = change.value();
+        match line.strip_suffix('\n') {
+            Some(body) => {
+                append_contract_text(&mut out, &mut encoded_size, body, has_raw_bytes)?;
+                append_contract_text(&mut out, &mut encoded_size, ending, has_raw_bytes)?;
+            }
+            None => append_contract_text(&mut out, &mut encoded_size, line, has_raw_bytes)?,
+        }
+    }
+    Ok(out)
+}
+
+/// Rewrite `content` to match the line-ending style of an existing file's
+/// `prior` content, so a full-file overwrite (`write_file` / contract `write`)
+/// does not silently flip a CRLF (Windows) file to LF — the same policy
+/// `edit_file` applies. A brand-new file (no prior content) is returned
+/// verbatim: there is no style to preserve.
+fn preserve_prior_line_endings(content: &str, prior: &str) -> String {
+    if prior.is_empty() {
+        return content.to_string();
+    }
+    restore_contract_line_endings(
+        &normalize_contract_line_endings(content),
+        contract_line_ending(prior),
+    )
+}
+
 /// Fallback matching view used only after a literal match fails. It follows
 /// The small-contract normalization categories while leaving the public schema as
 /// exact-text replacement rather than teaching a second edit mode.
 fn normalize_contract_fuzzy(text: &str) -> String {
     let compatible = text.nfkc().collect::<String>();
-    compatible
-        .split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut trimmed = String::with_capacity(compatible.len());
+    for (index, line) in compatible.split('\n').enumerate() {
+        if index > 0 {
+            trimmed.push('\n');
+        }
+        trimmed.push_str(line.trim_end());
+    }
+    trimmed
         .chars()
         .map(|ch| match ch {
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
@@ -1641,6 +2211,14 @@ fn contract_edit_duplicate(path: &str, index: usize, total: usize, matches: usiz
 }
 
 fn prepare_contract_edit_input(mut input: Value) -> Result<Value, ToolError> {
+    for key in ["oldText", "newText"] {
+        if let Some(text) = input.get(key).and_then(Value::as_str) {
+            check_contract_file_size(text.len())?;
+        }
+    }
+    if let Some(encoded) = input.get("edits").and_then(Value::as_str) {
+        check_contract_file_size(encoded.len())?;
+    }
     let object = input
         .as_object_mut()
         .ok_or_else(|| ToolError::invalid_input("edit input must be an object"))?;
@@ -1661,11 +2239,10 @@ fn prepare_contract_edit_input(mut input: Value) -> Result<Value, ToolError> {
         .map(str::to_string);
     if let (Some(old_text), Some(new_text)) = (legacy_old, legacy_new) {
         let legacy = json!({"oldText": old_text, "newText": new_text});
-        let mut edits = object
-            .get("edits")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let mut edits = match object.remove("edits") {
+            Some(Value::Array(edits)) => edits,
+            _ => Vec::new(),
+        };
         edits.push(legacy);
         object.insert("edits".to_string(), Value::Array(edits));
         object.remove("oldText");
@@ -1684,12 +2261,20 @@ fn parse_contract_edits(input: &Value) -> Result<Vec<ContractEdit>, ToolError> {
             "edit requires at least one replacement in edits",
         ));
     }
+    let mut replacement_bytes = 0usize;
     raw.iter()
         .enumerate()
         .map(|(index, edit)| {
             reject_primitive_unknown(edit, &format!("edits[{index}]"), &["oldText", "newText"])?;
             let old_text = required_str(edit, "oldText")?;
             let new_text = required_str(edit, "newText")?;
+            check_contract_file_size(old_text.len())?;
+            check_contract_file_size(new_text.len())?;
+            // All non-overlapping replacements survive into the output. Count
+            // normalized bytes before copying another large replacement.
+            replacement_bytes = replacement_bytes
+                .saturating_add(new_text.len() - new_text.match_indices("\r\n").count());
+            check_contract_file_size(replacement_bytes)?;
             if old_text.is_empty() {
                 return Err(ToolError::invalid_input(format!(
                     "edits[{index}].oldText must not be empty"
@@ -1704,15 +2289,34 @@ fn parse_contract_edits(input: &Value) -> Result<Vec<ContractEdit>, ToolError> {
         .collect()
 }
 
-fn apply_resolved_edits(base: &str, edits: &[ResolvedContractEdit], offset: usize) -> String {
+fn apply_resolved_edits(
+    base: &str,
+    edits: &[ResolvedContractEdit],
+    offset: usize,
+    has_raw_bytes: bool,
+) -> Result<String, ToolError> {
+    let mut encoded_size = contract_encoded_size(base, has_raw_bytes);
+    check_contract_file_size(encoded_size)?;
     let mut updated = base.to_string();
     for edit in edits.iter().rev() {
-        updated.replace_range(
-            edit.start.saturating_sub(offset)..edit.end.saturating_sub(offset),
-            &edit.replacement,
-        );
+        let range = edit.start.saturating_sub(offset)..edit.end.saturating_sub(offset);
+        let removed = &updated[range.clone()];
+        let projected_string_size = updated
+            .len()
+            .saturating_sub(removed.len())
+            .saturating_add(edit.replacement.len());
+        encoded_size = encoded_size
+            .saturating_sub(contract_encoded_size(removed, has_raw_bytes))
+            .saturating_add(contract_encoded_size(&edit.replacement, has_raw_bytes));
+        // Reject each intermediate replacement before String::replace_range
+        // allocates; raw-byte placeholders are at most four bytes in memory.
+        check_contract_file_size(encoded_size)?;
+        if projected_string_size > CONTRACT_FILE_MAX_BYTES * if has_raw_bytes { 4 } else { 1 } {
+            check_contract_file_size(CONTRACT_FILE_MAX_BYTES + 1)?;
+        }
+        updated.replace_range(range, &edit.replacement);
     }
-    updated
+    Ok(updated)
 }
 
 fn lines_with_endings(text: &str) -> Vec<&str> {
@@ -1759,6 +2363,7 @@ fn apply_fuzzy_edits_preserving_other_lines(
     original: &str,
     normalized: &str,
     edits: &[ResolvedContractEdit],
+    has_raw_bytes: bool,
 ) -> Result<String, ToolError> {
     let original_lines = lines_with_endings(original);
     let spans = line_spans(normalized);
@@ -1793,22 +2398,25 @@ fn apply_fuzzy_edits_preserving_other_lines(
     }
 
     let mut result = String::new();
+    let mut encoded_size = 0;
     let mut original_line = 0usize;
     for group in groups {
         for line in &original_lines[original_line..group.start_line] {
-            result.push_str(line);
+            append_contract_text(&mut result, &mut encoded_size, line, has_raw_bytes)?;
         }
         let group_start = spans[group.start_line].0;
         let group_end = spans[group.end_line - 1].1;
-        result.push_str(&apply_resolved_edits(
+        let replacement = apply_resolved_edits(
             &normalized[group_start..group_end],
             &group.edits,
             group_start,
-        ));
+            has_raw_bytes,
+        )?;
+        append_contract_text(&mut result, &mut encoded_size, &replacement, has_raw_bytes)?;
         original_line = group.end_line;
     }
     for line in &original_lines[original_line..] {
-        result.push_str(line);
+        append_contract_text(&mut result, &mut encoded_size, line, has_raw_bytes)?;
     }
     Ok(result)
 }
@@ -1817,6 +2425,7 @@ fn apply_contract_edits(
     base: &str,
     edits: &[ContractEdit],
     path: &str,
+    has_raw_bytes: bool,
 ) -> Result<String, ToolError> {
     let fuzzy_base = normalize_contract_fuzzy(base);
     let initial = edits
@@ -1882,9 +2491,9 @@ fn apply_contract_edits(
     }
 
     let updated = if use_fuzzy {
-        apply_fuzzy_edits_preserving_other_lines(base, replacement_base, &resolved)?
+        apply_fuzzy_edits_preserving_other_lines(base, replacement_base, &resolved, has_raw_bytes)?
     } else {
-        apply_resolved_edits(replacement_base, &resolved, 0)
+        apply_resolved_edits(replacement_base, &resolved, 0, has_raw_bytes)?
     };
     if updated == base {
         return Err(ToolError::execution_failed(format!(
@@ -1907,39 +2516,52 @@ impl EditFileTool {
         let mutation_guard = acquire_file_mutation(&file_path, context).await?;
         check_file_operation_cancelled(context)?;
 
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file_path)
-            .map_err(|error| {
+        let raw_bytes = load_contract_source(&file_path, true, context)
+            .await?
+            .ok_or_else(|| {
                 ToolError::execution_failed(format!(
-                    "Could not edit file {path_str}: target must be readable and writable ({error})"
+                    "Could not edit file {path_str}: file not found"
                 ))
             })?;
         check_file_operation_cancelled(context)?;
-        let raw_bytes = fs::read(&file_path).map_err(|error| {
-            ToolError::execution_failed(format!("Could not edit file {path_str}: {error}"))
-        })?;
-        check_file_operation_cancelled(context)?;
-        let raw = String::from_utf8_lossy(&raw_bytes).into_owned();
+        // Bytes that are not UTF-8 ride through the edit as placeholders and
+        // are written back unchanged (B6), instead of becoming U+FFFD.
+        let (raw, has_raw_bytes) = decode_bytes_losslessly(&raw_bytes, &edits, path_str)?;
         let (bom, without_bom) = raw
             .strip_prefix('\u{FEFF}')
             .map_or(("", raw.as_str()), |text| ("\u{FEFF}", text));
         let ending = contract_line_ending(without_bom);
         let normalized = normalize_contract_line_endings(without_bom);
-        let updated = apply_contract_edits(&normalized, &edits, path_str)?;
+        let updated = apply_contract_edits(&normalized, &edits, path_str, has_raw_bytes)?;
         check_file_operation_cancelled(context)?;
-        let final_content = format!("{bom}{}", restore_contract_line_endings(&updated, ending));
-
-        crate::utils::write_atomic_workspace(&file_path, final_content.as_bytes()).map_err(
-            |error| {
-                ToolError::execution_failed(format!(
-                    "Failed to write {}: {error}",
-                    file_path.display()
-                ))
-            },
+        let restored = restore_line_endings_per_line(
+            without_bom,
+            &normalized,
+            &updated,
+            ending,
+            has_raw_bytes,
         )?;
+        check_contract_file_size(
+            bom.len()
+                .saturating_add(contract_encoded_size(&restored, has_raw_bytes)),
+        )?;
+        let mut final_content = format!("{bom}{restored}");
+        guard_edit(&file_path, path_str, Some(&raw), &final_content)?;
+        if let Some(normalized) = normalize_edit(&file_path, &raw, &final_content).await {
+            final_content = normalized;
+        }
+
+        check_contract_file_size(contract_encoded_size(&final_content, has_raw_bytes))?;
         check_file_operation_cancelled(context)?;
+        let bytes = if has_raw_bytes {
+            encode_lossless_text(&final_content)
+        } else {
+            final_content.clone().into_bytes()
+        };
+        check_contract_file_size(bytes.len())?;
+        check_file_operation_cancelled(context)?;
+        // The mutation worker owns completion after atomic replacement starts.
+        run_blocking_write_atomic(&file_path, bytes.clone()).await?;
         context.note_file_read(&file_path);
         drop(mutation_guard);
 
@@ -1949,6 +2571,7 @@ impl EditFileTool {
             path_str,
             &raw,
             &final_content,
+            &bytes,
             "updated",
             format!(
                 "Successfully replaced {} block(s) in {path_str}.",
@@ -1970,7 +2593,7 @@ impl ToolSpec for EditFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Replace text in a single file via exact search/replace after the file has been read with File `read` in this session. Use this instead of `sed -i` in `Bash` for one unambiguous in-place edit. `search` must match exactly one location by default; when no exact match is found the tool retries with leading-whitespace-tolerant fuzzy matching automatically. Returns a compact unified diff, not the full file. Pass `expected_hash` (the `content_hash` from that `read`) to have the edit refused, with the file untouched, if it changed in between. For structural, multi-block, or cross-file changes, use File `patch` or `write` instead."
+        "Replace text in a single file via exact search/replace after the file has been read with File `read` in this session. It makes one unambiguous in-place edit, the File-tool counterpart of `sed -i` in `Bash`. `search` must match exactly one location by default; when no exact match is found the tool retries with leading-whitespace-tolerant fuzzy matching automatically. Returns a compact unified diff, not the full file. Pass `expected_hash` (the `content_hash` from that `read`) to have the edit refused, with the file untouched, if it changed in between. File `patch` handles structural, multi-block, or cross-file changes, and `write` replaces a whole file."
     }
 
     fn input_schema(&self) -> Value {
@@ -2050,7 +2673,7 @@ impl ToolSpec for EditFileTool {
         let file_path = context.resolve_path(path_str)?;
         context.require_fresh_file_read(&file_path, path_str)?;
 
-        let contents = fs::read_to_string(&file_path).map_err(|e| {
+        let contents = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
             ToolError::execution_failed(format!("Failed to read {}: {}", file_path.display(), e))
         })?;
 
@@ -2105,9 +2728,15 @@ impl ToolSpec for EditFileTool {
                             // missed; show the first lines of the search text
                             // so it can compare against the file's contents.
                             return Err(ToolError::execution_failed(format!(
-                                "Search string not found in {}. The search text starts with:\n{}\nRecovery: call File with action=\"read\" path=\"{path_str}\" to inspect the current contents, then retry with a search string copied from the file.",
+                                "Search string not found in {}. The search text starts with:\n{}\n{}Recovery: retry with the search copied from the lines above, or call File with action=\"read\" path=\"{path_str}\" to inspect the current contents.",
                                 file_path.display(),
                                 preview_search_for_error(search),
+                                nearest_match_hint(
+                                    normalized_contents.as_ref(),
+                                    normalized_search.as_ref(),
+                                    crlf_positions.is_some(),
+                                    search.contains('\r'),
+                                ),
                             )));
                         }
                         [(start, end)] => ((*start, *end), Some("punctuation")),
@@ -2170,15 +2799,25 @@ impl ToolSpec for EditFileTool {
             ));
         }
 
-        crate::utils::write_atomic_workspace(&file_path, updated.as_bytes()).map_err(|e| {
-            ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
-        })?;
+        guard_edit(&file_path, path_str, Some(&contents), &updated)?;
+
+        // #6205 — normalize after the syntax gate so the next turn's anchors
+        // match the bytes on disk rather than the text the model emitted.
+        let normalized_formatting = match normalize_edit(&file_path, &contents, &updated).await {
+            Some(normalized) => {
+                updated = normalized;
+                true
+            }
+            None => false,
+        };
+
+        run_blocking_write_atomic(&file_path, updated.clone().into_bytes()).await?;
 
         // #5209 — never emit a success receipt unless the on-disk write
         // actually applied. A fabricated "Replaced 1 occurrence" + diff is
         // worse than a hard error: models trust it and re-edit the same
         // span 3–5× before noticing nothing changed.
-        let on_disk = fs::read_to_string(&file_path).map_err(|e| {
+        let on_disk = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
             ToolError::execution_failed(format!(
                 "Failed to verify write to {}: {}",
                 file_path.display(),
@@ -2205,7 +2844,12 @@ impl ToolSpec for EditFileTool {
             Some(other) => other,
             None => "",
         };
-        let summary = format!("Replaced 1 occurrence in {display}{fuzz_note}");
+        let format_note = if normalized_formatting {
+            NORMALIZED_NOTE
+        } else {
+            ""
+        };
+        let summary = format!("Replaced 1 occurrence in {display}{fuzz_note}{format_note}");
         let body = if diff.is_empty() {
             format!("{summary}\n(no textual changes)")
         } else {
@@ -2227,7 +2871,7 @@ impl ToolSpec for EditFileTool {
             "event": "file.mutation",
             "mutation": {
                 "diff": receipt_diff,
-                "files": [{ "path": path_str, "outcome": "updated" }],
+                "files": [mutation_file_entry(path_str, "updated", Some(updated.as_bytes()))],
                 "renames": []
             }
         })))
@@ -2388,6 +3032,130 @@ fn preprocessor_directive(line: &str) -> Option<&str> {
 /// Build a short, line-truncated preview of a (possibly very long) search
 /// payload for error messages, so the model can compare what it searched for
 /// against the file's actual contents without the error message ballooning.
+/// The file region most like a search that did not match (#6542), with
+/// 1-based line numbers and a note on whitespace / line-ending differences,
+/// so the next edit can copy the real text instead of re-reading the file.
+///
+/// Known limitation: candidates are anchored on the search's first
+/// non-blank line, so a search whose first line is also wrong may report
+/// no similar region even when later lines exist in the file.
+fn nearest_match_hint(
+    contents: &str,
+    search: &str,
+    file_has_crlf: bool,
+    search_has_cr: bool,
+) -> String {
+    const MAX_SCANNED_LINES: usize = 50_000;
+    const MAX_EXCERPT_LINES: usize = 12;
+    const MAX_EXCERPT_LINE_LEN: usize = 200;
+    const MIN_SCORE: f32 = 0.5;
+
+    let line_ratio = |a: &str, b: &str| -> f32 {
+        let (a, b) = (a.trim(), b.trim());
+        if a == b {
+            1.0
+        } else {
+            similar::TextDiff::from_chars(a, b).ratio()
+        }
+    };
+    let file_lines: Vec<&str> = contents.lines().take(MAX_SCANNED_LINES).collect();
+    let search_lines: Vec<&str> = search.lines().collect();
+    let Some(anchor) = search_lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let window = search_lines.len().min(file_lines.len()).max(1);
+
+    let mut anchors: Vec<(f32, usize)> = file_lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| *index >= anchor && !line.trim().is_empty())
+        .map(|(index, line)| (line_ratio(search_lines[anchor], line), index - anchor))
+        .collect();
+    anchors.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let best = anchors
+        .into_iter()
+        .take(8)
+        .map(|(_, start)| {
+            let end = (start + window).min(file_lines.len());
+            let score = search_lines
+                .iter()
+                .zip(&file_lines[start..end])
+                .map(|(want, have)| line_ratio(want, have))
+                .sum::<f32>()
+                / window as f32;
+            (score, start, end)
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let mut notes = Vec::new();
+    if search_has_cr && !file_has_crlf {
+        notes.push(
+            "the search contains carriage returns (CRLF) but the file uses LF line endings"
+                .to_string(),
+        );
+    }
+    let Some((score, start, end)) = best.filter(|(score, ..)| *score >= MIN_SCORE) else {
+        let mut hint = String::from("No similar region found in the file.\n");
+        for note in notes {
+            hint.push_str(&format!("Note: {note}.\n"));
+        }
+        return hint;
+    };
+    let region = &file_lines[start..end];
+    let strip_trailing = |lines: &[&str]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.trim_end().to_string())
+            .collect()
+    };
+    let collapse = |lines: &[&str]| -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if strip_trailing(region) == strip_trailing(&search_lines) {
+        notes.push("the closest region differs only in trailing whitespace".to_string());
+    } else if collapse(region) == collapse(&search_lines) {
+        let tabs = |lines: &[&str]| lines.iter().any(|line| line.starts_with('\t'));
+        if tabs(region) != tabs(&search_lines) {
+            notes
+                .push("the closest region differs only in whitespace (tabs vs spaces)".to_string());
+        } else {
+            notes.push("the closest region differs only in whitespace".to_string());
+        }
+    }
+    if file_has_crlf {
+        notes.push("the file uses CRLF line endings; LF in the search is fine".to_string());
+    }
+
+    let width = end.to_string().len();
+    let mut hint = format!(
+        "Closest match (lines {}-{}, {:.0}% similar):\n",
+        start + 1,
+        end,
+        score * 100.0
+    );
+    for (offset, line) in region.iter().take(MAX_EXCERPT_LINES).enumerate() {
+        let mut shown: String = line.chars().take(MAX_EXCERPT_LINE_LEN).collect();
+        if line.chars().count() > MAX_EXCERPT_LINE_LEN {
+            shown.push_str("...");
+        }
+        hint.push_str(&format!("{:>width$}\t{shown}\n", start + offset + 1));
+    }
+    if region.len() > MAX_EXCERPT_LINES {
+        hint.push_str(&format!(
+            "... ({} more lines)\n",
+            region.len() - MAX_EXCERPT_LINES
+        ));
+    }
+    for note in notes {
+        hint.push_str(&format!("Note: {note}.\n"));
+    }
+    hint
+}
+
 fn preview_search_for_error(search: &str) -> String {
     const MAX_PREVIEW_LINES: usize = 3;
     const MAX_PREVIEW_LINE_LEN: usize = 80;
@@ -2644,7 +3412,7 @@ impl ToolSpec for ListDirTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path (default: .)"
+                    "description": "Path to inspect (relative to workspace, absolute, or ~/ home-relative; default: .)"
                 }
             },
             "required": []

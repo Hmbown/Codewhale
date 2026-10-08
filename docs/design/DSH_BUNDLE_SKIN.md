@@ -48,7 +48,7 @@ injection hacks.
 
 - New: `pub(crate) struct SkinTokens` / `pub(crate) fn skin_tokens() ->
   BTreeMap<String, (String, String)>` — alias name → (light, dark), both
-  rendered from the real TUI palette (`crates/tui/src/palette`, Blue Stage
+  rendered from the real TUI palette (`crates/palette/src`, Blue Stage
   dark + light). Port every mapping from today's `alias_map()` +
   `theme_block()`.
 - New: `pub(crate) fn bundle_client_js() -> String` — renders the client

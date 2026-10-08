@@ -1,109 +1,121 @@
 import type { HomeDict } from "../types";
 
 /**
- * Catalan home dictionary — la pàgina d’inici «diari-oceà».
- *
- * Reescriptura nativa en la direcció anglesa actual: porta el teu model,
- * tot passa a la teva màquina. El vocabulari de producte es manté literal
- * i coincideix amb el pack TUI: Plan / Work / Operate, Ask / Auto-Review /
- * Full Access, Codewhale, TUI, `codewhale exec`, Runtime API + MCP, fleet,
- * Node 18+, Rust, MIT.
- *
- * Els segells de secció (法, 行, …) són glifs compartits amb l’edició
- * anglesa — marques, no prosa.
+ * Catalan home dictionary — native copy for the whale-road landing page,
+ * translated from the English reference: an open-source coding agent for
+ * any model, control over approvals, and availability stated per surface
+ * as it is today. Product vocabulary stays literal (Plan / Work / Operate,
+ * Ask / Auto-Review / Full Access, Codewhale, codewhale exec, Fleet,
+ * /receipts).
  */
+
 export const home: HomeDict = {
-  metaTitle: "Codewhale — s’immergeix a les profunditats per tu.",
+  metaTitle: "Codewhale: l’agent de programació de codi obert per a qualsevol model",
   metaDescription:
-    "Codewhale s’immergeix a les profunditats per tu — un agent de programació de codi obert per al terminal. Porta el teu model. A la teva màquina. En Rust, amb llicència MIT.",
-
-  kicker: "Codi obert · Porta el teu model · Al teu terminal",
-  heroTitleA: "Codewhale s’immergeix a les profunditats",
-  heroTitleB: "perquè tu no ho hagis de fer.",
+    "Codewhale és un agent de programació de codi obert per al teu terminal. Llegeix el teu projecte, edita fitxers i executa les teves proves amb el model allotjat o local que triïs.",
+  heroTitle: "L’agent de programació de codi obert per a qualsevol model",
   heroIntro:
-    "{brand} és un agent de programació de codi obert per al teu terminal. Dóna-li un model i una tasca: llegeix el teu codi, edita fitxers, executa les seves pròpies comprovacions i s’atura quan la feina és feta o quan et necessita. Porta el model que vulguis, o barreja’ls: fixa un model diferent per a cada rol.",
-  install: "Instal·la",
-  docs: "Documentació",
-  copy: "Copia",
-  copied: "Copiat ✓",
-
-  installEyebrow: "instal·lació en una línia",
-  installRequirement: "cal Node 18+ — sense cadena d’eines Rust",
-  installOtherWays: "altres mètodes →",
-
+    "{brand} llegeix el teu projecte, edita fitxers i executa les teves proves des del terminal. Connecta un model allotjat o local i tria quines accions necessiten la teva aprovació.",
+  getCodewhale: "Instal·lar Codewhale",
+  heroInstallAria: "Ordre d'instal·lació",
+  exploreProduct: "Veure com funciona",
+  shotPreview: "Vista prèvia del terminal",
+  shotBuild: "build de desenvolupament v{version}",
+  screenshotAlt:
+    "Codewhale v{version}, versió de desenvolupament: balena, sessió nova, camp de missatge, permisos Ask, mode Work i estat del model. Representació de la sortida real d’un terminal aïllat.",
   latestRelease: "Última versió {tag}",
   releaseUnavailable: "Estat de la versió no disponible",
   currentSource: "Font",
   sourceCandidate: "Sense publicar",
-  providerRoutes: "{count} proveïdors",
   publishedRelease: "publicada",
   figcaptionSourceCandidate: "sense publicar",
-
-  shotSession: "Sessió actual",
-  screenshotAlt:
-    "Sessió de terminal actual de Codewhale amb el mode Operate, la balena, el compositor i el peu de pàgina",
-  figcaption: "Sessió actual de Codewhale · mode Operate · postura de permisos Ask",
-
-  proofHeading: "Un intèrpret d’ordres submarí. Qualsevol model. A la teva màquina.",
-  proofBody:
-    "Porta el model que ja utilitzes — allotjat, via gateway o local. Plan / Work / Operate i les postures de permisos explícites mantenen la immersió sota el teu control.",
-
-  sealDecides: "法",
-  decidesEyebrow: "Mira com decideix",
-  decidesHeading: "Regles que pots veure a la traça",
-  decidesLede:
-    "Extractes de sessions reals: la jerarquia de regles del projecte es veu al raonament del model, no és només una afirmació de la portada.",
-
-  sealWorkflow: "行",
-  workflowHeading: "De la tasca al canvi verificat.",
-  workflow: [
-    ["Inspeccionar", "Llegir el repositori, les seves instruccions i la tasca."],
-    ["Actuar", "Editar fitxers dins de límits d’aprovació explícits."],
-    ["Verificar", "Executar les comprovacions i inspeccionar el resultat."],
-    ["Reportar", "Deixar un resguard concís i durable."],
+  chapterTerminal: "El teu terminal",
+  chapterTerminalTitle: "Segueix cada edició i cada ordre mentre s’executen",
+  gainHeading: "Delega la tasca i mantén el control",
+  gainLede:
+    "Demana un resultat: corregir un error, explicar un mòdul o automatitzar una tasca que repeteixes. Comença amb un agent i afegeix-ne més quan la feina creixi.",
+  gain: [
+    [
+      "Canvia el codi i comprova’l",
+      "L’agent inspecciona el teu projecte, edita fitxers i executa les teves proves. Segueix cada edició i cada resultat d’ordre mentre treballa."
+    ],
+    [
+      "Automatitza la feina repetitiva",
+      "Executa codewhale exec des de scripts i CI. Fes servir un Fleet per dividir una feina més gran entre diversos agents."
+    ],
+    [
+      "Mantén el control",
+      "Defineix els permisos abans de començar, respon a les sol·licituds d’aprovació i atura una tasca en qualsevol moment. Executa /receipts per llistar cada fitxer, ordre i aprovació d’una sessió."
+    ]
   ],
-  receiptAria: "Exemple de resguard de feina",
-  receiptInspect: "repositori i instruccions",
-  receiptAct: "edició segons la postura de permisos triada",
-  receiptReport: "comprovacions superades · resguard desat",
-
-  sealStart: "起",
-  startHeading: "Nou a Codewhale? Quatre passos de principi a fi.",
+  chapterModels: "Els teus models",
+  modelsHeading: "Tria un model per a cada tasca",
+  modelsBody:
+    "Per a cada sessió, tria un proveïdor integrat, qualsevol endpoint compatible amb OpenAI o un model local. La connexió amb el teu model es manté separada de qualsevol compte de Codewhale.",
+  modelsFacts: [
+    ["Allotjat", "La teva pròpia clau d’API, desada amb codewhale auth set --provider <id>"],
+    ["Gateway", "Un endpoint per a molts models; el proveïdor el continues triant tu"],
+    ["Local", "vLLM, SGLang o Ollama a localhost, normalment sense clau"],
+  ],
+  modelsLink: "Consulta els models i els proveïdors",
+  startHeading: "Instal·la, connecta un model i executa una tasca",
   startLede:
-    "Instal·lar → primera sessió sense claus → connectar un proveïdor → configurar la teva fleet. Els termes es defineixen a la pàgina de vocabulari.",
-  startGuideLink: "Llegeix la guia d’inici →",
-  startVocabularyLink: "Consulta el vocabulari del producte →",
-
-  sealBoundaries: "界",
-  boundariesHeadingA: "El teu model.",
-  boundariesHeadingB: "Els teus límits.",
-  boundariesBody:
-    "Tria explícitament el model, el mode de treball i la postura de permisos. El cost desconegut es declara desconegut, i les superfícies en previsualització es marquen com a tals.",
-  hostedGatewayLocal: "Models allotjats, de gateway i locals",
-  planActOperateDesc: "De la planificació de només lectura a l’operació autònoma",
-  askAutoReviewDesc: "Tria la postura de permisos per a la feina",
-  tuiExecWebDesc: "Superfícies de runtime interactives i sense interfície",
-
-  sealSurfaces: "面",
-  surfacesHeading: "Fes servir el runtime on passa la feina.",
-  surfaces: [
-    ["TUI", "Treball interactiu al terminal"],
-    ["codewhale exec", "Scripts i CI"],
-    ["Client web", "Client de navegador, només loopback"],
-    ["Runtime API + MCP", "Integracions locals"],
-    ["fleet", "Feina multiagent durable"],
+    "Executa la teva primera tasca en tres passos des de la carpeta del projecte. Afegeix un Fleet més endavant si la feina necessita diversos agents.",
+  startGuideLink: "Segueix la guia d’inici",
+  startVocabularyLink: "Consulta el vocabulari del producte",
+  chapterAvailability: "On funciona",
+  availabilityHeading: "Fes servir Codewhale al terminal des d’avui",
+  availabilityLede:
+    "Ja pots fer servir el terminal, el client de navegador local o la interfície CodeWhale GUI de la comunitat. L’aplicació d’escriptori i l’aplicació web allotjada reconstruïda estan en desenvolupament i comparteixen el mateix model de sessió.",
+  availability: [
+    [
+      "Terminal i navegador local",
+      "Publicat",
+      "Instal·la’l a Linux, macOS o Windows i després executa codewhale, o codewhale web per al client de navegador local. npm i Cargo també funcionen; Android amb Termux és una vista prèvia."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Disponible",
+      "Un projecte independent mantingut per la comunitat: xat, fils i canvis de fitxers en una barra lateral del VS Code sobre el mateix Codewhale Runtime. Instal·la-la des del VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
+    ],
+    [
+      "Aplicació web allotjada",
+      "Vista prèvia de desenvolupament",
+      "S’està reconstruint per igualar l’aplicació d’escriptori. Avui pots iniciar sessió i després escriure /rc en una sessió de terminal en execució per continuar-la al web; l’execució de tasques allotjades encara s’està validant."
+    ],
+    [
+      "Escriptori",
+      "Build de desenvolupament",
+      "L’aplicació nativa que s’està convertint en el client principal de Codewhale: carpetes, converses i connexions de models en una sola finestra. Encara no hi ha cap descàrrega pública."
+    ],
+    [
+      "Ordinadors al núvol",
+      "En desenvolupament",
+      "Ordinadors allotjats que executen les teves tasques."
+    ]
   ],
-  runtimeLink: "Veure les superfícies del runtime i les notes d’estabilitat →",
-
-  installBandHeading: "Comença amb una sola ordre.",
+  availabilityNote:
+    "El terminal, el navegador local i la GUI no necessiten cap compte de Codewhale. La web allotjada i l’escriptori fan servir un compte, que no substitueix la connexió amb el teu model; el teu proveïdor factura l’ús amb la teva pròpia clau.",
+  accountLink: "Crear un compte",
+  surfacesHeading: "Amplia allò a què pot accedir l’agent",
+  surfaces: [
+    ["Fitxers i ordres", "Llegeix el projecte, edita fitxers, executa proves i revisa la sortida dins dels permisos que defineixis."],
+    ["Plugins i MCP", "Connecta més eines i serveis. Cada plugin roman desactivat fins que el revisis i l’activis."],
+    ["Computer Use · vista prèvia", "Un plugin que permet a l’agent veure i fer servir altres aplicacions. Tu l’actives i concedeixes els permisos del sistema que demana."],
+    ["Sessions desades", "Mantén junts la conversa i els resultats de les eines, i reprèn la feina en lloc de començar de nou. El navegador local obre la mateixa sessió al teu ordinador."],
+    ["Fleet", "Assigna parts d’una tasca a agents amb models i rols diferents, i després segueix-ne el progrés."],
+  ],
+  runtimeLink: "Consulta totes les integracions",
+  installBandHeading: "Instal·la a macOS o Linux",
+  copy: "Copia",
+  copied: "Copiat ✓",
   binaries: "Binaris",
   chinaMirrors: "Mirrors a la Xina",
-  installGuideLink: "Llegeix la guia d’instal·lació →",
-
-  sealCommunity: "众",
-  communityHeading: "Construït en públic",
+  installGuideLink: "Llegeix la guia d’instal·lació",
+  communityHeading: "Construeix Codewhale amb nosaltres",
   communityBody:
-    "Amb llicència MIT i format per col·laboradors de runtimes, proveïdors, plataformes, documentació i tests.",
+    "Informa d’un error, proposa una funció o envia el teu primer pull request a GitHub. Les correccions petites i provades són benvingudes.",
   communityLinksAria: "Enllaços de la comunitat",
-  contribute: "Col·labora",
+  contribute: "Enviar un pull request",
 };

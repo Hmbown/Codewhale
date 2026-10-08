@@ -1,10 +1,12 @@
 # Localization Matrix
 
+> 阅读简体中文版：[zh_hans/LOCALIZATION.md](zh_hans/LOCALIZATION.md)。
+
 Canonical tracking document for every locale Codewhale ships, is actively
 building, is planning, or has explicitly deferred.
 
 > **Scope note (2026-07-12):** this matrix covers three surfaces — the TUI
-> locale packs (`crates/tui/locales/`), the translated READMEs (repo root),
+> locale packs (`crates/localization/locales/`), the translated READMEs (repo root),
 > and the website (`web/`). The three ship on different cadences, so a
 > locale can be **shipped** on one surface and **planned** on another; the
 > per-surface tables below are the per-surface truth. The website registry
@@ -36,30 +38,30 @@ Source-of-truth README: `README.md` (English, post-#3087).
 
 ## TUI locale packs
 
-The TUI packs under `crates/tui/locales/` are the largest translation
+The TUI packs under `crates/localization/locales/` are the largest translation
 surface in the repo. `en.json` is the reference; a pack is **complete**
 only at exact raw key parity with it, enforced by
 `scripts/check-tui-locale-parity.py` (CI) and the parity tests in
-`crates/tui/src/localization.rs`. See `crates/tui/locales/AGENTS.md` for the
+`crates/localization/src/lib.rs`. See `crates/localization/locales/AGENTS.md` for the
 authoring contract.
 
-| Locale | File | Keys vs `en.json` (1299) | Status | Notes |
+| Locale | File | Keys vs `en.json` | Status | Notes |
 |--------|------|--------------------------|--------|-------|
-| English | `en.json` | 1299/1299 | **shipped** | Reference pack. |
-| Japanese | `ja.json` | 1299/1299 | **shipped** | Complete. |
-| Simplified Chinese | `zh-Hans.json` | 1299/1299 | **shipped** | Complete. |
-| Traditional Chinese | `zh-Hant.json` | 1299/1299 | **shipped** | Complete (#5143). Awaiting native-speaker review. |
-| Brazilian Portuguese | `pt-BR.json` | 1299/1299 | **shipped** | Complete. |
-| Latin American Spanish | `es-419.json` | 1299/1299 | **shipped** | Complete. Note the website tracks `es` — the shipped TUI pack is Latin American Spanish, not `es-ES`. |
-| Vietnamese | `vi.json` | 1299/1299 | **shipped** | Complete. |
-| Korean | `ko.json` | 1299/1299 | **shipped** | Complete. |
-| Catalan | `ca.json` | 1299/1299 | **shipped** | Complete (#4749/#4788). Awaiting native-speaker review. |
-| German | `de.json` | 1299/1299 | **shipped** | Complete (#4788). Awaiting native-speaker review. |
-| French | `fr.json` | 1299/1299 | **shipped** | Complete (#4788). Awaiting native-speaker review. |
-| Indonesian | `id.json` | 1299/1299 | **shipped** | Complete (#4789). Awaiting native-speaker review. |
-| Hindi | `hi.json` | 1299/1299 | **shipped** | Complete (#4790). Devanagari shaping spike: `docs/evidence/v092-devanagari-terminal-shaping.md` — code-level guarantees only; terminal visual QA and native review still open. |
-| Russian | `ru.json` | 1299/1299 | **shipped** | Complete (#3092). Cyrillic script fixtures guard against mixed-language copy. Awaiting native-speaker review. |
-| Ukrainian | `uk.json` | 1299/1299 | **shipped** | Complete (#4791). Cyrillic script fixtures keep it distinct from Russian (no ы/э/ъ; і/ї/є/ґ present). Awaiting native-speaker review. |
+| English | `en.json` | all | **shipped** | Reference pack. |
+| Japanese | `ja.json` | all | **shipped** | Complete. |
+| Simplified Chinese | `zh-Hans.json` | all | **shipped** | Complete. |
+| Traditional Chinese | `zh-Hant.json` | all | **shipped** | Complete (#5143). Awaiting native-speaker review. |
+| Brazilian Portuguese | `pt-BR.json` | all | **shipped** | Complete. |
+| Latin American Spanish | `es-419.json` | all | **shipped** | Complete. Note the website tracks `es` — the shipped TUI pack is Latin American Spanish, not `es-ES`. |
+| Vietnamese | `vi.json` | all | **shipped** | Complete. |
+| Korean | `ko.json` | all | **shipped** | Complete. |
+| Catalan | `ca.json` | all | **shipped** | Complete (#4749/#4788). Awaiting native-speaker review. |
+| German | `de.json` | all | **shipped** | Complete (#4788). Awaiting native-speaker review. |
+| French | `fr.json` | all | **shipped** | Complete (#4788). Awaiting native-speaker review. |
+| Indonesian | `id.json` | all | **shipped** | Complete (#4789). Awaiting native-speaker review. |
+| Hindi | `hi.json` | all | **shipped** | Complete (#4790). The Devanagari shaping spike (moved out of this repository in `7242381022`) gave code-level guarantees only; terminal visual QA and native review still open. |
+| Russian | `ru.json` | all | **shipped** | Complete (#3092). Cyrillic script fixtures guard against mixed-language copy. Awaiting native-speaker review. |
+| Ukrainian | `uk.json` | all | **shipped** | Complete (#4791). Cyrillic script fixtures keep it distinct from Russian (no ы/э/ъ; і/ї/є/ґ present). Awaiting native-speaker review. |
 
 ## Website locales
 
@@ -90,7 +92,7 @@ Runtime stays the dictionaries above — do not add `gt-next` beside them.
 writes reviewed JSON back to website dictionary TS only. `translate` is
 fail-closed unless BYOK `GT_API_KEY` and `GT_PROJECT_ID` are set in the
 environment — never commit those values, never point this config at
-`crates/tui/locales`, and never wrap model completions. `gt generate` is
+`crates/localization/locales`, and never wrap model completions. `gt generate` is
 not used: it is a framework JSX scanner, not a JSON-catalog tool.
 Reference shape: **`ChromeDict` 52 keys, `HomeDict` 62 keys.** Bilingual
 secondary nav labels, the masthead seal and issue line, the ticker live
@@ -159,7 +161,7 @@ what the `(partial)` badge is honest about.
 
 | Check | Tool | Status |
 |-------|------|--------|
-| TUI pack key parity with `en.json` (complete packs) | `scripts/check-tui-locale-parity.py` + parity tests in `crates/tui/src/localization.rs` | **Shipped** (CI Lint job) |
+| TUI pack key parity with `en.json` (complete packs) | `scripts/check-tui-locale-parity.py` + parity tests in `crates/localization/src/lib.rs` | **Shipped** (CI Lint job) |
 | README translations stay in sync with `README.md` | `scripts/check-readme-translations.py` | **Shipped** (CI Lint job) |
 | README locale links symmetric | `scripts/check-readme-locales.sh` | **Shipped** (CI Lint job) |
 | Website dictionaries cover every routed locale except the `en` reference | `npm run check:locales` + `web/lib/i18n/dictionaries.test.ts` | **Shipped** (#3091, extended to `zh` in #4934) |
@@ -168,10 +170,10 @@ what the `(partial)` badge is honest about.
 | Accept-Language routes deterministically to all routed locales | `web/lib/i18n/detect.test.ts` (middleware delegates to `lib/i18n/detect.ts`) | **Shipped** (#3091) |
 | Locale selector lists all routed locales with partial badges | `web/lib/i18n/config.test.ts` (switcher + router derive from one registry) | **Shipped** (#3091) |
 | hreflang alternates cover every routed locale | `web/lib/page-meta.test.ts` | **Shipped** (#3091) |
-| Cyrillic packs stay script-pure (no mixed-language copy, ru≠uk) | `cyrillic_packs_have_script_purity_and_no_mixed_language_fixtures` in `crates/tui/src/localization.rs` + `dictionaries.test.ts` | **Shipped** (#3092/#4791) |
-| Devanagari grapheme-safe clip/wrap at 40/60/80 columns | `truncate_to_width_never_splits_devanagari_clusters` + width fixtures in `crates/tui/src/localization.rs` | **Shipped** (#4790) |
+| Cyrillic packs stay script-pure (no mixed-language copy, ru≠uk) | `cyrillic_packs_have_script_purity_and_no_mixed_language_fixtures` in `crates/localization/src/lib.rs` + `dictionaries.test.ts` | **Shipped** (#3092/#4791) |
+| Devanagari grapheme-safe clip/wrap at 40/60/80 columns | `truncate_to_width_never_splits_devanagari_clusters` + width fixtures in `crates/localization/src/lib.rs` | **Shipped** (#4790) |
 | Adding a UI locale never changes model-visible prompt bytes | `v092_locales_add_no_prompt_bookends_so_prompt_bytes_stay_stable` in `crates/tui/src/prompts.rs` | **Shipped** (cache-stability contract) |
-| No shipped locale renders a missing-message marker | `no_shipped_locale_renders_a_missing_message_marker` in `crates/tui/src/localization.rs` | **Shipped** |
+| No shipped locale renders a missing-message marker | `no_shipped_locale_renders_a_missing_message_marker` in `crates/localization/src/lib.rs` | **Shipped** |
 
 ## How to add a locale
 
@@ -180,21 +182,30 @@ carry an explicit `planned`/`partial`/`deferred` row in this matrix.
 
 ### 1. TUI pack
 
-1. Create `crates/tui/locales/<tag>.json` with every key in `en.json`,
-   following `crates/tui/locales/AGENTS.md` (placeholders stay literal;
+1. Create `crates/localization/locales/<tag>.json` with every key in `en.json`,
+   following `crates/localization/locales/AGENTS.md` (placeholders stay literal;
    product terms stay English per pack convention; preserve intentional
    leading/trailing spaces).
 2. Add the `Locale` variant plus its `tag`/`translation_target_name`/
    `parse_locale`/`shipped`/`shipped_complete` arms in
-   `crates/tui/src/localization.rs`, and the `include_str!` arm in the
+   `crates/localization/src/lib.rs`, and the `include_str!` arm in the
    test module.
-3. Wire the typed settings schema (`UiLocale` in
-   `crates/tui/src/config_ui.rs`) plus the pickers and displays that enumerate
-   locales: onboarding language picker
-   (`crates/tui/src/tui/onboarding/language.rs` — a test forces every shipped
-   locale to be offered), setup-wizard match arms, and the locale display arms
-   in the `/config` and changelog commands. Keep the schema/round-trip invariant
-   tied to `Locale::shipped()` so these surfaces cannot silently drift.
+3. Wire the surfaces that still enumerate locales by hand. The `locale`
+   setting is a plain string row in `crates/config/src/settings_schema.rs`,
+   validated by `normalize_configured_locale` (which reuses `parse_locale`
+   from step 2), and the `/config` value list (`config_choice_values` in
+   `crates/tui/src/tui/views/mod.rs`) and hint text
+   (`configured_locale_values`) derive from `Locale::shipped()`, so those need
+   no edit. The exhaustive `match` arms the compiler will point at are the
+   setup wizard (`crates/tui/src/tui/setup/mod.rs`), `locale_display` in
+   `crates/tui/src/commands/groups/config/config.rs`, and
+   `public_site_locale_segment` (the `/links` site path) in
+   `crates/tui/src/commands/groups/core/core.rs`. Add a `LANGUAGE_OPTIONS`
+   entry to the onboarding language picker
+   (`crates/tui/src/tui/onboarding/language.rs`); its
+   `picker_offers_every_shipped_locale` test fails until you do. Several no-English-leak tests
+   (for example in `status_picker.rs` and `tool_card.rs`) list locales
+   explicitly; add the new tag there when the pack is complete.
 4. Run `python3 scripts/check-tui-locale-parity.py` and
    `cargo test -p codewhale-tui localization`.
 5. If the pack must ship incomplete, declare it partial: keep it out of

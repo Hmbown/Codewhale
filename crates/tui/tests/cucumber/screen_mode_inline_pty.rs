@@ -31,6 +31,97 @@ const SETTLE_WAIT: Duration = Duration::from_secs(5);
 const LIVE_SHELL_SENTINEL: &str = "Type a message";
 
 #[test]
+fn offline_queue_late_unbracketed_submit_keeps_composer_and_commands_responsive() {
+    // #5999 requires the burst heuristic to stay armed: type_line() uses
+    // bracketed paste and would hide the original queue/session-id wedge.
+    for (rows, cols) in [(24, 80), (32, 100)] {
+        for delay_ms in [150, 250, 400] {
+            let workspace = make_sealed_workspace().expect("sealed workspace");
+            std::fs::write(workspace.home().join(".codewhale/.onboarded"), "")
+                .expect("onboarded marker");
+            let trust_dir = workspace.workspace().join(".deepseek");
+            std::fs::create_dir_all(&trust_dir).expect("workspace trust dir");
+            std::fs::write(trust_dir.join("trusted"), "").expect("workspace trust marker");
+            let mut tui = Harness::builder(Harness::codewhale_binary())
+                .cwd(workspace.workspace())
+                .clear_env()
+                .seal_home(workspace.home())
+                .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
+                .env("CODEWHALE_NO_UPDATE_CHECK", "1")
+                .env("NO_ANIMATIONS", "1")
+                .args([
+                    "--workspace",
+                    workspace.workspace().to_str().expect("workspace UTF-8"),
+                    "--no-project-config",
+                    "--fresh",
+                ])
+                .size(rows, cols)
+                .spawn()
+                .expect("start offline TUI");
+
+            wait_or_panic(
+                &mut tui,
+                "Choose your model provider",
+                STARTUP_WAIT,
+                "provider",
+            );
+            tui.send(keys::key::ctrl('o')).expect("Explore Offline");
+            wait_or_panic(&mut tui, "You're ready.", SETTLE_WAIT, "offline ready");
+            tui.send(keys::key::enter()).expect("leave onboarding");
+            wait_or_panic(&mut tui, "New session", STARTUP_WAIT, "launch card");
+            tui.wait_for_idle(Duration::from_millis(100), SETTLE_WAIT)
+                .expect("composer ready");
+            tui.send(keys::key::ctrl('u'))
+                .expect("clear suggested prompt");
+
+            tui.send(keys::key::text("late queue draft"))
+                .expect("raw prompt bytes");
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            tui.send(keys::key::enter()).expect("late submit");
+            wait_or_panic(
+                &mut tui,
+                "Queued #1",
+                STARTUP_WAIT,
+                &format!("offline queue receipt ({cols}x{rows}, {delay_ms}ms submit)"),
+            );
+
+            tui.send(keys::key::ctrl('u')).expect("clear queued draft");
+            tui.send(keys::key::text("input is still live"))
+                .expect("type after queued submit");
+            wait_or_panic(
+                &mut tui,
+                "input is still live",
+                SETTLE_WAIT,
+                "composer liveness",
+            );
+            tui.send(keys::key::ctrl('u'))
+                .expect("clear liveness probe");
+            tui.wait_for(|frame| !frame.contains("input is still live"), SETTLE_WAIT)
+                .expect("Ctrl+U still clears the composer");
+            tui.send(keys::key::text("/queue drop 1"))
+                .expect("type queue command");
+            // Keep the heuristic armed, but let this raw command's burst
+            // settle before Enter so it is not a pasted newline.
+            tui.wait_for_idle(Duration::from_millis(300), SETTLE_WAIT)
+                .expect("queue command settles");
+            tui.send(keys::key::enter()).expect("execute queue command");
+            wait_or_panic(
+                &mut tui,
+                "Dropped queued message",
+                SETTLE_WAIT,
+                "command liveness",
+            );
+            assert!(
+                !tui.frame().contains("engine session id diverged"),
+                "{cols}x{rows}, {delay_ms}ms submit: {}",
+                tui.diagnostics()
+            );
+            tui.shutdown();
+        }
+    }
+}
+
+#[test]
 fn inline_start_never_takes_the_alternate_screen_and_screen_commands_switch_it() {
     let workspace = make_sealed_workspace().expect("sealed workspace");
     std::fs::write(workspace.home().join(".codewhale/.onboarded"), "").expect("onboarded marker");
@@ -46,7 +137,7 @@ fn inline_start_never_takes_the_alternate_screen_and_screen_commands_switch_it()
         std::fs::write(&path, config).expect("seed inline screen mode");
     }
 
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -80,7 +171,23 @@ fn inline_start_never_takes_the_alternate_screen_and_screen_commands_switch_it()
         tui.diagnostics()
     );
 
-    // Claim 2: `/fullscreen` takes the alternate screen in-process.
+    // Claim 2: `/fullscreen` takes the alternate screen in-process. In
+    // Explore Offline the first prompt is parked by the offline queue
+    // ("Queued #1 … Enter send now"), and while a queued draft is held the
+    // composer answers to the queue — a follow-up command's Enter would
+    // send the draft instead of executing the command. Drop the queue
+    // first, exactly the way the footer tells a human to.
+    if tui.frame().contains("Queued #1") {
+        tui.send(keys::key::text("/queue drop 1"))
+            .expect("type /queue drop 1");
+        tui.send(keys::key::enter()).expect("submit /queue drop 1");
+        wait_or_panic(
+            &mut tui,
+            "Dropped queued message",
+            Duration::from_secs(20),
+            "queue drop receipt",
+        );
+    }
     tui.send(keys::key::ctrl('u')).expect("clear seeded input");
     tui.send(keys::key::text("/fullscreen"))
         .expect("type /fullscreen");
@@ -145,9 +252,10 @@ fn enter_live_shell(tui: &mut Harness) {
     wait_or_panic(tui, "New session", STARTUP_WAIT, "launch card");
     // Typing goes straight to the composer; Enter sends the first message
     // and the session begins (the card dissolved on the first keystroke).
-    tui.send("start the session")
-        .expect("type the first prompt");
-    tui.send(keys::key::enter()).expect("send the first prompt");
+    // type_line, not send+enter: a zero-gap PTY write is paste-classified
+    // and the immediate Enter would be absorbed as a pasted newline.
+    tui.type_line("start the session")
+        .expect("type and send the first prompt");
     if tui
         .wait_for(|frame| !frame.text().contains('\u{2442}'), STARTUP_WAIT)
         .is_err()

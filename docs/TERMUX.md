@@ -1,5 +1,7 @@
 # Termux / Android arm64 Support
 
+> 阅读简体中文版：[zh_hans/TERMUX.md](zh_hans/TERMUX.md)。
+
 Codewhale provides an Android arm64 build and archive path for
 [Termux](https://termux.dev). Treat Termux support as a preview until the
 real-device runtime QA tracked in #4236 and #4242 is complete. This document
@@ -8,19 +10,26 @@ should know about.
 
 ## Installation
 
-See [`INSTALL.md`](./INSTALL.md) → "Android / Termux arm64" for the current
-install steps. The short version:
+Use the Android-specific GitHub release archive. The
+[v0.9.11 release](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
+includes `codewhale-android-arm64.tar.gz`; device support remains **preview**.
+Follow [the Android / Termux installation steps](INSTALL.md#android--termux-arm64-preview)
+to verify the archive against the matching `codewhale-bundles-sha256.txt`, then
+run the bundled installer with `PREFIX="$PREFIX"` so commands go into
+`$PREFIX/bin`. Use `codewhale update` for an existing direct installation;
+keep package-managed files under their package manager's control.
+
+If a release has no compatible Android archive or you are validating a source
+build, Cargo remains a preview fallback inside Termux:
 
 ```sh
-# Inside Termux (pkg install rust git ...)
+pkg install -y rust clang pkg-config make git
 cargo install codewhale-cli --locked
 ```
 
-Or, when a release includes `codewhale-android-arm64.tar.gz`, extract it
-into `$PREFIX/bin`.
-
-> **Do not** install the GNU libc `codewhale-linux-arm64` archive in Termux.
-> Android uses Bionic libc, not glibc — the Linux binary will not run.
+The general macOS/Linux web installer is not the Android installation route.
+Do not install `codewhale-linux-arm64` in Termux: Android uses Bionic libc and
+a separate build target. A Linux release asset is not an Android binary.
 
 ## Platform behavior on Android
 

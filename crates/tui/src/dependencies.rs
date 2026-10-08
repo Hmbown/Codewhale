@@ -68,20 +68,9 @@ pub fn probe_executable_with_flag(spec: &str, version_flag: &str) -> bool {
     let Some(program) = parts.next() else {
         return false;
     };
-    let mut cmd = Command::new(program);
-    crate::utils::suppress_console_window(&mut cmd);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    cmd.arg(version_flag);
-
-    // Silence the subprocess's stdout/stderr — the version banner would
-    // otherwise print to our terminal during startup, which is
-    // confusing on the TUI's first frame.
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-
-    matches!(cmd.status(), Ok(status) if status.success())
+    let mut cmd = version_probe_command(program);
+    cmd.args(parts).arg(version_flag);
+    matches!(probe_output(&mut cmd, false, VERSION_PROBE_TIMEOUT), Ok(output) if output.status.success())
 }
 
 /// Probe a single executable and capture its version banner in one spawn.
@@ -92,15 +81,9 @@ pub fn probe_executable_with_flag(spec: &str, version_flag: &str) -> bool {
 pub fn probe_executable_capturing(spec: &str, version_flag: &str) -> Option<String> {
     let mut parts = spec.split_whitespace();
     let program = parts.next()?;
-    let mut cmd = Command::new(program);
-    crate::utils::suppress_console_window(&mut cmd);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    cmd.arg(version_flag);
-    cmd.stderr(std::process::Stdio::null());
-
-    let output = cmd.output().ok()?;
+    let mut cmd = version_probe_command(program);
+    cmd.args(parts).arg(version_flag);
+    let output = probe_output(&mut cmd, true, VERSION_PROBE_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -108,6 +91,104 @@ pub fn probe_executable_capturing(spec: &str, version_flag: &str) -> Option<Stri
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const VERSION_PROBE_MAX_OUTPUT: u64 = 16 * 1024;
+
+fn version_probe_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    crate::utils::suppress_console_window(&mut cmd);
+    crate::child_env::apply_to_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+    // A presence probe needs no bootstrap code or import paths from the
+    // parent. The general child allowlist retains these for normal SDK tools.
+    for key in ["NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "RUSTC_WRAPPER"] {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+/// Version/help probes never inherit stdin, retain unbounded banners, or leave
+/// a normal descendant alive after their deadline. No runtime is constructed.
+fn probe_output(
+    command: &mut Command,
+    capture: bool,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use wait_timeout::ChildExt;
+    command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let (mut child, tree) = crate::process_tree::spawn_contained_std(command)?;
+    let mut tree = Some(tree);
+    let result = (|| {
+        let reader = if capture {
+            let pipe = child
+                .stdout
+                .take()
+                .ok_or_else(|| std::io::Error::other("version probe stdout missing"))?;
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("version-probe-output".into())
+                .spawn(move || {
+                    let mut bytes = Vec::new();
+                    let result = pipe
+                        .take(VERSION_PROBE_MAX_OUTPUT + 1)
+                        .read_to_end(&mut bytes)
+                        .and_then(|_| {
+                            if bytes.len() as u64 > VERSION_PROBE_MAX_OUTPUT {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "version probe output exceeded limit",
+                                ))
+                            } else {
+                                Ok(bytes)
+                            }
+                        });
+                    let _ = tx.send(result);
+                })?;
+            Some(rx)
+        } else {
+            None
+        };
+        let status = child.wait_timeout(timeout)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "version probe did not finish before its deadline",
+            )
+        })?;
+        // A successful parent may leave an inherited pipe open in a child.
+        drop(tree.take());
+        let stdout = match reader {
+            Some(reader) => reader
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "version probe pipe did not close",
+                    )
+                })??,
+            None => Vec::new(),
+        };
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
+    })();
+    if result.is_err() {
+        drop(tree.take());
+        let _ = child.kill();
+        let _ = child.wait_timeout(std::time::Duration::from_millis(250));
+    }
+    result
 }
 
 fn executable_path_candidates(program: &str) -> Vec<PathBuf> {
@@ -151,13 +232,11 @@ fn resolve_executable_path(spec: &str, version_flag: &str) -> Option<String> {
             continue;
         }
 
-        let mut cmd = Command::new(&candidate);
-        cmd.args(&args)
-            .arg(version_flag)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        let mut cmd = version_probe_command(&candidate);
+        cmd.args(&args).arg(version_flag);
 
-        if matches!(cmd.status(), Ok(status) if status.success()) {
+        if matches!(probe_output(&mut cmd, false, VERSION_PROBE_TIMEOUT), Ok(output) if output.status.success())
+        {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }
@@ -269,6 +348,49 @@ pub fn resolve_pandoc() -> Option<String> {
         .clone()
 }
 
+/// Whether an optional tool whose backend lives on this host (an interpreter,
+/// a converter, an OCR engine) is available: `probe` decides, except that a
+/// conformance replay answers with the recorded host's set so goldens do not
+/// depend on what the machine running them has installed (test builds only).
+pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> bool {
+    #[cfg(all(test, unix))]
+    if let Some(available) = RECORDED_HOST_TOOLS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|tools| tools.iter().any(|name| name == tool))
+    }) {
+        return available;
+    }
+    // Only a conformance replay reads the name.
+    #[cfg(not(all(test, unix)))]
+    let _ = tool;
+    probe()
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static RECORDED_HOST_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Pin [`host_tool_available`] on this thread to a recorded host's tools until
+/// the guard drops.
+#[cfg(all(test, unix))]
+pub(crate) fn pin_recorded_host_tools(tools: Vec<String>) -> RecordedHostToolsGuard {
+    RECORDED_HOST_TOOLS.with(|cell| *cell.borrow_mut() = Some(tools));
+    RecordedHostToolsGuard
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct RecordedHostToolsGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for RecordedHostToolsGuard {
+    fn drop(&mut self) {
+        RECORDED_HOST_TOOLS.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Resolve the Node.js runtime once per process. Used by the
 /// `js_execution` tool to decide whether to advertise itself in
 /// the catalog. Unlike Python, the executable name `node` is the
@@ -294,6 +416,559 @@ pub fn resolve_node() -> Option<String> {
             }
         })
         .clone()
+}
+
+/// A Node.js runtime chosen by *running* each candidate, plus every candidate
+/// rejected on the way and why (for `/plugin` and doctor diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeResolution {
+    pub selected: Option<(PathBuf, (u32, u32, u32))>,
+    pub rejected: Vec<(PathBuf, String)>,
+}
+
+impl NodeResolution {
+    /// One-line human summary of why no `kind` candidate was selected.
+    #[must_use]
+    pub fn describe_rejections(&self, kind: HostRuntimeKind) -> String {
+        if self.rejected.is_empty() {
+            return format!("no `{}` found {}", kind.name(), kind.search_scope());
+        }
+        self.rejected
+            .iter()
+            .map(|(path, reason)| format!("{}: {reason}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// `major.minor.patch` at the start of `text`, ignoring any pre-release or
+/// build suffix (`1.4.2-canary.3+abc`).
+fn parse_version_triple(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.split(['.', '-', '+']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Parse `node --version` output (`v22.20.0`).
+#[must_use]
+pub fn parse_node_version(banner: &str) -> Option<(u32, u32, u32)> {
+    parse_version_triple(banner.trim().strip_prefix('v')?)
+}
+
+/// Whether `version` satisfies the extension host floor `^22.19 || >=24`
+/// (the DSH `engines` range: odd-numbered 23 is not an LTS line).
+#[must_use]
+pub fn node_version_supported_for_extension_host(version: (u32, u32, u32)) -> bool {
+    let (major, minor, _) = version;
+    (major == 22 && minor >= 19) || major >= 24
+}
+
+/// Parse `bun --version` output (`1.4.0`, or `1.4.0-canary.1+abc`).
+#[must_use]
+pub fn parse_bun_version(banner: &str) -> Option<(u32, u32, u32)> {
+    parse_version_triple(banner.trim())
+}
+
+/// The oldest Bun the extension host accepts. The `Bun.plugin` module shim,
+/// `--no-install`, `--no-env-file`, the macOS jetsam memory limit and the
+/// native-code lockdown were measured against Bun 1.4.0 on macOS 26.1 arm64
+/// only. CI's JS host-suite leg installs Bun 1.4.0 on `ubuntu-latest`; the
+/// Rust host integration tests do not run on Bun in CI, and no Windows Bun
+/// run is recorded. A newer Bun on which a lock no longer holds fails the
+/// host's start (`extension-host/src/runtime.ts`).
+pub const BUN_MIN_VERSION_FOR_EXTENSION_HOST: (u32, u32, u32) = (1, 4, 0);
+
+/// Node flags that switch off builtins able to load native code in-process:
+/// `node:sqlite` (SQLite extensions are `dlopen`ed even under `--no-addons`)
+/// and `node:ffi` (on by default where it exists: Node 26.10 has it, 22.20 and
+/// 24.19 reject the flag). Each is passed only when the chosen Node accepts
+/// it; the host refuses to start if either builtin is still available.
+pub const NODE_NATIVE_CODE_FLAGS: &[&str] = &["--no-experimental-sqlite", "--no-experimental-ffi"];
+
+/// A JavaScript runtime that can run the extension host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRuntimeKind {
+    Bun,
+    Node,
+}
+
+impl HostRuntimeKind {
+    /// The name the host reports in `host/hello` (`bun` / `node`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bun => "bun",
+            Self::Node => "node",
+        }
+    }
+
+    fn program(self) -> &'static str {
+        match (self, cfg!(windows)) {
+            (Self::Bun, false) => "bun",
+            (Self::Bun, true) => "bun.exe",
+            (Self::Node, false) => "node",
+            (Self::Node, true) => "node.exe",
+        }
+    }
+
+    fn floor(self) -> String {
+        match self {
+            Self::Bun => {
+                let (major, minor, patch) = BUN_MIN_VERSION_FOR_EXTENSION_HOST;
+                format!(">={major}.{minor}.{patch}")
+            }
+            // `node_version_supported_for_extension_host`.
+            Self::Node => "^22.19 || >=24".to_string(),
+        }
+    }
+
+    /// Where a search for this runtime looks ([`runtime_candidates`]).
+    fn search_scope(self) -> &'static str {
+        match self {
+            Self::Bun => "on PATH or in $BUN_INSTALL/bin (default ~/.bun/bin)",
+            Self::Node => "on PATH",
+        }
+    }
+
+    fn parse(self, banner: &str) -> Option<(u32, u32, u32)> {
+        match self {
+            Self::Bun => parse_bun_version(banner),
+            Self::Node => parse_node_version(banner),
+        }
+    }
+
+    fn supported(self, version: (u32, u32, u32)) -> bool {
+        match self {
+            Self::Bun => version >= BUN_MIN_VERSION_FOR_EXTENSION_HOST,
+            Self::Node => node_version_supported_for_extension_host(version),
+        }
+    }
+}
+
+/// The runtime chosen for the extension host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntime {
+    pub kind: HostRuntimeKind,
+    pub path: PathBuf,
+    pub version: (u32, u32, u32),
+    /// Node: the [`NODE_NATIVE_CODE_FLAGS`] this Node accepts. Empty for Bun.
+    pub native_code_flags: Vec<&'static str>,
+    /// The canonical host entry is embedded in this Bun executable.
+    pub compiled: bool,
+}
+
+impl HostRuntime {
+    #[must_use]
+    pub fn version_string(&self) -> String {
+        let (major, minor, patch) = self.version;
+        format!("{major}.{minor}.{patch}")
+    }
+
+    /// Whether a version the running host reported (`process.versions.bun`
+    /// or `process.versions.node`: no `v`, maybe a pre-release suffix) is the
+    /// version this runtime's probe saw.
+    #[must_use]
+    pub fn reports_version(&self, reported: &str) -> bool {
+        parse_version_triple(reported.trim().trim_start_matches('v')) == Some(self.version)
+    }
+}
+
+/// The outcome of `[extension_host] runtime` selection, with every rejected
+/// candidate (for `/plugin` and doctor). `bun` / `node` are `None` when that
+/// runtime was not probed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeResolution {
+    pub choice: crate::config::ExtensionHostRuntime,
+    pub selected: Option<HostRuntime>,
+    pub bun: Option<NodeResolution>,
+    pub node: Option<NodeResolution>,
+}
+
+impl HostRuntimeResolution {
+    /// One line: what runs the host and why, including why Bun was passed
+    /// over when `auto` fell back to Node, and every candidate of the chosen
+    /// runtime that was skipped or rejected on the way.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let choice = self.choice.as_str();
+        let Some(runtime) = &self.selected else {
+            return self.failure();
+        };
+        let mut line = format!(
+            "{} {} at {} (runtime = \"{choice}\")",
+            runtime.kind.name(),
+            runtime.version_string(),
+            runtime.path.display()
+        );
+        if runtime.compiled {
+            line.push_str("; compiled canonical host (runtime embedded)");
+        }
+        if runtime.kind == HostRuntimeKind::Node
+            && let Some(bun) = &self.bun
+        {
+            line.push_str(&format!(
+                "; Bun {} not used: {}",
+                HostRuntimeKind::Bun.floor(),
+                bun.describe_rejections(HostRuntimeKind::Bun)
+            ));
+        }
+        let probed = match runtime.kind {
+            HostRuntimeKind::Bun => self.bun.as_ref(),
+            HostRuntimeKind::Node => self.node.as_ref(),
+        };
+        if let Some(probed) = probed
+            && !probed.rejected.is_empty()
+        {
+            line.push_str(&format!(
+                "; passed over: {}",
+                probed.describe_rejections(runtime.kind)
+            ));
+        }
+        line
+    }
+
+    /// Why no runtime was selected.
+    #[must_use]
+    pub fn failure(&self) -> String {
+        let mut reasons = Vec::new();
+        if let Some(bun) = &self.bun {
+            reasons.push(format!(
+                "bun: {}",
+                bun.describe_rejections(HostRuntimeKind::Bun)
+            ));
+        }
+        if let Some(node) = &self.node {
+            reasons.push(format!(
+                "node: {}",
+                node.describe_rejections(HostRuntimeKind::Node)
+            ));
+        }
+        let (bun, node) = (HostRuntimeKind::Bun.floor(), HostRuntimeKind::Node.floor());
+        let wanted = match self.choice {
+            crate::config::ExtensionHostRuntime::Auto => {
+                format!("Bun {bun} or Node.js {node} (set `[extension_host] bun` or `node`)")
+            }
+            crate::config::ExtensionHostRuntime::Bun => {
+                format!("Bun {bun} (`runtime = \"bun\"`; set `[extension_host] bun`)")
+            }
+            crate::config::ExtensionHostRuntime::Node => {
+                format!("Node.js {node} (set `[extension_host] node`)")
+            }
+        };
+        format!("the extension host needs {wanted}; {}", reasons.join("; "))
+    }
+}
+
+/// A probe of a runtime binary: no inherited environment (no credentials, no
+/// `NODE_OPTIONS` preloads), since it runs unsandboxed; Windows needs
+/// `SystemRoot` to load system DLLs.
+fn probe_command(path: &Path) -> Command {
+    let mut cmd = Command::new(path);
+    crate::utils::suppress_console_window(&mut cmd);
+    cmd.env_clear();
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+fn probe_runtime_version(kind: HostRuntimeKind, path: &Path) -> Result<(u32, u32, u32), String> {
+    // Only absolute candidates are run: a relative `PATH` entry resolves
+    // against the current (workspace) directory, where a repository could
+    // plant a `node`.
+    if !path.is_absolute() {
+        return Err("not an absolute path; skipped".to_string());
+    }
+    let mut cmd = probe_command(path);
+    let compiled = kind == HostRuntimeKind::Bun && is_compiled_host_path(path);
+    cmd.arg(if compiled {
+        "--codewhale-host-info"
+    } else {
+        "--version"
+    });
+    let output = probe_output(&mut cmd, true, VERSION_PROBE_TIMEOUT)
+        .map_err(|error| format!("does not start ({error})"))?;
+    if !output.status.success() {
+        return Err(format!("does not run (exit {})", output.status));
+    }
+    if compiled {
+        return parse_compiled_host_info(&output.stdout, crate::extension_host::bundle_sha256());
+    }
+    let banner = String::from_utf8_lossy(&output.stdout);
+    kind.parse(&banner)
+        .ok_or_else(|| format!("unrecognized version banner `{}`", banner.trim()))
+}
+
+/// A packaged host is adjacent to the running Engine, not searched in a
+/// repository or downloaded at launch. Explicit runtime overrides remain sole
+/// candidates; `runtime = "node"` never probes this optional Bun image.
+fn compiled_host_candidate() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let candidate = executable.parent()?.join(if cfg!(windows) {
+        "codewhale-extension-host.exe"
+    } else {
+        "codewhale-extension-host"
+    });
+    candidate.is_file().then_some(candidate)
+}
+
+fn is_compiled_host_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == "codewhale-extension-host" || name == "codewhale-extension-host.exe"
+    })
+}
+
+fn parse_compiled_host_info(
+    bytes: &[u8],
+    expected_source: &str,
+) -> Result<(u32, u32, u32), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Info {
+        kind: String,
+        runtime: String,
+        platform: String,
+        arch: String,
+        version: String,
+        bundle_sha256: String,
+    }
+    if bytes.len() > 4096 {
+        return Err("compiled host identity exceeds 4096 bytes".to_string());
+    }
+    let info: Info = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid compiled host identity ({error})"))?;
+    if info.kind != "codewhale-extension-host" || info.runtime != "bun" {
+        return Err("executable is not a compiled Bun extension host".to_string());
+    }
+    let expected_platform = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        os => os,
+    };
+    let expected_arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        arch => arch,
+    };
+    if info.platform != expected_platform || info.arch != expected_arch {
+        return Err("compiled host executed target differs from this Engine".to_string());
+    }
+    if info.bundle_sha256 != expected_source {
+        return Err("compiled host source digest differs from this Engine; reinstall matching release assets or choose a system runtime".to_string());
+    }
+    parse_bun_version(&info.version).ok_or_else(|| "invalid compiled Bun version".to_string())
+}
+
+/// Every `program` on `PATH`; for Bun also its default install location
+/// (`$BUN_INSTALL/bin`, else `~/.bun/bin`), which the Bun installer adds to
+/// shell profiles but a GUI-launched process may not see.
+fn runtime_candidates(kind: HostRuntimeKind) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = executable_path_candidates(kind.program())
+        .into_iter()
+        .filter(|candidate| candidate.is_file())
+        .collect();
+    if kind == HostRuntimeKind::Bun {
+        let install = std::env::var_os("BUN_INSTALL")
+            .map(PathBuf::from)
+            .or_else(|| codewhale_paths::user_home().map(|home| home.join(".bun")));
+        if let Some(bin) = install.map(|root| root.join("bin").join(kind.program()))
+            && bin.is_file()
+        {
+            candidates.push(bin);
+        }
+    }
+    candidates
+}
+
+/// Why a runtime found by *searching* must not be run: it sits in a
+/// `node_modules` tree (a package's bin shim, such as
+/// `node_modules/.bin/bun`), or inside the current working directory (usually
+/// the workspace), where a repository could plant it. Either would run
+/// unsandboxed as a version probe and then host plugin code. A configured
+/// override is never checked: naming a path is the opt-in.
+///
+/// Known limits: a working directory that contains the user's home (a
+/// launch from `~`, or from `/` as GUI apps are) is not treated as a
+/// workspace, because every user-level install lives under it, so a runtime
+/// planted directly there is not caught. The `node_modules` test reads the
+/// `PATH` spelling, not the resolved target, so a global npm install reached
+/// through a symlink outside `node_modules` still counts as trusted.
+fn untrusted_location(
+    kind: HostRuntimeKind,
+    candidate: &Path,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<String> {
+    let opt_in = format!("set `[extension_host] {}` to use it anyway", kind.name());
+    if candidate
+        .components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("node_modules"))
+    {
+        return Some(format!(
+            "inside a `node_modules` directory; skipped ({opt_in})"
+        ));
+    }
+    let cwd = cwd?;
+    let contains_home = |home: &Path| {
+        home.starts_with(cwd) || std::fs::canonicalize(home).is_ok_and(|home| home.starts_with(cwd))
+    };
+    if cwd.parent().is_none() || home.is_some_and(contains_home) {
+        return None;
+    }
+    // `current_dir` is the resolved path; a `PATH` entry may be spelled
+    // through a symlink (`/tmp` on macOS), so compare its resolved directory.
+    let inside = candidate.starts_with(cwd)
+        || candidate
+            .parent()
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .is_some_and(|dir| dir.starts_with(cwd));
+    inside.then(|| {
+        format!(
+            "inside the working directory {}; skipped ({opt_in})",
+            cwd.display()
+        )
+    })
+}
+
+/// Resolve one runtime. A configured override is the only candidate: one
+/// that does not run or is below the floor fails resolution for this
+/// runtime with its reason, rather than falling through to a search.
+/// Otherwise the search candidates, minus those in an [`untrusted_location`],
+/// which are recorded as rejected without being run. Blocking.
+fn resolve_runtime(kind: HostRuntimeKind, override_path: Option<&Path>) -> NodeResolution {
+    if let Some(path) = override_path {
+        return select_runtime(kind, vec![path.to_path_buf()]);
+    }
+    let cwd = std::env::current_dir().ok();
+    let home = codewhale_paths::user_home();
+    let mut skipped = Vec::new();
+    let compiled = (kind == HostRuntimeKind::Bun)
+        .then(compiled_host_candidate)
+        .flatten();
+    let candidates = compiled
+        .iter()
+        .cloned()
+        .chain(runtime_candidates(kind))
+        .filter(|candidate| {
+            // An image shipped beside the Engine has its install authority.
+            // It is still probed for the exact embedded source identity.
+            if compiled.as_ref() == Some(candidate) {
+                return true;
+            }
+            match untrusted_location(kind, candidate, cwd.as_deref(), home.as_deref()) {
+                Some(reason) => {
+                    skipped.push((candidate.clone(), reason));
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect();
+    let mut resolution = select_runtime(kind, candidates);
+    skipped.append(&mut resolution.rejected);
+    resolution.rejected = skipped;
+    resolution
+}
+
+/// Choose the extension host's runtime for `[extension_host] runtime`:
+/// `bun` and `node` try only that runtime (an explicit choice never falls
+/// back); `auto` prefers a supported Bun and otherwise uses Node, recording
+/// why Bun was passed over. Blocking: call from `spawn_blocking`.
+#[must_use]
+pub fn resolve_extension_host_runtime(
+    choice: crate::config::ExtensionHostRuntime,
+    node_override: Option<&Path>,
+    bun_override: Option<&Path>,
+) -> HostRuntimeResolution {
+    select_host_runtime(
+        choice,
+        || resolve_runtime(HostRuntimeKind::Bun, bun_override),
+        || resolve_runtime(HostRuntimeKind::Node, node_override),
+    )
+}
+
+fn select_host_runtime(
+    choice: crate::config::ExtensionHostRuntime,
+    probe_bun: impl FnOnce() -> NodeResolution,
+    probe_node: impl FnOnce() -> NodeResolution,
+) -> HostRuntimeResolution {
+    use crate::config::ExtensionHostRuntime as Choice;
+    let mut resolution = HostRuntimeResolution {
+        choice,
+        selected: None,
+        bun: None,
+        node: None,
+    };
+    let pick = |kind: HostRuntimeKind, probe: &NodeResolution| {
+        probe.selected.clone().map(|(path, version)| HostRuntime {
+            native_code_flags: match kind {
+                HostRuntimeKind::Bun => Vec::new(),
+                HostRuntimeKind::Node => accepted_flags(&path, NODE_NATIVE_CODE_FLAGS),
+            },
+            compiled: kind == HostRuntimeKind::Bun && is_compiled_host_path(&path),
+            kind,
+            path,
+            version,
+        })
+    };
+    if matches!(choice, Choice::Auto | Choice::Bun) {
+        let bun = probe_bun();
+        resolution.selected = pick(HostRuntimeKind::Bun, &bun);
+        resolution.bun = Some(bun);
+    }
+    if resolution.selected.is_none() && matches!(choice, Choice::Auto | Choice::Node) {
+        let node = probe_node();
+        resolution.selected = pick(HostRuntimeKind::Node, &node);
+        resolution.node = Some(node);
+    }
+    resolution
+}
+
+/// The `flags` a runtime starts with (`<runtime> <flag> --version` exits 0).
+/// Blocking: one short probe per flag.
+fn accepted_flags(path: &Path, flags: &[&'static str]) -> Vec<&'static str> {
+    flags
+        .iter()
+        .copied()
+        .filter(|flag| {
+            let mut cmd = probe_command(path);
+            cmd.args([*flag, "--version"])
+                .stdout(std::process::Stdio::null());
+            cmd.status().is_ok_and(|status| status.success())
+        })
+        .collect()
+}
+
+fn select_runtime(kind: HostRuntimeKind, candidates: Vec<PathBuf>) -> NodeResolution {
+    let mut seen = std::collections::HashSet::new();
+    let mut resolution = NodeResolution::default();
+    for candidate in candidates {
+        // Deduplicate by spelling only: resolving symlinks here would be a
+        // blocking call per candidate for a cosmetic gain.
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        match probe_runtime_version(kind, &candidate) {
+            Ok(version) if kind.supported(version) => {
+                resolution.selected = Some((candidate, version));
+                break;
+            }
+            Ok((major, minor, patch)) => resolution.rejected.push((
+                candidate,
+                format!(
+                    "{major}.{minor}.{patch} is below the {} floor",
+                    kind.floor()
+                ),
+            )),
+            Err(reason) => resolution.rejected.push((candidate, reason)),
+        }
+    }
+    resolution
 }
 
 // ---------------------------------------------------------------------------
@@ -337,38 +1012,32 @@ pub trait ExternalTool {
     /// Callers should chain `.args(...)`, `.current_dir(...)`, and then
     /// call `.output()`, `.status()`, or `.spawn()`.
     fn command() -> Option<Command> {
-        let spec = Self::resolve()?;
-        let (program, fixed_args) = split_interpreter_spec(&spec);
-        let mut cmd = Command::new(&program);
-        crate::utils::suppress_console_window(&mut cmd);
-        for arg in &fixed_args {
-            cmd.arg(arg);
-        }
-        Some(cmd)
+        Some(command_for_spec(&Self::resolve()?))
+    }
+
+    /// The error a caller sees when the tool is not installed. It names the
+    /// binary the user would install (`git`, `python3`), never the Rust type
+    /// path (`codewhale_tui::dependencies::Git`).
+    fn not_found_error() -> std::io::Error {
+        let name = Self::candidates().first().copied().unwrap_or("tool");
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{name} not found on PATH"),
+        )
     }
 
     /// Convenience: run the tool with arguments in a working directory
     /// and return the captured output.
     fn output(args: &[&str], cwd: &std::path::Path) -> std::io::Result<std::process::Output> {
-        let mut cmd = Self::command().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{} not found on PATH", std::any::type_name::<Self>()),
-            )
-        })?;
+        let mut cmd = Self::command().ok_or_else(Self::not_found_error)?;
         cmd.args(args).current_dir(cwd).output()
     }
 
     /// Convenience: run the tool with arguments and return only the
     /// exit status (discards stdout/stderr).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     fn status(args: &[&str], cwd: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
-        let mut cmd = Self::command().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{} not found on PATH", std::any::type_name::<Self>()),
-            )
-        })?;
+        let mut cmd = Self::command().ok_or_else(Self::not_found_error)?;
         cmd.args(args).current_dir(cwd).status()
     }
 
@@ -390,12 +1059,188 @@ pub trait ExternalTool {
     }
 }
 
+/// Build a `std::process::Command` for an interpreter spec such as `"py -3"`.
+fn command_for_spec(spec: &str) -> Command {
+    let (program, fixed_args) = split_interpreter_spec(spec);
+    let mut cmd = Command::new(&program);
+    crate::utils::suppress_console_window(&mut cmd);
+    for arg in &fixed_args {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
+/// [`command_for_spec`] started from the sanitized child environment. Used by
+/// the runtimes whose every caller runs model-authored code (Python, Node),
+/// so no constructor for them hands out the parent's credentials.
+fn scrubbed_command_for_spec(spec: &str) -> Command {
+    let mut cmd = command_for_spec(spec);
+    crate::child_env::apply_to_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+    cmd
+}
+
 // ---------------------------------------------------------------------------
 // Concrete tool implementations
 // ---------------------------------------------------------------------------
 
 /// Git version control.
 pub struct Git;
+
+/// Keep a git child from ever waiting on a human.
+///
+/// Git and ssh read credentials, passphrases and host-key confirmations from
+/// `/dev/tty` directly — `stdin(null)` does not stop them — so inside the
+/// raw-mode TUI or an HTTP request a prompt is an invisible, indefinite hang.
+/// `GIT_TERMINAL_PROMPT=0` makes git fail instead of asking for a username or
+/// password; BatchMode ssh fails instead of asking for a passphrase or an
+/// unknown host key; an empty `GIT_PAGER` keeps output from ever being paged.
+/// A user who pinned their own ssh transport (`GIT_SSH_COMMAND` or `GIT_SSH`)
+/// keeps it untouched.
+///
+/// This is the single definition site; [`Git::command`] and
+/// [`Git::tokio_command`] apply it to every product git spawn. Call it
+/// directly only for a non-git program that may shell out to git (`gh`).
+pub(crate) fn apply_git_noninteractive_env(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_PAGER", "");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+}
+
+impl Git {
+    /// Flags every `diff`, `show` or patch `log` that collects repository
+    /// content passes. `--no-ext-diff`/`--no-textconv` skip diff drivers; a
+    /// dirty check or `diff.submodule=diff` spawns a child git inside each
+    /// submodule that inherits neither flag, so submodules compare by commit
+    /// only. A read that touches the working tree also runs the superproject's
+    /// clean filters, which no flag disables: build it from
+    /// [`Self::review_command`] too.
+    pub(crate) const REVIEW_DIFF_ARGS: [&'static str; 4] = [
+        "--no-ext-diff",
+        "--no-textconv",
+        "--submodule=short",
+        "--ignore-submodules=dirty",
+    ];
+
+    /// Construct a read-only review command with content conversion disabled.
+    /// Review callers also pass [`Self::REVIEW_DIFF_ARGS`] for diffs.
+    /// Configured filters otherwise execute even when those flags are present.
+    pub(crate) fn review_command(workspace: &Path) -> anyhow::Result<Command> {
+        let overrides = Self::review_filter_overrides(workspace)?;
+        let mut command = Self::review_base(workspace)?;
+        let mut count = 2;
+        for (key, value) in overrides {
+            // A subsection may contain '='; `-c key=value` would then
+            // override a different key. Separate env fields preserve it.
+            command.env(format!("GIT_CONFIG_KEY_{count}"), key);
+            command.env(format!("GIT_CONFIG_VALUE_{count}"), value);
+            count += 1;
+        }
+        command.env("GIT_CONFIG_COUNT", count.to_string());
+        Ok(command)
+    }
+
+    /// Git with fsmonitor, hooks, lazy fetch and replace objects disabled,
+    /// running in `workspace`. [`Self::review_command`] adds filter overrides.
+    pub(crate) fn review_base(workspace: &Path) -> anyhow::Result<Command> {
+        use anyhow::Context;
+
+        let mut command = Self::command().context("git not found on PATH")?;
+
+        // Runtime config pairs are required to disable filter names containing
+        // '=' without changing which key Git sees. Older Git ignores them.
+        // Probe once for this process's cached executable, before any read.
+        // A random value prevents repository config from spoofing support.
+        static REVIEW_CONFIG_SUPPORTED: OnceLock<bool> = OnceLock::new();
+        if !*REVIEW_CONFIG_SUPPORTED.get_or_init(|| {
+            let Some(mut probe) = Self::command() else {
+                return false;
+            };
+            let value = uuid::Uuid::new_v4().to_string();
+            probe
+                .current_dir(workspace)
+                .stdin(std::process::Stdio::null())
+                .env_remove("GIT_CONFIG")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "codewhale.reviewConfigCapability")
+                .env("GIT_CONFIG_VALUE_0", &value)
+                .args(["config", "--get", "codewhale.reviewConfigCapability"]);
+            matches!(probe.output(), Ok(output)
+                if output.status.success() && output.stdout == format!("{value}\n").as_bytes())
+        }) {
+            anyhow::bail!(
+                "Cannot safely inspect Git review configuration: Git runtime configuration overrides are unavailable; upgrade Git (2.31 or newer)"
+            );
+        }
+
+        command
+            .current_dir(workspace)
+            .stdin(std::process::Stdio::null())
+            // GIT_CONFIG redirects only `git config`, not `git diff`.
+            // Both phases must observe the same effective repository config.
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+            .env(
+                "GIT_CONFIG_VALUE_1",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_NO_REPLACE_OBJECTS", "1");
+        Ok(command)
+    }
+
+    /// Config overrides (`key`, `value`) that neutralize every clean/process
+    /// filter driver configured for the repository at `workspace`. Callers
+    /// apply them through `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`.
+    pub(crate) fn review_filter_overrides(
+        workspace: &Path,
+    ) -> anyhow::Result<Vec<(String, &'static str)>> {
+        use anyhow::{Context, bail};
+
+        let output = Self::review_base(workspace)?
+            .args([
+                "config",
+                "--null",
+                "--name-only",
+                "--get-regexp",
+                r"^filter\..*\.(clean|process|required)$",
+            ])
+            .output()
+            .context("Failed to inspect Git review filters")?;
+        let no_filters =
+            output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
+        if (!output.status.success() && !no_filters)
+            || (!output.stdout.is_empty() && !output.stdout.ends_with(&[0]))
+        {
+            bail!("Cannot safely inspect Git review configuration");
+        }
+        let mut filters = std::collections::BTreeSet::new();
+        for key in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|key| !key.is_empty())
+        {
+            let key =
+                std::str::from_utf8(key).context("Git review filter name is not valid UTF-8")?;
+            let (driver, _) = key
+                .rsplit_once('.')
+                .context("Invalid Git review filter key")?;
+            filters.insert(driver.to_string());
+        }
+        Ok(filters
+            .into_iter()
+            .flat_map(|driver| {
+                [("clean", ""), ("process", ""), ("required", "false")]
+                    .map(|(suffix, value)| (format!("{driver}.{suffix}"), value))
+            })
+            .collect())
+    }
+}
 
 impl ExternalTool for Git {
     fn candidates() -> &'static [&'static str] {
@@ -425,29 +1270,37 @@ impl ExternalTool for Git {
     /// agent-visible command string rendered by `tools::git::format_command`,
     /// and an unknown flag hard-fails on old git while an unknown environment
     /// variable is silently ignored.
+    ///
+    /// The child also starts from the sanitized environment (see
+    /// [`crate::child_env::apply_to_git_command`]): workspace config such as
+    /// `core.fsmonitor` or a clean filter makes even a read like `git status`
+    /// run a program the workspace chose, so no git child gets the parent's
+    /// credentials. The guards below are applied after the scrub.
     fn command() -> Option<Command> {
-        let spec = Self::resolve()?;
-        let (program, fixed_args) = split_interpreter_spec(&spec);
-        let mut cmd = Command::new(&program);
+        let mut cmd = Command::new(Self::resolve()?);
         crate::utils::suppress_console_window(&mut cmd);
-        for arg in &fixed_args {
-            cmd.arg(arg);
-        }
+        crate::child_env::apply_to_git_command(&mut cmd);
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        apply_git_noninteractive_env(&mut cmd);
         Some(cmd)
+    }
+
+    /// Same environment as [`Git::command`]: the trait default would build a
+    /// bare command and silently drop the lock and prompt guards.
+    fn tokio_command() -> Option<tokio::process::Command> {
+        Self::command().map(tokio::process::Command::from)
     }
 
     fn resolve() -> Option<String> {
         static CACHE: OnceLock<Option<String>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
-                for candidate in Self::candidates() {
-                    if probe_executable(candidate) {
-                        tracing::info!(target: "tool_dependencies", "Resolved git binary");
-                        return Some((*candidate).to_string());
-                    }
-                }
-                None
+                // The review capability cache must follow the executable
+                // checked here even if a later child changes PATH or cwd.
+                let path = resolve_executable_path(Self::candidates().first()?, "--version")?;
+                let path = std::path::absolute(path).ok()?;
+                tracing::info!(target: "tool_dependencies", "Resolved git binary");
+                Some(path.to_string_lossy().into_owned())
             })
             .clone()
     }
@@ -558,6 +1411,20 @@ impl ExternalTool for Python {
         PYTHON_CANDIDATES
     }
 
+    /// Every Python caller runs model-authored code (`code_execution`, the
+    /// RLM REPL), so both constructors (and the `output`/`status` helpers
+    /// built on them) start the child from the sanitized environment instead
+    /// of inheriting provider credentials and other parent secrets. Callers
+    /// that need extra variables re-apply them through
+    /// [`crate::child_env::apply_to_tokio_command`] with explicit overrides.
+    fn command() -> Option<Command> {
+        Some(scrubbed_command_for_spec(&Self::resolve()?))
+    }
+
+    fn tokio_command() -> Option<tokio::process::Command> {
+        Self::command().map(tokio::process::Command::from)
+    }
+
     fn resolve() -> Option<String> {
         resolve_python_interpreter()
     }
@@ -571,6 +1438,16 @@ pub struct Node;
 impl ExternalTool for Node {
     fn candidates() -> &'static [&'static str] {
         &["node"]
+    }
+
+    /// Node runs model-authored code (`js_execution`); like [`Python`], every
+    /// constructor starts from the sanitized environment.
+    fn command() -> Option<Command> {
+        Some(scrubbed_command_for_spec(&Self::resolve()?))
+    }
+
+    fn tokio_command() -> Option<tokio::process::Command> {
+        Self::command().map(tokio::process::Command::from)
     }
 
     fn resolve() -> Option<String> {
@@ -598,6 +1475,374 @@ pub fn split_interpreter_spec(spec: &str) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_host_identity_requires_exact_engine_source_and_real_bun_version() {
+        let digest = "a".repeat(64);
+        let info = serde_json::json!({
+            "kind": "codewhale-extension-host", "runtime": "bun", "version": "1.4.0", "bundle_sha256": digest,
+            "platform": match std::env::consts::OS { "macos" => "darwin", "windows" => "win32", os => os },
+            "arch": match std::env::consts::ARCH { "aarch64" => "arm64", "x86_64" => "x64", arch => arch },
+        });
+        assert_eq!(
+            parse_compiled_host_info(&serde_json::to_vec(&info).unwrap(), &digest),
+            Ok((1, 4, 0))
+        );
+        let mut changed = info.clone();
+        changed["bundle_sha256"] = "b".repeat(64).into();
+        assert!(
+            parse_compiled_host_info(&serde_json::to_vec(&changed).unwrap(), &digest)
+                .unwrap_err()
+                .contains("differs from this Engine")
+        );
+        for (key, value) in [
+            ("runtime", "node"),
+            ("kind", "bun"),
+            ("version", "not-a-version"),
+            ("platform", "incorrect-platform"),
+            ("arch", "incorrect-arch"),
+        ] {
+            let mut invalid = info.clone();
+            invalid[key] = value.into();
+            assert!(
+                parse_compiled_host_info(&serde_json::to_vec(&invalid).unwrap(), &digest).is_err()
+            );
+        }
+        assert!(
+            parse_compiled_host_info(&vec![b' '; 4097], &digest)
+                .unwrap_err()
+                .contains("4096")
+        );
+        assert!(parse_compiled_host_info(b"{}", &digest).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probes_scrub_credentials_preloads_and_close_stdin() {
+        let _home = crate::test_support::SealedHome::new();
+        let _secret =
+            crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "synthetic-probe-secret");
+        let _preload = crate::test_support::EnvVarGuard::set("NODE_OPTIONS", "synthetic-preload");
+        let mut command = version_probe_command("/bin/sh");
+        command.args(["-c", "[ -z \"${DEEPSEEK_API_KEY+x}\" ] && [ -z \"${NODE_OPTIONS+x}\" ] && ! read ignored && printf clean"]);
+        let output = probe_output(&mut command, true, VERSION_PROBE_TIMEOUT).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"clean");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_timeout_kills_ordinary_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("descendant.pid");
+        let mut command = version_probe_command("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & echo $! > \"$1\"; wait", "probe"])
+            .arg(&pid_file);
+        let started = std::time::Instant::now();
+        let error =
+            probe_output(&mut command, false, std::time::Duration::from_millis(150)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let pid = crate::process_tree::read_pid_file(&pid_file, std::time::Duration::from_secs(1));
+        assert!(crate::process_tree::wait_for_pid_exit(
+            pid,
+            std::time::Duration::from_secs(2)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_reaps_successful_parents_inherited_pipe_child() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("pipe-child.pid");
+        let mut command = version_probe_command("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & echo $! > \"$1\"; printf version", "probe"])
+            .arg(&pid_file);
+        let output = probe_output(&mut command, true, VERSION_PROBE_TIMEOUT).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"version");
+        let pid = crate::process_tree::read_pid_file(&pid_file, std::time::Duration::from_secs(1));
+        assert!(crate::process_tree::wait_for_pid_exit(
+            pid,
+            std::time::Duration::from_secs(2)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_refuses_oversized_banner() {
+        let mut command = version_probe_command("/bin/sh");
+        command.args(["-c", "head -c 20000 /dev/zero"]);
+        assert_eq!(
+            probe_output(&mut command, true, VERSION_PROBE_TIMEOUT)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn node_version_banner_parses_and_floor_matches_dsh_engines() {
+        assert_eq!(parse_node_version("v22.20.0\n"), Some((22, 20, 0)));
+        assert_eq!(parse_node_version("v24.1.0-nightly"), Some((24, 1, 0)));
+        assert_eq!(parse_node_version("22.20.0"), None);
+        assert!(node_version_supported_for_extension_host((22, 19, 0)));
+        assert!(!node_version_supported_for_extension_host((22, 18, 9)));
+        assert!(!node_version_supported_for_extension_host((23, 11, 0)));
+        assert!(!node_version_supported_for_extension_host((20, 19, 0)));
+        assert!(node_version_supported_for_extension_host((24, 0, 0)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_ladder_skips_broken_and_old_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let broken = script(
+            "broken-node",
+            "echo 'dyld: Library not loaded' >&2; exit 134",
+        );
+        let old = script("old-node", "echo v20.11.1");
+        let good = script("good-node", "echo v22.20.0");
+        let later = script("later-node", "echo v24.0.0");
+        let relative = PathBuf::from("node_modules/.bin/node");
+        let resolution = select_runtime(
+            HostRuntimeKind::Node,
+            vec![
+                relative.clone(),
+                broken.clone(),
+                old.clone(),
+                good.clone(),
+                later,
+            ],
+        );
+        assert_eq!(resolution.selected, Some((good, (22, 20, 0))));
+        assert_eq!(resolution.rejected.len(), 3);
+        assert_eq!(resolution.rejected[0].0, relative);
+        assert!(resolution.rejected[0].1.contains("not an absolute path"));
+        assert_eq!(resolution.rejected[1].0, broken);
+        assert!(resolution.rejected[1].1.contains("does not run"));
+        assert_eq!(resolution.rejected[2].0, old);
+        assert!(resolution.rejected[2].1.contains("below"));
+    }
+
+    #[test]
+    fn bun_version_banner_parses_and_floor_is_the_validated_release() {
+        assert_eq!(parse_bun_version("1.4.0\n"), Some((1, 4, 0)));
+        assert_eq!(parse_bun_version("1.4.2-canary.3+abc"), Some((1, 4, 2)));
+        assert_eq!(parse_bun_version("v1.4.0"), None);
+        assert!(HostRuntimeKind::Bun.supported((1, 4, 0)));
+        assert!(HostRuntimeKind::Bun.supported((2, 0, 0)));
+        assert!(!HostRuntimeKind::Bun.supported((1, 3, 14)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_runtime_auto_prefers_bun_and_explicit_choices_never_fall_back() {
+        use crate::config::ExtensionHostRuntime as Choice;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let bun = script("bun", "echo 1.4.0");
+        let old_bun = script("old-bun", "echo 1.3.14");
+        // A Node without `node:ffi`: it rejects `--no-experimental-ffi` the
+        // way Node 22 and 24 do.
+        let node = script(
+            "node",
+            "case \"$1\" in --no-experimental-ffi) echo 'bad option' >&2; exit 9;; esac\necho v24.1.0",
+        );
+
+        let probe = |kind, candidates: &[&PathBuf]| {
+            select_runtime(
+                kind,
+                candidates.iter().map(|path| (*path).clone()).collect(),
+            )
+        };
+
+        // auto: a supported Bun wins, and Node is never probed. The Bun
+        // passed over on the way is in the summary.
+        let auto = select_host_runtime(
+            Choice::Auto,
+            || probe(HostRuntimeKind::Bun, &[&old_bun, &bun]),
+            || panic!("node must not be probed when Bun is usable"),
+        );
+        let selected = auto.selected.clone().unwrap();
+        assert_eq!(selected.kind, HostRuntimeKind::Bun);
+        assert_eq!(selected.path, bun);
+        assert_eq!(selected.version_string(), "1.4.0");
+        assert!(selected.native_code_flags.is_empty());
+        let summary = auto.summary();
+        assert!(summary.starts_with("bun 1.4.0 at "), "{summary}");
+        assert!(summary.contains("(runtime = \"auto\")"), "{summary}");
+        assert!(
+            summary.contains("passed over: ") && summary.contains("1.3.14 is below"),
+            "{summary}"
+        );
+
+        // auto without a supported Bun: Node, and the summary says why.
+        let fallback = select_host_runtime(
+            Choice::Auto,
+            || probe(HostRuntimeKind::Bun, &[&old_bun]),
+            || probe(HostRuntimeKind::Node, &[&node]),
+        );
+        assert_eq!(
+            fallback.selected.as_ref().unwrap().kind,
+            HostRuntimeKind::Node
+        );
+        let summary = fallback.summary();
+        assert!(summary.starts_with("node 24.1.0 at "), "{summary}");
+        assert!(summary.contains("Bun >=1.4.0 not used"), "{summary}");
+        assert!(
+            summary.contains("1.3.14 is below the >=1.4.0 floor"),
+            "{summary}"
+        );
+        // Nothing found: the message names every place that was searched.
+        let none_found = select_host_runtime(Choice::Auto, NodeResolution::default, || {
+            probe(HostRuntimeKind::Node, &[&node])
+        });
+        assert!(
+            none_found
+                .summary()
+                .contains("no `bun` found on PATH or in $BUN_INSTALL/bin (default ~/.bun/bin)"),
+            "{}",
+            none_found.summary()
+        );
+
+        // runtime = "bun": no Node fallback, even when Node works.
+        let bun_only = select_host_runtime(
+            Choice::Bun,
+            || probe(HostRuntimeKind::Bun, &[&old_bun]),
+            || panic!("runtime = \"bun\" must not probe node"),
+        );
+        assert!(bun_only.selected.is_none());
+        assert!(
+            bun_only.failure().contains("needs Bun >=1.4.0"),
+            "{}",
+            bun_only.failure()
+        );
+
+        // runtime = "node": Bun is never probed.
+        let node_only = select_host_runtime(
+            Choice::Node,
+            || panic!("runtime = \"node\" must not probe bun"),
+            || probe(HostRuntimeKind::Node, &[&node]),
+        );
+        let node_runtime = node_only.selected.unwrap();
+        assert_eq!(node_runtime.kind, HostRuntimeKind::Node);
+        // Only the flags this Node starts with are passed.
+        assert_eq!(
+            node_runtime.native_code_flags,
+            vec!["--no-experimental-sqlite"]
+        );
+        assert!(node_only.bun.is_none());
+    }
+
+    /// A runtime found by searching that a repository could have planted is
+    /// never run; a configured override is exempt from that check but is
+    /// final: when it fails, resolution fails with its reason.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_search_candidates_are_skipped_and_a_failing_override_is_final() {
+        use crate::config::ExtensionHostRuntime as Choice;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let kind = HostRuntimeKind::Bun;
+        let home = dir.path().join("home");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("bin")).unwrap();
+        // `current_dir` is resolved; the temp dir may be spelled through a
+        // symlink (`/var` → `/private/var` on macOS).
+        let cwd = std::fs::canonicalize(&workspace).unwrap();
+
+        let shim = Path::new("/opt/tools/node_modules/.bin/bun");
+        let reason = untrusted_location(kind, shim, None, None).unwrap();
+        assert!(reason.contains("`node_modules`"), "{reason}");
+        let reason = untrusted_location(
+            kind,
+            &workspace.join("bin/bun"),
+            Some(cwd.as_path()),
+            Some(home.as_path()),
+        )
+        .unwrap();
+        assert!(reason.contains("inside the working directory"), "{reason}");
+        assert!(reason.contains("`[extension_host] bun`"), "{reason}");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(workspace.join("bin"), &link).unwrap();
+        assert!(
+            untrusted_location(
+                kind,
+                &link.join("bun"),
+                Some(cwd.as_path()),
+                Some(home.as_path())
+            )
+            .is_some()
+        );
+        assert_eq!(
+            untrusted_location(
+                kind,
+                &dir.path().join("elsewhere/bun"),
+                Some(cwd.as_path()),
+                Some(home.as_path())
+            ),
+            None
+        );
+        // A working directory that contains the home is not a workspace.
+        let user_bun = home.join(".bun/bin/bun");
+        assert_eq!(
+            untrusted_location(kind, &user_bun, Some(home.as_path()), Some(home.as_path())),
+            None
+        );
+        assert_eq!(
+            untrusted_location(kind, &user_bun, Some(Path::new("/")), Some(home.as_path())),
+            None
+        );
+
+        // A failing override never falls through to a search.
+        let broken = script("broken-bun", "exit 3");
+        let bun_only = resolve_extension_host_runtime(Choice::Bun, None, Some(broken.as_path()));
+        assert!(bun_only.selected.is_none());
+        let failure = bun_only.failure();
+        assert!(
+            failure.contains(&format!("{}: does not run", broken.display())),
+            "{failure}"
+        );
+        assert_eq!(bun_only.bun.as_ref().unwrap().rejected.len(), 1);
+        // Under `auto` the Node that runs instead says why the Bun did not.
+        let node = script("node", "echo v24.1.0");
+        let auto = resolve_extension_host_runtime(
+            Choice::Auto,
+            Some(node.as_path()),
+            Some(broken.as_path()),
+        );
+        let summary = auto.summary();
+        assert!(summary.starts_with("node 24.1.0 at "), "{summary}");
+        assert!(
+            summary.contains(&format!(
+                "Bun >=1.4.0 not used: {}: does not run",
+                broken.display()
+            )),
+            "{summary}"
+        );
+    }
 
     #[test]
     fn probe_executable_returns_false_for_unknown_binary() {
@@ -737,6 +1982,29 @@ mod tests {
     }
 
     #[test]
+    fn missing_tool_error_names_the_binary_not_the_rust_type() {
+        struct Missing;
+        impl ExternalTool for Missing {
+            fn candidates() -> &'static [&'static str] {
+                &["codewhale-imaginary-tool", "fallback-name"]
+            }
+            fn resolve() -> Option<String> {
+                None
+            }
+        }
+
+        let error = Missing::output(&["--version"], std::path::Path::new("."))
+            .expect_err("an unresolvable tool must not spawn");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "codewhale-imaginary-tool not found on PATH"
+        );
+        assert!(!error.to_string().contains("::"), "{error}");
+        assert_eq!(Git::not_found_error().to_string(), "git not found on PATH");
+    }
+
+    #[test]
     fn cargo_candidates_is_cargo_only() {
         assert_eq!(Cargo::candidates(), &["cargo"]);
     }
@@ -854,6 +2122,38 @@ mod tests {
         assert_eq!(value, std::ffi::OsStr::new("0"));
     }
 
+    /// No git spawn may prompt on `/dev/tty` (0.10.1 item 3): a credential,
+    /// passphrase or host-key prompt inside the raw-mode TUI is a silent hang.
+    #[test]
+    fn git_commands_are_non_interactive() {
+        if !Git::available() {
+            return;
+        }
+        let std_cmd = Git::command().expect("git resolves when available");
+        let tokio_cmd = Git::tokio_command().expect("git resolves when available");
+        for envs in [
+            std_cmd.get_envs().collect::<Vec<_>>(),
+            tokio_cmd.as_std().get_envs().collect::<Vec<_>>(),
+        ] {
+            let get = |name: &str| {
+                envs.iter()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                    .and_then(|(_, value)| *value)
+            };
+            assert_eq!(get("GIT_TERMINAL_PROMPT"), Some(std::ffi::OsStr::new("0")));
+            assert_eq!(get("GIT_PAGER"), Some(std::ffi::OsStr::new("")));
+            assert_eq!(get("GIT_OPTIONAL_LOCKS"), Some(std::ffi::OsStr::new("0")));
+            if std::env::var_os("GIT_SSH_COMMAND").is_none()
+                && std::env::var_os("GIT_SSH").is_none()
+            {
+                assert_eq!(
+                    get("GIT_SSH_COMMAND"),
+                    Some(std::ffi::OsStr::new("ssh -o BatchMode=yes"))
+                );
+            }
+        }
+    }
+
     /// The suppression is deliberately scoped to git. Other external tools
     /// have no index to protect and must not inherit a git-specific variable.
     #[test]
@@ -868,6 +2168,84 @@ mod tests {
                 "only Git may set GIT_OPTIONAL_LOCKS"
             );
         }
+    }
+
+    /// The Python and Node constructors run model-authored code, so the
+    /// command they build must not carry the parent's environment. This
+    /// runs on every unix runner, with or without Python or Node installed.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_commands_do_not_inherit_parent_secret_env() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _secret = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_RUNTIME_SECRET",
+            "runtime-secret-value",
+        );
+        let output = scrubbed_command_for_spec("env").output().expect("env runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(!stdout.contains("runtime-secret-value"), "{stdout}");
+        assert!(stdout.contains("PATH="), "{stdout}");
+
+        // Both constructors of each runtime are built on the scrubbed spec,
+        // which sets the sanitized environment explicitly.
+        let has_explicit_path = |cmd: &Command| {
+            cmd.get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new("PATH") && value.is_some())
+        };
+        for cmd in [Python::command(), Node::command()].into_iter().flatten() {
+            assert!(has_explicit_path(&cmd), "{cmd:?}");
+        }
+        for cmd in [Python::tokio_command(), Node::tokio_command()]
+            .into_iter()
+            .flatten()
+        {
+            assert!(has_explicit_path(cmd.as_std()), "{cmd:?}");
+        }
+    }
+
+    /// Workspace git config can make even `git status` run a program
+    /// (`core.fsmonitor`); that program must not see the parent's secrets.
+    #[cfg(unix)]
+    #[test]
+    fn git_command_does_not_inherit_parent_secret_env() {
+        use std::os::unix::fs::PermissionsExt;
+        if !Git::available() {
+            return;
+        }
+        let _env_lock = crate::test_support::lock_test_env();
+        let _secret =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_TEST_GIT_SECRET", "git-secret-value");
+        let repo = tempfile::tempdir().expect("repo");
+        let hooks = tempfile::tempdir().expect("hooks");
+        let marker = hooks.path().join("seen");
+        let hook = hooks.path().join("fsmonitor.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf 'leak=%s\\n' \"${{CODEWHALE_TEST_GIT_SECRET-unset}}\" >> '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .expect("write hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let run = |args: &[&str]| {
+            let status = Git::status(args, repo.path()).expect("git spawns");
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("file.txt"), "hello\n").expect("write");
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        run(&["config", "core.fsmonitor", &hook.to_string_lossy()]);
+
+        let output = Git::output(&["status", "--porcelain"], repo.path()).expect("status");
+        assert!(output.status.success());
+        let seen = std::fs::read_to_string(&marker).expect("fsmonitor hook ran");
+        assert!(seen.contains("leak=unset"), "{seen}");
+        assert!(!seen.contains("git-secret-value"), "{seen}");
     }
 
     #[test]
@@ -889,6 +2267,208 @@ mod tests {
         if Node::available() {
             assert!(Node::tokio_command().is_some());
         }
+    }
+
+    #[test]
+    fn git_review_accepts_supported_runtime_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = Git::review_command(dir.path())
+            .expect("native Git supports runtime overrides")
+            .args(["config", "--get", "core.fsmonitor"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"false\n");
+    }
+
+    /// The child has a fresh executable/capability cache. Its wrapper ignores
+    /// runtime config as older Git would; it is not an old-Git installation.
+    #[cfg(unix)]
+    #[test]
+    fn git_review_refuses_unsupported_runtime_config() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "CODEWHALE_TEST_UNSUPPORTED_GIT_REVIEW";
+        if let Some(repo) = std::env::var_os(CHILD) {
+            let repo = PathBuf::from(repo);
+            if std::env::var_os("CODEWHALE_TEST_MISSING_GIT_REVIEW").is_some() {
+                let error = Git::review_command(&repo).expect_err("Git is absent");
+                assert_eq!(error.to_string(), "git not found on PATH");
+                return;
+            }
+            match Git::review_command(&repo) {
+                Err(error) => assert!(
+                    error
+                        .to_string()
+                        .contains("runtime configuration overrides are unavailable"),
+                    "{error:#}"
+                ),
+                Ok(mut command) => {
+                    let output = command.args(["status", "--porcelain"]).output().unwrap();
+                    let witness = std::fs::read_to_string(repo.join("helper-seen"))
+                        .unwrap_or_else(|_| "no helper witness".into());
+                    panic!(
+                        "unsupported Git reached repository read: status={:?}; {witness}",
+                        output.status
+                    );
+                }
+            }
+            assert!(!repo.join("helper-seen").exists());
+            return;
+        }
+        let _lock = crate::test_support::lock_test_env();
+        let real_git = resolve_executable_path("git", "--version").expect("absolute native Git");
+        let repo = tempfile::tempdir().unwrap();
+        let wrapper_dir = tempfile::tempdir().unwrap();
+        let helper = repo.path().join("fsmonitor.sh");
+        let marker = repo.path().join("helper-seen");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf 'unsupported-runtime-config-helper\\n' >> '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "core.fsmonitor", helper.to_str().unwrap()],
+            // A static capability marker would falsely accept this repository.
+            vec!["config", "codewhale.reviewConfigCapability", "supported"],
+        ] {
+            let output = Git::output(&args, repo.path()).unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let wrapper = wrapper_dir.path().join("git");
+        let quoted_git = real_git.replace('\'', "'\\''");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nunset GIT_CONFIG_COUNT\nexec '{quoted_git}' \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dependencies::tests::git_review_refuses_unsupported_runtime_config",
+                "--nocapture",
+            ])
+            .env(CHILD, repo.path())
+            .env("PATH", wrapper_dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "emulated unsupported Git refusal failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker.exists());
+        let missing_path = tempfile::tempdir().unwrap();
+        let missing = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dependencies::tests::git_review_refuses_unsupported_runtime_config",
+                "--nocapture",
+            ])
+            .env(CHILD, repo.path())
+            .env("CODEWHALE_TEST_MISSING_GIT_REVIEW", "1")
+            .env("PATH", missing_path.path())
+            .output()
+            .unwrap();
+        assert!(
+            missing.status.success(),
+            "missing Git diagnostic failed: {}\n{}",
+            String::from_utf8_lossy(&missing.stdout),
+            String::from_utf8_lossy(&missing.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_review_keeps_checked_executable_after_path_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "CODEWHALE_TEST_GIT_REVIEW_PATH_CHANGE";
+        if let Some(repo) = std::env::var_os(CHILD) {
+            let _lock = crate::test_support::lock_test_env();
+            let repo = PathBuf::from(repo);
+            let initial = Git::review_command(&repo)
+                .unwrap()
+                .args(["config", "--get", "core.fsmonitor"])
+                .output()
+                .unwrap();
+            assert!(initial.status.success());
+            assert_eq!(initial.stdout, b"false\n");
+            let changed = std::env::var_os("CODEWHALE_TEST_CHANGED_GIT_PATH").unwrap();
+            let _path = crate::test_support::EnvVarGuard::set("PATH", changed);
+            let output = Git::review_command(&repo)
+                .unwrap()
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let marker = repo.join("path-change-helper-seen");
+            assert!(
+                !marker.exists(),
+                "cached review switched to unchecked Git: {}",
+                std::fs::read_to_string(marker).unwrap_or_default()
+            );
+            return;
+        }
+        let _lock = crate::test_support::lock_test_env();
+        let real_git = resolve_executable_path("git", "--version").expect("absolute native Git");
+        let quoted_git = real_git.replace('\'', "'\\''");
+        let repo = tempfile::tempdir().unwrap();
+        let original_path = tempfile::tempdir().unwrap();
+        let supported_git_dir = original_path.path().join("Git path with spaces");
+        std::fs::create_dir(&supported_git_dir).unwrap();
+        let changed_path = tempfile::tempdir().unwrap();
+        for (dir, prefix) in [
+            (supported_git_dir.as_path(), ""),
+            (changed_path.path(), "unset GIT_CONFIG_COUNT\n"),
+        ] {
+            let script = dir.join("git");
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\n{prefix}exec '{quoted_git}' \"$@\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let helper = repo.path().join("fsmonitor.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf 'path-change-fixture-helper\\n' >> '{}'\nexit 1\n",
+                repo.path().join("path-change-helper-seen").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "core.fsmonitor", helper.to_str().unwrap()],
+        ] {
+            assert!(Git::output(&args, repo.path()).unwrap().status.success());
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dependencies::tests::git_review_keeps_checked_executable_after_path_changes",
+                "--nocapture",
+            ])
+            .env(CHILD, repo.path())
+            .env("CODEWHALE_TEST_CHANGED_GIT_PATH", changed_path.path())
+            .env("PATH", &supported_git_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "native PATH-switch review fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!repo.path().join("path-change-helper-seen").exists());
     }
 
     #[test]

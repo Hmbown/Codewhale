@@ -1,8 +1,8 @@
 //! `/agent` command.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
+use codewhale_localization::MessageId;
 
 use super::CommandResult;
 
@@ -58,12 +58,19 @@ pub fn agent(_app: &mut App, arg: Option<&str>) -> CommandResult {
             );
         }
     };
-    let message = format!(
-        "Launch one sub-agent for this task by calling `agent` with name `slash_agent`, `prompt: {task:?}`, and `max_depth: {max_depth}`. Use `handle_read` on the returned transcript_handle if you need more detail. Verify any claimed side effects before reporting success."
-    );
+    let message = agent_dispatch_brief(&task, max_depth);
     CommandResult::with_message_and_action(
         format!("Opening persistent sub-agent at depth {max_depth}..."),
         AppAction::SendMessage(message),
+    )
+}
+
+/// The model-facing /agent brief. `handle_read` is deferred on the default
+/// catalog, so the brief teaches its activation path (#6747).
+pub(crate) fn agent_dispatch_brief(task: &str, max_depth: impl std::fmt::Display) -> String {
+    format!(
+        "Launch one sub-agent for this task by calling `agent` with name `slash_agent`, `prompt: {task:?}`, and `max_depth: {max_depth}`. Use `handle_read` on the returned transcript_handle if you need more detail ({}). Verify any claimed side effects with `read` before reporting success.",
+        crate::tools::handle::HANDLE_READ_ACTIVATION_HINT
     )
 }
 
@@ -103,6 +110,16 @@ mod tests {
             ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &crate::config::Config::default())
+    }
+
+    /// #6747: the /agent brief names only callable tools and teaches the
+    /// deferred `handle_read` activation path.
+    #[test]
+    fn agent_dispatch_brief_names_only_callable_tools() {
+        crate::tools::canonical_action::tests::assert_text_names_only_callable_tools(
+            "/agent brief",
+            &agent_dispatch_brief("inspect the repo", 1),
+        );
     }
 
     #[test]

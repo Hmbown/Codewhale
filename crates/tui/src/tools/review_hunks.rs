@@ -3,8 +3,8 @@
 //! GitHub's "create a review" API rejects the *entire* review with a 422 when
 //! any single inline comment anchors to a line that is not part of the diff.
 //! Before this module existed the reviewer only checked that the *file* was
-//! touched, so one model-estimated line number silently discarded every
-//! inline comment (the summary-only retry in `post_pr_review` hid the loss).
+//! touched, so one model-estimated line number could make the whole review
+//! request fail after every other inline comment had already been prepared.
 //!
 //! [`DiffHunks::parse`] turns a unified diff into the exact set of RIGHT-side
 //! (post-image) line numbers GitHub will accept per file, so a bad anchor
@@ -103,6 +103,20 @@ impl DiffHunks {
     #[must_use]
     pub fn touches_path(&self, path: &str) -> bool {
         self.files.contains_key(path)
+    }
+
+    /// Post-image paths and hunk ranges from the same parser used to validate
+    /// comments. Context collection must not invent a second diff parser.
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    pub(crate) fn ranges(&self, path: &str) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.files.get(path).into_iter().flat_map(|file| {
+            file.commentable
+                .iter()
+                .map(|range| (range.start, range.end))
+        })
     }
 
     /// True when `line` is a RIGHT-side line GitHub will accept an inline
@@ -218,7 +232,7 @@ fn post_image_path(rest: &str) -> Option<String> {
 /// Parse `@@ -a,b +c,d @@ optional context` into
 /// `(right_start, old_count, new_count)`. Counts may be omitted
 /// (`@@ -1 +1 @@` means one line on each side).
-fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32)> {
+pub(super) fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32)> {
     let rest = line.strip_prefix("@@ ")?;
     let end = rest.find(" @@")?;
     let ranges = &rest[..end];

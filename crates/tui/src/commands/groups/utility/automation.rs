@@ -10,7 +10,7 @@ use crate::tui::app::{AppAction, AutomationAction};
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "automation",
     aliases: &["automations", "scheduled"],
-    usage: "/automation [list|show <id>|pause <id>|resume <id>|delete <id> [--confirm <token>]|run <id>]",
+    usage: "/automation [list|show <id>|print <id>|pause <id>|resume <id>|delete <id> [--confirm <token>]|run <id>]",
     description_key: "cmd_automation_description",
 };
 
@@ -42,7 +42,12 @@ fn automation(
     args: Option<&str>,
 ) -> CommandResult {
     let raw = args.unwrap_or("").trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("list") {
+    // Bare `/automation` opens the room; `list` keeps the text receipt for
+    // scripts and transcripts.
+    if raw.is_empty() {
+        return action(AutomationAction::Open { focus: None });
+    }
+    if raw.eq_ignore_ascii_case("list") {
         return action(AutomationAction::List);
     }
 
@@ -50,7 +55,10 @@ fn automation(
     let verb = parts.next().unwrap_or("").to_ascii_lowercase();
 
     match verb.as_str() {
-        "show" | "status" => single_id(presentation, &mut parts, AutomationAction::Show),
+        "show" | "status" => single_id(presentation, &mut parts, |id| AutomationAction::Open {
+            focus: Some(id),
+        }),
+        "print" => single_id(presentation, &mut parts, AutomationAction::Show),
         "pause" => single_id(presentation, &mut parts, AutomationAction::Pause),
         "resume" => single_id(presentation, &mut parts, AutomationAction::Resume),
         "delete" | "remove" | "rm" => delete(presentation, &mut parts),
@@ -132,10 +140,16 @@ mod tests {
 
     #[test]
     fn parses_list_show_and_mutations() {
-        assert_eq!(parsed(None), Some(AutomationAction::List));
+        assert_eq!(parsed(None), Some(AutomationAction::Open { focus: None }));
         assert_eq!(parsed(Some("list")), Some(AutomationAction::List));
         assert_eq!(
             parsed(Some("show auto_1")),
+            Some(AutomationAction::Open {
+                focus: Some("auto_1".to_string())
+            })
+        );
+        assert_eq!(
+            parsed(Some("print auto_1")),
             Some(AutomationAction::Show("auto_1".to_string()))
         );
         assert_eq!(
@@ -163,7 +177,9 @@ mod tests {
     fn accepts_operator_aliases() {
         assert_eq!(
             parsed(Some("status auto_1")),
-            Some(AutomationAction::Show("auto_1".to_string()))
+            Some(AutomationAction::Open {
+                focus: Some("auto_1".to_string())
+            })
         );
         assert_eq!(
             parsed(Some("rm auto_1")),

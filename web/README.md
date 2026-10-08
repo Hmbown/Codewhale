@@ -1,8 +1,8 @@
 # codewhale-web
 
-Documentation and community site for [Codewhale](https://github.com/Hmbown/CodeWhale) — lives at **codewhale.net**.
+Documentation and community site for [Codewhale](https://github.com/codewhale-hq/CodeWhale) — lives at **codewhale.net**.
 
-Next.js 15 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-v4-flash` to summarise recent repo activity, and stored in Workers KV.
+Next.js 16 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-flash` to summarise recent repo activity, and stored in Workers KV.
 
 ## Local dev
 
@@ -19,11 +19,11 @@ Env (mirrors `.env.example`):
 | --------------------------- | ---------------------------------------------------------------- | -------------------- |
 | `DEEPSEEK_API_KEY`          | DeepSeek platform key (`sk-...`)                                 | only for the `/api/cron` tasks (summarization + community agent) |
 | `GITHUB_TOKEN`              | Fine-grained PAT, public-repo read scope                         | optional (raises rate limit 60 → 5000 req/h) |
-| `GITHUB_REPO`               | Defaults to `Hmbown/CodeWhale`                                   | optional             |
+| `GITHUB_REPO`               | Defaults to `codewhale-hq/CodeWhale`                                   | optional             |
 | `CRON_SECRET`               | Shared secret for manual `/api/cron` invocation                  | optional (Cloudflare cron triggers don't need it) |
-| `DEEPSEEK_MODEL`            | Defaults to `deepseek-v4-flash`                                  | optional             |
+| `DEEPSEEK_MODEL`            | Defaults to `deepseek-flash`                                     | optional             |
 | `DEEPSEEK_BASE_URL`         | Defaults to `https://api.deepseek.com`                           | optional             |
-| `MAINTAINER_TOKEN`          | Admin panel auth; access `/admin?token=<value>`                  | only for `/admin`    |
+| `MAINTAINER_TOKEN`          | Admin panel auth; enter it in the `/admin` login form            | only for `/admin`    |
 | `MAINTAINER_GITHUB_PAT`     | PAT with `issues:write`, for posting comments via `/admin`       | only for `/admin` posting |
 | `NEXT_PUBLIC_GITEE_ENABLED` | Set to `1` once the Gitee mirror exists; blank hides Gitee links | optional             |
 
@@ -39,7 +39,7 @@ record the exact 40-character `origin/main` SHA and trigger that ref:
 ```bash
 git fetch origin main
 git rev-parse origin/main
-gh workflow run web.yml --repo Hmbown/CodeWhale --ref main
+gh workflow run web.yml --repo codewhale-hq/CodeWhale --ref main
 ```
 
 Every green push to `main` also emits a `Deployment approval needed` workflow
@@ -55,35 +55,32 @@ local comparison is available without starting a deployment:
 npm run compare:deployed-facts -- --expected-revision <exact-40-character-sha>
 ```
 
-You already own `codewhale.net` on Cloudflare and have a Workers Paid plan. The deploy is two steps:
-
-1. **Provision KV namespaces once:**
-
-   ```bash
-   npx wrangler kv namespace create CURATED_KV
-   npx wrangler kv namespace create NEXT_INC_CACHE_KV
-   ```
-
-   Copy the printed `id` values into the matching `wrangler.jsonc` bindings
-   (replace each `REPLACE_WITH_KV_ID`).
-
-2. **Set secrets and deploy:**
-
-   ```bash
-   npx wrangler secret put DEEPSEEK_API_KEY
-   npx wrangler secret put GITHUB_TOKEN     # optional
-   npx wrangler secret put CRON_SECRET      # optional, for manual /api/cron?task=curate hits
-
-   npm run deploy                           # builds with OpenNext + uploads
-   ```
-
-3. **Point the domain:** in the Cloudflare dashboard, add a Worker route for `codewhale.net/*` → the deployed Worker, named `codewhale-web` (see `wrangler.jsonc`).
-
-The first cron run happens within 6 hours; you can also kick it manually:
+The Worker configuration now lives in `cloudflare.config.ts`; it retains the
+existing namespace IDs, domains, cron schedules and SQLite Durable Object.
+`npm ci` installs pinned `cf` and Cloudflare bundler versions. Use Node 22.18 or
+newer. OpenNext currently consumes a generated legacy configuration in the
+ignored `.cloudflare/` directory, derived from that same source with
+Cloudflare's configuration SDK.
 
 ```bash
-curl -H "x-cron-secret: $CRON_SECRET" "https://codewhale.net/api/cron?task=curate"
+npm run build:cloudflare          # one OpenNext build, then native cf Build Output
+npx cf deploy --prebuilt --dry-run # local validation; no upload
+npm run preview                   # local Worker with populated local cache
 ```
+
+The pinned cf beta's Next.js detection currently invokes plain `next build`,
+which does not produce the OpenNext Worker. `build:cloudflare` therefore runs
+OpenNext first and invokes cf's installed bundler (`cf-wrangler.js`) to emit
+Build Output. This is a build step; production deployment uses `cf deploy
+--prebuilt`. Do not add a custom post-cache build to `wrangler.config.ts`:
+rebuilding there changes the cache identity after OpenNext populates it.
+
+After production approval, the manual workflow runs `npm run deploy`,
+populates the remote OpenNext cache, and passes the exact prebuilt bundle to
+cf. Existing secrets remain managed in Cloudflare; namespace provisioning,
+secret changes and domain changes require separate approval. The predeploy
+guard rejects unset namespace IDs to avoid accidentally replacing live data.
+Use `npx cf cli search` to find the current resource-management commands.
 
 ## What's where
 
@@ -121,12 +118,13 @@ web/
 ├── data/
 │   └── latest-published-release.json  manually advanced only after publication
 ├── components/
+│   ├── native-terminal-gallery.tsx  six captured native terminal views
 │   ├── nav.tsx                 sticky header w/ date strip + CJK accents
 │   ├── footer.tsx              dense 5-column footer
 │   ├── whale.tsx               shared Codewhale mark
 │   ├── ticker.tsx              live wire: merges, issues, releases + handles
 │   ├── feed-card.tsx           one issue/PR card
-│   ├── locale-switcher.tsx     N-locale dropdown with partial badges
+│   ├── locale-switcher.tsx     N-locale dropdown; partial packs grouped last
 │   └── install-*.tsx           install page blocks (binary, code block, tiles)
 ├── lib/
 │   ├── types.ts                shared types
@@ -135,14 +133,19 @@ web/
 │   ├── deepseek.ts             v4-flash chat client + curate() prompt
 │   ├── facts.ts                getFacts(): KV value, else build-time FACTS
 │   ├── facts.generated.ts      GENERATED — do not edit by hand
+│   ├── changelog.generated.ts  GENERATED at build/test time, untracked
+│   ├── install-guide.generated.ts GENERATED at build/test time, untracked
 │   ├── facts-drift.ts          runtime re-derivation for the drift cron
 │   ├── community-agent.ts      triage / pr-review / digest cron tasks
 │   └── kv.ts                   Cloudflare KV access via OpenNext bindings
 ├── scripts/
 │   ├── derive-facts.mjs        prebuild: repo sources → lib/facts.generated.ts
+│   ├── derive-changelog.mjs    prebuild + vitest setup: CHANGELOG.md → lib/changelog.generated.ts
+│   ├── derive-install.mjs      prebuild + vitest setup: docs/INSTALL.md → lib/install-guide.generated.ts
 │   ├── compare-deployed-facts.mjs credential-free exact-SHA receipt check
 │   └── check-kv-id.mjs         predeploy guard for KV namespace ids
-├── wrangler.jsonc              CF Worker config + cron + KV binding
+├── cloudflare.config.ts        Worker config + existing bindings, exports and cron
+├── wrangler.config.ts          cf bundler options (no separate Worker config)
 ├── open-next.config.ts         OpenNext adapter config
 └── tailwind.config.ts          design tokens
 ```
@@ -173,10 +176,12 @@ default model, Node engines) are never hand-written into pages:
 revision, version, provider count, tool count, selection reason, and latest
 published release. It contains no environment values, tokens, or KV contents.
 
-When a new `ApiProvider` variant lands in `crates/tui/src/config.rs`, it must
-be added to the `labelMap` in **both** `scripts/derive-facts.mjs` and
-`lib/facts-drift.ts` (or to the `EXCLUDED` set if deliberately hidden). Both
-fail loudly on unmapped variants, so the build / cron will tell you.
+Public provider facts derive the complete roster and optional presentation
+labels from `crates/config/assets/provider_descriptors.json`, alongside the
+catalog from the same selected source revision. Both local generation and the
+remote drift check validate that descriptor document and refuse missing or
+malformed data. Add metadata there; there is no separate website label map or
+TUI enum roster to update.
 
 ## Visual direction
 

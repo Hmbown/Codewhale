@@ -2,7 +2,8 @@
 
 > v0.8.65+ | `codex/lsp-php-custom-servers`
 >
-> 本文翻译自英文版 [LSP_PHP_CUSTOM.md](../LSP_PHP_CUSTOM.md)，与英文修订 `6f2ca52ec`（2026-06-26）同步。
+> 英文原文：[LSP_PHP_CUSTOM.md](../LSP_PHP_CUSTOM.md)。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 ## 概述
 
@@ -35,7 +36,7 @@ pub struct CustomLspDef {
 （不含前导点）为键，如 `"rb"`、`"cs"`、`"swift"`。
 
 `LspManager::diagnostics_for` 中，当内置注册表返回 `Language::Other` 时，管理器
-会先检查用户自定义表再放弃。自定义服务器拥有独立的懒加载 transport 映射和
+会先检查用户自定义表再放弃。自定义服务器拥有独立的按需（惰性）启动的 transport 映射和
 每个扩展名仅一次的缺失告警（避免日志刷屏）。
 
 ### 3. Transport 通用化
@@ -97,16 +98,16 @@ edit_file / write_file / apply_patch 成功
           poll_diagnostics(file, text, transport)
                 │
                 ▼
-          DiagnosticBlock → 注入会话消息流
+          DiagnosticBlock → 注入会话的消息流
 ```
 
 ## 验证
 
 ```
-cargo test -p codewhale-tui --bin codewhale-tui lsp::
+cargo test -p codewhale-tui --lib lsp::
 # 32 个测试通过（新增 3 个：detects_php_extension、language_ids_for_php、
 # server_for_php_is_intelephense）
-cargo clippy -p codewhale-tui --bin codewhale-tui
+cargo clippy -p codewhale-tui --lib
 # lsp 模块：零新增警告
 ```
 

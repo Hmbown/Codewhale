@@ -6,9 +6,16 @@
 //! module keeps registry construction, user-command precedence, and the
 //! fall-through behaviour.
 
+mod config_policy_host;
 mod contract;
 pub mod discovery;
 mod groups;
+
+// FEAT-025 host services for the session-export slice: the shared recovery
+// writer and the protected export-destination resolver/writer. Declared at the
+// `commands` root so they stay outside `groups/session`, which FEAT-043 moves
+// to `codewhale-commands`.
+mod session_export_host;
 pub mod traits;
 pub mod user_commands;
 pub mod user_registry;
@@ -17,84 +24,88 @@ pub mod user_registry;
 #[path = "epic_dispatch_acceptance.rs"]
 mod epic_dispatch_acceptance;
 
+// Extension slash commands through the real command table and `App` dispatch;
+// they cannot live in `extension_host`, a runtime module that may not depend
+// on this one.
+#[cfg(test)]
+mod extension_host_tests;
+
 #[cfg(test)]
 #[path = "epic_discovery_acceptance.rs"]
 mod epic_discovery_acceptance;
 
+// TUI-hosted session acceptance and persistence regressions deliberately stay
+// outside `groups/session`, which FEAT-043 moves to `codewhale-commands`.
+#[cfg(all(test, feature = "long-running-tests"))]
+mod session_acceptance;
+#[cfg(test)]
+mod session_control_regression_tests;
+#[cfg(test)]
+mod session_export_regression_tests;
+#[cfg(test)]
+mod session_structcopy_host_tests;
+#[cfg(test)]
+mod session_structcopy_regression_tests;
+// FEAT-025 Phase 5: public command-surface parity lives at the `commands` root
+// for the same extraction reason as the host regressions above.
+#[cfg(test)]
+mod session_export_surface_tests;
+// FEAT-025 audit hardening: shared host-bound test support for both export
+// test suites (timestamp normalisation and the exhaustive envelope check).
+#[cfg(test)]
+mod session_export_test_support;
+#[cfg(test)]
+mod session_lifecycle_regression_tests;
+
 use std::sync::OnceLock;
 
+pub(crate) use groups::config::config::set_workspace_trust;
+
+/// Stage a rollback of the last exchange for the UI to apply, or `None` when
+/// there is no user message to roll back. Nothing is mutated here.
+pub(crate) fn staged_conversation_undo(
+    app: &mut crate::tui::app::App,
+) -> Option<codewhale_command_contract::facets::SessionSyncPayload> {
+    let undone = contract::debug_operations::undo_conversation_for_engine(app);
+    (undone.removed > 0).then_some(undone.sync)
+}
 pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
 /// `/fleet add` and the picker's ⇧F share these gates; the UI applies them
 /// against the live `Config`.
 pub(crate) use groups::core::fleet::{fleet_catalog_rejection, fleet_provider_rejection};
+pub(crate) use groups::memory::{notes_path, read_notes};
 pub use groups::project::share;
-#[cfg(test)]
-pub(crate) use groups::session::rename_with_manager as rename_session_with_manager;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
 pub use groups::core::voice;
 
+#[cfg(test)]
+mod debug_diagnostics_baseline_tests;
+// Host fixtures for the eight diagnostics commands live outside the movable
+// debug group; CW-SLICE selects them together with the frozen baseline tests.
+#[cfg(test)]
+mod debug_diagnostics_host_tests;
+#[cfg(test)]
+mod debug_diagnostics_regression_tests;
+#[cfg(test)]
+mod debug_diagnostics_surface_tests;
+#[cfg(test)]
+mod debug_diagnostics_test_support;
+
+#[cfg(test)]
+mod debug_change_host_tests;
+mod debug_group;
+#[cfg(test)]
+mod debug_mutation_host_tests;
+mod session_group;
+
 use crate::tui::app::{App, AppAction};
+use codewhale_config::AppMode;
 
-/// Result of executing a command
-#[derive(Debug, Clone)]
-pub struct CommandResult {
-    /// Optional message to display to the user
-    pub message: Option<String>,
-    /// Optional action for the app to take
-    pub action: Option<AppAction>,
-    /// Whether the command failed.
-    pub is_error: bool,
-}
-
-impl CommandResult {
-    /// Create an empty result (command succeeded with no output)
-    pub fn ok() -> Self {
-        Self {
-            message: None,
-            action: None,
-            is_error: false,
-        }
-    }
-
-    /// Create a result with just a message
-    pub fn message(msg: impl Into<String>) -> Self {
-        Self {
-            message: Some(msg.into()),
-            action: None,
-            is_error: false,
-        }
-    }
-
-    /// Create a result with an action
-    pub fn action(action: AppAction) -> Self {
-        Self {
-            message: None,
-            action: Some(action),
-            is_error: false,
-        }
-    }
-
-    /// Create a result with both message and action
-    pub fn with_message_and_action(msg: impl Into<String>, action: AppAction) -> Self {
-        Self {
-            message: Some(msg.into()),
-            action: Some(action),
-            is_error: false,
-        }
-    }
-
-    /// Create an error message result
-    pub fn error(msg: impl Into<String>) -> Self {
-        Self {
-            message: Some(format!("Error: {}", msg.into())),
-            action: None,
-            is_error: true,
-        }
-    }
-}
+/// Shared result shape; host actions remain consumed by the existing event loop.
+pub type CommandResult = codewhale_command_contract::outcome::CommandResult<AppAction>;
 
 static REGISTRY: OnceLock<traits::CommandRegistry> = OnceLock::new();
 
@@ -191,6 +202,20 @@ pub fn registry() -> &'static traits::CommandRegistry {
     REGISTRY.get_or_init(build_registry)
 }
 
+/// The built-in command table as the extension host asks about it: the one
+/// read-only question "does a built-in command answer to this name?". The
+/// composition root installs it at startup (`lib.rs`), so the runtime-side host
+/// never depends on this module.
+pub(crate) struct BuiltinCommandNames;
+
+impl crate::extension_host::command::BuiltinCommandCatalog for BuiltinCommandNames {
+    fn answers_to(&self, name: &str) -> bool {
+        // `jihua` and `zidong` are mode aliases the dispatcher answers ahead
+        // of the registry.
+        matches!(name, "jihua" | "zidong") || registry().get(name).is_some()
+    }
+}
+
 pub fn command_infos() -> Vec<&'static CommandInfo> {
     registry().infos()
 }
@@ -199,8 +224,26 @@ pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
     registry().get_info(name)
 }
 
-/// Execute a slash command
+/// Execute a slash command with its captured active configuration.
+pub fn execute_with_config(
+    cmd: &str,
+    app: &mut App,
+    config: &crate::config::Config,
+) -> CommandResult {
+    execute_in_context(cmd, app, Some(config))
+}
+
+/// Legacy fixture entry; it cannot authorize a model route change.
+#[cfg(test)]
 pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
+    execute_in_context(cmd, app, None)
+}
+
+fn execute_in_context(
+    cmd: &str,
+    app: &mut App,
+    config: Option<&crate::config::Config>,
+) -> CommandResult {
     // Keep the command's raw remainder available for commands whose payload is
     // byte-sensitive. Most slash commands intentionally receive a normalized
     // argument below; `/preview-request --prompt`, however, must describe the
@@ -249,6 +292,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         .filter(|value| !value.is_empty());
 
     // Check user-defined commands FIRST so they can override built-ins.
+    // Workspace (repository) commands load only in a trusted workspace and
+    // never under a protected built-in such as /trust or /undo — the
+    // registry drops those at load.
     if let Some(result) = user_registry::try_dispatch(app, trimmed) {
         return result;
     }
@@ -292,7 +338,7 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
                     capabilities,
                     handler: contextual,
                 } => {
-                    let mut bundle = app.command_contexts();
+                    let mut bundle = app.command_contexts_with_config(config);
                     contextual(bundle.contexts(capabilities), command_arg)
                 }
             };
@@ -319,10 +365,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
             if let Some(result) = groups::skills::run_skill_by_name(app, command.as_str(), arg) {
                 return result;
             }
-            let suggestions =
-                user_registry::with_registry_for_workspace(Some(&app.workspace), |user_commands| {
-                    suggest_command_names(command.as_str(), 3, user_commands)
-                });
+            let suggestions = user_registry::with_registry_for_app(app, |user_commands| {
+                suggest_command_names(command.as_str(), 3, user_commands)
+            });
             if suggestions.is_empty() {
                 CommandResult::error(format!(
                     "Unknown command: /{command}. Type /help for available commands."
@@ -347,7 +392,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
 }
 
 /// Switch the interaction mode (plan / work / operate).
-pub fn switch_mode(app: &mut App, mode: crate::tui::app::AppMode) -> String {
+pub fn switch_mode(app: &mut App, mode: AppMode) -> String {
     groups::config::config::switch_mode(app, mode)
 }
 
@@ -381,7 +426,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b_chars.len()]
 }
 
-fn best_suggestion_score<'a>(
+pub(crate) fn best_suggestion_score<'a>(
     query: &str,
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Option<(u8, usize)> {
@@ -470,13 +515,12 @@ fn suggest_command_names(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, Config};
-    use crate::localization::{Locale, MessageId};
+    use crate::config::{Config, ProviderKind};
     use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
     use crate::tools::todo::TodoStatus;
     use crate::tui::app::{App, AppAction, TuiOptions};
     use crate::tui::work_surface::{RailPanel, WorkSurfacePlacement};
-    use std::ffi::OsString;
+    use codewhale_localization::{Locale, MessageId};
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
@@ -524,6 +568,7 @@ mod tests {
     #[test]
     fn user_command_shadows_builtin_before_group_dispatch() {
         let temp = tempdir().unwrap();
+        crate::test_support::trust_workspace(temp.path());
         let commands_dir = temp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -532,8 +577,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut app = create_test_app();
-        app.workspace = temp.path().to_path_buf();
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(temp.path()),
+        );
         super::user_registry::reload(Some(temp.path()));
 
         let result = execute("/help now", &mut app);
@@ -547,13 +593,15 @@ mod tests {
     #[test]
     fn removed_user_command_reloads_and_falls_back_to_builtin() {
         let temp = tempdir().unwrap();
+        crate::test_support::trust_workspace(temp.path());
         let commands_dir = temp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         let command_path = commands_dir.join("help.md");
         std::fs::write(&command_path, "user help").unwrap();
 
-        let mut app = create_test_app();
-        app.workspace = temp.path().to_path_buf();
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(temp.path()),
+        );
         super::user_registry::reload(Some(temp.path()));
         assert!(matches!(
             execute("/help config", &mut app).action,
@@ -577,6 +625,8 @@ mod tests {
     #[test]
     fn command_registry_contains_config_and_links_but_not_set_or_deepseek() {
         assert!(command_infos().iter().any(|cmd| cmd.name == "config"));
+        assert!(get_command_info("experiments").is_none());
+        assert!(get_command_info("experimental").is_none());
         let rail = command_infos()
             .into_iter()
             .find(|cmd| cmd.name == "workbar")
@@ -595,6 +645,21 @@ mod tests {
         assert!(command_infos().iter().any(|cmd| cmd.name == "memory"));
         assert!(!command_infos().iter().any(|cmd| cmd.name == "set"));
         assert!(!command_infos().iter().any(|cmd| cmd.name == "deepseek"));
+    }
+
+    #[test]
+    fn pet_command_is_registered_and_the_workbar_no_longer_advertises_watch() {
+        let pet = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "pet")
+            .expect("pet command should exist");
+        assert_eq!(pet.description_id, MessageId::CmdPetDescription);
+        assert!(pet.usage.starts_with("/pet"));
+        let rail = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "workbar")
+            .expect("workbar command should exist");
+        assert!(!rail.usage.contains("watch"), "{}", rail.usage);
     }
 
     #[test]
@@ -993,9 +1058,9 @@ mod tests {
                 has_config = true;
                 assert_eq!(
                     commands.len(),
-                    16,
+                    17,
                     "config group (group-local metadata exception) expected \
-                     exactly 16 commands, got {}",
+                     exactly 17 commands, got {}",
                     commands.len()
                 );
             }
@@ -1003,9 +1068,9 @@ mod tests {
                 has_debug = true;
                 assert_eq!(
                     commands.len(),
-                    13,
+                    14,
                     "debug group (group-local metadata exception) expected \
-                     exactly 13 commands, got {}",
+                     exactly 14 commands, got {}",
                     commands.len()
                 );
             }
@@ -1465,7 +1530,7 @@ mod tests {
             let msg = result.message.expect("links commands should return text");
             assert!(msg.contains("https://codewhale.net/en/docs"));
             assert!(msg.contains("https://codewhale.net/en/community"));
-            assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+            assert!(msg.contains("https://github.com/codewhale-hq/CodeWhale"));
             assert!(msg.contains("https://app.codewhale.net"));
             assert!(msg.contains("separate sign-in"));
             assert!(msg.contains("not connected to the current local session"));
@@ -1508,35 +1573,24 @@ mod tests {
         assert!(deepseek_result.action.is_none());
     }
 
+    /// Seals the user's home *and* points the config at the fixture's own
+    /// file. Dispatching every command reaches credentials, sessions, snapshots,
+    /// plugin bundles, audit logs and the `/import-claude` report — all of which
+    /// resolve under the home, so pinning the config path alone (as this once
+    /// did) left them on the developer's real profile.
     struct ConfigPathGuard {
-        previous: Option<OsString>,
-        _lock: crate::test_support::TestEnvLock,
+        // Fields drop in order: restore the config path, then the seal.
+        _config_path: crate::test_support::EnvVarGuard,
+        _home: crate::test_support::SealedHome,
     }
 
     impl ConfigPathGuard {
         fn new(config_path: &Path) -> Self {
-            let lock = crate::test_support::lock_test_env();
-            let previous = std::env::var_os("DEEPSEEK_CONFIG_PATH");
-            // Safety: test-only environment mutation guarded by a global mutex.
-            unsafe {
-                std::env::set_var("DEEPSEEK_CONFIG_PATH", config_path);
-            }
+            let home = crate::test_support::SealedHome::new();
+            let config = crate::test_support::EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", config_path);
             Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for ConfigPathGuard {
-        fn drop(&mut self) {
-            // Safety: test-only environment mutation guarded by a global mutex.
-            unsafe {
-                if let Some(previous) = self.previous.take() {
-                    std::env::set_var("DEEPSEEK_CONFIG_PATH", previous);
-                } else {
-                    std::env::remove_var("DEEPSEEK_CONFIG_PATH");
-                }
+                _config_path: config,
+                _home: home,
             }
         }
     }
@@ -1551,6 +1605,8 @@ mod tests {
         let config_path = workspace.join(".deepseek").join("config.toml");
         std::fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
         let guard = ConfigPathGuard::new(&config_path);
+        // Skills live under the workspace here, so they load only once trusted.
+        crate::test_support::trust_workspace(&workspace);
         let options = TuiOptions {
             config_path: Some(config_path),
             skills_dir: workspace.join("skills"),
@@ -1560,6 +1616,10 @@ mod tests {
             ..crate::test_support::test_tui_options(workspace.clone())
         };
         let app = App::new(options, &Config::default());
+        assert!(
+            app.dispatch_completion_tx.is_none(),
+            "dispatch smoke fixtures must not permit native window mutations"
+        );
         (app, tmpdir, guard)
     }
 
@@ -1587,8 +1647,71 @@ mod tests {
     /// `scoped_home` (snapshot repo init shells out to git, which races
     /// against parallel-running tests). Skip it here so this smoke test
     /// stays parallel-safe.
+    ///
+    /// `/pin` is covered on every platform. The headless fixture has no
+    /// completion mailbox, so Windows rejects it before resolving or changing
+    /// a host window; the former synchronous message-pump wait cannot occur.
     fn skip_in_dispatch_smoke(name: &str) -> bool {
         name == "restore"
+    }
+
+    /// Upper bound on a single command dispatch in the smoke tests.
+    ///
+    /// Generous next to the millisecond each handler actually takes, and far
+    /// below nextest's 600 s test timeout, so a handler that blocks fails the
+    /// test *by name* instead of burning a ten-minute CI slot with no
+    /// attribution (#5919).
+    const DISPATCH_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Dispatch one command under a per-command watchdog and return the
+    /// handler's message.
+    ///
+    /// The app is built and the command executed on a dedicated thread; the
+    /// test thread waits on the result with a timeout. A handler that never
+    /// returns leaves its thread parked, but the test itself fails
+    /// immediately, naming the invocation. A handler that panics still
+    /// surfaces as that panic — the smoke tests are the repo's only
+    /// panic-in-a-handler net, so the payload is resumed rather than
+    /// swallowed.
+    fn dispatch_under_watchdog(command_name: &str, alias_or_name: &str) -> Option<String> {
+        let label = format!("/{alias_or_name}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = command_name.to_string();
+        let alias = alias_or_name.to_string();
+        let handle = std::thread::Builder::new()
+            .name(format!("dispatch-smoke-{alias_or_name}"))
+            // Command handlers are deeply recursive in debug builds; match the
+            // 16 MiB the CI runner sets via RUST_MIN_STACK for the main thread.
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let (mut app, tmpdir, _guard) = create_isolated_test_app();
+                let invocation = invocation_for(&name, &alias, tmpdir.path());
+                let result = execute(&invocation, &mut app);
+                let _ = tx.send(result.message);
+            })
+            .expect("spawn dispatch smoke thread");
+
+        let started = std::time::Instant::now();
+        match rx.recv_timeout(DISPATCH_WATCHDOG) {
+            Ok(message) => {
+                let _ = handle.join();
+                // Quiet on the common path; a handler heading for the
+                // watchdog still leaves a named breadcrumb in the log.
+                let elapsed = started.elapsed();
+                if elapsed > std::time::Duration::from_secs(1) {
+                    eprintln!("dispatch smoke: {label} took {elapsed:?}");
+                }
+                message
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "{label} did not return within {DISPATCH_WATCHDOG:?}: its handler blocks. \
+                 Fix the handler or add it to skip_in_dispatch_smoke with a reason."
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+                Ok(()) => panic!("{label} dispatch thread ended without producing a result"),
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+        }
     }
 
     #[test]
@@ -1663,7 +1786,12 @@ mod tests {
 
         let (mut app, _tmpdir, _guard) = create_isolated_test_app();
         let result = execute("/skills", &mut app);
-        assert!(matches!(result.action, Some(AppAction::OpenSkillsManager)));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::OpenExtensions {
+                tab: crate::tui::views::extensions::ExtensionsTab::Skills
+            })
+        ));
 
         let mut app = create_test_app();
         let result = execute("/task list", &mut app);
@@ -1690,10 +1818,7 @@ mod tests {
             if skip_in_dispatch_smoke(command.name) {
                 continue;
             }
-            let (mut app, tmpdir, _guard) = create_isolated_test_app();
-            let invocation = invocation_for(command.name, command.name, tmpdir.path());
-            let result = execute(&invocation, &mut app);
-            if let Some(msg) = &result.message {
+            if let Some(msg) = dispatch_under_watchdog(command.name, command.name) {
                 assert!(
                     !msg.contains("Unknown command"),
                     "/{} fell through to the unknown-command branch: {msg}",
@@ -1712,10 +1837,7 @@ mod tests {
                 continue;
             }
             for alias in command.aliases {
-                let (mut app, tmpdir, _guard) = create_isolated_test_app();
-                let invocation = invocation_for(command.name, alias, tmpdir.path());
-                let result = execute(&invocation, &mut app);
-                if let Some(msg) = &result.message {
+                if let Some(msg) = dispatch_under_watchdog(command.name, alias) {
                     assert!(
                         !msg.contains("Unknown command"),
                         "/{alias} (alias of /{}) fell through to unknown: {msg}",
@@ -1740,9 +1862,9 @@ mod tests {
     fn balance_command_dispatches_live_fetch_for_prepaid_providers() {
         let mut app = create_test_app();
         for provider in [
-            ApiProvider::Deepseek,
-            ApiProvider::Openrouter,
-            ApiProvider::Siliconflow,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Siliconflow,
         ] {
             app.api_provider = provider;
             let result = execute("/balance", &mut app);
@@ -1757,7 +1879,7 @@ mod tests {
     #[test]
     fn balance_command_reports_unsupported_provider_clearly() {
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::Ollama;
+        app.set_provider_identity(ProviderKind::Ollama, "ollama");
 
         let result = execute("/balance", &mut app);
         let msg = result
@@ -1953,16 +2075,16 @@ mod tests {
         assert_eq!(info.name, "feat015ctx");
         assert_eq!(
             info.description_id,
-            crate::localization::MessageId::CmdWorkspaceDescription,
+            codewhale_localization::MessageId::CmdWorkspaceDescription,
             "portable description_key must bridge to the TUI localization id"
         );
     }
 
     #[test]
-    fn feat015_all_production_entries_remain_legacy() {
-        // FEAT-015 shipped no production contextual command, so the assertion
-        // below used to exclude nothing. FEAT-018 migrates the utility group;
-        // FEAT-019 migrates the memory group; FEAT-021 migrates the project group.
+    fn feat015_unmigrated_production_entries_remain_legacy() {
+        // FEAT-015 shipped no production contextual command. Later FEATs
+        // register bounded portable groups/slices; every entry outside the
+        // explicit list must still use the original legacy dispatcher.
         const MIGRATED_GROUPS: &[&str] = &[
             // FEAT-018 utility group.
             "attach",
@@ -1981,11 +2103,52 @@ mod tests {
             // FEAT-019 memory group.
             "note",
             "memory",
+            // FEAT-020 plugins group.
+            "plugin",
             // FEAT-022 skills group.
             "skills",
             "skill",
             "review",
             "restore",
+            // FEAT-023 session lifecycle slice.
+            "branch",
+            "compact",
+            "fork",
+            "load",
+            "new",
+            "purge",
+            "save",
+            "sessions",
+            "tree",
+            // FEAT-024 session control slice.
+            "relay",
+            "rename",
+            "resume",
+            "rc",
+            "remote-env",
+            "title",
+            // FEAT-025 session export slice.
+            "export",
+            // FEAT-026 completes the session structural-copy slice.
+            "structcopy",
+            // FEAT-027 config policy/status slice; remaining config stays legacy.
+            "permissions",
+            "status",
+            // FEAT-029 complete debug group, including receipts and mutation.
+            "tokens",
+            "cost",
+            "receipts",
+            "balance",
+            "cache",
+            "preview-request",
+            "tools",
+            "change",
+            "system",
+            "context",
+            "edit",
+            "diff",
+            "undo",
+            "retry",
         ];
         for info in command_infos() {
             if info.name == "feat015ctx" || MIGRATED_GROUPS.contains(&info.name) {
@@ -2107,7 +2270,7 @@ mod tests {
         for (name, expected) in [
             ("init", CommandCapabilities::WORKSPACE),
             ("lsp", CommandCapabilities::PROJECT),
-            ("share", CommandCapabilities::PROJECT),
+            ("share", CommandCapabilities::SESSION_EXPORT),
             (
                 "goal",
                 CommandCapabilities::PROJECT.union(CommandCapabilities::PRESENTATION),
@@ -2262,39 +2425,14 @@ mod tests {
     // is asserted by the migration fixtures and live gate.
     // ---------------------------------------------------------------------
 
-    /// Pins HOME to a tempdir so global skill discovery stays hermetic.
-    struct Feat022ScopedHome {
-        prev: Option<std::ffi::OsString>,
-        _home: tempfile::TempDir,
-        _guard: crate::test_support::TestEnvLock,
-    }
-    impl Drop for Feat022ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn feat022_scoped_home(_tmp: &tempfile::TempDir) -> Feat022ScopedHome {
-        let guard = crate::test_support::lock_test_env();
-        let prev = std::env::var_os("HOME");
-        let home = tempfile::TempDir::new().expect("home tempdir");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        Feat022ScopedHome {
-            prev,
-            _home: home,
-            _guard: guard,
-        }
+    /// Seals the user's home so global skill discovery stays hermetic.
+    fn feat022_scoped_home(_tmp: &tempfile::TempDir) -> crate::test_support::SealedHome {
+        crate::test_support::SealedHome::new()
     }
 
     fn feat022_test_app(tmp: &tempfile::TempDir) -> App {
+        // The fixture's skills dir lives inside its workspace.
+        crate::test_support::trust_workspace(tmp.path());
         let mut options = crate::test_support::test_tui_options(tmp.path());
         options.skills_dir = tmp.path().join("skills");
         crate::test_support::test_app_with_options(options)
@@ -2373,7 +2511,7 @@ mod tests {
         let info = registry().get_info("note").expect("note info");
         assert_eq!(
             info.description_id,
-            crate::localization::MessageId::CmdNoteDescription
+            codewhale_localization::MessageId::CmdNoteDescription
         );
     }
 
@@ -2384,21 +2522,23 @@ mod tests {
 
         let path = execute("/memory path", &mut app);
         assert!(!path.is_error, "{path:?}");
+        // The native store root is a directory; memory.md is only the legacy
+        // import anchor, no longer the authoritative path.
         assert_eq!(
             path.message.as_deref(),
-            Some(tmpdir.path().join("memory.md").to_str().unwrap())
+            Some(tmpdir.path().join("memory").to_str().unwrap())
         );
 
         // Native status reaches the real adapter through the public seam.
         let status = execute("/memory native status", &mut app);
         assert!(!status.is_error, "{status:?}");
         let msg = status.message.expect("status message");
-        assert!(msg.contains("native memory:"), "{msg}");
+        assert!(msg.contains("Native memory root:"), "{msg}");
 
         let info = registry().get_info("memory").expect("memory info");
         assert_eq!(
             info.description_id,
-            crate::localization::MessageId::CmdMemoryDescription
+            codewhale_localization::MessageId::CmdMemoryDescription
         );
     }
 
@@ -2427,16 +2567,37 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
         feat022_write_skill(&tmp.path().join("skills"), "demo");
 
-        // Bare /skills opens the unified manager (zero network).
+        // Bare /skills opens Extensions; explicit manage retains the mutation surface.
         let result = execute("/skills", &mut app);
         assert!(!result.is_error, "{result:?}");
         assert!(
             matches!(
                 result.action,
-                Some(crate::tui::app::AppAction::OpenSkillsManager)
+                Some(crate::tui::app::AppAction::OpenExtensions {
+                    tab: crate::tui::views::extensions::ExtensionsTab::Skills
+                })
             ),
             "{result:?}"
         );
+
+        assert!(matches!(
+            execute("/skills manage", &mut app).action,
+            Some(AppAction::OpenSkillsManager)
+        ));
+        let mcp_info = get_command_info("mcp").expect("registered MCP command");
+        assert!(mcp_info.aliases.contains(&"mcps"));
+        assert_eq!(get_command_info("mcps").unwrap().name, mcp_info.name);
+        for command in ["/mcp", "/mcps"] {
+            assert!(
+                matches!(
+                    execute(command, &mut app).action,
+                    Some(AppAction::OpenExtensions {
+                        tab: crate::tui::views::extensions::ExtensionsTab::Mcp
+                    })
+                ),
+                "{command}"
+            );
+        }
 
         // /skill activates the demo skill and sets active_skill.
         let result = execute("/skill demo", &mut app);
@@ -2469,7 +2630,9 @@ mod tests {
         assert!(
             matches!(
                 result.action,
-                Some(crate::tui::app::AppAction::OpenSkillsManager)
+                Some(crate::tui::app::AppAction::OpenExtensions {
+                    tab: crate::tui::views::extensions::ExtensionsTab::Skills
+                })
             ),
             "{result:?}"
         );
@@ -2499,4 +2662,457 @@ mod tests {
         // Missing-facet safety through the public seam is covered by the
         // handler-level tests; here we assert the envelope carries both.
     }
+
+    // ---------------------------------------------------------------------
+    // FEAT-020 plugins group public dispatch (Phase 6)
+    // ---------------------------------------------------------------------
+
+    /// App with an isolated temp workspace and a discovered plugin bundle.
+    fn plugin_test_app(tmpdir: &tempfile::TempDir) -> App {
+        // Write a minimal plugin bundle so the registry discovers real data.
+        let bundle = tmpdir.path().join(".codewhale/plugins/demo");
+        std::fs::create_dir_all(bundle.join("skills/hello")).unwrap();
+        std::fs::write(
+            bundle.join("plugin.toml"),
+            "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\ndescription = \"Import spreadsheet data safely\"\n[skills]\npath = \"skills\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join("skills/hello/SKILL.md"),
+            "---\nname: hello\ndescription: hello\n---\nbody\n",
+        )
+        .unwrap();
+        let options = TuiOptions {
+            ..crate::test_support::test_tui_options(tmpdir.path())
+        };
+        let mut app = App::new(options, &Config::default());
+        let discovery = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv();
+        app.plugin_registry = discovery.registry_for_workspace(tmpdir.path());
+        app
+    }
+
+    #[test]
+    fn feat020_plugin_entry_is_registered_with_exact_capabilities() {
+        let name = "plugin";
+        assert!(
+            registry().has_contextual_handler(name),
+            "/{name} must register through the portable bridge"
+        );
+        let handler = registry()
+            .get(name)
+            .expect("entry")
+            .contextual_handler()
+            .expect("contextual handler");
+        let codewhale_command_contract::handler::CommandHandler::Contextual {
+            capabilities, ..
+        } = handler
+        else {
+            panic!("/{name} must be contextual");
+        };
+        let expected = codewhale_command_contract::handler::CommandCapabilities::WORKSPACE
+            .union(codewhale_command_contract::handler::CommandCapabilities::PRESENTATION)
+            .union(codewhale_command_contract::handler::CommandCapabilities::PLUGIN);
+        assert_eq!(capabilities, expected, "/{name} exact capability set");
+        // Undeclared facets stay absent.
+        assert!(
+            !capabilities.contains(codewhale_command_contract::handler::CommandCapabilities::MEDIA)
+        );
+        assert!(
+            !capabilities
+                .contains(codewhale_command_contract::handler::CommandCapabilities::MEMORY)
+        );
+        assert!(
+            !capabilities
+                .contains(codewhale_command_contract::handler::CommandCapabilities::SKILLS)
+        );
+        assert!(
+            !capabilities
+                .contains(codewhale_command_contract::handler::CommandCapabilities::PROJECT)
+        );
+        assert!(
+            !capabilities
+                .contains(codewhale_command_contract::handler::CommandCapabilities::SKILL_GROUP)
+        );
+    }
+
+    #[test]
+    fn feat020_plugin_dispatches_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut app = plugin_test_app(&tmpdir);
+
+        // Bare action opens the extensions view (no panic).
+        let bare = execute("/plugin", &mut app);
+        assert!(bare.action.is_some(), "{bare:?}");
+
+        // List reaches the real adapter through the public seam.
+        let list = execute("/plugin list", &mut app);
+        assert!(!list.is_error, "{list:?}");
+        let msg = list.message.expect("list message");
+        assert!(msg.contains("demo"), "{msg}");
+
+        // Metadata bridges to the TUI localization id.
+        let info = registry().get_info("plugin").expect("plugin info");
+        assert_eq!(
+            info.description_id,
+            codewhale_localization::MessageId::CmdPluginDescription
+        );
+    }
+
+    #[test]
+    fn feat020_public_dispatch_never_panics_on_plugin_commands() {
+        let _home = crate::test_support::SealedHome::new();
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut app = plugin_test_app(&tmpdir);
+        for command in [
+            "/plugin",
+            "/plugin ",
+            "/plugin list",
+            "/plugin show nope",
+            "/plugin validate",
+            "/plugin tools",
+            "/plugin marketplace",
+            "/plugin import kimi",
+            "/plugin suggest",
+        ] {
+            let result = execute(command, &mut app);
+            // Every path returns a result; none may panic.
+            assert!(
+                result.message.is_some() || result.action.is_some(),
+                "{command}: {result:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // FEAT-023 Phase 6 (Task 6.2): the nine lifecycle registrations dispatch
+    // through the public seam with exact capability declarations.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn feat023_lifecycle_entries_register_through_portable_bridge() {
+        use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler};
+
+        for name in ["branch", "fork", "load", "new", "save", "sessions", "tree"] {
+            assert!(
+                registry().has_contextual_handler(name),
+                "/{name} must register through the portable bridge"
+            );
+            let handler = registry()
+                .get(name)
+                .expect("entry")
+                .contextual_handler()
+                .expect("contextual handler");
+            let CommandHandler::Contextual { capabilities, .. } = handler else {
+                panic!("/{name} must be contextual");
+            };
+            assert_eq!(
+                capabilities,
+                CommandCapabilities::SESSION_LIFECYCLE,
+                "/{name} declares lifecycle authority only"
+            );
+        }
+        // Pure handlers register through the bridge with no host bundle.
+        for name in ["compact", "purge"] {
+            assert!(
+                registry().has_contextual_handler(name),
+                "/{name} must register through the portable bridge"
+            );
+            let handler = registry()
+                .get(name)
+                .expect("entry")
+                .contextual_handler()
+                .expect("pure handler");
+            assert!(
+                matches!(handler, CommandHandler::Pure(_)),
+                "/{name} must be pure (no host context bundle)"
+            );
+        }
+        // FEAT-026 completes the final session command adoption.
+        assert!(
+            registry().has_contextual_handler("structcopy"),
+            "/structcopy must use the shared command boundary"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // FEAT-024: session control entries register through the portable bridge
+    // (D3/D6) — five declare SESSION_CONTROL only; `/remote-env` declares
+    // control plus presentation; export/structcopy have independent authority.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn feat024_control_entries_register_through_portable_bridge() {
+        use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler};
+
+        for name in ["relay", "rename", "resume", "rc", "title"] {
+            assert!(
+                registry().has_contextual_handler(name),
+                "/{name} must register through the portable bridge"
+            );
+            let handler = registry()
+                .get(name)
+                .expect("entry")
+                .contextual_handler()
+                .expect("contextual handler");
+            let CommandHandler::Contextual { capabilities, .. } = handler else {
+                panic!("/{name} must be contextual");
+            };
+            assert_eq!(
+                capabilities,
+                CommandCapabilities::SESSION_CONTROL,
+                "/{name} declares control authority only"
+            );
+        }
+        let handler = registry()
+            .get("remote-env")
+            .expect("entry")
+            .contextual_handler()
+            .expect("remote-env handler");
+        let CommandHandler::Contextual { capabilities, .. } = handler else {
+            panic!("/remote-env must be contextual");
+        };
+        assert_eq!(
+            capabilities,
+            CommandCapabilities::SESSION_CONTROL.union(CommandCapabilities::PRESENTATION),
+            "/remote-env declares control plus presentation only"
+        );
+        // FEAT-026 also registers structcopy through its own narrow boundary.
+        assert!(
+            registry().has_contextual_handler("structcopy"),
+            "/structcopy must use the shared command boundary"
+        );
+    }
+
+    #[test]
+    fn feat023_lifecycle_commands_dispatch_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from(".");
+
+        // Pure handlers need no App machinery.
+        let compact = execute("/compact the auth refactor", &mut app);
+        assert_eq!(
+            compact.message.as_deref(),
+            Some("Making room (focus: the auth refactor)…")
+        );
+        assert!(matches!(
+            compact.action,
+            Some(AppAction::CompactContext { focus: Some(ref f) }) if f == "the auth refactor"
+        ));
+        let purge = execute("/purge", &mut app);
+        assert_eq!(
+            purge.message.as_deref(),
+            Some("Agent context purge triggered...")
+        );
+        assert!(matches!(purge.action, Some(AppAction::PurgeContext)));
+
+        // Contextual handler reaches the adapter through the seam; /tree on a
+        // bare app reports no active session.
+        let tree = execute("/tree", &mut app);
+        assert!(
+            tree.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No active session"),
+            "{tree:?}"
+        );
+
+        // Subcommand routing and usage errors stay byte-exact.
+        let bad = execute("/sessions teleport", &mut app);
+        assert!(
+            bad.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unknown subcommand `teleport`"),
+            "{bad:?}"
+        );
+        let branch_usage = execute("/branch", &mut app);
+        assert!(
+            branch_usage
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Usage: /branch <entry_id>"),
+            "{branch_usage:?}"
+        );
+    }
+
+    #[test]
+    fn feat024_control_commands_dispatch_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from(".");
+
+        // /relay composes through the control adapter and emits the bounded
+        // SendMessage action; only SESSION_CONTROL is exposed.
+        let relay = execute("/relay handoff notes", &mut app);
+        assert_eq!(
+            relay.message.as_deref(),
+            Some("Preparing session relay at .deepseek/handoff.md...")
+        );
+        let relay_message = match relay.action {
+            Some(AppAction::SendMessage(message)) => message,
+            other => panic!("expected SendMessage, got {other:?}"),
+        };
+        assert!(relay_message.contains("Create a compact session relay (接力)"));
+        assert!(relay_message.contains("- Requested relay focus: handoff notes"));
+
+        // /rc status reaches the remote-control service through the facet.
+        let rc = execute("/rc status", &mut app);
+        assert_eq!(rc.message.as_deref(), Some("Remote control: off"));
+
+        // /remote-env bare overview is localized through the presentation
+        // facet with the exact source-custody boundary copy.
+        let remote_env = execute("/remote-env", &mut app);
+        assert!(
+            remote_env
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Hosted Work starts a new environment"),
+            "{remote_env:?}"
+        );
+
+        // /rename and /title validation boundaries stay exact over the seam.
+        let rename = execute("/rename", &mut app);
+        assert_eq!(
+            rename.message.as_deref(),
+            Some("Error: Usage: /rename <new title>")
+        );
+        let title = execute("/title", &mut app);
+        assert!(
+            title
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Window title: [unset]"),
+            "{title:?}"
+        );
+
+        // Bare /resume opens the picker through the adapter.
+        let resume = execute("/resume", &mut app);
+        assert!(!resume.is_error);
+        assert!(resume.action.is_none());
+        assert!(resume.message.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // FEAT-025: session export entry registers through the portable bridge
+    // (D1/D3/D5). `/export` (alias `/daochu`) declares exactly SESSION_EXPORT;
+    // `/structcopy` remains a direct host handler for FEAT-026, so the root
+    // `session` frontier stays pending.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn feat025_export_entry_registers_through_portable_bridge() {
+        use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler};
+
+        assert!(
+            registry().has_contextual_handler("export"),
+            "/export must register through the portable bridge"
+        );
+        assert!(
+            registry().has_contextual_handler("daochu"),
+            "/daochu must resolve to the same portable bridge entry"
+        );
+
+        let handler = registry()
+            .get("export")
+            .expect("entry")
+            .contextual_handler()
+            .expect("contextual handler");
+        let CommandHandler::Contextual { capabilities, .. } = handler else {
+            panic!("/export must be contextual");
+        };
+        assert_eq!(
+            capabilities,
+            CommandCapabilities::SESSION_EXPORT,
+            "/export declares export authority only"
+        );
+
+        // Least authority is catalogue-wide: no other registration may declare
+        // the session-export capability.
+        let export_declarers: Vec<&str> = registry()
+            .iter()
+            .filter(|command| {
+                command
+                    .contextual_handler()
+                    .is_some_and(|handler| match handler {
+                        CommandHandler::Contextual { capabilities, .. } => {
+                            capabilities.contains(CommandCapabilities::SESSION_EXPORT)
+                        }
+                        CommandHandler::Pure(_) => false,
+                    })
+            })
+            .map(|command| command.info().name)
+            .collect();
+        // `/share` publishes the same redacted projection `/export` renders,
+        // so it holds the same authority and nothing more.
+        let mut export_declarers = export_declarers;
+        export_declarers.sort_unstable();
+        assert_eq!(
+            export_declarers,
+            vec!["export", "share"],
+            "only /export and /share may declare SESSION_EXPORT"
+        );
+
+        // Export has no direct host fallback. Structcopy also uses the
+        // contract route after FEAT-026, with its own independent authority.
+        let mut app = create_test_app();
+        let legacy = registry()
+            .get("export")
+            .expect("entry")
+            .execute(&mut app, None);
+        assert_eq!(
+            legacy.message.as_deref(),
+            Some("Error: command has no executable handler"),
+            "/export must not keep a legacy function registration"
+        );
+        assert!(
+            registry().has_contextual_handler("structcopy"),
+            "/structcopy must use the shared command boundary"
+        );
+    }
+
+    #[test]
+    fn feat025_export_registered_handler_fails_safely_without_authority() {
+        // The dispatcher builds the envelope from the declared capabilities and
+        // calls this exact handler object. A narrower envelope that omits the
+        // export facet must return the safe error before parsing or performing
+        // any projection, clipboard, recovery, resolution, or write operation.
+        let handler = registry()
+            .get("export")
+            .expect("entry")
+            .contextual_handler()
+            .expect("contextual handler");
+        let codewhale_command_contract::handler::CommandHandler::Contextual {
+            handler: contextual,
+            ..
+        } = handler
+        else {
+            panic!("/export must be contextual");
+        };
+
+        for arg in [None, Some("clipboard"), Some("file out.md")] {
+            let result = contextual(
+                codewhale_command_contract::handler::CommandContexts::empty(),
+                arg,
+            );
+            assert!(result.is_error, "{arg:?} must fail without authority");
+            assert_eq!(
+                result.message.as_deref(),
+                Some("Error: Command capability unavailable: session_export"),
+                "{arg:?} must keep the exact safe error"
+            );
+            assert!(result.action.is_none(), "{arg:?} must produce no action");
+        }
+    }
 }
+
+#[cfg(test)]
+mod config_policy_host_tests;
+#[cfg(test)]
+mod config_policy_permissions_tests;
+#[cfg(test)]
+mod config_policy_status_tests;

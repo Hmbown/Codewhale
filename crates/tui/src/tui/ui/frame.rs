@@ -4,7 +4,6 @@
 //! Moved verbatim out of `ui.rs`.
 
 use super::*;
-use crate::models::Role;
 use crate::tui::infoline::{InfoLine, InfoSegment, InfoSegmentId, infoline_hitboxes};
 
 /// Context window percentage for the metrics line's reading — the same
@@ -14,105 +13,216 @@ pub(crate) fn info_context_percent(app: &App) -> u8 {
     crate::tui::phase_strip::context_percent_from_app(app)
 }
 
-/// The session cost as the one price string every surface prints
-/// (SHELL-DESIGN-20260901 §2.11 item 5): the metrics line, the roster's
-/// right column, the price widget and the turn summary all read this. Empty
-/// until the session has a priced or counted turn.
+/// Format the session's cumulative usage chip for the metrics line. `/cost`
+/// has its own detailed receipt and coverage report; it does not call this
+/// formatter. Chips without a cost display produce an empty string.
+///
+/// Incomplete cost includes its receipt's reason, including an unclassified
+/// billing route. A provider switch cannot erase earlier missing coverage.
 pub(crate) fn session_cost_label(app: &App) -> String {
+    use crate::route_billing::UsageChip;
     let usage_chip = app.cumulative_usage_chip();
     match &usage_chip {
-        crate::route_billing::UsageChip::Money(amount) => Some(amount.clone()),
-        crate::route_billing::UsageChip::PricedSubtotal { .. }
-        | crate::route_billing::UsageChip::Unknown => {
-            crate::route_billing::format_usage_chip(&usage_chip)
+        UsageChip::Money(amount) => Some(amount.clone()),
+        UsageChip::PricedSubtotal { .. } | UsageChip::Unknown(_) => {
+            crate::route_billing::format_usage_chip(&usage_chip, app.ui_locale)
         }
         _ => None,
     }
     .unwrap_or_default()
 }
 
-/// Output tokens and output rate for the metrics line: the live stream's
-/// running estimate while a turn is producing text, else the last turn's
-/// provider-reported figures. `None` before any turn has produced output.
-fn output_figures(app: &App) -> Option<(u64, Option<f64>)> {
-    if app.is_loading && app.streaming_output_token_estimate > 0 {
-        let rate = app
-            .turn_started_at
-            .map(|started| started.elapsed().as_secs_f64())
-            .filter(|secs| *secs > 0.0)
-            .map(|secs| app.streaming_output_token_estimate as f64 / secs);
-        return Some((app.streaming_output_token_estimate, rate));
+/// The clock-dependent billing tier of the active route, when the route has
+/// one: DeepSeek's V4 Pro/Flash and Flash halve their rates off-peak. `None`
+/// for flat-priced routes, for other vendors, and while auto routing has not
+/// pinned a concrete model.
+pub(crate) fn billing_tier_label(app: &App, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    use crate::config::ProviderKind;
+    use codewhale_localization::{MessageId, tr};
+    if app.auto_model || !matches!(app.api_provider, ProviderKind::Deepseek) {
+        return None;
     }
-    if let Some(throughput) = app.session.last_output_throughput {
-        return Some((
-            throughput.output_tokens,
-            Some(throughput.tokens_per_second()),
-        ));
+    let peak = crate::pricing::deepseek_time_tier(&app.model, now)?;
+    let id = if peak {
+        MessageId::InfoLinePeak
+    } else {
+        MessageId::InfoLineOffPeak
+    };
+    Some(tr(app.ui_locale, id).into_owned())
+}
+
+/// Output tokens for the metrics line: the live stream's running estimate,
+/// else the last turn's provider receipt. Request throughput is independently
+/// sourced from SessionMetrics, so a long tool call cannot lower that rate.
+fn output_tokens(app: &App) -> Option<u64> {
+    if app.is_loading && app.streaming_output_token_estimate > 0 {
+        return Some(app.streaming_output_token_estimate);
     }
     app.session
         .last_completion_tokens
         .filter(|tokens| *tokens > 0)
-        .map(|tokens| (u64::from(tokens), None))
+        .map(u64::from)
 }
 
 /// Build the metrics line's segments from live `App` state. Shedding is the
 /// widget's job; this only states the facts, in display order: model,
-/// context, cost, time to first token, output rate, output tokens.
+/// context, cost, balance, time to first token, output rate, output tokens.
 ///
 /// Repository and branch left this row (2026-09-02): the launch header and
 /// the git bottom view own them. Fleet, whale and automation counts left too —
 /// the posture bar's live counts own activity.
+///
+/// Composition is the user's (#5950): every segment here is gated on the
+/// matching [`StatusItem`] in `app.status_items`, which is what `/statusline`
+/// edits and `tui.status_items` persists. Between 0.9.12 and this change the
+/// row ignored that list entirely and the picker's toggles did nothing.
 pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
-    use crate::localization::MessageId;
-    use crate::palette::ChromeInk;
+    use crate::config::StatusItem;
+    use codewhale_localization::MessageId;
+    use codewhale_palette::ChromeInk;
     let mut segments = Vec::new();
     let tier = crate::tui::underwater::ShellTier::for_chrome_width(width);
+    let shows = |item: StatusItem| app.status_items.contains(&item);
+
+    // Where this session writes (#6112): the workspace leaf and the branch
+    // the next commit lands on. Both read cached state only — the branch
+    // comes from `app.workspace_context`, refreshed off the render path on
+    // the workspace-context TTL, so neither chip costs IO per frame. They
+    // lead the row: identity of place before identity of route. The branch
+    // chip degrades to absent outside a repository rather than printing a
+    // permanent dash.
+    if shows(StatusItem::Workspace) {
+        let name = crate::tui::workspace_context::status_workspace_name(
+            &app.workspace,
+            app.workspace_is_linked_worktree,
+        );
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Workspace,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &name,
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
+    if shows(StatusItem::GitBranch)
+        && let Some(branch) = app
+            .workspace_context
+            .as_deref()
+            .and_then(crate::tui::workspace_context::branch_from_context)
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::GitBranch,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &if app.workspace_is_linked_worktree {
+                    format!("{branch} (wt)")
+                } else {
+                    branch.to_string()
+                },
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
 
     // Route identity — the old identity band's fact, same shed discipline:
     // provider first, then effort, whole names or none. When no model is
     // configured the segment says so and waits.
-    let (_, model) = app.effective_route_identity_display();
-    if model.is_empty() {
-        segments.push(InfoSegment::new(
-            InfoSegmentId::Model,
-            app.tr(MessageId::StartupDefaultSubjectModel).as_ref(),
-            app.tr(MessageId::InfoLineNotConnected).as_ref(),
-            ChromeInk::Waiting,
-        ));
-    } else {
-        // The context reading and the metrics claim the rest of the row;
-        // the route sheds its own qualifiers first.
-        let budget = (usize::from(width)).saturating_sub(60).max(24);
-        let fields = crate::tui::phase_strip::route_identity_fields(app, tier, budget)
-            .unwrap_or_else(|| vec![model]);
-        segments.push(InfoSegment::new(
-            InfoSegmentId::Model,
-            "",
-            fields.join(" · "),
-            ChromeInk::Identity,
-        ));
+    // Off the row when the user says so: `/model`, the picker and the launch
+    // header all still name the route.
+    if shows(StatusItem::Model) {
+        let (_, model) = app.effective_route_identity_display();
+        // A keyless first run carries a default model id but nothing can
+        // answer it: the chip says "not connected", matching the launch
+        // card's no-model line (U3), instead of naming a route that fails.
+        if model.is_empty() || app.onboarding_needs_api_key {
+            segments.push(InfoSegment::new(
+                InfoSegmentId::Model,
+                app.tr(MessageId::StartupDefaultSubjectModel).as_ref(),
+                app.tr(MessageId::InfoLineNotConnected).as_ref(),
+                ChromeInk::Waiting,
+            ));
+        } else {
+            // The context reading and the metrics claim the rest of the row;
+            // the route sheds its own qualifiers first.
+            let budget = crate::tui::phase_strip::info_route_budget(width);
+            let fields = info_route_fields(app, tier, budget).unwrap_or_else(|| {
+                vec![crate::tui::phase_strip::RouteIdentityField {
+                    kind: crate::tui::phase_strip::RouteFieldKind::Model,
+                    text: model,
+                }]
+            });
+            segments.push(InfoSegment::new(
+                InfoSegmentId::Model,
+                "",
+                fields
+                    .iter()
+                    .map(|field| field.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(ROUTE_FIELD_JOIN),
+                ChromeInk::MetadataValue,
+            ));
+        }
     }
 
-    // The context reading: painted here and nowhere else. Only displayed
-    // when context fullness >= 50%; below 50% it remains silent. At the 80%
-    // cap the whole reading turns to the error token — it is the one fact on
-    // this row that becomes a problem rather than a status.
+    // The context reading: painted here and nowhere else, at every
+    // fullness. The 0.9.12 row went silent below 50% and left most of a
+    // session with no context signal at all (#5950); watching the number
+    // climb from 4% is the whole point of the reading. At the 80% cap the
+    // whole reading turns to the error token — it is the one fact on this
+    // row that becomes a problem rather than a status.
     let pct = info_context_percent(app);
-    if pct >= 50 {
+    if shows(StatusItem::ContextPercent) {
         segments.push(InfoSegment::new(
             InfoSegmentId::Context,
             app.tr(MessageId::InfoLineContext).as_ref(),
             format!("{pct}%"),
+            // The posture bar one row above calls this exact threshold
+            // `ChromeInk::Attention` (`phase_strip::at_context_cap`, also >= 80).
+            // One condition, one family: a full context is consequential, not a
+            // failure — the next turn still runs and `/compact` is the remedy.
             if pct >= 80 {
-                ChromeInk::Failure
+                ChromeInk::Attention
             } else {
                 ChromeInk::Info
             },
         ));
     }
 
+    // The active goal's live reading: elapsed time plus the model's latest
+    // reported progress with its bar. Painted only while a goal is actually
+    // active — the percent is the model's own estimate, and the row never
+    // invents one for a goal that has not reported.
+    if app.goal.status == crate::tools::goal::GoalStatus::Active
+        && app.goal.objective.is_some()
+        && let Some(started) = app.goal.started_at
+    {
+        let secs = started.elapsed().as_secs();
+        let elapsed = if secs < 60 {
+            format!("{secs}s")
+        } else {
+            format!("{}m", secs / 60)
+        };
+        let value = match app.goal.progress.as_ref() {
+            Some(progress) => format!(
+                "({elapsed}) {}% {}",
+                progress.percent,
+                crate::tools::goal::goal_progress_bar(progress.percent)
+            ),
+            None => format!("({elapsed})"),
+        };
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Goal,
+            app.tr(MessageId::GoalProgressLabel).as_ref(),
+            value,
+            ChromeInk::Info,
+        ));
+    }
+
     let cost = session_cost_label(app);
-    if !cost.is_empty() {
+    if shows(StatusItem::Cost) && !cost.is_empty() {
         segments.push(InfoSegment::new(
             InfoSegmentId::Cost,
             "",
@@ -121,10 +231,45 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
         ));
     }
 
+    // DeepSeek bills by the clock: the same flag that halves the rates
+    // off-peak is painted beside the cost, so the operator can see which tier
+    // the next turn buys without opening /cost. Gated on the cost item, whose
+    // owner asked for price readings by name.
+    if shows(StatusItem::Cost)
+        && let Some(tier) = billing_tier_label(app, chrono::Utc::now())
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::BillingTier,
+            "",
+            tier,
+            ChromeInk::MetadataValue,
+        ));
+    }
+
+    // The prepaid-credit reading: opt-in, and the same status item that
+    // authorises the background fetch (`should_fetch_provider_balance`), so
+    // the row can only show a number this session actually asked for.
+    if shows(StatusItem::Balance)
+        && let Some(balance) = app.balance_cell.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(crate::pricing::BalanceInfo::chip_label)
+        })
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Balance,
+            app.tr(MessageId::FooterBalancePrefix).as_ref(),
+            balance,
+            ChromeInk::MetadataValue,
+        ));
+    }
+
     // The DeepSeek-harness session metrics, from the same accumulators
     // `/cost` prints: nothing here is estimated except the live stream's
     // running token count, which the provider's receipt replaces.
-    if let Some(ttft) = app.session_metrics.ttft_average() {
+    if (shows(StatusItem::SessionMetrics) || shows(StatusItem::Ttft))
+        && let Some(ttft) = app.session_metrics.ttft_average()
+    {
         segments.push(InfoSegment::new(
             InfoSegmentId::Ttft,
             app.tr(MessageId::InfoLineTtft).as_ref(),
@@ -132,27 +277,25 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             ChromeInk::MetadataValue,
         ));
     }
-    if let Some((tokens, rate)) = output_figures(app) {
-        if let Some(rate) = rate {
-            segments.push(InfoSegment::new(
-                InfoSegmentId::Rate,
-                "",
-                format!(
-                    "{} {}",
-                    crate::tui::session_metrics::format_rate(rate),
-                    app.tr(MessageId::SessionMetricsTokensPerSecond)
-                ),
-                ChromeInk::MetadataValue,
-            ));
-        }
-        let hit = u64::from(app.session.displayed_total_cache_hit_tokens());
-        let miss = u64::from(app.session.displayed_total_cache_miss_tokens());
-        let cache_total = hit + miss;
-        if cache_total > 0 {
-            let cache_pct = (hit * 100 + cache_total / 2)
-                .checked_div(cache_total)
-                .and_then(|pct| u8::try_from(pct).ok())
-                .unwrap_or(100);
+    if (shows(StatusItem::SessionMetrics) || shows(StatusItem::OutputRate))
+        && let Some(rate) = app.session_metrics.tokens_per_second()
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Rate,
+            "",
+            format!(
+                "{} {}",
+                crate::tui::session_metrics::format_rate(rate),
+                app.tr(MessageId::SessionMetricsTokensPerSecond)
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
+    if let Some(tokens) = output_tokens(app) {
+        if shows(StatusItem::Cache)
+            && let Some(cache_pct) =
+                crate::tui::session_metrics::snapshot_from_app(app).cache_hit_percent
+        {
             segments.push(InfoSegment::new(
                 InfoSegmentId::Cache,
                 "cache",
@@ -160,21 +303,19 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
                 ChromeInk::MetadataValue,
             ));
         }
-        segments.push(InfoSegment::new(
-            InfoSegmentId::OutputTokens,
-            "↓",
-            crate::tui::session_metrics::format_tokens(tokens),
-            ChromeInk::MetadataValue,
-        ));
+        if shows(StatusItem::Tokens) {
+            segments.push(InfoSegment::new(
+                InfoSegmentId::OutputTokens,
+                "↓",
+                crate::tui::session_metrics::format_tokens(tokens),
+                ChromeInk::MetadataValue,
+            ));
+        }
     } else {
-        let hit = u64::from(app.session.displayed_total_cache_hit_tokens());
-        let miss = u64::from(app.session.displayed_total_cache_miss_tokens());
-        let cache_total = hit + miss;
-        if cache_total > 0 {
-            let cache_pct = (hit * 100 + cache_total / 2)
-                .checked_div(cache_total)
-                .and_then(|pct| u8::try_from(pct).ok())
-                .unwrap_or(100);
+        if shows(StatusItem::Cache)
+            && let Some(cache_pct) =
+                crate::tui::session_metrics::snapshot_from_app(app).cache_hit_percent
+        {
             segments.push(InfoSegment::new(
                 InfoSegmentId::Cache,
                 "cache",
@@ -187,6 +328,20 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     segments
 }
 
+/// Route fields the info line paints, or `None` when it paints the
+/// "not connected" chip instead. `info_segments` and the hitbox split both
+/// read this, so a click can never land on a route the row did not draw.
+fn info_route_fields(
+    app: &App,
+    tier: crate::tui::underwater::ShellTier,
+    budget: usize,
+) -> Option<Vec<crate::tui::phase_strip::RouteIdentityField>> {
+    if app.onboarding_needs_api_key {
+        return None;
+    }
+    crate::tui::phase_strip::route_identity_fields(app, tier, budget)
+}
+
 /// The info line's controls that actually painted in this frame.
 ///
 /// The route target intentionally contains no copied route metadata. The
@@ -195,7 +350,71 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
 #[derive(Debug, Clone, Copy, Default)]
 struct InfoLineInteractionHitboxes {
     context: Option<Rect>,
+    /// The provider name inside the route segment, when the row is wide
+    /// enough to render one.
     route: Option<Rect>,
+    /// The model name and its effort tier — one span, because they are
+    /// always adjacent and `/model` owns both.
+    model: Option<Rect>,
+}
+
+/// Separator between rendered route fields. Three columns wide, matching
+/// `phase_strip::ITEM_SEPARATOR_WIDTH`, which is what the shed budget counts.
+const ROUTE_FIELD_JOIN: &str = " · ";
+
+/// Split the route segment's rect back into its fields.
+///
+/// The segment renders as `provider · model · effort`; a click on the
+/// provider belongs to `/provider` and a click on the model or its effort
+/// tier belongs to `/model`. Widths come from the same field texts the
+/// segment was built from, so the split cannot disagree with what is on
+/// screen. Returns `(provider, model-and-effort)`.
+fn split_route_hitbox(
+    fields: &[crate::tui::phase_strip::RouteIdentityField],
+    area: Rect,
+) -> (Option<Rect>, Option<Rect>) {
+    use crate::tui::phase_strip::RouteFieldKind;
+    use unicode_width::UnicodeWidthStr as _;
+
+    let join = ROUTE_FIELD_JOIN.width();
+    let right = usize::from(area.right());
+    let mut x = usize::from(area.x);
+    let mut provider = None;
+    let mut model: Option<Rect> = None;
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            x += join;
+        }
+        let end = (x + field.text.width()).min(right);
+        if x >= end {
+            break;
+        }
+        let rect = Rect {
+            x: x as u16,
+            y: area.y,
+            width: (end - x) as u16,
+            height: 1,
+        };
+        match field.kind {
+            RouteFieldKind::Provider => provider = Some(rect),
+            // Model and effort are adjacent and share a destination, so the
+            // span grows rather than replacing — a two-target registration
+            // for one idea just gives the pointer a seam to fall into.
+            RouteFieldKind::Model | RouteFieldKind::Effort => {
+                model = Some(match model {
+                    Some(prev) => Rect {
+                        x: prev.x,
+                        y: prev.y,
+                        width: rect.right().saturating_sub(prev.x),
+                        height: 1,
+                    },
+                    None => rect,
+                });
+            }
+        }
+        x = end;
+    }
+    (provider, model)
 }
 
 /// Render the info line into its one row and record its segment
@@ -206,12 +425,31 @@ struct InfoLineInteractionHitboxes {
 /// recorded for hover (this frame's highlight resolves against the previous
 /// frame's rects, the standard one-frame-lag registry pattern) and for typed
 /// click routing.
-fn render_info_row(f: &mut Frame, app: &mut App, area: Rect) -> InfoLineInteractionHitboxes {
+fn render_info_row(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    identity_only: bool,
+) -> InfoLineInteractionHitboxes {
     if area.height == 0 {
         app.viewport.last_infoline_hitboxes.clear();
         return InfoLineInteractionHitboxes::default();
     }
-    let segments = info_segments(app, area.width);
+    // The two bottom rows share the composer's one-cell inset. Paint the
+    // full band before insetting so hover/click geometry uses the same area.
+    Block::default()
+        .style(Style::default().bg(app.ui_theme.header_bg))
+        .render(area, f.buffer_mut());
+    let area = area.inner(ratatui::layout::Margin::new(u16::from(area.width >= 8), 0));
+    let mut segments = info_segments(app, area.width);
+    if identity_only {
+        segments.retain(|segment| {
+            matches!(
+                segment.id,
+                InfoSegmentId::Model | InfoSegmentId::Workspace | InfoSegmentId::GitBranch
+            )
+        });
+    }
     let hovered = app.last_mouse_pos.and_then(|(mx, my)| {
         app.viewport
             .last_infoline_hitboxes
@@ -224,17 +462,44 @@ fn render_info_row(f: &mut Frame, app: &mut App, area: Rect) -> InfoLineInteract
             })
             .map(|hb| hb.id)
     });
-    let help_hint = crate::tui::shell_key_routing::info_help_hint(app.ui_locale);
+    // The metrics line no longer pins `/help` forever (founder, 2026-09-08).
+    // The route still appears until its binding has been used, then retires
+    // with the other footer hints so the row stays quiet once help is learned.
+    let help_hint = if crate::tui::footer_hints::retired(
+        &app.footer_hint_uses,
+        crate::tui::footer_hints::HELP_ROUTE,
+    ) {
+        String::new()
+    } else {
+        crate::tui::shell_key_routing::info_help_hint(app.ui_locale)
+    };
     let info = InfoLine::new(&app.ui_theme, &help_hint, &segments)
         .ascii_safe(crate::tui::color_compat::ascii_safe_enabled())
-        .hovered(hovered);
+        .hovered(hovered)
+        .compact(app.metrics_line == crate::config::ChromeRowPreset::Compact);
     let hitboxes = infoline_hitboxes(&info, area);
+    let route_area = hitboxes
+        .iter()
+        .find(|hitbox| hitbox.id == InfoSegmentId::Model)
+        .map(|hitbox| hitbox.area);
+    // Same pure call `info_segments` made, with the same budget owner, so the
+    // split lines up with the text that was just measured.
+    let route_fields = info_route_fields(
+        app,
+        crate::tui::underwater::ShellTier::for_chrome_width(area.width),
+        crate::tui::phase_strip::info_route_budget(area.width),
+    );
+    let (provider_area, model_area) = match (route_area, route_fields.as_deref()) {
+        (Some(area), Some(fields)) => split_route_hitbox(fields, area),
+        // No configured model: the segment says so and is not a route control.
+        // No drawn segment: nothing to point at either way.
+        (area, None) => (None, area),
+        (None, Some(_)) => (None, None),
+    };
     let interaction_hitboxes = InfoLineInteractionHitboxes {
         context: crate::tui::infoline::context_meter_hitbox(&info, area),
-        route: hitboxes
-            .iter()
-            .find(|hitbox| hitbox.id == InfoSegmentId::Model)
-            .map(|hitbox| hitbox.area),
+        route: provider_area,
+        model: model_area,
     };
     // Keep the row's quiet background under the widget itself.
     let buf = f.buffer_mut();
@@ -244,6 +509,109 @@ fn render_info_row(f: &mut Frame, app: &mut App, area: Rect) -> InfoLineInteract
     ratatui::widgets::Widget::render(info, area, buf);
     app.viewport.last_infoline_hitboxes = hitboxes;
     interaction_hitboxes
+}
+
+/// Paint the workbar: live runs first (in start order), then settled ones,
+/// each with the runtime's count of follow-ups queued on its busy agents.
+fn render_workbar(f: &mut Frame, app: &App, area: Rect) {
+    let queued_for = |panel: &crate::tui::widgets::workflow_panel::WorkflowPanel| {
+        panel
+            .phases
+            .iter()
+            .flat_map(|phase| phase.rows.iter())
+            .filter(|row| row.status.is_running())
+            .filter_map(|row| app.agent_queued_follow_ups.get(&row.task_id))
+            .sum::<usize>()
+    };
+    let (live, settled): (Vec<_>, Vec<_>) = app
+        .workflow_runs
+        .iter()
+        .partition(|panel| panel.lifecycle.is_running());
+    let runs: Vec<crate::tui::widgets::workbar::WorkbarRun<'_>> = live
+        .into_iter()
+        .chain(settled)
+        .map(|panel| crate::tui::widgets::workbar::WorkbarRun {
+            panel,
+            queued: queued_for(panel),
+        })
+        .collect();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default();
+    let buf = f.buffer_mut();
+    Block::default()
+        .style(Style::default().bg(app.ui_theme.footer_bg))
+        .render(area, buf);
+    crate::tui::widgets::workbar::render(area, buf, &runs, now_ms, &app.ui_theme, app.ui_locale);
+}
+
+/// Register the chrome that already answers a click, so it also answers the
+/// pointer.
+///
+/// "What responds to the pointer going over it right now across the entire
+/// app" — the honest answer had been: links, truncated text, and the info
+/// line. The jump-to-latest button, the plugin call-to-action, and the
+/// workflow panel all handled clicks in `mouse_ui` and lit up for nothing,
+/// which teaches a person that pointing at things does not work here.
+///
+/// This runs after the frame body has recorded its rects and before hover is
+/// resolved, so it stays one list rather than a `register_rect` scattered
+/// through every widget that happens to remember.
+fn register_clickable_chrome_for_hover(app: &App) {
+    use codewhale_localization::MessageId;
+    let targets: [(Option<Rect>, MessageId); 5] = [
+        (
+            app.viewport.jump_to_latest_button_area,
+            MessageId::KbJumpTopBottom,
+        ),
+        (
+            // The pinned prompt header jumps to the user message it names.
+            app.viewport.pinned_prompt_area,
+            MessageId::PinnedPromptJumpToMessage,
+        ),
+        (
+            app.viewport.last_plugin_cta_review_area,
+            MessageId::PluginCtaReview,
+        ),
+        (
+            app.viewport.last_plugin_cta_dismiss_area,
+            MessageId::KbCloseMenu,
+        ),
+        (
+            // A workbar row opens `/workflows`.
+            app.viewport.last_workbar_area,
+            MessageId::CmdWorkflowDescription,
+        ),
+    ];
+    for (area, label) in targets {
+        let Some(area) = area else { continue };
+        crate::tui::hover_layer::register_rect(
+            crate::tui::hover_hit::HoverTargetKind::Link,
+            area,
+            codewhale_localization::tr(app.ui_locale, label).into_owned(),
+            false,
+        );
+    }
+
+    // The composer's `[↵]` submit control. It registers only when a click
+    // there would actually send: an affordance that lights up and then does
+    // nothing is the same defect as one that acts without lighting up.
+    if let Some(composer) = app.viewport.last_composer_area
+        && let Some(submit) = crate::tui::widgets::active_composer_submit_rect(app, composer)
+        && app.composer_enter_would_submit()
+    {
+        crate::tui::hover_layer::register_rect(
+            crate::tui::hover_hit::HoverTargetKind::Link,
+            submit,
+            codewhale_localization::tr(
+                app.ui_locale,
+                codewhale_localization::MessageId::KbSendDraft,
+            )
+            .into_owned(),
+            false,
+        );
+    }
 }
 
 /// Register the info line's drawn controls as one typed input surface.
@@ -278,37 +646,64 @@ fn register_info_interaction_targets(app: &mut App, hitboxes: InfoLineInteractio
                 inspect_detail: crate::tui::tideline::InspectDetail::Route,
             });
     }
+    if let Some(hitbox) = hitboxes.model {
+        app.viewport
+            .interaction_targets
+            .register(crate::tui::tideline::InteractionTarget {
+                id: crate::tui::tideline::InteractionTargetId::HEADER_MODEL,
+                area: hitbox,
+                focus: crate::tui::tideline::InteractionFocus::Direct,
+                keyboard_action: Some(crate::tui::tideline::InteractionAction::OpenModelPicker),
+                mouse_action: Some(crate::tui::tideline::InteractionAction::OpenModelPicker),
+                inspect_detail: crate::tui::tideline::InspectDetail::Route,
+            });
+    }
 
     for target in app.viewport.interaction_targets.iter() {
         let label = match target.mouse_action {
             Some(crate::tui::tideline::InteractionAction::InspectContext) => format!(
                 "{} · {}",
-                crate::localization::tr(
+                codewhale_localization::tr(
                     app.ui_locale,
-                    crate::localization::MessageId::CtxMenuContextInspector,
+                    codewhale_localization::MessageId::CtxMenuContextInspector,
                 ),
-                crate::localization::tr(
+                codewhale_localization::tr(
                     app.ui_locale,
-                    crate::localization::MessageId::CtxMenuContextInspectorDesc,
+                    codewhale_localization::MessageId::CtxMenuContextInspectorDesc,
                 ),
             ),
             Some(crate::tui::tideline::InteractionAction::OpenProviderPicker) => format!(
                 "{} · {}",
-                crate::localization::tr(
+                codewhale_localization::tr(
                     app.ui_locale,
-                    crate::localization::MessageId::RoutePanelHeader,
+                    codewhale_localization::MessageId::RoutePanelHeader,
                 ),
-                crate::localization::tr(
+                codewhale_localization::tr(
                     app.ui_locale,
-                    crate::localization::MessageId::CmdProviderDescription,
+                    codewhale_localization::MessageId::CmdProviderDescription,
+                ),
+            ),
+            // `/model` is a command name, not prose, so it stays verbatim in
+            // every locale; only the description is translated.
+            Some(crate::tui::tideline::InteractionAction::OpenModelPicker) => format!(
+                "/model · {}",
+                codewhale_localization::tr(
+                    app.ui_locale,
+                    codewhale_localization::MessageId::CmdModelDescription,
                 ),
             ),
             Some(crate::tui::tideline::InteractionAction::ShowDockPanel(panel)) => {
                 panel.title().to_string()
             }
+            Some(crate::tui::tideline::InteractionAction::OpenAutomations) => {
+                "/automation".to_string()
+            }
             Some(crate::tui::tideline::InteractionAction::DismissDock) => {
-                crate::localization::tr(app.ui_locale, crate::localization::MessageId::KbCloseMenu)
-                    .into_owned()
+                codewhale_localization::tr(
+                    app.ui_locale,
+                    codewhale_localization::MessageId::KbCloseMenu,
+                )
+                .into_owned()
             }
             None => continue,
         };
@@ -318,6 +713,32 @@ fn register_info_interaction_targets(app: &mut App, hitboxes: InfoLineInteractio
             label,
             false,
         );
+    }
+}
+
+/// The posture bar's live counts are the bottom-of-screen way into the
+/// dock: each one opens the view it counts (agents → AGENTS, shells / tasks
+/// → BACKGROUND, automations → their own view, the idle `todo` word → TODO).
+/// Dock destinations use the same `ShowDockPanel` action as the strip's tabs.
+fn register_footer_count_targets(
+    app: &mut App,
+    facts: &crate::tui::phase_strip::TidelineFooterFacts,
+    count_rects: &[(usize, Rect)],
+) {
+    for (index, area) in count_rects {
+        let Some(action) = facts.count_actions.get(*index).copied() else {
+            continue;
+        };
+        app.viewport
+            .interaction_targets
+            .register(crate::tui::tideline::InteractionTarget {
+                id: crate::tui::tideline::InteractionTargetId::FOOTER_COUNT,
+                area: *area,
+                focus: crate::tui::tideline::InteractionFocus::Direct,
+                keyboard_action: Some(action),
+                mouse_action: Some(action),
+                inspect_detail: crate::tui::tideline::InspectDetail::Route,
+            });
     }
 }
 
@@ -455,7 +876,10 @@ pub(crate) async fn build_preview_request_inputs(
         content.push_str(note);
     }
 
-    let (app_route_identity, route_config) = app_scoped_runtime_config(app, config);
+    let (app_route_identity, route_config) = match app_scoped_runtime_config(app, config) {
+        Ok(route) => route,
+        Err(error) => return posture(None, PreviewUnresolved::PlanFailed(error)),
+    };
     let planned = plan_turn_route(TurnRoutePlanRequest {
         route_config: &route_config,
         app_route_identity: &app_route_identity,
@@ -465,7 +889,6 @@ pub(crate) async fn build_preview_request_inputs(
         reasoning_effort: app.reasoning_effort,
         mode: app.mode,
         content: &content,
-        display_text: &prompt,
         auto_router_context: &auto_router::recent_auto_router_context(&app.api_messages),
         should_auto_resolve: false,
         allow_auto_router_response_cache: false,
@@ -511,7 +934,10 @@ pub(crate) async fn build_preview_request_inputs(
 }
 
 pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
-    let provider = app.api_provider;
+    let identity = app
+        .provider_identity
+        .as_ref()
+        .filter(|identity| config.verify_provider_identity(identity).is_ok());
     let max_subagents = app.max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
     EngineConfig {
         model: app.model.clone(),
@@ -529,39 +955,50 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         mcp_oauth_callback_port: config.mcp_oauth_callback_port,
         mcp_oauth_callback_url: config.mcp_oauth_callback_url.clone(),
         skills_dir: app.skills_dir.clone(),
-        skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+        skills_discovery_mode: app.skills_discovery_mode,
         plugin_registry: Some(std::sync::Arc::clone(&app.plugin_registry)),
         instructions: configured_instruction_sources(config),
         project_context_pack_enabled: config.project_context_pack_enabled(),
         translation_enabled: app.translation_enabled,
         verbosity: app.verbosity.clone(),
-        // R1: finite, not `u32::MAX`. The old comment argued a runaway is
-        // "human-noticeable", but an interactive session left running is
-        // exactly where an unbounded loop spends real money unattended.
-        // The default (200) is far above what a long multi-step plan needs;
-        // operators who want more raise `[tui].max_model_steps`, and the
-        // clamp keeps even the maximum finite.
+        // Only an explicit `[tui].max_model_steps` installs a step ceiling.
         max_steps: config.max_model_steps(),
         max_subagents,
-        max_admitted_subagents: config
-            .max_admitted_subagents_for_provider(provider)
+        max_admitted_subagents: identity
+            .map_or_else(
+                || config.max_admitted_subagents(),
+                |identity| config.max_admitted_subagents_for_provider(identity),
+            )
             .max(max_subagents),
-        launch_concurrency: config
-            .launch_concurrency_for_provider(provider)
+        launch_concurrency: identity
+            .map_or_else(
+                || config.launch_concurrency(),
+                |identity| config.launch_concurrency_for_provider(identity),
+            )
             .max(app.mode.mode_delegation_launch_floor()),
-        subagents_enabled: config.subagents_enabled_for_provider(provider),
+        subagents_enabled: identity
+            .is_some_and(|identity| config.subagents_enabled_for_provider(identity)),
         features: config.features(),
         auto_review_policy: config.auto_review_policy(),
         compaction: app.compaction_config(),
         todos: app.todos.clone(),
         plan_state: app.plan_state.clone(),
-        goal_state: crate::tools::goal::new_shared_goal_state_from_host_status(
-            app.goal.objective.clone(),
-            app.goal.token_budget,
-            app.goal.status,
+        goal_state: app.last_known_goal_state.as_ref().map_or_else(
+            || {
+                crate::tools::goal::new_shared_goal_state_from_host_status(
+                    app.goal.objective.clone(),
+                    app.goal.token_budget,
+                    app.goal.status,
+                )
+            },
+            |goal| {
+                crate::tools::goal::new_shared_goal_state_from_snapshot(&goal.to_runtime_snapshot())
+            },
         ),
-        max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
-        subagent_token_budget: config.subagent_token_budget_for_provider(provider),
+        max_spawn_depth: identity.map_or_else(
+            || config.subagent_max_spawn_depth(),
+            |identity| config.subagent_max_spawn_depth_for_provider(identity),
+        ),
         allowed_tools: app.active_allowed_tools.clone(),
         disallowed_tools: None,
         max_tool_calls: None,
@@ -574,6 +1011,9 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
+        // The TUI records no snapshot receipts; its post-turn snapshot stays
+        // off the input path (#234).
+        record_restore_points: false,
         lsp_config: config
             .lsp
             .clone()
@@ -583,19 +1023,23 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         fleet_roster: std::sync::Arc::new(crate::fleet::identity::load_effective_roster(
             &config.fleet_config(),
             &app.workspace,
-            Some(app.plugin_registry.as_ref()),
+            Some(app.extension_plugin_view().as_ref()),
         )),
-        subagent_api_timeout: Duration::from_secs(
-            config.subagent_api_timeout_secs_for_provider(provider),
-        ),
+        subagent_api_timeout: Duration::from_secs(identity.map_or_else(
+            || config.subagent_api_timeout_secs(),
+            |identity| config.subagent_api_timeout_secs_for_provider(identity),
+        )),
         stream_chunk_timeout: Duration::from_secs(app.stream_chunk_timeout_secs),
         turn_wall_clock: config.turn_wall_clock(),
         stream_max_content_bytes: config.stream_max_content_bytes(),
         stream_max_duration: config.stream_max_duration(),
-        subagent_heartbeat_timeout: Duration::from_secs(
-            config.subagent_heartbeat_timeout_secs_for_provider(provider),
-        ),
-        prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
+        stream_retry_limits: config.stream_retry_limits(),
+        stream_open_timeout: config.stream_open_timeout(),
+        subagent_heartbeat_timeout: Duration::from_secs(identity.map_or_else(
+            || config.subagent_heartbeat_timeout_secs(),
+            |identity| config.subagent_heartbeat_timeout_secs_for_provider(identity),
+        )),
+        prefer_bwrap: config.prefers_bwrap(),
         bwrap_extensions: crate::sandbox::BwrapMountExtensions {
             read_only_roots: config.bwrap_ro_roots.clone(),
             device_roots: config.bwrap_dev_roots.clone(),
@@ -611,6 +1055,9 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         goal_status: app.goal.status,
         goal_max_continuations: config.goal_max_continuations(),
         goal_continuation_delay_seconds: config.goal_continuation_delay_seconds(),
+        goal_enforce_token_budget: config.goal_enforce_token_budget(),
+        reasoning_only_max_reprompts: config.reasoning_only_max_reprompts(),
+        reasoning_only_reprompt_message: Some(config.reasoning_only_reprompt_message().to_string()),
         locale_tag: app.ui_locale.tag().to_string(),
         workshop: {
             crate::tools::large_output_router::WorkshopConfig::install_active(
@@ -621,7 +1068,11 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
+        search_native: config.search_native(),
         tools_always_load: config.tools_always_load(),
+        user_input_limits: config.user_input_limits(),
+        user_input_timeout: config.user_input_timeout(),
+        goal_max_steps: Some(config.goal_max_steps()),
         tools: config.tools.clone(),
         workspace_follow_symlinks: app.workspace_follow_symlinks,
         exec_policy_engine: config.exec_policy_engine.clone(),
@@ -650,6 +1101,13 @@ pub(crate) fn build_app_system_prompt_with_goal(
         &config.memory_path(),
         &app.workspace,
     );
+    // Keep the previewed/rebuilt prompt identical to the engine's: the
+    // recovery hint is part of the prefix when a prior workspace session
+    // ended mid-turn (#5715).
+    let recovery_hint = crate::session_manager::session_recovery_hint(
+        &app.workspace,
+        app.current_session_id.as_deref(),
+    );
     prompts::system_prompt_for_mode_with_context_skills_and_session(
         &app.workspace,
         None,
@@ -668,13 +1126,19 @@ pub(crate) fn build_app_system_prompt_with_goal(
                 app.active_route_limits,
             )),
             verbosity: app.verbosity.as_deref(),
-            skills_scan_codewhale_only: app.skills_scan_codewhale_only,
-            plugin_registry: Some(app.plugin_registry.as_ref()),
+            recovery_hint: recovery_hint.as_deref(),
+            skills_discovery_mode: app.skills_discovery_mode,
+            plugin_registry: Some(app.extension_plugin_view().as_ref()),
             mode: app.mode,
         },
     )
 }
 
+/// Build the session snapshot every product caller queues into the
+/// persistence actor. Journal-only (#6214 T3): the `messages` projection is
+/// left empty because the queue drops it anyway, and serialization rehydrates
+/// it from the journal — the on-disk bytes are unchanged. Callers must not
+/// read `.messages` off the returned snapshot; save or serialize it.
 pub(crate) fn build_session_snapshot(
     app: &mut App,
     manager: &SessionManager,
@@ -686,26 +1150,28 @@ pub(crate) fn build_session_snapshot(
             format!("automatic session snapshot skipped while Work state is busy: {err}")
         })?,
     };
-    let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
-        create_saved_session_with_id_and_mode(
-            existing_id.clone(),
-            &app.api_messages,
-            &model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.as_setting()),
-        )
-    } else {
-        create_saved_session_with_mode(
-            &app.api_messages,
-            &model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.as_setting()),
-        )
-    };
+    // Drop what a bounded save already archived (#6842) so the live journal
+    // matches the document. No I/O: the ids come from the save path.
+    if let Some(session_id) = app.current_session_id.as_deref() {
+        let archived = crate::session_manager::take_archived_journal_ids(session_id);
+        if let Err(error) = app.session_journal.remove_entries(&archived) {
+            tracing::warn!(%error, "kept archived journal entries in memory");
+        }
+    }
+    app.session_journal
+        .rebranch_active_messages_stamped(&app.api_messages, &app.api_message_stamps);
+    let mut session = crate::session_manager::create_saved_session_journal_only(
+        app.current_session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        &app.api_messages,
+        app.session_journal.clone(),
+        &model,
+        &app.workspace,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+        Some(app.mode.as_setting()),
+    );
     let computed_title = session.metadata.title.clone();
     if let Some(cached) = app
         .current_session_metadata
@@ -719,12 +1185,36 @@ pub(crate) fn build_session_snapshot(
             .clone_from(&cached.parent_session_id);
         session.metadata.forked_from_message_count = cached.forked_from_message_count;
         session.metadata.archived = cached.archived;
+        session
+            .metadata
+            .runtime_store
+            .clone_from(&cached.runtime_store);
     }
     // The cache above is a hint; disk is the authority for lifecycle state.
     // Re-reading here is what makes "an archive or rename cannot be reverted
     // by autosave" true regardless of which surface applied it or when
     // (#2934 / #4397). One bounded metadata-prefix read, not a transcript scan.
     let merged = manager.merge_persisted_lifecycle(&mut session.metadata);
+    if let Some(binding) = app
+        .runtime_services
+        .task_manager
+        .as_ref()
+        .and_then(|tasks| tasks.session_store_binding())
+    {
+        if session
+            .metadata
+            .runtime_store
+            .as_ref()
+            .is_some_and(|saved| {
+                saved != &binding && !saved.is_missing_session_store().unwrap_or(false)
+            })
+        {
+            return Err(
+                "session snapshot refused to replace its saved Runtime store ownership".into(),
+            );
+        }
+        session.metadata.runtime_store = Some(binding);
+    }
     // Title resolution, in priority order:
     // 1. Disk, when the session already exists (#2934/#4397: a rename applied
     //    through the session manager is persisted and must survive autosave).
@@ -765,6 +1255,7 @@ pub(crate) fn build_session_snapshot(
     app.sync_cost_to_metadata(&mut session.metadata);
     session.context_references = app.session_context_references.clone();
     session.artifacts = app.session_artifacts.clone();
+    session.turn_outcomes = app.session_turn_outcomes.clone();
     session.work_state = work_state;
     session.last_auto_route = app.auto_route_for_persistence();
     session.window_title.clone_from(&app.window_title);
@@ -778,20 +1269,13 @@ pub(crate) fn build_session_snapshot(
     // "the TUI holds the authoritative copy", which is exactly the condition
     // the conflict protects. A session that has never been snapshotted has no
     // in-memory state to lose, so leaving it unclaimed is correct, not a gap.
-    crate::session_manager::set_live_session(Some(&session.metadata.id));
+    manager.claim_live_session(&session.metadata.id);
     Ok(session)
 }
 
-/// Strip ANSI control codes / non-printable bytes from a streaming
-/// text chunk. `pub(super)` because `tui::notifications` consumes it
-/// from `crate::tui::ui` for its per-turn message composition.
-pub(crate) fn sanitize_stream_chunk(chunk: &str) -> String {
-    // Keep printable characters and common whitespace; drop control bytes.
-    chunk
-        .chars()
-        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
-        .collect()
-}
+/// The stream sanitizer lives with the other output sanitizers in
+/// `codewhale-secrets`; the event loop reaches it through this module.
+pub(crate) use codewhale_secrets::sanitize::sanitize_stream_chunk;
 
 /// Ensure an in-flight streaming Assistant cell exists in history and return
 /// its index. Thinking cells go through `streaming_thinking::ensure_active_entry`
@@ -863,16 +1347,24 @@ pub(crate) fn commit_streaming_display_tick(
         return false;
     }
 
+    // Reveal a bounded slice per beat rather than everything received. The
+    // budget is sized from the beat and the backlog, so the displayed pace is a
+    // function of the clock instead of the provider's chunking.
+    let interval = stream_display_clock.interval();
     let mut updated = false;
     if let Some(index) = app.streaming_message_index {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             append_streaming_text(app, index, &committed);
             accrue_streaming_token_estimate(app, &committed);
             updated = true;
         }
     } else if let Some(entry_idx) = app.streaming_thinking_active_entry {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             if app.translation_enabled {
                 streaming_thinking::set_placeholder(app, entry_idx);
@@ -890,66 +1382,13 @@ pub(crate) fn commit_streaming_display_tick(
     updated
 }
 
-pub(crate) fn live_tool_receipt_messages(
-    app: &App,
-    id: &str,
-    raw: &str,
-    success: bool,
-) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(2);
-    if let Some(tool_use_msg) = app.api_messages.iter().rev().find(|message| {
-        message.content.iter().any(|block| {
-            matches!(block, ContentBlock::ToolUse { id: tool_use_id, ..} if tool_use_id == id)
-        })
-    }) {
-        messages.push(tool_use_msg.clone());
-    }
-    messages.push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.to_string(),
-            content: raw.to_string(),
-            is_error: Some(!success),
-            content_blocks: None,
-        }],
-    });
-    messages
-}
-
-pub(crate) fn compact_live_tool_receipt(
-    messages: Vec<Message>,
-    artifacts: Vec<crate::artifacts::ArtifactRecord>,
-    raw: String,
-) -> Option<String> {
-    let (compacted, _) =
-        crate::tool_output_receipts::compact_messages_for_persistence(&messages, &artifacts);
-    let content = compacted
-        .last()
-        .and_then(|message| message.content.first())
-        .and_then(|block| match block {
-            ContentBlock::ToolResult { content, .. } => Some(content),
-            _ => None,
-        })?;
-    if content != &raw && live_tool_content_is_receipt(content) {
-        Some(content.clone())
-    } else {
-        None
-    }
-}
-
-pub(crate) fn live_tool_content_is_receipt(content: &str) -> bool {
-    content.trim_start().starts_with("[TOOL_OUTPUT_RECEIPT]")
-}
-
 /// Build the pending-input preview widget from current `App` state.
 ///
-/// v0.6.6 (#122) wires all three buckets:
+/// v0.6.6 (#122) wires the live buckets:
 /// - `pending_steers` — typed during a running turn + Esc; held until the
 ///   abort lands and gets resubmitted as a fresh merged turn.
-/// - `rejected_steers` — engine declined a mid-turn steer (scaffolding;
-///   no engine path produces these yet but the bucket renders with a distinct
-///   rejected-steer label).
-/// - `queued_messages` — Enter while busy; drained at end-of-turn. In Operate,
+/// - `queued_messages` — Enter while busy; drained at end-of-turn. An
+///   unaccepted steer also lands here (#6297) so it is never lost. In Operate,
 ///   the foreground operator dispatches these as additional background tasks.
 pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
     let mut preview = PendingInputPreview::new();
@@ -976,17 +1415,21 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
             }
         })
         .collect();
+    // #6190: a steer the engine has not recorded yet is exactly what this
+    // bucket's "sending into turn" label describes, so it shares it rather
+    // than growing a fourth bucket and a fifteenth locale string.
     preview.pending_steers = app
         .pending_steers
         .iter()
+        .chain(app.inflight_steers.iter().map(|steer| &steer.message))
         .map(|m| m.display.clone())
         .collect();
-    preview.rejected_steers = app.rejected_steers.iter().cloned().collect();
     preview.queued_messages = app
         .queued_messages
         .iter()
         .map(|m| m.display.clone())
         .collect();
+    preview.pending_approvals = crate::tui::pending_requests::footer_rows(app);
     preview.editing_queued_message = app.queued_draft.as_ref().map(|draft| {
         if app.input.trim().is_empty() {
             draft.display.clone()
@@ -998,15 +1441,12 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
 }
 
 pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(u16, u16)> {
+    app.viewport.ocean_semantic_surfaces.clear();
     let size = f.area();
-    // The sixel block is re-reserved by the launch paint below when the
-    // sixel tier is active; resetting first means any other screen (or a
-    // dissolved card) reads as "no block" and the reconciler clears a
-    // stranded image instead of re-emitting it.
-    app.launch.sixel_mark_area = None;
     // Hover targets belong to the whole composed frame. Resetting inside the
     // transcript erased targets registered later by the composer and modals.
     crate::tui::hover_layer::begin_frame();
+    app.pet_watch.prepare_frame();
     let shell_area = session_shell_area(size);
     // Keep the view stack's focus-context texture prototype (#4823) in step
     // with the parsed setting each frame: a plain enum/theme copy, no
@@ -1014,7 +1454,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     app.view_stack
         .set_focus_texture(app.focus_texture, app.ui_theme);
     app.sidebar_hover = crate::tui::app::SidebarHoverState::default();
-    app.viewport.last_approval_area = None;
+    app.viewport.last_prompt_area = None;
     app.viewport.interaction_targets.clear();
     // Keep the OSC-0 whale title truthful to the current shell phase so
     // alt-tabbed sessions communicate state without a second in-app spinner.
@@ -1038,111 +1478,23 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         return None;
     }
 
-    if app.launch.visible {
-        // The launch screen lives inside the session shell frame (spec
-        // §5b): the Tideline startup stage as the body, then the posture row
-        // and the info line beneath it — the same chrome every post-session
-        // screen wears, so opening Codewhale and working in it are one
-        // design. Nothing paints above the stage; the launch header is the
-        // stage's own. The pre-session composer docks in the stage's bottom
-        // rows; completion entries are computed here — the same way the
-        // session path below computes them for ComposerWidget — so the
-        // stage can paint its popup (#5698 review finding 2); the mention
-        // walker needs &mut App, rendering does not.
-        let launch_slash_menu_entries = visible_slash_menu_entries(app, SLASH_MENU_LIMIT);
-        let launch_mention_menu_entries =
-            crate::tui::file_mention::visible_mention_menu_entries(app, app.mention_menu_limit);
-        // The posture bar and the metrics line appear only once a session
-        // exists: while the launch card is up the stage owns every row.
-        let card_up = {
-            let motion = app.motion_policy().allows_decorative() && !app.low_motion;
-            app.launch
-                .card_dissolve_progress(app.ambient_clock_ms, motion)
-                < 1.0
-        };
-        let areas = if card_up {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .flex(ratatui::layout::Flex::Start)
-                .constraints([Constraint::Min(1)])
-                .split(size)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .flex(ratatui::layout::Flex::Start)
-                .constraints([
-                    Constraint::Min(1),    // stage: Tideline startup
-                    Constraint::Length(1), // posture row (merged footer, slots 6+8)
-                    Constraint::Length(1), // info line
-                ])
-                .split(size)
-        };
-        let stage_area = areas[0];
-        let footer_area = areas.get(1).copied().unwrap_or_default();
-        let info_area = areas.get(2).copied().unwrap_or_default();
-        let startup = crate::tui::underwater::tideline_startup_from_app(app);
-        let mut hitboxes = if startup.composer.enclosed {
-            crate::tui::underwater::tideline_startup_hitboxes(stage_area)
-        } else {
-            crate::tui::underwater::tideline_startup_hitboxes_with_composer(stage_area, false)
-        };
-        // The card's clickable rows share the painter's plan geometry, so
-        // hover and click rects match painted cells.
-        hitboxes.rows = crate::tui::underwater::tideline_startup_row_hitboxes(stage_area, &startup);
-        let sixel_area =
-            crate::tui::underwater::render_tideline_startup(stage_area, f.buffer_mut(), &startup);
-        app.launch.sixel_mark_area = if sixel_area.width > 0 {
-            Some(sixel_area)
-        } else {
-            None
-        };
-        // The completion popup paints above the docked composer's input row,
-        // over the stage rows it needs — the same caller-computed entries
-        // the session popup rides.
-        if let Some(input_row) = hitboxes
-            .input
-            .map(|area| area.y.saturating_sub(stage_area.y))
-        {
-            crate::tui::underwater::render_launch_completion_popup(
-                stage_area,
-                f.buffer_mut(),
-                app,
-                input_row,
-                &launch_slash_menu_entries,
-                &launch_mention_menu_entries,
-            );
-        }
-        crate::tui::underwater::apply_launch_hitboxes(&hitboxes, &mut app.launch);
-        // The merged footer is the screen's last row on every screen.
-        if footer_area.height > 0 {
-            let facts = crate::tui::phase_strip::tideline_footer_from_app(app, footer_area.width);
-            let footer = facts.widget(
-                &app.ui_theme,
-                crate::tui::color_compat::ascii_safe_enabled(),
-            );
-            let buf = f.buffer_mut();
-            Block::default()
-                .style(Style::default().bg(app.ui_theme.footer_bg))
-                .render(footer_area, buf);
-            crate::tui::phase_strip::render_tideline_footer(footer_area, buf, &footer);
-        }
-        // The info line is the screen's last row, under the posture row. At
-        // a height with no row for it, the stale rects must go too, or a
-        // model/context click could route against cells nothing paints.
-        let mut info_interactions = InfoLineInteractionHitboxes::default();
-        if info_area.height > 0 {
-            info_interactions = render_info_row(f, app, info_area);
-        } else {
-            app.viewport.last_infoline_hitboxes.clear();
-        }
-        register_info_interaction_targets(app, info_interactions);
-        if !app.view_stack.is_empty() {
-            if app.view_stack.top_kind() == Some(ModalKind::Approval) {
-                app.viewport.last_approval_area = app.view_stack.top_occupied_region(size);
-            }
-            let buf = f.buffer_mut();
-            app.view_stack.render(size, buf);
-        }
+    // The opening screen is no longer a separate surface. Founder ruling:
+    // "we don't have to have a different look for the opening screen ... we
+    // can make it an asset that exists there instead". The launch card is now
+    // the idle transcript's own empty state (`underwater::launch_empty_state`),
+    // so the composer below it is the real one, the footer and info line are
+    // the ones every other screen wears, and Tab means what it means
+    // everywhere else — there is no second input authority left to arbitrate.
+
+    // The `[redaction] model_bound` opt-out gate owns the first screen too:
+    // it must be answered before any session starts, and it renders above the
+    // launch surface.
+    if app.redaction_gate {
+        crate::tui::redaction_gate::render(f, size, app);
+        return None;
+    }
+    if app.view_stack.top_kind() == Some(crate::tui::views::ModalKind::PetHabitat) {
+        crate::tui::pet_watch::render_full(f, app);
         return None;
     }
 
@@ -1157,21 +1509,29 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // it to the bottom (SHELL-DESIGN-20260901 §2.0) so scrolling up reads as
     // intentional. `keep_header` still governs it in mini mode — the row it
     // names moved, not the preference.
-    let info_height = if mini && !mini_cfg.keep_header {
-        0
-    } else {
-        info_row_height_for(size.height)
-    };
     // Evaluate the fully-idle predicate exactly once per frame. It decides
     // how many rows the rail may reserve and whether the idle ocean draws
     // its brand mark (in ChatWidget); calling it twice would let the
     // reservation and the render disagree inside a single frame.
     let idle_empty = crate::tui::widgets::should_render_empty_state(app);
+    // `tui.metrics_line = "hidden"` gives the row to the transcript (#5950).
+    // The empty shell keeps route identity visible; render_info_row omits
+    // session readings until a conversation exists.
+    let info_height = if (mini && !mini_cfg.keep_header)
+        || app.metrics_line == crate::config::ChromeRowPreset::Hidden
+    {
+        0
+    } else {
+        info_row_height_for(size.height)
+    };
     // The merged Tideline footer is the single bottom row (spec §3: slots
     // 6+8 collapsed; §5b `Constraint::Length(1)`): phase·cost·posture on the
     // left, depth·keys on the right. It hides with the rest of the footer
     // chrome in mini mode, never with the composer.
-    let footer_height = if mini && !mini_cfg.keep_footer {
+    // `tui.posture_bar = "hidden"` likewise (#5950).
+    let footer_height = if (mini && !mini_cfg.keep_footer)
+        || app.posture_bar == crate::config::ChromeRowPreset::Hidden
+    {
         0
     } else {
         crate::tui::phase_strip::height()
@@ -1241,18 +1601,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // flight" (one owner per fact), and nothing sits between the transcript
     // and the composer that is not a queued draft or an expanded panel.
 
-    // WorkflowPanel unified activity surface (#4121). Expanded while running
-    // (interactive drill-in above the composer); when collapsed the panel
-    // takes no rows — its persistent status lives in the top status bar as a
-    // header chip instead (#5040). Zero height when no panel.
-    let desired_workflow_panel_height = if mini {
+    // The workbar (#4121): one row per workflow run, directly under the
+    // posture bar, so live progress sits beside the controls that act on it
+    // and never between the transcript and the composer. Zero rows when no
+    // run is showing.
+    let desired_workbar_height = if mini {
         0
     } else {
-        app.workflow_panel
-            .as_ref()
-            .filter(|panel| panel.expanded)
-            .map(|panel| panel.desired_height(shell_area.width))
-            .unwrap_or(0)
+        crate::tui::widgets::workbar::desired_rows(app.workflow_runs.len())
     };
     let plugin_cta_height = if mini && !mini_cfg.keep_input {
         0
@@ -1272,8 +1628,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // up to three compact rows at the release floor.
     let preview_cap = if size.height >= 20 { 4 } else { 3 };
     let preview_height = desired_preview_height.min(auxiliary_budget.min(preview_cap));
-    let workflow_panel_height =
-        desired_workflow_panel_height.min(auxiliary_budget.saturating_sub(preview_height));
+    let workbar_height =
+        desired_workbar_height.min(auxiliary_budget.saturating_sub(preview_height));
 
     // Two pinned rows bracket the composer from below (SHELL-DESIGN-20260901
     // §2.0 item 3, §2.3b): the posture bar — permission · mode · live counts
@@ -1304,27 +1660,48 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         .constraints([
             Constraint::Length(strip_above_height), // Tasks + To-do above transcript (`top`)
             Constraint::Min(1),                     // Chat area
-            Constraint::Length(workflow_panel_height), // Workflow panel (#4121)
             Constraint::Length(preview_height),     // Pending input preview (0 if empty)
             Constraint::Length(plugin_cta_height),  // Live plugin CTA (0 unless matched)
             Constraint::Length(composer_height),    // Composer
             Constraint::Length(footer_height),      // Posture bar
+            Constraint::Length(workbar_height),     // Workbar: one row per workflow run
             Constraint::Length(info_height),        // Metrics line
             Constraint::Length(strip_below_height), // Roster + To-do under the chrome (`bottom`)
         ])
         .split(body_area);
     let strip_slot = if strip_below { 8 } else { 0 };
-    let plugin_cta_slot = 4;
-    let composer_slot = 5;
-    let footer_slot = 6;
+    let preview_slot = 2;
+    let plugin_cta_slot = 3;
+    let composer_slot = 4;
+    let footer_slot = 5;
+    let workbar_slot = 6;
     let info_slot = 7;
 
+    if matches!(
+        app.view_stack.top_kind(),
+        Some(ModalKind::Approval | ModalKind::UserInput)
+    ) {
+        app.viewport.last_prompt_area = app.view_stack.top_occupied_region(size);
+    }
+    // Bottom prompts cover part of the ordinary chat slot. Resolve scrolling
+    // against the rows that remain visible, or End leaves the newest content
+    // underneath the prompt and PageUp counts rows the user cannot see.
+    let mut visible_chat_area = body_chunks[1];
+    if let Some(prompt) = app.viewport.last_prompt_area {
+        visible_chat_area.height = visible_chat_area
+            .height
+            .min(prompt.y.saturating_sub(visible_chat_area.y));
+    }
     let (work_chat_area, side_work_area) = if mini && !mini_cfg.keep_sidebar {
         // Mini mode without the side rail: the transcript takes the whole
         // chat row. split_chat is skipped so the rail never reserves columns.
-        (body_chunks[1], None)
+        (visible_chat_area, None)
     } else {
-        crate::tui::work_surface::split_chat(app, body_chunks[1], rail_min_chat_width(idle_empty))
+        crate::tui::work_surface::split_chat(
+            app,
+            visible_chat_area,
+            rail_min_chat_width(idle_empty),
+        )
     };
 
     if top_work_strip_height > 0 {
@@ -1372,7 +1749,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             };
         app.sidebar_hover_tooltip = None;
 
-        if app.agent_focus.is_some() {
+        if app.agent_focus.is_some() && !app.launch.return_to_session {
             // A focused worker's full transcript owns the conversation area;
             // the ocean column and every other shell surface stay as they are.
             //
@@ -1390,41 +1767,52 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
                 shell_ocean = chat_widget.ocean_column();
             }
             app.viewport.pending_scroll_delta = parked_scroll_delta;
+            // The constructor above sampled an invisible main transcript;
+            // only the actual focused painter may publish semantic regions.
+            app.viewport.ocean_semantic_surfaces.clear();
+            // The sampling constructor above records the pinned prompt header's
+            // hit box from the main session's transcript, but the focus pane
+            // never paints that header — its first row is the agent banner.
+            // Drop the stale box so the banner cannot answer a click meant for
+            // the (hidden) main transcript.
+            app.viewport.pinned_prompt_area = None;
+            app.viewport.pinned_prompt_message = None;
             crate::tui::agent_focus::refresh_focus(app);
             let buf = f.buffer_mut();
             crate::tui::agent_focus::render_focus(app, chat_area, buf);
         } else {
+            if app.launch.visible
+                && !app.launch.return_to_session
+                && app.onboarding == crate::tui::app::OnboardingState::None
+            {
+                app.launch
+                    .mark_reveal_started_at
+                    .get_or_insert_with(std::time::Instant::now);
+            }
             let chat_widget = ChatWidget::new(app, chat_area).with_ocean_viewport(size);
             shell_ocean = chat_widget.ocean_column();
             let buf = f.buffer_mut();
             chat_widget.render(chat_area, buf);
         }
-    }
-
-    // Workflow panel between chat and pending-input preview (#4121).
-    if workflow_panel_height > 0 {
-        if let Some(panel) = app.workflow_panel.as_ref() {
-            let area = body_chunks[2];
-            app.viewport.last_workflow_panel_area = Some(area);
-            app.viewport.last_workflow_cancel_area =
-                panel.cancel_hint_span(area.width).map(|(start, end)| Rect {
-                    x: area.x.saturating_add(start),
-                    y: area.y,
-                    width: end.saturating_sub(start),
-                    height: 1,
-                });
-            let buf = f.buffer_mut();
-            panel.render(area, buf);
+        // The launch card's rows are clickable where they painted. The row
+        // offsets come from the same builder that produced the lines, so a
+        // hitbox cannot describe a row the transcript did not draw — and a
+        // fully dissolved card painted nothing this frame, so it owns no
+        // rows either.
+        if app.launch.card_paintable(
+            app.ambient_clock_ms,
+            app.motion_policy().allows_decorative(),
+        ) {
+            crate::tui::underwater::refresh_launch_row_hitboxes(app, chat_area);
+        } else if !app.launch.row_hitboxes.is_empty() {
+            app.launch.row_hitboxes.clear();
         }
-    } else {
-        app.viewport.last_workflow_panel_area = None;
-        app.viewport.last_workflow_cancel_area = None;
     }
 
     // Render pending-input preview (queued/steered messages, if any).
     if preview_height > 0 {
         let buf = f.buffer_mut();
-        pending_preview.render(body_chunks[3], buf);
+        pending_preview.render(body_chunks[preview_slot], buf);
     }
 
     if plugin_cta_height > 0 {
@@ -1436,143 +1824,154 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         app.viewport.last_plugin_cta_dismiss_area = None;
     }
 
-    // Render composer
-    let cursor_pos = {
+    // Render once and retain that exact plan for caret and pointer projection.
+    let composer_plan = {
         let composer_widget = ComposerWidget::new(
             app,
             composer_max_height,
             &slash_menu_entries,
             &mention_menu_entries,
         );
-        let buf = f.buffer_mut();
-        composer_widget.render(body_chunks[composer_slot], buf);
-        composer_widget.cursor_pos(body_chunks[composer_slot])
+        composer_widget.render_plan(body_chunks[composer_slot], f.buffer_mut())
     };
+    let cursor_pos = composer_plan.cursor.map(|pos| (pos.x, pos.y));
     app.viewport.last_composer_area = Some(body_chunks[composer_slot]);
-    {
-        let area = body_chunks[composer_slot];
-        let composer_widget = ComposerWidget::new(
-            app,
-            composer_max_height,
-            &slash_menu_entries,
-            &mention_menu_entries,
-        );
-        let input_plane = composer_widget.inner_area(area);
-        app.viewport.last_composer_content = Some(input_plane);
-
-        // Compute scroll offset and top padding for mouse coordinate mapping.
-        let input_text = app.composer_display_input();
-        let input_cursor = app.composer_display_cursor();
-        let content_geometry = crate::tui::widgets::composer_content_geometry(
-            input_plane,
-            app.is_history_search_active(),
-        );
-        let content_width = content_geometry.text_width();
-        let menu_lines = ComposerWidget::new(
-            app,
-            composer_max_height,
-            &slash_menu_entries,
-            &mention_menu_entries,
-        )
-        .active_menu_reserved_rows();
-        let budget =
-            crate::tui::widgets::composer_input_rows_budget(input_plane.height, menu_lines);
-        let (_, _, _, scroll_offset) = crate::tui::widgets::layout_input_with_scroll(
-            input_text,
-            input_cursor,
-            content_width,
-            budget,
-        );
-        let visual_rows = if input_text.is_empty() {
-            let hint: Option<std::borrow::Cow<'_, str>> = if let Some(ref suggestion) =
-                app.prompt_suggestion
-                && !app.is_history_search_active()
-            {
-                Some(std::borrow::Cow::Borrowed(suggestion.as_str()))
-            } else {
-                Some(crate::tui::widgets::composer_empty_hint_text(app))
-            };
-            crate::tui::widgets::empty_composer_visual_rows(hint.as_deref(), content_width, budget)
-        } else {
-            // Count wrapped lines (approximation matching the render path).
-            crate::tui::widgets::wrap_input_lines_for_mouse(input_text, content_width).len()
-        };
-        let top_padding = budget.saturating_sub(visual_rows.clamp(1, budget));
-        app.viewport.last_composer_scroll_offset = scroll_offset;
-        app.viewport.last_composer_top_padding = top_padding;
-    }
+    app.viewport.last_composer_content = Some(composer_plan.geometry.inner);
+    app.viewport.last_composer_scroll_offset = composer_plan.scroll_offset;
+    app.viewport.last_composer_top_padding = composer_plan.top_padding;
     // The posture bar is the first row under the composer: permission chip
     // (never sheds), mode, live counts, the one hint that applies now, with
     // the remote-control state or a live notice pinned right.
     if footer_height > 0 {
         let area = body_chunks[footer_slot];
         let facts = crate::tui::phase_strip::tideline_footer_from_app(app, area.width);
-        let footer = facts.widget(
-            &app.ui_theme,
-            crate::tui::color_compat::ascii_safe_enabled(),
-        );
+        let footer = facts
+            .widget(
+                &app.ui_theme,
+                crate::tui::color_compat::ascii_safe_enabled(),
+            )
+            .compact(app.posture_bar == crate::config::ChromeRowPreset::Compact);
         let buf = f.buffer_mut();
         Block::default()
             .style(Style::default().bg(app.ui_theme.footer_bg))
             .render(area, buf);
-        crate::tui::phase_strip::render_tideline_footer(area, buf, &footer);
+        let count_rects = crate::tui::phase_strip::render_tideline_footer(area, buf, &footer);
+        register_footer_count_targets(app, &facts, &count_rects);
+    }
+
+    if workbar_height > 0 {
+        let area = body_chunks[workbar_slot];
+        render_workbar(f, app, area);
+        app.viewport.last_workbar_area = Some(area);
+    } else {
+        app.viewport.last_workbar_area = None;
     }
 
     // The metrics line sits directly under the posture bar: model · ctx ·
     // cost · ttft · tok/s · ↓ tokens, with the help hint pinned right.
     let mut info_interactions = InfoLineInteractionHitboxes::default();
     if info_height > 0 {
-        info_interactions = render_info_row(f, app, body_chunks[info_slot]);
+        info_interactions = render_info_row(f, app, body_chunks[info_slot], idle_empty);
     } else {
         app.viewport.last_infoline_hitboxes.clear();
     }
     register_info_interaction_targets(app, info_interactions);
 
+    // The native plan keeps its selected source rows private. If a custom
+    // theme aliases selection and base grounds, preserve the whole mounted
+    // composer while selecting rather than infer selected cells from RGB.
+    if app.selection_range().is_some() && app.ui_theme.selection_bg == app.ui_theme.composer_bg {
+        app.viewport
+            .ocean_semantic_surfaces
+            .push(body_chunks[composer_slot]);
+    }
+
     // The underwater shell is one water column, not a stack of independently
     // shaded panels. Continue the transcript's absolute-row ramp through each
     // ordinary shell surface after its foreground has rendered. Semantic
-    // backgrounds such as selection, hover, errors, and code blocks do not
-    // match these base colors and therefore remain intact.
+    // backgrounds remain exact through different-ground guards and the
+    // frame-derived explicit styled-surface mask, including aliased colors.
     if let Some(column) = shell_ocean {
         // The working canvas may keep a small responsive gutter, but the water
         // does not stop at that content edge. Paint the cleared terminal floor
         // first so wide layouts read as one ocean rather than a blue card
         // floating between black banks. `paint_matching` leaves every semantic
         // widget background untouched.
-        column.paint_matching(size, f.buffer_mut(), app.ui_theme.surface_bg);
+        column.paint_matching_native(
+            size,
+            f.buffer_mut(),
+            app.ui_theme.surface_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
+        );
         if top_work_strip_height > 0 {
-            column.paint_matching(
+            column.paint_matching_native(
                 body_chunks[strip_slot],
                 f.buffer_mut(),
                 app.ui_theme.surface_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
             );
         }
         if let Some(side_area) = side_work_area {
-            column.paint_matching(side_area, f.buffer_mut(), app.ui_theme.surface_bg);
+            column.paint_matching_native(
+                side_area,
+                f.buffer_mut(),
+                app.ui_theme.surface_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
+            );
         }
-        column.paint_matching(work_chat_area, f.buffer_mut(), app.ui_theme.surface_bg);
-        column.paint_matching(body_chunks[2], f.buffer_mut(), app.ui_theme.surface_bg);
-        column.paint_matching(body_chunks[3], f.buffer_mut(), app.ui_theme.surface_bg);
+        column.paint_matching_native(
+            work_chat_area,
+            f.buffer_mut(),
+            app.ui_theme.surface_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
+        );
+        column.paint_matching_native(
+            body_chunks[preview_slot],
+            f.buffer_mut(),
+            app.ui_theme.surface_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
+        );
         if plugin_cta_height > 0 {
-            column.paint_matching(
+            column.paint_matching_native(
                 body_chunks[plugin_cta_slot],
                 f.buffer_mut(),
                 app.ui_theme.composer_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
             );
         }
-        column.paint_matching(
+        column.paint_matching_native(
             body_chunks[composer_slot],
             f.buffer_mut(),
             app.ui_theme.composer_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
         );
         if footer_height > 0 {
-            column.paint_matching(
+            column.paint_matching_native(
                 body_chunks[footer_slot],
                 f.buffer_mut(),
                 app.ui_theme.footer_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
+            );
+        }
+        if workbar_height > 0 {
+            column.paint_matching_native(
+                body_chunks[workbar_slot],
+                f.buffer_mut(),
+                app.ui_theme.footer_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
             );
         }
     }
+    register_clickable_chrome_for_hover(app);
     crate::tui::hover_layer::apply_resolved_effects(
         f.buffer_mut(),
         app.effective_low_motion_for_status(),
@@ -1587,11 +1986,12 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         } else if app.view_stack.top_kind() == Some(ModalKind::ContextInspector) {
             refresh_context_inspector_overlay(app);
         }
-        if app.view_stack.top_kind() == Some(ModalKind::Approval) {
-            app.viewport.last_approval_area = app.view_stack.top_occupied_region(size);
-        }
         let buf = f.buffer_mut();
         app.view_stack.render(size, buf);
+        // Any view on the stack owns the keyboard and paints over the
+        // composer, and no view draws its own text caret, so the composer's
+        // caret must not surface through the modal (#6545).
+        return None;
     }
 
     cursor_pos
@@ -1638,63 +2038,6 @@ pub(super) fn finish_frame_cursor<B: ratatui::backend::Backend>(
 ///
 /// When `full_repaint` is false, only the diff from the previous draw is
 /// written (normal incremental update path).
-/// Reconcile the sixel tier's live image with this frame's reservation, in
-/// the frame's own synchronized update so the pixels land atomically with
-/// the cells around them. Steady state (same block as last frame) emits no
-/// bytes at all: ratatui never rewrites the reserved blank cells, so the
-/// image survives redraws untouched. A move clears the old block first;
-/// a tier exit clears and stops. Write errors are logged, never fatal —
-/// the blank block simply stays blank until the next frame retries.
-pub(crate) fn reconcile_launch_sixel(writer: &mut impl std::io::Write, app: &mut App) {
-    use crate::tui::mark;
-    let field_bg = mark::sixel_field_bg(&app.ui_theme, app.launch.sixel_terminal_bg);
-    // Fullscreen stage coordinates already are screen cells (both 0-based;
-    // the 1-based CUP shift happens in the sequence builders). Inline
-    // viewports have no stable origin, so the tier never reserves there
-    // and this maps nothing.
-    let want = if mark::sixel_graphics_supported() && app.use_alt_screen() && field_bg.is_some() {
-        app.launch.sixel_mark_area
-    } else {
-        None
-    };
-    if want == app.launch.sixel_emitted {
-        return;
-    }
-    let Some(bg) = field_bg else {
-        // No exact field colour to paint with: hold the current image and
-        // retry next frame rather than flashing a wrong background.
-        tracing::debug!(target: "sixel_graphics", "no RGB field; holding sixel state");
-        return;
-    };
-    if let Some(old) = app.launch.sixel_emitted {
-        let bytes = mark::sixel_clear_sequence(old, bg);
-        if writer.write_all(&bytes).is_err() {
-            tracing::debug!(target: "sixel_graphics", "sixel clear failed");
-            return;
-        }
-        app.launch.sixel_emitted = None;
-    }
-    if let Some(block) = want {
-        let sequence = app
-            .launch
-            .sixel_cell_px
-            .and_then(|cell_px| mark::sixel_mark_sequence(bg, cell_px));
-        if let Some(sequence) = sequence {
-            let bytes = mark::sixel_positioned_sequence(block, &sequence);
-            if writer.write_all(&bytes).is_err() {
-                tracing::debug!(target: "sixel_graphics", "sixel emission failed");
-                return;
-            }
-            app.launch.sixel_emitted = Some(block);
-        } else {
-            tracing::debug!(
-                target: "sixel_graphics",
-                "sixel raster unavailable; the blank block holds"
-            );
-        }
-    }
-}
-
 pub(crate) fn draw_app_frame_inner(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -1703,46 +2046,66 @@ pub(crate) fn draw_app_frame_inner(
 ) -> Result<()> {
     terminal.backend_mut().set_palette_mode(app.ui_theme.mode);
     terminal.backend_mut().set_theme(app.theme_id, app.ui_theme);
+    app.viewport.ocean_caps = Some(terminal.backend().native_ocean_caps());
     // DEC 2026 wrapping is on by default but can be turned off for
     // terminals that mishandle it (Ptyxis 50.x + VTE 0.84.x flashes the
     // whole viewport on every wrapped frame instead of deferring as the
     // standard requires). Settings::synchronized_output_enabled resolves
     // the user's setting against the Ptyxis env auto-detect.
-    let wrap_in_sync_update = app.synchronized_output_enabled;
-    if wrap_in_sync_update {
-        let _ = terminal.backend_mut().write_all(BEGIN_SYNC_UPDATE);
-    }
-
-    // Run fallible draw operations in a closure so END_SYNC_UPDATE is
-    // always sent even if an intermediate step fails. Without this, a
-    // failing `?` would return early and leave the terminal stuck in
-    // synchronized-update mode (screen frozen).
-    let result = (|| -> Result<()> {
+    let resized = app.viewport.pending_terminal_size.take();
+    let result = synchronized_frame(terminal, app.synchronized_output_enabled, |terminal| {
+        if let Some(size) = resized {
+            // Keep ratatui's resize clear in the same DEC 2026 transaction as
+            // the repaint. Inline mode rebuilds its fixed-height viewport.
+            let refit = if app.screen_mode == ScreenMode::Inline {
+                refit_inline_viewport(terminal, size)
+            } else {
+                terminal.resize(Rect::new(0, 0, size.width, size.height))
+            };
+            if let Err(err) = refit {
+                tracing::warn!(?err, "terminal resize failed; falling back to clear+draw");
+            }
+            // ConHost and Terminal.app can briefly report the previous size.
+            terminal.backend_mut().force_size(size);
+            terminal.backend_mut().set_terminal_size(size);
+        }
         // The terminal cursor itself is also input-method geometry. Hide it
         // before clear/diff operations move it, then restore the one composer
         // position after ratatui finishes drawing (#5023).
         prepare_frame_cursor(terminal)?;
-        if full_repaint {
+        if full_repaint || resized.is_some() {
             terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
             terminal.clear()?;
-            // A repaint wipes sixel pixels with everything else; forget the
-            // live image so the reconciler below re-emits it this frame.
-            app.launch.sixel_emitted = None;
         }
         let mut cursor_pos = None;
         terminal.draw(|f| cursor_pos = render(f, app, config))?;
+        app.pet_watch.present(terminal.backend_mut())?;
         finish_frame_cursor(terminal, cursor_pos)?;
-        // Inside the synchronized update: the pixels land atomically with
-        // the cells. Steady state emits nothing.
-        reconcile_launch_sixel(terminal.backend_mut(), app);
         Ok(())
-    })();
+    });
+    if resized.is_some() {
+        terminal.backend_mut().clear_forced_size();
+    }
+    result
+}
 
-    // Always end the synchronized update, regardless of success or failure.
-    if wrap_in_sync_update {
+/// End and flush the synchronized frame even when resizing or drawing fails.
+pub(super) fn synchronized_frame<B, T>(
+    terminal: &mut Terminal<B>,
+    enabled: bool,
+    draw: impl FnOnce(&mut Terminal<B>) -> Result<T>,
+) -> Result<T>
+where
+    B: ratatui::backend::Backend + Write,
+{
+    if enabled {
+        let _ = terminal.backend_mut().write_all(BEGIN_SYNC_UPDATE);
+    }
+    let result = draw(terminal);
+    if enabled {
         let _ = terminal.backend_mut().write_all(END_SYNC_UPDATE);
     }
-    let _ = terminal.backend_mut().flush();
+    let _ = std::io::Write::flush(terminal.backend_mut());
     result
 }
 
@@ -1819,6 +2182,14 @@ pub(crate) fn transcript_scroll_percent(top: usize, visible: usize, total: usize
 }
 
 pub(crate) fn estimated_context_tokens(app: &App) -> Option<i64> {
+    // ONE estimator: this is `compaction::estimate_input_tokens_for_pressure`
+    // over the same message list (per-message cache, framing included) —
+    // deliberately not the 1.5x conservative variant. The meter, the >=80%
+    // depth warning, and the auto-compact gate must agree about where the
+    // threshold is: the inflated estimate used to show "ctx 82%" while the
+    // gate read ~55% and correctly refused to compact (#6297). The 1.5x
+    // inflation stays where it belongs — request-overflow protection
+    // (`estimate_input_tokens_conservative`).
     let message_count = app.api_messages.len();
     let mut cache = app.context_token_cache.borrow_mut();
     if cache.message_tokens.len() > message_count {
@@ -1836,13 +2207,7 @@ pub(crate) fn estimated_context_tokens(app: &App) -> Option<i64> {
         let last = message_count - 1;
         cache.message_tokens[last] = estimate_tokens(&app.api_messages[last..=last]);
     }
-    let message_tokens = cache
-        .message_tokens
-        .iter()
-        .copied()
-        .sum::<usize>()
-        .saturating_mul(3)
-        .div_ceil(2);
+    let message_tokens = cache.message_tokens.iter().copied().sum::<usize>();
     let system_tokens =
         estimate_input_tokens_conservative(&[], app.system_prompt.as_ref()).saturating_sub(48);
     let estimated = message_tokens
@@ -1862,13 +2227,31 @@ pub(crate) fn context_usage_snapshot(app: &App) -> Option<(i64, u32, f64)> {
 }
 
 pub(crate) fn context_usage_snapshot_for_window(app: &App, max: u32) -> Option<(i64, u32, f64)> {
+    // Before a conversation starts, the assembled startup prompt alone is not
+    // conversation usage, and compacting an empty session cannot reclaim it.
+    // A submitted first turn has started the conversation even before the
+    // engine mirrors its messages back, and so has any provider usage; those
+    // keep the real pressure reading.
+    let conversation_started =
+        !app.api_messages.is_empty() || app.is_loading || count_user_history_cells(app) > 0;
+    if !conversation_started
+        && app.session.last_prompt_tokens.unwrap_or(0) == 0
+        && app.last_billed_input_tokens.unwrap_or(0) == 0
+    {
+        return Some((0, max, 0.0));
+    }
     let max_i64 = i64::from(max);
     let reported = app
         .session
         .last_prompt_tokens
         .map(i64::from)
         .map(|tokens| tokens.max(0));
-    let estimated = estimated_context_tokens(app).map(|tokens| tokens.max(0));
+    // Lift to the provider-billed prompt exactly as the auto-compaction gate,
+    // the context inspector and the `/context` headline do (#5577): a provider
+    // billing above the local estimate must not leave the footer under-showing
+    // the pressure those surfaces report.
+    let billed = app.last_billed_input_tokens.map_or(0, i64::from);
+    let estimated = estimated_context_tokens(app).map(|tokens| tokens.max(0).max(billed));
 
     // Always prefer the estimated current-context size (computed from
     // `app.api_messages`) when we have it. Reported `last_prompt_tokens`
@@ -1883,6 +2266,12 @@ pub(crate) fn context_usage_snapshot_for_window(app: &App, max: u32) -> Option<(
     // fallback when no estimate is available (e.g., immediately after a
     // session restore before the api_messages are populated).
     let used = match (estimated, reported) {
+        // No messages yet (a restore before the projection lands): the
+        // estimate is only the system prompt, so the reported prompt is the
+        // better reading and must not be dropped to ~0%.
+        (Some(estimated), Some(reported)) if app.api_messages.is_empty() => {
+            estimated.max(reported).min(max_i64)
+        }
         (Some(estimated), _) => estimated.min(max_i64),
         (None, Some(reported)) => reported.min(max_i64),
         (None, None) => return None,
@@ -1917,17 +2306,100 @@ mod tests {
     use super::{register_info_interaction_targets, render_info_row, short_title_truncate};
     use ratatui::{Terminal, backend::TestBackend};
 
+    /// Chrome that answers a click must also answer the pointer, or the app
+    /// teaches people that pointing at things does not work here.
+    #[test]
+    fn clickable_chrome_registers_a_hover_target() {
+        let _guard = crate::tui::hover_layer::HOVER_TEST_LOCK.lock().unwrap();
+        crate::tui::hover_layer::begin_frame();
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        let button = ratatui::layout::Rect::new(70, 10, 3, 3);
+        app.viewport.jump_to_latest_button_area = Some(button);
+
+        super::register_clickable_chrome_for_hover(&app);
+
+        let registered = crate::tui::hover_layer::registered_targets();
+        assert!(
+            registered.iter().any(|hit| hit.area == button),
+            "the jump-to-latest button handles a click in mouse_ui and must \
+             light up under the pointer; registered: {registered:?}"
+        );
+    }
+
+    /// The pinned prompt header answers a click in `mouse_ui`; it must light
+    /// up under the pointer like every other clickable chrome.
+    #[test]
+    fn pinned_prompt_header_registers_a_hover_target() {
+        let _guard = crate::tui::hover_layer::HOVER_TEST_LOCK.lock().unwrap();
+        crate::tui::hover_layer::begin_frame();
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        let header = ratatui::layout::Rect::new(4, 3, 40, 1);
+        app.viewport.pinned_prompt_area = Some(header);
+
+        super::register_clickable_chrome_for_hover(&app);
+
+        let registered = crate::tui::hover_layer::registered_targets();
+        assert!(
+            registered.iter().any(|hit| hit.area == header),
+            "the pinned prompt header handles a click in mouse_ui and must \
+             light up under the pointer; registered: {registered:?}"
+        );
+    }
+
+    /// The composer's `[↵]` answered clicks and showed nothing under the
+    /// pointer — the last of the clickable-but-dark controls. It lights up
+    /// only when a click there would actually send.
+    #[test]
+    fn composer_send_target_lights_up_only_when_it_would_send() {
+        let _guard = crate::tui::hover_layer::HOVER_TEST_LOCK.lock().unwrap();
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.launch.visible = false;
+        app.composer_border = true;
+        let area = ratatui::layout::Rect::new(0, 20, 80, 4);
+        app.viewport.last_composer_area = Some(area);
+        app.viewport.last_composer_content = Some(ratatui::layout::Rect::new(1, 21, 73, 2));
+        let submit = crate::tui::widgets::active_composer_submit_rect(&app, area)
+            .expect("enclosed composer submit");
+
+        // Empty draft: the click path refuses, so the pointer must not promise.
+        app.input.clear();
+        app.cursor_position = 0;
+        crate::tui::hover_layer::begin_frame();
+        super::register_clickable_chrome_for_hover(&app);
+        assert!(
+            !crate::tui::hover_layer::registered_targets()
+                .iter()
+                .any(|hit| hit.area == submit),
+            "an inert send target must not advertise itself"
+        );
+
+        app.input = "ship it".to_string();
+        app.cursor_position = app.input.chars().count();
+        crate::tui::hover_layer::begin_frame();
+        super::register_clickable_chrome_for_hover(&app);
+        assert!(
+            crate::tui::hover_layer::registered_targets()
+                .iter()
+                .any(|hit| hit.area == submit),
+            "a live send target must light up under the pointer"
+        );
+    }
+
     #[test]
     fn infoline_route_segment_registers_interaction_target() {
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.onboarding_needs_api_key = false;
         let mut terminal =
             Terminal::new(TestBackend::new(160, 1)).expect("info-line test terminal should build");
 
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                let hitboxes = render_info_row(frame, &mut app, area);
+                let hitboxes = render_info_row(frame, &mut app, area, false);
                 register_info_interaction_targets(&mut app, hitboxes);
             })
             .expect("info line should render");
@@ -1938,22 +2410,86 @@ mod tests {
             .iter()
             .find(|hitbox| hitbox.id == crate::tui::infoline::InfoSegmentId::Model)
             .expect("a wide info line should paint its model segment");
-        let target = app
-            .viewport
-            .interaction_targets
-            .iter()
-            .find(|target| target.id == crate::tui::tideline::InteractionTargetId::HEADER_ROUTE)
-            .expect("painted route segment should have a typed target");
+        let target_for = |id| {
+            app.viewport
+                .interaction_targets
+                .iter()
+                .find(|target| target.id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("painted route segment should register {id:?}"))
+        };
+        // The segment reads `provider · model · effort`. Pointing at the
+        // provider is a different request from pointing at the model, so the
+        // one target became two: the whole span used to open `/provider` no
+        // matter which name was under the pointer.
+        let provider = target_for(crate::tui::tideline::InteractionTargetId::HEADER_ROUTE);
+        let model = target_for(crate::tui::tideline::InteractionTargetId::HEADER_MODEL);
 
-        assert_eq!(target.area, segment.area);
+        assert_eq!(provider.area.x, segment.area.x);
+        assert!(
+            provider.area.right() < model.area.x,
+            "provider {:?} and model {:?} must not overlap",
+            provider.area,
+            model.area
+        );
+        assert_eq!(model.area.right(), segment.area.right());
         assert_eq!(
-            target.keyboard_action,
+            provider.keyboard_action,
             Some(crate::tui::tideline::InteractionAction::OpenProviderPicker)
         );
-        assert_eq!(target.mouse_action, target.keyboard_action);
         assert_eq!(
-            target.inspect_detail,
-            crate::tui::tideline::InspectDetail::Route
+            model.keyboard_action,
+            Some(crate::tui::tideline::InteractionAction::OpenModelPicker)
+        );
+        for target in [&provider, &model] {
+            assert_eq!(target.mouse_action, target.keyboard_action);
+            assert_eq!(
+                target.inspect_detail,
+                crate::tui::tideline::InspectDetail::Route
+            );
+        }
+    }
+
+    /// U3: a keyless first run keeps a default model id, but nothing can
+    /// answer it. The route chip says "not connected" instead of naming that
+    /// route, and it is not a route control until a model is connected.
+    #[test]
+    fn keyless_launch_route_chip_says_not_connected() {
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.onboarding_needs_api_key = true;
+        let (_, model) = app.effective_route_identity_display();
+        assert!(!model.is_empty(), "the fixture carries a default model id");
+        let mut terminal =
+            Terminal::new(TestBackend::new(160, 1)).expect("info-line test terminal should build");
+        let mut hitboxes = super::InfoLineInteractionHitboxes::default();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                hitboxes = render_info_row(frame, &mut app, area, false);
+            })
+            .expect("info line should render");
+        let row: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(row.contains("not connected"), "{row:?}");
+        assert!(!row.contains(&model), "a dead route is not named: {row:?}");
+        assert!(hitboxes.route.is_none(), "no provider control: {row:?}");
+
+        // Once a key lands the same row names the route again.
+        app.onboarding_needs_api_key = false;
+        let segments = super::info_segments(&app, 160);
+        assert!(
+            segments.iter().any(
+                |segment| segment.id == crate::tui::infoline::InfoSegmentId::Model
+                    && segment.value.contains(&model)
+            ),
+            "{segments:?}"
         );
     }
 
@@ -1990,6 +2526,559 @@ mod tests {
     #[test]
     fn leaves_short_titles_untouched() {
         assert_eq!(short_title_truncate("short", 10), "short");
+    }
+
+    // ── #5950: the bottom chrome is the user's to compose ─────────────
+
+    use crate::config::StatusItem;
+    use crate::tui::app::App;
+    use crate::tui::infoline::{InfoLine, InfoSegmentId};
+
+    /// A session whose context is `pct` full, by pinning the route's window
+    /// to a multiple of what this conversation actually estimates. Nothing
+    /// here fakes the reading itself — it goes through
+    /// `context_usage_snapshot` like the live shell does.
+    fn app_with_context_percent(pct: u8) -> App {
+        use codewhale_models::{ContentBlock, Message};
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        // A keyless test config would paint "not connected" (U3); these
+        // readings are about a connected route.
+        app.onboarding_needs_api_key = false;
+        app.api_messages = std::sync::Arc::new(vec![Message {
+            role: codewhale_models::Role::User,
+            content: vec![ContentBlock::Text {
+                text: "context ".repeat(400),
+                cache_control: None,
+            }],
+        }]);
+        let (used, _, _) =
+            super::context_usage_snapshot(&app).expect("a conversation has a context reading");
+        let window = (used as f64 * 100.0 / f64::from(pct)).round().max(1.0);
+        app.active_route_limits = Some(codewhale_config::route::RouteLimits {
+            context_tokens: Some(window as u64),
+            ..Default::default()
+        });
+        assert_eq!(
+            super::info_context_percent(&app),
+            pct,
+            "fixture should land exactly on {pct}%"
+        );
+        app
+    }
+
+    /// The metrics line as the user reads it, at `width`.
+    fn metrics_row(app: &App, width: u16) -> String {
+        let segments = super::info_segments(app, width);
+        let hint = crate::tui::shell_key_routing::info_help_hint(app.ui_locale);
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("metrics-line terminal");
+        terminal
+            .draw(|frame| {
+                use ratatui::widgets::Widget as _;
+                let area = frame.area();
+                InfoLine::new(&app.ui_theme, &hint, &segments).render(area, frame.buffer_mut());
+            })
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn footer_keeps_reasoning_label_for_every_effort_tier() {
+        use crate::reasoning_preference::ReasoningEffort;
+
+        let mut app = app_with_context_percent(1);
+        app.api_provider = crate::config::ProviderKind::Openai;
+        app.active_route_base_url = "https://api.openai.com/v1".to_string();
+        app.model = "gpt-5.6".to_string();
+        app.auto_model = false;
+        app.ui_locale = codewhale_localization::Locale::En;
+
+        let mut missing = Vec::new();
+        for effort in [
+            ReasoningEffort::Off,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Ultra,
+            ReasoningEffort::Auto,
+            ReasoningEffort::Max,
+        ] {
+            app.reasoning_effort = effort;
+            let label = app.reasoning_effort_display_label();
+            assert!(!label.is_empty(), "{effort:?} must have a label");
+            let row = metrics_row(&app, 80);
+            if !row.contains(&format!("thinking: {label}")) {
+                missing.push(format!("{effort:?}: {row:?}"));
+            }
+        }
+        assert!(missing.is_empty(), "missing footer labels: {missing:#?}");
+    }
+
+    /// The reading used to go silent below 50% fullness, which is most of a
+    /// session (#5950). It is a reading, not an alarm: it states 10% as
+    /// readily as 60%, and only the ink changes at the thresholds.
+    #[test]
+    fn context_reading_paints_at_every_fullness() {
+        for pct in [10u8, 60] {
+            let app = app_with_context_percent(pct);
+            let segment = super::info_segments(&app, 160)
+                .into_iter()
+                .find(|segment| segment.id == InfoSegmentId::Context)
+                .unwrap_or_else(|| panic!("{pct}%: the context reading must be on the row"));
+            assert_eq!(segment.value, format!("{pct}%"));
+            assert_eq!(
+                segment.ink,
+                codewhale_palette::ChromeInk::Info,
+                "{pct}%: below the cap the reading is a status, not a failure"
+            );
+            // Narrow rows keep it too: the reading is the row's floor and
+            // sheds after everything else, including the help hint.
+            for width in [40u16, 80, 160] {
+                let row = metrics_row(&app, width);
+                assert!(
+                    row.contains(&format!("context {pct}%")),
+                    "{pct}% at {width} columns: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// The warning ink still belongs to the thresholds it always used: the
+    /// error token from 80% up, and not one percent earlier.
+    #[test]
+    fn context_reading_keeps_its_warning_threshold() {
+        for (pct, expected) in [
+            (10u8, codewhale_palette::ChromeInk::Info),
+            (79, codewhale_palette::ChromeInk::Info),
+            (80, codewhale_palette::ChromeInk::Attention),
+        ] {
+            let app = app_with_context_percent(pct);
+            let segment = super::info_segments(&app, 160)
+                .into_iter()
+                .find(|segment| segment.id == InfoSegmentId::Context)
+                .expect("context reading");
+            assert_eq!(segment.ink, expected, "{pct}%");
+        }
+    }
+
+    /// `/statusline` drives this row. Between 0.9.12 and #5950 the picker
+    /// persisted a list nothing read, so every toggle in it was a lie.
+    #[test]
+    fn statusline_toggle_removes_its_segment_on_the_next_frame() {
+        use crate::tui::views::{ModalView, ViewAction, ViewEvent};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = app_with_context_percent(10);
+        assert!(
+            metrics_row(&app, 160).contains("context 10%"),
+            "the reading starts on the row"
+        );
+
+        let mut picker = crate::tui::views::status_picker::StatusPickerView::new(
+            &app.status_items,
+            app.api_provider,
+            app.ui_locale,
+        );
+        // Walk to the context row the way a user does, then uncheck it.
+        let context_row = StatusItem::all()
+            .iter()
+            .filter(|item| item.is_available_for(app.api_provider))
+            .position(|item| *item == StatusItem::ContextPercent)
+            .expect("the picker offers the context reading");
+        for _ in 0..context_row {
+            picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let action = picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let ViewAction::Emit(ViewEvent::StatusItemsUpdated { items, .. }) = action else {
+            panic!("space should emit a live preview: {action:?}");
+        };
+        assert!(!items.contains(&StatusItem::ContextPercent));
+
+        // What the handler does with the event, and then the next frame.
+        app.status_items = items;
+        let row = metrics_row(&app, 160);
+        assert!(
+            !row.contains("context "),
+            "the toggle must take it off: {row:?}"
+        );
+        assert!(
+            row.contains("deepseek"),
+            "and must take nothing else with it: {row:?}"
+        );
+    }
+
+    /// A custom OpenAI-compatible route without an endpoint receipt cannot
+    /// prove its effective tier. The route segment used to print
+    /// `high→effective unavailable` — a placeholder that could never resolve
+    /// (#5950). It now states no effort field at all, while a first-party
+    /// route keeps its tier label.
+    #[test]
+    fn unprovable_effort_states_no_field_instead_of_a_placeholder() {
+        use crate::tui::phase_strip::{RouteFieldKind, route_identity_fields};
+        use crate::tui::underwater::ShellTier;
+
+        let mut app = app_with_context_percent(10);
+        app.set_provider_identity(crate::config::ProviderKind::Custom, "my-gateway");
+        app.auto_model = false;
+        app.active_route_base_url = "https://gateway.example/v1".to_string();
+        app.model = "vendor-model-x".to_string();
+        app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::High;
+        assert_eq!(
+            app.reasoning_effort_display_label(),
+            "high→effective unavailable",
+            "the full label still tells /status the truth"
+        );
+        assert_eq!(app.provable_reasoning_effort_label(), None);
+        let fields = route_identity_fields(&app, ShellTier::Wide, 200).expect("route fields");
+        assert!(
+            fields
+                .iter()
+                .all(|field| field.kind != RouteFieldKind::Effort),
+            "no effort field on an unprovable route: {fields:?}"
+        );
+        let row = metrics_row(&app, 200);
+        assert!(row.contains("vendor-model-x"), "{row:?}");
+        // The unresolvable effort placeholder stays out; the localized
+        // missing-cost explanation ("rate unavailable") is a separate,
+        // legitimate reading.
+        assert!(!row.contains("high→effective unavailable"), "{row:?}");
+        assert!(!row.contains("high"), "{row:?}");
+
+        // First-party routes are unchanged: the tier label stays.
+        let app = app_with_context_percent(10);
+        let label = app
+            .provable_reasoning_effort_label()
+            .expect("a first-party route proves its tier");
+        assert_eq!(label, app.reasoning_effort_display_label());
+        let fields = route_identity_fields(&app, ShellTier::Wide, 200).expect("route fields");
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.kind == RouteFieldKind::Effort
+                    && field.text == format!("thinking: {label}")),
+            "{fields:?}"
+        );
+    }
+
+    /// DeepSeek's clock-tiered routes show which tier the next turn buys,
+    /// beside the cost; flat routes and other vendors show nothing.
+    #[test]
+    fn deepseek_tiered_routes_paint_the_billing_tier_beside_the_cost() {
+        use crate::config::ProviderKind;
+        use chrono::TimeZone as _;
+        let mut app = app_with_context_percent(10);
+        app.auto_model = false;
+        app.api_provider = ProviderKind::Deepseek;
+        app.model = "deepseek-v4-flash".to_string();
+        // Wednesday 2026-09-16: 02:00Z is inside the 01:00-04:00 peak
+        // window, 12:00Z outside every window.
+        let peak = chrono::Utc.with_ymd_and_hms(2026, 9, 16, 2, 0, 0).unwrap();
+        let off = chrono::Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        assert_eq!(
+            super::billing_tier_label(&app, peak).as_deref(),
+            Some("peak")
+        );
+        assert_eq!(
+            super::billing_tier_label(&app, off).as_deref(),
+            Some("off-peak")
+        );
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        assert!(ids.contains(&InfoSegmentId::BillingTier), "{ids:?}");
+        let row = metrics_row(&app, 200);
+        assert!(row.contains("peak"), "the tier reads in the row: {row:?}");
+
+        // A flat-priced DeepSeek model has no tier to show.
+        app.model = "deepseek-chat".to_string();
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        assert!(!ids.contains(&InfoSegmentId::BillingTier), "{ids:?}");
+
+        // Another vendor serving a DeepSeek id is priced on its own terms.
+        app.model = "deepseek-v4-flash".to_string();
+        app.api_provider = ProviderKind::Openai;
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+
+        // Auto routing has not pinned a model, so there is nothing to claim.
+        app.api_provider = ProviderKind::Deepseek;
+        app.auto_model = true;
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+    }
+
+    /// A provider switch must not hide missing historical coverage.
+    #[test]
+    fn cost_unknown_preserves_saved_coverage_across_route_changes() {
+        use crate::route_billing::BillingPresentation;
+        let mut app = app_with_context_percent(10);
+        app.session.cost_coverage_unknown_legacy = true;
+
+        app.billing_presentation = BillingPresentation::Metered;
+        assert!(matches!(
+            app.cumulative_usage_chip(),
+            crate::route_billing::UsageChip::Unknown(_)
+        ));
+        assert_eq!(
+            super::session_cost_label(&app),
+            "cost: unknown (saved coverage unavailable)"
+        );
+        let row = metrics_row(&app, 200);
+        assert!(
+            row.contains("cost: unknown"),
+            "a priceable route keeps the honesty: {row:?}"
+        );
+
+        app.billing_presentation = BillingPresentation::Unknown;
+        assert!(matches!(
+            app.cumulative_usage_chip(),
+            crate::route_billing::UsageChip::Unknown(_)
+        ));
+        assert_eq!(
+            super::session_cost_label(&app),
+            "cost: unknown (saved coverage unavailable)"
+        );
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        assert!(ids.contains(&InfoSegmentId::Cost), "{ids:?}");
+        let row = metrics_row(&app, 200);
+        assert!(
+            row.contains("saved coverage unavailable"),
+            "an unclassified route preserves the reason: {row:?}"
+        );
+        assert!(
+            row.contains("context 10%"),
+            "and nothing else moves: {row:?}"
+        );
+
+        // A real price on an otherwise unclassified route still prints.
+        app.session.cost_coverage_unknown_legacy = false;
+        app.session.cost_priced_turns = 1;
+        app.session.session_cost = 0.42;
+        assert!(
+            matches!(
+                app.cumulative_usage_chip(),
+                crate::route_billing::UsageChip::Money(_)
+            ),
+            "{:?}",
+            app.cumulative_usage_chip()
+        );
+        assert!(!super::session_cost_label(&app).is_empty());
+    }
+
+    #[test]
+    fn metrics_line_uses_measured_request_average_during_tool_waits_and_live_text() {
+        use crate::tui::session_metrics::{full_text, snapshot_from_app};
+
+        let mut app = app_with_context_percent(60);
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.status_items = vec![StatusItem::SessionMetrics, StatusItem::Tokens];
+        app.is_loading = true;
+        app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+        app.streaming_output_token_estimate = 60_000;
+        assert!(
+            super::info_segments(&app, 200)
+                .iter()
+                .all(|segment| segment.id != InfoSegmentId::Rate),
+            "live text estimates do not invent measured request throughput"
+        );
+        app.session_metrics
+            .record_model_call(120, 4_800, Some(1_000), Some(5_000));
+        let rate = |app: &App| {
+            super::info_segments(app, 200)
+                .into_iter()
+                .find(|segment| segment.id == InfoSegmentId::Rate)
+                .map(|segment| segment.value)
+        };
+        assert_eq!(rate(&app).as_deref(), Some("24 avg tok/s"));
+        let detailed = full_text(snapshot_from_app(&app), app.ui_locale, false);
+        assert!(detailed.contains("24 avg tok/s"), "{detailed}");
+
+        // Finishing a long turn or replacing the displayed token receipt must
+        // not switch the rate to the turn timer (which includes tool waits).
+        app.is_loading = false;
+        app.session.last_completion_tokens = Some(9_000);
+        assert_eq!(rate(&app).as_deref(), Some("24 avg tok/s"));
+        app.status_items = vec![StatusItem::Tokens];
+        assert_eq!(rate(&app), None, "the existing status toggle still owns it");
+    }
+
+    #[test]
+    fn default_compact_footer_keeps_measured_performance_at_working_widths() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = app_with_context_percent(60);
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.status_items = StatusItem::default_footer();
+        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        app.session_metrics
+            .record_model_call(120, 4_800, Some(1_000), Some(5_000));
+        for width in [80, 100, 140] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::render_info_row(frame, &mut app, frame.area(), false);
+                })
+                .unwrap();
+            let row: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(row.contains("ttft 1.0s"), "{width}: {row}");
+            assert!(row.contains("24 avg tok/s"), "{width}: {row}");
+            assert!(!row.contains("/help"), "{width}: {row}");
+        }
+    }
+
+    #[test]
+    fn performance_readings_can_be_selected_independently() {
+        let mut app = app_with_context_percent(60);
+        app.session_metrics
+            .record_model_call(120, 4_800, Some(1_000), Some(5_000));
+        for (item, expected) in [
+            (StatusItem::Ttft, InfoSegmentId::Ttft),
+            (StatusItem::OutputRate, InfoSegmentId::Rate),
+        ] {
+            app.status_items = vec![item];
+            let ids: Vec<_> = super::info_segments(&app, 80)
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            assert_eq!(ids, vec![expected]);
+        }
+    }
+
+    /// Every remaining status item owns a segment, and an empty list leaves
+    /// the row with nothing but the help hint — no toggle in `/statusline`
+    /// paints something no toggle can remove.
+    #[test]
+    fn every_metrics_segment_answers_to_a_status_item() {
+        let mut app = app_with_context_percent(60);
+        app.session.last_prompt_tokens = Some(1_000);
+        app.session_metrics
+            .record_model_call(1_200, 30_000, Some(400), Some(30_400));
+        app.streaming_output_token_estimate = 1_200;
+        app.is_loading = true;
+        app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        *app.balance_cell.lock().expect("balance cell") = Some(crate::pricing::BalanceInfo {
+            currency: "USD".to_string(),
+            total_balance: "4.32".to_string(),
+            topped_up_balance: String::new(),
+            granted_balance: String::new(),
+        });
+        app.status_items = StatusItem::all().to_vec();
+        app.workspace_context = Some("main | clean".to_string());
+
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        for expected in [
+            InfoSegmentId::Model,
+            InfoSegmentId::Context,
+            InfoSegmentId::Balance,
+            InfoSegmentId::Ttft,
+            InfoSegmentId::Rate,
+            InfoSegmentId::OutputTokens,
+            InfoSegmentId::Workspace,
+            InfoSegmentId::GitBranch,
+        ] {
+            assert!(ids.contains(&expected), "{expected:?} missing from {ids:?}");
+        }
+
+        app.status_items = Vec::new();
+        assert!(
+            super::info_segments(&app, 200).is_empty(),
+            "an empty status list leaves the metrics line empty"
+        );
+    }
+
+    #[test]
+    fn empty_session_keeps_opted_in_workspace_identity_visible() {
+        let mut app = app_with_context_percent(0);
+        app.workspace = std::path::PathBuf::from("/fixture/checkout");
+        app.workspace_context = Some("feature-6112 | clean".to_string());
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        let backend = ratatui::backend::TestBackend::new(100, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_info_row(frame, &mut app, area, true);
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("checkout"), "{rendered}");
+        assert!(rendered.contains("feature-6112"), "{rendered}");
+    }
+
+    /// #6112: the opt-in workspace and branch chips read cached state only —
+    /// the workspace path and the TTL-refreshed `workspace_context` string —
+    /// so neither costs IO per frame. Outside a repository the branch chip
+    /// degrades to absent rather than pinning a placeholder dash.
+    #[test]
+    fn workspace_and_git_branch_chips_follow_cached_workspace_context() {
+        let mut app = app_with_context_percent(60);
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+
+        let segments = super::info_segments(&app, 200);
+        let workspace = segments
+            .iter()
+            .find(|segment| segment.id == InfoSegmentId::Workspace)
+            .expect("workspace chip renders from the workspace path alone");
+        assert_eq!(
+            workspace.value,
+            crate::tui::workspace_context::workspace_basename(&app.workspace)
+        );
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.id != InfoSegmentId::GitBranch),
+            "outside a repository the branch chip is absent"
+        );
+
+        // A detached HEAD reads in its recorded short-SHA form.
+        app.workspace_context = Some("detached:abc1234 | clean".to_string());
+        let branch = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .expect("branch chip renders from cached context");
+        assert_eq!(branch.value, "detached:abc1234");
+        app.workspace_is_linked_worktree = true;
+        let linked = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .unwrap();
+        assert_eq!(linked.value, "detached:abc1234 (wt)");
+        assert!(!StatusItem::default_footer().contains(&StatusItem::Workspace));
+        assert!(!StatusItem::default_footer().contains(&StatusItem::GitBranch));
+
+        // Off means off.
+        app.status_items = Vec::new();
+        assert!(super::info_segments(&app, 200).is_empty());
     }
 }
 

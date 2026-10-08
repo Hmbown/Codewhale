@@ -34,20 +34,13 @@
     cargo fmt --all -- --check
     cargo check --workspace --all-targets --locked
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-    # Hermetic HOME so libtest's shared process cannot see a populated
-    # ~/.codewhale/config.toml (#5355 config-fixture family). Tests stay in
-    # the suite; isolation is scheduling, not deletion.
-    hermetic_home="${TMPDIR:-/tmp}/cw-cnb-hermetic-home-$$"
-    mkdir -p "${hermetic_home}/.codewhale"
-    export HOME="${hermetic_home}"
-    export USERPROFILE="${hermetic_home}"
-    export CODEWHALE_HOME="${hermetic_home}/.codewhale"
-    unset CODEWHALE_CONFIG_PATH DEEPSEEK_CONFIG_PATH DEEPSEEK_HOME || true
-    RUST_MIN_STACK=16777216 cargo test --workspace --all-features --locked
+    cargo build -p codewhale-cli --bin codewhale --all-features --locked
+    # Use the shared test HOME boundary while retaining the real toolchain.
+    RUST_MIN_STACK=16777216 sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked
     # Parity gates as first-class steps so drift surfaces as a named failure,
     # not a buried workspace-test entry. Mirrors release.yml's parity job.
-    cargo test -p codewhale-protocol --test parity_protocol --locked
-    cargo test -p codewhale-state --test parity_state --locked
+    sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-protocol --test parity_protocol --locked
+    sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-state --test parity_state --locked
 
 .linux_rust_gates: &linux_rust_gates
   name: linux rust gates
@@ -183,7 +176,7 @@ $:
             apt-get install -y git musl-tools nodejs pkg-config
             rustup target add x86_64-unknown-linux-musl
 
-            ./scripts/release/check-versions.sh
+            ./scripts/release/check-versions.sh --require-dated-release
             ./scripts/release/check-ohos-deps.sh
             checkout_sha="$(git rev-parse 'HEAD^{commit}')"
             commit_sha="${CNB_COMMIT:-${checkout_sha}}"

@@ -12,9 +12,9 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::localization::MessageId;
-use crate::palette;
 use crate::tui::app::App;
+use codewhale_localization::MessageId;
+use codewhale_palette as palette;
 use unicode_width::UnicodeWidthStr;
 
 /// Locale options shown in the picker. Order matches the keyboard hotkeys.
@@ -218,8 +218,8 @@ fn option_spans_inner(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::localization::Locale;
     use crate::tui::app::TuiOptions;
+    use codewhale_localization::Locale;
     use std::path::PathBuf;
 
     fn app() -> App {

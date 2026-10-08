@@ -409,13 +409,37 @@ fn is_env_file(path: &Path) -> bool {
 /// - The user's source tree, `~/Documents`, `~/Downloads` — a coding agent must
 ///   still be able to read the user's code, which is the entire point.
 fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
+    let mut out = machine_wide_denied_subtrees();
+    if let Ok(Some(active)) = codewhale_paths::codewhale_home() {
+        out.push((
+            active.join("secrets"),
+            "Codewhale secret store (active home)",
+        ));
+        out.push((
+            active.join("credentials"),
+            "Codewhale OAuth credentials (active home)",
+        ));
+    }
+    if let Some(legacy) = codewhale_paths::legacy_deepseek_home() {
+        out.push((
+            legacy.join("secrets"),
+            "Codewhale secret store (legacy home)",
+        ));
+        out.push((
+            legacy.join("credentials"),
+            "Codewhale OAuth credentials (legacy home)",
+        ));
+    }
+    out.push((
+        crate::oauth::auth_file_path(),
+        "Codex CLI login (resolved auth file)",
+    ));
     let Some(home) = dirs::home_dir() else {
-        // No home directory: only the machine-wide entries are meaningful.
-        return machine_wide_denied_subtrees();
+        return out;
     };
     let h = |rel: &str| home.join(rel);
 
-    let mut out = vec![
+    let mut ambient = vec![
         // --- SSH / GPG ---
         (h(".ssh"), "SSH keys and known-hosts (~/.ssh)"),
         (h(".gnupg"), "GnuPG keyring (~/.gnupg)"),
@@ -489,6 +513,20 @@ fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
             h(".deepseek/secrets"),
             "Codewhale secret store (~/.deepseek/secrets)",
         ),
+        (
+            h(".codewhale/credentials"),
+            "Codewhale OAuth credentials (ambient home)",
+        ),
+        (
+            h(".deepseek/credentials"),
+            "Codewhale OAuth credentials (ambient legacy home)",
+        ),
+        (h(".kimi/credentials"), "Kimi CLI credentials"),
+        (h(".claude/.credentials.json"), "Claude Code credentials"),
+        (
+            h(".codewhale-cu/recordings"),
+            "Computer Use recordings and trajectories",
+        ),
         // --- Browser profiles (cookies, saved passwords, session tokens) ---
         (h(".mozilla"), "Firefox profile (~/.mozilla)"),
         (
@@ -506,7 +544,7 @@ fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
     ];
 
     if cfg!(target_os = "macos") {
-        out.extend([
+        ambient.extend([
             (
                 h("Library/Keychains"),
                 "macOS keychain (~/Library/Keychains)",
@@ -531,7 +569,7 @@ fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
         ]);
     }
 
-    out.extend(machine_wide_denied_subtrees());
+    out.extend(ambient);
     out
 }
 
@@ -731,6 +769,66 @@ mod tests {
         CWD_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // Unix only: the fixture redirects the home directory through `HOME`,
+    // and Windows resolves the profile through the known-folder API instead.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_read_guard_denies_active_and_known_agent_credentials_in_real_file_tool() {
+        use crate::tools::spec::{ToolContext, ToolSpec};
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("private fixture");
+        let home = temp.path().join("home");
+        let active_home = temp.path().join("active");
+        let codex = temp.path().join("codex");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", home.to_str().unwrap());
+        let _active =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", active_home.to_str().unwrap());
+        let _codex = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex.to_str().unwrap());
+        let _auth = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_AUTH_FILE");
+        assert_eq!(dirs::home_dir().as_deref(), Some(home.as_path()));
+        let denied = [
+            active_home.join("credentials/fixture.json"),
+            codex.join("auth.json"),
+            home.join(".kimi/credentials/fixture.json"),
+            home.join(".claude/.credentials.json"),
+            home.join(".codewhale-cu/recordings/trajectories/fixture.jsonl"),
+        ];
+        for path in &denied {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "read-s10-synthetic-value").unwrap();
+        }
+        struct RestoreActive(Option<Arc<ReadDenylist>>);
+        impl Drop for RestoreActive {
+            fn drop(&mut self) {
+                *ACTIVE.write().unwrap() = self.0.take();
+            }
+        }
+        let previous = ACTIVE.write().unwrap().take();
+        let _restore = RestoreActive(previous);
+        set_active(ReadDenylist::build(true, &[], &[]));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let context = ToolContext::new(temp.path());
+        for path in denied {
+            let result = runtime.block_on(
+                crate::tools::file::ReadFileTool
+                    .execute(serde_json::json!({"path": path}), &context),
+            );
+            assert!(result.is_err(), "file tool read a credential source");
+        }
+        let safe = home.join(".claude/settings.json");
+        std::fs::write(&safe, "ordinary-readable-setting").unwrap();
+        let allowed = runtime
+            .block_on(
+                crate::tools::file::ReadFileTool
+                    .execute(serde_json::json!({"path": safe}), &context),
+            )
+            .expect("ordinary settings remain readable");
+        assert!(allowed.content.contains("ordinary-readable-setting"));
     }
 
     #[test]

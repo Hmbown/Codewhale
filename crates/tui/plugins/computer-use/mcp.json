@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/mcp.json",
+  "mcpServers": {
+    "computer": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["mcp/server.mjs"],
+      "cwd": ".",
+      "extensions": {
+        "net.codewhale": {
+          "execute_timeout": 120
+        }
+      }
+    }
+  }
+}

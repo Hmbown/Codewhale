@@ -17,9 +17,12 @@ export const states: StatesDict = {
   reload: "Reload the page",
   homeLink: "Back to the home page",
   docsIndexLink: "Open the documentation index",
-  notFoundTitle: "There is no page at this address",
+  notFoundTitle: "We all make typos.",
   notFoundBody:
-    "The link may be old, or the page may have moved. The documentation index lists every current page.",
+    "This page doesn’t exist yet.\nNeither does this game.",
+  notFoundHomeLink: "Return to base",
+  notFoundPosterAlt:
+    "A blue whale in tactical gear on the fictional Codwhale: Modern Whalefare game poster.",
   unavailableTitle: "The live record has not loaded",
   unavailableBody:
     "The source did not answer the last refresh, or this page has not refreshed since it was built. Nothing is shown in its place.",

@@ -5,8 +5,8 @@
 //! directly once per user turn when `app.auto_model` is set. The remaining
 //! helpers here build the compact recent-context summary the router sees.
 
-use crate::models::{ContentBlock, Message};
 use crate::tui::app::App;
+use codewhale_models::{ContentBlock, Message};
 
 /// Whether the next turn should consult the auto-route flash model.
 pub(super) fn should_resolve_auto_model_selection(app: &App) -> bool {
@@ -15,14 +15,16 @@ pub(super) fn should_resolve_auto_model_selection(app: &App) -> bool {
 
 /// Build a compact recent-context summary for the auto-route prompt.
 ///
-/// Walks `api_messages` from the most recent turn back, skipping the
-/// final draft (which is what the router is being asked to classify),
-/// collects up to six non-empty rows, and reverses them so the prompt
-/// reads oldest-first. Each row is `<role>: <truncated content>` and
-/// is capped at 900 characters.
+/// Walks `api_messages` from the most recent turn back, collects up to six
+/// non-empty rows, and reverses them so the prompt reads oldest-first. Each
+/// row is `<role>: <truncated content>` and is capped at 900 characters.
+///
+/// Both callers build this context before the draft being classified is
+/// appended to `api_messages`, so every message here is prior context; the
+/// old `.skip(1)` dropped the newest of them, not the draft (U08-m3).
 pub(super) fn recent_auto_router_context(messages: &[Message]) -> String {
     let mut rows = Vec::new();
-    for message in messages.iter().rev().skip(1) {
+    for message in messages.iter().rev() {
         if rows.len() >= 6 {
             break;
         }
@@ -85,8 +87,8 @@ fn truncate_for_auto_router(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ContentBlock;
-    use crate::models::Role;
+    use codewhale_models::ContentBlock;
+    use codewhale_models::Role;
 
     fn make_msg(role: &str, text: &str) -> Message {
         Message {
@@ -107,9 +109,9 @@ mod tests {
     }
 
     #[test]
-    fn recent_auto_router_context_skips_final_message_and_caps_rows() {
-        // Eight messages; final one (the draft being routed) is skipped,
-        // so we expect at most six of the remaining seven.
+    fn recent_auto_router_context_keeps_newest_prior_message_and_caps_rows() {
+        // Eight prior messages (the draft is not in `api_messages` yet): the
+        // newest one is context, and only the six most recent are kept.
         let msgs: Vec<Message> = (0..8)
             .map(|i| {
                 make_msg(
@@ -119,12 +121,15 @@ mod tests {
             })
             .collect();
         let context = recent_auto_router_context(&msgs);
-        assert!(!context.contains("turn 7"), "final draft must be skipped");
+        assert!(
+            context.contains("turn 7"),
+            "the newest prior message is context"
+        );
         let row_count = context.lines().count();
         assert_eq!(row_count, 6);
         // Output is oldest-first.
         let first = context.lines().next().unwrap();
-        assert!(first.contains("turn 1"), "got: {context}");
+        assert!(first.contains("turn 2"), "got: {context}");
     }
 
     #[test]
@@ -134,28 +139,24 @@ mod tests {
 
     #[test]
     fn recent_auto_router_context_excludes_hidden_thinking() {
-        let msgs = vec![
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Thinking {
-                        signature: None,
-                        state: None,
-                        thinking: "The user seems to be asking me to classify myself.".to_string(),
-                    },
-                    ContentBlock::Text {
-                        text: "Visible assistant answer.".to_string(),
-                        cache_control: None,
-                    },
-                ],
-            },
-            make_msg("user", "latest draft"),
-        ];
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    signature: None,
+                    state: None,
+                    thinking: "The user seems to be asking me to classify myself.".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Visible assistant answer.".to_string(),
+                    cache_control: None,
+                },
+            ],
+        }];
 
         let context = recent_auto_router_context(&msgs);
 
         assert!(context.contains("Visible assistant answer."));
         assert!(!context.contains("The user seems"));
-        assert!(!context.contains("latest draft"));
     }
 }

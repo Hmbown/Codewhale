@@ -1,0 +1,26 @@
+{
+  "hooks": [
+    {
+      "env": {
+        "CODEWHALE_SESSION_ID": "<HOOK_SESSION>",
+        "CODEWHALE_TOOL_CALL_ID": "call_hook_bash",
+        "DEEPSEEK_MODE": "Agent",
+        "DEEPSEEK_MODEL": "deepseek-v4-pro",
+        "DEEPSEEK_SESSION_ID": "<HOOK_SESSION>",
+        "DEEPSEEK_TOOL_ARGS": "{\"command\":\"rm -rf build\"}",
+        "DEEPSEEK_TOOL_CALL_ID": "call_hook_bash",
+        "DEEPSEEK_TOOL_NAME": "Bash",
+        "DEEPSEEK_WORKSPACE": "<WORKSPACE>"
+      },
+      "name": "legacy",
+      "ran": true,
+      "stdin": ""
+    }
+  ],
+  "outcome": {
+    "refuse": {
+      "detail": "Failed to authorize tool execution: ToolCallBefore hook denied tool 'Bash': ToolCallBefore hook denied tool execution",
+      "kind": "permission_denied"
+    }
+  }
+}

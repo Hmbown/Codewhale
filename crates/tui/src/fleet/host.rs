@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -190,7 +190,13 @@ struct LocalWorkerProcess {
     stopped: bool,
     last_exit: Option<ExitStatus>,
     last_memory_mb: Option<u64>,
+    /// When `ps` last sampled this worker. Status polls can run every few
+    /// milliseconds; memory is display data, so one sample a second is ample.
+    last_memory_sample: Option<std::time::Instant>,
 }
+
+/// Minimum spacing between `ps` memory samples for one worker.
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl LocalProcessFleetHostAdapter {
     pub fn new(workspace: impl AsRef<Path>) -> Self {
@@ -214,12 +220,20 @@ impl LocalProcessFleetHostAdapter {
                     request.worker_id
                 )));
             }
+            // A draining worker's dispatcher exited but its tree still runs;
+            // forgetting it here would overlap a replacement with it.
+            if matches!(status.state, FleetHostWorkerState::Draining) {
+                return Err(FleetHostError::retryable(format!(
+                    "worker {} is still draining; stop it before starting a replacement",
+                    request.worker_id
+                )));
+            }
             self.processes.remove(&request.worker_id);
         }
 
         let env = worker_env(&request.env, &request.env_allowlist)?;
         let log_path = self.log_path_for(&request.worker_id, host_kind);
-        let log = open_worker_log(&log_path)?;
+        let log = open_worker_log(&self.workspace, &log_path)?;
         let stderr = log
             .try_clone()
             .map_err(|err| FleetHostError::retryable(format!("cloning worker log: {err}")))?;
@@ -303,6 +317,7 @@ impl LocalProcessFleetHostAdapter {
                 stopped: false,
                 last_exit: None,
                 last_memory_mb: None,
+                last_memory_sample: None,
             },
         );
         Ok(handle)
@@ -356,7 +371,11 @@ impl FleetHostAdapter for LocalProcessFleetHostAdapter {
         match process.child.try_wait() {
             Ok(None) => {
                 let pid = process.child.id();
-                let memory_mb = if process.host_kind == FleetHostKind::LocalProcess {
+                let due = process
+                    .last_memory_sample
+                    .is_none_or(|sampled| sampled.elapsed() >= MEMORY_SAMPLE_INTERVAL);
+                let memory_mb = if process.host_kind == FleetHostKind::LocalProcess && due {
+                    process.last_memory_sample = Some(std::time::Instant::now());
                     sample_process_memory_mb(pid)
                 } else {
                     None
@@ -406,7 +425,7 @@ impl FleetHostAdapter for LocalProcessFleetHostAdapter {
             .get(worker_id)
             .ok_or_else(|| FleetHostError::terminal(format!("unknown worker {worker_id}")))?;
         let max_bytes = max_bytes.min(process.request.log_limit_bytes.max(1));
-        read_bounded_log(&process.log_path, max_bytes)
+        read_bounded_log(&self.workspace, &process.log_path, max_bytes)
     }
 
     fn interrupt_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
@@ -429,9 +448,10 @@ impl FleetHostAdapter for LocalProcessFleetHostAdapter {
             .get(worker_id)
             .map(|process| process.request.clone())
             .ok_or_else(|| FleetHostError::terminal(format!("unknown worker {worker_id}")))?;
-        let _ = self.stop_worker(worker_id);
-        self.processes.remove(worker_id);
-        self.start_worker(request)
+        restart_after_confirmed_stop(self, worker_id, |adapter| {
+            adapter.processes.remove(worker_id);
+            adapter.start_worker(request)
+        })
     }
 
     fn stop_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
@@ -550,6 +570,13 @@ impl SshFleetHostConfig {
                 "SSH Fleet host requires an explicit host",
             ));
         }
+        // The destination is a single ssh argument. A leading '-' would be read
+        // as an ssh option, and whitespace/control characters would change what
+        // ssh or the remote shell receives.
+        validate_ssh_destination_part("host", &self.host)?;
+        if let Some(user) = self.user.as_ref().filter(|user| !user.trim().is_empty()) {
+            validate_ssh_destination_part("user", user)?;
+        }
         if self.codewhale_binary.trim().is_empty() {
             return Err(FleetHostError::configuration(
                 "SSH Fleet host requires an explicit codewhale binary path",
@@ -558,6 +585,31 @@ impl SshFleetHostConfig {
         if self.working_directory.as_os_str().is_empty() {
             return Err(FleetHostError::configuration(
                 "SSH Fleet host requires an explicit working directory",
+            ));
+        }
+        // Fingerprint-only verification is not implemented by the OpenSSH adapter.
+        // Refuse a configured pin rather than silently substituting another trust source.
+        if self.host_key_fingerprint.is_some() {
+            return Err(FleetHostError::configuration(
+                "SSH Fleet host_key_fingerprint is unsupported; configure known_hosts instead",
+            ));
+        }
+        if self
+            .known_hosts
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(FleetHostError::configuration(
+                "SSH Fleet known_hosts must not be empty",
+            ));
+        }
+        if self
+            .known_hosts
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().contains(['"', '\n', '\r']))
+        {
+            return Err(FleetHostError::configuration(
+                "SSH Fleet known_hosts contains unsupported characters",
             ));
         }
         validate_env_allowlist(&self.env_allowlist)
@@ -597,8 +649,24 @@ impl SshFleetHostAdapter {
             "-o".to_string(),
             "BatchMode=yes".to_string(),
             "-o".to_string(),
+            "StrictHostKeyChecking=yes".to_string(),
+            "-o".to_string(),
             format!("ConnectTimeout={}", self.config.connect_timeout_seconds),
         ];
+        if let Some(known_hosts) = &self.config.known_hosts {
+            args.push("-o".to_string());
+            args.push(format!("UserKnownHostsFile=\"{}\"", known_hosts.display()));
+            args.push("-o".to_string());
+            args.push("GlobalKnownHostsFile=none".to_string());
+            args.push("-o".to_string());
+            // IgnoreUnknown predates OpenSSH 7.x. Older clients have no
+            // KnownHostsCommand; newer ones must disable that extra trust source.
+            args.push("IgnoreUnknown=KnownHostsCommand".to_string());
+            args.push("-o".to_string());
+            args.push("KnownHostsCommand=none".to_string());
+            args.push("-o".to_string());
+            args.push("VerifyHostKeyDNS=no".to_string());
+        }
         for key in env.keys() {
             args.push("-o".to_string());
             args.push(format!("SendEnv={key}"));
@@ -611,6 +679,8 @@ impl SshFleetHostAdapter {
             args.push("-i".to_string());
             args.push(identity.display().to_string());
         }
+        // End option parsing so the destination can never be read as an option.
+        args.push("--".to_string());
         args.push(self.config.target());
         args.push(self.remote_command(request));
         Ok(FleetWorkerCommand::new(
@@ -678,9 +748,10 @@ impl FleetHostAdapter for SshFleetHostAdapter {
             .get(worker_id)
             .map(|process| process.request.clone())
             .ok_or_else(|| FleetHostError::terminal(format!("unknown worker {worker_id}")))?;
-        let _ = self.stop_worker(worker_id);
-        self.local.processes.remove(worker_id);
-        self.local.start_with_kind(request, FleetHostKind::Ssh)
+        restart_after_confirmed_stop(self, worker_id, |adapter| {
+            adapter.local.processes.remove(worker_id);
+            adapter.local.start_with_kind(request, FleetHostKind::Ssh)
+        })
     }
 
     fn stop_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
@@ -692,25 +763,72 @@ impl FleetHostAdapter for SshFleetHostAdapter {
     }
 }
 
-fn open_worker_log(path: &Path) -> FleetHostResult<File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            FleetHostError::retryable(format!(
-                "creating worker log dir {}: {err}",
-                parent.display()
-            ))
-        })?;
+/// Restart policy shared by the process-backed adapters. The previous worker
+/// is released — and `replace` spawns its successor — only once a stop has
+/// confirmed the whole worker tree is gone. A failed or unconfirmed stop keeps
+/// the old handle so status, logs, and cleanup still reach a worker that may
+/// be running, and no replacement starts beside it (duplicate execution). The
+/// process-tree lifecycle in `stop_worker` stays the authority on "gone".
+///
+/// Known limitations:
+/// - For [`SshFleetHostAdapter`], "confirmed stopped" proves only that the
+///   local `ssh` client's process tree is gone. The remote `codewhale`
+///   process is not observed: if the remote side does not tear the command
+///   down when the connection drops, a restart can start a second remote
+///   worker beside it.
+/// - `start_worker` on an id the adapter still holds refuses only `Running`
+///   and `Draining` (see `LocalProcessFleetHostAdapter::start_with_kind`),
+///   while this restart also refuses `Unknown`. The process-backed adapters
+///   never report `Unknown`, so the gap is latent; an adapter that does must
+///   refuse `Unknown` in its start path too, or a start can overlap a worker
+///   in an unknown state.
+fn restart_after_confirmed_stop<A: FleetHostAdapter>(
+    adapter: &mut A,
+    worker_id: &str,
+    replace: impl FnOnce(&mut A) -> FleetHostResult<FleetWorkerHandle>,
+) -> FleetHostResult<FleetWorkerHandle> {
+    let stopped = adapter.stop_worker(worker_id).map_err(|err| FleetHostError {
+        kind: err.kind,
+        message: format!(
+            "restart of worker {worker_id} refused: the previous worker was not confirmed stopped ({})",
+            err.message
+        ),
+    })?;
+    if matches!(
+        stopped.state,
+        FleetHostWorkerState::Running
+            | FleetHostWorkerState::Draining
+            | FleetHostWorkerState::Unknown
+    ) {
+        return Err(FleetHostError::retryable(format!(
+            "restart of worker {worker_id} refused: the previous worker is still {:?} after stop",
+            stopped.state
+        )));
     }
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|err| FleetHostError::retryable(format!("opening worker log: {err}")))
+    replace(adapter)
 }
 
-fn read_bounded_log(path: &Path, max_bytes: usize) -> FleetHostResult<String> {
-    let mut file = File::open(path).map_err(|err| {
+fn open_worker_log(workspace: &Path, path: &Path) -> FleetHostResult<File> {
+    // Pinned, no-follow open under the workspace: a link in `.codewhale` or at
+    // the log's name is refused instead of redirecting the worker's output.
+    let relative = path.strip_prefix(workspace).map_err(|_| {
+        FleetHostError::retryable(format!(
+            "worker log {} is outside the workspace",
+            path.display()
+        ))
+    })?;
+    let file = super::files::WorkspaceFile::open(workspace, relative, true)
+        .and_then(|target| target.open_write(false))
+        .map_err(|err| FleetHostError::retryable(format!("opening worker log: {err}")))?;
+    // Validated handle first, truncation second.
+    file.set_len(0)
+        .map_err(|err| FleetHostError::retryable(format!("truncating worker log: {err}")))?;
+    Ok(file)
+}
+
+fn read_bounded_log(workspace: &Path, path: &Path, max_bytes: usize) -> FleetHostResult<String> {
+    // The worker may still hold its log open for writing.
+    let mut file = crate::fs_confined::open_read_shared(workspace, path).map_err(|err| {
         FleetHostError::retryable(format!("opening worker log {}: {err}", path.display()))
     })?;
     let len = file
@@ -993,6 +1111,7 @@ fn unix_session_members(
                 if pid > 0 {
                     // Revalidate against the kernel after parsing the snapshot. A PID
                     // reused by an unrelated process must never receive our signal.
+                    // SAFETY: getsid(2) dereferences no pointers.
                     if unsafe { libc::getsid(pid) } == session_id {
                         members.push(pid);
                     }
@@ -1015,6 +1134,7 @@ fn unix_session_members(
 
 #[cfg(unix)]
 fn unix_pid_in_session(pid: libc::pid_t, session_id: libc::pid_t) -> bool {
+    // SAFETY: getsid(2) dereferences no pointers.
     unsafe { libc::getsid(pid) == session_id }
 }
 
@@ -1023,6 +1143,7 @@ fn unix_pid_exists(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return false;
     }
+    // SAFETY: kill(2) dereferences no pointers; signal 0 sends nothing.
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
@@ -1163,6 +1284,7 @@ fn signal_unix_session(
     signal: libc::c_int,
     known_leader: Option<libc::pid_t>,
 ) -> FleetHostResult<Vec<String>> {
+    // SAFETY: getsid(2) dereferences no pointers.
     let own_session = unsafe { libc::getsid(0) };
     if session_id <= 0 || session_id == own_session {
         return Err(FleetHostError::terminal(format!(
@@ -1182,6 +1304,7 @@ fn signal_unix_session(
     for pid in candidates {
         // Verify identity again immediately before signalling. Session IDs
         // remain stable across reparenting and separate process groups.
+        // SAFETY: getsid(2) dereferences no pointers.
         if unsafe { libc::getsid(pid) } != session_id {
             // Leader may already be gone; still try kill on known leader when
             // getsid fails only with ESRCH-equivalent absence.
@@ -1189,6 +1312,7 @@ fn signal_unix_session(
                 continue;
             }
         }
+        // SAFETY: kill(2) dereferences no pointers.
         if unsafe { libc::kill(pid, signal) } != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
@@ -1266,10 +1390,12 @@ unsafe impl Sync for FleetWindowsJob {}
 #[cfg(windows)]
 impl FleetWindowsJob {
     fn attach_to_child(child: &Child) -> std::io::Result<Self> {
+        // SAFETY: returned handle is owned by the new wrapper.
         let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()).map_err(windows_io_error)? };
         let job = Self { handle };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` is live with matching size; both handles are live.
         unsafe {
             SetInformationJobObject(
                 job.handle,
@@ -1285,11 +1411,13 @@ impl FleetWindowsJob {
     }
 
     fn terminate(&self) -> std::io::Result<()> {
+        // SAFETY: `self.handle` is a live owned job handle.
         unsafe { TerminateJobObject(self.handle, 1).map_err(windows_io_error) }
     }
 
     fn has_active_processes(&self) -> std::io::Result<bool> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: `accounting` is live with matching size.
         unsafe {
             QueryInformationJobObject(
                 Some(self.handle),
@@ -1307,6 +1435,7 @@ impl FleetWindowsJob {
 #[cfg(windows)]
 impl Drop for FleetWindowsJob {
     fn drop(&mut self) {
+        // SAFETY: `self.handle` is owned here; Drop runs once.
         unsafe {
             let _ = CloseHandle(self.handle);
         }
@@ -1340,6 +1469,28 @@ fn filtered_env(
         .filter(|(key, _)| allowlist.contains(*key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect())
+}
+
+/// Characters OpenSSH itself refuses in a command-line user or host name
+/// because an `ssh_config` `%h`/`%r` expansion can hand them to a shell.
+const SSH_DESTINATION_METACHARACTERS: &str = "'`\"$\\;&<>|(){}";
+
+fn validate_ssh_destination_part(label: &str, value: &str) -> FleetHostResult<()> {
+    let allowed = |ch: char| {
+        if label == "host" {
+            // Host names, IPv4/IPv6 literals (with a zone id) and ssh_config
+            // aliases. `@` would move the user/host split.
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '%')
+        } else {
+            ch.is_ascii_graphic() && !SSH_DESTINATION_METACHARACTERS.contains(ch)
+        }
+    };
+    if value.starts_with('-') || !value.chars().all(allowed) {
+        return Err(FleetHostError::configuration(format!(
+            "SSH Fleet {label} must not start with '-' or contain whitespace, control, non-ASCII or shell characters"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_env_allowlist(allowlist: &BTreeSet<String>) -> FleetHostResult<()> {
@@ -1380,19 +1531,24 @@ fn ssh_client_env() -> BTreeMap<String, String> {
 }
 
 fn process_base_env() -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    for key in [
-        "HOME",
-        "PATH",
-        "SYSTEMROOT",
-        "SystemRoot",
-        "COMSPEC",
-        "ComSpec",
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.to_string(), value);
-        }
-    }
+    base_env_from(std::env::vars_os())
+}
+
+/// The worker's inherited environment: the repository's scrubbed child-env
+/// allowlist (`child_env`), so proxy routing, CA bundles, temp directories,
+/// Windows system/profile roots, locale and toolchain paths survive
+/// `env_clear()` while provider keys and other secret-shaped names do not.
+/// Proxy URLs keep their credentials for the worker process itself; see
+/// [`crate::child_env::sanitized_runtime_env_from`] for that policy.
+fn base_env_from<K, V>(parent: impl IntoIterator<Item = (K, V)>) -> BTreeMap<String, String>
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut env: BTreeMap<String, String> = crate::child_env::sanitized_runtime_env_from(parent)
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     force_worker_telemetry_off(&mut env);
     env
 }
@@ -1454,6 +1610,58 @@ fn safe_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Worker output is opened through the pinned no-follow writer: a link in
+    /// `.codewhale` or at the log's name is refused, and a plain log is
+    /// truncated and readable back through the same confinement.
+    #[cfg(unix)]
+    #[test]
+    fn worker_logs_are_never_opened_through_links() {
+        use std::io::Write as _;
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let log = workspace
+            .path()
+            .join(".codewhale")
+            .join("fleet-host")
+            .join("local")
+            .join("w1.log");
+
+        let mut file = open_worker_log(workspace.path(), &log).expect("plain log opens");
+        file.write_all(b"first run output").unwrap();
+        drop(file);
+        assert_eq!(
+            read_bounded_log(workspace.path(), &log, 1024).unwrap(),
+            "first run output"
+        );
+        drop(open_worker_log(workspace.path(), &log).expect("reopen truncates"));
+        assert_eq!(read_bounded_log(workspace.path(), &log, 1024).unwrap(), "");
+
+        // A linked directory and a linked file are both refused.
+        let linked_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(linked_root.path().join(".codewhale")).unwrap();
+        symlink(
+            outside.path(),
+            linked_root.path().join(".codewhale").join("fleet-host"),
+        )
+        .unwrap();
+        let linked_dir_log = linked_root
+            .path()
+            .join(".codewhale")
+            .join("fleet-host")
+            .join("local")
+            .join("w1.log");
+        assert!(open_worker_log(linked_root.path(), &linked_dir_log).is_err());
+
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "do not read").unwrap();
+        let parent = log.parent().unwrap();
+        symlink(&secret, parent.join("w2.log")).unwrap();
+        assert!(open_worker_log(workspace.path(), &parent.join("w2.log")).is_err());
+        assert!(read_bounded_log(workspace.path(), &parent.join("w2.log"), 1024).is_err());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "do not read");
+    }
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -1924,6 +2132,95 @@ mod tests {
         adapter.stop_worker("local-restart").unwrap();
     }
 
+    /// A host whose stop outcome is scripted: `None` fails the stop, `Some`
+    /// reports that state. Only the restart path is exercised.
+    struct ScriptedStopHost {
+        stop_state: Option<FleetHostWorkerState>,
+        owned: bool,
+        spawned: usize,
+    }
+
+    impl FleetHostAdapter for ScriptedStopHost {
+        fn start_worker(
+            &mut self,
+            request: FleetWorkerStartRequest,
+        ) -> FleetHostResult<FleetWorkerHandle> {
+            self.spawned += 1;
+            self.owned = true;
+            Ok(FleetWorkerHandle {
+                worker_id: request.worker_id,
+                host_kind: FleetHostKind::LocalProcess,
+                pid: None,
+                log_path: PathBuf::new(),
+            })
+        }
+        fn read_status(&mut self, _: &str) -> FleetHostResult<FleetHostWorkerStatus> {
+            unreachable!("restart must not consult status outside stop")
+        }
+        fn read_logs(&self, _: &str, _: usize) -> FleetHostResult<String> {
+            unreachable!()
+        }
+        fn interrupt_worker(&mut self, _: &str) -> FleetHostResult<FleetHostWorkerStatus> {
+            unreachable!()
+        }
+        fn restart_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetWorkerHandle> {
+            restart_after_confirmed_stop(self, worker_id, |host| {
+                host.owned = false;
+                host.start_worker(FleetWorkerStartRequest::new(
+                    worker_id,
+                    shell_command("true"),
+                ))
+            })
+        }
+        fn stop_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
+            let Some(state) = self.stop_state else {
+                return Err(FleetHostError::retryable(
+                    "Fleet session still has a live tracked leader after SIGKILL",
+                ));
+            };
+            Ok(FleetHostWorkerStatus {
+                worker_id: worker_id.to_string(),
+                state,
+                pid: Some(4242),
+                exit_code: None,
+                memory_mb: None,
+                retryable: false,
+            })
+        }
+        fn cleanup_worker(&mut self, _: &str) -> FleetHostResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn fleet_host_restart_keeps_the_old_worker_when_stop_is_unconfirmed() {
+        for stop_state in [None, Some(FleetHostWorkerState::Draining)] {
+            let mut host = ScriptedStopHost {
+                stop_state,
+                owned: true,
+                spawned: 0,
+            };
+            let err = host
+                .restart_worker("overlap")
+                .expect_err("an unconfirmed stop must refuse the restart");
+            assert!(err.message.contains("refused"), "{}", err.message);
+            assert_eq!(
+                host.spawned, 0,
+                "no replacement may start beside a surviving worker ({stop_state:?})"
+            );
+            assert!(host.owned, "the old worker's handle is kept");
+        }
+
+        let mut host = ScriptedStopHost {
+            stop_state: Some(FleetHostWorkerState::Stopped),
+            owned: true,
+            spawned: 0,
+        };
+        host.restart_worker("overlap")
+            .expect("a confirmed stop restarts");
+        assert_eq!(host.spawned, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn fleet_host_local_adapter_reports_running_worker_memory_usage() {
@@ -2040,6 +2337,202 @@ mod tests {
         assert!(argv.contains("/usr/local/bin/codewhale"));
         assert!(argv.contains("fleet-worker"));
         assert!(!argv.contains("super-secret-profile-value"));
+        // Option parsing ends right before the destination.
+        let target = command
+            .args
+            .iter()
+            .position(|arg| arg == "fleet@builder.example.test")
+            .expect("destination argument");
+        assert_eq!(command.args[target - 1], "--");
+    }
+
+    #[test]
+    fn fleet_host_ssh_refuses_option_like_or_malformed_destination() {
+        let tmp = TempDir::new().unwrap();
+        for host in [
+            "-oProxyCommand=true",
+            "builder example.test",
+            "builder\nexample.test",
+            "builder\0example.test",
+            "builder;true",
+            "builder$(true)",
+            "builder`true`",
+            "fleet@builder.example.test",
+            "builder\u{202e}.example.test",
+        ] {
+            let config = SshFleetHostConfig::new(host, "/srv/codewhale");
+            let err = SshFleetHostAdapter::new(tmp.path(), config)
+                .expect_err("malformed SSH host must be refused");
+            assert_eq!(err.kind, FleetHostErrorKind::Configuration, "{host:?}");
+            assert!(err.message.contains("SSH Fleet host"), "{}", err.message);
+        }
+        for user in [
+            "-oProxyCommand=true",
+            "fleet user",
+            "fleet\tuser",
+            "fleet\0user",
+            "fleet;true",
+            "fleet$(true)",
+            "fleet|true",
+            "fl\u{e9}et",
+        ] {
+            let mut config = SshFleetHostConfig::new("builder.example.test", "/srv/codewhale");
+            config.user = Some(user.to_string());
+            let err = SshFleetHostAdapter::new(tmp.path(), config)
+                .expect_err("malformed SSH user must be refused");
+            assert_eq!(err.kind, FleetHostErrorKind::Configuration, "{user:?}");
+            assert!(err.message.contains("SSH Fleet user"), "{}", err.message);
+        }
+        let spec = FleetHostSpec::Ssh {
+            host: "-oProxyCommand=true".to_string(),
+            port: None,
+            user: None,
+            identity: None,
+            known_hosts: None,
+            host_key_fingerprint: None,
+            working_directory: Some(PathBuf::from("/srv/codewhale")),
+            env_allowlist: Vec::new(),
+            codewhale_binary: Some("codewhale".to_string()),
+        };
+        assert!(SshFleetHostConfig::from_host_spec(&spec).is_err());
+
+        // Ordinary destinations stay accepted, including a directory-style
+        // user name and IPv6 literals with a zone id.
+        for (user, host) in [
+            (Some("fleet"), "builder.example.test"),
+            (Some("alice@corp.example"), "10.0.0.7"),
+            (None, "fe80::1%en0"),
+            (Some("ci_bot-2"), "build_box-01"),
+        ] {
+            let mut config = SshFleetHostConfig::new(host, "/srv/codewhale");
+            config.user = user.map(str::to_string);
+            SshFleetHostAdapter::new(tmp.path(), config)
+                .unwrap_or_else(|err| panic!("{user:?}@{host} must be accepted: {err:?}"));
+        }
+    }
+
+    #[test]
+    fn worker_base_env_uses_the_child_env_allowlist_and_keeps_proxy_route() {
+        let parent = [
+            ("HTTPS_PROXY", "http://fleet:pass@proxy.example.test:8080"),
+            ("no_proxy", "localhost"),
+            ("SSL_CERT_FILE", "/etc/ssl/corp.pem"),
+            ("CURL_CA_BUNDLE", "/etc/ssl/corp.pem"),
+            ("REQUESTS_CA_BUNDLE", "/etc/ssl/corp.pem"),
+            ("NODE_EXTRA_CA_CERTS", "/etc/ssl/corp.pem"),
+            ("PATHEXT", ".COM;.EXE;.BAT"),
+            ("WINDIR", "C:\\Windows"),
+            ("ProgramFiles", "C:\\Program Files"),
+            ("USERPROFILE", "C:\\Users\\fleet"),
+            ("TEMP", "C:\\Temp"),
+            ("USER", "fleet"),
+            ("TERM", "xterm-256color"),
+            ("CARGO_HOME", "/home/fleet/.cargo"),
+            ("CARGO_TARGET_DIR", "/tmp/target"),
+            ("DEEPSEEK_API_KEY", "secret"),
+            ("GITHUB_TOKEN", "secret"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CARGO_REGISTRY_TOKEN", "secret"),
+            ("DATABASE_URL", "postgres://u:secret@db/app"),
+            ("CODEWHALE_TELEMETRY", "true"),
+        ];
+        let env = base_env_from(parent);
+        for (key, value) in &parent[..15] {
+            assert_eq!(
+                env.get(*key).map(String::as_str),
+                Some(*value),
+                "{key} must reach the worker unchanged"
+            );
+        }
+        for key in [
+            "DEEPSEEK_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "CARGO_REGISTRY_TOKEN",
+            "DATABASE_URL",
+        ] {
+            assert!(!env.contains_key(key), "{key} must not reach the worker");
+        }
+        assert_eq!(
+            env.get("CODEWHALE_TELEMETRY").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn runtime_surface_hardening_ssh_requires_known_host_verification() {
+        let tmp = TempDir::new().unwrap();
+        let request = FleetWorkerStartRequest::new(
+            "ssh-1",
+            FleetWorkerCommand::new("codewhale", ["fleet-worker"]),
+        );
+        for known_hosts in [None, Some(PathBuf::from("/tmp/fleet keys/known_hosts"))] {
+            let mut config = SshFleetHostConfig::new("builder.example.test", "/srv/codewhale");
+            config.known_hosts = known_hosts.clone();
+            let adapter = SshFleetHostAdapter::new(tmp.path(), config).unwrap();
+            let command = adapter.build_ssh_command(&request).unwrap();
+            assert!(
+                command
+                    .args
+                    .contains(&"StrictHostKeyChecking=yes".to_string())
+            );
+            if let Some(path) = known_hosts {
+                assert!(
+                    command
+                        .args
+                        .contains(&format!("UserKnownHostsFile=\"{}\"", path.display()))
+                );
+                assert!(
+                    command
+                        .args
+                        .contains(&"GlobalKnownHostsFile=none".to_string())
+                );
+                let ignore = command
+                    .args
+                    .iter()
+                    .position(|arg| arg == "IgnoreUnknown=KnownHostsCommand")
+                    .expect("OpenSSH 7.x must ignore the newer KnownHostsCommand option");
+                let command_option = command
+                    .args
+                    .iter()
+                    .position(|arg| arg == "KnownHostsCommand=none")
+                    .expect("disable additional known-host sources on newer clients");
+                assert!(
+                    ignore < command_option,
+                    "IgnoreUnknown applies only to later options"
+                );
+                assert!(command.args.contains(&"VerifyHostKeyDNS=no".to_string()));
+            }
+        }
+        let mut config = SshFleetHostConfig::new("builder.example.test", "/srv/codewhale");
+        config.host_key_fingerprint = Some("SHA256:configured-pin".to_string());
+        let err = SshFleetHostAdapter::new(tmp.path(), config).unwrap_err();
+        assert_eq!(err.kind, FleetHostErrorKind::Configuration);
+        assert!(err.message.contains("configure known_hosts"));
+    }
+
+    #[test]
+    fn runtime_surface_review_documented_ssh_host_loads() {
+        for docs in [
+            include_str!("../../../../docs/FLEET.md"),
+            include_str!("../../../../docs/zh_hans/FLEET.md"),
+        ] {
+            // Match the actual example, not a translated section heading.
+            // Windows checkouts may carry CRLF line endings.
+            let docs = docs.replace("\r\n", "\n");
+            let example = docs
+                .split("```json\n")
+                .skip(1)
+                .filter_map(|block| {
+                    serde_json::from_str::<serde_json::Value>(block.split("```").next()?).ok()
+                })
+                .find(|value| value["id"] == "builder-1")
+                .expect("documented SSH worker example");
+            let host: FleetHostSpec = serde_json::from_value(example["host"].clone()).unwrap();
+            let config = SshFleetHostConfig::from_host_spec(&host)
+                .expect("documented host must load without migration errors");
+            assert!(config.known_hosts.is_some());
+        }
     }
 
     #[test]

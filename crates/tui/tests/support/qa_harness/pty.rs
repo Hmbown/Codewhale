@@ -29,6 +29,10 @@ pub struct PtySession {
     /// no trace on the rendered screen at all.
     transcript: Arc<Mutex<Vec<u8>>>,
     reader_handle: Option<JoinHandle<()>>,
+    /// The signal that killed the child, when `wait_until` reaped one.
+    /// `portable_pty` folds a signal death into exit code 1, which reads as a
+    /// deliberate `exit(1)`; a SIGPIPE death spent a debugging session that way.
+    signal: Option<String>,
 }
 
 pub struct PtySessionBuilder<'a> {
@@ -158,6 +162,7 @@ impl<'a> PtySessionBuilder<'a> {
             buffer,
             transcript,
             reader_handle: Some(reader_handle),
+            signal: None,
         })
     }
 }
@@ -169,6 +174,11 @@ impl PtySession {
 
     pub fn pid(&self) -> Option<u32> {
         self.child.process_id()
+    }
+
+    /// The signal that killed the child, once it has been reaped.
+    pub fn signal(&self) -> Option<&str> {
+        self.signal.as_deref()
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
@@ -210,7 +220,10 @@ impl PtySession {
     pub fn wait_until(&mut self, deadline: Instant) -> Option<i32> {
         loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status.exit_code() as i32),
+                Ok(Some(status)) => {
+                    self.signal = status.signal().map(str::to_owned);
+                    return Some(status.exit_code() as i32);
+                }
                 Ok(None) => {}
                 Err(_) => return None,
             }

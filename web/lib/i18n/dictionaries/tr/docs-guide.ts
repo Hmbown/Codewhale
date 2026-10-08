@@ -7,15 +7,15 @@ import type { DocsGuideDict } from "../types";
 export const docsGuide: DocsGuideDict = {
   metaTitle: "Başlangıç · Codewhale Belgeleri",
   metaDescription:
-    "Kurulumdan ideal fleet'ine kadar tam yol: kurulum, anahtarsız ilk oturum, sağlayıcı bağlantısı ve fleet kurulumu.",
+    "Codewhale'i kur, bir model bağla ve ilk görevine başla. Model ve rollerden oluşan bir kadro istediğinde Fleet ekle.",
   bodyClassName: "text-ink-soft leading-relaxed",
   overviewTitle: "Başlangıç",
   overviewLead:
-    "Tek bir kurulum komutundan işine hazır bir fleet'e dört adım.",
+    "Codewhale'i kur, modelini bağla ve ona bir görev ver. Fleet kurulumu isteğe bağlıdır.",
   sessionTitle: "Gerçek bir oturum izle",
   sessionLead:
-    "Buraya gerçek bir oturumun kaydı gelecek. Henüz kayıt yok, bu yüzden hiçbir şey gösterilmiyor.",
+    "Bir görevi ilk istekten tamamlanmış sonuca kadar takip et.",
   nextTitle: "Sıradaki adım",
   sourceNote:
-    "Kaynak belgeler: docs/GUIDE.md, docs/KEYBINDINGS.md · Adım metinleri web/lib/content/getting-started.ts içinde; değişiklikte docs-map.ts'i güncelle.",
+    "Daha fazla bilgi için belgelerdeki kullanıcı kılavuzuna ve klavye kısayollarına bak.",
 };

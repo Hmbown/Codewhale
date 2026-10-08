@@ -11,13 +11,13 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Value, json};
 
-use crate::client::{DeepSeekClient, SpeechSynthesisRequest};
-use crate::config::{ApiProvider, normalize_model_name_for_provider};
+use crate::client::{CodewhaleClient, SpeechSynthesisRequest};
+use crate::config::{ProviderKind, normalize_model_name_for_provider};
 use crate::network_policy::{Decision, host_from_url};
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
-    optional_bool, optional_str, required_str,
+    optional_str, required_str,
 };
 
 pub(crate) const DEFAULT_FORMAT: &str = "wav";
@@ -41,21 +41,41 @@ pub(crate) const SPEECH_MODEL_EXAMPLES: &[&str] = &[
 
 pub struct SpeechTool {
     name: &'static str,
-    client: Option<DeepSeekClient>,
+    client: Option<CodewhaleClient>,
     output_dir: Option<PathBuf>,
+    /// The canonical `speech` entry is model-visible; `tts` is a hidden
+    /// compat alias so one capability costs one catalog entry (#5941).
+    visible: bool,
 }
 
 impl SpeechTool {
     #[must_use]
     pub fn new(
         name: &'static str,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         output_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             name,
             client,
             output_dir,
+            visible: true,
+        }
+    }
+
+    /// A hidden alias for saved-transcript replay: same behaviour, not
+    /// advertised to the model.
+    #[must_use]
+    pub fn alias(
+        name: &'static str,
+        client: Option<CodewhaleClient>,
+        output_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            name,
+            client,
+            output_dir,
+            visible: false,
         }
     }
 }
@@ -66,8 +86,12 @@ impl ToolSpec for SpeechTool {
         self.name
     }
 
+    fn model_visible(&self) -> bool {
+        self.visible
+    }
+
     fn description(&self) -> &str {
-        "Generate speech/audio directly through the configured Xiaomi MiMo OpenAI-compatible API. Use this when the user asks for speech, TTS, narration, read-aloud, voice design, or voice cloning."
+        "Generate speech/audio through the configured speech (TTS) provider. Use this when the user asks for speech, TTS, narration, read-aloud, voice design, or voice cloning. The provider decides which models and voices exist; omit model to take its default."
     }
 
     fn input_schema(&self) -> Value {
@@ -76,7 +100,7 @@ impl ToolSpec for SpeechTool {
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Text to synthesize. This is sent as the assistant message and is the spoken content; MiMo TTS style/audio tags may be included here."
+                    "description": "Text to synthesize; the spoken content. Provider style/audio tags may be included when the configured provider supports them."
                 },
                 "output": {
                     "type": "string",
@@ -88,12 +112,12 @@ impl ToolSpec for SpeechTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "TTS model. Defaults to mimo-v2.5-tts, or infers voice-design/voice-clone models from voice_prompt/clone_voice.",
+                    "description": "TTS model. Omit to take the configured provider's default, or its voice-design/voice-clone model when voice_prompt/clone_voice is set (for the MiMo provider: mimo-v2.5-tts and variants).",
                     "enum": SPEECH_MODEL_EXAMPLES
                 },
                 "voice": {
                     "type": "string",
-                    "description": "Built-in voice ID (for example mimo_default, 冰糖, 茉莉, 苏打, 白桦, Mia, Chloe, Milo, Dean) or a data:audio/...;base64,... URI for voice clone."
+                    "description": "Built-in voice ID from the configured provider (MiMo examples: mimo_default, 冰糖, 茉莉, 苏打, 白桦, Mia, Chloe, Milo, Dean) or a data:audio/...;base64,... URI for voice clone."
                 },
                 "instruction": {
                     "type": "string",
@@ -101,20 +125,16 @@ impl ToolSpec for SpeechTool {
                 },
                 "voice_prompt": {
                     "type": "string",
-                    "description": "Voice design prompt. When model is omitted this uses mimo-v2.5-tts-voicedesign."
+                    "description": "Voice design prompt. When model is omitted the provider's voice-design model is used (MiMo: mimo-v2.5-tts-voicedesign)."
                 },
                 "clone_voice": {
                     "type": "string",
-                    "description": "Path to a .mp3 or .wav voice sample for cloning. When model is omitted this uses mimo-v2.5-tts-voiceclone."
+                    "description": "Path to a .mp3 or .wav voice sample for cloning. When model is omitted the provider's voice-clone model is used (MiMo: mimo-v2.5-tts-voiceclone)."
                 },
                 "format": {
                     "type": "string",
-                    "description": "Requested audio format. Default: wav. MiMo-V2.5-TTS documentation examples use wav and pcm16; mp3 is accepted when the API returns it.",
+                    "description": "Requested audio format. Default: wav. Providers commonly document wav and pcm16; mp3 is accepted when the API returns it.",
                     "enum": SUPPORTED_SPEECH_FORMATS
-                },
-                "stream": {
-                    "type": "boolean",
-                    "description": "Low-latency streaming request. The direct tool currently writes complete audio files only, so leave this false."
                 }
             },
             "required": ["text"]
@@ -151,17 +171,8 @@ impl ToolSpec for SpeechTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_FORMAT);
-        let requested_format = normalize_speech_format(requested_format_raw).ok_or_else(|| {
-            ToolError::invalid_input(format!(
-                "unsupported speech format '{requested_format_raw}' (allowed: {})",
-                SUPPORTED_SPEECH_FORMATS.join(", ")
-            ))
-        })?;
-        if optional_bool(&input, "stream", false)? {
-            return Err(ToolError::invalid_input(
-                "stream=true low-latency speech output is not implemented in the direct tool yet; use stream=false to generate a complete audio file",
-            ));
-        }
+        let requested_format =
+            prepare_speech_format(requested_format_raw, SpeechSurface::Tool, context).await?;
         let output_raw = optional_str(&input, "output")?
             .map(str::trim)
             .filter(|value| !value.is_empty());
@@ -193,53 +204,36 @@ impl ToolSpec for SpeechTool {
             .filter(|value| !value.is_empty())
             .map(str::to_string);
 
-        let voice_is_data_uri = raw_voice
-            .as_deref()
-            .is_some_and(|value| value.starts_with("data:audio/"));
-        if clone_voice.is_some() && raw_voice.is_some() {
-            return Err(ToolError::invalid_input(
-                "use either clone_voice or voice for cloned voice data, not both",
-            ));
-        }
-        let model = infer_speech_model(
-            optional_str(&input, "model")?,
-            clone_voice.is_some() || voice_is_data_uri,
-            voice_prompt.is_some(),
-        );
-        let model_lower = model.to_ascii_lowercase();
-        if !model_lower.contains("tts") {
-            return Err(ToolError::invalid_input(format!(
-                "speech tool requires a TTS model (examples: {}), got '{model}'",
-                SPEECH_MODEL_EXAMPLES.join(", ")
-            )));
-        }
-
-        let is_voice_design = model_lower.contains("voicedesign");
-        let is_voice_clone = model_lower.contains("voiceclone");
-        let instruction = combine_speech_instructions(raw_instruction, voice_prompt);
-        if is_voice_design
-            && instruction
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(ToolError::invalid_input(
-                "mimo-v2.5-tts-voicedesign requires voice_prompt or instruction",
-            ));
-        }
-
-        let voice = if let Some(clone_path) = clone_voice {
-            let clone_path = context.resolve_path(&clone_path)?;
-            Some(encode_voice_clone_data_uri(&clone_path).await?)
-        } else if is_voice_design {
-            None
-        } else if let Some(value) = raw_voice {
-            Some(value)
-        } else if is_voice_clone {
-            return Err(ToolError::invalid_input(
-                "mimo-v2.5-tts-voiceclone requires clone_voice <mp3|wav> or voice <data-uri>",
-            ));
-        } else {
-            Some(DEFAULT_VOICE.to_string())
+        let plan = prepare_speech_options(
+            SpeechPreparation {
+                model: optional_str(&input, "model")?,
+                voice: raw_voice.as_deref(),
+                instruction: raw_instruction,
+                voice_prompt,
+                has_clone_path: clone_voice.is_some(),
+                surface: SpeechSurface::Tool,
+            },
+            context,
+        )
+        .await?;
+        let model = plan.model;
+        let instruction = plan.instruction;
+        // Raw sample bytes/data URIs are never part of the host snapshot.
+        let voice = match plan.voice {
+            SpeechVoice::Clone => {
+                let clone_path = clone_voice.as_deref().ok_or_else(|| {
+                    ToolError::execution_failed(
+                        "speech adapter requested an uncaptured clone sample",
+                    )
+                })?;
+                let clone_path = context.resolve_path(clone_path)?;
+                Some(encode_voice_clone_data_uri(&clone_path).await?)
+            }
+            SpeechVoice::Omit => None,
+            SpeechVoice::Raw => Some(raw_voice.ok_or_else(|| {
+                ToolError::execution_failed("speech adapter requested an uncaptured voice")
+            })?),
+            SpeechVoice::Default => Some(DEFAULT_VOICE.to_string()),
         };
 
         check_network_policy(context, client.base_url())?;
@@ -284,7 +278,6 @@ impl ToolSpec for SpeechTool {
             "base_url": openai_compatible_base_url(client.base_url()),
             "model": response.model,
             "format": response.audio_format,
-            "stream": false,
             "output": output_label,
             "absolute_output": output_path.display().to_string(),
             "bytes": response.audio_bytes.len(),
@@ -299,13 +292,224 @@ impl ToolSpec for SpeechTool {
     }
 }
 
+/// Both CLI and ToolSpec use this one preparation seam. Provider aliases,
+/// files, embedded samples, credentials and writes remain Core-owned.
+#[derive(Clone, Copy)]
+pub(crate) enum SpeechSurface {
+    Tool,
+    Cli,
+}
+impl SpeechSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Cli => "cli",
+        }
+    }
+}
+#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpeechVoice {
+    Clone,
+    Omit,
+    Raw,
+    Default,
+}
+#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpeechOptions {
+    pub model: String,
+    pub instruction: Option<String>,
+    pub voice: SpeechVoice,
+}
+
+pub(crate) async fn prepare_speech_format(
+    format: &str,
+    surface: SpeechSurface,
+    context: &ToolContext,
+) -> Result<String, ToolError> {
+    if context
+        .features
+        .enabled(crate::features::Feature::SpeechHost)
+    {
+        let metadata = speech_projection(
+            crate::extension_host::StockOperation::SpeechFormat,
+            json!({"format":format,"surface":surface.as_str()}),
+            context,
+        )
+        .await?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Format {
+            format: String,
+        }
+        return serde_json::from_value::<Format>(metadata)
+            .map(|value| value.format)
+            .map_err(|_| {
+                ToolError::execution_failed("speech format adapter returned a malformed plan")
+            });
+    }
+    normalize_speech_format(format).ok_or_else(|| {
+        ToolError::invalid_input(match surface {
+            SpeechSurface::Tool => format!(
+                "unsupported speech format '{format}' (allowed: {})",
+                SUPPORTED_SPEECH_FORMATS.join(", ")
+            ),
+            SpeechSurface::Cli => {
+                format!("Unsupported speech format '{format}' (allowed: wav, mp3, pcm16)")
+            }
+        })
+    })
+}
+
+pub(crate) struct SpeechPreparation<'a> {
+    pub model: Option<&'a str>,
+    pub voice: Option<&'a str>,
+    pub instruction: Option<String>,
+    pub voice_prompt: Option<String>,
+    pub has_clone_path: bool,
+    pub surface: SpeechSurface,
+}
+pub(crate) async fn prepare_speech_options(
+    input: SpeechPreparation<'_>,
+    context: &ToolContext,
+) -> Result<SpeechOptions, ToolError> {
+    let SpeechPreparation {
+        model,
+        voice,
+        instruction,
+        voice_prompt,
+        has_clone_path,
+        surface,
+    } = input;
+    // The provider's existing canonical alias map is the only route authority.
+    // The host receives an optional canonical model hint, never a client/base URL.
+    let model_hint = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            normalize_model_name_for_provider(ProviderKind::XiaomiMimo, value)
+                .unwrap_or_else(|| value.into())
+        });
+    let voice_is_data_uri = voice
+        .map(str::trim)
+        .is_some_and(|value| value.starts_with("data:audio/"));
+    if context
+        .features
+        .enabled(crate::features::Feature::SpeechHost)
+    {
+        let metadata = speech_projection(
+            crate::extension_host::StockOperation::SpeechOptions,
+            json!({"surface":surface.as_str(),"model":model_hint,"instruction":instruction,
+                "voice_prompt":voice_prompt,"has_clone_path":has_clone_path,
+                "has_voice":voice.is_some(),"voice_nonempty":voice.is_some_and(|value| !value.trim().is_empty()),
+                "voice_is_data_uri":voice_is_data_uri}), context,
+        ).await?;
+        return serde_json::from_value(metadata).map_err(|_| {
+            ToolError::execution_failed("speech options adapter returned a malformed plan")
+        });
+    }
+    if has_clone_path && voice.is_some() {
+        return Err(ToolError::invalid_input(match surface {
+            SpeechSurface::Tool => {
+                "use either clone_voice or voice for cloned voice data, not both"
+            }
+            SpeechSurface::Cli => {
+                "Use either --clone-voice or --voice for cloned voice data, not both"
+            }
+        }));
+    }
+    let model = infer_speech_model(
+        model_hint.as_deref(),
+        has_clone_path || voice_is_data_uri,
+        voice_prompt.is_some(),
+    );
+    let lower = model.to_ascii_lowercase();
+    if !lower.contains("tts") {
+        return Err(ToolError::invalid_input(match surface {
+            SpeechSurface::Tool => format!(
+                "speech tool requires a TTS model (examples: {}), got '{model}'",
+                SPEECH_MODEL_EXAMPLES.join(", ")
+            ),
+            SpeechSurface::Cli => format!(
+                "speech requires a TTS model (examples: {}); got {model}",
+                SPEECH_MODEL_EXAMPLES.join(", ")
+            ),
+        }));
+    }
+    let instruction = combine_speech_instructions(instruction, voice_prompt);
+    if lower.contains("voicedesign")
+        && instruction
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(ToolError::invalid_input(match surface {
+            SpeechSurface::Tool => "mimo-v2.5-tts-voicedesign requires voice_prompt or instruction",
+            SpeechSurface::Cli => {
+                "mimo-v2.5-tts-voicedesign requires --voice-prompt or --instruction to describe the voice"
+            }
+        }));
+    }
+    let voice = if has_clone_path {
+        SpeechVoice::Clone
+    } else if lower.contains("voicedesign") {
+        SpeechVoice::Omit
+    } else if voice.is_some_and(|value| !value.trim().is_empty()) {
+        SpeechVoice::Raw
+    } else if lower.contains("voiceclone") {
+        return Err(ToolError::invalid_input(match surface {
+            SpeechSurface::Tool => {
+                "mimo-v2.5-tts-voiceclone requires clone_voice <mp3|wav> or voice <data-uri>"
+            }
+            SpeechSurface::Cli => {
+                "mimo-v2.5-tts-voiceclone requires --clone-voice <mp3|wav> or --voice <data-uri>"
+            }
+        }));
+    } else {
+        SpeechVoice::Default
+    };
+    Ok(SpeechOptions {
+        model,
+        instruction,
+        voice,
+    })
+}
+
+async fn speech_projection(
+    operation: crate::extension_host::StockOperation,
+    input: Value,
+    context: &ToolContext,
+) -> Result<Value, ToolError> {
+    let result = crate::extension_host::manager()
+        .execute_stock(
+            operation,
+            input,
+            context,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+    let metadata = result
+        .metadata
+        .ok_or_else(|| ToolError::execution_failed("speech adapter result is missing"))?;
+    if !result.success {
+        let error = metadata
+            .get("error")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ToolError::execution_failed("speech adapter validation failure is malformed")
+            })?;
+        return Err(ToolError::invalid_input(error));
+    }
+    Ok(metadata)
+}
+
 pub(crate) fn infer_speech_model(
     model: Option<&str>,
     has_clone_voice: bool,
     has_voice_prompt: bool,
 ) -> String {
     match model.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => normalize_model_name_for_provider(ApiProvider::XiaomiMimo, value)
+        Some(value) => normalize_model_name_for_provider(ProviderKind::XiaomiMimo, value)
             .unwrap_or_else(|| value.into()),
         None if has_clone_voice => "mimo-v2.5-tts-voiceclone".to_string(),
         None if has_voice_prompt => "mimo-v2.5-tts-voicedesign".to_string(),
@@ -346,6 +550,7 @@ pub(crate) fn normalize_speech_format(format: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn default_speech_output_name(format: &str) -> String {
     format!(
         "speech.{}",
@@ -366,7 +571,8 @@ fn resolve_speech_output_path(
         return context.resolve_path(output);
     }
 
-    let filename = default_speech_output_name(format);
+    // Both selected backends have already validated/canonicalized the format.
+    let filename = format!("speech.{format}");
     if let Some(output_dir) = optional_str(input, "output_dir")?
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -533,7 +739,7 @@ mod tests {
             &json!({"text": "hello"}),
             &context,
             None,
-            "pcm",
+            "pcm16",
             Some(&configured),
         )
         .expect("output path");
@@ -562,6 +768,12 @@ mod tests {
         let schema = tool.input_schema();
         assert!(schema.to_string().contains("mimo-v2.5-tts-voiceclone"));
         assert!(schema.to_string().contains("pcm16"));
-        assert!(schema.to_string().contains("stream"));
+        // #6516: the tool writes complete audio files only, so it no longer
+        // advertises a `stream` parameter it could only reject.
+        assert!(schema["properties"].get("stream").is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "speech_host_tests.rs"]
+pub(crate) mod speech_host_tests;

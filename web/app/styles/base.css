@@ -1,0 +1,239 @@
+/* ------------------------------------------------------------------ */
+/*  Base — the ground, type, and the few legacy structures docs use     */
+/* ------------------------------------------------------------------ */
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  max-width: 100%;
+  overflow-x: clip;
+  background: var(--bg);
+  /* Keep a focused control clear of the sticky header in both Tab
+     directions (WCAG 2.4.11). */
+  scroll-padding-top: 5rem;
+}
+
+body {
+  /* The ground: paper under a pale sky in light; the navy ocean rising into
+     the logo's blue at the top of the page in dark. */
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--ground), var(--bg);
+  background-repeat: no-repeat;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  line-height: 1.5;
+  font-feature-settings: "ss01", "cv11";
+  max-width: 100%;
+  overflow-x: clip;
+  position: relative;
+}
+
+main { flex: 1 0 auto; }
+main, header, footer, nav { position: relative; z-index: 1; }
+
+/* ---------- type ---------- */
+/* One face: Shannon Sans for headings, body and labels, a little negative
+   tracking on the big headings. Code uses the system monospace stack. No
+   serif, no all-caps, no wide tracking. */
+.font-display { font-family: var(--font-display); font-weight: 600; }
+.font-cjk { font-family: var(--font-cjk); }
+.font-mono { font-family: var(--font-mono); }
+
+h1, h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  text-wrap: balance;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+h3, h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+h1 { font-size: var(--text-display); line-height: 1.08; }
+h2 { font-size: clamp(1.375rem, 1.1rem + 1vw, 1.75rem); line-height: 1.2; }
+h3, h4 { font-size: var(--text-heading); line-height: 1.35; }
+
+p { text-wrap: pretty; }
+
+/* Han headings gain nothing from Latin tracking; strict CJK line-breaking
+   keeps punctuation attached while still breaking between characters. */
+html[lang="zh"] :is(h1, h2, h3),
+html[lang="ja"] :is(h1, h2, h3),
+html[lang="ko"] :is(h1, h2, h3) {
+  letter-spacing: 0;
+  line-break: strict;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+@media (max-width: 640px) {
+  h1, h2 { hyphens: auto; }
+  html[lang="en"] h1,
+  html[lang="en"] h2 { hyphens: none; }
+}
+
+.tabular { font-variant-numeric: tabular-nums; }
+
+/* ---------- containers ---------- */
+.site-container,
+.portal-container {
+  width: var(--container);
+  margin-inline: auto;
+}
+
+/* ---------- the ` · ` chain (release-truth in the docs) ---------- */
+.dotline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  font-size: var(--text-caption);
+}
+.dotline > *:not(:last-child)::after {
+  content: "·";
+  margin-inline: 0.5em;
+  color: var(--muted);
+}
+
+/* ---------- legacy structures still used by the docs ---------- */
+.hairline-t { border-top: 1px solid var(--line); }
+.hairline-b { border-bottom: 1px solid var(--line); }
+.hairline-l { border-inline-start: 1px solid var(--line); }
+.hairline-r { border-inline-end: 1px solid var(--line); }
+
+/* The docs band. New pages use .page-head. */
+.hero {
+  position: relative;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  padding-block: var(--hero-pad);
+}
+
+.section { padding-block: var(--section-pad); }
+
+.eyebrow {
+  font-size: var(--text-caption);
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.125rem 0.5rem;
+  font-size: var(--text-caption);
+  font-weight: 500;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--text);
+}
+
+/* ---------- code ---------- */
+/* Code is set into the floor: the recessed surface, a hairline, the page's
+   own ink. Prompts and comments recede; keys stay in the text ink. */
+pre.code-block {
+  background: var(--surface);
+  color: var(--text);
+  max-width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-mono);
+  line-height: 1.6;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-surface);
+  overflow-x: auto;
+  position: relative;
+  white-space: pre;
+  tab-size: 2;
+  -webkit-overflow-scrolling: touch;
+  /* Commands read left to right in every locale, including RTL pages. */
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: isolate;
+}
+pre.code-block .prompt,
+pre.code-block .comment { color: var(--muted); }
+pre.code-block .key { color: var(--text); font-weight: 500; }
+
+code.inline,
+.prose :not(pre) > code {
+  background: var(--surface);
+  padding: 0.0625rem 0.3125rem;
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  border-radius: var(--radius-control);
+  overflow-wrap: anywhere;
+}
+
+kbd,
+.kbd {
+  display: inline-block;
+  padding: 0 0.3125rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+}
+
+/* ---------- search ---------- */
+.search-input {
+  width: 100%;
+  min-height: 2.75rem;
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  padding-block: var(--space-2);
+  padding-inline: 2.5rem var(--space-3);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-control);
+  transition: border-color var(--dur-state) var(--ease-out), box-shadow var(--dur-state) var(--ease-out);
+}
+.search-input::placeholder { color: var(--muted); }
+.search-input:focus-visible { border-color: var(--ring); box-shadow: var(--glow-focus); }
+
+mark.search-highlight {
+  background: var(--selection);
+  color: inherit;
+}
+
+/* ---------- a11y: skip link ---------- */
+.skip-link {
+  position: absolute;
+  inset-inline-start: 1rem;
+  top: -3.5rem;
+  z-index: 60;
+  padding: 0.5rem 0.875rem;
+  background: var(--text);
+  color: var(--bg);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  border-radius: var(--radius-control);
+}
+.skip-link:focus-visible { top: 0.5rem; }
+
+/* The docs band's mark and label (docs/layout.tsx): the reading whale. */
+.portal-mark-pose { --pose-size: 2.25rem; flex: none; }
+.portal-mark {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  margin-bottom: 1.25rem;
+  color: var(--muted);
+  font-size: var(--text-caption);
+  font-weight: 600;
+}

@@ -1,105 +1,115 @@
 import type { HomeDict } from "../types";
 
 /**
- * Simplified Chinese home copy — a native rewrite mirroring the current
- * English direction (the brand dives so you don't have to; bring your own
- * model; runs on your machine), not a translation of it. The hero leans on
- * the classical 「一入侯门深似海」 allusion per community feedback — clever
- * in a way machine translation never is. The seal* glyphs are shared
- * editorial marks; the keys exist so a locale can override them without
- * touching the page.
+ * Simplified Chinese home dictionary — native copy for the whale-road landing page,
+ * in the current direction: your models, more capable together; agents
+ * and control on your own machine; availability stated per surface as it
+ * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
+ * Auto-Review / Full Access, Codewhale, TUI, codewhale exec, Fleet).
  */
+
 export const home: HomeDict = {
-  metaTitle: "Codewhale — 一入码门深似海，它替你潜。",
+  metaTitle: "Codewhale：适用于任意模型的开源编程智能体",
   metaDescription:
-    "Codewhale 潜入深海，你不必亲自下潜——开源的终端编程智能体。模型自带，跑在你自己的机器上。Rust 编写，MIT 许可。",
-
-  kicker: "开源 · 自带模型 · 运行在你的终端",
-  heroTitleA: "一入码门深似海，",
-  heroTitleB: "Codewhale 替你潜。",
+    "Codewhale 是一个在终端中运行的开源编程智能体。它使用你选择的云端或本地模型，读取项目、编辑文件并运行测试。",
+  heroTitle: "适用于任意模型的开源编程智能体",
   heroIntro:
-    "{brand} 是一个跑在终端里的开源编程智能体。给它一个模型和一个任务。它会读你的代码、改文件、跑检查，活干完了或需要你拿主意时就停下来。模型随便用，也可以给每个角色各配一个。",
-  install: "安装",
-  docs: "文档",
-  copy: "复制",
-  copied: "已复制 ✓",
-
-  installEyebrow: "一行安装",
-  installRequirement: "需要 Node 18+，无需 Rust 工具链",
-  installOtherWays: "其他方式 →",
-
+    "{brand} 在终端中读取你的项目、编辑文件并运行测试。连接云端或本地模型，并决定哪些操作需要你批准。",
+  getCodewhale: "安装 Codewhale",
+  heroInstallAria: "安装命令",
+  exploreProduct: "了解工作方式",
+  shotPreview: "终端预览",
+  shotBuild: "v{version} 预发布版本",
+  screenshotAlt:
+    "Codewhale v{version} 预发布版本：鲸鱼标志、新会话、消息输入区、Ask 权限、Work 模式和模型状态。由隔离终端会话的实际画面渲染。",
   latestRelease: "最新发布 {tag}",
   releaseUnavailable: "发布状态暂不可用",
   currentSource: "源码",
   sourceCandidate: "未发布",
-  providerRoutes: "{count} 个提供商",
   publishedRelease: "已发布",
   figcaptionSourceCandidate: "未发布",
-
-  shotSession: "会话",
-  screenshotAlt: "Codewhale 终端会话，Operate 模式：鲸鱼、输入区与状态栏",
-  figcaption: "Codewhale 会话 · Operate 模式 · 权限：Ask",
-
-  proofHeading: "终端里的编程智能体。任意模型。本机运行。",
-  proofBody:
-    "用你手头已有的模型——托管、网关或本地都行。选一个模式：Plan、Work 或 Operate。再选它不问你就能做多少：Ask、Auto-Review 或 Full Access。",
-
-  sealDecides: "法",
-  decidesEyebrow: "它如何决策",
-  decidesHeading: "推理过程，原话呈现",
-  decidesLede:
-    "会话摘录。每一段都写明模型依据了哪条项目规则，以及接着做了什么。",
-
-  sealWorkflow: "行",
-  workflowHeading: "从任务到验证过的改动。",
-  workflow: [
-    ["检查", "读取仓库、项目说明与任务。"],
-    ["执行", "修改文件，你要求先问的地方会先问。"],
-    ["验证", "运行检查，核对结果。"],
-    ["报告", "说明改了什么、通过了什么。"],
+  chapterTerminal: "你的终端",
+  chapterTerminalTitle: "实时查看每一次编辑和命令",
+  gainHeading: "交出任务，保留控制权",
+  gainLede: "直接说出想要的结果：修复错误、解释某个模块，或自动完成重复任务。先用一个智能体，任务变大时再增加。",
+  gain: [
+    [
+      "修改代码并验证",
+      "智能体查看你的项目、编辑文件并运行测试。你可以在它工作时查看每一次编辑和命令结果。"
+    ],
+    [
+      "自动完成重复工作",
+      "在脚本和 CI 中运行 codewhale exec。使用 Fleet 把大型任务分给多个智能体。"
+    ],
+    [
+      "掌握执行过程",
+      "开始前设定权限，回应审批请求，随时停止任务。运行 /receipts 可列出会话中的每个文件、命令和审批。"
+    ]
   ],
-  receiptAria: "运行摘要示例",
-  receiptInspect: "仓库与项目说明",
-  receiptAct: "在你设定的权限内修改文件",
-  receiptReport: "检查通过 · 摘要已保存",
-
-  sealStart: "起",
-  startHeading: "第一次用？四步。",
-  startLede:
-    "安装 → 首次会话，无需密钥 → 接入提供商 → 配置 fleet。",
-  startGuideLink: "阅读新手指引 →",
-  startVocabularyLink: "查名词 →",
-
-  sealBoundaries: "界",
-  boundariesHeadingA: "你的模型。",
-  boundariesHeadingB: "你的边界。",
-  boundariesBody:
-    "模型、模式、以及它不问你能做多少，都由你来选。你不改，提供商和模型就不会变。预览功能会标注预览。",
-  hostedGatewayLocal: "托管、网关与本地模型",
-  planActOperateDesc: "从只读规划到自主执行",
-  askAutoReviewDesc: "它在问你之前能做多少",
-  tuiExecWebDesc: "交互式或脚本化",
-
-  sealSurfaces: "面",
-  surfacesHeading: "活在哪里干，就在哪里用。",
+  chapterModels: "你的模型",
+  modelsHeading: "为每项任务选择模型",
+  modelsBody:
+    "为每个会话选择内置提供商、任意 OpenAI 兼容端点或本地模型。你的模型连接与 Codewhale 账户相互独立。",
+  modelsFacts: [
+    ["托管", "你自己的 API 密钥，用 codewhale auth set --provider <id> 保存"],
+    ["网关", "一个端点接多个模型；提供商仍由你选择"],
+    ["本地", "localhost 上的 vLLM、SGLang 或 Ollama，通常无需密钥"],
+  ],
+  modelsLink: "浏览模型与提供商",
+  startHeading: "安装、连接模型、运行任务",
+  startLede: "在项目文件夹中用三个步骤运行第一项任务。如果工作需要多个智能体，之后再添加 Fleet。",
+  startGuideLink: "按照新手指引操作",
+  startVocabularyLink: "查名词",
+  chapterAvailability: "在哪里运行",
+  availabilityHeading: "现在就在终端中使用",
+  availabilityLede: "终端、本地浏览器客户端和社区维护的 CodeWhale GUI 现已可用。桌面应用和重建中的托管网页应用正在开发，两者共用同一会话模型。",
+  availability: [
+    [
+      "终端与本地浏览器",
+      "已发布",
+      "在 Linux、macOS 或 Windows 上安装，然后运行 codewhale，或运行 codewhale web 打开本地浏览器客户端。也可以用 npm 或 Cargo 安装；Android 上的 Termux 版本为预览版。"
+    ],
+    [
+      "CodeWhale GUI（VS Code）",
+      "可用",
+      "由社区维护的独立项目：在 VS Code 侧边栏中连接同一个 Codewhale Runtime，进行对话、管理线程并查看文件变更。可从 VS Code Marketplace 安装。",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
+    ],
+    [
+      "托管网页应用",
+      "开发预览",
+      "正在重建，以与桌面应用保持一致。目前你可以登录，然后在正在运行的终端会话中输入 /rc，在网页上继续该会话；托管任务执行仍在验证中。"
+    ],
+    [
+      "桌面端",
+      "开发版本",
+      "正在成为 Codewhale 主要客户端的原生应用：文件夹、对话和模型连接集中在一个窗口中。暂无公开下载。"
+    ],
+    [
+      "云端计算机",
+      "开发中",
+      "为你运行任务的托管计算机。"
+    ]
+  ],
+  availabilityNote: "终端、本地浏览器和 GUI 无需 Codewhale 账户。托管网页和桌面端使用账户，但账户不能代替模型连接；使用你自己的密钥产生的用量由提供商计费。",
+  accountLink: "创建账户",
+  surfacesHeading: "扩展智能体能接触的范围",
   surfaces: [
-    ["TUI", "交互式终端工作"],
-    ["codewhale exec", "脚本与 CI"],
-    ["Web 客户端", "浏览器客户端，仅限本机"],
-    ["运行时 API + MCP", "本地集成"],
-    ["fleet", "多个智能体协作一件事"],
+    ["文件与命令", "在你设定的权限内读取项目、编辑文件、运行测试并查看输出。"],
+    ["插件与 MCP", "连接更多工具和服务。每个插件在你审核并启用之前都保持关闭。"],
+    ["Computer Use · 预览", "让智能体查看并操作其他应用的插件。由你启用它，并授予它请求的系统权限。"],
+    ["保存的会话", "将对话和工具结果保存在一起，可以接着之前的工作继续，无需从头开始。本地浏览器会打开你电脑上的同一个会话。"],
+    ["Fleet", "把任务的各部分分配给使用不同模型和角色的智能体，然后跟踪它们的进度。"],
   ],
-  runtimeLink: "运行时界面与稳定程度 →",
-
-  installBandHeading: "从一条命令开始。",
+  runtimeLink: "查看全部集成",
+  installBandHeading: "在 macOS 或 Linux 上安装",
+  copy: "复制",
+  copied: "已复制 ✓",
   binaries: "预编译包",
   chinaMirrors: "中国镜像",
-  installGuideLink: "阅读安装指南 →",
-
-  sealCommunity: "众",
-  communityHeading: "公开构建",
-  communityBody:
-    "MIT 许可。贡献者的工作覆盖运行时、提供商、平台、文档与测试。",
+  installGuideLink: "阅读安装指南",
+  communityHeading: "和我们一起构建 Codewhale",
+  communityBody: "在 GitHub 上报告 bug、提出功能建议，或提交你的第一个 pull request。欢迎小而经过测试的修复。",
   communityLinksAria: "社区链接",
-  contribute: "参与贡献",
+  contribute: "提交 pull request",
 };

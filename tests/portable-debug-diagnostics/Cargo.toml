@@ -1,0 +1,16 @@
+[package]
+name = "codewhale-portable-debug-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Only normal portable dependencies: no TUI, provider, client or host crate.
+[dependencies]
+codewhale-command-contract = { path = "../../crates/command-contract", version = "0.10.1" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

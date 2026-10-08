@@ -25,12 +25,9 @@ export const chrome: ChromeDict = {
   navCommunity: "Communauté",
   navContribute: "Contribuer",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
+  navProduct: "Produit",
+  navModels: "Modèles",
+  navPlugins: "Plugins",
 
   skipToContent: "Aller au contenu principal",
 
@@ -40,30 +37,8 @@ export const chrome: ChromeDict = {
   installCta: "Installer →",
 
   authSignIn: "Se connecter",
-  authRegister: "Créer un compte",
-  authGroupAria: "Compte",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "n’importe quel modèle, sur votre machine",
-
-  issueLabel: "Édition du {date}",
   dateLocale: "fr-FR",
-
-  starsAria: "Étoiles GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "En direct",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "fusionné",
-  tickerOpened: "ouvert",
-  tickerClosed: "fermé",
-  tickerReleased: "publié",
-  tickerFirstContribution: "première contribution",
-  tickerBy: "par {handle}",
-  tickerAria: "Activité récente du dépôt",
-
-  traceLabel: "trace de raisonnement",
-  traceTabsAria: "Extraits de session",
 
   menuOpen: "Ouvrir le menu",
   menuClose: "Fermer le menu",
@@ -71,11 +46,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "clair",
   themeDark: "sombre",
-  themeAria: "Thème de la documentation : {mode} (cliquer pour changer)",
-  themeTitle: "Thème de la documentation · auto / clair / sombre",
+  themeAria: "Thème : {mode} (cliquer pour changer)",
+  themeTitle: "Thème · auto / clair / sombre",
 
   footerTagline:
-    "Codewhale plonge dans les profondeurs à votre place — documentation, code source et communauté du runtime open source.",
+    "Modifiez du code, exécutez des tests et examinez les modifications avec les modèles de votre choix.",
   footerProduct: "Produit",
   footerProject: "Projet",
   footerDocs: "Documentation",
@@ -87,7 +62,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "Contribuer",
   footerLicense: "Licence MIT",
-  footerPricing: "Tarifs",
   footerTerms: "Conditions d’utilisation",
   footerPrivacy: "Confidentialité",
   footerChangelog: "Journal des modifications",

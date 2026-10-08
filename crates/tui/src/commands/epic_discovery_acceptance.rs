@@ -9,12 +9,12 @@ use cucumber::{World as _, given, then, when, writer::Stats as _};
 use tempfile::TempDir;
 
 use crate::commands::{self, CommandResult};
-use crate::config::ApiProvider;
 use crate::config::Config;
-use crate::localization::Locale;
+use crate::config::ProviderKind;
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::command_palette::{self, CommandPaletteEntry};
 use crate::tui::widgets::{self, SlashMenuEntry};
+use codewhale_localization::Locale;
 
 // --- FEAT-012 discovery filtering constants ---
 
@@ -48,6 +48,8 @@ fn create_discovery_app(tmpdir: &TempDir) -> App {
 }
 
 fn write_user_command(tmpdir: &TempDir, name: &str, content: &str) {
+    // Workspace commands load only in a trusted workspace.
+    crate::test_support::trust_workspace(tmpdir.path());
     let commands_dir = tmpdir.path().join(".codewhale").join("commands");
     std::fs::create_dir_all(commands_dir).expect("create commands dir");
     let path = tmpdir
@@ -62,7 +64,7 @@ fn palette_entries(tmpdir: &TempDir) -> Vec<CommandPaletteEntry> {
     command_palette::build_entries(
         Locale::En,
         tmpdir.path().join("skills").as_path(),
-        false,
+        crate::skills::SkillDiscoveryMode::Compatible,
         tmpdir.path(),
         tmpdir.path().join("mcp.json").as_path(),
         None,
@@ -76,7 +78,7 @@ fn completion_hints(tmpdir: &TempDir, input: &str) -> Vec<SlashMenuEntry> {
         &[],
         Locale::En,
         Some(tmpdir.path()),
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
     )
 }
 

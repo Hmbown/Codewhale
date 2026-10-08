@@ -1,79 +1,180 @@
-<!-- source: README.md sha256:e421b94e9f7e -->
-# Codewhale
+<!-- source: README.md sha256:004b3d422063 -->
+<div align="center">
 
-Codewhale è un agente di programmazione open source per il terminale, sviluppato in Rust e migliorato pubblicamente insieme alle persone che lo utilizzano.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/wordmark-inverted.svg">
+  <img src="brand/wordmark.svg" alt="Codewhale" width="320">
+</picture>
 
-![Codewhale in esecuzione in un terminale](assets/screenshot.webp)
+**L’agente di programmazione open source che funziona con qualsiasi modello.**
+
+Codewhale legge il tuo progetto, modifica i file, esegue comandi e controlla il proprio
+lavoro — nel tuo terminale, con un modello ospitato o locale a tua scelta.
+
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
+[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+
+[Sito web](https://codewhale.net) · [Documentazione](docs/README.md) · [Changelog](CHANGELOG.md) · [Contribuire](CONTRIBUTING.md)
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
-[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Una sessione di terminale di Codewhale" width="760">
+
+<sub>Acquisizione reale del terminale di una nuova installazione — nessun output simulato.</sub>
+
+</div>
 
 ## Installazione
 
+macOS e Linux:
+
 ```bash
-npm install -g codewhale
-codewhale
+curl -fsSL https://codewhale.net/install.sh | sh
 ```
 
-Al primo avvio, Codewhale ti aiuta a collegare un provider oppure a rimanere offline. Supporta inoltre Cargo, Docker, Nix, Scoop, archivi precompilati, Android/Termux e un mirror CNB. Consulta la [guida all’installazione](docs/INSTALL.md).
+Il programma di installazione scarica in `~/.local/bin` binari con checksum verificato. Se
+`codewhale` risponde poi «command not found», esegui l’unica riga PATH che l’installer
+stampa, oppure consulta [Aggiungere al PATH](docs/INSTALL.md#put-it-on-your-path).
+Aggiorna in qualsiasi momento con `codewhale update`.
 
-Il completamento con Tab si attiva con un solo comando per ogni shell — `codewhale completion bash|zsh|fish|powershell|elvish`. Consulta il [completamento della shell](docs/INSTALL.md#8-shell-completions).
+<details>
+<summary><b>Windows, npm, Cargo e altre vie</b></summary>
 
-## Utilizzo
+```bash
+winget install HunterBown.CodeWhale  # Windows x64 (or Scoop, or the installer from GitHub Releases)
+npm install -g codewhale            # wraps the same release binaries
+cargo install codewhale-cli --locked  # build from crates.io
+```
 
-Parla con Codewhale come parleresti con un membro del tuo team:
+Docker, Nix, Homebrew su Linux, Android/Termux, download manuali con verifica del checksum
+e il mirror CNB opzionale sono descritti nella
+[guida all’installazione](docs/INSTALL.md). Scegli una sola via: più installazioni
+sulla stessa macchina finiscono per contendersi il `PATH`.
+
+</details>
+
+## Avvio rapido
+
+**Le chiavi API dei tuoi provider, in un unico posto.** [Crea un account Codewhale](https://app.codewhale.net/register)
+oppure esegui `codewhale login` per accedere. Salva e aggiorna le chiavi API nel tuo account,
+poi usale tramite l’instradamento dei modelli di Codewhale sui dispositivi su cui hai effettuato l’accesso.
+[Configura le chiavi dell’account](docs/CONFIGURATION.md#account-provider-keys).
+L’accesso non carica le chiavi locali esistenti; puoi continuare a usare Codewhale in locale senza un account.
+
+1. **Apri il tuo progetto.** Esegui `codewhale` nella cartella su cui vuoi lavorare.
+2. **Collega un modello.** Esegui `/provider` (o premi `F3`) per aggiungere una chiave
+   ospitata o scegliere un runtime locale. Se Ollama è già in esecuzione con un modello di
+   chat, Codewhale passa a quello da solo. Usa `/model` per cambiare modello.
+3. **Dagli un compito concreto.**
 
 ```text
 Fix the failing tests and explain what changed.
 ```
 
-Oppure esegui un’attività senza aprire la TUI:
+Lo stesso compito gira senza interfaccia da uno script o da un job di CI:
 
 ```bash
 codewhale exec "fix the failing tests and explain what changed"
 ```
 
-Codewhale può leggere il tuo repository, modificare file, eseguire comandi, controllare i risultati e continuare a lavorare verso un obiettivo. Sei tu a decidere quanto accesso concedergli.
+Esegui `/help` per i comandi e le scorciatoie da tastiera.
 
-## Perché Codewhale
+## Modi di eseguirlo
 
-- **Usa il modello che preferisci.** Collega provider gestiti oppure modelli locali tramite Ollama, vLLM o SGLang. Cambia provider e modello con `/model`.
-- **Mantieni il controllo.** Plan è in sola lettura. Ask, Auto-Review e Full Access rendono visibile il comportamento delle approvazioni. `/undo` annulla l’ultimo turno e `/restore` riporta l’area di lavoro a uno snapshot precedente.
-- **Mantieni organizzati i lavori lunghi.** Salva le sessioni, imposta un `/goal` duraturo, rivedi i workflow prima dell’esecuzione e coordina gli agenti senza trasformare le loro istruzioni interne in parte della tua conversazione.
-- **Estendi l’agente che hai già.** Collega server MCP e skill, configura gli hook e conserva i ruoli degli agenti come file leggibili nel progetto o nelle impostazioni personali.
+Ogni client pilota lo stesso Runtime Codewhale locale, quindi sessioni, strumenti e
+permessi si comportano allo stesso modo ovunque.
 
-Esegui `/help` nella TUI per vedere i comandi e le scorciatoie da tastiera.
+| Comando | Cosa fa |
+| --- | --- |
+| `codewhale` | L’interfaccia interattiva nel terminale |
+| `codewhale exec "…"` | Un turno senza interfaccia da uno script o dalla CI, con JSON in streaming |
+| `codewhale web` | Il [client browser locale](docs/WEB.md) incluso, su `127.0.0.1` |
+| `codewhale review --pr N` | Una [revisione di pull request](docs/GITHUB_ACTION.md) a scopo consultivo; la pubblicazione è facoltativa |
+| Runtime API | Una [API HTTP locale](docs/RUNTIME_API.md) per thread, eventi e approvazioni |
+
+Un’app desktop nativa (GPUI) è in sviluppo come client del prodotto per gli utenti con
+account; consulta la
+[pagina del prodotto](https://codewhale.net/en/product) per la disponibilità. L’[estensione VS Code](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode)
+mantenuta dalla comunità si connette allo stesso Runtime da una barra laterale ([sorgente](https://github.com/HengQuWorld/CodeWhale-VSCode)).
+
+## Cosa fa
+
+- **Qualsiasi modello, nessun vincolo.** Oltre 40 percorsi di provider integrati — Anthropic,
+  DeepSeek, Google, Mistral, Moonshot, OpenAI, OpenRouter, xAI e altri — più
+  qualsiasi endpoint compatibile con OpenAI e modelli locali tramite Ollama, vLLM o SGLang.
+  [Provider](docs/PROVIDERS.md)
+- **Resti tu al controllo.** La modalità Plan esplora senza modificare nulla; Work
+  e Operate apportano modifiche. Le posture di approvazione decidono quando una chiamata a uno
+  strumento richiede il tuo consenso, `/undo` e `/restore` ripristinano le modifiche
+  all’area di lavoro, e `/receipts` elenca ogni file, comando e approvazione di una sessione.
+  [Modalità](docs/MODES.md) · [Ricevute](docs/RECEIPTS.md)
+- **Pensato per i lavori lunghi.** Imposta un `/goal` duraturo, delega lavoro circoscritto a
+  [sub-agenti](docs/SUBAGENTS.md), avvia [team di agenti](docs/FLEET.md) supervisionati
+  con un controllo prima della spesa, oppure scrivili come
+  [workflow](docs/WORKFLOW_AUTHORING.md) versionati nel repository.
+- **Estendi ciò che già usi.** Collega [server MCP](docs/MCP.md), installa
+  [skill](docs/SKILLS.md) e [plugin](docs/PLUGINS.md), esegui
+  [hook](docs/HOOKS.md) sugli eventi di sessione e di strumento e carica i
+  [plugin di Claude Code](docs/CLAUDE_PLUGIN_COMPAT.md) esistenti.
+- **Computer Use.** Un plugin incluso aggiunge strumenti per osservare e usare altre
+  applicazioni. Controlla i suoi accessi e abilitalo prima dell’uso.
+  [Guida](crates/tui/plugins/computer-use/README.md)
+
+## Modalità e permessi
+
+| | Si sceglie con | Opzioni |
+| --- | --- | --- |
+| **Modalità** — cosa sta facendo l’agente | `Tab` o `/mode` | Plan (esplorare, nessuna modifica) · Work (modificare ed eseguire) · Operate (portare avanti un obiettivo con passaggi pianificati e verificati) |
+| **Postura** — quando chiede prima | `Shift+Tab` | Ask · Auto-Review · Full Access |
+
+Full Access rispetta comunque i limiti rigidi delle policy. La
+[guida a modalità e permessi](docs/MODES.md) spiega ogni opzione.
 
 ## Sicurezza
 
-Codewhale viene eseguito sul tuo computer con l’accesso che gli concedi. Le modalità di approvazione e le regole del repository limitano ciò che l’agente può fare; il sandboxing facoltativo del sistema operativo aggiunge un confine di esecuzione più solido dove supportato. I prezzi sconosciuti dei modelli restano indicati come sconosciuti anziché essere segnalati come gratuiti.
+Codewhale gira sulla tua macchina con gli accessi che gli concedi. Le posture di approvazione
+e le regole del repository limitano ciò che l’agente può fare, e i comandi vengono eseguiti in
+una sandbox del sistema operativo dove supportata (Seatbelt su macOS; bubblewrap su Linux è
+facoltativo). `/preview-request` mostra la richiesta esatta, con i dati oscurati, prima che
+venga inviato qualcosa. I prezzi dei modelli sconosciuti restano sconosciuti invece di essere
+indicati come gratuiti.
 
-Leggi l’[ordine di autorizzazione](docs/AUTHORIZATION_ORDER.md) per conoscere l’esatta gerarchia delle regole e la [configurazione](docs/CONFIGURATION.md) per le impostazioni locali.
+Consulta l’[ordine di autorizzazione](docs/AUTHORIZATION_ORDER.md),
+la [sandbox](docs/SANDBOX.md) e la [telemetria](docs/TELEMETRY.md) — i contatori
+di utilizzo sono attivi per impostazione predefinita e `codewhale config set telemetry false` li disattiva.
 
 ## Documentazione
 
-- [Provider e modelli locali](docs/PROVIDERS.md)
-- [Team di agenti](docs/FLEET.md)
-- [MCP](docs/MCP.md), [hook](docs/HOOKS.md) e [configurazione](docs/CONFIGURATION.md)
-- [Client web locale](docs/WEB.md)
-- [Tutta la documentazione](docs)
+| Per iniziare | Per approfondire |
+| --- | --- |
+| [Installazione](docs/INSTALL.md) | [Configurazione](docs/CONFIGURATION.md) |
+| [Provider e modelli locali](docs/PROVIDERS.md) | [Architettura](docs/ARCHITECTURE.md) |
+| [Modalità e permessi](docs/MODES.md) | [Runtime API](docs/RUNTIME_API.md) |
+| [Scorciatoie da tastiera](docs/KEYBINDINGS.md) | [Creare plugin](docs/PLUGIN_AUTHORING.md) |
+| [Revisione PR su GitHub](docs/GITHUB_ACTION.md) | [Tutta la documentazione](docs/README.md) |
 
-## Unisciti alla comunità
+## Comunità
 
-Codewhale migliora quando le persone lo usano, segnalano ciò che non funziona e aiutano a correggerlo. Se manca un provider, un workflow risulta scomodo o l’interfaccia del terminale ti ostacola, [apri una issue](https://github.com/Hmbown/CodeWhale/issues). Se sai come migliorarlo, [apri una pull request](CONTRIBUTING.md). I primi contributi sono benvenuti e chi contribuisce mantiene il riconoscimento per il lavoro integrato.
+Segnalazioni di bug, idee per nuove funzioni e pull request sono benvenute, che tu usi
+Codewhale da mesi o lo stia provando per la prima volta. Se manca un provider o un workflow è
+scomodo, [apri una issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) o
+[invia una pull request](CONTRIBUTING.md). I primi contributi sono benvenuti, e
+chi contribuisce mantiene il riconoscimento per il lavoro integrato. La
+[struttura del repository](CONTRIBUTING.md#project-structure) è un buon punto di partenza.
 
-Unisciti a [Discord](https://discord.gg/37gfS3ksug), oppure aggiungi Hunter su WeChat (`hunterbown`) e chiedi di entrare nel gruppo Whale Brothers.
+Unisciti al [Discord](https://discord.gg/37gfS3ksug), oppure aggiungi Hunter su WeChat
+(`hunterbown`) e chiedi di entrare nel gruppo Whale Brothers.
 
-## Storia del progetto
+## Storia e licenza
 
-Codewhale è nato come `deepseek-tui` e conserva ancora la compatibilità con la sua configurazione e le sue sessioni. Ora è indipendente dai provider, viene mantenuto in modo autonomo e non è affiliato ad alcun provider di modelli.
+Codewhale è nato come `deepseek-tui` e legge ancora la configurazione e le sessioni di quel
+progetto. Ora è indipendente da qualsiasi provider, mantenuto in modo autonomo e non è
+affiliato ad alcun fornitore di modelli. Grazie a
+[tutti i contributori](docs/CONTRIBUTORS.md) e alle comunità open source che
+hanno aiutato la sua crescita.
 
-Grazie a ogni persona che ha contribuito e alle comunità open source che hanno aiutato il progetto a crescere. Consulta il [registro dei contributori](docs/CONTRIBUTORS.md).
-
-## Licenza
-
-[MIT](LICENSE). Le parti adattate da altri progetti open source sono indicate nelle [note sui componenti di terze parti](docs/THIRD_PARTY_NOTICES.md).
+[MIT](LICENSE). Le parti adattate da altri progetti open source sono riportate negli
+[avvisi di terze parti](docs/THIRD_PARTY_NOTICES.md).

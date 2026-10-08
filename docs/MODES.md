@@ -6,19 +6,21 @@ Codewhale has three related concepts:
 
 - **TUI mode**: what kind of visible interaction you're in (Plan/Work/Operate).
 - **Permission posture**: how aggressively the UI asks before executing tools.
-- **Workflow overlay**: optional long-running orchestration that can
-  run on top of any TUI mode when a task needs many coordinated workers.
+- **Workflow**: named steps that coordinate sub-agents, with dependencies and
+  results, available in any TUI mode.
 
 Model selection is separate. `--model auto` and `/model auto` route each turn to
 a concrete model and thinking level; they are not TUI modes and are not part of
 the `Tab` cycle.
 
-Workflow is also separate from the mode itself. It is the visible ordered
-orchestration layer for repeatable workflows and fleet workers. High fan-out
-routes through durable fleet-backed workers instead of prompt-only sub-agent
-fanout. The active mode
-still controls permissions; Workflow controls whether a large task is planned
-into a resumable workflow with its own progress view.
+Workflow runs named steps through the same sub-agent runtime; Fleet manages
+their saved roles and model assignments. A workflow adds ordering, result
+handoffs, gates and a progress view. The active mode and permission posture
+still control what each step may execute.
+
+Before assigning steps, query `agent(action="roster")` for the saved Fleet
+models and roles. A plan child can select a listed model with `model`, or use
+the saved `role`/`profile` assignment. An Exact Fleet fixes each member's route.
 
 ## TUI Modes
 
@@ -31,8 +33,8 @@ Run `/mode` to open the mode picker, or switch directly with `/mode work`,
 `/mode plan`, or `/mode operate`.
 
 - **Plan**: design-first prompting. The stable primitive names remain familiar, but the runtime centrally refuses file mutation and shell execution. Read-only inspection and policy-allowed research, including deferred Web search/fetch, remain available.
-- **Work** (internally `agent`): ordinary multi-step execution. The small first-turn toolbox is `read`, `write`, `edit`, `bash`, `agent`, and `todo_write`; approval, sandbox, repository law, and managed policy still decide what may execute.
-- **Operate**: multitask conductor posture. Operate turns your prompt into a goal and works it in parallel: background workers for separable streams, verified before it stops. It has the same primitive identities and execution authority as Work. When no unfinished goal exists, a submitted prompt that is real work (not a greeting, acknowledgement, or short question) becomes the session goal automatically, with continuation on; the transcript shows `◆ goal set · Operate keeps working until it is verified · /goal to edit`. An explicit `/goal` declaration still wins, `/goal` still edits it, and an existing goal is never replaced. The parent session is the **operator**: dispatching background workers is the default for independent or parallel work. Handle small or tightly coupled tasks in the parent; use background `agent` workers for separable streams, and use Workflow when order, phases, gates, shared budgets, or deterministic fan-in matter. **Dispatch is not completion** — write-capable children must return real verification evidence. The first Operate turn of a session appends this contract once as a user-role runtime message (append-only history, never the pinned system prompt), so Plan, Work, and Operate keep one shared prompt prefix.
+- **Work** (internally `agent`): ordinary multi-step execution. The first-turn toolbox includes `read`, `write`, `edit`, `bash`, `agent`, `workflow`, and `todo_write`, plus `create_goal`, `get_goal`, and `update_goal` so goal controls are available without discovery. The agent calls `create_goal` when a request is a durable objective; the host never infers a goal from wording, and the contract must not tell the model otherwise. Approval, sandbox, repository law, and managed policy decide what may execute.
+- **Operate**: Work at full strength, the "ultra" mode. Same tools and authority as Work; the difference is how they are used. Each substantive request becomes a goal (`create_goal`), the plan stays visible (`todo_write`), multi-part work runs through `workflow` and parallel `agent` workers, non-trivial changes get an independent reviewer before they are called done, long commands keep running in the background, and recurring or watch-type work is offered as an `automation` (created after approval). It keeps going until the goal is verified, blocked on you, or paused.
 
 `Act` and `/mode act` remain compatibility aliases for Work. Saved settings
 still normalize to the internal value `agent`.
@@ -60,11 +62,12 @@ authority difference does not require a different primitive vocabulary.
 ```text
 User message
   → small / chat / one-file?  → parent does it (Work-equivalent tools)
-  → real / multi-stream work? → goal (set from the prompt) → dispatch background workers
-       → each write child: implement → VERDICT PASS/FAIL with evidence
-       → ordered / gated fan-in? → Workflow (operate_* starters)
-       → high-stakes ambiguous? → best-of-n (N worktrees + reviewer; apply on PASS)
-  → parent synthesizes receipts; stays free for the next ask
+  → multi-step work? → goal → named steps + dependencies + completion checks
+       → Workflow phases → independent sub-agents in parallel
+       → collect results → check evidence → hand off to the next phase
+       → missing required result? → stop dependent work and repair the step
+       → one independent task? → one direct sub-agent
+  → parent integrates results and reports completed, blocked and next steps
 ```
 
 Lifecycle claims stay exact: dispatched ≠ settled ≠ verified.
@@ -189,10 +192,11 @@ Legacy note: `/set approval_mode ...` was retired in favor of `/config`.
 - `suggest` (**Ask**, default): tool approvals may interrupt, and Codewhale asks
   when an unresolved user choice materially changes authority, cost, scope, or
   outcome.
-- `auto` (**Auto-Review**): the fully autonomous posture. It never opens a user
-  question; the model resolves ambiguity from context, chooses a safe reversible
-  interpretation, or reports that it cannot proceed safely. Tool safety holds
-  remain separate from user questions. Two layers decide approvals. The
+- `auto` (**Auto-Review**): reviews tool calls automatically. Deliberate user
+  questions remain available in interactive sessions through `request_user_input`;
+  a question parks the turn until answered, canceled, or its configured timeout
+  expires. Headless `exec` withholds that tool because it has no responder.
+  Tool safety holds remain separate from user questions. Two layers decide approvals. The
   **deterministic floor** (configured block rules plus the built-in safety
   floor) allows proven-safe calls and hard-blocks publish-like actions and
   destructive background/headless work; it is never model-reviewed. Fallback
@@ -225,8 +229,8 @@ also has no LLM reviewer. Its ordered
 [permission policy](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/permissionPolicyService.ts)
 applies explicit deny rules and then its
 [Auto policy](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/policies/auto-mode-approve.ts)
-returns `approve` directly. Codewhale borrows Kimi's no-question autonomous UX,
-not that blanket approval rule.
+returns `approve` directly. Codewhale uses the deterministic floor and guardian
+described above, while keeping deliberate user questions available.
 
 The sandbox and escalation baseline is grounded in DeepSeek Harness
 `0.1.0-rc.5` at
@@ -311,6 +315,14 @@ built-in tools. Read-only MCP helpers may auto-run in Ask and Auto-Review when
 policy permits; MCP tools with possible side effects require approval. Full
 Access does not bypass hard policy holds.
 
+A tool's own MCP annotations count only as far as their source is trusted. A
+tool from a reviewed, enabled plugin that declares `readOnlyHint: true` runs
+like the built-in read helpers, with no prompt; the same claim from any other
+server is ignored. A tool that declares `destructiveHint: true` never gets
+that relaxation, even from a reviewed plugin, and its approval card says the
+server marked it destructive. Full Access still runs it without a prompt, like
+any other tool that would ask.
+
 See `MCP.md`.
 
 ## Related CLI Flags
@@ -319,6 +331,7 @@ Run `codewhale --help` for the canonical list. Common flags:
 
 - `-p, --prompt <TEXT>`: one-shot prompt mode (prints and exits)
 - `codewhale exec --auto --output-format stream-json <PROMPT>`: run the tool-backed non-interactive agent and emit one JSON object per line for harnesses and backend wrappers. Exit codes: `0` on success, `1` for genuine task/agent failures, `75` (`EX_TEMPFAIL`) when the turn ended on a retryable infrastructure failure (provider/transport `network`/`timeout` after all in-session retries) so harnesses can tell a retryable infra exit apart from a task failure; the terminal stream `metadata` event's `error_category` carries the same classification
+- `codewhale exec --prompt-file <PATH>` / `cat prompt.txt | codewhale exec --prompt-file -`: read the prompt from a file or stdin instead of argv, for prompts past the OS per-argument limit (~128 KiB on Linux). Conflicts with a positional prompt, and a positional `-` is literal prompt text; `--prompt-file -` is refused with `--parent-death-watch`, which owns stdin
 - `codewhale exec --resume <ID|PREFIX> <PROMPT>` / `--session-id <ID|PREFIX>`: continue a saved session non-interactively
 - `codewhale exec --continue <PROMPT>`: continue the most recent saved session for this workspace non-interactively
 - `codewhale fork <ID|PREFIX>` / `codewhale fork --last`: copy a saved session into a new sibling session; forked sessions retain additive parent-session metadata and show that lineage in session listings

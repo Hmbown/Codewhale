@@ -1,4 +1,4 @@
-//! Unified `/skills` manager — audit inventory + mutation actions.
+//! Dedicated `/skills manage` manager — audit inventory + mutation actions.
 //!
 //! This view never writes files. Keys emit [`ViewEvent::SkillMutationRequested`];
 //! the host runs [`crate::skills::mutation`] and rebuilds the view.
@@ -16,7 +16,6 @@ use super::{
     ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
     render_modal_footer, render_underwater_surface, truncate_view_text,
 };
-use crate::palette;
 use crate::skills::audit::{
     AuditedSkill, AuditedSkillId, DigestState, IntegrityState, ParserState, PrecedenceState,
     ProvenanceState, SkillActionKind, SkillAuditMode, SkillAuditSnapshot, SkillSourceKind,
@@ -26,6 +25,7 @@ use crate::skills::mutation::{ConflictPolicy, SkillMutationRequest, SkillTargetS
 use crate::skills::roots::SkillRootKind;
 use crate::tui::app::App;
 use crate::tui::menu_style;
+use codewhale_palette as palette;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagerMode {
