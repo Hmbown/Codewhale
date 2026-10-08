@@ -3493,7 +3493,7 @@ pub(crate) fn apply_backtrack(app: &mut App, depth: usize) {
     // Backtrack rewinds the conversation only. State the file fact first,
     // and name the command that puts the files back.
     app.status_message =
-        Some("Files not changed; conversation rewound. /undo puts files back".to_string());
+        Some("Files not changed. /undo puts them back. Conversation rewound.".to_string());
     app.scroll_to_bottom();
     app.mark_history_updated();
     app.needs_redraw = true;

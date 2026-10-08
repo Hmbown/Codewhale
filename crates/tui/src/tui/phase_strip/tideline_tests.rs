@@ -539,11 +539,11 @@ fn rewind_notice_states_the_file_fact_first_and_names_undo_when_it_fits() {
     };
     assert_eq!(
         shown(&mut app, 80).as_deref(),
-        Some("Files not changed; conversation rewound.")
+        Some("Files not changed. /undo puts them back.")
     );
     assert_eq!(
         shown(&mut app, 124).as_deref(),
-        Some("Files not changed; conversation rewound. /undo puts files back")
+        Some("Files not changed. /undo puts them back. Conversation rewound.")
     );
 }
 

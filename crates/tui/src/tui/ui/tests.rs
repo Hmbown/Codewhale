@@ -9998,7 +9998,7 @@ fn backtrack_prefill_rehydrates_attachment_rows() {
     // The rewind leaves files alone: the footer says so and names `/undo`.
     assert_eq!(
         app.status_message.as_deref(),
-        Some("Files not changed; conversation rewound. /undo puts files back")
+        Some("Files not changed. /undo puts them back. Conversation rewound.")
     );
 }
 
