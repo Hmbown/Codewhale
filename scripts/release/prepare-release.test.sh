@@ -134,6 +134,22 @@ EOF
   printf 'fixture packaged changelog\n' >"${root}/crates/tui/CHANGELOG.md"
   printf 'fixture generated facts\n' >"${root}/web/lib/facts.generated.ts"
 
+  mkdir -p \
+    "${root}/crates/config/src/route" \
+    "${root}/crates/tui/src/commands/contract/fixtures/config_policy"
+  cat >"${root}/crates/config/src/route/providers-export.golden.json" <<'EOF'
+{
+  "schemaVersion": 1,
+  "runtimeVersion": "0.8.68",
+  "routes": []
+}
+EOF
+  cat >"${root}/crates/tui/src/commands/contract/fixtures/config_policy/status.json" <<'EOF'
+{
+  "message": "codewhale 0.8.68\n\n  Route: fixture\n"
+}
+EOF
+
   for readme in README.md README.zh-CN.md README.ja-JP.md README.vi.md README.ko-KR.md; do
     printf 'Install Codewhale from the package manager.\n' >"${root}/${readme}"
   done
@@ -199,6 +215,10 @@ grep -Fq 'RELEASE_TAG="${RELEASE_TAG:-v0.9.0}"' \
   "${success_root}/scripts/remote-smoke/setup-vm.sh"
 grep -Fq '"sourceCandidate": { "version": "0.9.0" }' \
   "${success_root}/docs/public-surface-facts.json"
+grep -Fq '"runtimeVersion": "0.9.0"' \
+  "${success_root}/crates/config/src/route/providers-export.golden.json"
+grep -Fq 'codewhale 0.9.0' \
+  "${success_root}/crates/tui/src/commands/contract/fixtures/config_policy/status.json"
 grep -Fq '"tag": "v0.8.67"' \
   "${success_root}/docs/public-surface-facts.json"
 grep -Fq '"sourceVersion": "0.8.67"' \
