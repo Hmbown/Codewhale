@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "Aktuell wird auf keinen Shell-Befehl gewartet.",
+  "ShellWaitInteractive": "Interaktive Befehle können nicht im Hintergrund weiterlaufen. Brich den aktuellen Durchgang ab oder warte, bis der Befehl fertig ist.",
+  "ShellWaitUnavailable": "Dieses Werkzeug kann nicht im Hintergrund weiterlaufen. Brich den aktuellen Durchgang ab oder warte, bis es fertig ist.",
+  "ShellWaitReleased": "Es geht ohne Warten weiter. Shell-Befehle laufen unter {jobs} weiter.",
   "TerminalDockStarting": "Neues Terminal wird gestartet…",
   "TerminalDockControls": "{new} neu · {next} nächste Sitzung · {detach} Eingabefeld",
   "TerminalDockEmpty": "Keine aktiven Terminals. Mit {new} eines starten.",

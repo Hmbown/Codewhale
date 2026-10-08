@@ -17,7 +17,7 @@
 | `F3` | 打开提供商/模型选择器（等同于 `/provider`） |
 | `Ctrl-K` | 打开命令面板（斜杠命令查找器） |
 | `Ctrl-C` | 取消当前回合 / 关闭模态框 / 先预备再确认退出 |
-| `Ctrl-B` | 将受支持的前台 shell 等待移入 `/jobs`，使当前回合得以继续；可用 `/jobs` 或 `action: "wait"` 的 `Bash` 来查看它 |
+| `Ctrl-B` | 结束当前 shell 等待，使回合继续；前台命令转入 `/jobs`，后台任务继续运行。可用 `/jobs` 或 `action: "wait"` 的 `Bash` 查看输出 |
 | `Ctrl-D` | 退出（仅当输入框为空时） |
 | `Tab` | 当输入框为空时，循环切换 TUI 模式：Plan → Work → Operate → Plan |
 | `Shift+Tab` | 循环切换权限级别：Ask → Auto-Review → Full Access（完全访问）。无论输入框内容如何、回合是否在运行都即时生效（仅在打开设置以外的模态框时被抑制） |
@@ -265,4 +265,3 @@ Hotbar 的触发键刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 - **输入框为空时，裸 Up/Down 方向键滚动对话记录（v0.8.13）。** 以前 `should_scroll_with_arrows` 开关被硬编码为 false，意味着即使输入框为空，裸方向键也总是在输入框历史中导航。虚拟终端（Ghostty、Codex、Kitty 协议）中的用户尤其受影响，因为他们无法使用 Cmd+Up / Alt+Up 快捷键。
 - **可配置键位（#436）和 `tui.toml`（#437）仍然延期。** `TuiPrefs` 结构体和加载器存在于 `settings.rs` 中，但未在启动时接线。允许 `~/.codewhale/tui.toml` 覆盖单个条目的命名绑定注册表仍然待办。
 - **未发现其他损坏的绑定。** 上面列出的每个其他组合都解析为 `crates/tui/src/tui/ui.rs`（按键事件分发）或 `crates/tui/src/tui/app.rs`（模式 + 状态转换）中的实时处理器。
-

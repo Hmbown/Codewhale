@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "No hay ninguna espera de shell activa.",
+  "ShellWaitInteractive": "Los comandos interactivos no pueden continuar en segundo plano. Cancela el turno o espera a que terminen.",
+  "ShellWaitUnavailable": "Esta herramienta no puede continuar en segundo plano. Cancela el turno o espera a que termine.",
+  "ShellWaitReleased": "El turno continúa sin esperar. Los comandos de shell siguen ejecutándose en {jobs}.",
   "TerminalDockStarting": "Iniciando una terminal nueva…",
   "TerminalDockControls": "{new} nuevo · {next} siguiente sesión · {detach} entrada",
   "TerminalDockEmpty": "No hay terminales activos. Inicia uno con {new}.",

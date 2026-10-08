@@ -129,6 +129,10 @@ accounting, localized replies and Windows launcher guidance.
 
 ### Fixed
 
+- `Ctrl+B` and steering input release foreground and background shell waits
+  without stopping their commands. Requests apply only to active waits in the
+  current session, including waits on several tasks; a later wait starts fresh
+  ([#6909](https://github.com/codewhale-hq/Codewhale/issues/6909)).
 - Concurrent starts and reconnects for one workspace converge on one Engine
   owner. A receipt retired during a reconnect is observed again before
   attaching; files with unsafe ownership, permissions or multiple links are

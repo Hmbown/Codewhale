@@ -1118,7 +1118,7 @@ mod tests {
     use codewhale_models::{ContentBlock, Role};
     use std::time::Duration;
 
-    fn parse_lines(output: Vec<u8>) -> Vec<Value> {
+    pub(super) fn parse_lines(output: Vec<u8>) -> Vec<Value> {
         String::from_utf8(output)
             .unwrap()
             .lines()
@@ -2421,6 +2421,185 @@ mod tests {
             !wire
                 .iter()
                 .any(|v| v["method"] == "session/request_permission")
+        );
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_full_access_keeps_safety_floor_and_repo_law_without_permission_modal() -> Result<()>
+    {
+        let mut config = fixture_config();
+        config.approval_policy = Some("full-access".into());
+        config.allow_shell = Some(true);
+        let mut rig = Rig::new(
+            config,
+            vec![
+                canned::tool_call_turn(
+                    "ordinary-write",
+                    "write",
+                    r#"{"path":"ordinary.txt","content":"allowed"}"#,
+                ),
+                // ACP reviews even foreground bash as Headless. Reuse the
+                // harmless Core catastrophic-command fixture: a regression
+                // can only overwrite this private sentinel.
+                canned::tool_call_turn(
+                    "floor-held",
+                    "bash",
+                    r#"{"command":"echo \"rm -rf /\" > floor-sentinel.txt"}"#,
+                ),
+                canned::tool_call_turn(
+                    "law-held",
+                    "write",
+                    r#"{"path":"CHANGELOG.md","content":"must not be written"}"#,
+                ),
+                canned::simple_text_turn("ordinary write completed; protected changes refused"),
+            ],
+        )?;
+        std::fs::write(rig.workspace.join("floor-sentinel.txt"), "guarded\n")?;
+        std::fs::create_dir_all(rig.workspace.join(".codewhale"))?;
+        std::fs::write(
+            rig.workspace.join(".codewhale/constitution.json"),
+            r#"{"protected_invariants":[{"text":"Release notes need human review","paths":["CHANGELOG.md"]}]}"#,
+        )?;
+        let config_path = rig._dir.path().join("operator.toml");
+        std::fs::write(
+            &config_path,
+            "allow_shell = true\napproval_policy = \"full-access\"\n",
+        )?;
+        rig.server.config_path = Some(config_path);
+        rig.server
+            .handle_request(
+                "initialize",
+                json!({"protocolVersion":1,"clientCapabilities":{"terminal":true}}),
+            )
+            .await
+            .unwrap();
+        let session = rig.new_session().await;
+        let (reason, wire) = rig
+            .prompt(&session, "write ordinary and protected files")
+            .await?;
+        assert_eq!(reason, "end_turn");
+        assert_eq!(
+            std::fs::read_to_string(rig.workspace.join("ordinary.txt"))?,
+            "allowed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rig.workspace.join("floor-sentinel.txt"))?,
+            "guarded\n"
+        );
+        assert!(!rig.workspace.join("CHANGELOG.md").exists());
+        assert!(
+            !wire
+                .iter()
+                .any(|frame| frame["method"] == "session/request_permission")
+        );
+        let statuses: Vec<_> = wire
+            .iter()
+            .filter_map(|frame| {
+                frame
+                    .pointer("/params/update/status")
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == "in_progress")
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == "completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == "failed")
+                .count(),
+            2
+        );
+        let requests = rig.mock.captured_requests();
+        assert_eq!(requests.len(), 4, "no guardian or provider replay");
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .flatten()
+                .any(|tool| tool.name == "bash"),
+            "the floor fixture must exercise an admitted shell tool"
+        );
+        let history = rig.history(&session).await;
+        for (request, call, error, refusal_reason) in [
+            (1, "ordinary-write", false, None),
+            (
+                2,
+                "floor-held",
+                true,
+                Some("destructive background/headless action requires durable review"),
+            ),
+            (3, "law-held", true, Some("Release notes need human review")),
+        ] {
+            let results: Vec<_> = history
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } if tool_use_id == call => Some((content.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(results.len(), 1, "one paired result for {call}");
+            assert_eq!(results[0].1.unwrap_or(false), error, "{call}: {results:?}");
+            assert!(!results[0].0.is_empty(), "{call}");
+            let provider_results: Vec<_> = requests[request]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } if tool_use_id == call => Some((content.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                provider_results, results,
+                "the next provider request must receive the exact paired Core result for {call}"
+            );
+            if let Some(reason) = refusal_reason {
+                assert!(
+                    provider_results[0].0.contains(reason),
+                    "{call} must report its actual policy hold: {provider_results:?}"
+                );
+            }
+        }
+        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
+            .load_session(&session)?;
+        assert_eq!(
+            saved.messages, history,
+            "ACP persists the full paired Core history"
+        );
+        let detail = rig
+            .server
+            .runtime
+            .get_thread_detail(&rig.server.sessions[&session].thread_id)
+            .await?;
+        assert!(detail.pending_approvals.is_empty());
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(
+            detail.turns[0].status,
+            crate::runtime_threads::RuntimeTurnStatus::Completed
         );
         rig.close().await;
         Ok(())

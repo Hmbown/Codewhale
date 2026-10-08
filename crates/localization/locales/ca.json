@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "No s'està esperant cap ordre de l'intèrpret.",
+  "ShellWaitInteractive": "Les ordres interactives no poden continuar en segon pla. Cancel·la el torn o espera que acabin.",
+  "ShellWaitUnavailable": "Aquesta eina no pot continuar en segon pla. Cancel·la el torn o espera que acabi.",
+  "ShellWaitReleased": "El torn continua sense esperar. Les ordres de l'intèrpret continuen executant-se a {jobs}.",
   "TerminalDockStarting": "S’està iniciant un terminal nou…",
   "TerminalDockControls": "{new} nou · {next} sessió següent · {detach} entrada",
   "TerminalDockEmpty": "Cap terminal actiu. Inicia’n un amb {new}.",

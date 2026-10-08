@@ -1195,53 +1195,39 @@ type ProviderKeyVerification<'a> = Pin<
     >,
 >;
 
-pub(crate) fn request_foreground_shell_background(app: &mut App) {
-    if !app.is_loading {
-        app.status_message = Some("No foreground shell wait to move to /jobs".to_string());
-        return;
-    }
-    if !active_foreground_shell_running(app) {
-        // #3032 AC3: name the reason backgrounding is unavailable —
-        // interactive execs and non-shell blocking tools are visibly running
-        // but cannot be detached, and a generic shrug reads like a bug.
-        let reason = if terminal_pause_has_live_owner(app) {
-            "the running command is interactive"
-        } else if app
-            .active_cell
-            .as_ref()
-            .is_some_and(|active| !active.is_empty())
-        {
-            "the running tool is not a foreground shell command"
-        } else {
-            "no foreground shell command is running"
-        };
-        app.status_message = Some(format!(
-            "Cannot move to /jobs: {reason}. Press Ctrl+C to cancel the turn, or wait for completion."
-        ));
-        return;
-    }
-
-    match request_active_foreground_shell_background(app) {
-        Ok(()) => {
-            app.status_message = Some("Moving current shell command to /jobs...".to_string());
+pub(crate) fn request_shell_wait_detach(app: &mut App) {
+    let (notice, level) = match request_active_shell_wait_detach(app) {
+        Ok(true) => (
+            app.tr(MessageId::ShellWaitReleased)
+                .replace("{jobs}", "/jobs"),
+            StatusToastLevel::Info,
+        ),
+        Ok(false) => {
+            let message = if terminal_pause_has_live_owner(app) {
+                MessageId::ShellWaitInteractive
+            } else if app.is_loading {
+                MessageId::ShellWaitUnavailable
+            } else {
+                MessageId::ShellWaitNoActive
+            };
+            (app.tr(message).to_string(), StatusToastLevel::Info)
         }
-        Err(err) => {
-            app.status_message = Some(err.to_string());
-        }
-    }
+        Err(err) => (err.to_string(), StatusToastLevel::Error),
+    };
+    app.push_status_toast(notice, level, Some(6_000));
 }
 
-fn request_active_foreground_shell_background(app: &App) -> Result<()> {
-    let shell_manager = app
-        .runtime_services
-        .shell_manager
-        .clone()
-        .context("No shell session is active.")?;
+fn request_active_shell_wait_detach(app: &App) -> Result<bool> {
+    let Some(session_id) = app.current_session_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(shell_manager) = app.runtime_services.shell_manager.as_ref() else {
+        return Ok(false);
+    };
     let mut manager = shell_manager.lock().map_err(|_| {
         anyhow::anyhow!("Shell tracking hit an internal error — restart Codewhale to recover.")
     })?;
-    manager.request_foreground_background();
-    Ok(())
+    Ok(manager.request_shell_wait_detach(session_id))
 }
 
 pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
@@ -1260,20 +1246,6 @@ pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
     app.cursor_position = app.input.len();
     app.status_message = Some("Press Enter to cancel all running commands".to_string());
     true
-}
-
-pub(crate) fn active_foreground_shell_running(app: &App) -> bool {
-    app.active_cell.as_ref().is_some_and(|active| {
-        active.entries().iter().any(|cell| {
-            matches!(
-                cell,
-                HistoryCell::Tool(ToolCell::Exec(exec))
-                    if exec.status == ToolStatus::Running
-                        && exec.interaction.is_none()
-                        && exec.shell_task_id.is_none()
-            )
-        })
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

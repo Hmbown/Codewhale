@@ -15,7 +15,7 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `F3`                 | Open the provider/model picker (same as `/provider`)          |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
 | `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
-| `Ctrl-B`             | Move a supported foreground shell wait into `/jobs` so the turn can continue; use `/jobs` or `Bash` with `action: "wait"` to inspect it |
+| `Ctrl-B`             | Release the current shell wait so the turn can continue; foreground commands move into `/jobs`, and background tasks keep running. Use `/jobs` or `Bash` with `action: "wait"` to inspect output |
 | `Ctrl-D`             | Quit (only when the composer is empty)                         |
 | `Tab`                | When the composer is empty, cycle TUI mode: Plan → Work → Operate → Plan |
 | `Shift+Tab`          | Cycle permission posture: Ask → Auto-Review → Full Access. Live regardless of composer contents or whether a turn is running (suppressed only while a modal other than Config is open) |

@@ -20364,36 +20364,19 @@ async fn steer_user_message_records_prompt_for_cancel_restore() {
 }
 
 #[tokio::test]
-async fn steer_user_message_backgrounds_foreground_shell_before_dispatch() {
+async fn steer_user_message_detaches_session_shell_waits_before_dispatch() {
     let mut app = create_test_app();
     app.is_loading = true;
-    let shell_manager = app
-        .runtime_services
-        .shell_manager
-        .clone()
-        .expect("test app shell manager");
-    let mut active = ActiveCell::new();
-    active.push_tool(
-        "foreground-shell",
-        HistoryCell::Tool(ToolCell::Exec(ExecCell {
-            command: "cargo test --workspace".to_string(),
-            status: ToolStatus::Running,
-            output: None,
-            live_output: None,
-            shell_task_id: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-            started_at: Some(Instant::now()),
-            duration_ms: None,
-            stale_elapsed_since_output_ms: None,
-            source: ExecSource::Assistant,
-            interaction: None,
-            output_summary: None,
-        })),
-    );
-    app.active_cell = Some(active);
+    app.current_session_id = Some("steer-session".to_string());
+    let shell_manager = app.runtime_services.shell_manager.clone().unwrap();
+    let (waiting, foreign) = {
+        let mut manager = shell_manager.lock().unwrap();
+        (
+            manager.register_shell_wait_for_test("steer-session"),
+            manager.register_shell_wait_for_test("other-session"),
+        )
+    };
     let mut engine = crate::core::engine::mock_engine_handle();
-
     steer_user_message(
         &mut app,
         &Config::default(),
@@ -20402,14 +20385,8 @@ async fn steer_user_message_backgrounds_foreground_shell_before_dispatch() {
     )
     .await
     .expect("steer user message");
-
-    assert!(
-        shell_manager
-            .lock()
-            .expect("shell manager lock")
-            .foreground_background_requested_for_test(),
-        "foreground shell must receive its detach request"
-    );
+    assert!(waiting.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!foreign.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(
         engine.rx_steer.recv().await.as_deref(),
         Some("use the partial results")
@@ -21735,43 +21712,38 @@ fn terminal_pause_has_live_owner_only_for_running_exec_cells() {
 }
 
 #[test]
-fn active_foreground_shell_running_excludes_detached_background_jobs() {
+fn shell_wait_key_detaches_only_live_waits_of_current_session() {
     let mut app = create_test_app();
-    let mut active = ActiveCell::new();
-    active.push_tool(
-        "shell",
-        HistoryCell::Tool(ToolCell::Exec(ExecCell {
-            command: "cargo test --workspace".to_string(),
-            status: ToolStatus::Running,
-            output: None,
-            live_output: None,
-            shell_task_id: Some("shell-42".to_string()),
-            owner_agent_id: None,
-            owner_agent_name: None,
-            started_at: Some(Instant::now()),
-            duration_ms: None,
-            stale_elapsed_since_output_ms: None,
-            source: ExecSource::Assistant,
-            interaction: None,
-            output_summary: None,
-        })),
-    );
-    app.active_cell = Some(active);
-
-    assert!(
-        !active_foreground_shell_running(&app),
-        "a detached job remains Running but is no longer a foreground wait"
-    );
-
-    let Some(HistoryCell::Tool(ToolCell::Exec(exec))) = app
-        .active_cell
-        .as_mut()
-        .and_then(|active| active.entry_mut(0))
-    else {
-        panic!("running shell cell");
+    app.current_session_id = Some("key-session".to_string());
+    let manager = app.runtime_services.shell_manager.clone().unwrap();
+    let (waiting, foreign) = {
+        let mut manager = manager.lock().unwrap();
+        (
+            manager.register_shell_wait_for_test("key-session"),
+            manager.register_shell_wait_for_test("other-session"),
+        )
     };
-    exec.shell_task_id = None;
-    assert!(active_foreground_shell_running(&app));
+    request_shell_wait_detach(&mut app);
+    assert!(waiting.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!foreign.load(std::sync::atomic::Ordering::Acquire));
+    drop(waiting);
+    assert!(
+        !manager
+            .lock()
+            .unwrap()
+            .request_shell_wait_detach("key-session")
+    );
+    let next = manager
+        .lock()
+        .unwrap()
+        .register_shell_wait_for_test("key-session");
+    assert!(
+        !next.load(std::sync::atomic::Ordering::Acquire),
+        "old requests must expire"
+    );
+    app.current_session_id = Some("absent-session".to_string());
+    request_shell_wait_detach(&mut app);
+    assert!(!next.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[test]

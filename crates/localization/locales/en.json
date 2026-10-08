@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "No shell wait is active.",
+  "ShellWaitInteractive": "Interactive commands cannot continue in the background. Cancel the turn, or wait for completion.",
+  "ShellWaitUnavailable": "This tool cannot continue in the background. Cancel the turn, or wait for completion.",
+  "ShellWaitReleased": "Continuing without waiting. Shell commands keep running in {jobs}.",
   "TerminalDockStarting": "Starting a fresh terminal…",
   "TerminalDockControls": "{new} new · {next} next session · {detach} composer",
   "TerminalDockEmpty": "No live terminals. Start one with {new}.",

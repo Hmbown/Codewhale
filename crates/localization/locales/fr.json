@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "Aucune attente de commande shell en cours.",
+  "ShellWaitInteractive": "Les commandes interactives ne peuvent pas continuer en arrière-plan. Annulez le tour ou attendez la fin de la commande.",
+  "ShellWaitUnavailable": "Cet outil ne peut pas continuer en arrière-plan. Annulez le tour ou attendez la fin de son exécution.",
+  "ShellWaitReleased": "Le tour reprend sans attendre. Les commandes shell continuent dans {jobs}.",
   "TerminalDockStarting": "Ouverture d’un nouveau terminal…",
   "TerminalDockControls": "{new} nouveau · {next} session suivante · {detach} saisie",
   "TerminalDockEmpty": "Aucun terminal actif. Utilisez {new} pour en ouvrir un.",

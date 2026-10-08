@@ -6049,11 +6049,9 @@ pub(crate) async fn run_event_loop(
                 && key_shortcuts::has_control_like_modifier(key.modifiers)
                 && app.view_stack.is_empty()
             {
-                // #3032/#3859: Ctrl+B moves the active foreground shell wait
-                // into /jobs instead of opening a two-step shell-control menu.
-                // When nothing is movable, the status message tells the user
-                // what's going on.
-                request_foreground_shell_background(app);
+                // Release foreground or background shell waits in this session
+                // without canceling their commands (#3032/#3859/#6909).
+                request_shell_wait_detach(app);
                 app.needs_redraw = true;
                 continue;
             }

@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "待機中のシェルコマンドはありません。",
+  "ShellWaitInteractive": "対話型コマンドはバックグラウンドで続行できません。ターンをキャンセルするか、完了をお待ちください。",
+  "ShellWaitUnavailable": "このツールはバックグラウンドで続行できません。ターンをキャンセルするか、完了をお待ちください。",
+  "ShellWaitReleased": "待機を終了し、ターンを続行します。シェルコマンドは {jobs} で実行を続けます。",
   "TerminalDockStarting": "新しい端末を起動中…",
   "TerminalDockControls": "{new} 新規 · {next} 次のセッション · {detach} 入力欄へ",
   "TerminalDockEmpty": "実行中の端末はありません。{new} で開始できます。",

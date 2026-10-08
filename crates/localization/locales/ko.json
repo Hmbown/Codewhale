@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "현재 완료를 기다리는 셸 명령이 없습니다.",
+  "ShellWaitInteractive": "대화형 명령은 백그라운드에서 계속 실행할 수 없습니다. 턴을 취소하거나 명령이 완료될 때까지 기다리세요.",
+  "ShellWaitUnavailable": "이 도구는 백그라운드에서 계속 실행할 수 없습니다. 턴을 취소하거나 완료될 때까지 기다리세요.",
+  "ShellWaitReleased": "대기를 끝내고 턴을 계속합니다. 셸 명령은 {jobs}에서 계속 실행됩니다.",
   "TerminalDockStarting": "새 터미널을 시작하는 중…",
   "TerminalDockControls": "{new} 새 터미널 · {next} 다음 세션 · {detach} 입력창",
   "TerminalDockEmpty": "실행 중인 터미널이 없습니다. {new} 키로 시작하세요.",

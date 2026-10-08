@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "Không có lệnh shell nào đang được chờ.",
+  "ShellWaitInteractive": "Lệnh tương tác không thể tiếp tục chạy nền. Hãy hủy lượt hoặc chờ lệnh hoàn tất.",
+  "ShellWaitUnavailable": "Công cụ này không thể tiếp tục chạy nền. Hãy hủy lượt hoặc chờ công cụ hoàn tất.",
+  "ShellWaitReleased": "Tiếp tục lượt mà không chờ. Các lệnh shell vẫn chạy trong {jobs}.",
   "TerminalDockStarting": "Đang mở thiết bị đầu cuối mới…",
   "TerminalDockControls": "{new} mới · {next} phiên tiếp theo · {detach} ô nhập",
   "TerminalDockEmpty": "Không có thiết bị đầu cuối đang chạy. Mở bằng {new}.",

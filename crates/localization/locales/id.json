@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "Tidak ada perintah shell yang sedang ditunggu.",
+  "ShellWaitInteractive": "Perintah interaktif tidak dapat berjalan di latar belakang. Batalkan giliran atau tunggu hingga selesai.",
+  "ShellWaitUnavailable": "Alat ini tidak dapat berjalan di latar belakang. Batalkan giliran atau tunggu hingga selesai.",
+  "ShellWaitReleased": "Giliran dilanjutkan tanpa menunggu. Perintah shell tetap berjalan di {jobs}.",
   "TerminalDockStarting": "Memulai terminal baru…",
   "TerminalDockControls": "{new} baru · {next} sesi berikutnya · {detach} kotak masukan",
   "TerminalDockEmpty": "Tidak ada terminal aktif. Mulai dengan {new}.",

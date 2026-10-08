@@ -1,4 +1,8 @@
 {
+  "ShellWaitNoActive": "目前沒有正在等待的 shell 命令。",
+  "ShellWaitInteractive": "互動式命令無法在背景繼續執行。請取消目前回合，或等待命令完成。",
+  "ShellWaitUnavailable": "此工具無法在背景繼續執行。請取消目前回合，或等待它完成。",
+  "ShellWaitReleased": "不再等待，繼續目前回合。shell 命令仍在 {jobs} 中執行。",
   "TerminalDockStarting": "正在啟動新終端…",
   "TerminalDockControls": "{new} 新增 · {next} 下一個工作階段 · {detach} 返回輸入框",
   "TerminalDockEmpty": "沒有執行中的終端。按 {new} 新增。",
