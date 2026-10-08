@@ -6,29 +6,29 @@ export const NATIVE_TERMINAL_VIEWS = {
   home: {
     label: { en: "Home", zh: "首页" },
     description: {
-      en: "A new session, with the composer and status line.",
-      zh: "新会话界面，包含输入框与状态栏。",
+      en: "The conversation, composer and model status in one view.",
+      zh: "在同一界面查看对话、输入框和模型状态。",
     },
   },
   composer: {
     label: { en: "Composer", zh: "输入框" },
     description: {
-      en: "A message in the composer, before it is sent.",
-      zh: "输入框中的消息，尚未发送。",
+      en: "A follow-up message in the composer, ready to send.",
+      zh: "输入框中准备发送的后续消息。",
     },
   },
   workbar: {
     label: { en: "Workbar", zh: "工作栏" },
     description: {
-      en: "The session dock, with tasks and other work views.",
-      zh: "会话工作栏，包含任务与其他工作视图。",
+      en: "Task progress and session details in the workbar.",
+      zh: "在工作栏中查看任务进度与会话详情。",
     },
   },
   "workbar-fleet": {
     label: { en: "Fleet", zh: "智能体团队" },
     description: {
-      en: "The Fleet workbar in a new session.",
-      zh: "新会话中的智能体团队工作栏。",
+      en: "The Fleet view in the session workbar.",
+      zh: "会话工作栏中的智能体团队视图。",
     },
   },
   "provider-picker": {
@@ -41,17 +41,17 @@ export const NATIVE_TERMINAL_VIEWS = {
   help: {
     label: { en: "Help", zh: "帮助" },
     description: {
-      en: "Commands and keyboard shortcuts in the help view.",
-      zh: "帮助视图中的命令与快捷键。",
+      en: "Commands and keyboard shortcuts.",
+      zh: "命令与键盘快捷键。",
     },
   },
 } satisfies Record<string, { label: LocalizedText; description: LocalizedText }>;
 
 export const NATIVE_TERMINAL_COPY = {
-  title: { en: "Inside the terminal", zh: "走进终端" },
+  title: { en: "Explore the terminal", zh: "探索终端界面" },
   description: {
-    en: "Explore Codewhale’s composer, workbar, provider picker and help.",
-    zh: "探索 Codewhale 的输入框、工作栏、提供商选择与帮助视图。",
+    en: "Captured views from a Codewhale demo session. Explore the conversation, task workbar, model connections and help.",
+    zh: "Codewhale 演示会话的实录画面。查看对话、任务工作栏、模型连接与帮助。",
   },
   viewsLabel: { en: "Terminal views", zh: "终端视图" },
   scrollHint: { en: "Scroll sideways to see the full terminal.", zh: "左右滚动，查看完整终端。" },

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:004b3d422063 -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -22,9 +22,9 @@ wybierzesz.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Sesja Codewhale w terminalu" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Sesja Codewhale w terminalu" width="760">
 
-<sub>Prawdziwy zrzut terminala po świeżej instalacji — bez reżyserowanego wyjścia.</sub>
+<sub>Prawdziwy zrzut terminala Codewhale ze skonfigurowanej lokalnej sesji demonstracyjnej.</sub>
 
 </div>
 

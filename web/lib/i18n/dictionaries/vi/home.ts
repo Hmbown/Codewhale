@@ -1,71 +1,84 @@
 import type { HomeDict } from "../types";
 
-/**
- * Vietnamese home dictionary — native copy for the whale-road landing page,
- * in the current direction: your models, more capable together; agents
- * and control on your own machine; availability stated per surface as it
- * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
- * Auto-Review / Full Access, Codewhale, TUI, codewhale exec, Fleet).
- */
+/** Vietnamese home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale: tác tử lập trình mã nguồn mở cho mọi mô hình",
+  metaTitle: "Codewhale: xây dựng với mô hình và công cụ của bạn",
   metaDescription:
-    "Codewhale là tác tử lập trình mã nguồn mở dành cho terminal. Codewhale đọc dự án, chỉnh sửa tệp và chạy kiểm thử bằng mô hình chạy trên máy chủ hoặc cục bộ mà bạn chọn.",
-  heroTitle: "Tác tử lập trình mã nguồn mở cho mọi mô hình",
+    "Tạo ứng dụng, tự động hóa quy trình và làm việc với công cụ đã kết nối bằng Codewhale. Mã nguồn mở, dùng API mô hình của bạn hoặc suy luận cục bộ và tự lưu trữ.",
+  heroTitle: "Biến điều bạn nghĩ thành sản phẩm.",
   heroIntro:
-    "{brand} đọc dự án, chỉnh sửa tệp và chạy kiểm thử của bạn ngay từ terminal. Hãy kết nối một mô hình chạy trên máy chủ hoặc cục bộ, rồi chọn những thao tác cần bạn phê duyệt.",
+    "Tạo ứng dụng, tự động hóa quy trình hoặc biến tài liệu nghiên cứu thành kết quả hữu ích. {brand} làm việc với API mô hình bạn đang dùng, hạ tầng suy luận riêng và các công cụ bạn kết nối.",
   getCodewhale: "Cài đặt Codewhale",
   heroInstallAria: "Lệnh cài đặt",
-  exploreProduct: "Xem cách hoạt động",
+  exploreProduct: "Khám phá Codewhale",
   shotPreview: "Xem trước terminal",
-  shotBuild: "bản phát triển v{version}",
   screenshotAlt:
-    "Bản phát triển Codewhale v{version}: dấu cá voi, phiên mới, ô nhập tin nhắn, quyền Ask, chế độ Work và trạng thái mô hình. Hiển thị từ đầu ra thực của một terminal biệt lập.",
+    "Codewhale v{version}: ảnh chụp terminal với cuộc trò chuyện, ô nhập tin nhắn và điều khiển phiên.",
   latestRelease: "Bản phát hành mới nhất {tag}",
   releaseUnavailable: "Không có trạng thái phát hành",
   currentSource: "Mã nguồn",
   sourceCandidate: "Chưa phát hành",
   publishedRelease: "đã phát hành",
-  figcaptionSourceCandidate: "chưa phát hành",
-  chapterTerminal: "Terminal của bạn",
-  chapterTerminalTitle: "Theo dõi từng chỉnh sửa và lệnh khi chạy",
-  gainHeading: "Giao tác vụ và vẫn giữ quyền kiểm soát",
+  gainHeading: "Tạo ra điều hữu ích.",
   gainLede:
-    "Hãy yêu cầu một kết quả: sửa lỗi, giải thích một module hoặc tự động hóa một tác vụ bạn thường lặp lại. Bắt đầu với một tác tử, rồi thêm tác tử khi công việc lớn hơn.",
+    "Bắt đầu từ kết quả bạn muốn. Codewhale làm việc với tệp, lệnh và công cụ đã kết nối; bạn quyết định quyền truy cập và phê duyệt.",
   gain: [
     [
-      "Thay đổi mã và kiểm tra",
-      "Tác tử xem xét dự án, chỉnh sửa tệp và chạy kiểm thử của bạn. Bạn theo dõi từng chỉnh sửa và kết quả lệnh trong khi tác tử làm việc."
+      "Tạo ứng dụng và công cụ",
+      "Biến ý tưởng thành ứng dụng chạy được, script hữu ích hoặc tính năng trong dự án có sẵn. Để tác tử cùng bạn viết, chạy và kiểm thử."
     ],
     [
-      "Tự động hóa công việc lặp lại",
-      "Chạy codewhale exec từ script và CI. Dùng Fleet để chia một công việc lớn cho nhiều tác tử."
+      "Tự động hóa việc lặp lại",
+      "Biến tác vụ định kỳ thành quy trình chạy từ terminal, script hoặc CI. Dùng đội tác tử Fleet khi công việc có thể chạy song song."
     ],
     [
-      "Giữ quyền kiểm soát",
-      "Đặt quyền trước khi bắt đầu, trả lời các yêu cầu phê duyệt và dừng tác vụ bất cứ lúc nào. Chạy /receipts để liệt kê mọi tệp, lệnh và phê duyệt trong một phiên."
+      "Kết nối công cụ bạn dùng",
+      "Kết nối công cụ như Gmail và Slack qua plugin, máy chủ MCP hoặc API. Làm việc với các dịch vụ đó cùng tệp và lệnh của bạn."
     ]
   ],
+  exampleTasks: [
+    "Tạo một ứng dụng đặt lịch hẹn.",
+    "Biến CSV bán hàng thành báo cáo hằng tuần có thể tạo lại.",
+    "Biến thư trong email đã kết nối của tôi thành danh sách việc cần làm.",
+  ],
+  // A static example report built from local sample orders.
+  reportTitle: "Báo cáo doanh số hằng tuần",
+  reportSampleLabel: "Báo cáo minh họa · dữ liệu mẫu",
+  reportDescription: "Yêu cầu Codewhale nhóm đơn hàng theo tuần và lưu quy trình để dùng với tệp CSV tiếp theo.",
+  reportSourceLabel: "Dữ liệu đầu vào:",
+  reportColumns: ["Đầu tuần","Đơn hàng","Doanh số (USD)"],
+  reportTotalLabel: "Tổng",
+  reportTrend: "Thay đổi doanh số từ tuần đầu đến tuần cuối: {change}.",
+  reportDownloadLabel: "Tải báo cáo CSV",
   chapterModels: "Mô hình của bạn",
-  modelsHeading: "Chọn mô hình cho từng tác vụ",
+  modelsHeading: "Tiếp tục dùng mô hình bạn chọn.",
   modelsBody:
-    "Với mỗi phiên, hãy chọn một nhà cung cấp tích hợp sẵn, một endpoint tương thích OpenAI bất kỳ hoặc một mô hình cục bộ. Kết nối mô hình của bạn luôn tách biệt với tài khoản Codewhale.",
+    "Kết nối API mô hình bạn đang trả phí, dùng gateway tương thích hoặc chạy suy luận trên phần cứng riêng. Chọn mô hình cho từng phiên và từng tác tử trong Fleet.",
   modelsFacts: [
-    ["Hosted", "Khóa API của bạn, lưu bằng codewhale auth set --provider <id>"],
-    ["Gateway", "Một endpoint cho nhiều mô hình; bạn vẫn chọn nhà cung cấp"],
-    ["Cục bộ", "vLLM, SGLang hoặc Ollama trên localhost, thường không cần khóa"],
+    [
+      "Tài khoản API của bạn",
+      "Kết nối OpenAI, Anthropic, Google hoặc DeepSeek bằng khóa riêng."
+    ],
+    [
+      "Gateway của bạn",
+      "Dùng endpoint tương thích OpenAI và chọn mô hình nó cung cấp."
+    ],
+    [
+      "Suy luận của bạn",
+      "Chạy mô hình cục bộ hoặc tự lưu trữ bằng Ollama, vLLM hoặc SGLang."
+    ]
   ],
   modelsLink: "Xem mô hình và nhà cung cấp",
-  startHeading: "Cài đặt, kết nối mô hình, chạy tác vụ",
+  startHeading: "Mang theo tác vụ. Bắt đầu thôi.",
   startLede:
-    "Chạy tác vụ đầu tiên trong ba bước từ thư mục dự án của bạn. Hãy thêm Fleet sau nếu công việc cần nhiều tác tử.",
+    "Cài Codewhale, kết nối mô hình và giao một việc đáng làm. Bắt đầu với một tác tử; thêm công cụ hoặc đội khi cần.",
   startGuideLink: "Làm theo hướng dẫn bắt đầu",
   startVocabularyLink: "Xem thuật ngữ sản phẩm",
   chapterAvailability: "Chạy ở đâu",
-  availabilityHeading: "Dùng ngay trong terminal của bạn",
+  availabilityHeading: "Bắt đầu trong terminal.",
   availabilityLede:
-    "Bạn có thể dùng terminal, client trình duyệt cục bộ hoặc CodeWhale GUI của cộng đồng ngay bây giờ. Ứng dụng desktop và ứng dụng web lưu trữ trực tuyến đang được xây dựng lại đều đang phát triển và dùng chung một mô hình phiên.",
+    "Terminal và client trình duyệt cục bộ đã có sẵn. Ứng dụng desktop gốc và ứng dụng web lưu trữ trực tuyến đang được phát triển.",
   availability: [
     [
       "Terminal và trình duyệt cục bộ",
@@ -95,15 +108,30 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Terminal, trình duyệt cục bộ và GUI không cần tài khoản Codewhale. Web lưu trữ trực tuyến và desktop dùng tài khoản, nhưng tài khoản không thay thế kết nối mô hình của bạn; nhà cung cấp tính phí mức sử dụng trên khóa của riêng bạn.",
+    "Terminal, trình duyệt cục bộ và GUI không cần tài khoản Codewhale. Web lưu trữ trực tuyến và ứng dụng desktop dùng tài khoản. Khi bạn dùng khóa riêng của mình từ nhà cung cấp, nhà cung cấp đó tính phí phần sử dụng này.",
   accountLink: "Tạo tài khoản",
-  surfacesHeading: "Mở rộng phạm vi mà tác tử có thể tiếp cận",
+  surfacesHeading: "Một tác vụ. Tệp, ứng dụng và tác tử của bạn.",
   surfaces: [
-    ["Tệp và lệnh", "Đọc dự án, chỉnh sửa tệp, chạy kiểm thử và xem đầu ra trong phạm vi quyền bạn đặt."],
-    ["Plugin và MCP", "Kết nối thêm công cụ và dịch vụ. Mỗi plugin luôn tắt cho đến khi bạn xem xét và bật plugin đó."],
-    ["Computer Use · xem trước", "Một plugin cho phép tác tử xem và điều khiển các ứng dụng khác. Bạn tự bật plugin này và cấp các quyền hệ thống mà plugin yêu cầu."],
-    ["Phiên đã lưu", "Giữ cuộc trò chuyện và kết quả công cụ cùng nhau, rồi tiếp tục thay vì bắt đầu lại. Trình duyệt cục bộ mở cùng phiên đó trên máy tính của bạn."],
-    ["Fleet", "Giao các phần của một tác vụ cho các tác tử có mô hình và vai trò khác nhau, rồi theo dõi tiến độ của các tác tử đó."],
+    [
+      "Tệp và terminal",
+      "Tạo tệp, chạy lệnh, xem dữ liệu và kiểm thử sản phẩm. Bạn đặt thư mục làm việc và quyền truy cập."
+    ],
+    [
+      "Plugin và ứng dụng đã kết nối",
+      "Thêm kỹ năng và công cụ qua plugin và MCP. Xem xét và bật các kết nối bạn muốn tác tử sử dụng."
+    ],
+    [
+      "Trình duyệt và máy tính · xem trước",
+      "Dùng công cụ trình duyệt và plugin Computer Use để làm việc trong ứng dụng và website với quyền bạn cấp."
+    ],
+    [
+      "Phiên có thể tiếp tục",
+      "Giữ cuộc trò chuyện, kết quả công cụ và lịch sử công việc cùng nhau. Tiếp tục tác vụ trong terminal hoặc client trình duyệt cục bộ."
+    ],
+    [
+      "Đội tác tử",
+      "Dùng Fleet chia công việc lớn cho tác tử có vai trò và mô hình khác nhau, rồi theo dõi tiến độ ở một nơi."
+    ]
   ],
   runtimeLink: "Xem tất cả tích hợp",
   installBandHeading: "Cài đặt trên macOS hoặc Linux",
@@ -112,9 +140,9 @@ export const home: HomeDict = {
   binaries: "Bản nhị phân",
   chinaMirrors: "Mirror Trung Quốc",
   installGuideLink: "Đọc hướng dẫn cài đặt",
-  communityHeading: "Cùng chúng tôi xây dựng Codewhale",
+  communityHeading: "Biến Codewhale thành công cụ của bạn.",
   communityBody:
-    "Báo lỗi, đề xuất tính năng hoặc gửi pull request đầu tiên của bạn trên GitHub. Chúng tôi hoan nghênh các bản sửa nhỏ đã được kiểm thử.",
+    "Codewhale là mã nguồn mở. Đọc mã, tạo plugin, chia sẻ quy trình hoặc giúp cải thiện bản phát hành tiếp theo.",
   communityLinksAria: "Liên kết cộng đồng",
-  contribute: "Gửi pull request",
+  contribute: "Đóng góp trên GitHub",
 };

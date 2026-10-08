@@ -10,7 +10,7 @@
   position: sticky;
   z-index: 30;
   top: 0;
-  background: var(--ground), var(--bg);
+  background: var(--ground, var(--bg));
   background-attachment: fixed;
   background-repeat: no-repeat;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);

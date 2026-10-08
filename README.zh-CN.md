@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:004b3d422063 -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ Codewhale 会读取你的项目、编辑文件、运行命令并检查自己的�
 
 [English](README.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="一次 Codewhale 终端会话" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="一次 Codewhale 终端会话" width="760">
 
-<sub>全新安装后的真实终端截图——未经任何摆拍。</sub>
+<sub>已配置的本地演示会话中的真实 Codewhale 终端截图。</sub>
 
 </div>
 

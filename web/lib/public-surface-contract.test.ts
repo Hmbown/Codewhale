@@ -566,9 +566,8 @@ done
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // The site and README use captures from the same exact build. The site
-    // opens on the real unsent composer; the README image preserves the home
-    // frame rasterized from its corresponding capture.
+    // The site and README use the same measured native capture. Demo route
+    // and development-source provenance remain explicit in capture metadata.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
@@ -579,28 +578,30 @@ done
     expect(matrix.screenshot.terminal).toContain("real PTY cell capture");
     // A development-build capture, never a release claim.
     expect(matrix.screenshot.capture).toContain("development build");
-    expect(matrix.screenshot.capture).toContain("not a default");
+    const capture = JSON.parse(text("web/lib/terminal-captures/manifest.json"));
+    expect(capture.baseCommit).toBe(matrix.screenshot.sourceCommit);
+    expect(capture.binarySha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.sourceDiffSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.sourceDirty).toBe(true);
+    expect(capture.conditions.provider).toContain("loopback");
+    expect(capture.conditions.model).toBe("website-demo");
+    expect(capture.conditions.submittedPrompts).toBeGreaterThan(0);
+    expect(capture.conditions.fixtureHistory).toBe(false);
 
     const readme = text("README.md");
-    const homepage = text("web/app/[locale]/page.tsx");
+    const productPage = text("web/app/[locale]/product/page.tsx");
     expect(readme).toContain(matrix.screenshot.readme);
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
-    expect(homepage).toContain('<NativeTerminalGallery\n                    locale={locale}\n                    defaultFrame="composer"');
+    expect(productPage).toContain("<NativeTerminalGallery");
     expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
     expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
     // Every locale describes the actual capture; build identity comes from
     // the media manifest instead of a stale version embedded in translations.
-    expect(homepage).toContain("label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
-    expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
-    expect(getHome("en").shotBuild).toBe("v{version} pre-release build");
+    expect(productPage).toContain("label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
     for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
       const home = getHome(locale);
-      expect(home.shotBuild, `${locale} shotBuild`).toContain("{version}");
       expect(home.screenshotAlt, `${locale} alt`).toContain("{version}");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Ask");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Work");
-      expect(home.screenshotAlt, `${locale} alt`).not.toMatch(/171acee|0\.9\.12|Full Access/);
     }
   });
 

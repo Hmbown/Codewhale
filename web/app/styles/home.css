@@ -2,11 +2,9 @@
 /*  Home — paper above, sea below                                      */
 /* ------------------------------------------------------------------ */
 /*
- * Paper holds the promise and the install command. The live whale rests on
- * one horizon line where the paper meets the sea; the real terminal floats
- * in the deep water just under it. The reading sections return to paper,
- * and the page ends in the sea with the install command, which runs on into
- * the footer. Two sea moments, one horizon each; nothing else decorates.
+ * Paper holds the promise, illustrative task briefs and reading sections.
+ * The live whale stays beside the hero. The page ends in the sea with the
+ * install command, which runs on into the footer.
  */
 
 .home { --home-measure: 36rem; }
@@ -144,16 +142,6 @@
 .whale-live[data-ready] .whale-live-canvas { opacity: 1; }
 .whale-live[data-ready] .whale-live-poster { visibility: hidden; }
 
-/* ---------- the sea: the terminal ---------- */
-/* The tide: paper fades through light aqua into cobalt and the deep, like
-   the merch's Tide ombré (light at the top, navy at the hem). No hard edge;
-   the whale rests where the water begins, and the terminal floats in calm,
-   dark water below. */
-.home-terminal {
-  position: relative;
-  background: var(--tide), var(--ocean-floor);
-}
-
 /* The install band ends the page in the sea: one line of light at its top,
    and water that reaches the floor colour by its own bottom edge, so it runs
    into the footer without a seam. */
@@ -169,35 +157,99 @@
   background: var(--horizon-light);
 }
 
-.home-terminal-inner {
-  display: grid;
-  gap: var(--space-6);
-  width: min(var(--container), 64rem);
-  margin-inline: auto;
-  padding-block: clamp(9rem, 16vw, 13rem) clamp(4rem, 8vw, 6.5rem);
+/* ---------- paper: one worked example, with its data ---------- */
+.home-tasks {
+  background: var(--bg);
+  border-block-start: 1px solid var(--line);
+  padding-block: clamp(4.5rem, 9vw, 8rem) 0;
 }
-
-.home-terminal-title {
-  max-width: 22ch;
-  font-size: var(--text-section);
+.home-tasks-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr);
+  gap: var(--space-6) clamp(3rem, 6vw, 6rem);
+  inline-size: var(--container);
+  margin-inline: auto;
+}
+.home-task-intro {
+  min-inline-size: 0;
+  max-inline-size: 25rem;
+  padding-block-start: var(--space-5);
+}
+.home-task-heading {
+  font-size: clamp(2rem, 1.3rem + 2vw, 3rem);
   font-weight: 600;
   line-height: 1.1;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.03em;
   color: var(--text);
   text-wrap: balance;
+  hyphens: auto;
+  overflow-wrap: break-word;
 }
-
-.home-shot .figure-frame {
-  border: 0;
-  box-shadow:
-    0 0 0 1px rgb(var(--gpui-dark-primary-rgb) / 0.14),
-    0 40px 80px -40px rgb(0 0 0 / 0.75);
+.home-task-intro > p {
+  margin-block: var(--space-5);
+  color: var(--muted);
+  font-size: var(--text-body);
+  line-height: 1.65;
+  text-wrap: pretty;
 }
-.home-shot figcaption {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: var(--space-2) var(--space-4);
+.home-report {
+  min-inline-size: 0;
+  padding: clamp(1.25rem, 3vw, 2rem);
+  border-block-start: 2px solid var(--text);
+  background: var(--surface);
+}
+.home-report table { inline-size: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.home-report caption { padding-block-end: var(--space-5); text-align: start; }
+.home-report caption strong {
+  display: block;
+  color: var(--text);
+  font-size: 1.375rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.home-report caption span { display: block; margin-block-start: var(--space-2); color: var(--muted); font-size: var(--text-ui); }
+.home-report th,
+.home-report td { padding: 0.7rem 0.35rem; text-align: end; font-size: var(--text-ui); line-height: 1.4; }
+.home-report th:first-child { padding-inline-start: 0; text-align: start; }
+.home-report td:last-child,
+.home-report thead th:last-child { padding-inline-end: 0; }
+.home-report thead th { color: var(--muted); font-weight: 500; border-block-end: 1px solid var(--line); }
+.home-report tbody th { font-weight: 400; }
+.home-report tbody tr { border-block-end: 1px solid var(--line); }
+.home-report td { white-space: nowrap; }
+.home-report tfoot { border-block-start: 2px solid var(--text); }
+.home-report tfoot th,
+.home-report tfoot td { font-weight: 600; }
+.home-report-trend { margin-block: var(--space-4); color: var(--text); font-size: var(--text-ui); line-height: 1.6; }
+.home-report-source { margin-block-start: var(--space-4); color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
+.home-task-secondary {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-6) clamp(3rem, 6vw, 6rem);
+  padding-block-start: var(--space-6);
+  border-block-start: 1px solid var(--line);
+}
+.home-task-secondary h3 { color: var(--text); font-size: var(--text-body); font-weight: 600; line-height: 1.45; }
+.home-task-detail { margin-block-start: var(--space-3); color: var(--muted); font-size: var(--text-ui); line-height: 1.65; max-inline-size: 60ch; }
+.home-task-brief {
+  margin: var(--space-3) 0 0;
+  max-inline-size: 45ch;
+  color: var(--text);
+  font-size: 1.1875rem;
+  font-weight: 400;
+  line-height: 1.45;
+  hyphens: auto;
+  overflow-wrap: break-word;
+  text-wrap: pretty;
+}
+:lang(en) .home-task-heading,
+:lang(en) .home-task-brief { hyphens: none; }
+.home-release {
+  grid-column: 1 / -1;
+  padding-block-start: var(--space-5);
+  border-block-start: 1px solid var(--line);
+  font-size: var(--text-ui);
 }
 
 /* ---------- paper: the reading sections ---------- */
@@ -246,6 +298,12 @@
   .home-hero-copy { padding-bottom: var(--space-4); }
   .home-whale { justify-content: flex-end; }
   .home-whale .whale-live { --whale-size: clamp(14rem, 70vw, 20rem); margin-inline: auto; }
+  .home-tasks-inner { grid-template-columns: minmax(0, 1fr); }
+  .home-task-intro { max-inline-size: 36rem; padding-block-start: 0; }
+}
+
+@media (max-width: 600px) {
+  .home-task-secondary { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (forced-colors: active) {

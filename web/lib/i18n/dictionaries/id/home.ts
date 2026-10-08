@@ -1,72 +1,84 @@
 import type { HomeDict } from "../types";
 
-/**
- * Indonesian home dictionary — native copy for the whale-road landing page.
- * Translates the English reference in en/home.ts: an open-source coding
- * agent for any model, control you can check, and availability stated per
- * surface as it is today. Product vocabulary stays literal (Plan / Work /
- * Operate, Ask / Auto-Review / Full Access, Codewhale, codewhale exec,
- * Fleet, MCP, Runtime, /receipts).
- */
+/** Indonesian home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale: agen pemrograman sumber terbuka untuk model apa pun",
+  metaTitle: "Codewhale: berkarya dengan model dan alat pilihanmu",
   metaDescription:
-    "Codewhale adalah agen pemrograman sumber terbuka untuk terminal Anda. Codewhale membaca proyek Anda, mengedit berkas, dan menjalankan pengujian Anda dengan model yang dihosting atau lokal pilihan Anda.",
-  heroTitle: "Agen pemrograman sumber terbuka untuk model apa pun",
+    "Buat aplikasi, otomatisasikan alur kerja, dan gunakan alat terhubung dengan Codewhale. Sumber terbuka, dengan API model milikmu atau inferensi lokal dan mandiri.",
+  heroTitle: "Wujudkan apa yang kamu bayangkan.",
   heroIntro:
-    "{brand} membaca proyek Anda, mengedit berkas, dan menjalankan pengujian Anda dari terminal. Hubungkan model yang dihosting atau lokal, lalu pilih tindakan mana yang memerlukan persetujuan Anda.",
+    "Buat aplikasi, otomatisasikan alur kerja, atau ubah hasil riset menjadi sesuatu yang berguna. {brand} bekerja dengan API model yang sudah kamu gunakan, inferensimu sendiri, dan alat yang kamu hubungkan.",
   getCodewhale: "Instal Codewhale",
   heroInstallAria: "Perintah instalasi",
-  exploreProduct: "Lihat cara kerjanya",
+  exploreProduct: "Jelajahi Codewhale",
   shotPreview: "Pratinjau terminal",
-  shotBuild: "build pengembangan v{version}",
   screenshotAlt:
-    "Build pengembangan Codewhale v{version}: tanda paus, sesi baru, kolom pesan, izin Ask, mode Work, dan status model. Dirender dari keluaran nyata terminal terisolasi.",
+    "Codewhale v{version}: tangkapan terminal berisi percakapan, kolom pesan, dan kontrol sesi.",
   latestRelease: "Rilis terbaru {tag}",
   releaseUnavailable: "Status rilis tidak tersedia",
   currentSource: "Sumber",
   sourceCandidate: "Belum dirilis",
   publishedRelease: "dirilis",
-  figcaptionSourceCandidate: "belum dirilis",
-  chapterTerminal: "Terminal Anda",
-  chapterTerminalTitle: "Ikuti setiap editan dan perintah saat dijalankan",
-  gainHeading: "Delegasikan tugas dan tetap memegang kendali",
+  gainHeading: "Buat sesuatu yang berguna.",
   gainLede:
-    "Minta sebuah hasil: memperbaiki bug, menjelaskan modul, atau mengotomatisasikan tugas yang sering Anda ulangi. Mulai dengan satu agen, lalu tambahkan agen lain saat pekerjaan bertambah besar.",
+    "Mulai dari hasil yang kamu inginkan. Codewhale bekerja dengan berkas, perintah, dan alat terhubung; kamu menentukan akses dan persetujuannya.",
   gain: [
     [
-      "Ubah kode dan periksa hasilnya",
-      "Agen memeriksa proyek Anda, mengedit berkas, dan menjalankan pengujian Anda. Ikuti setiap editan dan hasil perintah selama agen bekerja."
+      "Buat aplikasi dan alat",
+      "Ubah ide menjadi aplikasi yang berjalan, skrip berguna, atau fitur dalam proyek yang ada. Biarkan agen menulis, menjalankan, dan menguji bersamamu."
     ],
     [
-      "Otomatisasikan pekerjaan berulang",
-      "Jalankan codewhale exec dari skrip dan CI. Gunakan Fleet untuk membagi pekerjaan yang lebih besar ke beberapa agen."
+      "Otomatiskan pekerjaan berulang",
+      "Ubah tugas berulang menjadi alur kerja dari terminal, skrip, atau CI. Gunakan tim agen Fleet saat pekerjaan bisa berjalan paralel."
     ],
     [
-      "Tetap memegang kendali",
-      "Atur izin sebelum pekerjaan dimulai, jawab permintaan persetujuan, dan hentikan tugas kapan saja. Jalankan /receipts untuk menampilkan setiap berkas, perintah, dan persetujuan dalam satu sesi."
+      "Hubungkan alat yang kamu pakai",
+      "Hubungkan alat seperti Gmail dan Slack melalui plugin, server MCP, atau API. Gunakan layanan tersebut bersama berkas dan perintahmu."
     ]
   ],
+  exampleTasks: [
+    "Buat aplikasi untuk membuat janji temu.",
+    "Ubah CSV penjualan menjadi laporan mingguan yang bisa saya buat ulang.",
+    "Ubah pesan dari email saya yang sudah terhubung menjadi daftar tindakan.",
+  ],
+  // A static example report built from local sample orders.
+  reportTitle: "Laporan penjualan mingguan",
+  reportSampleLabel: "Contoh laporan · data sampel",
+  reportDescription: "Minta Codewhale mengelompokkan pesanan per minggu dan menyimpan prosesnya untuk CSV berikutnya.",
+  reportSourceLabel: "Data masukan:",
+  reportColumns: ["Awal minggu","Pesanan","Penjualan (USD)"],
+  reportTotalLabel: "Jumlah",
+  reportTrend: "Perubahan penjualan dari minggu pertama ke minggu terakhir: {change}.",
+  reportDownloadLabel: "Unduh laporan CSV",
   chapterModels: "Model Anda",
-  modelsHeading: "Pilih model untuk setiap tugas",
+  modelsHeading: "Tetap gunakan model pilihanmu.",
   modelsBody:
-    "Untuk setiap sesi, pilih penyedia bawaan, endpoint apa pun yang kompatibel dengan OpenAI, atau model lokal. Koneksi model Anda tetap terpisah dari akun Codewhale mana pun.",
+    "Hubungkan API model yang sudah kamu bayar, gunakan gateway yang kompatibel, atau jalankan inferensi di perangkat kerasmu. Pilih model per sesi dan untuk setiap agen dalam Fleet.",
   modelsFacts: [
-    ["Hosted", "Kunci API Anda sendiri, disimpan dengan codewhale auth set --provider <id>"],
-    ["Gateway", "Satu endpoint untuk banyak model; Anda tetap memilih penyedianya"],
-    ["Lokal", "vLLM, SGLang, atau Ollama di localhost, biasanya tanpa kunci"],
+    [
+      "Akun API milikmu",
+      "Hubungkan OpenAI, Anthropic, Google, atau DeepSeek dengan kuncimu sendiri."
+    ],
+    [
+      "Gateway milikmu",
+      "Gunakan endpoint yang kompatibel dengan OpenAI dan pilih model yang disediakannya."
+    ],
+    [
+      "Inferensi milikmu",
+      "Jalankan model lokal atau yang dihosting sendiri dengan Ollama, vLLM, atau SGLang."
+    ]
   ],
   modelsLink: "Lihat model dan penyedia",
-  startHeading: "Instal, hubungkan model, jalankan tugas",
+  startHeading: "Bawa tugasmu. Mulai bekerja.",
   startLede:
-    "Jalankan tugas pertama Anda dalam tiga langkah dari folder proyek Anda. Tambahkan Fleet nanti jika pekerjaan memerlukan beberapa agen.",
+    "Pasang Codewhale, hubungkan model, dan beri pekerjaan yang berguna. Mulai dengan satu agen; tambahkan alat atau tim saat diperlukan.",
   startGuideLink: "Ikuti panduan memulai",
   startVocabularyLink: "Lihat kosakata produk",
   chapterAvailability: "Tempat menjalankan",
-  availabilityHeading: "Gunakan di terminal Anda hari ini",
+  availabilityHeading: "Mulai dari terminal.",
   availabilityLede:
-    "Gunakan terminal, klien peramban lokal, atau CodeWhale GUI dari komunitas sekarang. Aplikasi desktop dan aplikasi web hosted yang dibangun ulang sedang dikembangkan dan berbagi model sesi yang sama.",
+    "Terminal dan klien peramban lokal sudah tersedia. Aplikasi desktop native dan aplikasi web yang dihosting sedang dikembangkan ulang.",
   availability: [
     [
       "Terminal dan peramban lokal",
@@ -96,15 +108,30 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Terminal, peramban lokal, dan GUI tidak memerlukan akun Codewhale. Web hosted dan desktop menggunakan akun, yang tidak menggantikan koneksi model Anda; penyedia Anda menagih penggunaan dengan kunci Anda sendiri.",
+    "Terminal, peramban lokal, dan GUI tidak memerlukan akun Codewhale. Web hosted dan aplikasi desktop menggunakan akun. Jika Anda memakai kunci penyedia milik Anda sendiri, penyedia tersebut menagih penggunaan itu.",
   accountLink: "Buat akun",
-  surfacesHeading: "Perluas jangkauan agen",
+  surfacesHeading: "Satu tugas. Berkas, aplikasi, dan agenmu.",
   surfaces: [
-    ["Berkas dan perintah", "Baca proyek, edit berkas, jalankan pengujian, dan periksa keluaran sesuai izin yang Anda tetapkan."],
-    ["Plugin dan MCP", "Hubungkan lebih banyak alat dan layanan. Setiap plugin tetap nonaktif sampai Anda meninjau dan mengaktifkannya."],
-    ["Computer Use · pratinjau", "Plugin yang memungkinkan agen melihat dan mengoperasikan aplikasi lain. Anda yang mengaktifkannya dan memberikan izin sistem yang dimintanya."],
-    ["Sesi tersimpan", "Simpan percakapan dan hasil alat bersama-sama, lalu lanjutkan pekerjaan tanpa mulai dari awal. Peramban lokal membuka sesi yang sama di komputer Anda."],
-    ["Fleet", "Tugaskan bagian-bagian tugas ke agen dengan model dan peran yang berbeda, lalu ikuti kemajuannya."],
+    [
+      "Berkas dan terminal",
+      "Buat berkas, jalankan perintah, periksa data, dan uji hasilmu. Kamu menentukan folder kerja dan izin."
+    ],
+    [
+      "Plugin dan aplikasi terhubung",
+      "Tambahkan keterampilan dan alat melalui plugin dan MCP. Tinjau dan aktifkan koneksi yang boleh digunakan agen."
+    ],
+    [
+      "Peramban dan komputer · pratinjau",
+      "Gunakan alat peramban dan plugin Computer Use untuk bekerja di aplikasi dan situs dengan akses yang kamu berikan."
+    ],
+    [
+      "Sesi yang bisa dilanjutkan",
+      "Simpan percakapan, hasil alat, dan riwayat kerja bersama. Lanjutkan tugas di terminal atau klien peramban lokal."
+    ],
+    [
+      "Tim agen",
+      "Gunakan Fleet untuk membagi pekerjaan besar ke agen dengan peran dan model berbeda, lalu ikuti kemajuannya di satu tempat."
+    ]
   ],
   runtimeLink: "Lihat semua integrasi",
   installBandHeading: "Instal di macOS atau Linux",
@@ -113,9 +140,9 @@ export const home: HomeDict = {
   binaries: "Biner",
   chinaMirrors: "Mirror Tiongkok",
   installGuideLink: "Baca panduan instalasi",
-  communityHeading: "Bangun Codewhale bersama kami",
+  communityHeading: "Jadikan Codewhale milikmu.",
   communityBody:
-    "Laporkan bug, usulkan fitur, atau kirim pull request pertama Anda di GitHub. Kami menyambut perbaikan kecil yang sudah diuji.",
+    "Codewhale bersumber terbuka. Baca kodenya, buat plugin, bagikan alur kerja, atau bantu memperbaiki rilis berikutnya.",
   communityLinksAria: "Tautan komunitas",
-  contribute: "Kirim pull request",
+  contribute: "Berkontribusi di GitHub",
 };

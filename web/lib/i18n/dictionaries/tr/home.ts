@@ -1,72 +1,85 @@
 import type { HomeDict } from "../types";
 
-/**
- * Turkish home dictionary — native copy for the whale-road landing page,
- * in the current direction: your models, more capable together; agents
- * and control on your own machine; availability stated per surface as it
- * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
- * Auto-Review / Full Access, Codewhale, TUI, codewhale exec, Fleet).
- */
+/** Turkish home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale: her model için açık kaynaklı kodlama ajanı",
+  metaTitle: "Codewhale: kendi modellerin ve araçlarınla geliştir",
   metaDescription:
-    "Codewhale, terminalin için açık kaynaklı bir kodlama ajanıdır. Projeni okur, dosyaları düzenler ve testlerini seçtiğin barındırılan veya yerel modelle çalıştırır.",
-  heroTitle: "Her model için açık kaynaklı kodlama ajanı",
+    "Codewhale ile uygulamalar geliştir, iş akışlarını otomatikleştir ve bağlı araçlarla çalış. Açık kaynak; kendi model API’lerin, yerel veya kendi barındırdığın çıkarımla.",
+  heroTitle: "Aklındakini hayata geçir.",
   heroIntro:
-    "{brand}, terminalinde projeni okur, dosyaları düzenler ve testlerini çalıştırır. Barındırılan veya yerel bir model bağla ve hangi eylemlerin senin onayını gerektireceğini seç.",
+    "Bir uygulama geliştir, bir iş akışını otomatikleştir veya araştırmalarını faydalı bir sonuca dönüştür. {brand}, kullandığın model API’leri, kendi çıkarımın ve bağladığın araçlarla çalışır.",
   getCodewhale: "Codewhale'i kur",
   heroInstallAria: "Kurulum komutu",
-  exploreProduct: "Nasıl çalıştığını gör",
+  exploreProduct: "Codewhale’i keşfet",
   shotPreview: "Terminal önizlemesi",
-  shotBuild: "v{version} geliştirme derlemesi",
   screenshotAlt:
-    "Codewhale v{version} geliştirme derlemesi: balina, yeni oturum, mesaj alanı, Ask izinleri, Work modu ve model durumu. Yalıtılmış bir terminalin gerçek çıktısından oluşturulmuştur.",
+    "Codewhale v{version}: sohbeti, mesaj alanını ve oturum kontrollerini gösteren terminal kaydı.",
   latestRelease: "En yeni sürüm {tag}",
   releaseUnavailable: "Sürüm durumu kullanılamıyor",
   currentSource: "Kaynak",
   sourceCandidate: "Yayımlanmadı",
   publishedRelease: "yayımlandı",
-  figcaptionSourceCandidate: "yayımlanmadı",
-  chapterTerminal: "Senin terminalin",
-  chapterTerminalTitle: "Her düzenlemeyi ve komutu çalışırken takip et",
   gainHeading:
-    "Görevi devret ve kontrolü elinde tut",
+    "Faydalı bir şey üret.",
   gainLede:
-    "Bir sonuç iste: bir hatanın düzeltilmesi, bir modülün açıklanması veya tekrarladığın bir görevin otomatikleştirilmesi. Tek bir ajanla başla ve iş büyüdükçe daha fazla ajan ekle.",
+    "İstediğin sonuçla başla. Codewhale dosyalar, komutlar ve bağlı araçlarla çalışır; erişimi ve onayları sen belirlersin.",
   gain: [
     [
-      "Kodu değiştir ve kontrol et",
-      "Ajan projeni inceler, dosyaları düzenler ve testlerini çalıştırır. Ajan çalışırken her düzenlemeyi ve komut sonucunu takip et."
+      "Uygulamalar ve araçlar geliştir",
+      "Bir fikri çalışan uygulamaya, faydalı bir betiğe veya mevcut projede yeni bir özelliğe dönüştür. Ajan seninle birlikte yazsın, çalıştırsın ve test etsin."
     ],
     [
       "Tekrarlanan işleri otomatikleştir",
-      "Betiklerden ve CI'dan codewhale exec komutunu çalıştır. Daha büyük bir işi birkaç ajan arasında bölmek için bir Fleet kullan."
+      "Tekrarlanan bir görevi terminalden, betiklerden veya CI’dan çalıştırılan iş akışına dönüştür. İş paralel yürüyebiliyorsa Fleet ile ajan ekibi kullan."
     ],
     [
-      "Kontrolü elinde tut",
-      "Çalışma başlamadan izinleri ayarla, onay isteklerini yanıtla ve bir görevi istediğin anda durdur. Bir oturumdaki her dosyayı, komutu ve onayı listelemek için /receipts komutunu çalıştır."
+      "Kullandığın araçları bağla",
+      "Gmail ve Slack gibi araçları eklentiler, MCP sunucuları veya API’lerle bağla. Bu hizmetlerle dosya ve komutlarını aynı görevde kullan."
     ]
   ],
+  exampleTasks: [
+    "Randevu rezervasyonu için bir uygulama yap.",
+    "Satış CSV’sini tekrar oluşturabileceğim bir haftalık rapora dönüştür.",
+    "Bağlı e-posta hesabımdaki iletileri bir yapılacaklar listesine dönüştür.",
+  ],
+  // A static example report built from local sample orders.
+  reportTitle: "Haftalık satış raporu",
+  reportSampleLabel: "Örnek rapor · örnek veriler",
+  reportDescription: "Codewhale’den siparişleri haftalara göre gruplamasını ve işlemi sonraki CSV için kaydetmesini isteyin.",
+  reportSourceLabel: "Girdi verileri:",
+  reportColumns: ["Hafta başlangıcı","Siparişler","Satışlar (USD)"],
+  reportTotalLabel: "Toplam",
+  reportTrend: "İlk haftadan son haftaya satış değişimi: {change}.",
+  reportDownloadLabel: "CSV raporunu indir",
   chapterModels: "Senin modellerin",
-  modelsHeading: "Her görev için bir model seç",
+  modelsHeading: "Kendi modellerini kullanmaya devam et.",
   modelsBody:
-    "Her oturum için yerleşik bir sağlayıcı, OpenAI uyumlu herhangi bir uç nokta veya yerel bir model seç. Model bağlantın, herhangi bir Codewhale hesabından ayrı kalır.",
+    "Zaten ödeme yaptığın model API’lerini bağla, uyumlu bir ağ geçidi kullan veya kendi donanımında çıkarım çalıştır. Her oturum ve Fleet içindeki her ajan için model seç.",
   modelsFacts: [
-    ["Barındırılan", "codewhale auth set --provider <id> ile kaydedilen kendi API anahtarın"],
-    ["Gateway", "Birçok model için tek uç nokta; sağlayıcıyı yine sen seçersin"],
-    ["Yerel", "localhost üzerinde vLLM, SGLang veya Ollama, genellikle anahtarsız"],
+    [
+      "API hesapların",
+      "OpenAI, Anthropic, Google veya DeepSeek’i kendi anahtarlarınla bağla."
+    ],
+    [
+      "Ağ geçidin",
+      "OpenAI uyumlu bir uç nokta kullan ve sunduğu modelleri seç."
+    ],
+    [
+      "Kendi çıkarımın",
+      "Ollama, vLLM veya SGLang ile yerel ya da kendi barındırdığın modelleri çalıştır."
+    ]
   ],
   modelsLink: "Modellere ve sağlayıcılara göz at",
-  startHeading: "Kur, bir model bağla, bir görev çalıştır",
+  startHeading: "Bir görev getir. Başla.",
   startLede:
-    "Proje klasöründen üç adımda ilk görevini çalıştır. İş birkaç ajan gerektirirse daha sonra bir Fleet ekle.",
+    "Codewhale’i kur, bir model bağla ve ona yapmaya değer bir iş ver. Bir ajanla başla; gerektiğinde araçlar veya bir ekip ekle.",
   startGuideLink: "Başlangıç kılavuzunu takip et",
   startVocabularyLink: "Ürün sözlüğünü gör",
   chapterAvailability: "Nerede çalışır",
-  availabilityHeading: "Codewhale'i bugün terminalinde kullan",
+  availabilityHeading: "Terminalden başla.",
   availabilityLede:
-    "Terminali, yerel tarayıcı istemcisini veya topluluk tarafından sürdürülen CodeWhale GUI'yi şimdi kullanabilirsin. Masaüstü uygulaması ve yeniden yapılan barındırılan web uygulaması geliştirme aşamasında ve aynı oturum modelini paylaşıyor.",
+    "Terminal ve yerel tarayıcı istemcisi hazır. Yerel masaüstü uygulaması ve yeniden kurulan barındırılmış web uygulaması geliştiriliyor.",
   availability: [
     [
       "Terminal ve yerel tarayıcı",
@@ -96,15 +109,30 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Terminal, yerel tarayıcı ve GUI için Codewhale hesabı gerekmez. Barındırılan web ve masaüstü bir hesap kullanır ve bu hesap model bağlantının yerini almaz; kendi anahtarınla yapılan kullanımı sağlayıcın faturalandırır.",
+    "Terminal, yerel tarayıcı ve GUI için Codewhale hesabı gerekmez. Barındırılan web ve masaüstü uygulaması bir hesap kullanır. Kendi sağlayıcı anahtarını kullanırsan, bu kullanımı sağlayıcın faturalandırır.",
   accountLink: "Hesap oluştur",
-  surfacesHeading: "Ajanın erişebildiği alanı genişlet",
+  surfacesHeading: "Tek görev. Dosyaların, uygulamaların ve ajanların.",
   surfaces: [
-    ["Dosyalar ve komutlar", "Belirlediğin izinler dahilinde projeyi oku, dosyaları düzenle, testleri çalıştır ve çıktıyı incele."],
-    ["Eklentiler ve MCP", "Daha fazla araç ve hizmet bağla. Her eklenti, sen inceleyip etkinleştirene kadar kapalı kalır."],
-    ["Computer Use · önizleme", "Ajanın diğer uygulamaları görmesini ve kullanmasını sağlayan bir eklenti. Eklentiyi sen etkinleştirir ve istediği sistem izinlerini verirsin."],
-    ["Kayıtlı oturumlar", "Sohbeti ve araç sonuçlarını bir arada tut ve baştan başlamak yerine kaldığın yerden devam et. Yerel tarayıcı, bilgisayarındaki aynı oturumu açar."],
-    ["Fleet", "Bir görevin parçalarını farklı modellere ve rollere sahip ajanlara ata, ardından ilerlemelerini takip et."],
+    [
+      "Dosyalar ve terminal",
+      "Dosya oluştur, komut çalıştır, verileri incele ve geliştirdiklerini test et. Çalışma klasörünü ve izinleri sen belirlersin."
+    ],
+    [
+      "Eklentiler ve bağlı uygulamalar",
+      "Eklentiler ve MCP ile beceriler ve araçlar ekle. Ajanın kullanmasını istediğin bağlantıları incele ve etkinleştir."
+    ],
+    [
+      "Tarayıcı ve bilgisayar · önizleme",
+      "Verdiğin erişim kapsamında uygulama ve sitelerde tarayıcı araçları ve Computer Use eklentisiyle çalış."
+    ],
+    [
+      "Devam edebileceğin oturumlar",
+      "Sohbeti, araç sonuçlarını ve çalışma geçmişini bir arada tut. Görevi terminalde veya yerel tarayıcı istemcisinde sürdür."
+    ],
+    [
+      "Ajan ekipleri",
+      "Büyük bir işi Fleet ile farklı rol ve modellerdeki ajanlara böl, ilerlemelerini tek yerde izle."
+    ]
   ],
   runtimeLink: "Tüm entegrasyonları gör",
   installBandHeading: "macOS veya Linux üzerine kur",
@@ -113,9 +141,9 @@ export const home: HomeDict = {
   binaries: "İkililer",
   chinaMirrors: "Çin yansıları",
   installGuideLink: "Kurulum kılavuzunu oku",
-  communityHeading: "Codewhale'i bizimle birlikte geliştir",
+  communityHeading: "Codewhale’i kendine göre şekillendir.",
   communityBody:
-    "GitHub'da bir hata bildir, bir özellik öner veya ilk pull request'ini gönder. Küçük ve test edilmiş düzeltmeler memnuniyetle karşılanır.",
+    "Codewhale açık kaynak. Kodu oku, bir eklenti geliştir, iş akışı paylaş veya sonraki sürümü iyileştirmeye yardım et.",
   communityLinksAria: "Topluluk bağlantıları",
-  contribute: "Pull request gönder",
+  contribute: "GitHub’da katkıda bulun",
 };

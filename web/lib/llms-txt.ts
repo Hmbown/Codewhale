@@ -95,7 +95,7 @@ export function buildLlmsTxt(): string {
     "",
     `> ${IDENTITY_PHRASE}`,
     "",
-    `${SITE_NAME} is a terminal-native coding agent for hosted and local models.`,
+    `${SITE_NAME} is an open-source agent for building apps and tools, automating workflows, and working across connected services through plugins, MCP servers or APIs. Use your existing model APIs or local and self-hosted inference.`,
     `Official site: ${SITE_URL}`,
     `Source: ${REPO_URL}`,
     "",

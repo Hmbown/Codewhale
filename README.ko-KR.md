@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:004b3d422063 -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -22,9 +22,9 @@ Codewhale은 프로젝트를 읽고, 파일을 편집하고, 명령을 실행하
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Codewhale 터미널 세션" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Codewhale 터미널 세션" width="760">
 
-<sub>새로 설치한 환경에서 캡처한 실제 터미널 화면입니다. 연출된 출력은 없습니다.</sub>
+<sub>설정된 로컬 데모 세션에서 캡처한 실제 Codewhale 터미널 화면입니다.</sub>
 
 </div>
 

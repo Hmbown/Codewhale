@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:004b3d422063 -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ pròpia feina — al teu terminal, amb un model allotjat o local que tu tries.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Una sessió de terminal de Codewhale" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Una sessió de terminal de Codewhale" width="760">
 
-<sub>Captura real del terminal en una instal·lació nova — sense sortida preparada.</sub>
+<sub>Captura real del terminal de Codewhale en una sessió de demostració local configurada.</sub>
 
 </div>
 

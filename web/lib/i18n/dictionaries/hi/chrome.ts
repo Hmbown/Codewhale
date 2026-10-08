@@ -48,7 +48,7 @@ export const chrome: ChromeDict = {
   themeTitle: "थीम · ऑटो / लाइट / डार्क",
 
   footerTagline:
-    "अपनी पसंद के मॉडल से कोड संपादित करें, टेस्ट चलाएँ और बदलावों की समीक्षा करें।",
+    "अपने मॉडल और जुड़े टूल से ऐप बनाएं और काम स्वचालित करें।",
   footerProduct: "उत्पाद",
   footerProject: "प्रोजेक्ट",
   footerDocs: "दस्तावेज़ीकरण",

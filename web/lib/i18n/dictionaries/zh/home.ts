@@ -1,68 +1,81 @@
 import type { HomeDict } from "../types";
 
-/**
- * Simplified Chinese home dictionary — native copy for the whale-road landing page,
- * in the current direction: your models, more capable together; agents
- * and control on your own machine; availability stated per surface as it
- * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
- * Auto-Review / Full Access, Codewhale, TUI, codewhale exec, Fleet).
- */
+/** Simplified Chinese home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale：适用于任意模型的开源编程智能体",
+  metaTitle: "Codewhale：用自己的模型和工具，把想法做出来",
   metaDescription:
-    "Codewhale 是一个在终端中运行的开源编程智能体。它使用你选择的云端或本地模型，读取项目、编辑文件并运行测试。",
-  heroTitle: "适用于任意模型的开源编程智能体",
+    "用 Codewhale 构建应用、自动处理工作，并连接你常用的工具。开源，支持你已有的模型 API、本地模型和自托管推理服务。",
+  heroTitle: "把你想做的，做出来。",
   heroIntro:
-    "{brand} 在终端中读取你的项目、编辑文件并运行测试。连接云端或本地模型，并决定哪些操作需要你批准。",
+    "做一个应用，让一项工作自动完成，或把一堆研究资料变成有用的成果。{brand} 连接你已有的模型 API、自己的推理服务，以及你选择的工具。",
   getCodewhale: "安装 Codewhale",
   heroInstallAria: "安装命令",
-  exploreProduct: "了解工作方式",
+  exploreProduct: "探索 Codewhale",
   shotPreview: "终端预览",
-  shotBuild: "v{version} 预发布版本",
   screenshotAlt:
-    "Codewhale v{version} 预发布版本：鲸鱼标志、新会话、消息输入区、Ask 权限、Work 模式和模型状态。由隔离终端会话的实际画面渲染。",
+    "Codewhale v{version} 的终端实录画面，包含对话、消息输入框与会话控制。",
   latestRelease: "最新发布 {tag}",
   releaseUnavailable: "发布状态暂不可用",
   currentSource: "源码",
   sourceCandidate: "未发布",
   publishedRelease: "已发布",
-  figcaptionSourceCandidate: "未发布",
-  chapterTerminal: "你的终端",
-  chapterTerminalTitle: "实时查看每一次编辑和命令",
-  gainHeading: "交出任务，保留控制权",
-  gainLede: "直接说出想要的结果：修复错误、解释某个模块，或自动完成重复任务。先用一个智能体，任务变大时再增加。",
+  gainHeading: "做出真正有用的东西。",
+  gainLede: "从你想要的结果开始。Codewhale 使用文件、命令和已连接的工具完成工作，由你决定访问范围和审批方式。",
   gain: [
     [
-      "修改代码并验证",
-      "智能体查看你的项目、编辑文件并运行测试。你可以在它工作时查看每一次编辑和命令结果。"
+      "构建应用和工具",
+      "把一个想法做成能运行的应用、实用脚本，或现有项目中的新功能。让智能体和你一起编写、运行并测试。"
     ],
     [
-      "自动完成重复工作",
-      "在脚本和 CI 中运行 codewhale exec。使用 Fleet 把大型任务分给多个智能体。"
+      "让重复工作自动完成",
+      "把反复要做的事变成工作流，从终端、脚本或 CI 中运行。需要并行推进时，让 Fleet 智能体团队分工完成。"
     ],
     [
-      "掌握执行过程",
-      "开始前设定权限，回应审批请求，随时停止任务。运行 /receipts 可列出会话中的每个文件、命令和审批。"
+      "连接你常用的工具",
+      "通过插件、MCP 服务或 API 连接 Gmail、Slack 等工具。让这些服务与文件和命令一起参与同一项任务。"
     ]
   ],
+  exampleTasks: [
+    "做一个能在线预约的应用。",
+    "把销售 CSV 做成每周可重复生成的报告。",
+    "把已连接邮箱中的邮件整理成行动清单。",
+  ],
+  // A static example report built from local sample orders.
+  reportTitle: "周销售报告",
+  reportSampleLabel: "示例报告 · 样本数据",
+  reportDescription: "让 Codewhale 按周汇总订单，并把处理步骤保存下来，供下一份 CSV 使用。",
+  reportSourceLabel: "输入数据：",
+  reportColumns: ["周起始日","订单数","销售额（美元）"],
+  reportTotalLabel: "合计",
+  reportTrend: "首周到末周的销售额变化：{change}。",
+  reportDownloadLabel: "下载报告 CSV",
   chapterModels: "你的模型",
-  modelsHeading: "为每项任务选择模型",
+  modelsHeading: "继续用你选择的模型。",
   modelsBody:
-    "为每个会话选择内置提供商、任意 OpenAI 兼容端点或本地模型。你的模型连接与 Codewhale 账户相互独立。",
+    "连接你已经在用的模型 API，使用兼容网关，或在自己的硬件上运行推理。为每个会话选择模型，也能为 Fleet 中的不同智能体分配不同模型。",
   modelsFacts: [
-    ["托管", "你自己的 API 密钥，用 codewhale auth set --provider <id> 保存"],
-    ["网关", "一个端点接多个模型；提供商仍由你选择"],
-    ["本地", "localhost 上的 vLLM、SGLang 或 Ollama，通常无需密钥"],
+    [
+      "你的 API 账户",
+      "使用自己的密钥连接 OpenAI、Anthropic、Google、DeepSeek 等提供商。"
+    ],
+    [
+      "你的网关",
+      "连接 OpenAI 兼容端点，选择它提供的模型。"
+    ],
+    [
+      "你的推理服务",
+      "通过 Ollama、vLLM 或 SGLang 运行本地或自托管模型。"
+    ]
   ],
   modelsLink: "浏览模型与提供商",
-  startHeading: "安装、连接模型、运行任务",
-  startLede: "在项目文件夹中用三个步骤运行第一项任务。如果工作需要多个智能体，之后再添加 Fleet。",
+  startHeading: "带上任务，开始动手。",
+  startLede: "安装 Codewhale，连接模型，交给它一件值得做的事。先从一个智能体开始，需要时再添加工具或团队。",
   startGuideLink: "按照新手指引操作",
   startVocabularyLink: "查名词",
   chapterAvailability: "在哪里运行",
-  availabilityHeading: "现在就在终端中使用",
-  availabilityLede: "终端、本地浏览器客户端和社区维护的 CodeWhale GUI 现已可用。桌面应用和重建中的托管网页应用正在开发，两者共用同一会话模型。",
+  availabilityHeading: "从终端开始。",
+  availabilityLede: "终端和本地浏览器客户端现已可用。原生桌面应用与重建中的托管网页应用正在开发。",
   availability: [
     [
       "终端与本地浏览器",
@@ -91,15 +104,30 @@ export const home: HomeDict = {
       "为你运行任务的托管计算机。"
     ]
   ],
-  availabilityNote: "终端、本地浏览器和 GUI 无需 Codewhale 账户。托管网页和桌面端使用账户，但账户不能代替模型连接；使用你自己的密钥产生的用量由提供商计费。",
+  availabilityNote: "终端、本地浏览器和 GUI 无需 Codewhale 账户。托管网页和桌面端使用账户。使用你自己的提供商密钥时，相应用量由该提供商计费。",
   accountLink: "创建账户",
-  surfacesHeading: "扩展智能体能接触的范围",
+  surfacesHeading: "一项任务，连接文件、应用和智能体。",
   surfaces: [
-    ["文件与命令", "在你设定的权限内读取项目、编辑文件、运行测试并查看输出。"],
-    ["插件与 MCP", "连接更多工具和服务。每个插件在你审核并启用之前都保持关闭。"],
-    ["Computer Use · 预览", "让智能体查看并操作其他应用的插件。由你启用它，并授予它请求的系统权限。"],
-    ["保存的会话", "将对话和工具结果保存在一起，可以接着之前的工作继续，无需从头开始。本地浏览器会打开你电脑上的同一个会话。"],
-    ["Fleet", "把任务的各部分分配给使用不同模型和角色的智能体，然后跟踪它们的进度。"],
+    [
+      "文件与终端",
+      "创建文件、运行命令、分析数据，并测试你构建的成果。工作目录和权限由你设定。"
+    ],
+    [
+      "插件与已连接的应用",
+      "通过插件和 MCP 添加技能与工具。审核并启用你希望智能体使用的连接。"
+    ],
+    [
+      "浏览器与电脑操作 · 预览",
+      "使用浏览器工具和 Computer Use 插件，在你授予的访问范围内操作应用与网站。"
+    ],
+    [
+      "随时接着做的会话",
+      "将对话、工具结果和工作记录保存在一起。在终端或本地浏览器客户端中继续之前的任务。"
+    ],
+    [
+      "智能体团队",
+      "用 Fleet 将大任务分配给不同角色和模型的智能体，在一处查看它们的进度。"
+    ]
   ],
   runtimeLink: "查看全部集成",
   installBandHeading: "在 macOS 或 Linux 上安装",
@@ -108,8 +136,8 @@ export const home: HomeDict = {
   binaries: "预编译包",
   chinaMirrors: "中国镜像",
   installGuideLink: "阅读安装指南",
-  communityHeading: "和我们一起构建 Codewhale",
-  communityBody: "在 GitHub 上报告 bug、提出功能建议，或提交你的第一个 pull request。欢迎小而经过测试的修复。",
+  communityHeading: "把 Codewhale 变成你想要的样子。",
+  communityBody: "Codewhale 是开源的。读源码、做插件、分享工作流，或一起把下一个版本做得更好。",
   communityLinksAria: "社区链接",
-  contribute: "提交 pull request",
+  contribute: "在 GitHub 上参与贡献",
 };

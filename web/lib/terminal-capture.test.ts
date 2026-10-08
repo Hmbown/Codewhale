@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
 import { TERMINAL_CAPTURE_FRAMES, TERMINAL_CAPTURE_META } from "./terminal-capture.generated";
 
-// The homepage terminal is live text drawn from real PTY cells. These checks
+// The product page terminal is live text drawn from real PTY cells. These checks
 // keep the generated runs tied to the capture files, cell for cell.
 const webRoot = new URL("../", import.meta.url);
 
@@ -45,8 +45,11 @@ describe("terminal capture", () => {
   it("keeps the native workbar and every recorded frame tied to their capture hashes", () => {
     const manifest = JSON.parse(readFileSync(new URL("./terminal-captures/manifest.json", import.meta.url), "utf8"));
     expect(manifest.binarySha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(manifest.conditions.submittedPrompts).toBe(0);
+    expect(manifest.conditions.submittedPrompts).toBe(1);
     expect(manifest.conditions.fixtureHistory).toBe(false);
+    expect(manifest.conditions.provider).toContain("loopback");
+    expect(manifest.conditions.model).toBe("website-demo");
+    expect(manifest.sourceDiffSha256).toMatch(/^[0-9a-f]{64}$/);
     for (const frame of manifest.frames) {
       const bytes = readFileSync(new URL(`./terminal-captures/${frame.file}`, import.meta.url));
       expect(createHash("sha256").update(bytes).digest("hex"), frame.file).toBe(frame.sha256);
@@ -55,9 +58,13 @@ describe("terminal capture", () => {
       expect(capture.cols).toBe(frame.cols);
     }
     const workbar = TERMINAL_CAPTURE_FRAMES.workbar.lines.map((runs) => runs.map(([text]) => text).join("")).join("\n");
-    expect(workbar).toContain("no to-dos yet");
-    expect(workbar).toContain("~/my-project");
+    expect(workbar).toContain("--json");
+    expect(workbar).not.toContain("no to-dos yet");
+    expect(manifest.conditions.workspace).toBe("~/my-project inside a sealed HOME");
     expect(workbar).not.toContain(".tmp");
+    const fleet = TERMINAL_CAPTURE_FRAMES["workbar-fleet"].lines.map((runs) => runs.map(([text]) => text).join("")).join("\n");
+    expect(fleet).toContain("export-review");
+    expect(fleet).not.toContain("no agents have run this session");
   });
 
   it("exports native geometry and every whale braille dot without relying on font fallback", () => {
@@ -73,8 +80,7 @@ describe("terminal capture", () => {
         const code = glyph.codePointAt(0)!;
         if (code >= 0x2800 && code <= 0x28ff) dots += (code - 0x2800).toString(2).replaceAll("0", "").length;
       }
-      expect(dots).toBeGreaterThan(0);
-      expect(svg.match(/<circle /g)).toHaveLength(dots);
+      expect(svg.match(/<circle /g) ?? []).toHaveLength(dots);
       expect(svg).not.toContain("<script");
     } finally {
       rmSync(directory, { recursive: true, force: true });

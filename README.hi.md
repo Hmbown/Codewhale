@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:004b3d422063 -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ Codewhale आपका प्रोजेक्ट पढ़ता है, फ�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="टर्मिनल में चलता Codewhale सेशन" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="टर्मिनल में चलता Codewhale सेशन" width="760">
 
-<sub>नए इंस्टॉल का असली टर्मिनल कैप्चर — कोई तैयार किया हुआ आउटपुट नहीं।</sub>
+<sub>कॉन्फ़िगर किए गए स्थानीय डेमो सत्र से Codewhale के असली टर्मिनल का कैप्चर।</sub>
 
 </div>
 

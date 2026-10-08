@@ -2,14 +2,14 @@ import { Fragment } from "react";
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { HeroInstall } from "@/components/hero-install";
-import { Icon, type IconName } from "@/components/icon";
+import { Icon } from "@/components/icon";
 import { InstallCodeBlock } from "@/components/install-code-block";
 import { Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
-import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
 import { WhaleLive } from "@/components/whale-live";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
+import { csvDataUri, EXAMPLE_SALES_REPORT, SAMPLE_SALES_CSV_URI } from "@/lib/example-sales-report";
 import { fill, getHome, splitToken } from "@/lib/i18n/dictionaries";
 import {
   APP_SIGNUP_URL,
@@ -20,29 +20,24 @@ import {
 } from "@/lib/i18n/links";
 import { serializeJsonLd } from "@/lib/json-ld";
 import { buildSoftwareApplicationJsonLd } from "@/lib/software-application-schema";
-import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 
 // Revalidate against source-proven runtime facts without giving up static edge
 // caching. `getFacts()` rejects legacy or older KV snapshots.
 export const revalidate = 300;
 
-// Row order is shared by every locale's `gain` and `availability` lists, so
-// the marks and states follow the row, not a word.
-const GAIN_ICONS: IconName[] = ["terminal", "repeat", "shield"];
 // Released · GUI available · development preview · development build · in
 // development.
 const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
 
 /**
- * The whale-road homepage, paper above and sea below. The promise and the
- * install command sit on paper; the live v2 whale (the desktop app's own
- * Director) rests on one horizon line; the real terminal floats in the deep
- * water just under it. The reading sections return to paper, and the page
- * ends in the sea with the install command, running into the footer.
+ * The whale-road homepage: the promise, illustrative task briefs and reading
+ * sections sit on paper. The live v2 whale (the desktop app's own Director)
+ * rests beside the hero, and the page ends in the sea with the install
+ * command, running into the footer.
  *
  * One memorable thing moves: the whale. It breathes, glances toward the
- * pointer, and acts out the terminal view a reader picks. Everything else is
- * still. Reduced motion shows its poster pose.
+ * pointer, and performs its existing poses. Everything else is still.
+ * Reduced motion shows its poster pose.
  *
  * Every visible string resolves through `getHome(locale)`. The only literals
  * left here are code-owned per docs/VOICE.md: the product control vocabulary
@@ -66,6 +61,17 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
   // token keeps the sentence a single translated unit — no concatenation of
   // fragments around a variable, and a locale may place the brand anywhere.
   const ledeParts = splitToken(d.heroIntro, "brand");
+  const money = new Intl.NumberFormat(locale, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+  const number = new Intl.NumberFormat(locale);
+  const date = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", timeZone: "UTC" });
+  const change = new Intl.NumberFormat(locale, { style: "percent", signDisplay: "always", maximumFractionDigits: 0 });
+  const report = EXAMPLE_SALES_REPORT;
+  const reportRows = report.rows.map(row => ({ ...row, week: date.format(new Date(`${row.weekStart}T00:00:00Z`)) }));
+  const reportCsv = csvDataUri([
+    d.reportColumns,
+    ...reportRows.map(row => [row.week, row.orders, (row.salesCents / 100).toFixed(2)]),
+    [d.reportTotalLabel, report.orders, (report.salesCents / 100).toFixed(2)],
+  ]);
 
   return (
     <div className="home">
@@ -105,61 +111,77 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         </div>
       </section>
 
-      {/* THE SEA — the horizon, then the real terminal just under the
-          surface: live text from an exact-build PTY cell capture. No
-          fabricated conversation, connected tools or completion metrics. */}
-      <section className="home-terminal stage" aria-labelledby="home-terminal">
-        <div className="home-terminal-inner">
-          <h2 className="home-terminal-title" id="home-terminal">{d.chapterTerminalTitle}</h2>
-          <figure className="figure home-shot">
-            <div className="figure-frame">
-              <NativeTerminalGallery
-                    locale={locale}
-                    defaultFrame="composer"
-                    regionLabel={d.shotPreview}
-                    label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
-              />
-            </div>
-            <figcaption className="figure-caption">
-              <span>
-                {d.shotPreview} · {fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })}
-              </span>
-              {/* Each fact is its own translated unit; nothing is
-                  concatenated around a token. */}
-              <span
-                className="status-line"
-                data-source-state={sourceIsPublished ? "published release" : "source candidate"}
-                data-source-state-label={sourceIsPublished ? d.publishedRelease : d.figcaptionSourceCandidate}
-              >
-                <Status tone={publishedRelease ? "ready" : "idle"}>
-                  {publishedRelease
-                    ? fill(d.latestRelease, { tag: publishedRelease.tag })
-                    : d.releaseUnavailable}
-                </Status>
-                <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
-                <span>{facts.license ?? "MIT"}</span>
-              </span>
-            </figcaption>
-          </figure>
+      {/* A static report generated from local sample orders. This is an
+          illustrative artifact, not a customer job or live model result. */}
+      <section className="home-tasks" aria-labelledby="home-tasks-title">
+        <div className="home-tasks-inner">
+          <div className="home-task-intro">
+            <h2 className="home-task-heading" id="home-tasks-title">{d.exampleTasks[1]}</h2>
+            <p>{d.reportDescription}</p>
+            <Link href={`/${locale}/docs/guide`} className="section-link">
+              {d.startGuideLink}
+            </Link>
+          </div>
+          <div className="home-report">
+            <table>
+              <caption>
+                <strong>{d.reportTitle}</strong>
+                <span>{d.reportSampleLabel}</span>
+              </caption>
+              <thead>
+                <tr>{d.reportColumns.map(column => <th key={column} scope="col">{column}</th>)}</tr>
+              </thead>
+              <tbody>
+                {reportRows.map(row => (
+                  <tr key={row.weekStart}>
+                    <th scope="row"><bdi>{row.week}</bdi></th>
+                    <td><bdi>{number.format(row.orders)}</bdi></td>
+                    <td><bdi>{money.format(row.salesCents / 100)}</bdi></td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <th scope="row">{d.reportTotalLabel}</th>
+                  <td><bdi>{number.format(report.orders)}</bdi></td>
+                  <td><bdi>{money.format(report.salesCents / 100)}</bdi></td>
+                </tr>
+              </tfoot>
+            </table>
+            <p className="home-report-trend">{fill(d.reportTrend, { change: change.format(report.change) })}</p>
+            <a href={reportCsv} download="weekly-sales-report.csv" className="section-link">{d.reportDownloadLabel}</a>
+            <p className="home-report-source">
+              {d.reportSourceLabel}{" "}
+              <a href={SAMPLE_SALES_CSV_URI} download="sample-sales.csv" className="link"><code>sample-sales.csv</code></a>
+            </p>
+          </div>
+          <div className="home-task-secondary">
+            {[0, 2].map(index => (
+              <article key={index} aria-labelledby={`home-task-${index}`}>
+                <h3 id={`home-task-${index}`}>{d.gain[index][0]}</h3>
+                <blockquote className="home-task-brief">{d.exampleTasks[index]}</blockquote>
+                {index === 2 && <p className="home-task-detail">{d.gain[index][1]}</p>}
+              </article>
+            ))}
+          </div>
+          <div
+            className="home-release status-line"
+            data-source-state={sourceIsPublished ? "published release" : "source candidate"}
+            data-source-state-label={sourceIsPublished ? d.publishedRelease : d.sourceCandidate}
+          >
+            <Status tone={publishedRelease ? "ready" : "idle"}>
+              {publishedRelease
+                ? fill(d.latestRelease, { tag: publishedRelease.tag })
+                : d.releaseUnavailable}
+            </Status>
+            <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
+            <span>{facts.license ?? "MIT"}</span>
+          </div>
         </div>
       </section>
 
-      {/* PAPER AGAIN — what it does, how it connects, how to start. */}
+      {/* PAPER — models, connections, and the getting-started path. */}
       <div className="home-body">
-        <Section id="home-gain" title={d.gainHeading} scope={d.gainLede} className="home-section">
-          <div className="ruled-cols">
-            {d.gain.map(([title, body], index) => (
-              <div key={title}>
-                <span className="ruled-icon" aria-hidden="true">
-                  <Icon name={GAIN_ICONS[index] ?? "terminal"} />
-                </span>
-                <h3>{title}</h3>
-                <p>{body}</p>
-              </div>
-            ))}
-          </div>
-        </Section>
-
         <Section
           id="home-models"
           layout="split"

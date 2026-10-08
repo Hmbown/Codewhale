@@ -20,8 +20,8 @@ and [CHANGELOG.md](../CHANGELOG.md).
 
 The maintainer rule: reports and PRs are real project work, even when the final
 patch has to be narrowed, delayed, or harvested into a maintainer branch.
-Harvested PRs keep visible credit in the commit/PR body, changelog or release
-notes, and relevant issue/PR comments.
+Adapted contributions keep visible credit in commits and PR bodies, the
+changelog or release notes, and this contributor record.
 
 ---
 
@@ -35,7 +35,15 @@ notes, and relevant issue/PR comments.
 </details>
 
 <details open>
-<summary><strong>v0.10.2 — undo, diff and provider failure reporting</strong></summary>
+<summary><strong>v0.10.2 — terminal, recovery and reliability</strong></summary>
+
+**Contributions**
+
+- **[dajiaohuang](https://github.com/dajiaohuang)** — cache-write token accounting, with missing and explicit-zero usage preserved ([#6913](https://github.com/codewhale-hq/Codewhale/pull/6913)).
+- **[gaord](https://github.com/gaord)** — embedder-declared telemetry surface support without changing collection policy ([#6916](https://github.com/codewhale-hq/Codewhale/pull/6916)).
+- **[Lstarsky0](https://github.com/Lstarsky0)** — localized `/profile` replies across all 15 complete locale packs ([#6919](https://github.com/codewhale-hq/Codewhale/pull/6919)).
+- **[jayanthvee](https://github.com/jayanthvee)** — Windows npm launcher guidance and targeted process shutdown ([#6906](https://github.com/codewhale-hq/Codewhale/pull/6906)).
+- **[asto18089](https://github.com/asto18089)** — reference fix for longer browser sign-in callback windows ([#6865](https://github.com/codewhale-hq/Codewhale/issues/6865)).
 
 **Reports and verification**
 

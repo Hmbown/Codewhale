@@ -19,7 +19,13 @@
  */
 
 /** Contributors whose PRs were merged or harvested into this release. */
-export const RELEASE_CONTRIBUTORS: string[] = [];
+export const RELEASE_CONTRIBUTORS: string[] = [
+  "@dajiaohuang",
+  "@gaord",
+  "@Lstarsky0",
+  "@jayanthvee",
+  "@asto18089",
+];
 
 /**
  * Contributors whose work landed after the latest release and before the next
