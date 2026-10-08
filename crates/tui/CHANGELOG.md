@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `/pet on` now brings the animated GPUI whale, the current session's agents,
+  and streamed replies or errors into one terminal view. Tab switches panes,
+  Enter opens the selected agent's transcript, and Escape returns to the
+  existing composer. The view respects motion preferences and keeps missing
+  usage unknown (#6920), using the shared `codewhale-ratatui` components
+  ([#23](https://github.com/codewhale-hq/codewhale-ratatui/pull/23)).
+  This Unreleased feature is separate from the 0.10.2 candidate in #6907.
+
 ## [0.10.1] - 2026-10-07
 
 ### Contributor integration and reliability
