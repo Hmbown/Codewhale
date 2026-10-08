@@ -27,7 +27,7 @@ mod avatars;
 mod full;
 mod graphics;
 mod habitat;
-pub use full::render_full;
+pub use full::{render_full, render_main};
 mod live;
 pub(crate) mod owner;
 mod persistence;
@@ -58,6 +58,7 @@ pub struct PetWatch {
     exporting: bool,
     sound_requested: bool,
     pub(crate) area: Option<Rect>,
+    pub(crate) inspect_area: Option<Rect>,
     raster: Option<Presentation>,
     controls: Arc<Mutex<Vec<Control>>>,
     desired: Option<Rect>,
@@ -68,14 +69,13 @@ pub struct PetWatch {
     bytes: u64,
     render_ms: f64,
     output_ms: f64,
-    /// `/pet on`: accepted turns enter the full habitat automatically.
+    /// `/pet on`: the native pet replaces the ordinary shell backdrop.
     pub(crate) enabled: bool,
-    work_enter_pending: bool,
     work_history_start: usize,
     full: codewhale_ratatui::PetModeState,
     full_next: Option<Instant>,
     full_response: Option<crate::tui::transcript::TranscriptViewCache>,
-    full_response_key: Option<(u64, u64, usize)>,
+    full_response_key: Option<(u64, usize, bool)>,
     full_inputs: Option<codewhale_ratatui::whale_motion::Inputs>,
     selection: Arc<Mutex<Option<String>>>,
 }
@@ -111,7 +111,6 @@ impl PetWatch {
         self.failed = false;
         self.unavailable = false;
         self.last_tick = None;
-        self.work_enter_pending = false;
         self.work_history_start = 0;
         self.full = codewhale_ratatui::PetModeState::default();
         self.full_next = None;
@@ -184,7 +183,14 @@ impl PetWatch {
             self.failed = true;
         }
     }
+    /// Wake the existing terminal loop for the native stage, even at idle.
+    /// Hidden and reduced/still stages clear this deadline in `full::tick`.
+    pub fn next_frame_in(&self, now: Instant) -> Option<Duration> {
+        self.full_next
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
     pub fn prepare_frame(&mut self) {
+        self.inspect_area = None;
         self.desired = None;
     }
     pub fn present(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -362,26 +368,49 @@ pub fn open_habitat(app: &mut App) {
     }
     app.needs_redraw = true;
 }
+/// Explicit tools and focused workers remain available on demand.
+pub fn main_view(app: &App) -> bool {
+    app.pet_watch.enabled
+        && app.agent_focus.is_none()
+        && !app.work_surface.focused
+        && app.file_tree.is_none()
+}
 pub fn is_open(app: &App) -> bool {
     app.view_stack.top_kind() == Some(ModalKind::PetHabitat)
+        || (main_view(app) && app.view_stack.is_empty())
 }
-/// `/pet on|off`. Enabling enters the habitat now and lets every accepted
-/// turn re-enter it; disabling closes the view and stops automatic entry.
-/// The durable pet keeps living in its companion either way, and the
-/// composer draft, transcript and active Engine turn are never touched.
+/// `/pet on|off` selects the shell backdrop without taking composer focus.
+/// Drafts, history, selection and the active Engine turn retain their owners.
 pub fn set_enabled(app: &mut App, enabled: bool) {
     app.pet_watch.enabled = enabled;
-    if enabled {
-        open_habitat(app);
-        return;
-    }
-    app.pet_watch.work_enter_pending = false;
-    if is_open(app) {
+    if app.view_stack.top_kind() == Some(ModalKind::PetHabitat) {
         app.view_stack.pop();
     }
-    let session = app.pet_watch.session.clone();
-    app.pet_watch.reset(session);
+    if enabled {
+        crate::tui::work_surface::release_focus(app);
+        app.launch.visible = false;
+        crate::tui::agent_focus::exit_focus(app);
+        app.file_tree = None;
+        app.file_tree_visible = false;
+        app.pet_watch.ensure(app.current_session_id.clone());
+    } else {
+        let session = app.pet_watch.session.clone();
+        app.pet_watch.reset(session);
+    }
     app.needs_redraw = true;
+}
+/// F5 and `/pet inspect` enter the same existing modal stack. Printable keys,
+/// paste, submit and editing remain with the normal composer on the main view.
+pub fn handle_inspect_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
+    use crate::tui::shell_key_routing::{self, ShellBindingId};
+    if app.pet_watch.enabled
+        && shell_key_routing::route(app.focus(), key) == Some(ShellBindingId::PetInspect)
+    {
+        open_habitat(app);
+        true
+    } else {
+        false
+    }
 }
 /// The existing Engine determines work boundaries. Only the shell reads the
 /// answer; no conversation text enters the pet owner or recording.
@@ -391,27 +420,13 @@ pub fn observe(app: &mut App, event: &Event, now: Instant) {
     if matches!(event, Event::TurnStarted { .. }) {
         app.pet_watch.work_history_start = app.history.len();
         app.pet_watch.full.reset_output();
-        app.pet_watch.work_enter_pending = app.pet_watch.enabled;
     } else if matches!(event, Event::TurnComplete { .. }) {
-        app.pet_watch.work_enter_pending = false;
         app.needs_redraw = true;
     }
 }
 pub fn tick(app: &mut App, now: Instant) {
-    if app.pet_watch.work_enter_pending
-        && app.view_stack.is_empty()
-        && !app.redaction_gate
-        && app.onboarding == crate::tui::app::OnboardingState::None
-    {
-        app.pet_watch.work_enter_pending = false;
-        // Alternate avatars need their companion raster; the native whale
-        // and Engine response remain available while it reconnects.
-        if full::canonical(&app.pet_watch) || !app.pet_watch.unavailable {
-            open_habitat(app);
-        }
-    }
-    // The habitat is the pet's only terminal view: it owns the whole content
-    // viewport or nothing. Reduced motion follows the shell's motion setting.
+    // Only the visible native backdrop or its inspector advances the stage.
+    // Other modal owners pause it; the existing composer never becomes a modal.
     let visible = !app.redaction_gate
         && app.onboarding == crate::tui::app::OnboardingState::None
         && is_open(app);
@@ -532,7 +547,10 @@ pub fn tick(app: &mut App, now: Instant) {
             ),
             Notice::Unreachable(message) => {
                 app.pet_watch.unavailable = true;
-                if app.is_loading && is_open(app) && !full::canonical(&app.pet_watch) {
+                if app.is_loading
+                    && app.view_stack.top_kind() == Some(ModalKind::PetHabitat)
+                    && !full::canonical(&app.pet_watch)
+                {
                     app.view_stack.pop();
                 }
                 (
@@ -736,7 +754,11 @@ mod tests {
             Instant::now(),
         );
         tick(&mut app, Instant::now());
-        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::PetHabitat));
+        assert!(
+            app.view_stack.is_empty(),
+            "accepted work keeps the composer focused"
+        );
+        assert!(main_view(&app));
         app.add_message(crate::tui::history::HistoryCell::Assistant {
             content: "Prepared result stays in the transcript".into(),
             streaming: false,
@@ -876,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn pet_off_stops_automatic_entry_and_keeps_the_draft() {
+    fn pet_off_restores_the_shell_and_keeps_the_draft() {
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
         app.onboarding = crate::tui::app::OnboardingState::None;
@@ -895,11 +917,11 @@ mod tests {
             },
             Instant::now(),
         );
-        assert!(app.pet_watch.work_enter_pending);
+        assert!(main_view(&app));
+        assert!(app.view_stack.is_empty());
         set_enabled(&mut app, false);
         tick(&mut app, Instant::now());
         assert!(!app.pet_watch.enabled);
-        assert!(!app.pet_watch.work_enter_pending);
         assert!(app.view_stack.is_empty());
         assert_eq!(app.input, "kept draft");
         assert!(app.pet_watch.worker.is_none());

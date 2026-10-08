@@ -94,6 +94,7 @@ pub enum ShellBindingId {
     ElevationDown,
     ElevationConfirm,
     ElevationAbort,
+    PetInspect,
     PetResultUp,
     PetResultDown,
     PetResultPageUp,
@@ -150,6 +151,7 @@ impl ShellBinding {
                 key.code == KeyCode::Enter && key.modifiers.is_empty()
             }
             ShellBindingId::ElevationAbort => key.code == KeyCode::Esc && key.modifiers.is_empty(),
+            ShellBindingId::PetInspect => key.code == KeyCode::F(5) && key.modifiers.is_empty(),
             ShellBindingId::PetResultUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
             ShellBindingId::PetResultDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
             ShellBindingId::PetResultPageUp => {
@@ -229,6 +231,12 @@ pub const SHELL_BINDINGS: &[ShellBinding] = &[
         catalog_chord: "Esc",
         footer_chord: "Esc",
         focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetInspect,
+        catalog_chord: "F5 / /pet inspect",
+        footer_chord: "F5",
+        focus: FocusScope::AnyShell,
     },
     ShellBinding {
         id: ShellBindingId::PetResultUp,

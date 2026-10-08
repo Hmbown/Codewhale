@@ -704,17 +704,12 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     CommandResult::message(rail_status_message(app))
 }
 
-/// `/pet`: turn the terminal over to the Codewhale pet.
-///
-/// Bare `/pet` toggles. `on` enters the full habitat now and lets every
-/// accepted turn re-enter it until `off`. The habitat is a modal over the
-/// existing shell: composer draft, transcript, selection and the active
-/// Engine turn stay underneath, and Escape returns without cancelling
-/// anything. The remaining verbs address the shared companion: the browser
-/// appearance studio, the native window, source selection, replay export and
-/// the single audio lease. The pet has no workbar panel.
+/// `/pet on` makes the pet the main shell surface, with the real composer
+/// always available. `/pet inspect` opens replies and agents on demand;
+/// Escape returns to the same backdrop and draft. Companion verbs keep the
+/// existing shared simulation, appearance, replay and single audio lease.
 pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
-    const USAGE: &str = "Usage: /pet [on|off|status|appearance|window|source|export|sound on|off|avatar [key]|action [name|live]|view [name|live]]";
+    const USAGE: &str = "Usage: /pet [on|off|inspect|status|appearance|window|source|export|sound on|off|avatar [key]|action [name|live]|view [name|live]]";
     use crate::tui::pet_watch::{self, Control};
     let words = arg
         .map(str::trim)
@@ -739,6 +734,10 @@ pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
         CommandResult::message(tr(app.ui_locale, MessageId::PetHabitatQueued))
     };
     match words.as_slice() {
+        ["inspect"] => {
+            pet_watch::open_habitat(app);
+            CommandResult::ok()
+        }
         [] => {
             let enabled = !app.pet_watch.enabled;
             mode(app, enabled)
@@ -3910,7 +3909,7 @@ mod tests {
     }
 
     #[test]
-    fn pet_command_toggles_the_habitat_and_automatic_entry() {
+    fn pet_command_selects_the_main_view_without_taking_composer_focus() {
         let mut app = create_test_app();
         app.onboarding = crate::tui::app::OnboardingState::None;
         app.redaction_gate = false;
@@ -3925,7 +3924,8 @@ mod tests {
             on.message.as_deref(),
             Some(&*tr(app.ui_locale, MessageId::PetModeOn))
         );
-        // Repeating `on` is harmless: still one habitat, still enabled.
+        assert!(app.view_stack.is_empty());
+        // Repeating `on` leaves the composer in the same shell focus.
         assert!(!pet(&mut app, Some(" ON ")).is_error);
         assert!(app.pet_watch.enabled);
         assert!(crate::tui::pet_watch::is_open(&app));

@@ -550,7 +550,7 @@ owner = "crates/tui/src/voice.rs"
 [[feature]]
 id = "pet"
 name = "Pet"
-summary = "/pet turns the screen over to the Codewhale pet while it works."
+summary = "/pet on makes the animated pet the main view with the normal message box; /pet inspect opens replies and agents."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/tui/pet_watch"

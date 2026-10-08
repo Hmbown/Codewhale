@@ -4965,6 +4965,9 @@ pub(crate) async fn run_event_loop(
         if let Some(until_anim) = frame_requester.due_in(now) {
             poll_timeout = poll_timeout.min(until_anim);
         }
+        if let Some(until_pet) = app.pet_watch.next_frame_in(Instant::now()) {
+            poll_timeout = poll_timeout.min(until_pet);
+        }
         // While the quit-confirmation prompt is armed, ensure we wake up to
         // expire it on time even if no input event arrives.
         if let Some(deadline) = app.quit_armed_until {
@@ -5486,6 +5489,10 @@ pub(crate) async fn run_event_loop(
                     }
                 }
                 submit_initial_input_if_ready(app, config, &engine_handle).await?;
+                continue;
+            }
+
+            if crate::tui::pet_watch::handle_inspect_key(app, &key) {
                 continue;
             }
 

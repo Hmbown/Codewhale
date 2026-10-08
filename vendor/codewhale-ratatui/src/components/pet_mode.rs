@@ -9,7 +9,8 @@ use crate::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Alignment, Rect},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Paragraph, StatefulWidget, Widget, Wrap},
 };
@@ -288,6 +289,7 @@ impl PetModeState {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_output(-3),
                 MouseEventKind::ScrollDown => self.scroll_output(3),
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) => {}
                 _ => return false,
             }
             self.focus_agents = false;
@@ -320,6 +322,8 @@ pub struct PetMode<'a> {
     pub agent_words: SubagentViewWords<'a>,
     pub output: &'a [Line<'a>],
     pub output_title: Cow<'a, str>,
+    /// Optional second footer row for the focused pane's controls.
+    pub pane_hints: Cow<'a, str>,
     pub hints: Cow<'a, str>,
 }
 
@@ -335,6 +339,7 @@ impl<'a> PetMode<'a> {
             agent_words: SubagentViewWords::default(),
             output: &[],
             output_title: "Response".into(),
+            pane_hints: "".into(),
             hints: "Esc back".into(),
         }
     }
@@ -362,19 +367,25 @@ impl StatefulWidget for PetMode<'_> {
         );
         state.areas = plan;
         if !plan.header.is_empty() {
-            Paragraph::new(Line::from(
-                vec![
-                    Span::styled(
-                        text::display_safe(&self.title).into_owned(),
-                        self.theme.fg(Role::Primary),
-                    ),
-                    Span::raw("   "),
-                ]
-                .into_iter()
-                .chain(self.status.spans(self.theme))
-                .collect::<Vec<_>>(),
-            ))
-            .render(
+            let status = self.status.spans(self.theme);
+            let status_width: usize = status.iter().map(|span| text::width(&span.content)).sum();
+            let title = text::display_safe(&self.title);
+            let mut spans = Vec::new();
+            // Shed identity before phase; narrow/ASCII views still name the
+            // activity even when a caller supplies a long title.
+            if text::width(&title)
+                .saturating_add(3)
+                .saturating_add(status_width)
+                <= usize::from(plan.header.width)
+            {
+                spans.push(Span::styled(
+                    title.into_owned(),
+                    self.theme.fg(Role::Primary),
+                ));
+                spans.push(Span::raw("   "));
+            }
+            spans.extend(status);
+            Paragraph::new(Line::from(spans)).render(
                 Rect {
                     height: 1,
                     ..plan.header
@@ -401,23 +412,28 @@ impl StatefulWidget for PetMode<'_> {
         }
         if !plan.pet.is_empty() {
             WhalePet::new(self.theme)
-                .words(self.status.word.to_string())
+                .words("")
                 .paint(plan.pet, buf, &mut state.stage);
+        }
+        let marker = if self.theme.ascii() { "> " } else { "› " };
+        let mut agent_words = self.agent_words;
+        if state.focus_agents {
+            agent_words.title = format!("{marker}{}", agent_words.title).into();
+        }
+        if !plan.agents.is_empty() && plan.agents.x > area.x {
+            // The shared layout already reserves this gap; no reading space
+            // or pointer geometry is consumed by the divider.
+            for y in plan.agents.y..plan.agents.bottom() {
+                buf[(plan.agents.x - 1, y)]
+                    .set_symbol(if self.theme.ascii() { "|" } else { "│" })
+                    .set_style(self.theme.fg(Role::Muted));
+            }
         }
         // Render even the hidden roster's empty area to clear stale hitboxes.
         SubagentView::new(self.agents, self.theme)
-            .words(self.agent_words)
+            .words(agent_words)
             .render(plan.agents, buf, &mut state.agents);
         if !plan.output.is_empty() {
-            Paragraph::new(text::display_safe(&self.output_title).into_owned())
-                .style(self.theme.fg(Role::Primary))
-                .render(
-                    Rect {
-                        height: 1,
-                        ..plan.output
-                    },
-                    buf,
-                );
             let body = Rect::new(
                 plan.output.x,
                 plan.output.y + 1,
@@ -430,6 +446,39 @@ impl StatefulWidget for PetMode<'_> {
             } else {
                 state.output_end
             };
+            let heading = Rect {
+                height: 1,
+                ..plan.output
+            };
+            let mut title_area = heading;
+            if body.height > 0 && state.output_end > 0 {
+                let range = format!(
+                    "{}-{} / {}",
+                    state.output_scroll + 1,
+                    (state.output_scroll + usize::from(body.height)).min(self.output.len()),
+                    self.output.len()
+                );
+                let width = text::width(&range) as u16;
+                if heading.width >= width.saturating_add(8) {
+                    title_area.width -= width + 1;
+                    Paragraph::new(range)
+                        .alignment(Alignment::Right)
+                        .style(self.theme.fg(Role::Muted))
+                        .render(heading, buf);
+                }
+            }
+            let title = if state.focus_agents {
+                self.output_title.into_owned()
+            } else {
+                format!("{marker}{}", self.output_title)
+            };
+            Paragraph::new(text::display_safe(&title).into_owned())
+                .style(if state.focus_agents {
+                    self.theme.fg(Role::Muted)
+                } else {
+                    self.theme.fg(Role::Primary).add_modifier(Modifier::BOLD)
+                })
+                .render(title_area, buf);
             // usize selection preserves arbitrarily long already-wrapped output.
             for (y, line) in self
                 .output
@@ -452,10 +501,39 @@ impl StatefulWidget for PetMode<'_> {
             }
         }
         if !plan.footer.is_empty() {
-            Paragraph::new(text::display_safe(&self.hints).into_owned())
+            let split = plan.footer.height > 1 && !self.pane_hints.is_empty();
+            let hints = text::display_safe(&self.hints);
+            let hints = if split {
+                text::truncate(&hints, usize::from(plan.footer.width), self.theme.ascii())
+                    .into_owned()
+            } else {
+                hints.into_owned()
+            };
+            Paragraph::new(hints)
                 .wrap(Wrap { trim: true })
                 .style(self.theme.fg(Role::Muted))
-                .render(plan.footer, buf);
+                .render(
+                    Rect {
+                        height: if split { 1 } else { plan.footer.height },
+                        ..plan.footer
+                    },
+                    buf,
+                );
+            if split {
+                Paragraph::new(
+                    text::truncate(
+                        &text::display_safe(&self.pane_hints),
+                        usize::from(plan.footer.width),
+                        self.theme.ascii(),
+                    )
+                    .into_owned(),
+                )
+                .style(self.theme.fg(Role::Muted))
+                .render(
+                    Rect::new(plan.footer.x, plan.footer.y + 1, plan.footer.width, 1),
+                    buf,
+                );
+            }
         }
     }
 }

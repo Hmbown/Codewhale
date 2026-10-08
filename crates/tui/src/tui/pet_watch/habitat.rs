@@ -1,5 +1,6 @@
 //! Full viewport ownership uses the existing modal stack. Hidden composer,
-//! history, selection and active Engine state are untouched.
+//! history, selection and active Engine state are untouched. Escape returns
+//! to the pet backdrop and the real composer when pet mode is enabled.
 use super::Control;
 use crate::tui::{
     shell_key_routing::{self, Focus, ShellBindingId as Id},
@@ -66,11 +67,10 @@ impl ModalView for Habitat {
         self
     }
 }
-pub fn hints(locale: codewhale_localization::Locale) -> String {
+pub fn companion_hints(locale: codewhale_localization::Locale) -> String {
     use codewhale_localization::{MessageId, tr};
-    let mut text = tr(locale, MessageId::PetHabitatHints).into_owned();
+    let mut text = tr(locale, MessageId::PetModeCompanionHints).into_owned();
     for (name, id) in [
-        ("back", Id::PetBack),
         ("sound", Id::PetSound),
         ("browser", Id::PetBrowser),
         ("window", Id::PetWindow),
@@ -119,7 +119,7 @@ mod tests {
                 Focus::Composer,
                 &KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)
             ),
-            None
+            Some(Id::PetInspect)
         );
         app.view_stack
             .handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));

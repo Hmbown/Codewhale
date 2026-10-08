@@ -890,6 +890,7 @@ fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
         ShellBindingId::ElevationDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::ElevationConfirm => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         ShellBindingId::ElevationAbort => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ShellBindingId::PetInspect => KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
         ShellBindingId::PetResultUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ShellBindingId::PetResultDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),

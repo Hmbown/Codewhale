@@ -191,6 +191,18 @@ impl TranscriptViewCache {
         self.streaming_source_receipt = receipt;
     }
 
+    #[cfg(test)]
+    pub(crate) fn streaming_render_work(
+        &self,
+        cell_index: usize,
+    ) -> Option<crate::tui::markdown_render::MarkdownRenderWork> {
+        self.per_cell
+            .get(cell_index)?
+            .incremental_markdown
+            .as_ref()
+            .map(|cache| cache.work())
+    }
+
     pub(crate) fn take_transcript_action(
         &mut self,
     ) -> Option<(TranscriptActionOwner, Option<CellFoldActionTarget>)> {
