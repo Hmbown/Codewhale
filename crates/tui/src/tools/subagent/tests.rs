@@ -22087,7 +22087,11 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // The wait-bound disclosure (#6850) adds exactly 222 UTF-8 bytes to the
 // agent schema on top of the rewrites; the runtime measurement below still
 // detects unrelated growth.
-const PARENT_SURFACE_BYTE_CEILING: usize = 90_343;
+// Raised 2026-10-08 by 115B for the 0.10.2 batch: +145B for the `agent` tool
+// sentence that restores the legacy Operate contract, less 30B from the
+// background-shell schema edits. The delta was measured on one macOS machine
+// whose absolute figure sits above hosted CI's, so only the delta is used.
+const PARENT_SURFACE_BYTE_CEILING: usize = 90_458;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {
