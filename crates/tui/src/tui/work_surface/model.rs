@@ -335,6 +335,7 @@ pub(crate) struct SessionInstanceScope {
 
 #[derive(Debug, Clone)]
 pub struct WorkSurfaceState {
+    #[cfg(all(unix, not(target_env = "ohos")))]
     pub(super) terminal: super::terminal::TerminalDock,
     pub placement: WorkSurfacePlacement,
     pub(super) effective_placement: WorkSurfacePlacement,
@@ -441,6 +442,7 @@ impl WorkSurfaceState {
             placement,
             effective_placement: placement,
             panel: RailPanel::default(),
+            #[cfg(all(unix, not(target_env = "ohos")))]
             terminal: super::terminal::TerminalDock::default(),
             explicit_view: false,
             file_activity: SettledFileActivity::default(),

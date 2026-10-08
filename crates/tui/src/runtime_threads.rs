@@ -6636,6 +6636,7 @@ impl RuntimeProcessOwnerLock {
     }
 
     /// Host admission reuses this exact store lease, never a PID-file lock.
+    #[cfg(unix)]
     pub(crate) fn try_acquire_for_host(root: &Path, create: bool) -> Result<Option<Self>> {
         if !create {
             checked_existing_runtime_store_dir(root)?;

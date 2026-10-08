@@ -7,74 +7,76 @@
 
 use codewhale_localization::MessageId;
 use crossterm::event::KeyEvent;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect, prelude::Widget, style::Style, text::Line, widgets::Paragraph};
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 use super::model::RailPanel;
 use crate::tui::app::App;
 use crate::tui::shell_key_routing::ShellBindingId;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 use crate::tui::shell_key_routing::{binding, display_chord};
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 use crate::tools::terminal_session::{self, TerminalSessionInfo};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 use std::{
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
 };
 
+#[cfg(all(unix, not(target_env = "ohos")))]
 #[derive(Debug, Default)]
 pub(super) struct TerminalDock {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     workspace: PathBuf,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     worker: Option<Worker>,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     sessions: Vec<TerminalSessionInfo>,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     selected: Option<String>,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     output: Vec<u8>,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     dropped: u64,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     last_poll: Option<Instant>,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     refreshing: bool,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     size: Option<(u16, u16)>,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     lost: bool,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     creating: bool,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     session_tabs: Vec<(String, Rect)>,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     scroll: usize,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     error: Option<String>,
 }
 
 // A copied presentation must not share an input queue or steal replies.
+#[cfg(all(unix, not(target_env = "ohos")))]
 impl Clone for TerminalDock {
     fn clone(&self) -> Self {
         Self::default()
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 #[derive(Debug)]
 struct Worker {
     requests: mpsc::SyncSender<Request>,
     replies: mpsc::Receiver<Reply>,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 #[derive(Debug)]
 enum Request {
     Refresh(Option<String>),
@@ -93,7 +95,7 @@ enum Request {
     },
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 #[derive(Debug)]
 enum Reply {
     Snapshot {
@@ -106,7 +108,7 @@ enum Reply {
     Error(String),
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 impl Worker {
     fn start(workspace: PathBuf) -> Result<Self, String> {
         let (requests, incoming) = mpsc::sync_channel(128);
@@ -186,7 +188,7 @@ impl Worker {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 fn policy(app: &App) -> crate::sandbox::SandboxPolicy {
     crate::core::authority::sandbox_policy_for_turn(
         app.mode,
@@ -199,7 +201,7 @@ fn policy(app: &App) -> crate::sandbox::SandboxPolicy {
 
 /// Called by the existing event loop, including when another panel is open.
 pub(crate) fn poll(app: &mut App) {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     {
         let visible = app.work_surface.panel == RailPanel::Terminal
             && !app.work_surface.dismissed
@@ -311,11 +313,11 @@ pub(crate) fn poll(app: &mut App) {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), target_env = "ohos"))]
     let _ = app;
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 fn send(app: &mut App, request: Request) -> bool {
     let dock = &mut app.work_surface.terminal;
     let result = dock
@@ -355,7 +357,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }) {
         return false;
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     {
         if action == Some(ShellBindingId::TerminalNew) {
             if app.work_surface.terminal.worker.is_none() {
@@ -422,7 +424,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 fn input(app: &mut App, bytes: Vec<u8>) {
     let dock = &app.work_surface.terminal;
     if let Some(session) = dock
@@ -451,7 +453,7 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) -> bool {
     {
         return false;
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     {
         // Paste is deliberate terminal input. Limit it before queuing, and
         // never pass terminal control sequences supplied by the clipboard.
@@ -470,12 +472,12 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) -> bool {
         }
         app.needs_redraw = true;
     }
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), target_env = "ohos"))]
     let _ = text;
     true
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let control =
         key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
@@ -509,7 +511,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .fg(app.ui_theme.text_muted)
         .bg(app.ui_theme.panel_bg);
     let mut lines = Vec::new();
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     {
         use ansi_to_tui::IntoText;
         let hints = app
@@ -656,7 +658,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         app.work_surface.terminal.session_tabs = session_tabs;
         app.work_surface.terminal.scroll = scroll;
     }
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), target_env = "ohos"))]
     lines.push(Line::styled(
         app.tr(MessageId::TerminalDockUnsupported),
         muted,
@@ -677,7 +679,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             super::interaction::claim_focus(app);
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_env = "ohos")))]
             if let Some(id) = app
                 .work_surface
                 .terminal
@@ -698,7 +700,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             app.needs_redraw = true;
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_env = "ohos")))]
             {
                 let dock = &mut app.work_surface.terminal;
                 dock.scroll = if mouse.kind == MouseEventKind::ScrollUp {
