@@ -64,6 +64,15 @@ done
 
 echo "Verifying all ${#packages[@]} release package tarballs before any upload..."
 cargo publish "${package_args[@]}"
+
+# crates.io refuses an upload over 10 MiB compressed with HTTP 413, and only
+# when the upload happens: v0.10.1 uploaded 26 crates before codewhale-tui was
+# refused at 11.93 MiB, stranding tui and its dependent cli. The dry run above
+# already built every tarball, so check the real sizes before the first upload
+# (and on every dry run, where the same failure would otherwise surface only
+# at release time).
+echo "Checking release tarball sizes against the crates.io upload cap..."
+python3 "${script_dir}/check-crate-sizes.py" "${packages[@]}"
 if [[ "${mode}" == "dry-run" ]]; then
   echo "Release package verification OK; no crates uploaded."
   exit 0

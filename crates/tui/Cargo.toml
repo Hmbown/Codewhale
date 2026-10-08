@@ -7,6 +7,20 @@ license.workspace = true
 repository.workspace = true
 description = "Terminal UI for open-source and open-weight coding models"
 autobins = false
+# crates.io rejects packages over 10 MiB compressed, and this crate's test
+# sources (~11 MiB) push the package past that cap (0.10.1's upload was
+# refused with HTTP 413 at 11.9 MiB). None of these are compiled by
+# `cargo build` / `cargo install`; the repository keeps them for CI and local
+# test runs, and only the published package omits them.
+exclude = [
+  "tests/**",
+  "src/**/tests.rs",
+  "src/**/tests/**",
+  "src/**/*_tests.rs",
+  "src/**/test_cases_*.rs",
+  "extension-host/test/**",
+  "plugins/computer-use/tests/**",
+]
 
 [lints]
 workspace = true
