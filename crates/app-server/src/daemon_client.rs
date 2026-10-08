@@ -34,6 +34,237 @@ mod platform {
         frontend: crate::daemon_socket::AttachFrontend,
     }
 
+    /// Host startup is the only caller allowed to acquire the Runtime lease.
+    /// Unavailable is pre-write transport evidence, never ownership or death.
+    pub enum HostOwnerProbe {
+        Absent,
+        Attached(Box<OwnerClient>),
+        Unavailable(Arc<UnavailablePublication>),
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("selected owner publication changed before attach; re-observe")]
+    pub struct PublicationChangedBeforeAttach;
+
+    fn owner_receipt_error(error: anyhow::Error) -> anyhow::Error {
+        #[cfg(unix)]
+        if error.is::<codewhale_config::private_directory::UnlinkedPrivateFile>() {
+            return PublicationChangedBeforeAttach.into();
+        }
+        error
+    }
+
+    pub(crate) struct OwnerPublication {
+        pub(crate) parent: Arc<PrivateDirectory>,
+        pub(crate) receipt_name: String,
+        #[cfg(unix)]
+        pub(crate) socket_path: PathBuf,
+        pub(crate) bytes: Vec<u8>,
+        pub(crate) receipt: RuntimeOwnerReceipt,
+        pub(crate) file: std::fs::File,
+        #[cfg(unix)]
+        pub(crate) socket_identity:
+            Option<codewhale_config::private_directory::PrivateSocketIdentity>,
+    }
+    impl OwnerPublication {
+        pub(crate) fn receipt_is_current(&self) -> Result<bool> {
+            if !self.parent.is_at_selected_path()? {
+                return Ok(false);
+            }
+            let current = match self
+                .parent
+                .read_private_receipt(&self.receipt_name, 16384)
+                .map_err(owner_receipt_error)
+            {
+                Err(error) if error.is::<PublicationChangedBeforeAttach>() => return Ok(false),
+                result => result?,
+            };
+            let Some((bytes, file)) = current else {
+                return Ok(false);
+            };
+            Ok(bytes == self.bytes && PrivateDirectory::same_file_identity(&self.file, &file)?)
+        }
+        pub(crate) fn is_current(&self) -> Result<bool> {
+            if !self.receipt_is_current()? {
+                return Ok(false);
+            }
+            #[cfg(unix)]
+            {
+                let name = self
+                    .socket_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("invalid owner endpoint basename")?;
+                if self.parent.socket_identity(name)? != self.socket_identity {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    /// Opaque retained publication. No public constructor or path-based cleanup.
+    pub struct UnavailablePublication {
+        pub(crate) publication: Arc<OwnerPublication>,
+        cause: std::io::Error,
+    }
+    impl UnavailablePublication {
+        pub fn receipt(&self) -> &RuntimeOwnerReceipt {
+            &self.publication.receipt
+        }
+        fn strict_error(&self) -> anyhow::Error {
+            let cause = match self.cause.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(self.cause.kind(), self.cause.to_string()),
+            };
+            anyhow::Error::new(cause)
+                .context("selected owner publication unavailable; canonical host recovery required")
+        }
+        #[cfg(unix)]
+        fn require_dead_process(&self) -> Result<()> {
+            use codewhale_config::private_directory::{UnixProcessStatus, unix_process_status};
+            let receipt = self.receipt();
+            anyhow::ensure!(
+                receipt.principal == PrivateDirectory::current_user_id().to_string()
+                    && !receipt.process_start.is_empty(),
+                "selected owner process identity is invalid"
+            );
+            match unix_process_status(receipt.pid)? {
+                UnixProcessStatus::Absent => Ok(()),
+                UnixProcessStatus::Present { start } if start == receipt.process_start => {
+                    bail!("selected owner process is still present; refusing recovery")
+                }
+                UnixProcessStatus::Present { .. } => {
+                    bail!("selected owner PID was reused; refusing recovery")
+                }
+            }
+        }
+        /// Caller retains the real Runtime lease; this checks evidence only.
+        #[cfg(unix)]
+        pub(crate) fn revalidate_receipt(&self) -> Result<bool> {
+            if !self.publication.receipt_is_current()? {
+                return Ok(false);
+            }
+            self.require_dead_process()?;
+            Ok(true)
+        }
+        #[cfg(unix)]
+        pub(crate) fn revalidate_all(&self) -> Result<bool> {
+            if !self.publication.is_current()? {
+                return Ok(false);
+            }
+            self.require_dead_process()?;
+            Ok(true)
+        }
+        #[cfg(unix)]
+        pub async fn revalidate(self: &Arc<Self>) -> Result<bool> {
+            let held = self.clone();
+            owner_work(move || held.revalidate_all()).await
+        }
+    }
+
+    async fn observe_publication(
+        config_path: Option<PathBuf>,
+        selected: Option<PathBuf>,
+    ) -> Result<Option<Arc<OwnerPublication>>> {
+        let socket_path = owner_work(move || match selected {
+            Some(path) => Ok(path),
+            None => default_socket_path().map_err(Into::into),
+        })
+        .await?;
+        #[cfg(unix)]
+        let directory = socket_path
+            .parent()
+            .context("owner endpoint has no private parent")?
+            .to_path_buf();
+        #[cfg(windows)]
+        let directory = owner_work(crate::daemon_windows::owner_directory).await?;
+        #[cfg(unix)]
+        let name = format!(
+            "{}.owner.json",
+            socket_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("invalid owner endpoint basename")?
+        );
+        #[cfg(windows)]
+        let name = "daemon.owner.json".to_string();
+        owner_work(move || {
+            let parent = match PrivateDirectory::inspect(&directory) {
+                Ok(parent) => Arc::new(parent),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let Some((bytes, file)) = parent
+                .read_private_receipt(&name, 16384)
+                .map_err(owner_receipt_error)?
+            else {
+                return Ok(None);
+            };
+            let receipt: RuntimeOwnerReceipt = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                receipt.version == 1
+                    && receipt.pid > 0
+                    && receipt.socket_path == socket_path
+                    && !receipt.lease_generation.is_empty(),
+                "selected owner receipt is invalid"
+            );
+            anyhow::ensure!(
+                receipt.config_path == config_path,
+                "selected owner config does not match; refusing another store"
+            );
+            #[cfg(unix)]
+            let socket_identity = parent.socket_identity(
+                socket_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("invalid owner endpoint basename")?,
+            )?;
+            Ok(Some(Arc::new(OwnerPublication {
+                parent,
+                receipt_name: name,
+                bytes,
+                receipt,
+                file,
+                #[cfg(unix)]
+                socket_path,
+                #[cfg(unix)]
+                socket_identity,
+            })))
+        })
+        .await
+    }
+
+    /// Read-only absence recheck after the actual Runtime lease was acquired.
+    pub async fn publication_is_absent(
+        config_path: Option<PathBuf>,
+        selected: Option<PathBuf>,
+    ) -> Result<bool> {
+        Ok(observe_publication(config_path, selected).await?.is_none())
+    }
+
+    pub async fn probe_owner_for_host_startup(
+        config_path: Option<PathBuf>,
+        selected: Option<PathBuf>,
+    ) -> Result<HostOwnerProbe> {
+        probe_frontend(
+            config_path,
+            selected,
+            crate::daemon_socket::AttachFrontend::Control,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
     pub async fn connect(
         config_path: Option<PathBuf>,
         selected: Option<PathBuf>,
@@ -141,68 +372,65 @@ mod platform {
         scope: Option<crate::RuntimeFrontendScope>,
         acp_model: Option<String>,
     ) -> Result<Option<OwnerClient>> {
-        let socket_path = owner_work(move || match selected {
-            Some(path) => Ok(path),
-            None => default_socket_path().map_err(Into::into),
-        })
-        .await?;
-        #[cfg(unix)]
-        let directory = socket_path
-            .parent()
-            .context("owner endpoint has no private parent")?
-            .to_path_buf();
-        #[cfg(windows)]
-        let directory = owner_work(crate::daemon_windows::owner_directory).await?;
-        #[cfg(unix)]
-        let name = format!(
-            "{}.owner.json",
-            socket_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("invalid owner endpoint basename")?
-        );
-        #[cfg(windows)]
-        let name = "daemon.owner.json".to_string();
-        let receipt_name = name.clone();
-        let found = owner_work(move || {
-            let parent = match PrivateDirectory::inspect(&directory) {
-                Ok(parent) => Arc::new(parent),
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
-            let Some((bytes, file)) = parent.read_private_receipt(&name, 16384)? else {
-                return Ok(None);
-            };
-            let receipt: RuntimeOwnerReceipt = serde_json::from_slice(&bytes)?;
-            Ok(Some((parent, receipt, file)))
-        })
-        .await?;
-        let Some((parent, receipt, file)) = found else {
-            return Ok(None);
+        match probe_frontend(
+            config_path,
+            selected,
+            frontend,
+            listener,
+            expected_owner,
+            scope,
+            acp_model,
+        )
+        .await?
+        {
+            HostOwnerProbe::Absent => Ok(None),
+            HostOwnerProbe::Attached(client) => Ok(Some(*client)),
+            HostOwnerProbe::Unavailable(publication) => Err(publication.strict_error()),
+        }
+    }
+
+    async fn probe_frontend(
+        config_path: Option<PathBuf>,
+        selected: Option<PathBuf>,
+        frontend: crate::daemon_socket::AttachFrontend,
+        listener: Option<crate::RuntimeListenerSelection>,
+        expected_owner: Option<RuntimeOwnerReceipt>,
+        scope: Option<crate::RuntimeFrontendScope>,
+        acp_model: Option<String>,
+    ) -> Result<HostOwnerProbe> {
+        let Some(publication) = observe_publication(config_path, selected).await? else {
+            return Ok(HostOwnerProbe::Absent);
         };
-        anyhow::ensure!(
-            receipt.version == 1
-                && receipt.pid > 0
-                && receipt.socket_path == socket_path
-                && !receipt.lease_generation.is_empty(),
-            "selected owner receipt is invalid"
-        );
-        anyhow::ensure!(
-            receipt.config_path == config_path,
-            "selected owner config does not match; refusing another store"
-        );
+        #[cfg(unix)]
+        let socket_path = publication.socket_path.clone();
+        let receipt = publication.receipt.clone();
         #[cfg(unix)]
         let (stream, peer) = {
-            let stream =
-                tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path))
-                    .await
-                    .context("owner connect deadline expired")??;
+            let stream = match tokio::time::timeout(
+                Duration::from_secs(5),
+                UnixStream::connect(&socket_path),
+            )
+            .await
+            .context("owner connect deadline expired")?
+            {
+                Ok(stream) => stream,
+                Err(cause) => {
+                    let held = publication.clone();
+                    anyhow::ensure!(
+                        owner_work(move || held.is_current()).await?,
+                        PublicationChangedBeforeAttach
+                    );
+                    if cause.kind() == std::io::ErrorKind::ConnectionRefused
+                        || (cause.kind() == std::io::ErrorKind::NotFound
+                            && publication.socket_identity.is_none())
+                    {
+                        return Ok(HostOwnerProbe::Unavailable(Arc::new(
+                            UnavailablePublication { publication, cause },
+                        )));
+                    }
+                    return Err(cause.into());
+                }
+            };
             let credential = stream
                 .peer_cred()
                 .context("owner peer credentials unavailable")?;
@@ -210,12 +438,17 @@ mod platform {
                 .pid()
                 .and_then(|pid| u32::try_from(pid).ok())
                 .context("owner peer PID unavailable")?;
-            anyhow::ensure!(
-                credential.uid() == PrivateDirectory::current_user_id()
-                    && receipt.principal == credential.uid().to_string()
-                    && pid == receipt.pid,
-                "connected process is not the selected Runtime owner"
-            );
+            if credential.uid() != PrivateDirectory::current_user_id()
+                || receipt.principal != credential.uid().to_string()
+                || pid != receipt.pid
+            {
+                let held = publication.clone();
+                anyhow::ensure!(
+                    owner_work(move || held.is_current()).await?,
+                    PublicationChangedBeforeAttach
+                );
+                bail!("connected process is not the selected Runtime owner");
+            }
             (
                 stream,
                 Arc::new(AuthorizedPeer {
@@ -234,22 +467,13 @@ mod platform {
             };
             (stream, Arc::new(peer))
         };
-        let held_parent = parent.clone();
-        let held_receipt = receipt.clone();
+        let held_publication = publication.clone();
         let check = peer.clone();
         owner_work(move || {
             check.check()?;
             anyhow::ensure!(
-                held_parent.is_at_selected_path()?,
-                "selected owner parent changed"
-            );
-            let (bytes, current) = held_parent
-                .read_private_receipt(&receipt_name, 16384)?
-                .context("selected owner receipt withdrawn")?;
-            anyhow::ensure!(
-                serde_json::from_slice::<RuntimeOwnerReceipt>(&bytes)? == held_receipt
-                    && PrivateDirectory::same_file_identity(&file, &current)?,
-                "selected owner receipt changed before attach"
+                held_publication.is_current()?,
+                PublicationChangedBeforeAttach
             );
             Ok(())
         })
@@ -297,14 +521,14 @@ mod platform {
             .filter(|value| !value.is_null())
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()?;
-        Ok(Some(OwnerClient {
+        Ok(HostOwnerProbe::Attached(Box::new(OwnerClient {
             read: replies,
             write,
             peer,
             receipt,
             routing,
             frontend,
-        }))
+        })))
     }
 
     impl OwnerClient {
@@ -394,13 +618,34 @@ mod platform {
             .forward(tokio::io::stdin(), tokio::io::stdout())
             .await
     }
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn owner_receipt_reobserves_only_typed_unlinked_file_refusals() {
+            let retired =
+                anyhow::Error::new(codewhale_config::private_directory::UnlinkedPrivateFile)
+                    .context("bounded owner receipt read");
+            assert!(owner_receipt_error(retired).is::<PublicationChangedBeforeAttach>());
+            for refused in [
+                anyhow::anyhow!("private file was unlinked before validation"),
+                anyhow::anyhow!("xAI OAuth file must not have multiple filesystem links"),
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
+                anyhow::anyhow!("owner attach write deadline expired; outcome uncertain"),
+            ] {
+                assert!(!owner_receipt_error(refused).is::<PublicationChangedBeforeAttach>());
+            }
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
 pub use platform::{
-    OwnerClient, connect, connect_acp_if_published, connect_if_published,
-    connect_listener_if_published, connect_scoped_control_if_published,
-    connect_selected_acp_if_published, forward_stdio,
+    HostOwnerProbe, OwnerClient, PublicationChangedBeforeAttach, UnavailablePublication, connect,
+    connect_acp_if_published, connect_if_published, connect_listener_if_published,
+    connect_scoped_control_if_published, connect_selected_acp_if_published, forward_stdio,
+    probe_owner_for_host_startup, publication_is_absent,
 };
 
 #[cfg(not(any(unix, windows)))]

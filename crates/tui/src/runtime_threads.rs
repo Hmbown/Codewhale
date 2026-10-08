@@ -6635,6 +6635,23 @@ impl RuntimeProcessOwnerLock {
         Ok(None)
     }
 
+    /// Host admission reuses this exact store lease, never a PID-file lock.
+    pub(crate) fn try_acquire_for_host(root: &Path, create: bool) -> Result<Option<Self>> {
+        if !create {
+            checked_existing_runtime_store_dir(root)?;
+        }
+        Self::try_acquire_file(&root.join(RUNTIME_PROCESS_OWNER_LOCK_FILE), create)
+    }
+
+    pub(crate) fn validate_at_root(&self, root: &Path) -> Result<()> {
+        let root = checked_runtime_store_root(root.to_path_buf())?;
+        anyhow::ensure!(
+            owner_lock_is_at_path(&self._file, &root.join(RUNTIME_PROCESS_OWNER_LOCK_FILE))?,
+            "held Runtime owner lease changed before host recovery"
+        );
+        Ok(())
+    }
+
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
         let root = checked_runtime_store_root(root.to_path_buf())?;
         let path = root.join(RUNTIME_PROCESS_OWNER_LOCK_FILE);
@@ -7408,6 +7425,7 @@ impl RuntimeThreadManager {
             None,
             None,
             crate::core::engine::EngineHostProfile::Normal,
+            None,
         )
     }
 
@@ -7424,6 +7442,7 @@ impl RuntimeThreadManager {
             Some(plugin_registry),
             None,
             crate::core::engine::EngineHostProfile::Normal,
+            None,
         )
     }
 
@@ -7457,6 +7476,7 @@ impl RuntimeThreadManager {
                     Some(plugin_registry),
                     None,
                     crate::core::engine::EngineHostProfile::Normal,
+                    None,
                 );
             }
             binding.validate_existing_store()?;
@@ -7469,6 +7489,7 @@ impl RuntimeThreadManager {
             Some(plugin_registry),
             binding,
             crate::core::engine::EngineHostProfile::Normal,
+            None,
         )
     }
 
@@ -7496,6 +7517,7 @@ impl RuntimeThreadManager {
             Some(plugin_registry),
             Some(binding),
             crate::core::engine::EngineHostProfile::Normal,
+            None,
         )
     }
 
@@ -7521,19 +7543,23 @@ impl RuntimeThreadManager {
         Self::open_existing_session(config, workspace, manager_cfg, plugin_registry, &binding)
     }
 
-    pub(crate) fn open_acp(
+    pub(crate) fn open_host(
         config: Config,
         workspace: PathBuf,
         manager_cfg: RuntimeThreadManagerConfig,
         plugins: Arc<crate::plugins::PluginRegistry>,
+        host_profile: crate::core::engine::EngineHostProfile,
+        preheld_lock: Option<RuntimeProcessOwnerLock>,
+        binding: Option<&RuntimeStoreBinding>,
     ) -> Result<Self> {
         Self::open_inner(
             config,
             workspace,
             manager_cfg,
             Some(plugins),
-            None,
-            crate::core::engine::EngineHostProfile::Acp,
+            binding,
+            host_profile,
+            preheld_lock,
         )
     }
 
@@ -7544,6 +7570,7 @@ impl RuntimeThreadManager {
         plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
         binding: Option<&RuntimeStoreBinding>,
         host_profile: crate::core::engine::EngineHostProfile,
+        preheld_lock: Option<RuntimeProcessOwnerLock>,
     ) -> Result<Self> {
         // A public RuntimeThreadManager owns independent native threads. They
         // may run concurrently with the interactive TUI because their events
@@ -7560,9 +7587,18 @@ impl RuntimeThreadManager {
                 .sessions_dir()
                 .to_path_buf(),
         );
-        let process_owner_lock = Arc::new(RuntimeProcessOwnerLock::acquire(&manager_cfg.data_dir)?);
+        let process_owner_lock = match preheld_lock {
+            Some(lock) => lock,
+            None => RuntimeProcessOwnerLock::acquire(&manager_cfg.data_dir)?,
+        };
+        process_owner_lock.validate_at_root(&manager_cfg.data_dir)?;
+        let process_owner_lock = Arc::new(process_owner_lock);
         // Recheck under the exclusive host lock, before store recovery can write.
         if let Some(binding) = binding {
+            anyhow::ensure!(
+                checked_runtime_store_root(manager_cfg.data_dir.clone())? == binding.data_dir,
+                "captured Runtime store differs from the held host lease"
+            );
             binding.validate_existing_store()?;
         }
         let store = RuntimeThreadStore::open(manager_cfg.data_dir.clone())?;
@@ -17308,6 +17344,7 @@ impl RuntimeThreadManager {
                     tool_name,
                     description,
                     input,
+                    approval_key,
                     approval_grouping_key,
                     intent_summary,
                     approval_force_prompt,
@@ -17350,7 +17387,30 @@ impl RuntimeThreadManager {
                         summary: Some(summary.clone()),
                     };
 
-                    if auto_approve {
+                    use crate::core::authority::{
+                        ApprovalRequestDisposition, TurnAuthority,
+                        resolve_approval_request_disposition,
+                    };
+                    let grant = self.session_grant_for(&thread_id, &approval_grouping_key);
+                    // This resolver reads the exact live approval posture only;
+                    // Core already owns mode and shell admission for this call.
+                    let approval_authority = TurnAuthority::from_effective_fields(
+                        codewhale_config::AppMode::Agent,
+                        true,
+                        trust_mode,
+                        auto_approve,
+                        approval_mode,
+                    );
+                    let disposition = resolve_approval_request_disposition(
+                        &approval_authority,
+                        grant.is_some(),
+                        false, // Runtime has grants, but no session-denial cache.
+                        approval_force_prompt,
+                        // Rust mints this namespace; tool text cannot claim origin.
+                        approval_key.starts_with("extcall:ext:"),
+                    );
+
+                    if disposition == ApprovalRequestDisposition::AutoApprove && auto_approve {
                         // No waiter is registered on this path, but the emitted
                         // identity still has to obey the one contract clients
                         // read: `approval_id` is ours, `tool_call_id` is the
@@ -17373,13 +17433,6 @@ impl RuntimeThreadManager {
                             }),
                         )
                         .await?;
-                        let auto_decision =
-                            Self::approval_decision(auto_approve, trust_mode, false);
-                        let (dec_str, approved) = match auto_decision {
-                            RuntimeApprovalDecision::ApproveTool => ("allow", true),
-                            RuntimeApprovalDecision::DenyTool
-                            | RuntimeApprovalDecision::RetryWithFullAccess => ("deny", false),
-                        };
                         // Emit approval.decided so external clients (GUI)
                         // know the approval was resolved automatically and
                         // can clear any pending approval UI.  Without this
@@ -17393,37 +17446,33 @@ impl RuntimeThreadManager {
                             json!({
                                 "approval_id": approval_id,
                                 "tool_call_id": id,
-                                "decision": dec_str,
+                                "decision": "allow",
                                 "remember": false,
                                 "auto": true,
                             }),
                         )
                         .await
                         .ok();
-                        if approved {
-                            let _ = engine
-                                .approve_tool_call_by(
-                                    id,
-                                    crate::approval_log::ApprovalDecider::Posture,
-                                )
-                                .await;
-                        } else {
-                            let _ = engine
-                                .deny_tool_call_by(
-                                    id,
-                                    crate::approval_log::ApprovalDecider::Posture,
-                                )
-                                .await;
-                        }
+                        let _ = engine
+                            .approve_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
+                            .await;
                         continue;
                     }
 
-                    // Auto-Review never opens an approval modal. The engine
-                    // resolves gated tools under Auto itself, so reaching
-                    // this branch means a host injected the event directly:
-                    // fail closed (the audit trail stays authoritative)
-                    // instead of pausing the turn.
-                    if approval_mode == ApprovalMode::Auto {
+                    // The same typed dispositions used by TUI fail closed:
+                    // a Full Access policy hold or Never posture must not be
+                    // answered by posture or a remembered conversation grant.
+                    let denied_posture = match disposition {
+                        ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold => {
+                            Some("full_access_policy_hold")
+                        }
+                        ApprovalRequestDisposition::AutoDenyAutoReview => Some("auto_review"),
+                        ApprovalRequestDisposition::AutoDenyNeverPosture => Some("never"),
+                        ApprovalRequestDisposition::AutoDenySessionDenied => Some("session_denied"),
+                        ApprovalRequestDisposition::AutoApprove
+                        | ApprovalRequestDisposition::Prompt => None,
+                    };
+                    if let Some(posture) = denied_posture {
                         self.emit_event(
                             &thread_id,
                             Some(&turn_id),
@@ -17435,7 +17484,7 @@ impl RuntimeThreadManager {
                                 "decision": "deny",
                                 "remember": false,
                                 "auto": true,
-                                "posture": "auto_review",
+                                "posture": posture,
                             }),
                         )
                         .await
@@ -17449,9 +17498,8 @@ impl RuntimeThreadManager {
                     // A session grant for this tool and argument class
                     // answers the prompt without a modal and without touching
                     // posture (E1). A forced prompt is never pre-answered.
-                    if !approval_force_prompt
-                        && let Some(grant) =
-                            self.session_grant_for(&thread_id, &approval_grouping_key)
+                    if disposition == ApprovalRequestDisposition::AutoApprove
+                        && let Some(grant) = grant
                     {
                         let approval_id = Self::mint_approval_id();
                         self.emit_event(

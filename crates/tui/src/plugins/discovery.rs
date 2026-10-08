@@ -173,6 +173,23 @@ pub(crate) fn discover_with_context(
     )
 }
 
+// These exact operation-name shapes are reserved by stage::fresh_staging_dir
+// and place::finalize_install. Do not hide human paths such as demo.bak or
+// .staging-not-a-uuid, which can legitimately contain reviewed bundles.
+fn is_internal_publication_directory(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix(".staging-").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) || name.strip_prefix(".plugin-backup-").is_some_and(|suffix| {
+        suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
 fn scan_root(
     root: &Path,
     scope: PluginScope,
@@ -244,6 +261,9 @@ fn scan_root(
     entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
+        if is_internal_publication_directory(&entry.file_name()) {
+            continue;
+        }
         let plugin_root = entry.path();
         let Ok(metadata) = fs::symlink_metadata(&plugin_root) else {
             continue;
@@ -837,3 +857,7 @@ mod tests {
         assert!(!home.join("plugins/state.json").exists());
     }
 }
+
+#[cfg(test)]
+#[path = "discovery_internal_paths_tests.rs"]
+mod internal_publication_tests;

@@ -603,13 +603,37 @@ fn install_update_uninstall_verbs_drive_the_guided_trust_flow() {
                 .exists()
         );
 
-        // Local-path installs cannot be updated from the network.
+        // An unchanged local source succeeds without changing the review token.
         let update = plugins_with_kimi_home_override(&mut app, Some("update installed-demo"), None);
-        assert!(update.is_error);
-        assert!(update.message.unwrap().contains("local path"));
+        assert!(!update.is_error, "{:?}", update.message);
+        assert!(update.message.unwrap().contains("already up to date"));
 
         let arg = confirmation.trim_start_matches("/plugin ").to_string();
         assert!(!plugins_with_kimi_home_override(&mut app, Some(&arg), None).is_error);
+        assert!(
+            !plugins_with_kimi_home_override(&mut app, Some("enable installed-demo"), None)
+                .is_error
+        );
+        assert!(app.plugin_registry.is_active("installed-demo"));
+
+        fs::write(
+            source.join("plugin.toml"),
+            "schema_version = 1\n[plugin]\nname = \"installed-demo\"\nversion = \"2.0.0\"\n",
+        )
+        .unwrap();
+        let updated =
+            plugins_with_kimi_home_override(&mut app, Some("update installed-demo"), None);
+        assert!(!updated.is_error, "{:?}", updated.message);
+        let message = updated.message.unwrap();
+        let current_confirmation = message
+            .lines()
+            .find(|line| line.starts_with("/plugin trust installed-demo "))
+            .expect("changed local content must route into its current review");
+        assert_ne!(current_confirmation, confirmation);
+        assert!(!app.plugin_registry.is_active("installed-demo"));
+        assert!(plugins_with_kimi_home_override(&mut app, Some(&arg), None).is_error);
+        let current_arg = current_confirmation.trim_start_matches("/plugin ");
+        assert!(!plugins_with_kimi_home_override(&mut app, Some(current_arg), None).is_error);
         assert!(
             !plugins_with_kimi_home_override(&mut app, Some("enable installed-demo"), None)
                 .is_error

@@ -15903,6 +15903,302 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
     Ok(())
 }
 
+/// Drive Runtime's actual event monitor and inspect the Engine inbox, rather
+/// than restating the pure resolver's truth table (#6471).
+#[tokio::test]
+async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Result<()> {
+    use crate::approval_log::ApprovalDecider;
+
+    for (posture, forced, remembered, approved, denied_posture) in [
+        ("full-access", false, false, true, None),
+        ("full-access", false, true, true, None),
+        (
+            "full-access",
+            true,
+            false,
+            false,
+            Some("full_access_policy_hold"),
+        ),
+        (
+            "full-access",
+            true,
+            true,
+            false,
+            Some("full_access_policy_hold"),
+        ),
+        ("never", false, false, false, Some("never")),
+        ("never", false, true, false, Some("never")),
+        ("ask", false, true, true, None),
+    ] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                permission_posture: Some(
+                    if posture == "never" { "ask" } else { posture }.to_string(),
+                ),
+                ..Default::default()
+            })
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "honor the exact approval disposition".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ));
+        // Never is an internal live authority, not a public Runtime posture.
+        if posture == "never" {
+            harness.handle.publish_turn_authority(
+                AppMode::Agent,
+                true,
+                false,
+                false,
+                ApprovalMode::Never,
+                None,
+            );
+        }
+        let grant = if remembered {
+            Some(
+                manager
+                    .add_session_grant(&thread.id, &turn.id, "bash", "policy-group", "s")
+                    .await
+                    .context("fixture conversation grant")?,
+            )
+        } else {
+            None
+        };
+        harness
+            .tx_event
+            .send(EngineEvent::ApprovalRequired {
+                approval_key: "policy-key".to_string(),
+                approval_grouping_key: "policy-group".to_string(),
+                id: "policy-call".to_string(),
+                tool_name: "bash".to_string(),
+                // Text and input cannot impersonate a Rust-minted origin key.
+                description: "Requested by extension:claimed".to_string(),
+                input: json!({"approval_key": "extcall:ext:claimed", "command": "echo fixture"}),
+                intent_summary: None,
+                approval_force_prompt: forced,
+            })
+            .await?;
+        let decision =
+            tokio::time::timeout(APPROVAL_READINESS_TIMEOUT, harness.recv_approval_decision())
+                .await
+                .context("automatic disposition must not open a modal")?;
+        let expected = if approved {
+            MockApprovalEvent::Approved {
+                id: "policy-call".to_string(),
+            }
+        } else {
+            MockApprovalEvent::Denied {
+                id: "policy-call".to_string(),
+            }
+        };
+        let by = if approved && posture == "ask" {
+            ApprovalDecider::SessionRule
+        } else {
+            ApprovalDecider::Posture
+        };
+        assert_eq!(
+            decision,
+            Some((expected, Some(by))),
+            "{posture}/{forced}/{remembered}"
+        );
+        assert_eq!(manager.pending_approvals_count(), 0);
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        assert!(detail.pending_approvals.is_empty());
+        assert_eq!(detail.approval_grants.len(), usize::from(remembered));
+        let decided = manager
+            .events_since(&thread.id, None)?
+            .into_iter()
+            .find(|event| {
+                event.event == "approval.decided" && event.payload["tool_call_id"] == "policy-call"
+            })
+            .context("automatic decision receipt")?;
+        assert_eq!(
+            decided.payload["decision"],
+            if approved { "allow" } else { "deny" }
+        );
+        assert_eq!(decided.payload["auto"], true);
+        assert_eq!(decided.payload["remember"], false);
+        if let Some(posture) = denied_posture {
+            assert_eq!(decided.payload["posture"], posture);
+        }
+        if approved && posture == "ask" {
+            assert_eq!(decided.payload["grant_id"], grant.unwrap().grant_id);
+        } else {
+            assert!(decided.payload.get("grant_id").is_none());
+        }
+        let approval_id = decided.payload["approval_id"]
+            .as_str()
+            .context("opaque decision identity")?;
+        assert!(approval_id.starts_with("approval_"));
+        assert_ne!(approval_id, "policy-call");
+        for id in ["policy-call", approval_id] {
+            assert!(!manager.deliver_external_approval(
+                id,
+                ExternalApprovalDecision::Allow { remember: false },
+            ));
+        }
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        assert_eq!(
+            wait_for_terminal_turn(&manager, &turn.id).await?.status,
+            RuntimeTurnStatus::Completed,
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_approval_disposition_forced_requests_require_human() -> Result<()> {
+    use crate::approval_log::ApprovalDecider;
+
+    for (posture, tool_name, extension_origin) in [
+        ("full-access", "bash", true),
+        ("full-access", "web_search", true),
+        ("ask", "bash", false),
+    ] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                permission_posture: Some(posture.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "wait for the exact human decision".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ));
+        let input = json!({"command": "echo fixture", "query": "fixture"});
+        let (key, group) = if extension_origin {
+            crate::tools::approval_cache::extension_origin_approval_keys(
+                "ext:fixture@reviewed-hash",
+                None,
+                tool_name,
+                &input,
+            )
+        } else {
+            crate::tools::approval_cache::approval_keys_for_call(None, tool_name, &input)
+        };
+        let grant = manager
+            .add_session_grant(&thread.id, &turn.id, tool_name, &group.0, "s")
+            .await
+            .context("fixture conversation grant")?;
+        harness
+            .tx_event
+            .send(EngineEvent::ApprovalRequired {
+                approval_key: key.0,
+                approval_grouping_key: group.0,
+                id: "human-call".to_string(),
+                tool_name: tool_name.to_string(),
+                description: "exact human approval required".to_string(),
+                input,
+                intent_summary: None,
+                approval_force_prompt: true,
+            })
+            .await?;
+        let approval_id = await_approval_identity(&manager, &thread.id, "human-call").await?;
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        assert_eq!(detail.pending_approvals.len(), 1, "{posture}/{tool_name}");
+        assert_eq!(detail.pending_approvals[0].id, approval_id);
+        assert_eq!(detail.pending_approvals[0].turn_id, turn.id);
+        assert_eq!(
+            detail.pending_approvals[0].tool_call_id.as_deref(),
+            Some("human-call")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.recv_approval_decision())
+                .await
+                .is_err(),
+            "neither Full Access nor a remembered grant may answer: {posture}/{tool_name}"
+        );
+        assert!(!manager.deliver_external_approval(
+            "human-call",
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert!(manager.deliver_external_approval(
+            &approval_id,
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert_eq!(
+            tokio::time::timeout(APPROVAL_READINESS_TIMEOUT, harness.recv_approval_decision())
+                .await?,
+            Some((
+                MockApprovalEvent::Approved {
+                    id: "human-call".to_string()
+                },
+                Some(ApprovalDecider::User),
+            )),
+        );
+        assert_eq!(manager.pending_approvals_count(), 0);
+        assert!(!manager.deliver_external_approval(
+            &approval_id,
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert_eq!(
+            manager.approval_grants_for_thread(&thread.id)[0].grant_id,
+            grant.grant_id
+        );
+        let decided = manager
+            .events_since(&thread.id, None)?
+            .into_iter()
+            .find(|event| {
+                event.event == "approval.decided" && event.payload["approval_id"] == approval_id
+            })
+            .context("human decision receipt")?;
+        assert_eq!(decided.payload["decision"], "allow");
+        assert_ne!(
+            decided.payload.get("auto").and_then(Value::as_bool),
+            Some(true)
+        );
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        assert_eq!(
+            wait_for_terminal_turn(&manager, &turn.id).await?.status,
+            RuntimeTurnStatus::Completed,
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn auto_review_force_prompt_is_denied_without_opening_a_modal() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;

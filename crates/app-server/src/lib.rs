@@ -610,6 +610,7 @@ pub async fn bind_runtime_owner(
             acp_only: false,
         },
         None,
+        None,
     )
     .await?;
     Ok(daemon)
@@ -623,6 +624,7 @@ pub async fn bind_runtime_frontends(
     owner: codewhale_protocol::RuntimeOwnerReceipt,
     routing: RuntimeOwnerRouting,
     owner_frontend: Option<Arc<dyn RuntimeOwnerFrontend>>,
+    recovery: Option<Arc<daemon_client::UnavailablePublication>>,
 ) -> Result<(daemon_socket::DaemonSocket, AppState)> {
     anyhow::ensure!(
         owner.version == 1 && owner.pid == std::process::id() && !owner.lease_generation.is_empty(),
@@ -660,7 +662,16 @@ pub async fn bind_runtime_frontends(
     state.captured_routing = Some(routing);
     state.owner_frontend = owner_frontend;
     *state.runtime_bridge.lock().await = Some(Arc::new(Mutex::new(bridge)));
-    let daemon = daemon_socket::bind_captured_owner(state.clone(), owner).await?;
+    #[cfg(unix)]
+    let daemon = daemon_socket::bind_captured_owner(state.clone(), owner, recovery).await?;
+    #[cfg(windows)]
+    let daemon = {
+        anyhow::ensure!(
+            recovery.is_none(),
+            "Windows stale-owner recovery is not qualified; refusing fallback"
+        );
+        daemon_socket::bind_captured_owner(state.clone(), owner).await?
+    };
     Ok((daemon, state))
 }
 

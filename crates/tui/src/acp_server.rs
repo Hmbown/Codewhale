@@ -1183,11 +1183,14 @@ mod tests {
             };
             let plugins = Arc::new(crate::plugins::PluginRegistry::empty(&workspace));
             let manager = Arc::new(if acp {
-                RuntimeThreadManager::open_acp(
+                RuntimeThreadManager::open_host(
                     config.clone(),
                     workspace.clone(),
                     manager_config,
                     plugins,
+                    crate::core::engine::EngineHostProfile::Acp,
+                    None,
+                    None,
                 )?
             } else {
                 RuntimeThreadManager::open_with_plugin_registry(
@@ -1367,6 +1370,7 @@ mod tests {
                 acp_only: base_acp,
             },
             Some(frontend),
+            None,
         )
         .await?;
         let shutdown = daemon.shutdown_handle();

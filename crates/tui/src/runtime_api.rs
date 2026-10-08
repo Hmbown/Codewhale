@@ -1588,7 +1588,15 @@ fn open_runtime_threads_for_server(
     SharedRuntimeThreadManager,
     crate::tools::large_output_router::WorkshopConfig,
 )> {
-    open_runtime_threads_for_host(config, workspace, manager_config, plugin_registry, false)
+    open_runtime_threads_for_host(
+        config,
+        workspace,
+        manager_config,
+        plugin_registry,
+        false,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn open_runtime_threads_for_host(
@@ -1597,6 +1605,8 @@ pub(crate) fn open_runtime_threads_for_host(
     manager_config: RuntimeThreadManagerConfig,
     plugin_registry: Arc<crate::plugins::PluginRegistry>,
     acp: bool,
+    preheld_lock: Option<crate::runtime_threads::RuntimeProcessOwnerLock>,
+    binding: Option<&crate::runtime_threads::RuntimeStoreBinding>,
 ) -> Result<(
     SharedRuntimeThreadManager,
     crate::tools::large_output_router::WorkshopConfig,
@@ -1606,21 +1616,98 @@ pub(crate) fn open_runtime_threads_for_host(
     // thread manager can spawn any of those engines, matching interactive and
     // headless exec startup.
     let workshop_activation = install_runtime_server_workshop_budgets(config);
-    let manager = Arc::new(if acp {
-        RuntimeThreadManager::open_acp(config.clone(), workspace, manager_config, plugin_registry)
+    let profile = if acp {
+        crate::core::engine::EngineHostProfile::Acp
     } else {
-        RuntimeThreadManager::open_with_plugin_registry(
-            config.clone(),
-            workspace,
-            manager_config,
-            plugin_registry,
-        )
-    }?);
+        crate::core::engine::EngineHostProfile::Normal
+    };
+    let manager = Arc::new(RuntimeThreadManager::open_host(
+        config.clone(),
+        workspace,
+        manager_config,
+        plugin_registry,
+        profile,
+        preheld_lock,
+        binding,
+    )?);
     // Publish the same exact endpoint-scoped catalog as interactive startup
     // before the server admits turns. A cached model list alone does not make
     // its capabilities available to route resolution.
     crate::provider_catalog_live::maybe_load_persisted_cache_for_config(config);
     Ok((manager, workshop_activation))
+}
+
+#[cfg(unix)]
+enum RuntimeHostAdmission {
+    Attached(Box<codewhale_app_server::daemon_client::OwnerClient>),
+    Bootstrap {
+        lock: crate::runtime_threads::RuntimeProcessOwnerLock,
+        binding: Option<crate::runtime_threads::RuntimeStoreBinding>,
+        recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
+    },
+}
+
+/// Observe first, then hold the existing store lease through all recovery.
+/// Only pre-write publication changes or lease contention can re-observe.
+#[cfg(unix)]
+async fn admit_runtime_host(
+    config_path: Option<PathBuf>,
+    selected_socket: Option<PathBuf>,
+    selected_store: PathBuf,
+) -> Result<RuntimeHostAdmission> {
+    use codewhale_app_server::daemon_client::{HostOwnerProbe, PublicationChangedBeforeAttach};
+    use codewhale_app_server::daemon_socket::owner_work;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let probe = match codewhale_app_server::daemon_client::probe_owner_for_host_startup(
+                config_path.clone(), selected_socket.clone(),
+            ).await {
+                Err(error) if error.is::<PublicationChangedBeforeAttach>() => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                result => result?,
+            };
+            let (binding, recovery) = match probe {
+                HostOwnerProbe::Attached(client) => return Ok(RuntimeHostAdmission::Attached(client)),
+                HostOwnerProbe::Absent => (None, None),
+                HostOwnerProbe::Unavailable(publication) => {
+                    let binding = validate_selected_owner_receipt(publication.receipt().clone(), selected_store.clone()).await?;
+                    (Some(binding), Some(publication))
+                }
+            };
+            let store = selected_store.clone();
+            let existing = binding.clone();
+            let create = recovery.is_none();
+            let lock = owner_work(move || {
+                if let Some(binding) = existing.as_ref() { binding.validate_existing_store()?; }
+                crate::runtime_threads::RuntimeProcessOwnerLock::try_acquire_for_host(&store, create)
+            }).await?;
+            let Some(lock) = lock else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            let store = selected_store.clone();
+            let existing = binding.clone();
+            let lock = owner_work(move || {
+                lock.validate_at_root(&store)?;
+                if let Some(binding) = existing.as_ref() { binding.validate_existing_store()?; }
+                Ok(lock)
+            }).await?;
+            let current = match recovery.as_ref() {
+                Some(publication) => publication.revalidate().await?,
+                None => codewhale_app_server::daemon_client::publication_is_absent(
+                    config_path.clone(), selected_socket.clone(),
+                ).await?,
+            };
+            if !current {
+                drop(lock);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            return Ok(RuntimeHostAdmission::Bootstrap { lock, binding, recovery });
+        }
+    }).await.context("Runtime host admission deadline expired; attachment outcome may be uncertain and is not replayed")?
 }
 
 /// Prefix of the first line the Runtime prints once it holds its listener.
@@ -1646,12 +1733,34 @@ pub async fn run_http_server(
         Some(task_default_model.clone()),
         Some(options.workers),
     );
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
+    let admission = admit_runtime_host(
+        options.config_path.clone(),
+        selected_control_socket(&options),
+        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()).data_dir,
+    )
+    .await?;
+    #[cfg(unix)]
+    let (published, preheld_lock, existing_binding, recovery) = match admission {
+        RuntimeHostAdmission::Attached(client) => (Some(*client), None, None, None),
+        RuntimeHostAdmission::Bootstrap {
+            lock,
+            binding,
+            recovery,
+        } => (None, Some(lock), binding, recovery),
+    };
+    #[cfg(windows)]
     let published = codewhale_app_server::daemon_client::connect_if_published(
         options.config_path.clone(),
         selected_control_socket(&options),
     )
     .await?;
+    #[cfg(not(unix))]
+    let preheld_lock = None;
+    #[cfg(not(unix))]
+    let existing_binding: Option<crate::runtime_threads::RuntimeStoreBinding> = None;
+    #[cfg(windows)]
+    let recovery = None;
     #[cfg(any(unix, windows))]
     if let Some(control) = published {
         let selected_store =
@@ -1761,6 +1870,8 @@ pub async fn run_http_server(
         manager_config,
         plugin_discovery.registry_for_workspace(&workspace),
         acp_selected,
+        preheld_lock,
+        existing_binding.as_ref(),
     )?;
     let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
     let task_manager =
@@ -1865,6 +1976,7 @@ pub async fn run_http_server(
         },
         options.workers,
         resolved_auth.generated,
+        recovery,
     )
     .await?;
     let listener_workspace = state.workspace.clone();
@@ -2003,7 +2115,16 @@ pub(crate) async fn validate_selected_owner(
     client: &codewhale_app_server::daemon_client::OwnerClient,
     selected_store: PathBuf,
 ) -> Result<()> {
-    let receipt = client.receipt().clone();
+    validate_selected_owner_receipt(client.receipt().clone(), selected_store)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(any(unix, windows))]
+async fn validate_selected_owner_receipt(
+    receipt: codewhale_protocol::RuntimeOwnerReceipt,
+    selected_store: PathBuf,
+) -> Result<crate::runtime_threads::RuntimeStoreBinding> {
     codewhale_app_server::daemon_socket::owner_work(move || {
         let selected = crate::runtime_threads::RuntimeStoreBinding::for_store_dir(&selected_store)?;
         selected.validate_existing_store()?;
@@ -2013,7 +2134,7 @@ pub(crate) async fn validate_selected_owner(
                 && selected.execution_scope == receipt.execution_scope,
             "authenticated Runtime owner belongs to another selected store; refusing attachment"
         );
-        Ok(())
+        Ok(selected)
     })
     .await
 }
@@ -2025,6 +2146,7 @@ async fn bind_captured_runtime_frontends(
     model: String,
     worker_setting: usize,
     generated_auth: bool,
+    recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
 ) -> Result<(
     codewhale_app_server::daemon_socket::DaemonSocket,
     codewhale_app_server::AppState,
@@ -2079,6 +2201,7 @@ async fn bind_captured_runtime_frontends(
             CapturedRuntimeFrontend::capture(state.clone(), model, worker_setting, generated_auth)
                 .await?,
         ),
+        recovery,
     )
     .await
 }

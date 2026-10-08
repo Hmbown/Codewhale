@@ -459,8 +459,8 @@ async fn run_plugin_mutation(
              to review its capabilities, then trust and enable it.",
         ),
         PluginMutationOutcome::Updated => Some(
-            "Content changed; the previous trust receipt no longer matches. \
-             Review and trust it again before enabling.",
+            "Installed content refreshed. Review its current capabilities \
+             and trust it if needed before enabling.",
         ),
         _ => None,
     };

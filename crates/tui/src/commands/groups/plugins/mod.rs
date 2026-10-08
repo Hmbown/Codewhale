@@ -874,8 +874,8 @@ fn update_bundle(
             PluginMutationOutcome::Updated => {
                 let name = receipt.name.clone();
                 let mut output = format!(
-                    "Updated plugin '{name}'. Its content changed, so the previous trust receipt no \
-                     longer matches — review and trust it again before enabling.\n"
+                    "Updated plugin '{name}'. Review its current capabilities and trust it \
+                     if needed before enabling.\n"
                 );
                 if let Some(review) = review_bundle(presentation, plugin, &name).message {
                     output.push('\n');

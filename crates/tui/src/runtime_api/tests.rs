@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 mod command_catalog;
 mod headless_catalog;
+#[cfg(unix)]
+mod owner_bootstrap;
 mod profile_constitution;
 #[cfg(any(unix, windows))]
 mod runtime_store_convergence;
@@ -1355,7 +1357,7 @@ async fn build_test_server(
         let model = runtime_request_model(&state.config.read(), None)
             .map_err(|error| anyhow::anyhow!(error.message))?;
         let (owner, compatibility) =
-            bind_captured_runtime_frontends(&state, Some(socket), model, 1, false).await?;
+            bind_captured_runtime_frontends(&state, Some(socket), model, 1, false, None).await?;
         (Some(owner), Some(compatibility))
     } else {
         (None, None)
