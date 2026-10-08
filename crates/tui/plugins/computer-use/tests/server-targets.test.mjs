@@ -237,6 +237,9 @@ test("batches prevalidate later steps and refuse ambiguous, missing and stale fi
     { tool: "type", args: { text: "x", computer: "elsewhere" } },
     { tool: "type", args: { text: "x" }, find: { query: " " } },
     { tool: "type", args: { text: "x", target: { type: "element", index: 1 } }, find: { query: "OK" } },
+    { tool: "wait_for", args: {} },
+    { tool: "get_app_state", args: { detail: "invalid" } },
+    { tool: "left_click", find: { query: "OK", window_id: -1 } },
   ]) {
     const result = await tool("run_actions", { steps: [{ tool: "type", args: { text: "must not send" } }, tail] });
     assert.equal(result.ok, false, JSON.stringify(tail));
@@ -254,6 +257,26 @@ test("batches prevalidate later steps and refuse ambiguous, missing and stale fi
     assert.equal(result.action_sent, false);
   } finally { setControl(null); }
   assert.equal(calls("type").length + calls("left_click").length, before);
+});
+
+test("merged computer aliases cannot switch or remove another computer inside a batch", async () => {
+  await tool("computer_register", { computer: "batch-pad", transport: "hdc" });
+  const before = calls("type").length;
+  try {
+    for (const action of ["switch", "remove"]) {
+      const result = await tool("run_actions", { steps: [
+        { tool: "type", args: { text: "must not send" } },
+        { tool: "computer", args: { action, id: "batch-pad" } },
+      ] });
+      assert.equal(result.ok, false, JSON.stringify(result));
+      assert.equal(result.error.code, "bad_args");
+    }
+    assert.equal(calls("type").length, before);
+    assert.equal((await tool("computer_switch", { computer: "batch-pad" })).ok, true, "refused remove preserved the computer");
+  } finally {
+    await tool("computer_switch", { computer: "local" });
+    await tool("computer_remove", { computer: "batch-pad" });
+  }
 });
 
 test("a timed-out batch wait stops later input and retains the already sent step receipt", async () => {

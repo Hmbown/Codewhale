@@ -113,6 +113,7 @@ test("wait_for absent is satisfied immediately when nothing matches", async () =
 });
 
 test("wait_for rechecks its condition on the observation returned for targeting", async () => {
+  const baseline = await tool("get_app_state");
   setControl({ observations: [
     { elements: [{ index: 0, path: [0], windowIndex: 0, role: "AXButton", label: "flashing" }] },
     { elements: [] },
@@ -124,6 +125,11 @@ test("wait_for rechecks its condition on the observation returned for targeting"
     assert.equal(result.timed_out, true);
     assert.equal(result.state_id, undefined);
   } finally { setControl(null); }
+  assert.equal((await tool("left_click", { target: { type: "element", index: 1 } })).ok, true,
+    "an unsuccessful recheck must not replace the last usable implicit target state");
+  const next = await tool("get_app_state");
+  assert.equal(Number(next.state_id.slice(2)), Number(baseline.state_id.slice(2)) + 1,
+    "unsuccessful rechecks never enter or evict states from the bounded cache");
 });
 
 test("wait_for absent succeeds without a target state when the app closes during the bound read", async () => {

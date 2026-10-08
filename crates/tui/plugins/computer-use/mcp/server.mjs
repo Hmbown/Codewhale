@@ -486,27 +486,24 @@ async function invokeType(invoke, prepared) {
   return { ...last, newlines_as_return: true, typed_parts: steps.length };
 }
 
-function observeState(computer, app_ref, result, args = {}) {
+function observeState(computer, app_ref, result, args = {}, bindWhen = null) {
   // Cache the complete backend records before making the model-facing view.
   // Public indices still address those records, including their private AX
   // paths; a compact response must never weaken live target revalidation.
   // Ephemeral polls (wait_for) share the filter math without churning the
   // state cache: only the observation a caller can act on earns a state_id.
-  const ephemeral = args.ephemeral === true;
+  const filtered = filterElements(result.elements, {
+    detail: args.detail === "full" ? "full" : "summary", query: args.query,
+    role: args.role, limit: args.limit, offset: args.offset,
+    compact: args.detail === "compact" || args.compact === true,
+  });
+  const ephemeral = args.ephemeral === true || (bindWhen && (result.found === false || !bindWhen({ matched: filtered.matched, tree_truncated: result.truncated === true })));
   const baseId = args.since === "latest" ? latestStateByComputer.get(computer.id) : args.since;
   const baseline = baseId ? appStates.get(baseId) : null;
   if (baseline && baseline.computerId !== computer.id) throw new ServerError("state_wrong_computer", "since belongs to another computer — observe this computer first");
   const state_id = ephemeral ? null : rememberState(computer, app_ref, result);
   const compact = args.detail === "compact" || args.compact === true;
   const detail = args.detail === "full" ? "full" : compact ? "compact" : "summary";
-  const filtered = filterElements(result.elements, {
-    detail: args.detail === "full" ? "full" : "summary",
-    query: args.query,
-    role: args.role,
-    limit: args.limit,
-    offset: args.offset,
-    compact,
-  });
   const data = {
     ...result,
     state_id,
@@ -557,6 +554,8 @@ function batchSteps(args, computer) {
     if (input.computer !== undefined && input.computer !== computer.id) throw new ServerError("bad_args", `step ${i} cannot switch computers inside a batch`);
     if (!TOOL_NAMES.has(step.tool)) throw new ServerError("unknown_tool", `unknown tool "${step.tool}"`);
     const resolved = resolveTool(step.tool, input);
+    if (resolved.args.computer !== undefined && resolved.args.computer !== computer.id) throw new ServerError("bad_args", `step ${i} cannot select another computer through an alias`);
+    validateToolArgs(computer, resolved.name, resolved.args);
     if (["run_actions", "trajectory_replay"].includes(resolved.name)) throw new ServerError("bad_args", "run_actions cannot nest or replay another batch");
     if (isConsentDecision(step.tool, input)) throw new ServerError("bad_args", "consent decisions cannot be a run_actions step — record each one as its own consent call after the user answers");
     if (needsUserDecision(step.tool, input)) throw new ServerError("consent_needs_user", `${step.tool} needs the user's own approval as its own call, not a run_actions step`);
@@ -569,6 +568,7 @@ function batchSteps(args, computer) {
         throw new ServerError("bad_args", `step ${i} find needs a nonempty query and/or exact role, with optional app_ref/window_id`);
       }
       if (resolved.args.target !== undefined || !TOOLS.find((tool) => tool.name === resolved.name)?.inputSchema.properties.target) throw new ServerError("bad_args", `step ${i} find needs a tool accepting target and cannot replace an explicit target`);
+      validateToolArgs(computer, "get_app_state", find);
     }
     for (const field of REQUIRED_ARGS.get(resolved.name) ?? []) {
       if (resolved.args[field] == null && !(field === "target" && step.find)) throw new ServerError("bad_args", `step ${i} ${step.tool} requires "${field}"`);
@@ -637,7 +637,7 @@ async function runActions(computer, args, switched) {
  * Errors that can resolve themselves (app not launched yet) count as "no
  * match yet"; errors that cannot (stopped, route changed) abort the wait.
  */
-async function waitFor(computer, args, switched) {
+function validateWaitArgs(args) {
   const { query, role } = args;
   if (query == null && role == null) throw new ServerError("bad_args", "wait_for needs a query and/or role to watch for");
   if (query != null && typeof query !== "string") throw new ServerError("bad_args", "query must be a string");
@@ -650,13 +650,18 @@ async function waitFor(computer, args, switched) {
   if (!Number.isInteger(intervalMs) || intervalMs < 100 || intervalMs > 5000) throw new ServerError("bad_args", "interval must be an integer 100..5000 ms");
   const limit = args.limit ?? 20;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new ServerError("bad_args", "limit must be an integer 1..100");
+  return { query, role, state, timeoutSec, intervalMs, limit };
+}
 
+async function waitFor(computer, args, switched) {
+  const { query, role, state, timeoutSec, intervalMs, limit } = validateWaitArgs(args);
   const FATAL = new Set(["cancelled", "control_stopped", "computer_route_changed", "app_upgrade_required"]);
   const missingApp = (body) => body?.found === false || /application not found/.test(body?.error?.message ?? "");
-  const observe = (ephemeral) => callTool({ name: "get_app_state", arguments: {
+  const satisfies = (body) => state === "absent" ? body.matched === 0 && !body.tree_truncated : body.matched > 0;
+  const observe = (ephemeral, bindWhen = null) => callTool({ name: "get_app_state", arguments: {
     app_ref: args.app_ref, window_id: args.window_id, query, role,
     limit, detail: "compact", ephemeral, computer: computer.id,
-  }});
+  }}, bindWhen);
   const started = Date.now();
   const deadline = started + timeoutSec * 1000;
   let polls = 0, lastError = null, everObserved = false;
@@ -679,7 +684,7 @@ async function waitFor(computer, args, switched) {
     }
     if (usable) { everObserved = true; lastError = null; }
     if (usable && (state === "absent" ? matchedCount === 0 : matchedCount > 0)) {
-      const bound = await observe(false);
+      const bound = await observe(false, satisfies);
       polls++;
       const b = JSON.parse(bound.content[0].text);
       if (state === "absent" && !FATAL.has(b.error?.code) && missingApp(b)) {
@@ -688,7 +693,7 @@ async function waitFor(computer, args, switched) {
       if (bound.isError || b.ok === false) {
         return { content: [{ type: "text", text: JSON.stringify(fail(computer, b.error?.code ?? "observe_failed", b.error?.message ?? "Follow-up observation failed", { tool: "wait_for", switched, matched: false, state, polls, elapsed_ms: Date.now() - started })) }], isError: true };
       }
-      if (state === "absent" ? b.matched === 0 && !b.tree_truncated : b.matched > 0) {
+      if (satisfies(b)) {
         return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, state_id: b.state_id, matched_count: b.matched ?? 0, elements: b.elements, app: { name: b.name ?? null, pid: b.pid ?? null, bundle_id: b.bundle_id ?? null }, note: "Elements are bound to this observation — target them with {type:'element', index}; add state_id only to pin this snapshot after later observes. Re-observe if the UI changes again." })) }] };
       }
     }
@@ -961,7 +966,7 @@ function assertNotOwnedElsewhere(id) {
 }
 
 // ---------- tool dispatch ----------
-async function callTool(params) {
+async function callTool(params, bindWhen = null) {
   const requested = params.name;
   if (!TOOL_NAMES.has(requested)) {
     return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: { code: "unknown_tool", message: `unknown tool "${requested}"` } }) }], isError: true };
@@ -1367,7 +1372,7 @@ async function callTool(params) {
       }
       if (backendMethod === "zoom") bindZoomRaster(computer, zoomParent, args.region, ex.filesLocal ? data?.file ?? data?.path : null, data?.file ?? data?.path);
       if (name === "get_app_state") {
-        data = observeState(computer, wireArgs.app_ref, data, args);
+        data = observeState(computer, wireArgs.app_ref, data, args, bindWhen);
       }
       if (backendMethod === "probe") Object.assign(data, { via: ex.kind, app: ex.app ?? null });
       if (backendMethod === "probe" && data?.app?.version && data.app.version !== APP_VERSION) {
@@ -1406,7 +1411,7 @@ async function callTool(params) {
       if (name === "screenshot") bindRaster(computer, data);
       if (backendMethod === "zoom") bindZoomRaster(computer, zoomParent, args.region, data?.file ?? data?.path);
       if (name === "get_app_state") {
-        data = observeState(computer, prepared.app_ref, data, args);
+        data = observeState(computer, prepared.app_ref, data, args, bindWhen);
       }
       if (backendMethod === "probe" && computer.transport === "local") {
         // Direct mode: permissions belong to whatever hosts this server. Say so.
@@ -1527,6 +1532,30 @@ async function callTool(params) {
   }
 }
 
+// Shared side-effect-free argument checks. Live targets and backend constraints
+// remain dispatch-time checks, so a batch may retain earlier completed effects.
+function validateToolArgs(computer, name, out) {
+  if (name === "wait_for") validateWaitArgs(out);
+  if (name === "get_app_state" || name === "find_elements") {
+    if (out.since !== undefined && (typeof out.since !== "string" || !out.since.trim() || out.since.length > 128)) throw new ServerError("bad_args", "since must be latest or an observation state_id");
+    const baseline = appStates.get(out.since === "latest" ? latestStateByComputer.get(computer.id) : out.since);
+    if (baseline && baseline.computerId !== computer.id) throw new ServerError("state_wrong_computer", "since belongs to another computer — observe this computer first");
+    if (out.detail != null && !["summary", "compact", "full"].includes(out.detail)) throw new ServerError("bad_args", "detail must be summary, compact or full");
+    if (out.include_ocr != null && typeof out.include_ocr !== "boolean") throw new ServerError("bad_args", "include_ocr must be true or false");
+    if (out.window_id != null && (!Number.isSafeInteger(out.window_id) || out.window_id < 0)) throw new ServerError("bad_args", "window_id must be a non-negative window index from list_windows");
+    if (out.limit != null && (!Number.isSafeInteger(out.limit) || out.limit < 1 || out.limit > 200)) throw new ServerError("bad_args", "limit must be an integer 1..200");
+    if (out.offset != null && (!Number.isSafeInteger(out.offset) || out.offset < 0)) throw new ServerError("bad_args", "offset must be a non-negative integer");
+    if (out.query != null && typeof out.query !== "string") throw new ServerError("bad_args", "query must be a string");
+    if (out.role != null && typeof out.role !== "string") throw new ServerError("bad_args", "role must be a string");
+    if (out.ocr_region != null && (!Array.isArray(out.ocr_region) || out.ocr_region.length !== 4)) throw new ServerError("bad_args", "ocr_region must be [x, y, w, h] in screen points");
+  }
+  if (name === "app_script") {
+    if (typeof out.script !== "string" || !out.script.trim()) throw new ServerError("bad_args", "app_script needs a non-empty script string");
+    if (out.language != null && !["applescript", "javascript"].includes(out.language)) throw new ServerError("bad_args", 'app_script language must be "applescript" or "javascript"');
+    if (out.timeout != null && (!Number.isFinite(out.timeout) || out.timeout <= 0 || out.timeout > 120)) throw new ServerError("bad_args", "app_script timeout must be 1..120 seconds");
+  }
+}
+
 /**
  * Convert public tool args into backend args, identically for every route.
  * Element targets carry their revalidated AX path and fresh center; coordinate
@@ -1569,27 +1598,10 @@ async function prepareArgs(computer, name, args, resolve, sink) {
     out[key] = { ...given, ...(await normalizeTarget(computer, given, kind, resolve, sink)) };
     delete out[key].raster_id;
   }
-  if (name === "get_app_state" || name === "find_elements") {
-    if (out.since !== undefined && (typeof out.since !== "string" || !out.since.trim() || out.since.length > 128)) throw new ServerError("bad_args", "since must be latest or an observation state_id");
-    const baseline = appStates.get(out.since === "latest" ? latestStateByComputer.get(computer.id) : out.since);
-    if (baseline && baseline.computerId !== computer.id) throw new ServerError("state_wrong_computer", "since belongs to another computer — observe this computer first");
-    if (out.detail != null && !["summary", "compact", "full"].includes(out.detail)) throw new ServerError("bad_args", "detail must be summary, compact or full");
-    if (name === "get_app_state") {
-      out.compact = out.detail === "compact";
-      out.detail = out.detail === "full" ? "full" : "summary";
-    }
-    if (out.include_ocr != null && typeof out.include_ocr !== "boolean") throw new ServerError("bad_args", "include_ocr must be true or false");
-    if (out.window_id != null && (!Number.isSafeInteger(out.window_id) || out.window_id < 0)) throw new ServerError("bad_args", "window_id must be a non-negative window index from list_windows");
-    if (out.limit != null && (!Number.isSafeInteger(out.limit) || out.limit < 1 || out.limit > 200)) throw new ServerError("bad_args", "limit must be an integer 1..200");
-    if (out.offset != null && (!Number.isSafeInteger(out.offset) || out.offset < 0)) throw new ServerError("bad_args", "offset must be a non-negative integer");
-    if (out.query != null && typeof out.query !== "string") throw new ServerError("bad_args", "query must be a string");
-    if (out.role != null && typeof out.role !== "string") throw new ServerError("bad_args", "role must be a string");
-    if (out.ocr_region != null && (!Array.isArray(out.ocr_region) || out.ocr_region.length !== 4)) throw new ServerError("bad_args", "ocr_region must be [x, y, w, h] in screen points");
-  }
-  if (name === "app_script") {
-    if (typeof out.script !== "string" || !out.script.trim()) throw new ServerError("bad_args", "app_script needs a non-empty script string");
-    if (out.language != null && !["applescript", "javascript"].includes(out.language)) throw new ServerError("bad_args", 'app_script language must be "applescript" or "javascript"');
-    if (out.timeout != null && (!Number.isFinite(out.timeout) || out.timeout <= 0 || out.timeout > 120)) throw new ServerError("bad_args", "app_script timeout must be 1..120 seconds");
+  validateToolArgs(computer, name, out);
+  if (name === "get_app_state") {
+    out.compact = out.detail === "compact";
+    out.detail = out.detail === "full" ? "full" : "summary";
   }
   return out;
 }
