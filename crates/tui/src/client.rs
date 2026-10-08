@@ -3965,10 +3965,33 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
         .and_then(Value::as_u64)
         .or(cached_tokens)
         .map(saturating_u32);
+    // Cache-creation tokens, kept as their own class so pricing can apply the
+    // write rate where the provider publishes one. DeepSeek-style payloads
+    // may nest these under `prompt_tokens_details`; accept a top-level
+    // spelling too for providers that flatten the object.
+    let nested_cache_write_tokens = usage
+        .and_then(|u| {
+            u.get("prompt_tokens_details")
+                .or_else(|| u.get("input_tokens_details"))
+        })
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64);
+    let prompt_cache_write_tokens = usage
+        .and_then(|u| u.get("prompt_cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or(nested_cache_write_tokens)
+        .map(saturating_u32);
     let prompt_cache_miss_tokens = usage
         .and_then(|u| u.get("prompt_cache_miss_tokens"))
         .and_then(Value::as_u64)
-        .or_else(|| prompt_cache_hit_tokens.map(|hit| input_tokens.saturating_sub(u64::from(hit))))
+        .or_else(|| {
+            // Derive miss from total input accounting for both hit and write tokens
+            let accounted = prompt_cache_hit_tokens
+                .map(u64::from)
+                .unwrap_or(0)
+                .saturating_add(prompt_cache_write_tokens.map(u64::from).unwrap_or(0));
+            Some(input_tokens.saturating_sub(accounted))
+        })
         .map(saturating_u32);
     // Reasoning tokens are a *subset* of the completion count every provider
     // bills, so they are never added to output. A payload claiming more
@@ -3999,7 +4022,7 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
         output_tokens: saturating_u32(output_tokens),
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
-        prompt_cache_write_tokens: None,
+        prompt_cache_write_tokens,
         reasoning_tokens,
         reasoning_replay_tokens: None,
         server_tool_use,
