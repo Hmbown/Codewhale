@@ -600,7 +600,7 @@
   "CmdUpdateDescription": "Buscar e instalar una nueva versión de Codewhale",
   "CmdNoteDescription": "Agregar nota al archivo persistente (.codewhale/notes.md)",
   "CmdThemeDescription": "Alternar entre tema claro y oscuro",
-  "CmdProviderDescription": "Cambiar o mostrar el backend LLM activo (deepseek | nvidia-nim | ollama)",
+  "CmdProviderDescription": "Cambiar el proveedor o el modelo",
   "CmdAuthDescription": "Gestionar flujos de autenticación de proveedores",
   "CmdLoginDescription": "Iniciar sesión en Codewhale o guardar claves de proveedor",
   "CmdQueueDescription": "Ver o editar mensajes en cola",
