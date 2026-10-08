@@ -278,6 +278,10 @@ impl ShowcaseState {
                         .elapsed_seconds(3),
                     ),
             ],
+            WorkbarPanel::Terminal => vec![WorkbarRow::new(
+                "terminal:host",
+                "Terminal sessions are supplied by the host",
+            )],
             WorkbarPanel::Jobs => vec![
                 WorkbarRow::new("shell:layout", "Check the compact session layout")
                     .mark(mark)

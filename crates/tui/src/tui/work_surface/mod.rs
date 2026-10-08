@@ -12,7 +12,7 @@
 //!   `work_surface_top_height` (5..=16) or `work_surface_side_width`
 //!   (26..=80) to `settings.toml`.
 //! - **panel** — what it shows. [`RailPanel`]: `Tasks` (default) | `Agents` |
-//!   `Background` | `Files` | `Notepad` | `Context` | `Git` | `Price`, from
+//!   `Background` | `Terminal` | `Files` | `Notepad` | `Context` | `Git` | `Price`, from
 //!   the `rail_panel` setting. The legacy `sidebar_focus` key migrates into
 //!   it.
 //!
@@ -65,6 +65,7 @@ mod input;
 mod interaction;
 mod model;
 mod render;
+mod terminal;
 mod views;
 
 pub use input::{cycle_view, enter_agents, handle_key, handle_mouse};
@@ -72,6 +73,7 @@ pub(crate) use interaction::{agent_details_closed, release_focus, select_dock_pa
 pub use model::{RailPanel, WorkSurfacePlacement, WorkSurfaceState};
 pub(crate) use render::collapse_strip;
 pub use render::{height, render, split_chat};
+pub(crate) use terminal::{handle_paste as handle_terminal_paste, poll as poll_terminal};
 
 #[cfg(test)]
 mod tests {
@@ -3137,7 +3139,8 @@ mod tests {
         assert!(first_row.contains("Fleet"), "{first_row:?}");
         assert!(!first_row.contains("Tasks 3"), "{first_row:?}");
         assert!(!first_row.contains("Fleet 1"), "{first_row:?}");
-        assert!(first_row.contains("Context"), "{first_row:?}");
+        assert!(first_row.contains("Terminal"), "{first_row:?}");
+        assert!(!first_row.contains("Context"), "{first_row:?}");
         // Shed from the right: price goes before any work view.
         assert!(!first_row.contains("Cost"), "{first_row:?}");
     }

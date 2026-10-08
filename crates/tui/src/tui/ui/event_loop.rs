@@ -4863,6 +4863,7 @@ pub(crate) async fn run_event_loop(
 
         let now = Instant::now();
         flush_paste_burst_before_composer(app, now);
+        crate::tui::work_surface::poll_terminal(app);
         app.sync_status_message_to_toasts();
         // Drain background-LLM cost (compaction summaries, seam
         // recompaction, cycle briefings) accumulated since the last
@@ -5033,6 +5034,11 @@ pub(crate) async fn run_event_loop(
             let remaining = state.next_tick.saturating_duration_since(now);
             poll_timeout = poll_timeout.min(remaining);
         }
+        if app.work_surface.panel == crate::tui::work_surface::RailPanel::Terminal
+            && app.work_surface.last_area.is_some()
+        {
+            poll_timeout = poll_timeout.min(Duration::from_millis(100));
+        }
         poll_timeout = clamp_event_poll_timeout(poll_timeout);
 
         // #549/#3216: give the engine task a scheduler turn before waiting on
@@ -5123,6 +5129,9 @@ pub(crate) async fn run_event_loop(
                 }
             }
             if let Event::Paste(text) = &evt {
+                if crate::tui::work_surface::handle_terminal_paste(app, text) {
+                    continue;
+                }
                 if app.launch.return_to_session && app.view_stack.is_empty() {
                     app.launch.dismiss();
                 }

@@ -22,6 +22,7 @@ pub(super) fn render_dock_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
                     RailPanel::Tasks => "Tasks",
                     RailPanel::Agents => "Fleet",
                     RailPanel::Background => "Jobs",
+                    RailPanel::Terminal => "Terminal",
                     RailPanel::Files => "Files",
                     RailPanel::Notepad => "Notes",
                     RailPanel::Context => "Context",
@@ -44,7 +45,8 @@ pub(super) fn render_dock_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
     // (`input::handle_key`). Otherwise Esc belongs to the composer and stops
     // the running turn, which the posture bar already says with the turn
     // status; a bare `×` here keeps the two from reading as one shortcut.
-    let esc_closes = app.work_surface.focused
+    let esc_closes = app.work_surface.panel != RailPanel::Terminal
+        && app.work_surface.focused
         && !super::super::interaction::opened_detail_on_screen(app)
         && (app.work_surface.explicit_view || !visible_rows_for_panel(app).is_empty());
     let close = if esc_closes && area.width >= 60 {

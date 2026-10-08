@@ -2814,6 +2814,9 @@ impl App {
             return Focus::Launch;
         }
         if self.work_surface.focused {
+            if self.work_surface.panel == crate::tui::work_surface::RailPanel::Terminal {
+                return Focus::TerminalPanel;
+            }
             return Focus::Panel;
         }
         Focus::Composer

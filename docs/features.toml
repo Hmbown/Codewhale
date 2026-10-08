@@ -612,6 +612,14 @@ status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/tui/sidebar.rs"
 
+[[feature]]
+id = "terminal-dock"
+name = "Terminal dock"
+summary = "/workbar terminal shows workspace PTYs with live output, human input, session selection and a fresh shell; macOS/Linux."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/tui/work_surface/terminal.rs"
+
 # --- Operations and platforms ---
 
 [[feature]]

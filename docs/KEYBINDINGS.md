@@ -320,3 +320,13 @@ then `Enter` to submit or `Esc` to return to the options without sending.
 - **Bare Up/Down arrows scroll transcript when composer empty (v0.8.13).** Previously the `should_scroll_with_arrows` gate was hardcoded to false, meaning bare arrows always navigated composer history even when the composer was empty. Users in virtual terminals (Ghostty, Codex, Kitty-protocol) were especially affected because they couldn't use Cmd+Up / Alt+Up shortcuts.
 - **Configurable keymap (#436) and `tui.toml` (#437) remain deferred.** The `TuiPrefs` struct and loader exist in `settings.rs` but are not wired at startup. The named-binding registry that would let `~/.codewhale/tui.toml` override individual entries is still pending.
 - **No other broken bindings found.** Every other chord listed above resolves to a live handler in `crates/tui/src/tui/ui.rs` (key-event dispatch) or `crates/tui/src/tui/app.rs` (mode + state transitions).
+
+## Live Terminal dock
+
+In `/workbar terminal`, click the dock or press `Alt+W` to focus it. Typing,
+Enter, Tab and Ctrl+C reach the selected shell. Esc returns to the composer.
+`Alt+Down` / `Alt+Up` switch sessions; `Ctrl+N` starts a fresh shell.
+Mouse-wheel and PageUp/PageDown scroll output.
+
+See the [Terminal dock guide](GUIDE.md#live-terminal-dock) for permission
+boundaries, paste behavior and supported platforms.

@@ -104,6 +104,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
     super::model::resolve_view(app);
     let rows = visible_rows_for_panel(app);
+    if app.work_surface.panel == RailPanel::Terminal {
+        Block::default()
+            .style(Style::default().bg(app.ui_theme.panel_bg))
+            .render(area, frame.buffer_mut());
+        render_dock_tabs(frame, area, app);
+        register_dock_targets(app);
+        super::terminal::render(frame, body_area, app);
+        render_divider(frame, area, placement, app);
+        app.work_surface.last_area = Some(area);
+        return;
+    }
     let todo_ordinals = if placement.is_strip() {
         todo_ordinals(&rows)
     } else {
@@ -455,6 +466,7 @@ fn empty_view_hint(panel: RailPanel) -> &'static str {
         RailPanel::Agents => "no agents have run this session",
         RailPanel::Tasks => "no to-dos yet",
         RailPanel::Background => "nothing running in the background",
+        RailPanel::Terminal => "",
         RailPanel::Files => "no files touched this session",
         RailPanel::Notepad => "/note add <text> to keep a note",
         RailPanel::Context => "context budget unknown",
@@ -580,6 +592,7 @@ fn kit_panel(panel: RailPanel) -> codewhale_ratatui::WorkbarPanel {
         RailPanel::Tasks => P::Tasks,
         RailPanel::Agents => P::Fleet,
         RailPanel::Background => P::Jobs,
+        RailPanel::Terminal => P::Terminal,
         RailPanel::Files => P::Files,
         RailPanel::Notepad => P::Notes,
         RailPanel::Context => P::Context,
@@ -596,6 +609,7 @@ fn native_target(target: codewhale_ratatui::DockTabTarget) -> DockTabTarget {
             P::Tasks => RailPanel::Tasks,
             P::Fleet => RailPanel::Agents,
             P::Jobs => RailPanel::Background,
+            P::Terminal => RailPanel::Terminal,
             P::Files => RailPanel::Files,
             P::Notes => RailPanel::Notepad,
             P::Context => RailPanel::Context,
@@ -625,7 +639,8 @@ fn render_dock_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
         "×"
     };
     // Name Esc only while Engine's actual keyboard action closes this dock.
-    let esc_closes = app.work_surface.focused
+    let esc_closes = app.work_surface.panel != RailPanel::Terminal
+        && app.work_surface.focused
         && !super::interaction::opened_detail_on_screen(app)
         && (app.work_surface.explicit_view || !visible_rows_for_panel(app).is_empty());
     let close = if esc_closes && area.width >= 60 {
@@ -702,6 +717,7 @@ fn dock_tab_count(app: &mut App, panel: RailPanel) -> Option<usize> {
         ),
         RailPanel::Files => Some(super::views::files_touched_count(app)),
         RailPanel::Notepad => Some(usize::from(super::views::notepad_has_text(app))),
+        RailPanel::Terminal => None,
         RailPanel::Context | RailPanel::Git | RailPanel::Price => None,
     }
 }
@@ -716,6 +732,7 @@ fn register_dock_targets(app: &mut App) {
                     RailPanel::Agents => Id::DOCK_TAB_AGENTS,
                     RailPanel::Tasks => Id::DOCK_TAB_TASKS,
                     RailPanel::Background => Id::DOCK_TAB_BACKGROUND,
+                    RailPanel::Terminal => Id::DOCK_TAB_TERMINAL,
                     RailPanel::Files => Id::DOCK_TAB_FILES,
                     RailPanel::Notepad => Id::DOCK_TAB_NOTEPAD,
                     RailPanel::Context => Id::DOCK_TAB_CONTEXT,

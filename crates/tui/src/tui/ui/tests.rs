@@ -887,6 +887,10 @@ fn bracketed_paste_returns_dock_focus_to_the_visible_composer() {
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {
+        ShellBindingId::TerminalNew => KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ShellBindingId::TerminalNext => KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+        ShellBindingId::TerminalPrevious => KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+        ShellBindingId::TerminalDetach => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         ShellBindingId::ElevationUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ShellBindingId::ElevationDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::ElevationConfirm => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),

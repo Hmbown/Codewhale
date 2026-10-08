@@ -813,3 +813,24 @@ and sub-agents.
 Next: [INSTALL.md](INSTALL.md), [CONFIGURATION.md](CONFIGURATION.md),
 [PROVIDERS.md](PROVIDERS.md), [MODES.md](MODES.md), and
 [TOOL_SURFACE.md](TOOL_SURFACE.md).
+
+## Live Terminal dock
+
+Open `/workbar terminal` to watch the same workspace PTY sessions the model
+uses. Click the dock or press `Alt+W` to give it input focus. While focused,
+typing, Enter, Tab and Ctrl+C reach the selected shell. Esc returns focus to
+the composer; the output remains visible. Click a session or use `Alt+Down` /
+`Alt+Up` to switch. `Ctrl+N` starts your own fresh shell without replacing the
+model’s session. Mouse-wheel and PageUp/PageDown review the retained output.
+The active permission posture and filesystem scope govern fresh shells and
+refuse reuse of an unsandboxed shell after the scope narrows.
+
+The dock shows the latest 64 KiB, reports omitted bytes, and never consumes the
+model’s output cursor. A reset or lost session requires explicit selection;
+input cannot silently follow a reused session name. PTYs are currently supported
+on macOS and Linux. This is an ANSI-styled output view: cursor-addressed programs,
+alternate screens and replay after process restart are outside its scope. Paste
+is direct terminal input and may execute commands containing newlines; control
+characters and pastes over 64 KiB are refused. While a process uses canonical
+line input, batches of 1 KiB or more are refused before any bytes are sent:
+the terminal can discard oversized input. Transfer long content through a file.

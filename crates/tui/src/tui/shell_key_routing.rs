@@ -40,6 +40,8 @@ pub enum Focus {
     Launch,
     /// A focused rail or workflow panel inside a live session.
     Panel,
+    /// The live PTY dock owns terminal input, including control keys.
+    TerminalPanel,
     /// The session composer: the default owner.
     Composer,
 }
@@ -51,6 +53,7 @@ pub enum Focus {
 /// is exclusive and sits outside that shell hierarchy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusScope {
+    TerminalPanel,
     PetHabitat,
     /// Only the sandbox-elevation decision card.
     Elevation,
@@ -73,14 +76,24 @@ impl FocusScope {
     #[must_use]
     pub fn admits(self, focus: Focus) -> bool {
         match self {
+            Self::TerminalPanel => focus == Focus::TerminalPanel,
             Self::PetHabitat => focus == Focus::Modal(ModalKind::PetHabitat),
             Self::Elevation => focus == Focus::Modal(ModalKind::Elevation),
             Self::RedactionGate => focus == Focus::RedactionGate,
-            Self::SessionShell => matches!(focus, Focus::Composer | Focus::Panel),
-            Self::AnyShell => matches!(focus, Focus::Composer | Focus::Panel | Focus::Launch),
+            Self::SessionShell => {
+                matches!(focus, Focus::Composer | Focus::Panel | Focus::TerminalPanel)
+            }
+            Self::AnyShell => matches!(
+                focus,
+                Focus::Composer | Focus::Panel | Focus::TerminalPanel | Focus::Launch
+            ),
             Self::AnyShellOrConfig => matches!(
                 focus,
-                Focus::Composer | Focus::Panel | Focus::Launch | Focus::Modal(ModalKind::Config)
+                Focus::Composer
+                    | Focus::Panel
+                    | Focus::TerminalPanel
+                    | Focus::Launch
+                    | Focus::Modal(ModalKind::Config)
             ),
             Self::Everywhere => focus != Focus::RedactionGate,
         }
@@ -90,6 +103,10 @@ impl FocusScope {
 /// Stable binding ids shared by handlers, footer hints, and help catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellBindingId {
+    TerminalNew,
+    TerminalNext,
+    TerminalPrevious,
+    TerminalDetach,
     ElevationUp,
     ElevationDown,
     ElevationConfirm,
@@ -140,6 +157,16 @@ impl ShellBinding {
     #[must_use]
     pub fn matches(&self, key: &KeyEvent) -> bool {
         match self.id {
+            ShellBindingId::TerminalNew => {
+                key.code == KeyCode::Char('n') && key.modifiers == KeyModifiers::CONTROL
+            }
+            ShellBindingId::TerminalNext => {
+                key.code == KeyCode::Down && key.modifiers == KeyModifiers::ALT
+            }
+            ShellBindingId::TerminalPrevious => {
+                key.code == KeyCode::Up && key.modifiers == KeyModifiers::ALT
+            }
+            ShellBindingId::TerminalDetach => key.code == KeyCode::Esc && key.modifiers.is_empty(),
             ShellBindingId::ElevationUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
             ShellBindingId::ElevationDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
             ShellBindingId::ElevationConfirm => {
@@ -192,12 +219,44 @@ impl ShellBinding {
 pub fn route(focus: Focus, key: &KeyEvent) -> Option<ShellBindingId> {
     SHELL_BINDINGS
         .iter()
-        .find(|binding| binding.focus.admits(focus) && binding.matches(key))
+        .find(|binding| {
+            binding.focus.admits(focus)
+                && binding.matches(key)
+                && !(focus == Focus::TerminalPanel
+                    && matches!(
+                        binding.id,
+                        ShellBindingId::ModeCycle | ShellBindingId::PermissionCycle
+                    ))
+        })
         .map(|binding| binding.id)
 }
 
 /// Canonical shell bindings. Handlers and chrome read from here.
 pub const SHELL_BINDINGS: &[ShellBinding] = &[
+    ShellBinding {
+        id: ShellBindingId::TerminalNew,
+        catalog_chord: "Ctrl+N",
+        footer_chord: "Ctrl+N",
+        focus: FocusScope::TerminalPanel,
+    },
+    ShellBinding {
+        id: ShellBindingId::TerminalNext,
+        catalog_chord: "Alt+Down",
+        footer_chord: "Alt+Down",
+        focus: FocusScope::TerminalPanel,
+    },
+    ShellBinding {
+        id: ShellBindingId::TerminalPrevious,
+        catalog_chord: "Alt+Up",
+        footer_chord: "Alt+Up",
+        focus: FocusScope::TerminalPanel,
+    },
+    ShellBinding {
+        id: ShellBindingId::TerminalDetach,
+        catalog_chord: "Esc",
+        footer_chord: "Esc",
+        focus: FocusScope::TerminalPanel,
+    },
     ShellBinding {
         id: ShellBindingId::ElevationUp,
         catalog_chord: "Up",

@@ -626,7 +626,7 @@ pub fn screen(app: &mut App, target: ScreenMode, arg: Option<&str>) -> CommandRe
 /// claim about a surface that cannot render.
 pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     const USAGE: &str =
-        "Usage: /workbar [bottom|top|left|right|off|tasks|agents|context|pinned] [--save]";
+        "Usage: /workbar [bottom|top|left|right|off|tasks|agents|terminal|context|pinned] [--save]";
     let raw = arg.map(str::trim).unwrap_or("");
     let mut tokens = raw.split_whitespace().collect::<Vec<_>>();
     let persist = matches!(tokens.last(), Some(&"--save" | &"-s"));
@@ -663,6 +663,7 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
                     Some(crate::tui::work_surface::RailPanel::Background)
                 }
                 "files" | "changes" => Some(crate::tui::work_surface::RailPanel::Files),
+                "terminal" | "terminals" => Some(crate::tui::work_surface::RailPanel::Terminal),
                 "notepad" | "notes" => Some(crate::tui::work_surface::RailPanel::Notepad),
                 "context" | "session" => Some(crate::tui::work_surface::RailPanel::Context),
                 "git" | "branch" => Some(crate::tui::work_surface::RailPanel::Git),

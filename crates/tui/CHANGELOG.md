@@ -9,11 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.2] - 2026-10-08
 
-Codewhale v0.10.2 is a patch release. `/undo` takes back a whole request,
-`/diff` works outside a git repository, Plan mode offers its hand-off again,
-and three provider failure modes are reported for what they are.
+Codewhale v0.10.2 adds a live Terminal work dock and improves recovery,
+plugin approval and provider reliability. `/undo` takes back a whole request,
+`/diff` works outside a Git repository, and contributor fixes improve token
+accounting, localized replies and Windows launcher guidance.
 
 ### Added
+
+- A Terminal work dock (`/workbar terminal`) shows the model’s live PTY sessions
+  in the current workspace, with ANSI-styled output, session selection, resize
+  and direct keyboard input. `Ctrl+N` starts a separate shell; `Alt+Down` and
+  `Alt+Up` switch sessions, and Esc returns input to the composer. Input remains
+  bound to the selected shell’s identity across resets. Available on macOS and
+  Linux; Windows names its current PTY limitation. The view shows a bounded
+  output tail rather than emulating full-screen terminal programs (Refs #6912).
 
 - When a Plan turn completes with open To-do steps, the TUI asks "How do you
   want to continue?". **Work (Ask)** and **Work (Auto-Review)** switch to Work
@@ -49,7 +58,18 @@ and three provider failure modes are reported for what they are.
   for `write_file`, `edit_file` and `apply_patch` in the posture where the
   same edit runs without a card inside a repository.
 
+- Clients that start `codewhale serve` can declare a telemetry surface with
+  `CODEWHALE_TELEMETRY_SURFACE`, including `vscode-extension`. This changes the
+  session label while preserving collection settings and opt-outs
+  ([#6916](https://github.com/codewhale-hq/Codewhale/pull/6916)).
+
 ### Changed
+
+- Goal mode has no step limit when `[goal].max_steps` is omitted or `0`.
+  Positive values still limit the goal, with values above `100000` clamped to
+  `100000` ([#6512](https://github.com/codewhale-hq/Codewhale/issues/6512)).
+- MCP and provider browser sign-in allow 15 minutes for the callback instead
+  of five ([#6865](https://github.com/codewhale-hq/Codewhale/issues/6865)).
 
 - `/undo` takes back your last request in one step, in every access mode:
   every file the request changed, plus the request and its reply. It no
@@ -109,6 +129,34 @@ and three provider failure modes are reported for what they are.
 
 ### Fixed
 
+- Concurrent starts and reconnects for one workspace converge on one Engine
+  owner. A receipt retired during a reconnect is observed again before
+  attaching; files with unsafe ownership, permissions or multiple links are
+  still refused.
+- Local plugin updates retain a private recovery backup while replacing the
+  installed version. Plugin actions marked as requiring approval keep that
+  requirement in Full Access, and internal installation paths are excluded
+  from discovery.
+- Concurrent Files API creates publish a workspace file exclusively. A
+  competing creator gets HTTP 409 and cannot overwrite the winning file.
+- Cache usage accounts for cache-write tokens as well as cache hits when
+  deriving cache misses. Missing cache details remain unknown, and explicit
+  zero counts stay zero
+  ([#6913](https://github.com/codewhale-hq/Codewhale/pull/6913)).
+- `/profile` usage, switching, success and failure replies follow the UI
+  language across all 15 complete locale packs
+  ([#6919](https://github.com/codewhale-hq/Codewhale/pull/6919)).
+- On Windows npm installs, the model's environment identifies `node.exe` as
+  the launcher and warns that killing it by name also stops npm-launched
+  Codewhale sessions. It points to stopping servers by PID or port instead
+  ([#6906](https://github.com/codewhale-hq/Codewhale/pull/6906)).
+
+- Persistent terminal commands keep interactive stdin available while preserving
+  current-shell variables, directories and aliases. Human answers no longer
+  consume the command's completion marker. Oversized raw input batches are
+  refused before writing in canonical line-input mode, across the Terminal
+  dock, `terminal/send` and the Runtime API.
+
 - A stream request that receives no response headers in time now adds that
   the provider may still be loading the model, and names `codewhale config
   set stream.open_timeout_secs 180` (up to 300). `codewhale doctor
@@ -166,6 +214,11 @@ and three provider failure modes are reported for what they are.
 
 ### Contributors
 
+- **[@dajiaohuang](https://github.com/dajiaohuang)** — cache-write token accounting ([#6913](https://github.com/codewhale-hq/Codewhale/pull/6913)).
+- **[@gaord](https://github.com/gaord)** — embedder telemetry surface support ([#6916](https://github.com/codewhale-hq/Codewhale/pull/6916)).
+- **[@Lstarsky0](https://github.com/Lstarsky0)** — localized profile replies ([#6919](https://github.com/codewhale-hq/Codewhale/pull/6919)).
+- **[@jayanthvee](https://github.com/jayanthvee)** — Windows npm launcher guidance ([#6906](https://github.com/codewhale-hq/Codewhale/pull/6906)).
+- **[@asto18089](https://github.com/asto18089)** — callback-window reference fix for longer browser sign-in waits ([#6865](https://github.com/codewhale-hq/Codewhale/issues/6865)).
 - **[@BX166](https://github.com/BX166)** — reported three provider failure modes measured on AICraft's own traffic: a cold model that reads as a dead connection, a listed model that fails on every call, and a response cut at the output ceiling that reports `stop` ([#6889](https://github.com/codewhale-hq/Codewhale/issues/6889)).
 
 ## [0.10.1] - 2026-10-07

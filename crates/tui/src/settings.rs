@@ -650,6 +650,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
     match value.trim().to_ascii_lowercase().as_str() {
         "agents" => "agents",
         "background" => "background",
+        "terminal" => "terminal",
         "files" => "files",
         "notepad" => "notepad",
         "context" => "context",
@@ -1549,6 +1550,7 @@ impl Settings {
                     "tasks"
                         | "agents"
                         | "background"
+                        | "terminal"
                         | "files"
                         | "notepad"
                         | "context"
@@ -1558,7 +1560,7 @@ impl Settings {
                         | "pinned"
                 ) {
                     anyhow::bail!(
-                        "Failed to update setting: invalid workbar panel '{value}'. Expected: tasks, agents, background, files, notepad, context, git, or price."
+                        "Failed to update setting: invalid workbar panel '{value}'. Expected: tasks, agents, background, terminal, files, notepad, context, git, or price."
                     );
                 }
                 self.rail_panel = normalize_rail_panel(&normalized).to_string();
@@ -3242,11 +3244,12 @@ mod tests {
         assert_eq!(settings.rail_panel, "tasks");
 
         // Every panel the dock cycles through must survive `set` and a
-        // settings.toml round trip — the dock persists all eight.
+        // settings.toml round trip — including an empty Terminal view.
         for panel in [
             "tasks",
             "agents",
             "background",
+            "terminal",
             "files",
             "notepad",
             "context",
@@ -3269,10 +3272,9 @@ mod tests {
         let err = settings
             .set("rail_panel", "auto")
             .expect_err("auto-collapse was dropped with the legacy sidebar");
-        assert!(
-            err.to_string()
-                .contains("tasks, agents, background, files, notepad, context, git, or price")
-        );
+        assert!(err.to_string().contains(
+            "tasks, agents, background, terminal, files, notepad, context, git, or price"
+        ));
         assert_eq!(settings.rail_panel, "tasks");
     }
 
