@@ -368,6 +368,11 @@ pub enum GoalPauseReason {
     NoProgress,
     UsageLimit,
     BudgetLimit,
+    /// The model finished a stage and handed control back, rather than a
+    /// reported blocker or a completion. It is not a judgement about the work,
+    /// so the user's next message resumes the goal (the same shape as a
+    /// runtime stop, which is also resumable by writing to it).
+    Yielded,
 }
 
 impl GoalPauseReason {
@@ -379,6 +384,7 @@ impl GoalPauseReason {
             Self::NoProgress => "no progress",
             Self::UsageLimit => "usage limit",
             Self::BudgetLimit => "budget limit",
+            Self::Yielded => "handed back",
         }
     }
 }

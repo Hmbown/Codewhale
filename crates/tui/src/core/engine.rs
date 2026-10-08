@@ -5184,6 +5184,37 @@ impl Engine {
         true
     }
 
+    /// Resume a goal the model handed back at a milestone, when it is the
+    /// objective this turn names; publish the change like any other goal
+    /// transition. A yield is a hand-back rather than a judgement about the
+    /// work, so answering it continues the work.
+    async fn resume_yielded_goal(&mut self, objective: Option<&str>) -> bool {
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if normalized_goal_objective(state.objective())
+                    != normalized_goal_objective(objective)
+                    || !state.resume_after_yield()
+                {
+                    return false;
+                }
+                state.snapshot()
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while resuming a yielded goal: {err}");
+                return false;
+            }
+        };
+        self.config.goal_status = GoalStatus::Active;
+        self.emit_session_updated().await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
+        let _ = self
+            .send_event(Event::status(
+                "Goal resumed: your message continues the work the earlier turn handed back",
+            ))
+            .await;
+        true
+    }
+
     /// Pause a still-active goal with an inspectable reason and publish every
     /// host projection in one ordered path.
     async fn pause_goal_continuation(&mut self, reason: GoalPauseReason, message: String) {
@@ -6074,15 +6105,25 @@ impl Engine {
         // A person writing to a goal that only the runtime stopped (a failed
         // or timed-out continuation) is continuing the work: resume it as a
         // new revision instead of running a goalless turn against a stale
-        // blocker. Blockers the model or user reported stay until an explicit
+        // blocker. A goal the model handed back at a milestone is the same
+        // shape — the model stopped for an answer, not because anything is
+        // wrong — so answering it continues the work too. Blockers the model
+        // reported and pauses the user asked for stay until an explicit
         // resume, and automated inputs never resume anything.
-        let goal_status = if !self.is_acp_turn()
-            && provenance == UserInputProvenance::ExternalUser
-            && goal_status == GoalStatus::Blocked
-            && self
-                .resume_runtime_blocked_goal(goal_objective.as_deref())
-                .await
+        let resumed_goal = if !self.is_acp_turn() && provenance == UserInputProvenance::ExternalUser
         {
+            match goal_status {
+                GoalStatus::Blocked => {
+                    self.resume_runtime_blocked_goal(goal_objective.as_deref())
+                        .await
+                }
+                GoalStatus::Paused => self.resume_yielded_goal(goal_objective.as_deref()).await,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let goal_status = if resumed_goal {
             GoalStatus::Active
         } else {
             goal_status

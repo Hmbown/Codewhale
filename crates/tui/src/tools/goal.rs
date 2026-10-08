@@ -507,6 +507,30 @@ impl GoalState {
         true
     }
 
+    /// Resume a goal the model handed back at a milestone, as a new control
+    /// revision. A yield is a hand-back rather than a judgement about the work,
+    /// so the user's next message continues it.
+    ///
+    /// Returns false, changing nothing, for any other state: a pause the user
+    /// asked for, and a pause the loop imposed on itself, both stay until an
+    /// explicit resume.
+    pub fn resume_after_yield(&mut self) -> bool {
+        if !(self.status == Some(GoalStatus::Paused)
+            && self.pause_reason == Some(GoalPauseReason::Yielded))
+        {
+            return false;
+        }
+        self.resume(None);
+        true
+    }
+
+    /// Hand the goal back to the user at a milestone. The goal stays Active in
+    /// intent — the work is not finished — but neither continuation dispatcher
+    /// re-arms a non-active goal, so the turn ends and the user answers.
+    pub fn mark_yielded(&mut self) -> Result<(), &'static str> {
+        self.mark_paused(GoalPauseReason::Yielded)
+    }
+
     /// Whether a judged completion has sealed this goal. A sealed goal is
     /// terminal: blocking or pausing it would overwrite the verified
     /// completion, so only an explicit resume or a new goal moves it on.
@@ -1044,7 +1068,7 @@ impl ToolSpec for UpdateGoalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input."
+        "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input. Mark yield when you finished a stage and the next step needs the user's decision: the goal stays unfinished, the turn ends, and their next message resumes it."
     }
 
     fn input_schema(&self) -> Value {
@@ -1053,8 +1077,8 @@ impl ToolSpec for UpdateGoalTool {
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["complete", "blocked", "not_achieved", "advisory"],
-                    "description": "Use complete only when a critical verifier proves the goal; not_achieved to record verifier gaps; blocked when meaningful progress cannot continue; advisory to append best-effort context without changing lifecycle state."
+                    "enum": ["complete", "blocked", "not_achieved", "advisory", "yield"],
+                    "description": "Use complete only when a critical verifier proves the goal; not_achieved to record verifier gaps; blocked when meaningful progress cannot continue; yield when a stage is finished and the next step is the user's call; advisory to append best-effort context without changing lifecycle state."
                 },
                 "evidence": {
                     "type": "string",
@@ -1211,6 +1235,9 @@ impl ToolSpec for UpdateGoalTool {
                         state.record_progress(progress);
                     }
                 }
+                "yield" => {
+                    state.mark_yielded().map_err(ToolError::invalid_input)?;
+                }
                 "advisory" => {
                     let advisory = input
                         .get("advisory")
@@ -1232,7 +1259,7 @@ impl ToolSpec for UpdateGoalTool {
                 }
                 other => {
                     return Err(ToolError::invalid_input(format!(
-                        "unsupported goal status '{other}'; update_goal can only mark complete or blocked, record not_achieved verifier gaps, or append advisory context"
+                        "unsupported goal status '{other}'; update_goal can only mark complete, blocked, or yield, record not_achieved verifier gaps, or append advisory context"
                     )));
                 }
             }
@@ -1247,6 +1274,72 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// A yield is a hand-back, not a judgement about the work: it stops the
+    /// auto-continuation, and the user's next message resumes it. A pause the
+    /// user asked for stays put.
+    #[test]
+    fn a_yield_stops_continuation_and_the_users_message_resumes_it() {
+        let mut state = GoalState::default();
+        state.replace("ship the slice", None, Some("goal-1".to_string()));
+        assert!(state.is_active());
+
+        state.mark_yielded().expect("yield an active goal");
+        assert_eq!(state.snapshot().status, GoalStatus::Paused.as_str());
+        assert_eq!(
+            state.snapshot().pause_reason,
+            Some(GoalPauseReason::Yielded),
+            "the pause names the hand-back so the UI can say what it is"
+        );
+        assert!(
+            !state.is_active(),
+            "neither continuation dispatcher re-arms a non-active goal"
+        );
+
+        assert!(
+            state.resume_after_yield(),
+            "the user's next message continues the work"
+        );
+        assert!(state.is_active());
+        assert_eq!(state.snapshot().pause_reason, None);
+    }
+
+    #[test]
+    fn a_user_pause_is_not_resumed_by_a_yield_resume() {
+        let mut state = GoalState::default();
+        state.replace("ship the slice", None, Some("goal-1".to_string()));
+        state
+            .mark_paused(GoalPauseReason::User)
+            .expect("user pause");
+
+        assert!(
+            !state.resume_after_yield(),
+            "only a hand-back is resumed by answering it"
+        );
+        assert_eq!(state.snapshot().status, GoalStatus::Paused.as_str());
+    }
+
+    #[tokio::test]
+    async fn update_goal_yield_pauses_without_completing_or_blocking() {
+        let state = new_shared_goal_state();
+        let ctx = ToolContext::new(".");
+        CreateGoalTool::new(state.clone())
+            .execute(json!({"objective": "ship the runtime slice"}), &ctx)
+            .await
+            .expect("create goal");
+
+        let result = UpdateGoalTool::new(state.clone())
+            .execute(json!({"status": "yield"}), &ctx)
+            .await
+            .expect("yield is a supported status");
+        assert!(result.success, "yield must not be refused");
+
+        let snapshot = state.lock().expect("goal state").snapshot();
+        assert_eq!(snapshot.status, GoalStatus::Paused.as_str());
+        assert_eq!(snapshot.pause_reason, Some(GoalPauseReason::Yielded));
+        assert_eq!(snapshot.blocker, None, "a hand-back reports no blocker");
+        assert_eq!(snapshot.evidence, None, "and claims no completion");
+    }
 
     #[tokio::test]
     async fn update_goal_rejects_objective_knob_instead_of_ignoring_it() {
@@ -1909,7 +2002,10 @@ mod tests {
             .await
             .expect_err("model resume should fail");
 
-        assert!(err.to_string().contains("complete or blocked"));
+        assert!(
+            err.to_string().contains("complete, blocked, or yield"),
+            "model resume stays rejected: {err}"
+        );
     }
 
     #[test]
