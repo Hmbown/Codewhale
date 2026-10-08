@@ -14538,7 +14538,11 @@ impl RuntimeThreadManager {
         let turn_goal_status = turn_goal
             .as_ref()
             .map(|goal| {
-                crate::tools::goal::thread_goal_status_projection(goal.status.clone()).0
+                crate::tools::goal::thread_goal_status_projection(
+                    goal.status.clone(),
+                    goal.pause_reason,
+                )
+                .0
             })
             .unwrap_or(crate::tools::goal::GoalStatus::Active);
 
@@ -15271,9 +15275,11 @@ impl RuntimeThreadManager {
                         )
                     } else {
                         let snapshot = crate::tools::goal::GoalSnapshot::from_thread_goal(goal);
-                        let status =
-                            crate::tools::goal::thread_goal_status_projection(goal.status.clone())
-                                .0;
+                        let status = crate::tools::goal::thread_goal_status_projection(
+                            goal.status.clone(),
+                            goal.pause_reason,
+                        )
+                        .0;
                         (
                             Some(objective.to_string()),
                             snapshot.token_budget,

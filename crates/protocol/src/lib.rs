@@ -373,6 +373,12 @@ pub enum GoalPauseReason {
     /// so the user's next message resumes the goal (the same shape as a
     /// runtime stop, which is also resumable by writing to it).
     Yielded,
+    /// A reason a **newer** build wrote. Kept so an older binary can still read
+    /// the durable record instead of failing the whole goal load on an unknown
+    /// variant; nothing constructs it. The resume path treats it as "not a
+    /// hand-back", which is the conservative reading.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl GoalPauseReason {
@@ -385,6 +391,7 @@ impl GoalPauseReason {
             Self::UsageLimit => "usage limit",
             Self::BudgetLimit => "budget limit",
             Self::Yielded => "handed back",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }

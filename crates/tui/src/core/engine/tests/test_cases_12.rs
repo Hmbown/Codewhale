@@ -1582,3 +1582,43 @@ fn turn_tool_context_uses_planned_authority_and_route_not_installed_session() {
         "planned-next-model"
     );
 }
+
+/// Both continuation dispatchers test `is_active()` before re-arming. A goal the
+/// model handed back must therefore land as `Inactive` at the gate the loop
+/// actually consults — the unit tests pin `GoalState`, not this decision.
+#[test]
+fn a_yielded_goal_is_not_rearmed_by_the_continuation_gate() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    {
+        let mut state = engine.config.goal_state.lock().expect("goal lock");
+        state.replace("ship the milestone", None, Some("goal-1".to_string()));
+        state.mark_yielded().expect("yield an active goal");
+    }
+
+    assert!(
+        matches!(
+            engine.goal_continuation_if_active(),
+            GoalContinuationAction::Inactive
+        ),
+        "a handed-back goal must not be re-armed by the cross-turn gate"
+    );
+}
+
+/// The same gate, against an active goal, still dispatches — so the test above
+/// is measuring the yield and not a gate that is dead in test conditions.
+#[test]
+fn an_active_goal_is_still_rearmed_by_the_continuation_gate() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    {
+        let mut state = engine.config.goal_state.lock().expect("goal lock");
+        state.replace("ship the milestone", None, Some("goal-1".to_string()));
+    }
+
+    assert!(
+        matches!(
+            engine.goal_continuation_if_active(),
+            GoalContinuationAction::Dispatch { .. }
+        ),
+        "an active goal still continues; otherwise the yield test proves nothing"
+    );
+}

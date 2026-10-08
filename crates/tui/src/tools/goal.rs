@@ -160,6 +160,20 @@ impl GoalState {
         token_budget: Option<u32>,
         status: GoalStatus,
     ) {
+        self.sync_from_host_status_with_reason(objective, token_budget, status, None);
+    }
+
+    /// [`Self::sync_from_host_status`], for a host that knows **why** the goal
+    /// is paused. Without a reason a `Paused` projection is read as a user
+    /// pause, which erases a hand-back and leaves the goal un-resumable by the
+    /// user's next message.
+    pub fn sync_from_host_status_with_reason(
+        &mut self,
+        objective: Option<&str>,
+        token_budget: Option<u32>,
+        status: GoalStatus,
+        pause_reason: Option<GoalPauseReason>,
+    ) {
         let objective = objective.map(str::trim).filter(|value| !value.is_empty());
         match objective {
             Some(objective) => {
@@ -206,7 +220,7 @@ impl GoalState {
                 if changed || status_changed || self.status.is_none() {
                     self.status = Some(status);
                     self.pause_reason = if status == GoalStatus::Paused {
-                        Some(GoalPauseReason::User)
+                        Some(pause_reason.unwrap_or(GoalPauseReason::User))
                     } else {
                         None
                     };
@@ -524,10 +538,23 @@ impl GoalState {
         true
     }
 
-    /// Hand the goal back to the user at a milestone. The goal stays Active in
-    /// intent — the work is not finished — but neither continuation dispatcher
-    /// re-arms a non-active goal, so the turn ends and the user answers.
+    /// Hand the goal back to the user at a milestone.
+    ///
+    /// Only an **active** goal can be handed back. A goal that is already paused
+    /// or blocked carries a reason someone else set — a user pause, a budget
+    /// stop, a reported blocker — and converting it would make it resumable by
+    /// the next message, which is exactly the contract this state exists to keep
+    /// narrow.
     pub fn mark_yielded(&mut self) -> Result<(), &'static str> {
+        if self.objective.is_none() {
+            return Err("No active goal exists to hand back.");
+        }
+        if self.status != Some(GoalStatus::Active) {
+            return Err(
+                "Only an active goal can be handed back; this one is already paused or \
+                 blocked for a reason someone else set.",
+            );
+        }
         self.mark_paused(GoalPauseReason::Yielded)
     }
 
@@ -733,7 +760,8 @@ impl GoalSnapshot {
 
     #[must_use]
     pub fn from_thread_goal(goal: &codewhale_protocol::ThreadGoal) -> Self {
-        let (status, pause_reason) = thread_goal_status_projection(goal.status.clone());
+        let (status, pause_reason) =
+            thread_goal_status_projection(goal.status.clone(), goal.pause_reason);
         Self {
             goal_id: Some(goal.goal_id.clone()),
             objective: Some(goal.objective.clone()),
@@ -747,7 +775,7 @@ impl GoalSnapshot {
             elapsed_seconds: None,
             evidence: None,
             blocker: None,
-            pause_reason: goal.pause_reason.or(pause_reason),
+            pause_reason,
             completion_verification: None,
             advisories: Vec::new(),
             last_gap_fingerprint: goal.last_gap_fingerprint.clone(),
@@ -761,12 +789,16 @@ impl GoalSnapshot {
 #[must_use]
 pub fn thread_goal_status_projection(
     status: codewhale_protocol::ThreadGoalStatus,
+    pause_reason: Option<GoalPauseReason>,
 ) -> (GoalStatus, Option<GoalPauseReason>) {
     match status {
         codewhale_protocol::ThreadGoalStatus::Active => (GoalStatus::Active, None),
-        codewhale_protocol::ThreadGoalStatus::Paused => {
-            (GoalStatus::Paused, Some(GoalPauseReason::User))
-        }
+        // The durable status alone cannot say why a goal is paused; the record's
+        // own reason can, and dropping it turns a hand-back into a user pause.
+        codewhale_protocol::ThreadGoalStatus::Paused => (
+            GoalStatus::Paused,
+            pause_reason.or(Some(GoalPauseReason::User)),
+        ),
         codewhale_protocol::ThreadGoalStatus::Complete => (GoalStatus::Complete, None),
         codewhale_protocol::ThreadGoalStatus::Blocked => (GoalStatus::Blocked, None),
         codewhale_protocol::ThreadGoalStatus::UsageLimited => {
@@ -1317,6 +1349,52 @@ mod tests {
             "only a hand-back is resumed by answering it"
         );
         assert_eq!(state.snapshot().status, GoalStatus::Paused.as_str());
+    }
+
+    #[test]
+    fn a_yield_cannot_overwrite_a_pause_reason_someone_else_set() {
+        let mut state = GoalState::default();
+        state.replace("ship the slice", None, Some("goal-1".to_string()));
+
+        for reason in [
+            GoalPauseReason::User,
+            GoalPauseReason::BudgetLimit,
+            GoalPauseReason::NoProgress,
+            GoalPauseReason::UsageLimit,
+        ] {
+            state.mark_paused(reason).expect("pause for another reason");
+            assert!(
+                state.mark_yielded().is_err(),
+                "only an active goal can be handed back, not one paused for {reason:?}"
+            );
+            assert_eq!(
+                state.snapshot().pause_reason,
+                Some(reason),
+                "the pause someone else set survives the rejected hand-back"
+            );
+        }
+
+        // And a blocked goal keeps its blocker rather than becoming resumable.
+        state
+            .mark_blocked("waiting on the vendor".to_string())
+            .expect("block");
+        assert!(state.mark_yielded().is_err());
+        assert_eq!(
+            state.snapshot().blocker.as_deref(),
+            Some("waiting on the vendor")
+        );
+    }
+
+    #[test]
+    fn a_pause_reason_written_by_a_newer_build_still_reads() {
+        let reason: GoalPauseReason = serde_json::from_str("\"invented-later\"")
+            .expect("an unknown pause reason must not fail the durable load");
+        assert_eq!(reason, GoalPauseReason::Unrecognized);
+        // And the known values still round-trip.
+        assert_eq!(
+            serde_json::from_str::<GoalPauseReason>("\"yielded\"").expect("yielded reads"),
+            GoalPauseReason::Yielded
+        );
     }
 
     #[tokio::test]
@@ -2124,7 +2202,7 @@ mod tests {
                 GoalPauseReason::BudgetLimit,
             ),
         ] {
-            let (projected, projected_reason) = thread_goal_status_projection(status);
+            let (projected, projected_reason) = thread_goal_status_projection(status, None);
             assert_eq!(projected, GoalStatus::Paused);
             assert_eq!(projected_reason, Some(reason));
         }
