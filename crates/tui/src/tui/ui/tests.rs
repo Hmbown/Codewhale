@@ -895,6 +895,10 @@ fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
         ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
         ShellBindingId::PetResultPageDown => KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
         ShellBindingId::PetBack => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ShellBindingId::PetResultStart => KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        ShellBindingId::PetResultEnd => KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        ShellBindingId::PetFocusAgents => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ShellBindingId::PetOpenAgent => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         ShellBindingId::PetSound => KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
         ShellBindingId::PetBrowser => KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
         ShellBindingId::PetWindow => KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
@@ -962,9 +966,13 @@ fn no_shell_binding_changes_meaning_once_the_composer_has_text() {
             .focus
             .admits(crate::tui::shell_key_routing::Focus::Composer)
         {
-            assert_eq!(
-                on_typed, None,
-                "exclusive view keys must not act on a draft"
+            // A chord may serve a different owner: Tab cycles the composer's
+            // mode and switches panes inside pet mode. The modal binding
+            // itself must never act on the composer draft.
+            assert_ne!(
+                on_typed,
+                Some(binding.id),
+                "exclusive view bindings must not act on a draft"
             );
             continue;
         }

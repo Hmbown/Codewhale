@@ -3,17 +3,21 @@
 use super::Control;
 use crate::tui::{
     shell_key_routing::{self, Focus, ShellBindingId as Id},
-    views::{ModalKind, ModalView, ViewAction},
+    views::{ModalKind, ModalView, ViewAction, ViewEvent},
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::sync::{Arc, Mutex};
 pub struct Habitat {
     controls: Arc<Mutex<Vec<Control>>>,
+    selection: Arc<Mutex<Option<String>>>,
 }
 impl Habitat {
-    pub fn new(controls: Arc<Mutex<Vec<Control>>>) -> Self {
-        Self { controls }
+    pub fn new(controls: Arc<Mutex<Vec<Control>>>, selection: Arc<Mutex<Option<String>>>) -> Self {
+        Self {
+            controls,
+            selection,
+        }
     }
 }
 impl ModalView for Habitat {
@@ -27,6 +31,15 @@ impl ModalView for Habitat {
             Some(Id::PetResultPageUp) => Some(Control::Scroll(-10)),
             Some(Id::PetResultPageDown) => Some(Control::Scroll(10)),
             Some(Id::PetBack) => return ViewAction::Close,
+            Some(Id::PetFocusAgents) => Some(Control::FocusAgents),
+            Some(Id::PetResultStart) => Some(Control::ScrollEnd(false)),
+            Some(Id::PetResultEnd) => Some(Control::ScrollEnd(true)),
+            Some(Id::PetOpenAgent) => {
+                if let Some(agent_id) = self.selection.lock().ok().and_then(|s| s.clone()) {
+                    return ViewAction::EmitAndClose(ViewEvent::OpenAgentTranscript { agent_id });
+                }
+                None
+            }
             Some(Id::PetSound) => Some(Control::Sound),
             Some(Id::PetBrowser) => Some(Control::Browser),
             Some(Id::PetWindow) => Some(Control::Window),
@@ -40,7 +53,12 @@ impl ModalView for Habitat {
         }
         ViewAction::None
     }
-    fn handle_mouse(&mut self, _mouse: MouseEvent) -> ViewAction {
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        if let Ok(mut queue) = self.controls.lock()
+            && queue.len() < 16
+        {
+            queue.push(Control::Mouse(mouse));
+        }
         ViewAction::None
     }
     fn render(&self, _area: Rect, _buf: &mut Buffer) {}
@@ -70,6 +88,18 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
     #[test]
+    fn enter_opens_only_the_painted_worker_through_the_existing_event_and_closes_pet_focus() {
+        let controls = Arc::new(Mutex::new(Vec::new()));
+        let selection = Arc::new(Mutex::new(None));
+        let mut view = Habitat::new(controls, selection.clone());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(view.handle_key(enter), ViewAction::None));
+        *selection.lock().unwrap() = Some("worker-id".into());
+        assert!(
+            matches!(view.handle_key(enter), ViewAction::EmitAndClose(ViewEvent::OpenAgentTranscript { agent_id }) if agent_id == "worker-id")
+        );
+    }
+    #[test]
     fn pet_habitat_full_view_preserves_composer_history_and_session_on_escape() {
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
@@ -81,7 +111,8 @@ mod tests {
         let session = app.current_session_id.clone();
         // Push the actual focus owner without starting a network client.
         let controls = Arc::new(Mutex::new(Vec::new()));
-        app.view_stack.push(Habitat::new(controls.clone()));
+        app.view_stack
+            .push(Habitat::new(controls.clone(), Arc::new(Mutex::new(None))));
         assert_eq!(app.focus(), Focus::Modal(ModalKind::PetHabitat));
         assert_eq!(
             shell_key_routing::route(

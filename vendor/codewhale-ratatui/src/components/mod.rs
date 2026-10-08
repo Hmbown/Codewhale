@@ -118,3 +118,10 @@ pub use dock_tabs::*;
 mod braille_frame;
 pub(crate) use braille_frame::paint_braille_cells;
 pub use braille_frame::*;
+
+mod whale_pet;
+pub use whale_pet::*;
+mod subagents;
+pub use subagents::*;
+mod pet_mode;
+pub use pet_mode::*;
