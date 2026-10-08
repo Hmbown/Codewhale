@@ -48,8 +48,8 @@
   "home": {
     "metaTitle": "Codewhale：用自己的模型和工具，把想法做出来",
     "metaDescription": "用 Codewhale 构建应用、自动处理工作，并连接你常用的工具。开源，支持你已有的模型 API、本地模型和自托管推理服务。",
-    "heroTitle": "把你想做的，做出来。",
-    "heroIntro": "做一个应用，让一项工作自动完成，或把一堆研究资料变成有用的成果。{brand} 连接你已有的模型 API、自己的推理服务，以及你选择的工具。",
+    "heroTitle": "在你电脑上工作的开源智能体。",
+    "heroIntro": "构建应用、自动化工作流，并使用 Slack、Gmail 和其他已连接的工具。{brand} 使用你已有的模型 API，或本地及自托管推理服务。",
     "getCodewhale": "安装 Codewhale",
     "heroInstallAria": "安装命令",
     "exploreProduct": "探索 Codewhale",
@@ -60,7 +60,7 @@
     "currentSource": "源码",
     "sourceCandidate": "未发布",
     "publishedRelease": "已发布",
-    "gainHeading": "做出真正有用的东西。",
+    "gainHeading": "你可以做什么",
     "gainLede": "从你想要的结果开始。Codewhale 使用文件、命令和已连接的工具完成工作，由你决定访问范围和审批方式。",
     "gain": [
       [
@@ -76,23 +76,6 @@
         "通过插件、MCP 服务或 API 连接 Gmail、Slack 等工具。让这些服务与文件和命令一起参与同一项任务。"
       ]
     ],
-    "exampleTasks": [
-      "做一个能在线预约的应用。",
-      "把销售 CSV 做成每周可重复生成的报告。",
-      "把已连接邮箱中的邮件整理成行动清单。"
-    ],
-    "reportTitle": "周销售报告",
-    "reportSampleLabel": "示例报告 · 样本数据",
-    "reportDescription": "让 Codewhale 按周汇总订单，并把处理步骤保存下来，供下一份 CSV 使用。",
-    "reportSourceLabel": "输入数据：",
-    "reportColumns": [
-      "周起始日",
-      "订单数",
-      "销售额（美元）"
-    ],
-    "reportTotalLabel": "合计",
-    "reportTrend": "首周到末周的销售额变化：{change}。",
-    "reportDownloadLabel": "下载报告 CSV",
     "chapterModels": "你的模型",
     "modelsHeading": "继续用你选择的模型。",
     "modelsBody": "连接你已经在用的模型 API，使用兼容网关，或在自己的硬件上运行推理。为每个会话选择模型，也能为 Fleet 中的不同智能体分配不同模型。",

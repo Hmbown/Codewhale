@@ -17,6 +17,7 @@ import { INSTALL_GUIDE } from "./install-guide.generated";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
+import { PRODUCT_COPY } from "./content/product";
 
 const root = new URL("../../", import.meta.url);
 
@@ -403,8 +404,9 @@ done
     });
     for (const label of [...matrix.control.modes, ...matrix.control.permissionPostures]) {
       expect(modes).toContain(label);
-      expect(homepage).toContain(label);
     }
+    expect(PRODUCT_COPY.modes.map(({ title }) => title.en)).toEqual(matrix.control.modes);
+    expect(PRODUCT_COPY.permissions.map(({ title }) => title.en)).toEqual(matrix.control.permissionPostures);
     expect(modes).toContain("when the composer is empty");
     expect(keys).toContain("When the composer is empty, cycle TUI mode");
     expect(keys).toContain("`Shift+Tab`");

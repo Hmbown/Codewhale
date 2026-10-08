@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale : créez avec vos modèles et vos outils",
   metaDescription:
     "Créez des applications, automatisez vos tâches et utilisez vos outils connectés avec Codewhale. Un logiciel libre, avec vos API de modèles ou votre inférence locale et auto-hébergée.",
-  heroTitle: "Donnez forme à vos idées.",
+  heroTitle: "Un agent open source pour votre ordinateur.",
   heroIntro:
-    "Créez une application, automatisez une tâche ou tirez quelque chose d’utile de vos recherches. {brand} utilise vos API de modèles habituelles, votre propre inférence et les outils que vous connectez.",
+    "Créez des applications, automatisez des workflows et travaillez avec Slack, Gmail et d’autres outils connectés. {brand} utilise les API de modèles que vous utilisez déjà, ou une inférence locale ou auto-hébergée.",
   getCodewhale: "Installer Codewhale",
   heroInstallAria: "Commande d'installation",
   exploreProduct: "Découvrir Codewhale",
@@ -20,7 +20,7 @@ export const home: HomeDict = {
   currentSource: "Source",
   sourceCandidate: "Non publiée",
   publishedRelease: "publiée",
-  gainHeading: "Créez quelque chose d’utile.",
+  gainHeading: "Ce que vous pouvez faire",
   gainLede:
     "Partez du résultat souhaité. Codewhale travaille avec les fichiers, les commandes et les outils connectés ; vous choisissez les accès et les approbations.",
   gain: [
@@ -37,20 +37,6 @@ export const home: HomeDict = {
       "Connectez des outils comme Gmail et Slack via des plugins, des serveurs MCP ou des API. Utilisez ces services avec vos fichiers et vos commandes."
     ]
   ],
-  exampleTasks: [
-    "Crée une application de prise de rendez-vous.",
-    "Transforme un CSV de ventes en un rapport hebdomadaire que je peux régénérer.",
-    "Transforme les messages de ma messagerie connectée en liste de tâches.",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "Rapport de ventes hebdomadaire",
-  reportSampleLabel: "Exemple de rapport · données fictives",
-  reportDescription: "Demandez à Codewhale de regrouper les commandes par semaine et de conserver le processus pour le prochain CSV.",
-  reportSourceLabel: "Données sources :",
-  reportColumns: ["Début de semaine","Commandes","Ventes (USD)"],
-  reportTotalLabel: "Total",
-  reportTrend: "Évolution des ventes, de la première semaine à la dernière : {change}.",
-  reportDownloadLabel: "Télécharger le rapport CSV",
   chapterModels: "Vos modèles",
   modelsHeading: "Gardez les modèles de votre choix.",
   modelsBody:

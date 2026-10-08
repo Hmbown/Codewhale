@@ -379,16 +379,11 @@ describe("homepage integration", () => {
     expect(homepage).toContain("/docs/vocabulary");
   });
 
-  it("keeps the previously pinned homepage facts intact", () => {
-    // Guard against the new band accidentally displacing the public-copy
-    // gate's required surface (the full contract lives in public-copy.test.ts).
+  it("keeps the published release separate from the source candidate", () => {
     expect(homepage).toContain("facts.latestPublishedRelease");
     // The unreleased-source label is the EN dictionary value the page renders
     // (plain "Unreleased", per docs/design/WEB_VOICE.md).
     expect(homepage).toContain("d.sourceCandidate");
     expect(getHome("en").sourceCandidate).toBe("Unreleased");
-    for (const label of ["Plan", "Work", "Operate", "Ask", "Auto-Review", "Full Access"]) {
-      expect(homepage).toContain(label);
-    }
   });
 });

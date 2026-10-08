@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: berkarya dengan model dan alat pilihanmu",
   metaDescription:
     "Buat aplikasi, otomatisasikan alur kerja, dan gunakan alat terhubung dengan Codewhale. Sumber terbuka, dengan API model milikmu atau inferensi lokal dan mandiri.",
-  heroTitle: "Wujudkan apa yang kamu bayangkan.",
+  heroTitle: "Agen sumber terbuka untuk komputermu.",
   heroIntro:
-    "Buat aplikasi, otomatisasikan alur kerja, atau ubah hasil riset menjadi sesuatu yang berguna. {brand} bekerja dengan API model yang sudah kamu gunakan, inferensimu sendiri, dan alat yang kamu hubungkan.",
+    "Buat aplikasi, otomatisasikan alur kerja, dan bekerja dengan Slack, Gmail serta alat terhubung lainnya. {brand} menggunakan API model yang sudah kamu pakai, atau inferensi lokal maupun yang kamu host sendiri.",
   getCodewhale: "Instal Codewhale",
   heroInstallAria: "Perintah instalasi",
   exploreProduct: "Jelajahi Codewhale",
@@ -20,7 +20,7 @@ export const home: HomeDict = {
   currentSource: "Sumber",
   sourceCandidate: "Belum dirilis",
   publishedRelease: "dirilis",
-  gainHeading: "Buat sesuatu yang berguna.",
+  gainHeading: "Yang bisa kamu lakukan",
   gainLede:
     "Mulai dari hasil yang kamu inginkan. Codewhale bekerja dengan berkas, perintah, dan alat terhubung; kamu menentukan akses dan persetujuannya.",
   gain: [
@@ -37,20 +37,6 @@ export const home: HomeDict = {
       "Hubungkan alat seperti Gmail dan Slack melalui plugin, server MCP, atau API. Gunakan layanan tersebut bersama berkas dan perintahmu."
     ]
   ],
-  exampleTasks: [
-    "Buat aplikasi untuk membuat janji temu.",
-    "Ubah CSV penjualan menjadi laporan mingguan yang bisa saya buat ulang.",
-    "Ubah pesan dari email saya yang sudah terhubung menjadi daftar tindakan.",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "Laporan penjualan mingguan",
-  reportSampleLabel: "Contoh laporan · data sampel",
-  reportDescription: "Minta Codewhale mengelompokkan pesanan per minggu dan menyimpan prosesnya untuk CSV berikutnya.",
-  reportSourceLabel: "Data masukan:",
-  reportColumns: ["Awal minggu","Pesanan","Penjualan (USD)"],
-  reportTotalLabel: "Jumlah",
-  reportTrend: "Perubahan penjualan dari minggu pertama ke minggu terakhir: {change}.",
-  reportDownloadLabel: "Unduh laporan CSV",
   chapterModels: "Model Anda",
   modelsHeading: "Tetap gunakan model pilihanmu.",
   modelsBody:

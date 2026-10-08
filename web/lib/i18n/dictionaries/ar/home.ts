@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: ابنِ باستخدام نماذجك وأدواتك",
   metaDescription:
     "ابنِ تطبيقات وأتمت العمل واستخدم الأدوات المتصلة مع Codewhale. مفتوح المصدر، مع واجهات نماذجك أو الاستدلال المحلي والمستضاف على أجهزتك.",
-  heroTitle: "حوّل ما تفكر فيه إلى شيء يعمل.",
+  heroTitle: "وكيل مفتوح المصدر لجهاز الكمبيوتر الخاص بك.",
   heroIntro:
-    "ابنِ تطبيقًا، أو أتمت سير عمل، أو حوّل أبحاثك إلى نتيجة مفيدة. يعمل {brand} مع واجهات النماذج التي تستخدمها بالفعل، واستدلالك الخاص، والأدوات التي تربطها.",
+    "أنشئ تطبيقات، وأتمت سير العمل، واستخدم Slack وGmail وغيرها من الأدوات المتصلة. يستخدم {brand} واجهات API للنماذج التي تستخدمها بالفعل، أو الاستدلال المحلي والمستضاف ذاتيًا.",
   getCodewhale: "ثبّت Codewhale",
   heroInstallAria: "أمر التثبيت",
   exploreProduct: "استكشف Codewhale",
@@ -21,7 +21,7 @@ export const home: HomeDict = {
   sourceCandidate: "غير منشور",
   publishedRelease: "منشور",
   gainHeading:
-    "اصنع شيئًا مفيدًا.",
+    "ما يمكنك فعله",
   gainLede:
     "ابدأ بالنتيجة التي تريدها. يعمل Codewhale بالملفات والأوامر والأدوات المتصلة، وأنت تحدد الوصول والموافقات.",
   gain: [
@@ -38,20 +38,6 @@ export const home: HomeDict = {
       "اربط أدوات مثل Gmail وSlack عبر الإضافات أو خوادم MCP أو واجهات API. استخدم هذه الخدمات مع ملفاتك وأوامرك في المهمة نفسها."
     ]
   ],
-  exampleTasks: [
-    "أنشئ تطبيقًا لحجز المواعيد.",
-    "حوّل ملف CSV للمبيعات إلى تقرير أسبوعي يمكن إعداده مجددًا.",
-    "حوّل الرسائل من بريدي الإلكتروني المتصل إلى قائمة مهام.",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "تقرير المبيعات الأسبوعي",
-  reportSampleLabel: "تقرير توضيحي · بيانات تجريبية",
-  reportDescription: "اطلب من Codewhale تجميع الطلبات حسب الأسبوع وحفظ خطوات العمل لاستخدامها مع ملف CSV التالي.",
-  reportSourceLabel: "بيانات الإدخال:",
-  reportColumns: ["بداية الأسبوع","الطلبات","المبيعات (دولار أمريكي)"],
-  reportTotalLabel: "الإجمالي",
-  reportTrend: "تغيّر المبيعات من الأسبوع الأول إلى الأخير: {change}.",
-  reportDownloadLabel: "تنزيل التقرير بصيغة CSV",
   chapterModels: "نماذجك",
   modelsHeading: "واصل استخدام نماذجك.",
   modelsBody:

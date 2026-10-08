@@ -48,8 +48,8 @@
   "home": {
     "metaTitle": "Codewhale: build with your models and tools",
     "metaDescription": "Build apps, automate workflows, and work across connected tools with Codewhale. Open source, with your own model APIs or local and self-hosted inference.",
-    "heroTitle": "Build what you have in mind.",
-    "heroIntro": "Create an app, automate a workflow, or turn a pile of research into something useful. {brand} works with the model APIs you already use, your own inference, and the tools you connect.",
+    "heroTitle": "An open-source agent for your computer.",
+    "heroIntro": "Build apps, automate workflows, and work with Slack, Gmail and other connected tools. {brand} uses your existing model APIs or local and self-hosted inference.",
     "getCodewhale": "Install Codewhale",
     "heroInstallAria": "Install command",
     "exploreProduct": "Explore Codewhale",
@@ -60,7 +60,7 @@
     "currentSource": "Source",
     "sourceCandidate": "Unreleased",
     "publishedRelease": "released",
-    "gainHeading": "Make something useful.",
+    "gainHeading": "What you can do",
     "gainLede": "Start with the result you want. Codewhale works through the files, commands and connected tools, while you choose its access and approvals.",
     "gain": [
       [
@@ -76,23 +76,6 @@
         "Connect tools like Gmail and Slack through plugins, MCP servers or APIs. Work across those services alongside your files and commands."
       ]
     ],
-    "exampleTasks": [
-      "Build an appointment-booking app.",
-      "Turn a sales CSV into a repeatable weekly report.",
-      "Turn messages from my connected email into an action list."
-    ],
-    "reportTitle": "Weekly sales report",
-    "reportSampleLabel": "Example report · sample data",
-    "reportDescription": "Ask Codewhale to group orders by week and save the process for the next CSV.",
-    "reportSourceLabel": "Input data:",
-    "reportColumns": [
-      "Week beginning",
-      "Orders",
-      "Sales (USD)"
-    ],
-    "reportTotalLabel": "Total",
-    "reportTrend": "Sales change, first week to last: {change}.",
-    "reportDownloadLabel": "Download report CSV",
     "chapterModels": "Your models",
     "modelsHeading": "Keep using your models.",
     "modelsBody": "Connect the model APIs you already pay for, use a compatible gateway, or run inference on your own hardware. Choose a model for each session—and different models for the agents in a Fleet.",

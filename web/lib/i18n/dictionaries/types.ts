@@ -162,18 +162,6 @@ export interface HomeDict {
   gainHeading: string;
   gainLede: string;
   gain: [string, string][];
-  /** Illustrative starter requests, in the same order as the three gain rows. */
-  exampleTasks: [string, string, string];
-  /** Copy for the static sample-data report; the numbers come from its dataset. */
-  reportTitle: string;
-  reportSampleLabel: string;
-  reportDescription: string;
-  reportSourceLabel: string;
-  reportColumns: [string, string, string];
-  reportTotalLabel: string;
-  /** Carries a localized `{change}` percentage. */
-  reportTrend: string;
-  reportDownloadLabel: string;
 
   /** Running head of the models chapter ("02 / Your models"). */
   chapterModels: string;

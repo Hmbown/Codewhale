@@ -6,10 +6,10 @@ import { Icon } from "@/components/icon";
 import { InstallCodeBlock } from "@/components/install-code-block";
 import { Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
+import { TerminalCapture } from "@/components/terminal-capture";
 import { WhaleLive } from "@/components/whale-live";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
-import { csvDataUri, EXAMPLE_SALES_REPORT, SAMPLE_SALES_CSV_URI } from "@/lib/example-sales-report";
 import { fill, getHome, splitToken } from "@/lib/i18n/dictionaries";
 import {
   APP_SIGNUP_URL,
@@ -19,6 +19,7 @@ import {
   REPO_URL,
 } from "@/lib/i18n/links";
 import { serializeJsonLd } from "@/lib/json-ld";
+import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 import { buildSoftwareApplicationJsonLd } from "@/lib/software-application-schema";
 
 // Revalidate against source-proven runtime facts without giving up static edge
@@ -30,7 +31,7 @@ export const revalidate = 300;
 const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
 
 /**
- * The whale-road homepage: the promise, illustrative task briefs and reading
+ * The whale-road homepage: the promise, capabilities and reading
  * sections sit on paper. The live v2 whale (the desktop app's own Director)
  * rests beside the hero, and the page ends in the sea with the install
  * command, running into the footer.
@@ -39,10 +40,8 @@ const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle",
  * pointer, and performs its existing poses. Everything else is still.
  * Reduced motion shows its poster pose.
  *
- * Every visible string resolves through `getHome(locale)`. The only literals
- * left here are code-owned per docs/VOICE.md: the product control vocabulary
- * (`Plan · Work · Operate`, `Ask · Auto-Review · Full Access`) and package
- * channel proper nouns.
+ * Public copy resolves through `getHome(locale)`; product names and package
+ * channels keep their canonical spelling.
  */
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -61,17 +60,6 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
   // token keeps the sentence a single translated unit — no concatenation of
   // fragments around a variable, and a locale may place the brand anywhere.
   const ledeParts = splitToken(d.heroIntro, "brand");
-  const money = new Intl.NumberFormat(locale, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
-  const number = new Intl.NumberFormat(locale);
-  const date = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", timeZone: "UTC" });
-  const change = new Intl.NumberFormat(locale, { style: "percent", signDisplay: "always", maximumFractionDigits: 0 });
-  const report = EXAMPLE_SALES_REPORT;
-  const reportRows = report.rows.map(row => ({ ...row, week: date.format(new Date(`${row.weekStart}T00:00:00Z`)) }));
-  const reportCsv = csvDataUri([
-    d.reportColumns,
-    ...reportRows.map(row => [row.week, row.orders, (row.salesCents / 100).toFixed(2)]),
-    [d.reportTotalLabel, report.orders, (report.salesCents / 100).toFixed(2)],
-  ]);
 
   return (
     <div className="home">
@@ -111,77 +99,52 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         </div>
       </section>
 
-      {/* A static report generated from local sample orders. This is an
-          illustrative artifact, not a customer job or live model result. */}
-      <section className="home-tasks" aria-labelledby="home-tasks-title">
-        <div className="home-tasks-inner">
-          <div className="home-task-intro">
-            <h2 className="home-task-heading" id="home-tasks-title">{d.exampleTasks[1]}</h2>
-            <p>{d.reportDescription}</p>
-            <Link href={`/${locale}/docs/guide`} className="section-link">
-              {d.startGuideLink}
-            </Link>
-          </div>
-          <div className="home-report">
-            <table>
-              <caption>
-                <strong>{d.reportTitle}</strong>
-                <span>{d.reportSampleLabel}</span>
-              </caption>
-              <thead>
-                <tr>{d.reportColumns.map(column => <th key={column} scope="col">{column}</th>)}</tr>
-              </thead>
-              <tbody>
-                {reportRows.map(row => (
-                  <tr key={row.weekStart}>
-                    <th scope="row"><bdi>{row.week}</bdi></th>
-                    <td><bdi>{number.format(row.orders)}</bdi></td>
-                    <td><bdi>{money.format(row.salesCents / 100)}</bdi></td>
-                  </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr>
-                  <th scope="row">{d.reportTotalLabel}</th>
-                  <td><bdi>{number.format(report.orders)}</bdi></td>
-                  <td><bdi>{money.format(report.salesCents / 100)}</bdi></td>
-                </tr>
-              </tfoot>
-            </table>
-            <p className="home-report-trend">{fill(d.reportTrend, { change: change.format(report.change) })}</p>
-            <a href={reportCsv} download="weekly-sales-report.csv" className="section-link">{d.reportDownloadLabel}</a>
-            <p className="home-report-source">
-              {d.reportSourceLabel}{" "}
-              <a href={SAMPLE_SALES_CSV_URI} download="sample-sales.csv" className="link"><code>sample-sales.csv</code></a>
-            </p>
-          </div>
-          <div className="home-task-secondary">
-            {[0, 2].map(index => (
-              <article key={index} aria-labelledby={`home-task-${index}`}>
-                <h3 id={`home-task-${index}`}>{d.gain[index][0]}</h3>
-                <blockquote className="home-task-brief">{d.exampleTasks[index]}</blockquote>
-                {index === 2 && <p className="home-task-detail">{d.gain[index][1]}</p>}
-              </article>
-            ))}
-          </div>
-          <div
-            className="home-release status-line"
-            data-source-state={sourceIsPublished ? "published release" : "source candidate"}
-            data-source-state-label={sourceIsPublished ? d.publishedRelease : d.sourceCandidate}
-          >
-            <Status tone={publishedRelease ? "ready" : "idle"}>
-              {publishedRelease
-                ? fill(d.latestRelease, { tag: publishedRelease.tag })
-                : d.releaseUnavailable}
-            </Status>
-            <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
-            <span>{facts.license ?? "MIT"}</span>
-          </div>
+      <div
+        className="home-release status-line"
+        data-source-state={sourceIsPublished ? "published release" : "source candidate"}
+        data-source-state-label={sourceIsPublished ? d.publishedRelease : d.sourceCandidate}
+      >
+        <Status tone={publishedRelease ? "ready" : "idle"}>
+          {publishedRelease
+            ? fill(d.latestRelease, { tag: publishedRelease.tag })
+            : d.releaseUnavailable}
+        </Status>
+        <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
+        <span>{facts.license ?? "MIT"}</span>
+      </div>
+
+      <figure className="home-terminal figure">
+        <div className="figure-frame" dir="ltr">
+          <TerminalCapture
+            frame="home"
+            regionLabel={d.shotPreview}
+            label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+          />
         </div>
-      </section>
+        <figcaption className="figure-caption">
+          {d.shotPreview} · {d.sourceCandidate} v{TERMINAL_SCREENSHOT.version}
+        </figcaption>
+      </figure>
 
       {/* PAPER — models, connections, and the getting-started path. */}
       <div className="home-body">
+        <Section
+          id="home-capabilities"
+          layout="split"
+          className="home-section"
+          title={d.gainHeading}
+          scope={d.gainLede}
+        >
+          <dl className="ruled-list">
+            {d.gain.map(([name, description]) => (
+              <div key={name}>
+                <dt>{name}</dt>
+                <dd>{description}</dd>
+              </div>
+            ))}
+          </dl>
+        </Section>
+
         <Section
           id="home-models"
           layout="split"
@@ -202,10 +165,6 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 <dd>{description}</dd>
               </div>
             ))}
-            <div className="home-modes">
-              <dt>Plan · Work · Operate</dt>
-              <dd>Ask · Auto-Review · Full Access</dd>
-            </div>
           </dl>
         </Section>
 

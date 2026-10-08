@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: अपने मॉडल और टूल से बनाएं",
   metaDescription:
     "Codewhale से ऐप बनाएं, काम स्वचालित करें और जुड़े टूल इस्तेमाल करें। ओपन सोर्स, आपके मॉडल API या स्थानीय और खुद होस्ट किए गए इन्फरेंस के साथ।",
-  heroTitle: "जो सोचा है, उसे बनाएं।",
+  heroTitle: "आपके कंप्यूटर के लिए एक ओपन-सोर्स एजेंट।",
   heroIntro:
-    "ऐप बनाएं, काम की प्रक्रिया स्वचालित करें या जुटाई गई शोध सामग्री से उपयोगी परिणाम निकालें। {brand} आपके मौजूदा मॉडल API, अपने इन्फरेंस और आपके जोड़े गए टूल के साथ काम करता है।",
+    "ऐप बनाएं, काम की प्रक्रियाएं स्वचालित करें और Slack, Gmail व दूसरे जुड़े टूल के साथ काम करें। {brand} आपके मौजूदा मॉडल API या स्थानीय और स्वयं होस्ट किए गए इन्फरेंस का उपयोग करता है।",
   getCodewhale: "Codewhale इंस्टॉल करें",
   heroInstallAria: "इंस्टॉल कमांड",
   exploreProduct: "Codewhale देखें",
@@ -21,7 +21,7 @@ export const home: HomeDict = {
   sourceCandidate: "अप्रकाशित",
   publishedRelease: "प्रकाशित",
   gainHeading:
-    "कुछ उपयोगी बनाएं।",
+    "आप क्या कर सकते हैं",
   gainLede:
     "मनचाहे परिणाम से शुरू करें। Codewhale फ़ाइलों, कमांड और जुड़े टूल से काम करता है; पहुंच और मंज़ूरी आप तय करते हैं।",
   gain: [
@@ -38,20 +38,6 @@ export const home: HomeDict = {
       "प्लगइन, MCP सर्वर या API के ज़रिए Gmail और Slack जैसे टूल जोड़ें। इन सेवाओं का इस्तेमाल अपनी फ़ाइलों और कमांड के साथ करें।"
     ]
   ],
-  exampleTasks: [
-    "अपॉइंटमेंट बुक करने वाला ऐप बनाओ।",
-    "बिक्री की CSV से ऐसी साप्ताहिक रिपोर्ट बनाओ जिसे दोबारा तैयार किया जा सके।",
-    "मेरे कनेक्ट किए गए ईमेल के संदेशों से कामों की सूची बनाओ।",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "साप्ताहिक बिक्री रिपोर्ट",
-  reportSampleLabel: "उदाहरण रिपोर्ट · नमूना डेटा",
-  reportDescription: "Codewhale से ऑर्डर को हफ़्ते के हिसाब से जोड़ने और अगले CSV के लिए प्रक्रिया सहेजने को कहें।",
-  reportSourceLabel: "इनपुट डेटा:",
-  reportColumns: ["हफ़्ते की शुरुआत","ऑर्डर","बिक्री (USD)"],
-  reportTotalLabel: "कुल",
-  reportTrend: "पहले से आख़िरी हफ़्ते तक बिक्री में बदलाव: {change}।",
-  reportDownloadLabel: "रिपोर्ट CSV डाउनलोड करें",
   chapterModels: "आपके मॉडल",
   modelsHeading: "अपने चुने हुए मॉडल इस्तेमाल करें।",
   modelsBody:

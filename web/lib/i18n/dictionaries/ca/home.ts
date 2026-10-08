@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: crea amb els teus models i eines",
   metaDescription:
     "Crea aplicacions, automatitza fluxos de treball i utilitza eines connectades amb Codewhale. Codi obert, amb les teves API de models o inferència local i autoallotjada.",
-  heroTitle: "Crea allò que tens al cap.",
+  heroTitle: "Un agent de codi obert per al teu ordinador.",
   heroIntro:
-    "Crea una aplicació, automatitza un flux de treball o transforma una recerca en alguna cosa útil. {brand} treballa amb les API de models que ja fas servir, la teva pròpia inferència i les eines que connectis.",
+    "Crea aplicacions, automatitza fluxos de treball i treballa amb Slack, Gmail i altres eines connectades. {brand} fa servir les API de models que ja utilitzes o inferència local i autoallotjada.",
   getCodewhale: "Instal·lar Codewhale",
   heroInstallAria: "Ordre d'instal·lació",
   exploreProduct: "Explora Codewhale",
@@ -20,7 +20,7 @@ export const home: HomeDict = {
   currentSource: "Font",
   sourceCandidate: "Sense publicar",
   publishedRelease: "publicada",
-  gainHeading: "Crea alguna cosa útil.",
+  gainHeading: "Què pots fer",
   gainLede:
     "Comença pel resultat que vols. Codewhale treballa amb fitxers, ordres i eines connectades; tu decideixes els accessos i les aprovacions.",
   gain: [
@@ -37,20 +37,6 @@ export const home: HomeDict = {
       "Connecta eines com Gmail i Slack mitjançant plugins, servidors MCP o API. Treballa amb aquests serveis al costat dels teus fitxers i ordres."
     ]
   ],
-  exampleTasks: [
-    "Crea una aplicació per reservar cites.",
-    "Converteix un CSV de vendes en un informe setmanal que pugui tornar a generar.",
-    "Converteix els missatges del correu connectat en una llista de tasques.",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "Informe de vendes setmanal",
-  reportSampleLabel: "Informe d’exemple · dades de mostra",
-  reportDescription: "Demana a Codewhale que agrupi les comandes per setmana i desi el procés per al pròxim CSV.",
-  reportSourceLabel: "Dades d’entrada:",
-  reportColumns: ["Inici de setmana","Comandes","Vendes (USD)"],
-  reportTotalLabel: "Total",
-  reportTrend: "Canvi en les vendes, de la primera setmana a l’última: {change}.",
-  reportDownloadLabel: "Descarrega l’informe en CSV",
   chapterModels: "Els teus models",
   modelsHeading: "Continua fent servir els teus models.",
   modelsBody:

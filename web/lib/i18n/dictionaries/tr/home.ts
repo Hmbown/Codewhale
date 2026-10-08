@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: kendi modellerin ve araçlarınla geliştir",
   metaDescription:
     "Codewhale ile uygulamalar geliştir, iş akışlarını otomatikleştir ve bağlı araçlarla çalış. Açık kaynak; kendi model API’lerin, yerel veya kendi barındırdığın çıkarımla.",
-  heroTitle: "Aklındakini hayata geçir.",
+  heroTitle: "Bilgisayarın için açık kaynaklı bir ajan.",
   heroIntro:
-    "Bir uygulama geliştir, bir iş akışını otomatikleştir veya araştırmalarını faydalı bir sonuca dönüştür. {brand}, kullandığın model API’leri, kendi çıkarımın ve bağladığın araçlarla çalışır.",
+    "Uygulamalar geliştir, iş akışlarını otomatikleştir ve Slack, Gmail ve diğer bağlı araçlarla çalış. {brand}, mevcut model API’lerini veya yerel ve kendi barındırdığın çıkarım altyapısını kullanır.",
   getCodewhale: "Codewhale'i kur",
   heroInstallAria: "Kurulum komutu",
   exploreProduct: "Codewhale’i keşfet",
@@ -21,7 +21,7 @@ export const home: HomeDict = {
   sourceCandidate: "Yayımlanmadı",
   publishedRelease: "yayımlandı",
   gainHeading:
-    "Faydalı bir şey üret.",
+    "Neler yapabilirsin",
   gainLede:
     "İstediğin sonuçla başla. Codewhale dosyalar, komutlar ve bağlı araçlarla çalışır; erişimi ve onayları sen belirlersin.",
   gain: [
@@ -38,20 +38,6 @@ export const home: HomeDict = {
       "Gmail ve Slack gibi araçları eklentiler, MCP sunucuları veya API’lerle bağla. Bu hizmetlerle dosya ve komutlarını aynı görevde kullan."
     ]
   ],
-  exampleTasks: [
-    "Randevu rezervasyonu için bir uygulama yap.",
-    "Satış CSV’sini tekrar oluşturabileceğim bir haftalık rapora dönüştür.",
-    "Bağlı e-posta hesabımdaki iletileri bir yapılacaklar listesine dönüştür.",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "Haftalık satış raporu",
-  reportSampleLabel: "Örnek rapor · örnek veriler",
-  reportDescription: "Codewhale’den siparişleri haftalara göre gruplamasını ve işlemi sonraki CSV için kaydetmesini isteyin.",
-  reportSourceLabel: "Girdi verileri:",
-  reportColumns: ["Hafta başlangıcı","Siparişler","Satışlar (USD)"],
-  reportTotalLabel: "Toplam",
-  reportTrend: "İlk haftadan son haftaya satış değişimi: {change}.",
-  reportDownloadLabel: "CSV raporunu indir",
   chapterModels: "Senin modellerin",
   modelsHeading: "Kendi modellerini kullanmaya devam et.",
   modelsBody:

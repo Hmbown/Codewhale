@@ -65,10 +65,11 @@ Runtime model: source readiness is not deployment or customer acceptance.
   compatibility identifiers (GitHub org/repo, package scopes).
 - Provider and model names are first-class and neutral; never rank providers
   in copy.
-- The homepage leads with a task and useful output, rather than a terminal
-  view picker. Authored example artifacts use clearly labeled sample data;
-  their downloads must match the visible result. They are not captured customer
-  sessions or evidence of model performance.
+- The homepage explains what Codewhale does, the models and tools it connects
+  to, and how to install it. Keep it straightforward. Invented task briefs,
+  sample reports and terminal view galleries do not belong on the homepage.
+  Show one actual native TUI capture below the introduction. The product page
+  and component explorer can show the other views.
 - `web/lib/media-manifest.ts` records the exact captured native build and
   shared README image. Native views on the product page and getting-started
   guide retain their original PTY text and colors. An isolated local demo may

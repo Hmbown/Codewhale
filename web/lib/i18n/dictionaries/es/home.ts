@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: construye con tus modelos y herramientas",
   metaDescription:
     "Crea aplicaciones, automatiza flujos de trabajo y usa herramientas conectadas con Codewhale. Código abierto, con tus propias API de modelos o inferencia local y autoalojada.",
-  heroTitle: "Construye lo que tienes en mente.",
+  heroTitle: "Un agente de código abierto para tu ordenador.",
   heroIntro:
-    "Crea una aplicación, automatiza un flujo de trabajo o convierte una investigación en algo útil. {brand} trabaja con las API de modelos que ya usas, tu propia inferencia y las herramientas que conectes.",
+    "Crea aplicaciones, automatiza flujos de trabajo y trabaja con Slack, Gmail y otras herramientas conectadas. {brand} usa las API de modelos que ya utilizas o inferencia local y autoalojada.",
   getCodewhale: "Instalar Codewhale",
   heroInstallAria: "Comando de instalación",
   exploreProduct: "Explora Codewhale",
@@ -20,7 +20,7 @@ export const home: HomeDict = {
   currentSource: "Fuente",
   sourceCandidate: "Sin publicar",
   publishedRelease: "publicado",
-  gainHeading: "Crea algo útil.",
+  gainHeading: "Qué puedes hacer",
   gainLede:
     "Empieza por el resultado que quieres. Codewhale trabaja con archivos, comandos y herramientas conectadas; tú eliges los accesos y las aprobaciones.",
   gain: [
@@ -37,20 +37,6 @@ export const home: HomeDict = {
       "Conecta herramientas como Gmail y Slack mediante plugins, servidores MCP o API. Trabaja con esos servicios junto con tus archivos y comandos."
     ]
   ],
-  exampleTasks: [
-    "Crea una aplicación para reservar citas.",
-    "Convierte un CSV de ventas en un informe semanal que pueda volver a generar.",
-    "Convierte los mensajes de mi correo conectado en una lista de tareas.",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "Informe semanal de ventas",
-  reportSampleLabel: "Informe de ejemplo · datos de muestra",
-  reportDescription: "Pide a Codewhale que agrupe los pedidos por semana y guarde el proceso para el siguiente CSV.",
-  reportSourceLabel: "Datos de entrada:",
-  reportColumns: ["Inicio de semana","Pedidos","Ventas (USD)"],
-  reportTotalLabel: "Total",
-  reportTrend: "Cambio en las ventas, de la primera semana a la última: {change}.",
-  reportDownloadLabel: "Descargar informe CSV",
   chapterModels: "Tus modelos",
   modelsHeading: "Sigue usando tus modelos.",
   modelsBody:

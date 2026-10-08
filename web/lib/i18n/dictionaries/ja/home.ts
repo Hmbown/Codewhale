@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale：自分のモデルとツールで、作りたいものを形に",
   metaDescription:
     "Codewhale でアプリを作り、仕事を自動化し、接続したツールを活用。オープンソースで、手持ちのモデル API やローカル・自己ホスト型の推論に対応。",
-  heroTitle: "作りたいものを、形に。",
+  heroTitle: "あなたのコンピューターのためのオープンソースエージェント。",
   heroIntro:
-    "アプリを作る。作業を自動化する。集めた調査資料を役立つ成果にまとめる。{brand} は、すでに使っているモデル API、自分の推論環境、接続したツールで動きます。",
+    "アプリを作り、ワークフローを自動化し、Slack、Gmail などの接続済みツールで作業できます。{brand} は、既存のモデル API、ローカル推論、セルフホストの推論を利用します。",
   getCodewhale: "Codewhale をインストール",
   heroInstallAria: "インストールコマンド",
   exploreProduct: "Codewhale を見る",
@@ -20,7 +20,7 @@ export const home: HomeDict = {
   currentSource: "ソース",
   sourceCandidate: "未リリース",
   publishedRelease: "リリース済み",
-  gainHeading: "役に立つものを作ろう。",
+  gainHeading: "できること",
   gainLede: "欲しい結果から始めましょう。Codewhale がファイル、コマンド、接続したツールで作業し、アクセス範囲と承認方法はあなたが決めます。",
   gain: [
     [
@@ -36,20 +36,6 @@ export const home: HomeDict = {
       "プラグイン、MCP サーバー、API を通じて Gmail や Slack などのツールを接続できます。ファイルやコマンドと同じタスクで活用できます。"
     ]
   ],
-  exampleTasks: [
-    "予約を受け付けるアプリを作って。",
-    "売上CSVから、毎週繰り返し作れるレポートを作って。",
-    "接続済みのメールから、やることリストを作って。",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "週次売上レポート",
-  reportSampleLabel: "レポートの例 · サンプルデータ",
-  reportDescription: "Codewhale に注文を週ごとに集計させ、次の CSV にも使えるように手順を保存しましょう。",
-  reportSourceLabel: "入力データ：",
-  reportColumns: ["週の開始日","注文数","売上（米ドル）"],
-  reportTotalLabel: "合計",
-  reportTrend: "最初の週から最後の週までの売上の変化：{change}。",
-  reportDownloadLabel: "レポート CSV をダウンロード",
   chapterModels: "あなたのモデル",
   modelsHeading: "使うモデルは、自分で選ぶ。",
   modelsBody:

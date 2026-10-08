@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: xây dựng với mô hình và công cụ của bạn",
   metaDescription:
     "Tạo ứng dụng, tự động hóa quy trình và làm việc với công cụ đã kết nối bằng Codewhale. Mã nguồn mở, dùng API mô hình của bạn hoặc suy luận cục bộ và tự lưu trữ.",
-  heroTitle: "Biến điều bạn nghĩ thành sản phẩm.",
+  heroTitle: "Một tác nhân mã nguồn mở cho máy tính của bạn.",
   heroIntro:
-    "Tạo ứng dụng, tự động hóa quy trình hoặc biến tài liệu nghiên cứu thành kết quả hữu ích. {brand} làm việc với API mô hình bạn đang dùng, hạ tầng suy luận riêng và các công cụ bạn kết nối.",
+    "Tạo ứng dụng, tự động hóa quy trình và làm việc với Slack, Gmail cùng các công cụ được kết nối khác. {brand} sử dụng API mô hình bạn đang dùng, hoặc suy luận cục bộ và trên hạ tầng bạn tự vận hành.",
   getCodewhale: "Cài đặt Codewhale",
   heroInstallAria: "Lệnh cài đặt",
   exploreProduct: "Khám phá Codewhale",
@@ -20,7 +20,7 @@ export const home: HomeDict = {
   currentSource: "Mã nguồn",
   sourceCandidate: "Chưa phát hành",
   publishedRelease: "đã phát hành",
-  gainHeading: "Tạo ra điều hữu ích.",
+  gainHeading: "Bạn có thể làm gì",
   gainLede:
     "Bắt đầu từ kết quả bạn muốn. Codewhale làm việc với tệp, lệnh và công cụ đã kết nối; bạn quyết định quyền truy cập và phê duyệt.",
   gain: [
@@ -37,20 +37,6 @@ export const home: HomeDict = {
       "Kết nối công cụ như Gmail và Slack qua plugin, máy chủ MCP hoặc API. Làm việc với các dịch vụ đó cùng tệp và lệnh của bạn."
     ]
   ],
-  exampleTasks: [
-    "Tạo một ứng dụng đặt lịch hẹn.",
-    "Biến CSV bán hàng thành báo cáo hằng tuần có thể tạo lại.",
-    "Biến thư trong email đã kết nối của tôi thành danh sách việc cần làm.",
-  ],
-  // A static example report built from local sample orders.
-  reportTitle: "Báo cáo doanh số hằng tuần",
-  reportSampleLabel: "Báo cáo minh họa · dữ liệu mẫu",
-  reportDescription: "Yêu cầu Codewhale nhóm đơn hàng theo tuần và lưu quy trình để dùng với tệp CSV tiếp theo.",
-  reportSourceLabel: "Dữ liệu đầu vào:",
-  reportColumns: ["Đầu tuần","Đơn hàng","Doanh số (USD)"],
-  reportTotalLabel: "Tổng",
-  reportTrend: "Thay đổi doanh số từ tuần đầu đến tuần cuối: {change}.",
-  reportDownloadLabel: "Tải báo cáo CSV",
   chapterModels: "Mô hình của bạn",
   modelsHeading: "Tiếp tục dùng mô hình bạn chọn.",
   modelsBody:
