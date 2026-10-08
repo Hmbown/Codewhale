@@ -20114,6 +20114,60 @@ async fn workspace_file_put_keeps_the_edited_files_mode() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn workspace_file_concurrent_creates_preserve_the_first_publication() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let relative = Path::new("notes/new.txt");
+    fs::write(tmp.path().join("unrelated.txt"), b"keep me\n")?;
+
+    // Admit both creators while the destination is absent, before either
+    // publishes. This makes the stale-create race independent of scheduling.
+    let files = [
+        crate::fleet::files::WorkspaceFile::open_shared(tmp.path(), relative, true)?,
+        crate::fleet::files::WorkspaceFile::open_shared(tmp.path(), relative, true)?,
+    ];
+    assert!(!tmp.path().join(relative).exists());
+    let payloads = [
+        b"first creator\n".as_slice(),
+        b"second creator\n".as_slice(),
+    ];
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .into_iter()
+            .zip(payloads)
+            .map(|(file, bytes)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    workspace::publish_workspace_file(&file, bytes, true)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("creator worker must not panic"))
+            .collect::<Vec<_>>()
+    });
+
+    let winners: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| result.is_ok().then_some(index))
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one create may publish");
+    let error = results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .unwrap();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert!(error.message.contains("read it before overwriting"));
+    assert_eq!(fs::read(tmp.path().join(relative))?, payloads[winners[0]]);
+    assert_eq!(fs::read(tmp.path().join("unrelated.txt"))?, b"keep me\n");
+    Ok(())
+}
+
 #[tokio::test]
 async fn workspace_files_list_read_write_bounds_and_confinement() -> Result<()> {
     let tmp = tempfile::tempdir()?;
