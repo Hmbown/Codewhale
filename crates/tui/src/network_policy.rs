@@ -191,27 +191,56 @@ impl NetworkPolicy {
     /// Fold a lower-precedence layer (the user's config document) onto this
     /// policy without letting it widen what a higher authority set.
     ///
-    /// A `deny` entry is never dropped, and the fallback keeps the stricter of
-    /// the two decisions. The lower layer's `allow` list is adopted, so it can
-    /// grant hosts that the fallback would otherwise prompt for — which is what
-    /// `/network allow <host>` writes — but it cannot make an unlisted host
-    /// more permissive than the authority already decided, and it cannot lift a
-    /// denial.
+    /// The fold is deliberately asymmetric, because the two layers are not
+    /// peers:
+    ///
+    /// * `deny` is the **union**. Either layer saying no is a no.
+    /// * `default` keeps the **stricter** of the two.
+    /// * When the authority's fallback is `Deny`, the lower layer contributes
+    ///   **nothing that can allow**: `allow`, `proxy`, and the fake-IP CIDRs
+    ///   stay the authority's own. `decide` checks `allow` *before* falling back
+    ///   to `default`, so adopting a lower `allow` entry under a
+    ///   deny-by-default authority would let the document lift exactly the
+    ///   denial the authority set.
+    /// * Otherwise the authority is prompt-by-default, and the lower layer may
+    ///   do what `/network allow <host>` writes: name additional hosts. Those
+    ///   merge with the authority's own rather than replacing them, so a
+    ///   refresh cannot erase an administrator's allowances either.
+    /// * `audit` is the one field that widens by `true`: either layer asking for
+    ///   the audit log keeps it, and a document cannot silence it under an
+    ///   authority.
     #[must_use]
     pub fn folded_with_lower_layer(&self, lower: Self) -> Self {
-        let mut deny = self.deny.clone();
-        for entry in lower.deny {
-            if !deny.iter().any(|existing| existing == &entry) {
-                deny.push(entry);
+        fn union(mut base: Vec<String>, extra: Vec<String>) -> Vec<String> {
+            for entry in extra {
+                if !base.iter().any(|existing| existing == &entry) {
+                    base.push(entry);
+                }
             }
+            base
         }
+
+        let deny_by_default = self.default == DecisionToml::Deny;
+        let (allow, proxy, proxy_fake_ip_cidrs) = if deny_by_default {
+            (
+                self.allow.clone(),
+                self.proxy.clone(),
+                self.proxy_fake_ip_cidrs.clone(),
+            )
+        } else {
+            (
+                union(self.allow.clone(), lower.allow),
+                union(self.proxy.clone(), lower.proxy),
+                union(self.proxy_fake_ip_cidrs.clone(), lower.proxy_fake_ip_cidrs),
+            )
+        };
         Self {
             default: stricter_decision(self.default, lower.default),
-            allow: lower.allow,
-            deny,
-            proxy: lower.proxy,
-            proxy_fake_ip_cidrs: lower.proxy_fake_ip_cidrs,
-            audit: lower.audit,
+            allow,
+            deny: union(self.deny.clone(), lower.deny),
+            proxy,
+            proxy_fake_ip_cidrs,
+            audit: self.audit || lower.audit,
         }
     }
 
@@ -1005,7 +1034,11 @@ mod tests {
 
     #[test]
     fn folding_a_document_never_widens_an_authority() {
-        // What a Fleet denial or a managed overlay resolved to.
+        // Assert what the folded policy *decides*, not the shape of its fields:
+        // `decide` checks `allow` before falling back to `default`, so a field
+        // assertion can look safe while the verdict is `Allow`.
+
+        // What a Fleet denial or a managed overlay resolved to: deny by default.
         let authority = NetworkPolicy {
             default: DecisionToml::Deny,
             deny: vec!["blocked.example.com".to_string()],
@@ -1015,28 +1048,74 @@ mod tests {
         let document = NetworkPolicy {
             default: DecisionToml::Allow,
             allow: vec!["api.github.com".to_string()],
+            proxy: vec!["proxy.example.com".to_string()],
+            proxy_fake_ip_cidrs: vec!["198.18.0.0/15".to_string()],
+            audit: false,
             ..NetworkPolicy::default()
         };
 
         let folded = authority.folded_with_lower_layer(document);
 
         assert_eq!(
-            folded.default,
-            DecisionToml::Deny,
-            "the document must not widen an authority's fallback"
+            folded.decide("api.github.com"),
+            Decision::Deny,
+            "a document cannot lift a deny-by-default authority's denial"
         );
-        assert!(
-            folded.deny.iter().any(|host| host == "blocked.example.com"),
+        assert_eq!(
+            folded.decide("blocked.example.com"),
+            Decision::Deny,
             "a denial the authority set survives the fold"
         );
+        assert_eq!(
+            folded.decide("unlisted.example.com"),
+            Decision::Deny,
+            "an unlisted host still falls back to the authority's denial"
+        );
         assert!(
-            folded.allow.iter().any(|host| host == "api.github.com"),
-            "the document may still name hosts the authority did not deny"
+            folded.proxy.is_empty() && folded.proxy_fake_ip_cidrs.is_empty(),
+            "a document cannot hand itself a fake-IP SSRF exception under a denial"
+        );
+        assert!(
+            folded.audit,
+            "a document cannot silence the audit log under an authority"
         );
 
-        // The fold is conservative by construction; that is why it is used only
-        // when an authority owns the policy. The plain user path replaces the
-        // policy outright, so `/network default allow` still lands there.
+        // A prompt-by-default authority is the case `/network allow` exists for:
+        // the document may name hosts, and it may not erase the authority's own.
+        let prompt_authority = NetworkPolicy {
+            default: DecisionToml::Prompt,
+            allow: vec!["internal.example.com".to_string()],
+            deny: vec!["blocked.example.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        let folded = prompt_authority.folded_with_lower_layer(NetworkPolicy {
+            default: DecisionToml::Allow,
+            allow: vec!["api.github.com".to_string()],
+            ..NetworkPolicy::default()
+        });
+        assert_eq!(
+            folded.decide("api.github.com"),
+            Decision::Allow,
+            "the document may still name hosts when the authority prompts"
+        );
+        assert_eq!(
+            folded.decide("internal.example.com"),
+            Decision::Allow,
+            "the authority's own allowance survives the fold"
+        );
+        assert_eq!(
+            folded.decide("unlisted.example.com"),
+            Decision::Prompt,
+            "the document cannot widen the authority's fallback to allow"
+        );
+        assert_eq!(
+            folded.decide("blocked.example.com"),
+            Decision::Deny,
+            "either layer's denial wins"
+        );
+
+        // The plain user path replaces the policy outright, so
+        // `/network default allow` still lands there.
         let plain = NetworkPolicy {
             default: DecisionToml::Prompt,
             ..NetworkPolicy::default()
