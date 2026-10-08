@@ -1131,6 +1131,34 @@ mod tests {
         );
     }
 
+    /// A managed overlay may legitimately resolve `default = "allow"`. Its fold
+    /// takes the union branch, and the document's own fallback can only narrow
+    /// it — nothing there is more permissive than the authority's own policy,
+    /// because that policy already allowed everything.
+    #[test]
+    fn folding_an_allow_by_default_authority_only_narrows() {
+        let authority = NetworkPolicy {
+            default: DecisionToml::Allow,
+            ..NetworkPolicy::default()
+        };
+        let folded = authority.folded_with_lower_layer(NetworkPolicy {
+            default: DecisionToml::Deny,
+            allow: vec!["named.example.com".to_string()],
+            ..NetworkPolicy::default()
+        });
+
+        assert_eq!(
+            folded.decide("named.example.com"),
+            Decision::Allow,
+            "the authority allowed everything already; naming a host is not a widening"
+        );
+        assert_eq!(
+            folded.decide("other.example.com"),
+            Decision::Deny,
+            "the document narrowed the fallback, which is the direction it may move"
+        );
+    }
+
     #[test]
     fn approve_persistent_writes_back_to_policy() {
         let policy = mk(Decision::Prompt, &[], &[]);
