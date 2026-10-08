@@ -91,6 +91,8 @@ pub struct PetModeState {
     agents: SubagentViewState,
     pub output_scroll: usize,
     pub focus_agents: bool,
+    output_detached: bool,
+    output_end: usize,
     areas: PetModeAreas,
     session: Option<String>,
     visible: bool,
@@ -111,9 +113,11 @@ impl PetModeState {
         if self.session.as_deref() != session {
             self.agents = SubagentViewState::default();
             self.agents.set_visible(self.visible);
-            self.output_scroll = 0;
+            self.reset_output();
             self.focus_agents = false;
             self.session = session.map(str::to_owned);
+        } else if self.stage.director().context.turn_id != inputs.context.turn_id {
+            self.reset_output();
         }
         let settled = inputs.presence == Presence::Done
             || (matches!(
@@ -179,6 +183,21 @@ impl PetModeState {
         }
     }
 
+    /// Follow the next response from the host's authoritative turn boundary.
+    pub fn reset_output(&mut self) {
+        self.output_scroll = 0;
+        self.output_end = 0;
+        self.output_detached = false;
+    }
+
+    fn scroll_output(&mut self, lines: i16) {
+        self.output_scroll = self
+            .output_scroll
+            .saturating_add_signed(isize::from(lines))
+            .min(self.output_end);
+        self.output_detached = self.output_scroll < self.output_end;
+    }
+
     /// Result scrolling or roster navigation, depending on the visible focus.
     pub fn scroll(&mut self, agents: &[Subagent<'_>], lines: i16) {
         if lines == 0 {
@@ -197,7 +216,7 @@ impl PetModeState {
                 self.agents.select(agents, &agent.id);
             }
         } else {
-            self.output_scroll = self.output_scroll.saturating_add_signed(isize::from(lines));
+            self.scroll_output(lines);
         }
     }
 
@@ -210,6 +229,7 @@ impl PetModeState {
             );
         } else {
             self.output_scroll = if end { usize::MAX } else { 0 };
+            self.output_detached = !end;
         }
     }
 
@@ -266,12 +286,8 @@ impl PetModeState {
         }
         if self.areas.output.contains(point) {
             match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.output_scroll = self.output_scroll.saturating_sub(3)
-                }
-                MouseEventKind::ScrollDown => {
-                    self.output_scroll = self.output_scroll.saturating_add(3)
-                }
+                MouseEventKind::ScrollUp => self.scroll_output(-3),
+                MouseEventKind::ScrollDown => self.scroll_output(3),
                 _ => return false,
             }
             self.focus_agents = false;
@@ -408,9 +424,12 @@ impl StatefulWidget for PetMode<'_> {
                 plan.output.width,
                 plan.output.height.saturating_sub(1),
             );
-            state.output_scroll = state
-                .output_scroll
-                .min(self.output.len().saturating_sub(usize::from(body.height)));
+            state.output_end = self.output.len().saturating_sub(usize::from(body.height));
+            state.output_scroll = if state.output_detached {
+                state.output_scroll.min(state.output_end)
+            } else {
+                state.output_end
+            };
             // usize selection preserves arbitrarily long already-wrapped output.
             for (y, line) in self
                 .output

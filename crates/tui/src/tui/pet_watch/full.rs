@@ -300,13 +300,18 @@ pub fn render_full(frame: &mut Frame, app: &mut App) {
             app.ui_locale,
             MessageId::SubagentsNoCurrentSessionFleetWorkers,
         ),
+        activity: tr(app.ui_locale, MessageId::AutomationStatusLabel),
+        output: tr(app.ui_locale, MessageId::AgentFocusResult),
+        // The retained roster supplies no event log or copied outcome.
+        // Enter opens those through the existing localized transcript view.
+        toggle_output: "".into(),
+        no_events: "".into(),
         hints: "".into(),
         open: "".into(),
         message: "".into(),
         stop: "".into(),
         summary: Some(agents.len().to_string().into()),
         steps_label: Some(tr(app.ui_locale, MessageId::SessionMetricsSteps)),
-        ..Default::default()
     };
     view.output = lines;
     view.output_title = tr(app.ui_locale, MessageId::AgentFocusResult);
@@ -415,6 +420,37 @@ mod tests {
             agents(&app)[0].card.status.word,
             tr(app.ui_locale, MessageId::AgentStatusParked)
         );
+        app.ui_locale = codewhale_localization::Locale::Fr;
+        app.pet_watch.full.focus_agents = true;
+        let detail = paint(&mut app, 95, 40);
+        assert!(detail.contains(tr(app.ui_locale, MessageId::AutomationStatusLabel).as_ref()));
+        assert!(!detail.contains("No events reported"));
+        assert!(!detail.contains("Activity"));
+    }
+    #[test]
+    fn streamed_tail_follows_until_the_reader_scrolls_back() {
+        let mut app = app();
+        app.is_loading = true;
+        app.runtime_turn_id = Some("streamed-turn".into());
+        let mut active = ActiveCell::new();
+        active.push_untracked(HistoryCell::Assistant {
+            content: (0..30).map(|n| format!("Stream row {n}\n\n")).collect(),
+            streaming: true,
+        });
+        app.active_cell = Some(active);
+        assert!(paint(&mut app, 40, 12).contains("Stream row 29"));
+        app.pet_watch.full.scroll(&[], -3);
+        let top = app.pet_watch.full.output_scroll;
+        let Some(HistoryCell::Assistant { content, .. }) =
+            app.active_cell.as_mut().unwrap().entry_mut(0)
+        else {
+            panic!("expected the live assistant response");
+        };
+        content.push_str("Appended streamed tail\n\n");
+        assert!(!paint(&mut app, 40, 12).contains("Appended streamed tail"));
+        assert_eq!(app.pet_watch.full.output_scroll, top);
+        app.pet_watch.full.scroll_end(&[], true);
+        assert!(paint(&mut app, 40, 12).contains("Appended streamed tail"));
     }
     #[test]
     fn full_mode_reads_streaming_response_then_failure_and_preserves_the_session() {

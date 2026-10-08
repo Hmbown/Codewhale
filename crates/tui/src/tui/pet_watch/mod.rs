@@ -390,7 +390,7 @@ pub fn observe(app: &mut App, event: &Event, now: Instant) {
         .observe(event, app.current_session_id.as_deref(), now);
     if matches!(event, Event::TurnStarted { .. }) {
         app.pet_watch.work_history_start = app.history.len();
-        app.pet_watch.full.output_scroll = 0;
+        app.pet_watch.full.reset_output();
         app.pet_watch.work_enter_pending = app.pet_watch.enabled;
     } else if matches!(event, Event::TurnComplete { .. }) {
         app.pet_watch.work_enter_pending = false;
