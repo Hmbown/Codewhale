@@ -36,10 +36,10 @@
     "providerCountDefinition": "Website descriptor identities in this source snapshot, excluding Custom and retired identities; includes protocol/plan variants. Not a count of distinct vendors, ProviderKind identities, live catalogs, or providers in any published release."
   },
   "latestPublishedRelease": {
-    "tag": "v0.10.0",
-    "version": "0.10.0",
-    "publishedAt": "2026-09-22T17:28:34Z",
-    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.0",
+    "tag": "v0.10.1",
+    "version": "0.10.1",
+    "publishedAt": "2026-10-08T01:47:44Z",
+    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.1",
     "sources": [
       "web/data/latest-published-release.json"
     ]
