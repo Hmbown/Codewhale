@@ -15,7 +15,7 @@ test-support = []
 workspace = true
 
 [dependencies]
-codewhale-config = { path = "../config", version = "0.10.1" }
-codewhale-core = { path = "../core", version = "0.10.1" }
+codewhale-config = { path = "../config", version = "0.10.2" }
+codewhale-core = { path = "../core", version = "0.10.2" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }

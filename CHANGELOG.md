@@ -7,19 +7,160 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-08
+
+### Added
+
+- When a Plan turn completes with open To-do steps, the TUI asks "How do you
+  want to continue?". **Work (Ask)** and **Work (Auto-Review)** switch to Work
+  with that permission and send "Go ahead with the plan."; **Keep planning**,
+  or Esc, stays in Plan and sends nothing; typed feedback is sent as the next
+  message in Plan. The question appears only when the composer is empty, no
+  message is queued, no other view is open and no agent is focused. If the
+  chosen permission cannot be applied (for example it is locked by config),
+  the session stays in Plan and the reason is shown
+  ([#6902](https://github.com/codewhale-hq/Codewhale/issues/6902)).
+- `/undo force` undoes a request whose end was never recorded, including
+  edits made to its files since it started. Any other `/undo` option is
+  reported as unknown and nothing runs.
+- `/diff` opens the changed lines in a pager titled "Changes since session
+  start", rendered like an edit in the transcript, under the file list and
+  stat it already printed. Patch text is cut at 256 KiB and left out past
+  200,000 changed lines; the message then says "The diff is too long to show
+  in full. The file list above is complete."
+- The model can stop a background shell command it owns: `task_shell_wait`
+  takes `cancel=true`. That call needs approval, its card reads "Stop a
+  running shell command", and it is refused when sent together with `gate`.
+  The notices for a command moved to the background now name `cancel=true`.
+- Each turn tells the model which configured MCP servers it may load, so a
+  question can reach a server you never named. The note lists enabled, allowed
+  server names only (at most 24), asks the model to `tool_search` a name
+  before searching files or saying no tool exists, and is recorded again only
+  when the list changes or a compaction dropped it. No server is started and
+  no schema is loaded until the model searches.
+- `codewhale mcp --help` lists the `mcp` subcommands with their descriptions
+  and shows `Usage: codewhale mcp [OPTIONS] <COMMAND>`.
+- A file-edit approval card in a folder with no Git repository says "No Git
+  repository here, so edits ask first." on its question row. It appears only
+  for `write_file`, `edit_file` and `apply_patch` in the posture where the
+  same edit runs without a card inside a repository.
+
 ### Changed
 
 - `/undo` takes back your last request in one step, in every access mode:
-  every file the request changed, plus the request and its reply. It lists
-  the files it put back and no longer asks for `/trust on`. It changes nothing
-  if one of those files was edited after the request, and it asks for
-  `/undo force` before undoing a request whose end was never recorded.
-  `/undo` no longer steps back one tool call at a time; `/restore` still
-  reaches those points.
+  every file the request changed, plus the request and its reply. It no
+  longer asks for `/trust on`. Its report names the request and lists each
+  file as `restored`, `brought back` or `removed`, then says whether the
+  request and its reply were removed from the conversation. It changes
+  nothing if one of those files was edited after the request, and names the
+  file. For a request whose end was never recorded it changes nothing and
+  points to `/undo force`. `/undo` no longer steps back one tool call at a
+  time; `/restore` still reaches those points. When only the conversation is
+  rolled back, the message adds "No file changes to undo." or says that
+  workspace files were not reverted.
+- `/restore` without trust mode or Full Access now says that it rolls every
+  file in the folder back to the chosen point, including later edits, that
+  nothing was changed, and that `/undo` takes back only your last request.
+- `/diff` compares the workspace with this session's first restore point, so
+  it works in a folder that is not a git repository and includes files
+  created since. Before the session has a restore point it shows the
+  workspace repository's uncommitted changes. With neither, it says "Nothing
+  to compare yet: this session has not saved a restore point here, and this
+  folder is not a git repository." instead of "No changes since session
+  start".
 - `/trust on` and `/trust off` leave a line in the transcript saying what
-  changed. Esc Esc says that files were not changed and names `/undo`.
-- `/diff` outside a git repository reports that, instead of "No changes since
-  session start".
+  changed; with `--save` the line also says what was saved for the folder.
+- After Esc Esc the footer reads "Files not changed. /undo puts them back.
+  Conversation rewound." in place of "Rewound to previous user message — edit
+  and Enter to resend".
+- `/relay` writes the session relay to `.codewhale/handoff.md`, the path a
+  new session reads first, instead of `.deepseek/handoff.md`. A relay left at
+  the legacy path is still read when the primary file is absent, and the
+  prompt block names the file that was actually read.
+- The highlighted option on an approval card is tagged `(Enter)`, so the
+  default `[3 / d / n] Don't allow (Enter)` row shows what Enter does.
+- The edit approval card shows only the lines an edit changes, as `- ` and
+  `+ ` rows. Lines shared at the start and end of the old and new text are
+  left out, the "replace this" and "with this" sub-labels are gone, and a
+  single edit is no longer headed "edit 1". Lines left out on a side are
+  counted (`... (+2 more lines)`); several edits are numbered and each shows
+  its first changed line.
+- The three-row preview of a successful command shows one opening row and two
+  closing rows, preferring closing rows that say something passed or failed.
+  Blank rows no longer take a slot, and lines hidden after the last row shown
+  are counted in a "lines omitted" marker too.
+- An MCP server the session has not needed yet shows as `not connected` in
+  `/mcp` instead of "not started", with its transport and "Not connected in
+  this session yet. Connects when a tool is needed, or connect it now." in
+  place of zero tool counts.
+- `codewhale doctor` adds "works without an API key (limited quota; set
+  FIRECRAWL_API_KEY or [search] api_key to raise it)" to the
+  `search_provider` line when Firecrawl is the provider and no key is set.
+- The stalled-tool notice now ends "Run /jobs to see it and /jobs cancel <id>
+  to stop it." instead of naming `exec_shell_cancel`.
+- A DeepSeek Harness (`dsh`) package refused with "No portable components in
+  this package" now lists the skipped rows, each with its package and reason,
+  and the Native composition refusal names the unresolved rows. Both name at
+  most five rows and count the rest.
+
+### Fixed
+
+- A stream request that receives no response headers in time now adds that
+  the provider may still be loading the model, and names `codewhale config
+  set stream.open_timeout_secs 180` (up to 300). `codewhale doctor
+  --probe-api` reports a live check that ran out of time as "Not confirmed"
+  with "API check got no answer in time", not as a failed credential, and no
+  longer points at replacing the key
+  ([#6889](https://github.com/codewhale-hq/Codewhale/issues/6889), thanks
+  @BX166).
+- When the same model fails with the same upstream HTTP status on two or more
+  requests in a row, the error adds how many times it has failed, that a
+  provider can list a model that is not serving requests, and to choose
+  another model with `/model`. The count starts over when a request opens its
+  stream, fails another way, or uses a different model or status
+  ([#6889](https://github.com/codewhale-hq/Codewhale/issues/6889), thanks
+  @BX166).
+- A Chat Completions response that reports `stop` while its reported
+  completion tokens equal the output ceiling the request asked for is treated
+  as cut at the output limit. A partial answer is kept and continued; an
+  empty one fails after that single request instead of being asked for again.
+  The "Model reached the response output limit with no answer or tool call"
+  error no longer depends on the provider having streamed reasoning
+  ([#6889](https://github.com/codewhale-hq/Codewhale/issues/6889), thanks
+  @BX166).
+- A shell command with a descriptor redirect such as `npm test 2>&1` or
+  `cargo build > /dev/null 2>&1` is no longer classified as a destructive
+  action: its approval card reads "Runs a command" without "Can't be
+  undone". `rm -rf /etc 2>&1` is still held as destructive, and other `&`
+  spellings (`&>file`, a trailing `&`) still fail closed.
+- A plugin command or skill typed on the startup screen resolves for the
+  session that submit begins, instead of reading as an unknown command. The
+  submit waits up to 2 seconds for the engine to install the new session.
+- A session saved in Operate by v0.10.0 and resumed on this build has that
+  release's internal Operate instructions recognized as a runtime message
+  rather than as something you typed. Compaction keeps only the current
+  instructions, so the two no longer disagree about who creates the goal.
+- The `agent` tool's rejection of an invalid `thinking` value lists `xhigh`
+  and `ultra`, the same values its schema offers. Its description now says
+  that in Operate a child the main session starts edits files and runs the
+  Run tool's built-in checks without a second approval, and that any other
+  shell command follows the session's approval settings.
+- A long line of tool output wraps between words instead of mid-word, and the
+  first row, which sits after the `result:` or `output:` label, is no longer
+  wrapped a second time when drawn.
+- A running task's unsaved progress is written to its task record on the
+  deadline set by its first unsaved event. Tool heartbeats and store polls no
+  longer restart that wait, and heartbeats are kept in memory only.
+
+### Maintenance
+
+- CI and test harness only, no change to the shipped binaries. The Windows
+  Terminal clipboard acceptance gives every desktop stage its own 45-second
+  deadline and records the stage, a desktop capture and the window list when
+  it fails. The persistence backlog budget takes five samples and judges
+  enqueue time on the fastest one. Linux CI jobs install apt packages through
+  `scripts/ci-apt-install.sh`, which bounds every wait and drops an
+  unreachable Azure mirror.
 
 ## [0.10.1] - 2026-10-07
 
@@ -10623,7 +10764,8 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/codewhale-hq/CodeWhale/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/codewhale-hq/CodeWhale/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/codewhale-hq/CodeWhale/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/codewhale-hq/CodeWhale/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/codewhale-hq/CodeWhale/compare/v0.9.13...v0.10.0
 [0.9.13]: https://github.com/codewhale-hq/CodeWhale/compare/v0.9.12...v0.9.13

@@ -36,10 +36,10 @@ path = "src/lib.rs"
 ahash = "0.8"
 anyhow.workspace = true
 chrono.workspace = true
-codewhale-config = { path = "../config", version = "0.10.1" }
-codewhale-core = { path = "../core", version = "0.10.1" }
-codewhale-memory = { path = "../memory", version = "0.10.1" }
-codewhale-models = { path = "../models", version = "0.10.1" }
+codewhale-config = { path = "../config", version = "0.10.2" }
+codewhale-core = { path = "../core", version = "0.10.2" }
+codewhale-memory = { path = "../memory", version = "0.10.2" }
+codewhale-models = { path = "../models", version = "0.10.2" }
 fd-lock = "4.0.4"
 lru = "0.18"
 regex = "1.11"
@@ -53,7 +53,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-codewhale-models = { path = "../models", version = "0.10.1", features = [
+codewhale-models = { path = "../models", version = "0.10.2", features = [
     "test-support",
 ] }
 tempfile.workspace = true
