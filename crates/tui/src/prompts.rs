@@ -261,14 +261,104 @@ fn translation_target_language_for_tag(locale_tag: &str) -> &'static str {
 /// path is delivered per-turn via `<turn_meta>` (see `turn_metadata_block`).
 pub(crate) fn render_environment_block(_workspace: &Path, locale_tag: &str) -> String {
     let (platform, shell) = environment_host_facts();
+    format_environment_block(locale_tag, &platform, &shell, npm_launcher_fact())
+}
 
-    format!(
+/// Format the `## Environment` block from already-resolved facts. Pure, so
+/// the plain and npm-launcher shapes can both be tested on any host.
+fn format_environment_block(
+    locale_tag: &str,
+    platform: &str,
+    shell: &str,
+    launcher: Option<&str>,
+) -> String {
+    let mut block = format!(
         "## Environment\n\
          \n\
          - lang: {locale_tag}\n\
          - platform: {platform}\n\
          - shell: {shell}"
+    );
+    if let Some(launcher) = launcher {
+        block.push_str("\n- launcher: ");
+        block.push_str(launcher);
+    }
+    block
+}
+
+/// On Windows an npm install keeps the launcher's `node.exe` as this
+/// process's parent for the whole session, and Windows ends `codewhale.exe`
+/// with it (#6827). Like `platform` and `shell`, this is stable for the life
+/// of the process and changes how commands must be written, so it belongs in
+/// the static block. It names no PID, so the prefix stays cacheable.
+const NPM_LAUNCHER_FACT: &str = "npm (node.exe is this session's parent; killing node.exe by name ends this and other npm-launched Codewhale sessions, so stop servers by PID or port)";
+
+fn launcher_fact(
+    is_windows: bool,
+    method: codewhale_release::InstallMethod,
+) -> Option<&'static str> {
+    (is_windows && method == codewhale_release::InstallMethod::Npm).then_some(NPM_LAUNCHER_FACT)
+}
+
+/// The launcher line for this process. Install detection reads the
+/// executable's path, so it runs once and only on Windows; recorded
+/// conformance environments never carry it.
+fn npm_launcher_fact() -> Option<&'static str> {
+    #[cfg(test)]
+    if RECORDED_ENVIRONMENT.with(|cell| cell.borrow().is_some()) {
+        return None;
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    static METHOD: std::sync::OnceLock<codewhale_release::InstallMethod> =
+        std::sync::OnceLock::new();
+    launcher_fact(
+        true,
+        *METHOD.get_or_init(codewhale_release::current_install_method),
     )
+}
+
+#[cfg(test)]
+mod npm_launcher_fact_tests {
+    use super::*;
+    use codewhale_release::InstallMethod;
+
+    #[test]
+    fn plain_environment_block_is_unchanged() {
+        assert_eq!(
+            format_environment_block("en", "windows", "powershell", None),
+            "## Environment\n\n- lang: en\n- platform: windows\n- shell: powershell"
+        );
+    }
+
+    #[test]
+    fn windows_npm_install_names_the_node_launcher() {
+        let block = format_environment_block(
+            "en",
+            "windows",
+            "powershell",
+            launcher_fact(true, InstallMethod::Npm),
+        );
+        assert!(
+            block.ends_with(&format!("\n- launcher: {NPM_LAUNCHER_FACT}")),
+            "{block}"
+        );
+        assert!(block.contains("stop servers by PID or port"), "{block}");
+    }
+
+    #[test]
+    fn launcher_fact_is_windows_npm_only() {
+        assert_eq!(launcher_fact(false, InstallMethod::Npm), None);
+        for method in [
+            InstallMethod::Binary,
+            InstallMethod::Cargo,
+            InstallMethod::Homebrew,
+            InstallMethod::Omarchy,
+        ] {
+            assert_eq!(launcher_fact(true, method), None);
+        }
+    }
 }
 
 /// The host facts the `## Environment` block names: this process's OS and
