@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.2] - 2026-10-08
 
+Codewhale v0.10.2 is a patch release. `/undo` takes back a whole request,
+`/diff` works outside a git repository, Plan mode offers its hand-off again,
+and three provider failure modes are reported for what they are.
+
 ### Added
 
 - When a Plan turn completes with open To-do steps, the TUI asks "How do you
@@ -159,6 +163,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fastest one. Linux CI jobs install apt packages through
   `scripts/ci-apt-install.sh`, which bounds every wait and drops an
   unreachable Azure mirror.
+
+### Contributors
+
+- **[@BX166](https://github.com/BX166)** — reported three provider failure modes measured on AICraft's own traffic: a cold model that reads as a dead connection, a listed model that fails on every call, and a response cut at the output ceiling that reports `stop` ([#6889](https://github.com/codewhale-hq/Codewhale/issues/6889)).
 
 ## [0.10.1] - 2026-10-07
 

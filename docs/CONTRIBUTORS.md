@@ -35,6 +35,15 @@ notes, and relevant issue/PR comments.
 </details>
 
 <details open>
+<summary><strong>v0.10.2 — undo, diff and provider failure reporting</strong></summary>
+
+**Reports and verification**
+
+- **[BX166](https://github.com/BX166)** — reported three provider failure modes measured on AICraft's own traffic: a cold model that reads as a dead connection, a listed model that fails on every call, and a response cut at the output ceiling that reports `stop` ([#6889](https://github.com/codewhale-hq/Codewhale/issues/6889)).
+
+</details>
+
+<details>
 <summary><strong>v0.10.1 — reliability and first-run fixes</strong></summary>
 
 **Merged or adapted contributions**

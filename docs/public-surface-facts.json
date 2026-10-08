@@ -226,19 +226,7 @@
       "docs/CONTRIBUTORS.md",
       "web/lib/release-credits.ts"
     ],
-    "requiredCandidateCredits": [
-      "@gaord",
-      "@Lstarsky0",
-      "@aboimpinto",
-      "@dajiaohuang",
-      "@Water-Run",
-      "@harryvgiunta",
-      "@wuisabel-gif",
-      "@BX166",
-      "@SparkofSpike",
-      "@cenab",
-      "@jayanthvee"
-    ]
+    "requiredCandidateCredits": ["@BX166"]
   },
   "screenshot": {
     "readme": "web/public/codewhale-tui-8ba2bbf.png",
