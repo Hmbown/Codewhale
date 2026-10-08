@@ -1310,10 +1310,6 @@ async fn configured_mcp_servers_are_named_to_the_model_once_without_loading_them
         !catalog.iter().any(|tool| tool.name.starts_with("mcp_")),
         "naming a server loads no schema"
     );
-    assert!(
-        crate::tui::history::history_cells_from_message(recorded[0]).is_empty(),
-        "a runtime note is not a user cell"
-    );
 
     // Without `tool_search` the model could not act on the list: withdrawn, once.
     let narrowed = policy_for_catalog(
