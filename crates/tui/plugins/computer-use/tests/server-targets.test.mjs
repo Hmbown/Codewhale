@@ -272,6 +272,21 @@ test("a timed-out batch wait stops later input and retains the already sent step
   assert.equal(calls("type").length, before + 1);
 });
 
+test("named lookup refuses a single match from a truncated native walk before input", async () => {
+  const before = calls("set_value").length;
+  setControl({ observation: { truncated: true, elements: [
+    { index: 0, path: [0], windowIndex: 0, role: "AXTextField", value: "only visited match" },
+  ] } });
+  try {
+    const result = await tool("run_actions", { steps: [
+      { tool: "set_value", find: { role: "AXTextField" }, args: { value: "must not send" } },
+    ] });
+    assert.equal(result.error?.code, "observation_incomplete", JSON.stringify(result));
+    assert.equal(result.action_sent, false);
+    assert.equal(calls("set_value").length, before);
+  } finally { setControl(null); }
+});
+
 test("screen-space coordinates skip raster conversion", async () => {
   await tool("screenshot");
   const r = await tool("left_click", { target: { type: "coordinate", x: 400, y: 300, space: "screen" } });

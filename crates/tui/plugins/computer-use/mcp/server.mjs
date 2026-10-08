@@ -546,8 +546,8 @@ function observeState(computer, app_ref, result, args = {}) {
 
 function batchSteps(args, computer) {
   if (!Array.isArray(args.steps) || args.steps.length < 1 || args.steps.length > 8) throw new ServerError("bad_args", "run_actions needs 1..8 steps");
-  // Validate the entire plan before any step can deliver input. Actual
-  // consent, route, target and human-control checks still run per call.
+  // Validate plan shape before input. Runtime argument, consent, route,
+  // target and human-control checks still run per call; batches are not atomic.
   return args.steps.map((step, i) => {
     if (!step || typeof step.tool !== "string") throw new ServerError("bad_args", `step ${i} needs a tool name`);
     if (Object.keys(step).some((key) => !["tool", "arguments", "args", "find"].includes(key))) throw new ServerError("bad_args", `step ${i} accepts tool, arguments (or args), and find`);
@@ -603,6 +603,7 @@ async function runActions(computer, args, switched) {
         const found = await callTool({ name: "get_app_state", arguments: { ...step.find, detail: "compact", limit: 2, computer: computer.id } });
         const state = JSON.parse(found.content[0].text);
         if (found.isError || state.ok === false) body = state;
+        else if (state.matched <= 1 && (state.tree_truncated || state.truncated)) body = fail(computer, "observation_incomplete", "Named lookup cannot prove uniqueness in an incomplete observation. Narrow the app/window or observe and select a target explicitly.", { candidates: state.elements, matched: state.matched });
         else if (state.matched !== 1 || state.returned !== 1) body = fail(computer, state.matched > 1 ? "element_ambiguous" : "element_not_found", "Named batch target must match exactly one element. Narrow query/role or observe the app before acting.", { candidates: state.elements, matched: state.matched });
         else input.target = { type: "element", state_id: state.state_id, index: state.elements[0].index };
       }
@@ -651,6 +652,7 @@ async function waitFor(computer, args, switched) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new ServerError("bad_args", "limit must be an integer 1..100");
 
   const FATAL = new Set(["cancelled", "control_stopped", "computer_route_changed", "app_upgrade_required"]);
+  const missingApp = (body) => body?.found === false || /application not found/.test(body?.error?.message ?? "");
   const observe = (ephemeral) => callTool({ name: "get_app_state", arguments: {
     app_ref: args.app_ref, window_id: args.window_id, query, role,
     limit, detail: "compact", ephemeral, computer: computer.id,
@@ -663,10 +665,14 @@ async function waitFor(computer, args, switched) {
     polls++;
     const body = JSON.parse(res.content[0].text);
     let usable = false, matchedCount = 0;
-    if (!res.isError && body.ok !== false) { usable = true; matchedCount = body.matched ?? 0; }
+    if (!res.isError && body.ok !== false) {
+      matchedCount = body.matched ?? 0;
+      usable = state !== "absent" || matchedCount > 0 || !body.tree_truncated;
+      if (!usable) lastError = { code: "observation_incomplete", message: "An incomplete walk cannot prove absence" };
+    }
     else if (FATAL.has(body?.error?.code)) {
       return { content: [{ type: "text", text: JSON.stringify(fail(computer, body.error.code, body.error.message, { tool: "wait_for", switched, polls })) }], isError: true };
-    } else if (body?.found === false || /application not found/.test(body?.error?.message ?? "")) {
+    } else if (missingApp(body)) {
       usable = true; // not running yet, or gone: zero matches either way
     } else {
       lastError = body?.error ?? { code: "observe_failed", message: "observation failed" };
@@ -676,10 +682,13 @@ async function waitFor(computer, args, switched) {
       const bound = await observe(false);
       polls++;
       const b = JSON.parse(bound.content[0].text);
+      if (state === "absent" && !FATAL.has(b.error?.code) && missingApp(b)) {
+        return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, matched_count: 0, elements: [], note: "The application is absent; no targetable app state exists. Observe again before acting." })) }] };
+      }
       if (bound.isError || b.ok === false) {
         return { content: [{ type: "text", text: JSON.stringify(fail(computer, b.error?.code ?? "observe_failed", b.error?.message ?? "Follow-up observation failed", { tool: "wait_for", switched, matched: false, state, polls, elapsed_ms: Date.now() - started })) }], isError: true };
       }
-      if (state === "absent" ? b.matched === 0 : b.matched > 0) {
+      if (state === "absent" ? b.matched === 0 && !b.tree_truncated : b.matched > 0) {
         return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, state_id: b.state_id, matched_count: b.matched ?? 0, elements: b.elements, app: { name: b.name ?? null, pid: b.pid ?? null, bundle_id: b.bundle_id ?? null }, note: "Elements are bound to this observation — target them with {type:'element', index}; add state_id only to pin this snapshot after later observes. Re-observe if the UI changes again." })) }] };
       }
     }

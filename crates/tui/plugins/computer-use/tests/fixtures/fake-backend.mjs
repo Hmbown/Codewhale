@@ -46,6 +46,7 @@ export function create() {
   // prove state survives between requests on the same agent process.
   let boundApp = null;
   let observationNumber = 0;
+  let observationControl;
 
   return {
     platform: "fake",
@@ -80,8 +81,11 @@ export function create() {
       record("get_app_state", { app_ref, detail, include_ocr });
       let control;
       try { control = JSON.parse(fs.readFileSync(controlFile, "utf8")); } catch {}
+      const signature = JSON.stringify(control);
+      if (signature !== observationControl) { observationNumber = 0; observationControl = signature; }
       if (control?.observation || control?.observations) {
         const observation = control.observation ?? control.observations[Math.min(observationNumber++, control.observations.length - 1)];
+        if (observation.error) throw Object.assign(new Error(observation.error.message), { code: observation.error.code });
         return { found: true, name: app_ref?.name ?? "FakeApp", ...observation };
       }
       observationNumber = 0;
