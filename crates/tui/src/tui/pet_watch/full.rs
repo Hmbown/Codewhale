@@ -267,6 +267,12 @@ fn render(frame: &mut Frame, area: Rect, app: &mut App, inspect: bool) {
     let mut options = app.transcript_render_options();
     options.low_motion = true;
     options.motion_mode = crate::tui::motion::MotionMode::Reduced;
+    let copy_hint = (inspect && app.completed_assistant_output_receipt().is_some()).then(|| {
+        tr(app.ui_locale, MessageId::PetModeCopyHint).replace(
+            "{copy}",
+            shell_key_routing::binding(Id::PetCopyReply).footer_chord,
+        )
+    });
     let lines = if inspect {
         let revision = response_index.map_or(0, |index| {
             if index < app.history.len() {
@@ -323,7 +329,7 @@ fn render(frame: &mut Frame, area: Rect, app: &mut App, inspect: bool) {
         shell_key_routing::binding(Id::PetResultUp).footer_chord,
         shell_key_routing::binding(Id::PetResultDown).footer_chord,
     );
-    let pane_hints = if app.pet_watch.full.focus_agents && !agents.is_empty() {
+    let mut pane_hints = if app.pet_watch.full.focus_agents && !agents.is_empty() {
         tr(app.ui_locale, MessageId::PetModeAgentHints)
             .replace("{select}", &arrows)
             .replace(
@@ -340,6 +346,13 @@ fn render(frame: &mut Frame, area: Rect, app: &mut App, inspect: bool) {
     } else {
         String::new()
     };
+    if let Some(copy_hint) = &copy_hint {
+        pane_hints = if pane_hints.is_empty() {
+            copy_hint.clone()
+        } else {
+            format!("{copy_hint} · {pane_hints}")
+        };
+    }
     let mut view = PetMode::new(&theme, mark);
     view.notice = notice;
     view.title = "Codewhale".into();
@@ -404,6 +417,15 @@ fn render(frame: &mut Frame, area: Rect, app: &mut App, inspect: bool) {
         motion,
     );
     frame.render_stateful_widget(view, area, &mut app.pet_watch.full);
+    if let Ok(mut copy_area) = app.pet_watch.copy_area.lock() {
+        *copy_area = copy_hint.as_ref().and_then(|hint| {
+            let width = codewhale_ratatui::text::width(hint);
+            // Match the actual second-row truncation; a hidden/truncated label
+            // never leaves a clickable target behind.
+            (plan.footer.height > 1 && width + 4 <= usize::from(plan.footer.width))
+                .then(|| Rect::new(plan.footer.x, plan.footer.y + 1, width as u16, 1))
+        });
+    }
     if let Ok(mut selection) = app.pet_watch.selection.lock() {
         *selection = inspect
             .then(|| app.pet_watch.full.selected_agent_id().map(str::to_owned))
@@ -701,5 +723,44 @@ mod tests {
         assert!(app.pet_watch.full_next.is_none());
         tick(&mut app, false, Instant::now() + Duration::from_secs(3));
         assert!(app.pet_watch.full_next.is_none());
+    }
+    #[test]
+    fn pet_copy_footer_tracks_completed_output_and_only_keeps_fully_painted_hitboxes() {
+        let mut app = app();
+        assert!(!paint(&mut app, 100, 32).contains("copy finished reply"));
+        assert!(app.pet_watch.copy_area.lock().unwrap().is_none());
+        let index = app.history.len();
+        app.add_message(HistoryCell::Assistant {
+            content: "finished answer".into(),
+            streaming: false,
+        });
+        app.record_completed_assistant_output(index, "finished answer");
+        app.add_message(HistoryCell::Assistant {
+            content: "current partial reply".into(),
+            streaming: true,
+        });
+        assert!(paint(&mut app, 100, 32).contains("c copy finished reply"));
+        assert!(app.pet_watch.copy_area.lock().unwrap().is_some());
+        paint(&mut app, 16, 8);
+        assert!(
+            app.pet_watch.copy_area.lock().unwrap().is_none(),
+            "truncated labels have no invisible click area"
+        );
+        paint(&mut app, 100, 32);
+        app.pet_watch.prepare_frame();
+        assert!(
+            app.pet_watch.copy_area.lock().unwrap().is_none(),
+            "another focus owner clears old targets before painting"
+        );
+        paint(&mut app, 100, 32);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 32)).unwrap();
+        terminal
+            .draw(|frame| render_main(frame, frame.area(), &mut app))
+            .unwrap();
+        assert!(
+            app.pet_watch.copy_area.lock().unwrap().is_none(),
+            "the composer backdrop does not expose an inspector action"
+        );
     }
 }

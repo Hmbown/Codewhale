@@ -42,6 +42,8 @@ pub struct StatusToast {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusToastKind {
     Ordinary,
+    /// An explicit command result stays visible over a completed turn.
+    CommandReceipt,
     ActionRequired,
     RedactionGate(RedactionGateNotice),
     BehavioralTip(crate::tui::behavioral_tips::BehavioralTip),
@@ -92,6 +94,11 @@ impl StatusToast {
     pub(crate) fn for_action(mut self, request_id: impl Into<String>) -> Self {
         self.kind = StatusToastKind::ActionRequired;
         self.event_id = Some(request_id.into());
+        self
+    }
+
+    pub(crate) fn for_command_receipt(mut self) -> Self {
+        self.kind = StatusToastKind::CommandReceipt;
         self
     }
 
@@ -394,6 +401,7 @@ impl App {
 
         let eligible = |toast: &&StatusToast| {
             phase != crate::tui::underwater::ShellPhase::Done
+                || toast.kind == StatusToastKind::CommandReceipt
                 || matches!(
                     toast.level,
                     StatusToastLevel::Warning | StatusToastLevel::Error

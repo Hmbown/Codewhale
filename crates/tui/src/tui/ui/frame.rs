@@ -3299,4 +3299,56 @@ mod pet_main_tests {
         assert_eq!(app.focus(), Focus::Composer);
         capture(&app, "main-light-100x32", &buf, true);
     }
+    #[test]
+    fn pet_inspector_keeps_the_copy_receipt_visible_and_returns_to_the_draft() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _state = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        for light in [false, true] {
+            let mut app = app();
+            if light {
+                app.theme_id = codewhale_palette::ThemeId::ShorelineLight;
+                app.ui_theme = app.theme_id.ui_theme();
+            }
+            app.clipboard = crate::tui::clipboard::ClipboardHandler::for_test(false, false);
+            app.input = "My next message".into();
+            let reply = "Pet mode\n\nYour view is remembered when Codewhale starts.\n\n- F5 opens replies and agents.\n- Escape returns to your draft.\n- c copies the last finished reply.";
+            let index = app.history.len();
+            app.add_message(HistoryCell::Assistant {
+                content: reply.into(),
+                streaming: false,
+            });
+            app.record_completed_assistant_output(index, reply);
+            assert!(pet_watch::handle_inspect_key(
+                &mut app,
+                &KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)
+            ));
+            let result =
+                crate::commands::execute_with_config("/copy", &mut app, &Config::default());
+            assert!(!result.is_error);
+            let (buf, cursor) = paint(&mut app, 100, 32);
+            let output = text(&buf);
+            assert!(
+                output.contains("Accepted the last completed assistant response"),
+                "copy feedback must be painted above the hidden transcript: {output}"
+            );
+            assert!(output.contains("c copy finished reply"));
+            assert!(cursor.is_none());
+            capture(
+                &app,
+                if light {
+                    "inspector-copy-light-100x32"
+                } else {
+                    "inspector-copy-dark-100x32"
+                },
+                &buf,
+                light,
+            );
+            app.view_stack
+                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.input, "My next message");
+            assert_eq!(app.focus(), Focus::Composer);
+        }
+    }
 }

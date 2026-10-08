@@ -59,6 +59,7 @@ pub struct PetWatch {
     sound_requested: bool,
     pub(crate) area: Option<Rect>,
     pub(crate) inspect_area: Option<Rect>,
+    copy_area: Arc<Mutex<Option<Rect>>>,
     raster: Option<Presentation>,
     controls: Arc<Mutex<Vec<Control>>>,
     desired: Option<Rect>,
@@ -191,6 +192,9 @@ impl PetWatch {
     }
     pub fn prepare_frame(&mut self) {
         self.inspect_area = None;
+        if let Ok(mut area) = self.copy_area.lock() {
+            *area = None;
+        }
         self.desired = None;
     }
     pub fn present(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -364,6 +368,7 @@ pub fn open_habitat(app: &mut App) {
         app.view_stack.push(habitat::Habitat::new(
             app.pet_watch.controls.clone(),
             app.pet_watch.selection.clone(),
+            app.pet_watch.copy_area.clone(),
         ));
     }
     app.needs_redraw = true;

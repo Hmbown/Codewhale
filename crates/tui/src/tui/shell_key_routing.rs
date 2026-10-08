@@ -104,6 +104,7 @@ pub enum ShellBindingId {
     PetResultEnd,
     PetFocusAgents,
     PetOpenAgent,
+    PetCopyReply,
     PetSound,
     PetBrowser,
     PetWindow,
@@ -165,6 +166,9 @@ impl ShellBinding {
             ShellBindingId::PetResultEnd => key.code == KeyCode::End && key.modifiers.is_empty(),
             ShellBindingId::PetFocusAgents => key.code == KeyCode::Tab && key.modifiers.is_empty(),
             ShellBindingId::PetOpenAgent => key.code == KeyCode::Enter && key.modifiers.is_empty(),
+            ShellBindingId::PetCopyReply => {
+                key.code == KeyCode::Char('c') && key.modifiers.is_empty()
+            }
             ShellBindingId::PetSound => key.code == KeyCode::F(6) && key.modifiers.is_empty(),
             ShellBindingId::PetBrowser => key.code == KeyCode::F(8) && key.modifiers.is_empty(),
             ShellBindingId::PetWindow => key.code == KeyCode::F(9) && key.modifiers.is_empty(),
@@ -290,6 +294,12 @@ pub const SHELL_BINDINGS: &[ShellBinding] = &[
         id: ShellBindingId::PetOpenAgent,
         catalog_chord: "Enter",
         footer_chord: "Enter",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetCopyReply,
+        catalog_chord: "c",
+        footer_chord: "c",
         focus: FocusScope::PetHabitat,
     },
     ShellBinding {

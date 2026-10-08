@@ -341,6 +341,7 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
             Some(if app.auto_compact { "true" } else { "false" }.to_string())
         }
         "calm_mode" | "calm" => Some(if app.calm_mode { "true" } else { "false" }.to_string()),
+        "pet_mode" => Some(app.pet_watch.enabled.to_string()),
         "low_motion" | "motion" => Some(if app.low_motion { "true" } else { "false" }.to_string()),
         "fancy_animations" | "fancy" | "animations" => Some(
             if app.fancy_animations {
@@ -704,6 +705,24 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     CommandResult::message(rail_status_message(app))
 }
 
+fn select_pet_mode(app: &mut App, enabled: bool, persist: bool) -> CommandResult {
+    crate::tui::pet_watch::set_enabled(app, enabled);
+    if persist {
+        app.startup_defaults
+            .spawn(crate::tui::startup_defaults::StartupDefaults::pet_mode(
+                enabled,
+            ));
+    }
+    CommandResult::message(tr(
+        app.ui_locale,
+        if enabled {
+            MessageId::PetModeOn
+        } else {
+            MessageId::PetModeOff
+        },
+    ))
+}
+
 /// `/pet on` makes the pet the main shell surface, with the real composer
 /// always available. `/pet inspect` opens replies and agents on demand;
 /// Escape returns to the same backdrop and draft. Companion verbs keep the
@@ -718,17 +737,7 @@ pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
     let words = words.iter().map(String::as_str).collect::<Vec<_>>();
-    let mode = |app: &mut App, enabled: bool| {
-        pet_watch::set_enabled(app, enabled);
-        CommandResult::message(tr(
-            app.ui_locale,
-            if enabled {
-                MessageId::PetModeOn
-            } else {
-                MessageId::PetModeOff
-            },
-        ))
-    };
+    let mode = |app: &mut App, enabled: bool| select_pet_mode(app, enabled, true);
     let queued = |app: &mut App, control: Control| {
         pet_watch::command(app, control);
         CommandResult::message(tr(app.ui_locale, MessageId::PetHabitatQueued))
@@ -1971,6 +1980,22 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
     }
 
     match key.as_str() {
+        "pet_mode" => {
+            let enabled = match parse_config_bool(value) {
+                Ok(enabled) => enabled,
+                Err(_) => {
+                    return CommandResult::error(
+                        tr(app.ui_locale, MessageId::ConfigCommandInvalidValue)
+                            .replace("{key}", &key)
+                            .replace("{value}", value)
+                            .replace("{choices}", "on/off"),
+                    );
+                }
+            };
+            // /pet and the settings editor share the ordered background writer.
+            // A failed save is reported by the existing warning mailbox.
+            return select_pet_mode(app, enabled, persist);
+        }
         "contextual_tips" => {
             let enabled = match parse_config_bool(value) {
                 Ok(enabled) => enabled,

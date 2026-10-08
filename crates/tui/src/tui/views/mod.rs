@@ -2448,6 +2448,13 @@ impl ConfigView {
                 facts: ConfigRowFacts::saved_setting(),
             },
             ConfigRow {
+                key: "pet_mode".to_string(),
+                value: settings.pet_mode.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+                facts: ConfigRowFacts::saved_setting().effective(app.pet_watch.enabled.to_string()),
+            },
+            ConfigRow {
                 key: "calm_mode".to_string(),
                 value: settings.calm_mode.to_string(),
                 editable: true,
@@ -9205,6 +9212,36 @@ base_url = "https://api.xiaomimimo.com/v1"
     /// Every message key declared by the schema must resolve to a localized
     /// string in every shipped locale. `tr_key` returns the key itself when a
     /// pack is missing the entry, so this fails fast on a stale binding.
+    #[test]
+    fn pet_mode_setting_shows_saved_and_live_choices_and_emits_the_existing_commit_event() {
+        let _guard = ConfigSettingsEnvGuard::new("pet_mode = false\n");
+        let mut app = create_test_app();
+        app.pet_watch.enabled = true;
+        let mut view = ConfigView::new_for_app(&app);
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "pet_mode")
+            .expect("pet view setting");
+        assert_eq!(row.value, "false");
+        assert_eq!(row.facts.effective.as_deref(), Some("true"));
+        assert!(row.editable);
+        assert_eq!(row.ui().unwrap().label, "ConfigLabelPetMode");
+        view.focus_key("pet_mode");
+        view.start_edit();
+        let edit = view.editing.as_mut().expect("pet mode editor");
+        edit.selected_choice = edit
+            .choices
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|value| value == "true")
+            .unwrap();
+        assert!(
+            matches!(view.handle_choice_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), ViewAction::Emit(ViewEvent::ConfigUpdated { key, value, persist: true }) if key == "pet_mode" && value == "true")
+        );
+    }
+
     #[test]
     fn settings_schema_message_keys_are_localized() {
         let mut keys: Vec<&'static str> = Vec::new();
