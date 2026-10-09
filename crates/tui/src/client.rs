@@ -37,7 +37,7 @@ use crate::config::{
 };
 use crate::llm_client::{
     LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after,
-    sanitize_http_error_body, with_retry,
+    retry_delay_from_error_body, sanitize_http_error_body, with_retry,
 };
 #[cfg(test)]
 #[path = "client/catalog_tests.rs"]
@@ -3304,6 +3304,15 @@ impl CodewhaleClient {
             });
         let usage = parse_usage(value.get("usage"));
         let stop_reason = value["choices"][0]["finish_reason"].as_str();
+        let stop_reason = if codewhale_models::stop_contradicts_output_ceiling(
+            stop_reason,
+            usage_reported.then_some(usage.output_tokens),
+            max_tokens,
+        ) {
+            Some(codewhale_models::OUTPUT_CEILING_STOP_REASON)
+        } else {
+            stop_reason
+        };
         let usage = (usage_reported && usage != Usage::default()).then_some(usage);
         let translated = if codewhale_models::is_incomplete_stop_reason(stop_reason) {
             Err(anyhow::anyhow!(
@@ -3958,8 +3967,10 @@ impl CodewhaleClient {
                     if status.is_success() {
                         return Ok(response);
                     }
-                    let retry_after = extract_retry_after(response.headers());
+                    let header_retry_after = extract_retry_after(response.headers());
                     let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let retry_after =
+                        header_retry_after.or_else(|| retry_delay_from_error_body(&raw));
                     let body = self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                     Err(self.http_error_with_route_context(status.as_u16(), &body, retry_after))
                 }
@@ -4075,8 +4086,10 @@ impl CodewhaleClient {
                         if status.is_success() {
                             return Ok(response);
                         }
-                        let retry_after = extract_retry_after(response.headers());
+                        let header_retry_after = extract_retry_after(response.headers());
                         let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                        let retry_after =
+                            header_retry_after.or_else(|| retry_delay_from_error_body(&raw));
                         let body =
                             self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                         Err(self.http_error_with_route_context(status.as_u16(), &body, retry_after))
