@@ -111,6 +111,48 @@
     "defer_loading": false
   },
   {
+    "name": "file_search",
+    "description": "Find workspace files by name, path, or glob (e.g. src/**/*.rs). Space-separated terms must all match. Literal matches rank above fuzzy matches; results are capped. Respects ignore files and skips build/dependency directories by default. Use extensions to filter suffixes.",
+    "input_schema": {
+      "properties": {
+        "exclude": {
+          "description": "Optional replacement exclusion globs (e.g. [\"**/target/**\", \"*.lock\"]); [] disables default exclusions.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "extensions": {
+          "description": "Optional list of file extensions to include (e.g. [\"rs\", \"md\"]).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "limit": {
+          "description": "Maximum number of ranked results to return (default: 20, maximum: 200).",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Optional base path to search (relative to workspace).",
+          "type": "string"
+        },
+        "query": {
+          "description": "File name, path fragment, space-separated terms, or glob (e.g. **/engine*.rs).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
     "name": "get_goal",
     "description": "Inspect the current runtime goal state, including objective, status, token budget, elapsed time, evidence, and blocker.",
     "input_schema": {
@@ -223,7 +265,7 @@
   },
   {
     "name": "update_goal",
-    "description": "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input.",
+    "description": "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input. Mark yield when you finished a stage and the next step needs the user's decision: the goal stays unfinished, the turn ends, and their next message resumes it.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -264,12 +306,13 @@
           "type": "object"
         },
         "status": {
-          "description": "Use complete only when a critical verifier proves the goal; not_achieved to record verifier gaps; blocked when meaningful progress cannot continue; advisory to append best-effort context without changing lifecycle state.",
+          "description": "Use complete only when a critical verifier proves the goal; not_achieved to record verifier gaps; blocked when meaningful progress cannot continue; yield when a stage is finished and the next step is the user's call; advisory to append best-effort context without changing lifecycle state.",
           "enum": [
             "complete",
             "blocked",
             "not_achieved",
-            "advisory"
+            "advisory",
+            "yield"
           ],
           "type": "string"
         },
