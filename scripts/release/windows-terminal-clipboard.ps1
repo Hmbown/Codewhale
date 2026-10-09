@@ -76,6 +76,8 @@ try {
     Focus-OwnedWindow
     Wait-For { (Read-Terminal).Contains('Type a message') } 'Codewhale composer'
     Capture 'ready'
+    @{ processId = $ownedPid; readyAt = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json |
+        Set-Content -Encoding UTF8 (Join-Path $Evidence 'ready.json')
     $payload = [System.IO.File]::ReadAllText((Join-Path $Evidence 'expected.txt'), [System.Text.Encoding]::UTF8)
     [System.Windows.Forms.Clipboard]::SetText($payload)
     if ([System.Windows.Forms.Clipboard]::GetText() -ne $payload) { throw 'Clipboard readback mismatch' }

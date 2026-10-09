@@ -4894,6 +4894,8 @@ pub struct UpdateThreadRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StartTurnRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_model_owner: Option<String>,
     /// Account-authorized data, rendered only by the Engine for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_constitution:
@@ -8849,6 +8851,7 @@ impl RuntimeThreadManager {
         continuation_index: u32,
     ) -> Result<TurnRecord> {
         let req = StartTurnRequest {
+            account_model_owner: None,
             profile_constitution: None,
             expected_workspace: None,
             max_output_tokens: None,
@@ -9379,6 +9382,7 @@ impl RuntimeThreadManager {
             .start_turn_with_source(
                 thread_id,
                 StartTurnRequest {
+                    account_model_owner: None,
                     profile_constitution: None,
                     expected_workspace: None,
                     max_output_tokens: None,
@@ -14221,7 +14225,7 @@ impl RuntimeThreadManager {
                 )
             };
         let mode = policy.mode;
-        let cfg_snapshot = self.config.read().clone();
+        let mut cfg_snapshot = self.config.read().clone();
         // Optional per-turn provider override: routes this turn only. The
         // saved thread keeps its provider; `route_thread` is the view the
         // route, fingerprint and turn receipt are resolved from.
@@ -14245,6 +14249,13 @@ impl RuntimeThreadManager {
             }
             None => req.model.as_deref().unwrap_or(&thread.model).to_string(),
         };
+        if req.account_model_owner.is_some() {
+            let identity = self.provider_identity_for_thread(&cfg_snapshot, &route_thread)?;
+            anyhow::ensure!(identity.provider == ProviderKind::Codewhale && identity.key.as_str() == "codewhale"
+                && requested_model.split_once('/').is_some_and(|(provider, model)| !provider.is_empty() && !provider.eq_ignore_ascii_case("codewhale") && !model.is_empty())
+                && !requested_model.chars().any(|c| c.is_whitespace() || c.is_control()),
+                "The agent model requires an exact account provider and model");
+        }
         let auto_model = requested_model.trim().eq_ignore_ascii_case("auto");
         if !image_blocks.is_empty() && (requested_model.is_empty() || requested_model.trim() != requested_model) {
             bail!("image inputs require an exact nonempty named model");
@@ -14270,7 +14281,11 @@ impl RuntimeThreadManager {
         if req.max_output_tokens.is_some() && auto_model {
             bail!("maxOutputTokens requires an exact model; Auto routing is unsupported");
         }
-        if let Some(snapshot) = &req.profile_constitution { snapshot.validate()?; }
+        if let Some(snapshot) = &req.profile_constitution {
+            snapshot.validate()?;
+            anyhow::ensure!(req.account_model_owner.as_ref().is_none_or(|owner| &snapshot.account_id == owner),
+                "The profile constitution and agent model must belong to the same account");
+        }
         let operation = if let Some(operation_key) = req.operation_key.as_deref() {
             validate_runtime_turn_operation_key(operation_key)?;
             let request_fingerprint = runtime_turn_request_fingerprint(
@@ -14302,6 +14317,13 @@ impl RuntimeThreadManager {
                     "profile_constitution": snapshot,
                 })).as_bytes())
             } else { request_fingerprint };
+            let request_fingerprint = if let Some(owner) = &req.account_model_owner {
+                crate::hashing::sha256_hex(crate::client::canonical_json(&json!({
+                    "domain": "codewhale:account-model-owner-turn:v1",
+                    "historical_fingerprint": request_fingerprint,
+                    "account_model_owner": owner,
+                })).as_bytes())
+            } else { request_fingerprint };
             let request_fingerprint=narrowing.request_fingerprint(request_fingerprint);
             self.prepare_runtime_turn_operation(
                 thread_id,
@@ -14316,6 +14338,9 @@ impl RuntimeThreadManager {
             && let Some(original_turn) = self.replay_turn_for_operation(operation)?
         {
             return Ok((original_turn, true));
+        }
+        if let Some(owner) = &req.account_model_owner {
+            cfg_snapshot.bind_account_model_owner(owner)?;
         }
         if !image_blocks.is_empty() || req.max_output_tokens.is_some() {
             let identity = self.provider_identity_for_thread(&cfg_snapshot, &route_thread)?;
@@ -14449,7 +14474,7 @@ impl RuntimeThreadManager {
                 None,
             )
         };
-        let route = if client_preflight_required || turn_provider.is_some() {
+        let route = if client_preflight_required || turn_provider.is_some() || req.account_model_owner.is_some() {
             route
                 .preflight()
                 .map_err(|reason| anyhow!("Failed to validate runtime thread route: {reason}"))?

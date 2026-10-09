@@ -2205,6 +2205,8 @@ pub struct Config {
     #[serde(skip)]
     pub(crate) account_model_access:
         std::sync::Arc<parking_lot::RwLock<Option<AccountModelAccess>>>,
+    #[serde(skip)]
+    pub(crate) required_account_model_owner: Option<String>,
     /// Persisted exact-route declarations, separate from provider credentials.
     #[serde(
         default,
@@ -6342,6 +6344,30 @@ impl Config {
                 && base_url_uses_local_host(&self.active_route_base_url()))
     }
 
+    pub(crate) fn bind_account_model_owner(&mut self, owner: &str) -> Result<()> {
+        anyhow::ensure!(
+            !owner.is_empty()
+                && owner.len() <= 240
+                && !owner.chars().any(|c| c.is_control() || c.is_whitespace()),
+            "Invalid account model owner"
+        );
+        let access = self
+            .account_model_access
+            .read()
+            .clone()
+            .context("Connect account model access before running the Codewhale agent")?;
+        self.account_model_access = std::sync::Arc::new(parking_lot::RwLock::new(Some(access)));
+        self.required_account_model_owner = Some(owner.to_string());
+        let identity = self
+            .resolve_persisted_provider_identity(Some("codewhale"), Some("codewhale"))
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            self.account_model_api_key(&identity).is_some(),
+            "Codewhale agent model access must belong to the signed-in account"
+        );
+        Ok(())
+    }
+
     pub(crate) fn account_model_api_key(&self, identity: &ProviderIdentity) -> Option<String> {
         let provider = identity.provider;
         // Exact endpoint binding, including path. A custom Codewhale route
@@ -6370,7 +6396,11 @@ impl Config {
         .runtime_info_at(chrono::Utc::now())
         .ok()?;
         (account.state == codewhale_secrets::account::AccountSessionState::Authenticated
-            && account.session_id.as_deref() == Some(access.session_id.as_str()))
+            && account.session_id.as_deref() == Some(access.session_id.as_str())
+            && self
+                .required_account_model_owner
+                .as_ref()
+                .is_none_or(|owner| account.account_id.as_ref() == Some(owner)))
         .then(|| access.credential.expose_secret().to_string())
     }
 
@@ -6381,6 +6411,9 @@ impl Config {
         &self,
         identity: &ProviderIdentity,
     ) -> Option<crate::route_receipt::CredentialGeneration> {
+        if self.required_account_model_owner.is_some() {
+            return None;
+        }
         self.verify_provider_identity(identity).ok()?;
         let mut scoped = self.clone();
         scoped.scope_to_provider_identity(identity).ok()?;
@@ -6565,6 +6598,11 @@ impl Config {
             .map_err(anyhow::Error::msg)?;
         self.verify_provider_identity(&identity)
             .map_err(anyhow::Error::msg)?;
+        if self.required_account_model_owner.is_some() {
+            return self.account_model_api_key(&identity)
+                .map(|key| (key, "Codewhale account".to_string()))
+                .context("The selected account model access is unavailable; no credential fallback is allowed");
+        }
         let provider = identity.provider;
         let keyless = || (String::new(), "none (keyless route)".to_string());
 
@@ -10539,6 +10577,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         legacy_root: base.legacy_root,
         legacy_root_custom_generation: base.legacy_root_custom_generation,
         account_model_access: base.account_model_access,
+        required_account_model_owner: base.required_account_model_owner,
         account_profile: override_cfg.account_profile.or(base.account_profile),
         plugin_oauth_read_only: base.plugin_oauth_read_only || override_cfg.plugin_oauth_read_only,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
