@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Run the background check", body: "The helper opens a disposable practice window, enters text, and captures that window. It checks whether the pointer or active app changed during the run." },
     { title: "Connect it to Codewhale", body: "Review, trust, and enable Computer Use in Codewhale’s plugin marketplace. Use plugin 0.3.1 or later so local actions go through the helper’s Pause and Stop controls." },
   ],
-  controlsTitle: "Keep working. Keep control.",
+  controlsTitle: "Pause or stop app control",
   controlsBody: "Supported actions operate on the selected app in the background. Apps and gestures that need foreground control require your authorization. The menu shows the target and input mode; Pause suspends helper input, and Stop ends its existing sessions.",
   updateTitle: "Updates when you choose",
   updateBody: "Choose Check for updates from the app. Before installing an update, it checks the download, Codewhale signature, and Apple notarization, and keeps the previous app for recovery.",

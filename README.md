@@ -20,9 +20,9 @@ work — in your terminal, with a hosted or local model you choose.
 
 [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="A Codewhale terminal session" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="A Codewhale terminal session" width="760">
 
-<sub>Real terminal capture of a fresh install — no staged output.</sub>
+<sub>Real Codewhale terminal capture from a configured local demo session.</sub>
 
 </div>
 
@@ -56,6 +56,13 @@ machine end up fighting over `PATH`.
 </details>
 
 ## Quickstart
+
+**Your provider keys, managed in one place.** [Create a Codewhale account](https://app.codewhale.net/register)
+or run `codewhale login` to sign in. Save and update your API keys in your
+account, then use them through the Codewhale model route on your signed-in
+devices. [Set up account keys](docs/CONFIGURATION.md#account-provider-keys).
+Signing in does not upload existing local keys; local use remains available
+without an account.
 
 1. **Open your project.** Run `codewhale` in the folder you want to work on.
 2. **Connect a model.** Run `/provider` (or press `F3`) to add a hosted key or

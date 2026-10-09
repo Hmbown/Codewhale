@@ -26,6 +26,22 @@ pub struct PrivateDirectory {
     pub(crate) _component_handles: Vec<File>,
 }
 
+/// A retained file was retired before it could be validated. This is still a
+/// refusal; an owner observer may re-observe, but must never accept this file.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UnlinkedPrivateFile;
+
+#[cfg(unix)]
+impl std::fmt::Display for UnlinkedPrivateFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("private file was unlinked before validation")
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for UnlinkedPrivateFile {}
+
 impl PrivateDirectory {
     pub fn open(directory: &Path) -> Result<Self> {
         open_owned_directory(directory, true, true)
@@ -287,38 +303,45 @@ impl PrivateDirectory {
                         .context("atomically replacing xAI OAuth credentials");
                 }
             } else {
-                // `linkat` installs the unique generation without clobbering an
-                // existing path. The temporary link is removed immediately.
-                // SAFETY: all descriptors/names remain valid for both calls.
-                if unsafe {
-                    libc::linkat(
-                        self.directory_handle.as_raw_fd(),
-                        temporary.as_ptr(),
-                        self.directory_handle.as_raw_fd(),
-                        target.as_ptr(),
-                        0,
-                    )
-                } != 0
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                // Exclusive rename publishes one link atomically. A hard-link
+                // publication briefly exposes two links to concurrent readers.
+                self.move_no_replace(&temp_name, name)?;
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 {
-                    return Err(std::io::Error::last_os_error())
-                        .context("installing a new xAI OAuth generation without replacement");
-                }
-                // SAFETY: same descriptor and staging name as the `linkat` above.
-                if unsafe {
-                    libc::unlinkat(self.directory_handle.as_raw_fd(), temporary.as_ptr(), 0)
-                } != 0
-                {
-                    let error = std::io::Error::last_os_error();
-                    // The target and staging name still reference the same
-                    // inode. Remove the just-installed target so the generic
-                    // error cleanup can safely retire the single remaining
-                    // staging link instead of leaving an inert secret with
-                    // link count two.
-                    // SAFETY: same descriptor; `target` was just installed above.
-                    unsafe {
-                        libc::unlinkat(self.directory_handle.as_raw_fd(), target.as_ptr(), 0)
-                    };
-                    return Err(error).context("removing xAI OAuth generation staging link");
+                    // `linkat` installs the unique generation without clobbering an
+                    // existing path. The temporary link is removed immediately.
+                    // SAFETY: all descriptors/names remain valid for both calls.
+                    if unsafe {
+                        libc::linkat(
+                            self.directory_handle.as_raw_fd(),
+                            temporary.as_ptr(),
+                            self.directory_handle.as_raw_fd(),
+                            target.as_ptr(),
+                            0,
+                        )
+                    } != 0
+                    {
+                        return Err(std::io::Error::last_os_error())
+                            .context("installing a new xAI OAuth generation without replacement");
+                    }
+                    // SAFETY: same descriptor and staging name as the `linkat` above.
+                    if unsafe {
+                        libc::unlinkat(self.directory_handle.as_raw_fd(), temporary.as_ptr(), 0)
+                    } != 0
+                    {
+                        let error = std::io::Error::last_os_error();
+                        // The target and staging name still reference the same
+                        // inode. Remove the just-installed target so the generic
+                        // error cleanup can safely retire the single remaining
+                        // staging link instead of leaving an inert secret with
+                        // link count two.
+                        // SAFETY: same descriptor; `target` was just installed above.
+                        unsafe {
+                            libc::unlinkat(self.directory_handle.as_raw_fd(), target.as_ptr(), 0)
+                        };
+                        return Err(error).context("removing xAI OAuth generation staging link");
+                    }
                 }
             }
             self.directory_handle
@@ -401,6 +424,7 @@ pub(crate) fn validate_owned_file_handle(file: &File, path: &Path) -> Result<fs:
         metadata.uid() == unsafe { libc::geteuid() },
         "xAI OAuth file must be owned by the current user"
     );
+    anyhow::ensure!(metadata.nlink() != 0, UnlinkedPrivateFile);
     anyhow::ensure!(
         metadata.nlink() == 1,
         "xAI OAuth file must not have multiple filesystem links"
@@ -1286,7 +1310,7 @@ impl PrivateDirectory {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn move_socket_no_replace(&self, from: &str, to: &str) -> Result<()> {
+    fn move_no_replace(&self, from: &str, to: &str) -> Result<()> {
         use std::os::fd::AsRawFd as _;
         validate_private_basename(from)?;
         validate_private_basename(to)?;
@@ -1304,9 +1328,11 @@ impl PrivateDirectory {
             )
         };
         #[cfg(target_os = "linux")]
+        // Use the kernel syscall because musl need not export a renameat2 wrapper.
         // SAFETY: same retained directory; NOREPLACE is required, never emulated by a check.
         let result = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 self.directory_handle.as_raw_fd(),
                 from.as_ptr(),
                 self.directory_handle.as_raw_fd(),
@@ -1316,13 +1342,13 @@ impl PrivateDirectory {
         };
         if result != 0 {
             return Err(std::io::Error::last_os_error())
-                .context("retiring endpoint without replacement");
+                .context("moving private entry without replacement");
         }
         Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    fn move_socket_no_replace(&self, _from: &str, _to: &str) -> Result<()> {
+    fn move_no_replace(&self, _from: &str, _to: &str) -> Result<()> {
         bail!("exclusive endpoint retirement is unsupported on this platform")
     }
 
@@ -1338,9 +1364,9 @@ impl PrivateDirectory {
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        self.move_socket_no_replace(name, &retired)?;
+        self.move_no_replace(name, &retired)?;
         if self.socket_identity(&retired)? != Some(expected) {
-            let restored = self.move_socket_no_replace(&retired, name);
+            let restored = self.move_no_replace(&retired, name);
             return Err(anyhow::anyhow!(
                 "endpoint identity changed; replacement preserved (restore: {restored:?})"
             ));
@@ -1398,6 +1424,75 @@ mod tests {
         assert!(parent.read_private_receipt("alias.json", 8).is_err());
     }
 
+    #[test]
+    fn owner_receipt_opened_before_retirement_is_rejected_as_unlinked_not_hardlinked() {
+        let root = root();
+        let parent = PrivateDirectory::admit(&root.path().join("run")).unwrap();
+        parent
+            .write_owned_file("owner.json", b"receipt", false)
+            .unwrap();
+        let file = parent
+            .open_owned_file_for_read("owner.json")
+            .unwrap()
+            .unwrap();
+        assert!(parent.remove_raw("owner.json").unwrap());
+        let error = parent
+            .read_private_receipt_file("owner.json", 8, file)
+            .unwrap_err();
+        assert!(error.is::<UnlinkedPrivateFile>());
+
+        parent
+            .write_owned_file("owner.json", b"receipt", false)
+            .unwrap();
+        fs::hard_link(
+            parent.directory.join("owner.json"),
+            parent.directory.join("alias.json"),
+        )
+        .unwrap();
+        let error = parent.read_private_receipt("owner.json", 8).unwrap_err();
+        assert!(
+            !error.is::<UnlinkedPrivateFile>(),
+            "a linked receipt must remain unsafe, not retryable"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn private_exclusive_publication_keeps_one_link_and_preserves_existing_destination() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = root();
+        let parent = PrivateDirectory::admit(&root.path().join("run")).unwrap();
+        let mut staging = parent.open_internal_file("staging").unwrap();
+        staging.write_all(b"receipt").unwrap();
+        staging.sync_all().unwrap();
+        parent.move_no_replace("staging", "owner.json").unwrap();
+        assert_eq!(staging.metadata().unwrap().nlink(), 1);
+        assert!(
+            parent
+                .open_owned_file_for_read("staging")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parent
+                .write_owned_file("owner.json", b"replacement", false)
+                .is_err()
+        );
+        assert_eq!(
+            parent
+                .read_private_receipt("owner.json", 8)
+                .unwrap()
+                .unwrap()
+                .0,
+            b"receipt"
+        );
+        assert_eq!(
+            fs::read_dir(&parent.directory).unwrap().count(),
+            1,
+            "failed publication must clean only its own staging file"
+        );
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn owner_receipt_retirement_preserves_a_replacement_and_uses_captured_file() {
@@ -1452,6 +1547,45 @@ mod tests {
         assert_eq!(unix_process_start(std::process::id()).unwrap(), first);
         assert!(unix_process_start(0).is_err());
         assert!(unix_process_start(u32::MAX).is_err());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn unix_process_status_requires_positive_kernel_absence() {
+        assert_eq!(
+            unix_process_status(std::process::id()).unwrap(),
+            UnixProcessStatus::Present {
+                start: unix_process_start(std::process::id()).unwrap()
+            }
+        );
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(unix_process_status(pid).unwrap(), UnixProcessStatus::Absent);
+        assert!(unix_process_status(0).is_err());
+        assert!(unix_process_status(u32::MAX).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_status_never_converts_uncertainty_to_death() {
+        assert!(unix_pid_is_absent(
+            -1,
+            &std::io::Error::from_raw_os_error(libc::ESRCH)
+        ));
+        for code in [libc::EPERM, libc::EACCES, libc::EINVAL] {
+            assert!(!unix_pid_is_absent(
+                -1,
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!unix_pid_is_absent(
+            0,
+            &std::io::Error::from_raw_os_error(libc::ESRCH)
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -1571,6 +1705,34 @@ mod tests {
         drop((original, replacement));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn endpoint_move_refuses_to_replace_existing_socket() {
+        let root = root();
+        let parent = PrivateDirectory::admit(&root.path().join("run")).unwrap();
+        let original = UnixListener::bind(parent.directory.join("owner.sock")).unwrap();
+        let destination = UnixListener::bind(parent.directory.join("retired.sock")).unwrap();
+        let original_identity = parent.socket_identity("owner.sock").unwrap().unwrap();
+        let destination_identity = parent.socket_identity("retired.sock").unwrap().unwrap();
+
+        let error = parent
+            .move_no_replace("owner.sock", "retired.sock")
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            parent.socket_identity("owner.sock").unwrap(),
+            Some(original_identity)
+        );
+        assert_eq!(
+            parent.socket_identity("retired.sock").unwrap(),
+            Some(destination_identity)
+        );
+        drop((original, destination));
+    }
+
     #[test]
     fn endpoint_leaf_symlink_is_never_followed_for_protection_or_retirement() {
         let root = root();
@@ -1597,6 +1759,42 @@ mod tests {
                 .is_symlink()
         );
         drop(original);
+    }
+}
+
+/// A current-user process identity or positive kernel absence. Query failures
+/// remain errors; an unreadable process record never establishes death.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnixProcessStatus {
+    Present { start: String },
+    Absent,
+}
+
+#[cfg(unix)]
+fn unix_pid_is_absent(result: i32, error: &std::io::Error) -> bool {
+    result == -1 && error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Read on the existing bounded owner worker. Signal zero never terminates a
+/// process; only ESRCH after validating a positive PID proves absence.
+#[cfg(unix)]
+pub fn unix_process_status(pid: u32) -> Result<UnixProcessStatus> {
+    let kernel_pid = i32::try_from(pid).context("invalid local process PID")?;
+    anyhow::ensure!(kernel_pid > 0, "invalid local process PID");
+    match unix_process_start(pid) {
+        Ok(start) => Ok(UnixProcessStatus::Present { start }),
+        Err(identity_error) => {
+            // SAFETY: a validated positive PID and signal zero only query
+            // existence. No process-group selection or signal is possible.
+            let result = unsafe { libc::kill(kernel_pid, 0) };
+            let error = std::io::Error::last_os_error();
+            if unix_pid_is_absent(result, &error) {
+                Ok(UnixProcessStatus::Absent)
+            } else {
+                Err(identity_error).context("selected process identity/liveness is uncertain")
+            }
+        }
     }
 }
 
@@ -1740,11 +1938,20 @@ impl PrivateDirectory {
     /// The same anchored owned-file opener used by credentials, with a bounded
     /// read and retained object for exact receipt retirement.
     pub fn read_private_receipt(&self, name: &str, max: usize) -> Result<Option<(Vec<u8>, File)>> {
-        use std::io::Read as _;
-        use std::os::unix::fs::MetadataExt as _;
-        let Some(mut file) = self.open_owned_file_for_read(name)? else {
+        let Some(file) = self.open_owned_file_for_read(name)? else {
             return Ok(None);
         };
+        self.read_private_receipt_file(name, max, file).map(Some)
+    }
+
+    fn read_private_receipt_file(
+        &self,
+        name: &str,
+        max: usize,
+        mut file: File,
+    ) -> Result<(Vec<u8>, File)> {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
         let before = validate_owned_file_handle(&file, &self.directory.join(name))?;
         anyhow::ensure!(
             before.mode() & 0o077 == 0 && before.len() <= u64::try_from(max)?,
@@ -1767,7 +1974,7 @@ impl PrivateDirectory {
                 && before.mtime_nsec() == after.mtime_nsec(),
             "private owner receipt changed while reading"
         );
-        Ok(Some((bytes, file)))
+        Ok((bytes, file))
     }
 
     pub fn retire_private_receipt(&self, name: &str, captured: &File) -> Result<bool> {
@@ -1785,13 +1992,13 @@ impl PrivateDirectory {
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         );
-        self.move_socket_no_replace(name, &retired)?;
+        self.move_no_replace(name, &retired)?;
         let Some(moved) = self.open_owned_file_for_read(&retired)? else {
             bail!("private receipt retirement is uncertain")
         };
         let moved_metadata = validate_owned_file_handle(&moved, &self.directory.join(&retired))?;
         if (expected.dev(), expected.ino()) != (moved_metadata.dev(), moved_metadata.ino()) {
-            let restored = self.move_socket_no_replace(&retired, name);
+            let restored = self.move_no_replace(&retired, name);
             bail!("private receipt changed; retaining replacement (restore: {restored:?})");
         }
         self.remove_raw(&retired)?;

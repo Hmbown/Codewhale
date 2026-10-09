@@ -2,8 +2,10 @@
 
 > 英文原文：[ARCHITECTURE.md](../ARCHITECTURE.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐单一回合循环的私有阶段与 ACP 投影边界。
 
-本文面向开发者和贡献者，概览 Codewhale 的架构。
+Codewhale Engine 是现有 Rust 执行运行时。[Runtime API](RUNTIME_API.md) 是客户端
+接口，[TypeScript mods](EXTENSIONS.md) 提供经审查的扩展。
 
 当前边界说明（工作区版本以 `Cargo.toml` 为准；该边界自 v0.9.1 起保持不变）：
 - `crates/tui` 仍是 TUI、运行时 API、任务管理器和工具执行循环的现行终端用户运行时。
@@ -81,7 +83,12 @@
 
 - **`core/`** - 主要引擎组件
   - `engine.rs` - 引擎状态、操作处理、消息处理
-  - `engine/turn_loop.rs` - 流式回合循环与工具执行编排
+  - `engine/turn_loop.rs` - 现有 Engine 外层回合循环、共享工具规划/执行/结果处理与
+    流解码。私有 `turn_loop/` 阶段包括准备（`preparation.rs`）、模型派发与接纳
+    （`model_step.rs`）、有序续接（`continuation.rs`）、内联 REPL 编排
+    （`inline_repl.rs`）及直接模型工具批次（`tool_batch.rs`）。它们借用同一个
+    Engine 与 TurnContext，不引入第二个运行时、会话、提示词、审批、事件或持久化
+    权威。重试、循环终止与立即返回仍不同，只有现有有效工作路径推进步骤。
   - `session.rs` - 会话状态管理
   - `turn.rs` - 基于回合的对话处理
   - `events.rs` - 用于 UI 更新的事件系统
@@ -114,7 +121,9 @@
   `crates/tui/src/core/engine/turn_loop.rs` 里的 `Engine::run_turn`，而
   `crates/tui/src/core/` 是 TUI crate 内部的模块，不是这个 crate 的。这里曾有一棵
   占位的 `engine/` 目录树让人误解——它没有任何调用方，还会在不接触模型的情况下
-  发出 `TurnComplete`——已在 v0.9.11 移除。
+  发出 `TurnComplete`——已在 v0.9.11 移除。源码守卫跟踪已解析的本地阶段调用，
+  仍拒绝未登记的循环 owner。ACP stdio 投影现有 Runtime manager 与 Engine，
+  不保留独立提供商/工具回合循环或历史。
   递归 RLM 和普通 Python RPC 现在使用同一个 Engine 生产者与 Session；RLM
   不再有独立循环。Python 保存上下文与变量，每轮只借用调用方已捕获的路由、
   Native 选择、原有代码审批、取消信号和截止时间。任务指导有界且追加到 Core

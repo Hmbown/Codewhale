@@ -304,9 +304,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             let mut message = tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
                 .replace("{new}", "auto");
-            message.push_str(
-                " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-            );
+            message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
             return CommandResult::with_message_and_action(
                 message,
                 AppAction::UpdateCompaction(app.compaction_config()),
@@ -420,9 +418,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         let mut message = tr(app.ui_locale, MessageId::ModelChanged)
             .replace("{old}", &old_model)
             .replace("{new}", &model_id);
-        message.push_str(
-            " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-        );
+        message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
         CommandResult::with_message_and_action(
             message,
             AppAction::UpdateCompaction(app.compaction_config()),
@@ -457,17 +453,15 @@ pub fn subagents(app: &mut App) -> CommandResult {
 }
 
 /// Switch to a configured profile.
-pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
+pub fn profile_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
     let profile_name = match arg {
         Some(name) if !name.trim().is_empty() => name.trim().to_string(),
         _ => {
-            return CommandResult::error(
-                "Usage: /profile <name>\n\nSwitch to a named config profile. Profiles are defined in ~/.codewhale/config.toml under [profiles] sections.",
-            );
+            return CommandResult::error(tr(app.ui_locale, MessageId::ProfileUsage));
         }
     };
     CommandResult::with_message_and_action(
-        format!("Switching to profile '{profile_name}'..."),
+        tr(app.ui_locale, MessageId::ProfileSwitching).replace("{name}", &profile_name),
         AppAction::SwitchProfile {
             profile: profile_name,
         },
@@ -475,11 +469,15 @@ pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
 }
 
 pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let locale = app.ui_locale;
     let Some(raw_path) = arg.map(str::trim).filter(|path| !path.is_empty()) else {
-        return CommandResult::message(format!("Current workspace: {}", app.workspace.display()));
+        return CommandResult::message(
+            tr(locale, MessageId::WorkspaceCurrent)
+                .replace("{path}", &app.workspace.display().to_string()),
+        );
     };
 
-    let expanded = match expand_workspace_path(raw_path) {
+    let expanded = match expand_workspace_path(locale, raw_path) {
         Ok(path) => path,
         Err(message) => return CommandResult::error(message),
     };
@@ -490,30 +488,33 @@ pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
     };
 
     if !candidate.exists() {
-        return CommandResult::error(format!("Workspace does not exist: {}", candidate.display()));
+        return CommandResult::error(
+            tr(locale, MessageId::WorkspaceNotFound)
+                .replace("{path}", &candidate.display().to_string()),
+        );
     }
     if !candidate.is_dir() {
-        return CommandResult::error(format!(
-            "Workspace is not a directory: {}",
-            candidate.display()
-        ));
+        return CommandResult::error(
+            tr(locale, MessageId::WorkspaceNotDirectory)
+                .replace("{path}", &candidate.display().to_string()),
+        );
     }
 
     let workspace = candidate.canonicalize().unwrap_or(candidate);
     CommandResult::with_message_and_action(
-        format!("Switching workspace to {}...", workspace.display()),
+        tr(locale, MessageId::WorkspaceSwitching)
+            .replace("{path}", &workspace.display().to_string()),
         AppAction::SwitchWorkspace { workspace },
     )
 }
 
-fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
+fn expand_workspace_path(locale: Locale, path: &str) -> Result<PathBuf, String> {
+    let unresolved = || tr(locale, MessageId::WorkspaceHomeUnresolved).into_owned();
     if path == "~" {
-        return crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string());
+        return crate::config::effective_home_dir().ok_or_else(unresolved);
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        let home = crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string())?;
+        let home = crate::config::effective_home_dir().ok_or_else(unresolved)?;
         return Ok(home.join(rest));
     }
     Ok(PathBuf::from(path))
@@ -866,6 +867,51 @@ mod tests {
         app.auto_model = false;
         app.model_ids_passthrough = false;
         app
+    }
+
+    #[test]
+    fn profile_command_localizes_replies_and_preserves_switch_action() {
+        let _env = crate::test_support::lock_test_env();
+        for (locale, usage, switching) in [
+            (
+                Locale::En,
+                "Usage: /profile <name>",
+                "Switching to profile 'work'...",
+            ),
+            (
+                Locale::ZhHans,
+                "用法: /profile <name>",
+                "正在切换到配置文件 'work'...",
+            ),
+            (
+                Locale::De,
+                "Verwendung: /profile <name>",
+                "Wechsle zum Profil 'work'...",
+            ),
+        ] {
+            let mut app = create_test_app();
+            app.ui_locale = locale;
+            let previous_profile = app.config_profile.clone();
+
+            for command in ["/profile", "/profile   "] {
+                let result = crate::commands::execute(command, &mut app);
+                assert!(result.is_error, "{locale:?}: {command:?}");
+                assert!(result.action.is_none(), "{locale:?}: {command:?}");
+                let message = result.message.expect("profile usage");
+                assert!(message.contains(usage), "{locale:?}: {message}");
+                assert!(message.contains("~/.codewhale/config.toml"), "{message}");
+                assert!(message.contains("[profiles]"), "{message}");
+            }
+
+            let result = crate::commands::execute("/profile   work  ", &mut app);
+            assert!(!result.is_error, "{locale:?}");
+            assert_eq!(result.message.as_deref(), Some(switching), "{locale:?}");
+            assert!(matches!(
+                result.action,
+                Some(AppAction::SwitchProfile { profile }) if profile == "work"
+            ));
+            assert_eq!(app.config_profile, previous_profile, "{locale:?}");
+        }
     }
 
     #[test]

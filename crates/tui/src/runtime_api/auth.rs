@@ -72,6 +72,14 @@ pub(super) async fn require_runtime_token(
 ) -> Response {
     if runtime_request_is_authorized(&req, &state) {
         next.run(req).await
+    } else if request_bearer(&req)
+        .is_some_and(|token| state.computer.client_principal(token).is_some())
+    {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "watch client tokens cannot change Runtime state"})),
+        )
+            .into_response()
     } else {
         runtime_token_required_response()
     }
@@ -84,10 +92,13 @@ pub(super) fn runtime_request_is_authorized(req: &Request, state: &RuntimeApiSta
     if request_has_header_runtime_token(req, expected) {
         return true;
     }
-    // Device client tokens (`POST /v1/auth/client-tokens`, <= 1 h, revocable)
-    // carry the same `/v1` authority as the master token, except minting.
-    if request_bearer(req).is_some_and(|token| state.computer.client_principal(token).is_some()) {
-        return true;
+    // Device tokens carry their immutable mint intent. Watch permits HTTP
+    // reads only; an upgraded GET could otherwise become a write channel.
+    // Computer display/control routes enforce intent in their own handlers.
+    if let Some(principal) =
+        request_bearer(req).and_then(|token| state.computer.client_principal(token))
+    {
+        return client_request_is_authorized(&principal, req);
     }
     if state
         .web
@@ -100,6 +111,16 @@ pub(super) fn runtime_request_is_authorized(req: &Request, state: &RuntimeApiSta
         .mobile
         .as_ref()
         .is_some_and(|mobile| mobile_session_request_is_authorized(req, state, mobile))
+}
+
+fn client_request_is_authorized(
+    principal: &super::computer_display::Principal,
+    req: &Request,
+) -> bool {
+    principal.can_drive()
+        || (matches!(*req.method(), Method::GET | Method::HEAD)
+            && !req.headers().contains_key(header::UPGRADE)
+            && !req.headers().contains_key("sec-websocket-key"))
 }
 
 fn request_bearer(req: &Request) -> Option<&str> {

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ Codewhale 會讀取你的專案、編輯檔案、執行指令並檢查自己的�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="一次 Codewhale 終端機工作階段" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="一次 Codewhale 終端機工作階段" width="760">
 
-<sub>全新安裝後的真實終端機截圖——未經任何擺拍。</sub>
+<sub>已設定的本機示範工作階段中的真實 Codewhale 終端機截圖。</sub>
 
 </div>
 
@@ -56,6 +56,11 @@ Docker、Nix、Linux 上的 Homebrew、Android/Termux、附校驗碼驗證的手
 </details>
 
 ## 快速開始
+
+**在同一個地方管理你的模型 API 金鑰。** [註冊 Codewhale 帳號](https://app.codewhale.net/register)，
+或執行 `codewhale login` 登入。將 API 金鑰儲存至帳號後，即可集中更新，並在已登入的裝置上
+透過 Codewhale 模型路由使用。[設定帳號金鑰](docs/CONFIGURATION.md#account-provider-keys)。
+登入不會上傳既有的本機金鑰；不註冊帳號也可以繼續在本機使用。
 
 1. **開啟你的專案。** 在要處理的資料夾中執行 `codewhale`。
 2. **連接模型。** 執行 `/provider`（或按 `F3`）新增託管服務的金鑰，或選擇本機執行環境。

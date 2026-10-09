@@ -2,7 +2,7 @@
 import type { Json } from '../../protocol.ts'
 interface Result { ok: true; result: { content: string; success: boolean; metadata: Json } }
 type Row = Record<string, unknown>
-const REPOSITORY = 'Hmbown/CodeWhale'
+const REPOSITORY = 'codewhale-hq/CodeWhale'
 function row(value: unknown): Row { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid GitHub snapshot'); return value as Row }
 function text(value: unknown): string { if (typeof value !== 'string') throw new Error('invalid GitHub text'); return value }
 function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('invalid GitHub list'); return value.map(text) }

@@ -135,18 +135,23 @@ pub(crate) fn parse_ollama_show_response(payload: &str) -> anyhow::Result<Ollama
 /// probe answers late, and switching provider under them would close the
 /// picker mid-choice or mid-key.
 #[must_use]
-pub(crate) fn should_adopt_live_local_ollama(app: &mut crate::tui::app::App) -> bool {
-    if app.startup_route_configured {
+pub(crate) fn should_adopt_live_local_ollama(
+    startup_route_configured: bool,
+    provider: ProviderKind,
+    picker_interacted: bool,
+    onboarding_needs_key: bool,
+) -> bool {
+    if startup_route_configured {
         return false;
     }
-    if app.api_provider == ProviderKind::Ollama {
+    if provider == ProviderKind::Ollama {
         // Already on Ollama — route_runtime + #5795 own the tag; don't fight it.
         return false;
     }
-    if app.view_stack.provider_picker_interacted() {
+    if picker_interacted {
         return false;
     }
-    app.onboarding_needs_api_key || app.onboarding_missing_key_recovery
+    onboarding_needs_key
 }
 
 /// Resolve the OpenAI-compat Ollama base URL (`…/v1`) from config defaults.

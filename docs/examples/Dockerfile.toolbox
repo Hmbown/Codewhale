@@ -2,18 +2,21 @@
 #
 # Opt-in Codewhale toolbox image.
 #
-# The published ghcr.io/codewhale-hq/codewhale:latest image intentionally stays
+# The published ghcr.io/hmbown/codewhale:latest image intentionally stays
 # minimal, non-root, and without passwordless sudo. Use this Dockerfile only for
 # workspaces where you deliberately want package installation, custom CA setup,
 # or project-specific build tools inside the container.
 #
+# The published base is currently 0.10.0. Build current main from the root
+# Dockerfile when testing unreleased source.
+#
 # Example:
 #   docker build -f docs/examples/Dockerfile.toolbox \
-#     --build-arg CODEWHALE_IMAGE=ghcr.io/codewhale-hq/codewhale:vX.Y.Z \
+#     --build-arg CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:v0.10.0 \
 #     --build-arg TOOLBOX_PACKAGES="git openssh-client curl build-essential pkg-config python3 python3-pip nodejs npm" \
 #     -t codewhale-toolbox:my-project .
 
-ARG CODEWHALE_IMAGE=ghcr.io/codewhale-hq/codewhale:latest
+ARG CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:latest
 FROM ${CODEWHALE_IMAGE}
 
 USER root

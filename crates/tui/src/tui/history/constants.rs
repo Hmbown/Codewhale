@@ -43,10 +43,10 @@ pub(super) const TOOL_FAILURE_PREVIEW_LINES: usize = 6;
 pub(super) const TOOL_OUTPUT_LINE_LIMIT: usize = 20;
 
 /// Rows of output a *successful* live `run` card shows before the details
-/// affordance takes over. Two opening rows and one tail row retain a quick
-/// read on what the command did while keeping routine successes quiet; failures
-/// keep their larger preview budget. The full result remains in the details
-/// transcript.
+/// affordance takes over. One opening row and two closing rows retain a quick
+/// read on what the command did and how it ended (a test run's pass and fail
+/// counts) while keeping routine successes quiet; failures keep their larger
+/// preview budget. The full result remains in the details transcript.
 pub(super) const TOOL_SUCCESS_OUTPUT_PREVIEW_LINES: usize = 3;
 
 pub(super) const TOOL_TEXT_LIMIT: usize = 300;
@@ -98,5 +98,3 @@ pub(super) const TOOL_SUMMARY_CARD_LINES: usize = 6;
 
 pub(super) const TOOL_DONE_SYMBOL: &str = crate::tui::glyphs::DONE;
 pub(super) const TOOL_FAILED_SYMBOL: &str = crate::tui::glyphs::FAILED;
-/// Compact Ctrl+B affordance for foreground shell waits in the live transcript.
-pub(super) const FOREGROUND_SHELL_WAIT_HINT: &str = "Ctrl+B → /jobs";

@@ -118,6 +118,9 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, rail_budget: u16)
         collapse_strip(app);
         return 0;
     }
+    if app.work_surface.panel == RailPanel::Terminal {
+        return cap;
+    }
     let list_rows = rows.len().max(usize::from(explicit));
     let progress = u16::from(
         top_todo_progress(app, &rows).is_some() && !progress_shares_goal_row(width, goal_rows > 0),

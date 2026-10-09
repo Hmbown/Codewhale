@@ -268,6 +268,81 @@ test('Windows sharing retries keep complete records and retain atomic replacemen
   assert.match(report.names[0], /^[a-f0-9]{64}\.json$/u)
 })
 
+test('Windows destination revalidation recovers after a sharing interval beyond 500ms', async (t) => {
+  const { a, store } = await fixture(t)
+  await store.set('shared', 'original')
+  const report = await sharingWorker(t, a, `
+    const timers = require('node:timers/promises');
+    const realOpen = fs.promises.open, realRename = fs.promises.rename, realRead = fs.promises.readFile;
+    const path = require('node:path').join(process.argv[1], 'storage-v1', require('node:crypto').createHash('sha256').update('shared').digest('hex') + '.json');
+    const original = await realRead(path, 'utf8');
+    let elapsed = 0, publications = 0, validationDenials = 0;
+    const observed = [], waits = [];
+    // A virtual sharing interval avoids tying this regression to runner load.
+    // Filesystem reads, writes, fsync and the eventual rename remain real.
+    timers.setTimeout = async (ms) => { elapsed += ms; waits.push(ms); };
+    fs.promises.open = async (...args) => {
+      if (String(args[0]).endsWith(require('node:path').basename(path)) && publications && elapsed < 600) {
+        validationDenials++;
+        observed.push(await realRead(path, 'utf8'));
+        throw Object.assign(new Error('destination sharing'), { code: 'EPERM' });
+      }
+      return realOpen(...args);
+    };
+    fs.promises.rename = async (...args) => {
+      if (publications++ === 0) {
+        observed.push(await realRead(path, 'utf8'));
+        throw Object.assign(new Error('publication sharing'), { code: 'EACCES' });
+      }
+      return realRename(...args);
+    };
+    syncBuiltinESMExports();
+    const { createStorage } = await import(${JSON.stringify(moduleUrl)});
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    let code;
+    try { await store.set('shared', 'complete replacement'); } catch (error) { code = error.code; }
+    process.send({ code, original, observed, waits, elapsed, publications, validationDenials,
+      value: await store.get('shared'), bytes: await realRead(path, 'utf8'),
+      names: await fs.promises.readdir(require('node:path').dirname(path)) });
+  `)
+  t.diagnostic(JSON.stringify(report))
+  assert.equal(report.code, undefined, JSON.stringify(report))
+  assert.ok(report.elapsed >= 600 && report.elapsed <= 2750, 'the finite sharing interval must settle within the bounded retry budget')
+  assert.ok(report.validationDenials > 0)
+  assert.equal(report.publications, 2, 'one refused rename followed by one real atomic publication')
+  assert.equal(report.original, JSON.stringify({ version: 1, key: 'shared', value: 'original' }) + '\n')
+  assert.ok(report.observed.length > 1 && report.observed.every((bytes) => bytes === report.original), 'old complete bytes remain visible throughout refusal')
+  assert.equal(report.value, 'complete replacement')
+  assert.equal(report.bytes, JSON.stringify({ version: 1, key: 'shared', value: 'complete replacement' }) + '\n')
+  assert.equal(report.names.length, 1, 'this invocation cleans its temporary file without deleting the destination')
+  assert.match(report.names[0], /^[a-f0-9]{64}\.json$/u)
+})
+
+test('Windows nonsharing publication errors preserve old state without retry', async (t) => {
+  const { a, store } = await fixture(t)
+  await store.set('shared', 'original')
+  const report = await sharingWorker(t, a, `
+    const path = require('node:path').join(process.argv[1], 'storage-v1', require('node:crypto').createHash('sha256').update('shared').digest('hex') + '.json');
+    const original = await fs.promises.readFile(path, 'utf8');
+    let publications = 0;
+    fs.promises.rename = async () => { publications++; throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    syncBuiltinESMExports();
+    const { createStorage } = await import(${JSON.stringify(moduleUrl)});
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    let code;
+    try { await store.set('shared', 'must not publish'); } catch (error) { code = error.code; }
+    process.send({ code, publications, original, bytes: await fs.promises.readFile(path, 'utf8'),
+      names: await fs.promises.readdir(require('node:path').dirname(path)) });
+  `)
+  assert.equal(report.code, 'io')
+  assert.equal(report.publications, 1)
+  assert.equal(report.bytes, report.original)
+  assert.equal(report.names.length, 1)
+  assert.match(report.names[0], /^[a-f0-9]{64}\.json$/u)
+})
+
 test('Windows sharing retries refuse revocation, corrupt replacements and permanent denial', async (t) => {
   const { a } = await fixture(t)
   for (const mode of ['revoked', 'corrupt', 'denied']) {

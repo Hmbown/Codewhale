@@ -259,8 +259,8 @@ async fn killed_process_is_reconciled_once_and_only_its_scope_resumes_queued_wor
 
 async fn stop_idle_workers(manager: &TaskManager) {
     for worker in std::mem::take(&mut *manager.workers.lock().await) {
-        worker.abort();
-        let _ = worker.await;
+        worker.join.abort();
+        let _ = worker.join.await;
     }
 }
 

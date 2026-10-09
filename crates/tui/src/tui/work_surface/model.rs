@@ -65,6 +65,8 @@ pub enum RailPanel {
     Tasks,
     /// Background shells and durable tasks. Scheduled work has its own manager.
     Background,
+    /// Live workspace PTYs shared with the model, with explicit input focus.
+    Terminal,
     /// Files edited this session (`+/−`) and files read into context.
     Files,
     /// Per-workspace plain-text notes (`.codewhale/notes.md`).
@@ -79,10 +81,11 @@ pub enum RailPanel {
 
 impl RailPanel {
     /// Cycle order — also the tab order in the dock strip.
-    pub const ORDER: [RailPanel; 8] = [
+    pub const ORDER: [RailPanel; 9] = [
         Self::Tasks,
         Self::Agents,
         Self::Background,
+        Self::Terminal,
         Self::Files,
         Self::Notepad,
         Self::Context,
@@ -128,6 +131,7 @@ impl RailPanel {
             "agents" | "subagents" | "sub-agents" => Self::Agents,
             "tasks" | "todo" | "todos" => Self::Tasks,
             "background" | "shells" | "jobs" => Self::Background,
+            "terminal" | "terminals" => Self::Terminal,
             "files" | "changes" => Self::Files,
             "notepad" | "notes" => Self::Notepad,
             "context" | "session" => Self::Context,
@@ -143,6 +147,7 @@ impl RailPanel {
             Self::Agents => "agents",
             Self::Tasks => "tasks",
             Self::Background => "background",
+            Self::Terminal => "terminal",
             Self::Files => "files",
             Self::Notepad => "notepad",
             Self::Context => "context",
@@ -163,6 +168,7 @@ impl RailPanel {
             Self::Agents => "AGENTS",
             Self::Tasks => "TODO",
             Self::Background => "BACKGROUND",
+            Self::Terminal => "TERMINAL",
             Self::Files => "FILES",
             Self::Notepad => "NOTEPAD",
             Self::Context => "CONTEXT",
@@ -329,6 +335,8 @@ pub(crate) struct SessionInstanceScope {
 
 #[derive(Debug, Clone)]
 pub struct WorkSurfaceState {
+    #[cfg(all(unix, not(target_env = "ohos")))]
+    pub(super) terminal: super::terminal::TerminalDock,
     pub placement: WorkSurfacePlacement,
     pub(super) effective_placement: WorkSurfacePlacement,
     /// Panel selection — orthogonal to placement.
@@ -434,6 +442,8 @@ impl WorkSurfaceState {
             placement,
             effective_placement: placement,
             panel: RailPanel::default(),
+            #[cfg(all(unix, not(target_env = "ohos")))]
+            terminal: super::terminal::TerminalDock::default(),
             explicit_view: false,
             file_activity: SettledFileActivity::default(),
             top_height: top_height.clamp(TOP_HEIGHT_MIN, TOP_HEIGHT_MAX),
@@ -881,6 +891,7 @@ fn view_has_work(app: &mut App, panel: RailPanel) -> bool {
         // tasks are work. Scheduled automation configuration belongs in /automation.
         RailPanel::Background => background_has_live_work(app),
         RailPanel::Files
+        | RailPanel::Terminal
         | RailPanel::Notepad
         | RailPanel::Context
         | RailPanel::Git
@@ -1151,6 +1162,7 @@ pub(super) fn visible_rows_for(app: &mut App, panel: RailPanel) -> Vec<WorkRow> 
         RailPanel::Agents => agents_view_rows(app),
         RailPanel::Tasks => project_visible(app),
         RailPanel::Background => background_view_rows(app),
+        RailPanel::Terminal => Vec::new(),
         RailPanel::Files => super::views::files_rows(app),
         RailPanel::Notepad => super::views::notepad_rows(app),
         RailPanel::Context => super::views::context_rows(app),

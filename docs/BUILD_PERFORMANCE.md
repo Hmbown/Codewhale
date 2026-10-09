@@ -153,11 +153,17 @@ Defaults never contain a machine-specific absolute path:
 export CODEWHALE_CACHE_ROOT=/path/to/cache/codewhale
 
 scripts/dev-cache.sh --self-check
-scripts/dev-test.sh crates/runtime/src/elapsed.rs
+scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked --no-run
 ```
 
 Hermetic script test (no rustc compile): `sh scripts/dev-cache.test.sh`.
+When the repository build lock governs Cargo, the entry point disables the
+external `cargowhale` governor for that process. Running both governors can
+replace the selected cache and recreate deleted tracked files while forcing
+their timestamps. Keep one build owner and a frozen source manifest; a build
+helper must not change that source. This leaves the machine's global settings
+unchanged.
 `scripts/dev-test.sh --self-check` reports the helper's resolved cache
 topology; its own script test, `scripts/dev-test.test.sh`, was removed in
 `d64b9429b7`.

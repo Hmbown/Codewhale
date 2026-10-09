@@ -407,6 +407,7 @@ impl ProviderLivePricingQuote {
             output: output_per_million,
             cache_read: cache_read_per_million,
             cache_write: cache_write_per_million,
+            ..Default::default()
         };
         if !codewhale_config::pricing::catalog_cost_is_valid(&cost) {
             return None;
@@ -509,6 +510,35 @@ fn inferred_provider_kind(identity: &str) -> ProviderKind {
 
 fn storage_provider(kind: ProviderKind, identity: &str) -> String {
     format!("{}:{}", kind.as_str(), identity.trim())
+}
+
+/// Providers whose model list is owned by their own `/v1/models` roster
+/// rather than the cross-provider Models.dev snapshot: the named live
+/// gateways, plus custom hosts whose private roster no snapshot can serve
+/// (#6289 widened). The active-provider refresh and the picker's freshness
+/// receipt both gate on this one predicate, so they cannot drift apart.
+#[cfg(test)]
+#[test]
+fn orcarouter_and_existing_custom_routes_own_live_catalogs() {
+    assert!(provider_owns_live_catalog(ProviderKind::Orcarouter));
+    assert!(provider_owns_live_catalog(ProviderKind::Custom));
+    assert!(provider_owns_live_catalog(ProviderKind::Openrouter));
+    assert!(provider_owns_live_catalog(ProviderKind::Ollama));
+    assert!(!provider_owns_live_catalog(ProviderKind::Openai));
+}
+
+pub(crate) fn provider_owns_live_catalog(provider: ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::Openrouter
+            | ProviderKind::Orcarouter
+            | ProviderKind::Telecomjs
+            | ProviderKind::Edenai
+            | ProviderKind::Zenmux
+            | ProviderKind::Concentrate
+            | ProviderKind::Codewhale
+            | ProviderKind::Ollama
+    ) || provider == ProviderKind::Custom
 }
 
 /// Whether a catalog scope holds an account-scoped roster that must never be

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ lavoro — nel tuo terminale, con un modello ospitato o locale a tua scelta.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Una sessione di terminale di Codewhale" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Una sessione di terminale di Codewhale" width="760">
 
-<sub>Acquisizione reale del terminale di una nuova installazione — nessun output simulato.</sub>
+<sub>Acquisizione reale del terminale Codewhale da una sessione demo locale configurata.</sub>
 
 </div>
 
@@ -57,6 +57,12 @@ sulla stessa macchina finiscono per contendersi il `PATH`.
 </details>
 
 ## Avvio rapido
+
+**Le chiavi API dei tuoi provider, in un unico posto.** [Crea un account Codewhale](https://app.codewhale.net/register)
+oppure esegui `codewhale login` per accedere. Salva e aggiorna le chiavi API nel tuo account,
+poi usale tramite l’instradamento dei modelli di Codewhale sui dispositivi su cui hai effettuato l’accesso.
+[Configura le chiavi dell’account](docs/CONFIGURATION.md#account-provider-keys).
+L’accesso non carica le chiavi locali esistenti; puoi continuare a usare Codewhale in locale senza un account.
 
 1. **Apri il tuo progetto.** Esegui `codewhale` nella cartella su cui vuoi lavorare.
 2. **Collega un modello.** Esegui `/provider` (o premi `F3`) per aggiungere una chiave

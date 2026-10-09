@@ -108,6 +108,34 @@ pub fn is_output_limit_stop_reason(reason: Option<&str>) -> bool {
     })
 }
 
+/// Stop reason recorded for a response that reported `stop` while its own usage
+/// shows it ran to the requested output ceiling (#6889). The Chat Completions
+/// spelling, so every existing output-limit path treats it as a `length` stop.
+pub const OUTPUT_CEILING_STOP_REASON: &str = "length";
+
+/// True when a Chat Completions `stop` is contradicted by the provider's own
+/// usage: the completion tokens it reported equal the output ceiling the
+/// request asked for (#6889). A finished answer leaves the allowance unfilled,
+/// so this response was cut at the ceiling, typically by reasoning that used
+/// the allowance before or during the answer.
+///
+/// `reported_output_tokens` is `None` when the provider reported no usage; no
+/// inference is made then. The match is exact: a provider that does not count
+/// reasoning against the cap can report more than the ceiling on a finished
+/// answer. Only `stop` is second-guessed. The Anthropic and Responses wires
+/// report a limit stop through typed fields of their own, and one Responses
+/// route sends no ceiling at all.
+#[must_use]
+pub fn stop_contradicts_output_ceiling(
+    reason: Option<&str>,
+    reported_output_tokens: Option<u32>,
+    requested_max_tokens: u32,
+) -> bool {
+    requested_max_tokens > 0
+        && reported_output_tokens == Some(requested_max_tokens)
+        && reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("stop"))
+}
+
 /// True when the provider explicitly reported that it did not complete the
 /// response. Responses API reasons carry an `incomplete:` prefix so unknown
 /// future reasons cannot accidentally be accepted as a finished answer.
@@ -222,10 +250,13 @@ pub fn effective_muse_wire_id(model: &str) -> &str {
 #[must_use]
 pub fn model_is_openai_reasoning_family(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    codewhale_config::catalog::reviewed::bundled_reviewed()
-        .openai_reasoning_ids
-        .contains_key(&lower)
-        || reviewed_snapshot_model(&lower).is_some()
+    let reviewed = codewhale_config::catalog::reviewed::bundled_reviewed();
+    reviewed.openai_reasoning_ids.contains_key(&lower)
+        // Snapshot resolution spans every reviewed family; the resolved
+        // target must itself be an OpenAI reasoning row, or a DeepSeek
+        // snapshot would be relabelled as one.
+        || reviewed_snapshot_model(&lower)
+            .is_some_and(|target| reviewed.openai_reasoning_ids.contains_key(target))
 }
 
 pub fn is_openai_gpt_56_api_model(model_lower: &str) -> bool {
@@ -249,6 +280,102 @@ pub fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
             .all(|(idx, byte)| idx == 4 || idx == 7 || byte.is_ascii_digit())
 }
 
+/// Resolve a snapshot or variant model id to the reviewed intrinsic row it
+/// denotes, without inventing facts for names the catalog does not own.
+///
+/// Two documented contracts, applied in order:
+/// - the authored `snapshot_prefixes` rows (`gpt-5.5-<YYYY-MM-DD>`);
+/// - a trailing date stamp (`-YYYY-MM-DD` or `-MMDD`) or an explicit variant
+///   marker (`-vision-exp`, `-vision`, `-exp`), accepted only when stripping
+///   it leaves the exact id of a reviewed intrinsic row
+///   (`deepseek-v4-pro-0813` denotes `deepseek-v4-pro`;
+///   `deepseek-v4-flash-vision` denotes `deepseek-v4-flash`).
+///   The compact `-YYYYMMDD` shape is deliberately not inferred: the
+///   sibling-metadata contract rejects it.
+///
+/// Every layer is resolved against the bundled reviewed catalog only. An
+/// unrecognized name still returns `None`: the unknown stays observable.
+fn reviewed_snapshot_model(model: &str) -> Option<&'static str> {
+    let reviewed = codewhale_config::catalog::reviewed::bundled_reviewed();
+    let via_authored_contract = |candidate: &str| {
+        reviewed
+            .snapshot_prefixes
+            .iter()
+            .find_map(|(prefix, target)| {
+                has_date_snapshot_suffix(candidate, prefix).then_some(target.as_str())
+            })
+    };
+    let mut candidate = model.to_ascii_lowercase();
+    for _ in 0..3 {
+        if let Some(target) = via_authored_contract(&candidate) {
+            return Some(target);
+        }
+        let stripped = strip_snapshot_or_variant_suffix(&candidate)?;
+        if let Some((key, _)) = reviewed.intrinsic.get_key_value(&stripped) {
+            return Some(key.as_str());
+        }
+        candidate = stripped;
+    }
+    None
+}
+
+/// One snapshot/variant normalization layer, longest marker first. The
+/// caller re-resolves the shortened id against the reviewed catalog and
+/// never accepts a shortening on its own.
+fn strip_snapshot_or_variant_suffix(id: &str) -> Option<String> {
+    for marker in ["-vision-exp", "-vision", "-exp"] {
+        if let Some(base) = id.strip_suffix(marker)
+            && !base.is_empty()
+        {
+            return Some(base.to_string());
+        }
+    }
+    strip_date_stamp(id)
+}
+
+/// Strip one trailing date stamp: `-YYYY-MM-DD` or `-MMDD` (the reviewed
+/// snapshot conventions). The compact `-YYYYMMDD` form is deliberately not
+/// inferred: the sibling-metadata contract rejects that shape (see
+/// `unrecognized_deepseek_models_do_not_inherit_sibling_metadata`).
+fn strip_date_stamp(id: &str) -> Option<String> {
+    // `-YYYY-MM-DD`: a ten-character tail preceded by its own dash. The split
+    // index is a byte offset, so it must land on a char boundary: a multi-byte
+    // model id would panic in `split_at` otherwise.
+    if id.len() > 11 && id.is_char_boundary(id.len() - 10) {
+        let (head, tail) = id.split_at(id.len() - 10);
+        if let Some(head) = head.strip_suffix('-')
+            && !head.is_empty()
+            && has_date_snapshot_suffix(tail, "")
+        {
+            return Some(head.to_string());
+        }
+    }
+    let (head, tail) = id.rsplit_once('-')?;
+    if head.is_empty() || tail.is_empty() {
+        return None;
+    }
+    let digits = tail.as_bytes();
+    if digits.len() == 4
+        && digits.iter().all(u8::is_ascii_digit)
+        && valid_month_day(&digits[0..2], &digits[2..4])
+    {
+        return Some(head.to_string());
+    }
+    None
+}
+
+/// Validate a two-digit month/day pair (ranges only, no calendar math).
+fn valid_month_day(month_digits: &[u8], day_digits: &[u8]) -> bool {
+    let two = |bytes: &[u8]| -> Option<u32> {
+        (bytes.len() == 2 && bytes.iter().all(u8::is_ascii_digit))
+            .then(|| u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0'))
+    };
+    match (two(month_digits), two(day_digits)) {
+        (Some(month), Some(day)) => (1..=12).contains(&month) && (1..=31).contains(&day),
+        _ => false,
+    }
+}
+
 /// The context window a model name's `_Nk` suffix advertises, when the
 /// catalog does not already describe the model (#5441).
 ///
@@ -257,16 +384,6 @@ pub fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
 /// from the name* — a naming convention the serving engine may ignore is not
 /// a fact about the route, and every surface that shows such a window must
 /// mark it unverified.
-fn reviewed_snapshot_model(model: &str) -> Option<&'static str> {
-    let lower = model.to_ascii_lowercase();
-    codewhale_config::catalog::reviewed::bundled_reviewed()
-        .snapshot_prefixes
-        .iter()
-        .find_map(|(prefix, target)| {
-            has_date_snapshot_suffix(&lower, prefix).then_some(target.as_str())
-        })
-}
-
 #[must_use]
 pub fn name_suffix_context_window_hint(model: &str) -> Option<u32> {
     if codewhale_config::catalog::reviewed::intrinsic_model(model)
@@ -600,6 +717,49 @@ mod tests {
         }
         for reason in [None, Some("end_turn"), Some("tool_use"), Some("")] {
             assert!(!is_output_limit_stop_reason(reason), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn stop_at_the_requested_ceiling_is_an_output_limit_stop() {
+        // #6889: 16000 requested, 16000 reported, `finish_reason: stop`.
+        assert!(stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(16_000),
+            16_000
+        ));
+        assert!(stop_contradicts_output_ceiling(
+            Some(" STOP "),
+            Some(50),
+            50
+        ));
+        assert!(is_output_limit_stop_reason(Some(
+            OUTPUT_CEILING_STOP_REASON
+        )));
+        assert!(is_incomplete_stop_reason(Some(OUTPUT_CEILING_STOP_REASON)));
+
+        // A finished answer leaves the allowance unfilled.
+        assert!(!stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(15_999),
+            16_000
+        ));
+        // Reasoning the provider does not count against the cap.
+        assert!(!stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(20_000),
+            16_000
+        ));
+        // No usage reported: nothing to compare.
+        assert!(!stop_contradicts_output_ceiling(Some("stop"), None, 16_000));
+        // No ceiling requested.
+        assert!(!stop_contradicts_output_ceiling(Some("stop"), Some(0), 0));
+        // Other wires and other stops keep their own reporting.
+        for reason in [None, Some("end_turn"), Some("tool_calls"), Some("length")] {
+            assert!(
+                !stop_contradicts_output_ceiling(reason, Some(16_000), 16_000),
+                "{reason:?}"
+            );
         }
     }
 
@@ -1177,6 +1337,54 @@ mod tests {
             Some(256_000)
         );
         assert_eq!(context_window_for_model("deepseek-v3.2-2k-preview"), None);
+    }
+
+    /// 2026-10-05: custom gateways serve V4 under snapshot and variant ids
+    /// the reviewed catalog does not enumerate (`deepseek-v4-pro-0813`,
+    /// `deepseek-v4-flash-vision`). They denote the same rows as their base
+    /// ids and must inherit the base facts instead of falling back to the
+    /// 128K unknown shape.
+    #[test]
+    fn deepseek_v4_snapshot_and_variant_ids_inherit_reviewed_facts() {
+        for model in [
+            "deepseek-v4-pro-0813",
+            "DeepSeek-V4-Pro-0813",
+            "deepseek-v4-pro-2025-08-13",
+            "deepseek-v4-flash-vision",
+            "deepseek-v4-flash-vision-0813",
+        ] {
+            assert_eq!(context_window_for_model(model), Some(1_000_000), "{model}");
+            assert_eq!(max_output_tokens_for_model(model), Some(384_000), "{model}");
+            assert!(model_supports_reasoning(model), "{model}");
+        }
+        // A trailing number that is not a recognized date stamp, an
+        // eight-digit compact stamp, or an unknown base, stays unknown: the
+        // resolver never invents a row.
+        for model in [
+            "not-a-model-0813",
+            "deepseek-v4-pro-9913",
+            "deepseek-v4-pro-08130",
+            "deepseek-v4-pro-x0813",
+            "deepseek-v4-pro-20250813",
+        ] {
+            assert_eq!(context_window_for_model(model), None, "{model}");
+            assert_eq!(model_reasoning_capability(model), None, "{model}");
+        }
+        // Snapshot resolution must not relabel a DeepSeek row as an OpenAI
+        // reasoning model, while the OpenAI snapshot contract keeps working.
+        assert!(!model_is_openai_reasoning_family("deepseek-v4-pro-0813"));
+        assert!(model_is_openai_reasoning_family("gpt-5.5-2026-06-01"));
+    }
+
+    /// Multi-byte model ids must not panic the byte-indexed date scan: the
+    /// `-YYYY-MM-DD` layer splits at `len - 10`, which need not be a UTF-8
+    /// char boundary (review finding from the PR #6 review).
+    #[test]
+    fn non_ascii_ids_do_not_panic_the_snapshot_scan() {
+        for model in ["模型模型模型模型", "ローカルモデル-2026", "モデル-0813"] {
+            assert_eq!(context_window_for_model(model), None, "{model}");
+            assert_eq!(model_reasoning_capability(model), None, "{model}");
+        }
     }
 
     #[test]

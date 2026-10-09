@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="جلسة Codewhale في الطرفية" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="جلسة Codewhale في الطرفية" width="760">
 
-<sub>لقطة حقيقية للطرفية من تثبيت جديد — دون مخرجات مُعدّة مسبقًا.</sub>
+<sub>لقطة حقيقية لطرفية Codewhale من جلسة عرض محلية مُهيّأة.</sub>
 
 </div>
 
@@ -56,6 +56,12 @@ cargo install codewhale-cli --locked  # build from crates.io
 </details>
 
 ## البدء السريع
+
+**مفاتيح API لمزوّديك، في مكان واحد.** [أنشئ حساب Codewhale](https://app.codewhale.net/register)
+أو شغّل `codewhale login` لتسجيل الدخول. احفظ مفاتيح API وحدّثها في حسابك،
+ثم استخدمها عبر مسار النماذج في Codewhale على الأجهزة التي سجّلت الدخول عليها.
+[إعداد مفاتيح الحساب](docs/CONFIGURATION.md#account-provider-keys).
+تسجيل الدخول لا يرفع المفاتيح المحلية الموجودة؛ ويمكنك مواصلة الاستخدام المحلي دون حساب.
 
 1. **افتح مشروعك.** شغّل `codewhale` في المجلد الذي تريد العمل عليه.
 2. **اربط نموذجًا.** شغّل `/provider` (أو اضغط `F3`) لإضافة مفتاح مستضاف أو اختيار

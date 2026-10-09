@@ -24,25 +24,28 @@ export interface EngineOwnerProjection {
   freshness: OwnerFreshness;
   authoritativePresence: OwnerPresence;
   activityKind: OwnerActivityKind | null;
+  actionId?: string;
   observedAtMs: number | null;
   parallelAgentCount: number;
-  activeSpans: { activityKind: OwnerActivityKind; startedAtMs: number }[];
+  activeSpans: { activityKind: OwnerActivityKind; actionId?: string; startedAtMs: number }[];
   turnId: string | null;
   turnOutcome: OwnerTurnOutcome | null;
   doneEffectId: string | null;
-  failedToolAge: { activityKind: OwnerActivityKind; ageMs: number } | null;
+  failedToolAge: { activityKind: OwnerActivityKind; actionId?: string; ageMs: number } | null;
 }
 
 type SpanGroup = 'operation' | 'agent' | 'thinking' | 'responding';
 interface ActiveSpan {
   key: string;
   activityKind: OwnerActivityKind;
+  actionId?: string;
   startedAtMs: number;
   event: WhaleEvent;
   group: SpanGroup;
 }
 interface FailedTool {
   activityKind: OwnerActivityKind;
+  actionId?: string;
   failedAtMs: number;
 }
 
@@ -69,7 +72,7 @@ function categoryFor(kind: OwnerActivityKind): Category {
 
 /** Read-only reducer for the Engine owner's typed metadata. It keeps using the
  * existing pet telemetry tape and physics owner; it neither recognizes tool
- * names nor accepts transcript text, arguments, commands, or results. */
+ * names from content nor accepts transcript text, arguments, commands, or results. */
 export class PetEngineTelemetry {
   private events: WhaleEvent[] = [];
   private active = new Map<string, ActiveSpan>();
@@ -119,8 +122,11 @@ export class PetEngineTelemetry {
     const failedAge = fresh && this.lastFailedTool
       && at >= this.lastFailedTool.failedAtMs
       && at - this.lastFailedTool.failedAtMs <= ENGINE_OWNER_STALE_MS
-      ? { activityKind: this.lastFailedTool.activityKind, ageMs: at - this.lastFailedTool.failedAtMs }
+      ? { activityKind: this.lastFailedTool.activityKind,
+        ...(this.lastFailedTool.actionId ? { actionId: this.lastFailedTool.actionId } : {}),
+        ageMs: at - this.lastFailedTool.failedAtMs }
       : null;
+    const actionId = activityKind ? (active.length ? active[0].actionId : failedAge?.actionId) : undefined;
     const doneEffectId = authoritativePresence === 'done' && terminalFresh
       && this.turnOutcome === 'completed' && this.turnId ? this.turnId : null;
 
@@ -132,10 +138,12 @@ export class PetEngineTelemetry {
       freshness,
       authoritativePresence,
       activityKind: activityKind ?? null,
+      ...(actionId ? { actionId } : {}),
       observedAtMs: this.lastObservedAt ?? null,
       parallelAgentCount: fresh ? agents : 0,
       activeSpans: active.slice(0, 4).map(span => ({
         activityKind: span.activityKind,
+        ...(span.actionId ? { actionId: span.actionId } : {}),
         startedAtMs: span.startedAtMs,
       })),
       turnId: this.turnId ?? null,
@@ -163,12 +171,12 @@ export class PetEngineTelemetry {
     return event;
   }
 
-  private start(key: string, kind: OwnerActivityKind, group: SpanGroup, at: number, agentId = 'parent'): void {
+  private start(key: string, kind: OwnerActivityKind, group: SpanGroup, at: number, agentId = 'parent', actionId?: string): void {
     if (this.active.has(key)) return;
     if (this.active.size >= 256) throw new Error('Too many active Engine pet spans.');
     const event = this.add(group === 'agent' ? 'agent' : group === 'thinking' ? 'thinking'
       : group === 'responding' ? 'assistant_message' : 'operation', categoryFor(kind), at, agentId);
-    this.active.set(key, { key, activityKind: kind, startedAtMs: at, event, group });
+    this.active.set(key, { key, activityKind: kind, actionId, startedAtMs: at, event, group });
   }
 
   private pulse(key: string, at: number): void {
@@ -234,11 +242,17 @@ export class PetEngineTelemetry {
     if (!value || typeof value !== 'object' || Array.isArray(value))
       throw new Error('Invalid Engine pet metadata.');
     const event = value as Record<string, unknown>;
-    const allowed = ['event', 'index', 'channel', 'span_id', 'activity_kind', 'outcome', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
-    const stringFields = ['event', 'span_id', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
+    const allowed = ['event', 'index', 'channel', 'span_id', 'activity_kind', 'action_id', 'outcome', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
+    const stringFields = ['action_id', 'event', 'span_id', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
     if (Object.keys(event).some(key => !allowed.includes(key)) || typeof event.event !== 'string'
       || Object.values(event).some(v => typeof v === 'string' && v.length > 256)
       || stringFields.some(key => event[key] !== undefined && typeof event[key] !== 'string')
+      || event.action_id !== undefined && (typeof event.action_id !== 'string' || !event.action_id
+        || /[\u0000-\u001f\u007f-\u009f]/.test(event.action_id)
+        || [...event.action_id].reduce((bytes, char) => {
+          const cp = char.codePointAt(0)!;
+          return bytes + (cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4);
+        }, 0) > 256)
       || event.channel !== undefined && !['text', 'reasoning'].includes(event.channel as string)
       || event.activity_kind !== undefined && !ACTIVITY_KINDS.includes(event.activity_kind as OwnerActivityKind)
       || event.outcome !== undefined && (typeof event.outcome !== 'string'
@@ -301,7 +315,7 @@ export class PetEngineTelemetry {
       case 'operation_activity_started': {
         const spanId = required('span_id');
         const kind = activityKind();
-        if (!this.completedSpans.has(spanId)) this.start(`operation:${spanId}`, kind, 'operation', at);
+        if (!this.completedSpans.has(spanId)) this.start(`operation:${spanId}`, kind, 'operation', at, 'parent', event.action_id as string | undefined);
         this.waiting = undefined;
         break;
       }
@@ -318,7 +332,7 @@ export class PetEngineTelemetry {
         if (completed && this.addOnce(this.completedSpans, spanId, 4096)) {
           if (outcome === 'failed') {
             this.add('operation_failed', 'error', at).status = 'error';
-            this.lastFailedTool = { activityKind: kind, failedAtMs: at };
+            this.lastFailedTool = { activityKind: kind, actionId: completed.actionId, failedAtMs: at };
           }
           if (outcome === 'denied' || outcome === 'cancelled') this.waiting = undefined;
         }

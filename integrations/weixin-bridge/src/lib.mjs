@@ -47,17 +47,15 @@ export async function processUpdateBatch({ messages, nextCursor, store, keyOf, h
   for (const msg of messages || []) {
     const key = keyOf(msg);
     if (!key) continue;
-    const claim = await store.claimMessage(key);
+    const claim = store.data.inflight?.[key] ? "interrupted" : await store.claimMessage(key);
     if (claim === "done") continue;
     if (claim === "interrupted") {
       await interrupted(msg);
+      await store.completeMessage(key);
       continue;
     }
-    try {
-      await handle(msg);
-    } finally {
-      await store.completeMessage(key);
-    }
+    await handle(msg);
+    await store.completeMessage(key);
   }
   if (nextCursor) await commitCursor(nextCursor);
 }

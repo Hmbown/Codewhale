@@ -1,8 +1,8 @@
 //! Preserved changelog parsing and host parity tests, outside the portable group.
 
 use crate::commands::CommandResult;
-use crate::commands::groups::debug::change::*;
 use crate::tui::app::AppAction;
+use codewhale_commands::debug::change::*;
 use codewhale_localization::{MessageId, tr};
 const CODEWHALE_CHANGELOG: &str = include_str!("../../CHANGELOG.md");
 fn change(app: &mut App, version: Option<&str>) -> CommandResult {

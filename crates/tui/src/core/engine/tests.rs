@@ -27,6 +27,8 @@ use tempfile::tempdir;
 mod extension_hooks;
 #[path = "tests/extension_prompts.rs"]
 mod extension_prompts;
+#[path = "tests/profile_constitution.rs"]
+mod profile_constitution;
 
 #[path = "tests/child_host.rs"]
 mod child_host;

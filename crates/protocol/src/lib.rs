@@ -368,6 +368,17 @@ pub enum GoalPauseReason {
     NoProgress,
     UsageLimit,
     BudgetLimit,
+    /// The model finished a stage and handed control back, rather than a
+    /// reported blocker or a completion. It is not a judgement about the work,
+    /// so the user's next message resumes the goal (the same shape as a
+    /// runtime stop, which is also resumable by writing to it).
+    Yielded,
+    /// A reason a **newer** build wrote. Kept so an older binary can still read
+    /// the durable record instead of failing the whole goal load on an unknown
+    /// variant; nothing constructs it. The resume path treats it as "not a
+    /// hand-back", which is the conservative reading.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl GoalPauseReason {
@@ -379,6 +390,8 @@ impl GoalPauseReason {
             Self::NoProgress => "no progress",
             Self::UsageLimit => "usage limit",
             Self::BudgetLimit => "budget limit",
+            Self::Yielded => "handed back",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }
@@ -1125,3 +1138,8 @@ pub enum EventFrame {
 
 pub mod request;
 pub mod role;
+
+/// Pure provenance data shared by hosts and portable status reports.
+pub mod cloud_facts;
+
+pub mod display;

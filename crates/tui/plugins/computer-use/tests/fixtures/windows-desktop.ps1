@@ -22,9 +22,19 @@ $form.Controls.Add($panel)
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 100
 $timer.Add_Tick({
+  try {
   $json = @{ title = $form.Text; visible = $form.Visible; text = $edit.Text; clicks = $script:clicks; hwnd = $form.Handle.ToInt64() } | ConvertTo-Json -Compress
   [IO.File]::WriteAllText($Receipt + '.tmp', $json, (New-Object Text.UTF8Encoding($false)))
-  Move-Item -Force ($Receipt + '.tmp') $Receipt
+  if ([IO.File]::Exists($Receipt)) {
+    [IO.File]::Replace($Receipt + '.tmp', $Receipt, [NullString]::Value)
+  } else {
+    [IO.File]::Move($Receipt + '.tmp', $Receipt)
+  }
+  } catch {
+    [Console]::Error.WriteLine($_.Exception.ToString())
+    $timer.Stop()
+    $form.Close()
+  }
 })
 $timer.Start()
 try { [System.Windows.Forms.Application]::Run($form) } finally { $timer.Dispose(); $form.Dispose() }

@@ -962,6 +962,7 @@ async fn assert_preview_matches_first_wire_body(
 
     let _ = engine
         .handle_send_message(TurnSpec {
+            profile_constitution: None,
             content: prompt.to_string(),
             mode: AppMode::Agent,
             route: Box::new(production_route),
@@ -1924,6 +1925,7 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
 
     let _ = engine
         .handle_send_message(TurnSpec {
+            profile_constitution: None,
             content: prompt.to_string(),
             mode: AppMode::Agent,
             route: Box::new(production_route),

@@ -23,7 +23,7 @@ fn test_options(yolo: bool) -> TuiOptions {
 }
 
 #[test]
-fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
+fn truncating_api_messages_keeps_preserved_stamps_in_place() {
     let mut app = App::new(test_options(false), &Config::default());
     let message = |text: &str| Message {
         role: codewhale_models::Role::User,
@@ -34,19 +34,9 @@ fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
     };
     let first = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
     let third = first + chrono::Duration::minutes(2);
-    // Reproduce partial legacy/test state without going through restoration,
-    // which already fills missing stamps. Reading it must preserve both rows.
-    app.api_messages = std::sync::Arc::new(vec![message("first"), message("unstamped")]);
-    app.api_message_stamps = vec![first];
-    let observed = app.api_messages_stamped().collect::<Vec<_>>();
-    assert_eq!(observed.len(), 2);
-    assert_eq!(observed[0].1, first);
-    assert_eq!(observed[1].0, &message("unstamped"));
-
-    app.push_api_message_stamped(message("third"), third);
-    assert_eq!(app.api_message_stamps.len(), 3);
-    assert_eq!(app.api_message_stamps[0], first);
-    assert_eq!(app.api_message_stamps[2], third);
+    app.api_messages =
+        std::sync::Arc::new(vec![message("first"), message("second"), message("third")]);
+    app.api_message_stamps = vec![first, first + chrono::Duration::minutes(1), third];
     app.truncate_api_messages(2);
     assert_eq!(app.api_messages.len(), 2);
     assert_eq!(app.api_message_stamps.len(), 2);
@@ -8010,5 +8000,207 @@ fn oversized_paste_is_not_written_through_a_linked_pastes_directory() {
     assert!(
         std::fs::read_dir(outside.path()).unwrap().next().is_none(),
         "the pasted text must not land outside the workspace"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn dropped_screenshot_path_becomes_an_image_attachment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    // Terminal.app / iTerm2 deliver a drop as a shell-escaped paste.
+    let dropped = shot.display().to_string().replace(' ', "\\ ");
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "what is wrong here?".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    app.insert_paste_text(&dropped);
+
+    let line = format!("[Attached image: {}]", shot.display());
+    assert!(app.input.contains(&line), "{}", app.input);
+    assert!(!app.input.contains("\\ "), "{}", app.input);
+    assert_eq!(app.composer_attachment_count(), 1);
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(format!("Attached image: {}", shot.display()).as_str())
+    );
+    let expanded = crate::image_attach::expand_attachment_blocks(&app.input);
+    assert!(expanded.notices.is_empty(), "{expanded:?}");
+    assert!(
+        expanded
+            .blocks
+            .iter()
+            .any(|block| matches!(block, codewhale_models::ContentBlock::ImageUrl { .. }))
+    );
+}
+
+#[test]
+fn image_path_pasted_on_a_command_line_stays_literal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("shot.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "/rename ".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    app.insert_paste_text(&shot.display().to_string());
+
+    assert_eq!(app.input, format!("/rename {}", shot.display()));
+    assert_eq!(app.composer_attachment_count(), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_typed_drop_with_the_question_on_its_line_still_sends_the_image() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let mut app = App::new(test_options(false), &Config::default());
+    // Arrived as keystrokes, so the paste-time check never saw it.
+    app.input = format!(
+        "{}  why does it show jobs 2?",
+        shot.display().to_string().replace(' ', "\\ ")
+    );
+    app.cursor_position = app.input.chars().count();
+
+    let submitted = app.submit_input().expect("submitted");
+
+    assert!(
+        submitted.starts_with(&format!("[Attached image: {}]\n", shot.display())),
+        "{submitted}"
+    );
+    assert!(
+        submitted.ends_with("why does it show jobs 2?"),
+        "{submitted}"
+    );
+    let expanded = crate::image_attach::expand_attachment_blocks(&submitted);
+    assert!(expanded.notices.is_empty(), "{expanded:?}");
+    assert!(
+        expanded
+            .blocks
+            .iter()
+            .any(|block| matches!(block, codewhale_models::ContentBlock::ImageUrl { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pet_view_choice_restores_without_launch_overlay_and_preserves_other_settings() {
+    let _lock = lock_test_env();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = sealed_settings_home(tmp.path());
+    let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
+    let path = tmp.path().join(".codewhale/settings.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "# keep this comment\nlow_motion = true\ncontextual_tips = false\n",
+    )
+    .unwrap();
+    let mut app = App::new(test_options(false), &Config::default());
+    assert!(
+        !app.pet_watch.enabled,
+        "old settings keep their existing view"
+    );
+    app.pet_watch.detach_for_test();
+    app.input = "unfinished draft".into();
+    assert!(
+        !crate::commands::execute_with_config("/pet on", &mut app, &Config::default()).is_error
+    );
+    assert!(app.pet_watch.enabled);
+    assert!(app.view_stack.is_empty());
+    assert_eq!(app.input, "unfinished draft");
+    app.startup_defaults.flush();
+    let restored = App::new(test_options(false), &Config::default());
+    assert!(restored.pet_watch.enabled);
+    assert!(
+        !restored.launch.visible,
+        "the welcome overlay must not hide the remembered view"
+    );
+    assert!(restored.low_motion);
+    assert!(restored.view_stack.is_empty());
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("# keep this comment"));
+    assert!(!Settings::load_persisted().unwrap().contextual_tips);
+
+    // Both public selectors enqueue in user-action order; quit immediately
+    // after the last choice and prove the existing shutdown join persists it.
+    for value in [false, true, false, true] {
+        app.pet_watch.detach_for_test();
+        let result = crate::commands::execute_with_config(
+            &format!(
+                "/config pet_mode {} --save",
+                if value { "true" } else { "false" }
+            ),
+            &mut app,
+            &Config::default(),
+        );
+        assert!(!result.is_error);
+    }
+    assert!(
+        !crate::commands::execute_with_config("/pet off", &mut app, &Config::default()).is_error
+    );
+    assert!(app.startup_defaults.shutdown().is_empty());
+    assert!(!Settings::load_persisted().unwrap().pet_mode);
+    assert!(
+        !App::new(test_options(false), &Config::default())
+            .pet_watch
+            .enabled
+    );
+
+    // Session overrides and rejected values must not change the saved choice.
+    app.pet_watch.detach_for_test();
+    assert!(
+        !crate::commands::execute_with_config(
+            "/config pet_mode true",
+            &mut app,
+            &Config::default()
+        )
+        .is_error
+    );
+    assert!(
+        crate::commands::execute_with_config(
+            "/config pet_mode banana --save",
+            &mut app,
+            &Config::default()
+        )
+        .is_error
+    );
+    assert!(app.pet_watch.enabled);
+    app.startup_defaults.flush();
+    assert!(!Settings::load_persisted().unwrap().pet_mode);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pet_view_save_failure_keeps_the_live_view_and_reports_without_overwriting_bad_settings() {
+    let _lock = lock_test_env();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = sealed_settings_home(tmp.path());
+    let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
+    let path = tmp.path().join(".codewhale/settings.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bad = "# preserve for repair\npet_mode = [broken";
+    std::fs::write(&path, bad).unwrap();
+    let mut app = App::new(test_options(false), &Config::default());
+    app.pet_watch.detach_for_test();
+    app.ui_locale = codewhale_localization::Locale::Fr;
+    assert!(
+        !crate::commands::execute_with_config("/pet on", &mut app, &Config::default()).is_error
+    );
+    assert!(app.pet_watch.enabled);
+    app.startup_defaults.flush();
+    let failures = app.startup_defaults.drain_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].subjects,
+        vec![crate::tui::startup_defaults::StartupDefaultSubject::PetMode]
+    );
+    let message = app.startup_default_failure_message(&failures[0]);
+    assert!(message.contains(app.tr(MessageId::ConfigLabelPetMode).as_ref()));
+    assert!(!message.contains(tmp.path().to_str().unwrap()));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+    assert!(
+        app.pet_watch.enabled,
+        "a failed save does not undo the live view"
     );
 }

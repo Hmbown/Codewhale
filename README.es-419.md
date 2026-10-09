@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ trabajo — en tu terminal, con un modelo alojado o local que tú eliges.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Una sesión de terminal de Codewhale" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Una sesión de terminal de Codewhale" width="760">
 
-<sub>Captura real de la terminal en una instalación nueva — sin salida preparada.</sub>
+<sub>Captura real de la terminal de Codewhale en una sesión de demostración local configurada.</sub>
 
 </div>
 
@@ -57,6 +57,12 @@ en la misma máquina terminan disputándose el `PATH`.
 </details>
 
 ## Inicio rápido
+
+**Las claves API de tus proveedores, en un solo lugar.** [Crea una cuenta de Codewhale](https://app.codewhale.net/register)
+o ejecuta `codewhale login` para iniciar sesión. Guarda y actualiza tus claves API en tu cuenta
+y úsalas a través de la ruta de modelos de Codewhale en los dispositivos donde hayas iniciado sesión.
+[Configura las claves de tu cuenta](docs/CONFIGURATION.md#account-provider-keys).
+Iniciar sesión no sube las claves locales existentes; puedes seguir usando Codewhale localmente sin una cuenta.
 
 1. **Abre tu proyecto.** Ejecuta `codewhale` en la carpeta en la que quieres trabajar.
 2. **Conecta un modelo.** Ejecuta `/provider` (o presiona `F3`) para agregar una

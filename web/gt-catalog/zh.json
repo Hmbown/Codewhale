@@ -22,7 +22,7 @@
     "themeDark": "深色",
     "themeAria": "主题：{mode}（点击切换）",
     "themeTitle": "主题 · 自动 / 浅色 / 深色",
-    "footerTagline": "用你选择的模型编辑代码、运行测试并审查变更。",
+    "footerTagline": "用自己的模型和连接的工具，构建应用，让工作自动完成。",
     "footerProduct": "产品",
     "footerProject": "项目",
     "footerDocs": "文档",
@@ -46,65 +46,61 @@
     "partialBadge": "(部分)"
   },
   "home": {
-    "metaTitle": "Codewhale：适用于任意模型的开源编程智能体",
-    "metaDescription": "Codewhale 是一个在终端中运行的开源编程智能体。它使用你选择的云端或本地模型，读取项目、编辑文件并运行测试。",
-    "heroTitle": "适用于任意模型的开源编程智能体",
-    "heroIntro": "{brand} 在终端中读取你的项目、编辑文件并运行测试。连接云端或本地模型，并决定哪些操作需要你批准。",
+    "metaTitle": "Codewhale：用自己的模型和工具，把想法做出来",
+    "metaDescription": "用 Codewhale 构建应用、自动处理工作，并连接你常用的工具。开源，支持你已有的模型 API、本地模型和自托管推理服务。",
+    "heroTitle": "构建应用，让你的工作自动运行。",
+    "heroIntro": "{brand} 是一个开源智能体，可以编写代码、运行命令，并使用你连接的工具。你可以使用已有的模型 API，也可以在本地或自己的服务器上运行模型。",
     "getCodewhale": "安装 Codewhale",
     "heroInstallAria": "安装命令",
-    "exploreProduct": "了解工作方式",
+    "exploreProduct": "探索 Codewhale",
     "shotPreview": "终端预览",
-    "shotBuild": "v{version} 预发布版本",
-    "screenshotAlt": "Codewhale v{version} 预发布版本：鲸鱼标志、新会话、消息输入区、Ask 权限、Work 模式和模型状态。由隔离终端会话的实际画面渲染。",
+    "screenshotAlt": "Codewhale v{version} 的终端实录画面，包含对话、消息输入框与会话控制。",
     "latestRelease": "最新发布 {tag}",
     "releaseUnavailable": "发布状态暂不可用",
     "currentSource": "源码",
     "sourceCandidate": "未发布",
     "publishedRelease": "已发布",
-    "figcaptionSourceCandidate": "未发布",
-    "chapterTerminal": "你的终端",
-    "chapterTerminalTitle": "实时查看每一次编辑和命令",
-    "gainHeading": "交出任务，保留控制权",
-    "gainLede": "直接说出想要的结果：修复错误、解释某个模块，或自动完成重复任务。先用一个智能体，任务变大时再增加。",
+    "gainHeading": "你可以做什么",
+    "gainLede": "描述你想构建或自动完成的工作。Codewhale 可以编辑文件、运行命令并检查结果，访问权限由你控制。",
     "gain": [
       [
-        "修改代码并验证",
-        "智能体查看你的项目、编辑文件并运行测试。你可以在它工作时查看每一次编辑和命令结果。"
+        "构建应用和工具",
+        "创建应用、添加功能或编写脚本。Codewhale 可以处理项目文件、运行代码并测试构建结果。"
       ],
       [
-        "自动完成重复工作",
-        "在脚本和 CI 中运行 codewhale exec。使用 Fleet 把大型任务分给多个智能体。"
+        "让重复工作自动完成",
+        "从终端、脚本或 CI 中运行工作流。任务较大时，可以把部分工作交给使用不同模型的 Fleet 智能体团队。"
       ],
       [
-        "掌握执行过程",
-        "开始前设定权限，回应审批请求，随时停止任务。运行 /receipts 可列出会话中的每个文件、命令和审批。"
+        "连接你常用的工具",
+        "通过插件和 MCP 服务器添加工具，或在自己的脚本中调用 API。每项服务都需要单独配置和身份验证。"
       ]
     ],
     "chapterModels": "你的模型",
-    "modelsHeading": "为每项任务选择模型",
-    "modelsBody": "为每个会话选择内置提供商、任意 OpenAI 兼容端点或本地模型。你的模型连接与 Codewhale 账户相互独立。",
+    "modelsHeading": "使用你选择的模型",
+    "modelsBody": "连接你的提供商账户、OpenAI 兼容端点，或本地及自托管模型。为会话选择模型，也可以为 Fleet 中的每个智能体分别选择模型。",
     "modelsFacts": [
       [
-        "托管",
-        "你自己的 API 密钥，用 codewhale auth set --provider <id> 保存"
+        "你的 API 账户",
+        "使用自己的密钥连接 OpenAI、Anthropic、Google、DeepSeek 等提供商。"
       ],
       [
-        "网关",
-        "一个端点接多个模型；提供商仍由你选择"
+        "你的网关",
+        "连接 OpenAI 兼容端点，选择它提供的模型。"
       ],
       [
-        "本地",
-        "localhost 上的 vLLM、SGLang 或 Ollama，通常无需密钥"
+        "你的推理服务",
+        "通过 Ollama、vLLM 或 SGLang 运行本地或自托管模型。"
       ]
     ],
     "modelsLink": "浏览模型与提供商",
-    "startHeading": "安装、连接模型、运行任务",
-    "startLede": "在项目文件夹中用三个步骤运行第一项任务。如果工作需要多个智能体，之后再添加 Fleet。",
+    "startHeading": "开始使用",
+    "startLede": "安装 Codewhale，连接模型，然后打开项目文件夹。需要时，再添加插件或更多智能体。",
     "startGuideLink": "按照新手指引操作",
     "startVocabularyLink": "查名词",
     "chapterAvailability": "在哪里运行",
-    "availabilityHeading": "现在就在终端中使用",
-    "availabilityLede": "终端、本地浏览器客户端和社区维护的 CodeWhale GUI 现已可用。桌面应用和重建中的托管网页应用正在开发，两者共用同一会话模型。",
+    "availabilityHeading": "当前可用与开发中的功能",
+    "availabilityLede": "终端和本地浏览器客户端现已可用。原生桌面应用与重建中的托管网页应用正在开发。",
     "availability": [
       [
         "终端与本地浏览器",
@@ -133,42 +129,42 @@
         "为你运行任务的托管计算机。"
       ]
     ],
-    "availabilityNote": "终端、本地浏览器和 GUI 无需 Codewhale 账户。托管网页和桌面端使用账户，但账户不能代替模型连接；使用你自己的密钥产生的用量由提供商计费。",
+    "availabilityNote": "终端、本地浏览器和 GUI 无需 Codewhale 账户。托管网页和桌面端使用账户。使用你自己的提供商密钥时，相应用量由该提供商计费。",
     "accountLink": "创建账户",
-    "surfacesHeading": "扩展智能体能接触的范围",
+    "surfacesHeading": "使用文件和工具开展工作",
     "surfaces": [
       [
-        "文件与命令",
-        "在你设定的权限内读取项目、编辑文件、运行测试并查看输出。"
+        "文件与终端",
+        "创建文件、运行命令、分析数据，并测试你构建的成果。工作目录和权限由你设定。"
       ],
       [
-        "插件与 MCP",
-        "连接更多工具和服务。每个插件在你审核并启用之前都保持关闭。"
+        "插件与已连接的应用",
+        "通过插件和 MCP 添加技能与工具。审核并启用你希望智能体使用的连接。"
       ],
       [
-        "Computer Use · 预览",
-        "让智能体查看并操作其他应用的插件。由你启用它，并授予它请求的系统权限。"
+        "浏览器与电脑操作 · 预览",
+        "使用浏览器工具和 Computer Use 插件，在你授予的访问范围内操作应用与网站。"
       ],
       [
-        "保存的会话",
-        "将对话和工具结果保存在一起，可以接着之前的工作继续，无需从头开始。本地浏览器会打开你电脑上的同一个会话。"
+        "随时接着做的会话",
+        "将对话、工具结果和工作记录保存在一起。在终端或本地浏览器客户端中继续之前的任务。"
       ],
       [
-        "Fleet",
-        "把任务的各部分分配给使用不同模型和角色的智能体，然后跟踪它们的进度。"
+        "智能体团队",
+        "用 Fleet 将大任务分配给不同角色和模型的智能体，在一处查看它们的进度。"
       ]
     ],
-    "runtimeLink": "查看全部集成",
+    "runtimeLink": "探索工具与集成",
     "installBandHeading": "在 macOS 或 Linux 上安装",
     "copy": "复制",
     "copied": "已复制 ✓",
     "binaries": "预编译包",
     "chinaMirrors": "中国镜像",
     "installGuideLink": "阅读安装指南",
-    "communityHeading": "和我们一起构建 Codewhale",
-    "communityBody": "在 GitHub 上报告 bug、提出功能建议，或提交你的第一个 pull request。欢迎小而经过测试的修复。",
+    "communityHeading": "为 Codewhale 做贡献",
+    "communityBody": "在 GitHub 上报告问题、改进文档或贡献代码。你也可以构建插件，与其他用户分享工作流。",
     "communityLinksAria": "社区链接",
-    "contribute": "提交 pull request"
+    "contribute": "在 GitHub 上参与贡献"
   },
   "docs-guide": {
     "metaTitle": "开始第一个任务 · Codewhale 文档",
@@ -185,8 +181,8 @@
     "metaTitle": "文档 · Codewhale",
     "metaDescription": "安装 Codewhale，连接模型提供商，然后把事情做完：模式与审批、查看改动、工作流、子智能体、MCP 工具、钩子、Runtime API 以及问题排查。",
     "portalMark": "Codewhale 文档",
-    "heroTitle": "用 Codewhale 把事情做完。",
-    "heroLead": "从你想做的事开始。每一页都会说明你需要准备什么，给出今天就能运行的命令，并指向下一步。",
+    "heroTitle": "安装与使用 Codewhale",
+    "heroLead": "查找安装步骤、模型连接、工具配置和问题排查指南。每份指南都包含可以运行的命令和示例。",
     "installCta": "安装 Codewhale",
     "releaseLabel": "版本",
     "releasePublished": "最新发布 {tag} · {date}",
@@ -213,8 +209,8 @@
     "breadcrumbAria": "面包屑导航",
     "breadcrumbHome": "首页",
     "breadcrumbDocs": "文档",
-    "helpTitle": "这一页还不够？",
-    "helpLead": "每份指南都对照仓库中的一份文档核实过。如果它写错了或缺了什么，请在维护者能看到的地方告诉我们。",
+    "helpTitle": "获取帮助",
+    "helpLead": "在 Discord 提问，或在 GitHub 报告文档问题。",
     "helpSource": "来源：{name}",
     "helpTroubleshooting": "排查问题",
     "helpFaq": "常见问题",
@@ -894,17 +890,17 @@
         "title": "用代码模式组合工具调用（实验性）",
         "blocks": [
           {
-            "p": "代码模式让模型写一段简短的 JavaScript 程序，在其中调用多个工具、循环和筛选结果，而不必把每次调用都作为单独的一步。只有程序的最终结果会返回给模型，长时间的查找因此更紧凑。它默认关闭。可以只在一次会话中试用，也可以在配置中开启："
+            "p": "代码模式让模型写一段简短的 JavaScript 程序，在其中调用多个工具、循环和筛选结果，而不必把每次调用都作为单独的一步。只有程序的最终结果会返回给模型，长时间的查找因此更紧凑。它默认开启——`execute_tools` 从第一条请求起就会提供——MCP 和插件工具与内置工具一样可以在程序中组合调用。要关闭它，可以只在一次会话中关闭，也可以在配置中关闭："
           },
           {
-            "code": "codewhale --enable code_mode\n\n# ~/.codewhale/config.toml\n[features]\ncode_mode = true",
+            "code": "codewhale --disable code_mode\n\n# ~/.codewhale/config.toml\n[features]\ncode_mode = false",
             "lang": "终端 / config.toml"
           },
           {
             "list": [
-              "程序中只能调用无需审批的只读工具。任何写入、运行 shell 命令或需要征求你同意的调用，都会让程序停止，并报告被拒绝的是哪一次调用。",
-              "程序中暂时还不能调用 MCP 工具，请把它们作为普通工具调用来使用。",
-              "每个程序的上限：50 次工具调用、同时最多 4 次、30 秒、返回 16 KiB。",
+              "程序中的嵌套调用——原生工具、MCP 和插件工具都一样——与直接调用走同一道关卡：允许/拒绝名单、ask 规则和审查照常生效。需要审批的调用会弹出常规审批卡片并暂停程序；允许后程序继续，拒绝只让该次调用失败。批准程序本身不会获得任何权限。",
+              "MCP 调用经由会话的 MCP 连接池执行，插件工具也可以像内置工具一样在程序中调用。",
+              "每个程序的上限：50 次嵌套调用、同时最多 4 次、返回 16 KiB。程序没有固定的 30 秒上限：它使用当前回合剩余的墙钟时间，除非设置了 `[tui].turn_wall_clock_secs`，否则不受限制。",
               "Plan 模式下不能使用代码模式。"
             ]
           }
@@ -1206,7 +1202,7 @@
               ],
               [
                 "Linux",
-                "bubblewrap，但需要你手动开启（见下文）。不开启时，命令在没有操作系统沙箱的情况下运行。"
+                "bubblewrap，安装并验证可用后自动启用（退出见下文）。不可用时，命令在没有操作系统沙箱的情况下运行。"
               ],
               [
                 "Windows",
@@ -1232,17 +1228,17 @@
       },
       {
         "id": "linux",
-        "title": "开启 Linux 沙箱",
+        "title": "启用（或关闭）Linux 沙箱",
         "blocks": [
           {
-            "p": "先安装 bubblewrap，再在 `~/.codewhale/config.toml` 中加一行来启用："
+            "p": "安装 bubblewrap 后 Codewhale 默认使用它。想让 Linux 命令不被包装，在 `~/.codewhale/config.toml` 中加一行退出："
           },
           {
-            "code": "sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap\n\n# ~/.codewhale/config.toml\nprefer_bwrap = true",
+            "code": "sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap\n\n# ~/.codewhale/config.toml\nprefer_bwrap = false",
             "lang": "终端 / config.toml"
           },
           {
-            "p": "只有当 `/usr/bin/bwrap` 存在且可执行时，Codewhale 才会使用它。此后，命令看到的是只读的系统视图，只能写入沙箱模式允许的位置，除非模式允许，否则无法联网。"
+            "p": "只有当 `/usr/bin/bwrap` 存在、可执行，且探测证明它能创建沙箱命名空间时，Codewhale 才会使用它——装了但被系统拦住的 bwrap 按不存在处理。此后，命令看到的是只读的系统视图，只能写入沙箱模式允许的位置，除非模式允许，否则无法联网。"
           }
         ]
       },
@@ -1916,9 +1912,9 @@
   "states": {
     "loadingLabel": "加载中…",
     "emptyTitle": "这里还没有内容",
-    "emptyBody": "暂时没有可显示的记录。这里不会用编造的内容填充。",
+    "emptyBody": "暂无可显示的记录。",
     "errorTitle": "页面没有加载完成",
-    "errorBody": "中途出了问题。你的操作没有丢失；请重试，如果持续失败，请报告给我们。",
+    "errorBody": "出了点问题。请重试；如果问题持续，请报告给我们。",
     "retry": "重试",
     "reload": "重新加载页面",
     "homeLink": "返回首页",
@@ -1928,7 +1924,7 @@
     "notFoundHomeLink": "返回基地",
     "notFoundPosterAlt": "虚构游戏《Codwhale: Modern Whalefare》的海报，一只身穿战术装备的蓝鲸。",
     "unavailableTitle": "实时记录尚未加载",
-    "unavailableBody": "数据源没有响应上一次刷新，或者此页面自构建以来尚未刷新。这里不会用编造的内容填充。",
+    "unavailableBody": "暂时无法获取最新信息。请尝试刷新此页面。",
     "offlineTitle": "你已离线",
     "offlineBody": "操作已暂停，直到网络恢复。此处显示的内容不会刷新。",
     "reconnectingTitle": "正在重新连接…",
@@ -1998,7 +1994,7 @@
         "body": "在 Codewhale 插件市场中审查、信任并启用 Computer Use。请使用插件 0.3.1 或更高版本，确保本地操作受助手的暂停和停止控制。"
       }
     ],
-    "controlsTitle": "继续工作，掌握控制权。",
+    "controlsTitle": "暂停或停止应用控制",
     "controlsBody": "受支持的操作可在选定应用的后台完成。需要前台控制的应用或手势必须得到你的授权。菜单会显示目标应用与输入模式；Pause 暂停助手输入，Stop 结束助手的现有会话。",
     "updateTitle": "由你决定何时更新",
     "updateBody": "在应用中选择 Check for updates。安装更新前，助手会校验下载文件、Codewhale 签名和 Apple 公证，并保留旧版应用以便恢复。",

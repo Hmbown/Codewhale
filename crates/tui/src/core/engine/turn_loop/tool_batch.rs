@@ -186,7 +186,11 @@ impl Engine {
                 turn.stop_diagnostics.reason = Some(TurnStopReason::NoProgress);
                 FLEET_NO_PROGRESS_STOP.to_string()
             };
-            let _ = self.send_event(Event::status(error.clone())).await;
+            if turn.budget_exhausted_final_report {
+                self.post_turn_budget_stop(&error).await;
+            } else {
+                let _ = self.send_event(Event::status(error.clone())).await;
+            }
             return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(error)));
         } else {
             let notice = match denial_action {

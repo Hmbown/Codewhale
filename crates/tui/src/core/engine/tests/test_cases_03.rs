@@ -1210,6 +1210,7 @@ async fn cross_turn_token_budget_exhaustion_does_not_pause_goal() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "start budgeted goal".to_string(),
             images: Vec::new(),

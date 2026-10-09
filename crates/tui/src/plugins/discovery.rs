@@ -173,6 +173,23 @@ pub(crate) fn discover_with_context(
     )
 }
 
+// These exact operation-name shapes are reserved by stage::fresh_staging_dir
+// and place::finalize_install. Do not hide human paths such as demo.bak or
+// .staging-not-a-uuid, which can legitimately contain reviewed bundles.
+fn is_internal_publication_directory(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix(".staging-").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) || name.strip_prefix(".plugin-backup-").is_some_and(|suffix| {
+        suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
 fn scan_root(
     root: &Path,
     scope: PluginScope,
@@ -244,6 +261,9 @@ fn scan_root(
     entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
+        if is_internal_publication_directory(&entry.file_name()) {
+            continue;
+        }
         let plugin_root = entry.path();
         let Ok(metadata) = fs::symlink_metadata(&plugin_root) else {
             continue;
@@ -602,7 +622,18 @@ fn load_staged_skill_snapshots_with_roots(
     Ok(snapshots)
 }
 
-fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId {
+pub(super) fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId {
+    PluginId(format!(
+        "{}/{}/{name}",
+        scope.as_str(),
+        plugin_root_hash(scope, canonical_root)
+    ))
+}
+
+/// The path-derived middle segment of a plugin id. It depends only on the
+/// scope and canonical root, never the manifest name, so a persisted record
+/// can be matched to a directory on disk even when its manifest no longer parses.
+pub(super) fn plugin_root_hash(scope: PluginScope, canonical_root: &Path) -> String {
     let mut hasher = Sha256::new();
     // v2 intentionally invalidates receipts produced by the former lossy
     // Unicode path identity.
@@ -611,11 +642,10 @@ fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId 
     hasher.update(b"\0");
     super::path_identity::hash_os_path(&mut hasher, b"canonical-plugin-root", canonical_root);
     let digest = hasher.finalize();
-    let suffix = digest[..6]
+    digest[..6]
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    PluginId(format!("{}/{suffix}/{name}", scope.as_str()))
+        .collect::<String>()
 }
 
 #[cfg(test)]
@@ -827,3 +857,7 @@ mod tests {
         assert!(!home.join("plugins/state.json").exists());
     }
 }
+
+#[cfg(test)]
+#[path = "discovery_internal_paths_tests.rs"]
+mod internal_publication_tests;

@@ -293,7 +293,13 @@ pub(super) async fn terminal_input(
     )?;
     let written = bytes.len();
     with_session(session, move |session| {
-        terminal_session::write_bytes(session, &bytes).map_err(ApiError::internal)
+        terminal_session::write_raw_input(session, &bytes).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                ApiError::bad_request(error.to_string())
+            } else {
+                ApiError::internal(error.to_string())
+            }
+        })
     })
     .await?;
     Ok(Json(TerminalWriteResponse { name, written }))

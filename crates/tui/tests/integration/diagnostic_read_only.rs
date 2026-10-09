@@ -475,11 +475,19 @@ fn doctor_text_probe_uses_a_legacy_key_without_migrating_it() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("API connection successful"),
-        "stdout:\n{}",
-        String::from_utf8_lossy(&output.stdout)
+        stdout.contains("API connection successful"),
+        "stdout:\n{stdout}"
     );
+    // The probe runs before the verdict, and the verdict reports its result.
+    let verdict = stdout
+        .find("Ready: the live deepseek API check passed")
+        .unwrap_or_else(|| panic!("verdict must use the probe result\nstdout:\n{stdout}"));
+    let connectivity = stdout
+        .find("API Connectivity")
+        .expect("connectivity section");
+    assert!(verdict < connectivity, "stdout:\n{stdout}");
     let requests = server.received_requests();
     assert_eq!(
         requests.len(),

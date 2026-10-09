@@ -1842,7 +1842,7 @@ fn download_url_once_with(
 }
 
 /// Compute the SHA256 hex digest of data.
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
     let hash = sha2::Sha256::digest(data);
     hex_bytes(hash)

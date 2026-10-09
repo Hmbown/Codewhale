@@ -6,54 +6,57 @@ export const NATIVE_TERMINAL_VIEWS = {
   home: {
     label: { en: "Home", zh: "首页" },
     description: {
-      en: "A new session, with the composer and status line.",
-      zh: "新会话界面，包含输入框与状态栏。",
+      en: "The conversation, composer and model status in one view.",
+      zh: "在同一界面查看对话、输入框和模型状态。",
     },
   },
   composer: {
     label: { en: "Composer", zh: "输入框" },
     description: {
-      en: "A message in the composer, before it is sent.",
-      zh: "输入框中的消息，尚未发送。",
+      en: "A follow-up message in the composer, ready to send.",
+      zh: "输入框中准备发送的后续消息。",
     },
   },
   workbar: {
     label: { en: "Workbar", zh: "工作栏" },
     description: {
-      en: "The session dock, with tasks and other work views.",
-      zh: "会话工作栏，包含任务与其他工作视图。",
+      en: "Task progress and session details in the workbar.",
+      zh: "在工作栏中查看任务进度与会话详情。",
     },
   },
   "workbar-fleet": {
     label: { en: "Fleet", zh: "智能体团队" },
     description: {
-      en: "The Fleet workbar in a new session.",
-      zh: "新会话中的智能体团队工作栏。",
+      en: "A delegated reviewer and its completed task in the Fleet workbar.",
+      zh: "团队工作栏中受委派的审阅智能体及其已完成任务。",
     },
   },
   "provider-picker": {
     label: { en: "Providers", zh: "提供商" },
     description: {
-      en: "Choose a provider for your model connection.",
-      zh: "为模型连接选择提供商。",
+      en: "The provider list and connection details, captured with a local demo model.",
+      zh: "使用本地演示模型实录的提供商列表和连接详情。",
     },
   },
   help: {
     label: { en: "Help", zh: "帮助" },
     description: {
-      en: "Commands and keyboard shortcuts in the help view.",
-      zh: "帮助视图中的命令与快捷键。",
+      en: "Commands and keyboard shortcuts.",
+      zh: "命令与键盘快捷键。",
     },
   },
 } satisfies Record<string, { label: LocalizedText; description: LocalizedText }>;
 
 export const NATIVE_TERMINAL_COPY = {
-  title: { en: "Inside the terminal", zh: "走进终端" },
+  title: { en: "Explore the terminal", zh: "探索终端界面" },
   description: {
-    en: "Explore Codewhale’s composer, workbar, provider picker and help.",
-    zh: "探索 Codewhale 的输入框、工作栏、提供商选择与帮助视图。",
+    en: "Captured views from a Codewhale demo session. Explore the conversation, task workbar, model connections and help.",
+    zh: "Codewhale 演示会话的实录画面。查看对话、任务工作栏、模型连接与帮助。",
   },
   viewsLabel: { en: "Terminal views", zh: "终端视图" },
+  showFull: { en: "Show full terminal", zh: "查看完整终端" },
+  showDetail: { en: "Focus on this panel", zh: "聚焦此面板" },
+  detailLabel: { en: "Panel detail from the captured terminal", zh: "终端实录中的面板详情" },
   scrollHint: { en: "Scroll sideways to see the full terminal.", zh: "左右滚动，查看完整终端。" },
   componentsLink: { en: "Build with these components", zh: "使用这些组件构建应用" },
 } satisfies Record<string, LocalizedText>;
@@ -63,6 +66,9 @@ export function getNativeTerminalCopy(locale: string) {
     title: pickText(NATIVE_TERMINAL_COPY.title, locale),
     description: pickText(NATIVE_TERMINAL_COPY.description, locale),
     viewsLabel: pickText(NATIVE_TERMINAL_COPY.viewsLabel, locale),
+    showFull: pickText(NATIVE_TERMINAL_COPY.showFull, locale),
+    showDetail: pickText(NATIVE_TERMINAL_COPY.showDetail, locale),
+    detailLabel: pickText(NATIVE_TERMINAL_COPY.detailLabel, locale),
     scrollHint: pickText(NATIVE_TERMINAL_COPY.scrollHint, locale),
     componentsLink: pickText(NATIVE_TERMINAL_COPY.componentsLink, locale),
     views: Object.fromEntries(Object.entries(NATIVE_TERMINAL_VIEWS).map(([id, view]) => [id, {

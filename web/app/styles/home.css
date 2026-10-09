@@ -2,11 +2,9 @@
 /*  Home — paper above, sea below                                      */
 /* ------------------------------------------------------------------ */
 /*
- * Paper holds the promise and the install command. The live whale rests on
- * one horizon line where the paper meets the sea; the real terminal floats
- * in the deep water just under it. The reading sections return to paper,
- * and the page ends in the sea with the install command, which runs on into
- * the footer. Two sea moments, one horizon each; nothing else decorates.
+ * Paper holds the promise, capabilities and reading sections.
+ * The live whale stays beside the hero. The page ends in the sea with the
+ * install command, which runs on into the footer.
  */
 
 .home { --home-measure: 36rem; }
@@ -47,6 +45,8 @@
   text-wrap: balance;
   color: var(--text);
 }
+
+:lang(en) .home-title { hyphens: none; }
 
 .home-lede {
   max-width: var(--home-measure);
@@ -144,16 +144,6 @@
 .whale-live[data-ready] .whale-live-canvas { opacity: 1; }
 .whale-live[data-ready] .whale-live-poster { visibility: hidden; }
 
-/* ---------- the sea: the terminal ---------- */
-/* The tide: paper fades through light aqua into cobalt and the deep, like
-   the merch's Tide ombré (light at the top, navy at the hem). No hard edge;
-   the whale rests where the water begins, and the terminal floats in calm,
-   dark water below. */
-.home-terminal {
-  position: relative;
-  background: var(--tide), var(--ocean-floor);
-}
-
 /* The install band ends the page in the sea: one line of light at its top,
    and water that reaches the floor colour by its own bottom edge, so it runs
    into the footer without a seam. */
@@ -169,35 +159,20 @@
   background: var(--horizon-light);
 }
 
-.home-terminal-inner {
-  display: grid;
-  gap: var(--space-6);
-  width: min(var(--container), 64rem);
+/* ---------- release and source status ---------- */
+.home-release {
+  width: var(--container);
   margin-inline: auto;
-  padding-block: clamp(9rem, 16vw, 13rem) clamp(4rem, 8vw, 6.5rem);
+  padding-block: var(--space-5);
+  border-block: 1px solid var(--line);
+  font-size: var(--text-ui);
 }
 
-.home-terminal-title {
-  max-width: 22ch;
-  font-size: var(--text-section);
-  font-weight: 600;
-  line-height: 1.1;
-  letter-spacing: -0.02em;
-  color: var(--text);
-  text-wrap: balance;
-}
-
-.home-shot .figure-frame {
-  border: 0;
-  box-shadow:
-    0 0 0 1px rgb(var(--gpui-dark-primary-rgb) / 0.14),
-    0 40px 80px -40px rgb(0 0 0 / 0.75);
-}
-.home-shot figcaption {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: var(--space-2) var(--space-4);
+.home-terminal {
+  width: var(--container);
+  max-width: 1000px;
+  margin-inline: auto;
+  padding-block-start: var(--space-6);
 }
 
 /* ---------- paper: the reading sections ---------- */
@@ -221,7 +196,6 @@
   letter-spacing: 0;
   color: var(--text);
 }
-.home-modes dt { font-family: var(--font-body); }
 
 .product-start-links { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-5); margin-top: var(--space-5); }
 

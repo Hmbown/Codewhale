@@ -137,15 +137,15 @@ Each repo can carry two distinct, complementary files:
   additionally **mechanically enforced** in the tool gate. See
   [Enforced repo-law invariants](#enforced-repo-law-invariants) below.
 
-  This is the **repo-local law** layer in Codewhale's hierarchy: *bundled global
-  Constitution* → *user-global constitution* (`$CODEWHALE_HOME/constitution.json`,
-  rendered as prose) → *repo constitution* (`.codewhale/constitution.json`, this
-  file) → *AGENTS/project instructions* → *memory and handoffs* → *current
-  request and live evidence for the active turn*. Runtime policy
-  (permissions/sandbox/cost limits enforced in code) is separate from all of
-  these prompt layers. The repo constitution gives project decision rules; it
-  does not replace the bundled Constitution, the user-global constitution, or
-  the current user request.
+  This is the **repo-local law** layer. When guidance conflicts, the
+  **Whose word wins** section of the effective base constitution owns the
+  ordering; the bundled source is
+  [`BASE_PROMPT`](../crates/tui/src/prompts/text.rs). Use `/constitution base`
+  to inspect the effective base, including any opted-in expert override.
+  The order in which these files are described or assembled is not an
+  authority ranking. Runtime policy (permissions, sandbox and cost limits
+  enforced in code) is separate from prompt guidance; editing a constitution
+  does not grant permissions.
 
 > **`WHALE.md` is deprecated.** It overlapped confusingly with `AGENTS.md`.
 > Codewhale no longer reads `WHALE.md` as project or global context. If one is
@@ -329,29 +329,50 @@ If a repo-local config declares `api_key`, `base_url`, `providers`, `provider`,
 `mcp_config_path`, `notes_path`, `hotbar`, `allow_shell = true`, or `instructions`,
 Codewhale ignores that key and keeps the user's global setting.
 
-The consolidated `codewhale` runtime uses one config file for DeepSeek auth
-and model defaults. `codewhale auth set --provider deepseek` saves
-the key to `~/.codewhale/config.toml` (migrating legacy `~/.deepseek/config.toml`
-on first launch when needed), and `codewhale --model deepseek-v4-flash` is
-forwarded to the TUI as `CODEWHALE_MODEL`. The dispatcher no longer writes the
-`DEEPSEEK_*` twins of these variables; a `DEEPSEEK_*` value you set yourself is
-still read as a legacy alias when the `CODEWHALE_*` one is unset.
+The consolidated `codewhale` runtime uses `~/.codewhale/config.toml` for
+provider and model settings. `codewhale auth set --provider deepseek` saves
+the key in the local secret store (a private file under `~/.codewhale/secrets/`
+by default; the OS keychain is an explicit option), rather than writing it
+into that config file. Legacy `~/.deepseek/config.toml` is migrated on first
+launch when needed. `codewhale --model deepseek-v4-flash` is forwarded to the
+TUI as `CODEWHALE_MODEL`. The dispatcher no longer writes `DEEPSEEK_*` twins;
+a value you set yourself remains a legacy alias when its `CODEWHALE_*`
+equivalent is unset.
 
-`codewhale login` signs in to the Codewhale account — it is the same browser
-device flow as `codewhale account login`, not a provider-key command. Provider
-credentials are configured exclusively through `codewhale auth set
---provider <provider>`.
+### Account provider keys
 
-That provider credential is distinct from the optional managed-product
-account. `codewhale account login` starts the Codewhale browser device flow;
-`codewhale account status` and `codewhale account logout` inspect or remove the
-session for the selected `--profile`. Account sessions prefer the OS
-credential manager and fall back automatically to the private `0600`
-Codewhale secrets file when no credential manager is available (headless
-hosts, SSH, containers).
-`codewhale account keys list|set|remove` manages the
-signed-in account's BYOK vault without displaying secret values. The older
-`codewhale cloud ...` spelling remains a command alias.
+A Codewhale account lets you **manage your provider API keys in one place**.
+[Register](https://app.codewhale.net/register) or [sign in](https://app.codewhale.net/login),
+then add, replace or remove keys in [Providers settings](https://app.codewhale.net/providers)
+or from the terminal:
+
+```bash
+codewhale login                         # browser sign-in; also: account login
+codewhale account keys set deepseek      # hidden prompt; add or replace a key
+codewhale account keys list              # configured status, never secret values
+codewhale --provider codewhale           # use the account's model route
+```
+
+Account keys stay on the service and are used for account-routed requests.
+Sign in on another device and choose Codewhale in `/provider` to use them
+without pasting keys again. `/models` lists models available to that account.
+Replacing a saved account key affects subsequent requests through this route;
+it does not change independent local copies or revoke keys at the provider.
+`codewhale account keys remove deepseek` removes the account's saved key.
+
+Login does **not** upload existing local keys. If you want to copy one, choose
+`codewhale account keys set deepseek --from-local` explicitly. Normal local
+provider setup remains `codewhale auth set --provider <provider>`; local keys
+and local models work without a Codewhale account. Signing in preserves an
+explicit or already configured local provider. Choose `--provider codewhale`
+when you want the account route instead.
+
+The account session is separate from provider keys. `codewhale account status`
+inspects it; `codewhale account logout` removes it for the selected `--profile`
+without removing your provider keys. Account sessions use the private `0600`
+Codewhale secrets file, scoped to the profile and account API origin; they do
+not use the OS keychain. The older `codewhale cloud ...` spelling remains an
+alias for account commands.
 
 ### Portable config bundles
 
@@ -468,7 +489,7 @@ Anthropic providers, set `provider = "<id>"` or pass
 For the provider-by-provider registry, including wire protocol, auth variables,
 default base URLs, model IDs, and capability metadata, see
 [PROVIDERS.md](PROVIDERS.md).
-The facade saves provider credentials to the shared user config and forwards
+The facade saves provider credentials in the local secret store and forwards
 the resolved key, base URL, provider, and model to the TUI process. Use
 `codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"` or
 `codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"` or
@@ -2168,6 +2189,7 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 - `[approval] default_selection` (string, optional): which option an approval
   card highlights when it first appears — `deny` (default) or `allow_once`.
   `deny` means a reflexive Enter on a card you have not read refuses the call.
+  The highlighted row is tagged `(Enter)`; press `y` to allow once.
   Set `allow_once` to restore the pre-v0.9.6 Enter-to-approve muscle memory
   (#5293). It moves the highlight only: which calls are prompted for is still
   `approval_policy` plus the rules in `permissions.toml`.
@@ -2190,9 +2212,9 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   ```
 - `sandbox_mode` (string, optional): `read-only`, `workspace-write`, `danger-full-access`, `external-sandbox`.
   Platform support is not identical. macOS uses Seatbelt when its runtime
-  probe succeeds. Linux uses bubblewrap only when `prefer_bwrap = true` and
-  `/usr/bin/bwrap` is executable; without that opt-in it reports no OS command
-  sandbox. Windows does not currently advertise an OS sandbox; its planned helper contract starts
+  probe succeeds. Linux uses bubblewrap by default whenever `/usr/bin/bwrap`
+  is installed and a probe proves it can confine a child; `prefer_bwrap =
+  false` opts out and reports no OS command sandbox. Windows does not currently advertise an OS sandbox; its planned helper contract starts
   with process-tree containment only and must not be described as read-only
   filesystem isolation, workspace-write enforcement, network blocking,
   registry isolation, or AppContainer isolation until those are implemented.
@@ -2625,7 +2647,7 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 
 - `tui.stream_chunk_timeout_secs` (int, optional, default `900`): per-SSE-chunk idle timeout for streamed model responses. Slow local or compatible servers can raise this with `/config stream_chunk_timeout_secs <seconds>` (add `--save` to write canonical `stream.chunk_timeout_secs`); `0` maps to the default and explicit values must be `1..=3600`. The legacy `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var is still honored when this key is omitted.
 - `tui.osc8_links` (bool, optional, default on for macOS/Linux, off for Windows): emit OSC 8 escape sequences around URLs in transcript output so supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) can open them with the terminal's link gesture—usually Cmd-click on macOS and Ctrl-click on Linux/Windows. Terminals without OSC 8 support render the plain label and ignore the escape. The escapes are emitted out-of-band (not inside buffer cells), so column corruption is not a concern; set `false` only for terminals that misrender the OSC 8 terminator itself. Windows legacy consoles default off; opt in with `true`.
-- `tui.max_model_steps` (int, optional, default uncapped): optional model-step ceiling for one ordinary turn. Omission or `0` leaves model steps uncapped; explicit positive values are clamped to `1..=100000`. Headless `exec` and Fleet workers also have no implicit model-step ceiling; `exec --max-turns N` and positive worker budgets still apply. At ~80% of an explicit step budget the model gets one soft-landing notice; at exhaustion the turn ends `Failed` with `Maximum model steps reached before completion (limit: N)` after one bounded final-report response when needed. Cumulative wall-clock and per-stream limits remain independent. Active interactive goal turns use `goal.max_steps` instead (default `1000`); see the Goal loop section below.
+- `tui.max_model_steps` (int, optional, default uncapped): optional model-step ceiling for one ordinary turn. Omission or `0` leaves model steps uncapped; explicit positive values are clamped to `1..=100000`. Headless `exec` and Fleet workers also have no implicit model-step ceiling; `exec --max-turns N` and positive worker budgets still apply. At ~80% of an explicit step budget the model gets one soft-landing notice; at exhaustion the turn ends `Failed` with `Maximum model steps reached before completion (limit: N)` after one bounded final-report response when needed. Cumulative wall-clock and per-stream limits remain independent. Active interactive goal turns use `goal.max_steps` instead (also uncapped by default); see the Goal loop section below.
 - `tui.turn_wall_clock_secs` (int, optional, default: no limit): cumulative per-turn wall-clock budget in seconds, measured across every model step of one turn (not per request). Time blocked on a human approval is excluded. Omitted or `0` means no limit; positive values clamp to `30..=86400` (24 hours is the ceiling). When exhausted the turn stops before authorizing another billable request with a message naming the limit and the key to raise.
 - `tui.stream_max_resumes` (int, optional, default `3`): how many times one turn re-issues a model request after its stream failed — the request never opened (connect failure or response-header stall), the stream died before any content, the host slept mid-stream, or the network dropped mid-stream. Every one of those paths spends this one budget, and a healthy stream resets it. `0` disables turn-level re-issues (a failed stream then fails the turn); values clamp to `0..=10`.
 - `tui.stream_max_transparent_retries` (int, optional, default `2`): in-stream re-requests while nothing has streamed yet. `0` disables them; values clamp to `0..=10`.
@@ -2753,12 +2775,10 @@ max_continuations = 100
 # provider turn open. Default: 0 (continue immediately).
 continuation_delay_seconds = 300
 
-# Per-turn step allowance while a goal is active (#5994). Goal turns get a
-# larger but still finite budget than an ordinary interactive turn.
-# Default: 1000 (0 or absent resolves to 1000, never unlimited). Range:
-# 1..=100,000. This bounds each provider turn, never the number of
-# continuation passes.
-max_steps = 1000
+# Optional per-turn model-step ceiling while a goal is active (#6512).
+# Default: uncapped (0 or absent). Positive values clamp to 1..=100,000.
+# This bounds each provider turn, never the number of continuation passes.
+max_steps = 0
 ```
 
 The effective delay is capped at 86,400 seconds (24 hours); use an automation
@@ -2768,11 +2788,11 @@ When an explicit backstop fires, the goal pauses with a status message naming
 `[goal] max_continuations` and a warning is logged; resume the goal after
 inspecting progress, or raise/disable the backstop.
 
-`[goal] max_steps` governs one engine turn at a time: the ordinary interactive
-turn has no implicit model-step ceiling. Explicit per-invocation
+`[goal] max_steps` governs one engine turn at a time. Like ordinary interactive
+turns, omitted or `0` leaves model steps uncapped. Explicit per-invocation
 ceilings — `exec --max-turns N`, child-worker caps — always win over it. At
-about 80% of the selected budget the model is told to land; at exhaustion it
-gets one bounded final report and the turn classifies as budget-exhausted. An
+about 80% of an explicit positive budget the model is told to land; at exhaustion
+it gets one bounded final report and the turn classifies as budget-exhausted. An
 unfinished goal then pauses with the BudgetLimit reason instead of re-arming
 another goal turn — resume it explicitly after reviewing the report. Wall-clock
 and stream protections are separate and still apply.

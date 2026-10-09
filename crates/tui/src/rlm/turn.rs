@@ -606,7 +606,7 @@ mod tests {
         );
     }
 
-    struct PendingAfterResponses(MockLlmClient, usize);
+    struct PendingAfterResponses(MockLlmClient, usize, tokio::sync::Notify);
 
     impl Replies for PendingAfterResponses {
         fn effective_route_envelope(
@@ -630,6 +630,7 @@ mod tests {
             if self.0.call_count() < self.1 {
                 self.0.create_message_boxed(request)
             } else {
+                self.2.notify_one();
                 Box::pin(std::future::pending())
             }
         }
@@ -639,6 +640,9 @@ mod tests {
     /// request, a Python block, or an event send within the current round.
     #[tokio::test]
     async fn wall_clock_deadline_interrupts_pending_work_and_keeps_partial_result() {
+        let _home = crate::test_support::SealedHome::new();
+        use crate::dependencies::ExternalTool as _;
+        assert!(crate::dependencies::Python::resolve().is_some());
         for pending_model in [true, false] {
             let partial = if pending_model {
                 "```repl\nprint(_os.environ['RLM_CONTEXT_FILE'])\n```"
@@ -647,30 +651,40 @@ mod tests {
             };
             let mock = MockLlmClient::new(Vec::new());
             mock.push_message_response(text_response(partial));
-            let client = Arc::new(PendingAfterResponses(mock, 1));
+            let client = Arc::new(PendingAfterResponses(mock, 1, tokio::sync::Notify::new()));
             let (tx, mut rx) = mpsc::channel(32);
             let usage = RlmUsageAccumulator::new();
+            // Admission reads configuration and constructs the captured route.
+            // It is fixture setup, before this invocation's one-second budget.
+            let caller =
+                crate::core::engine::tests::rlm_host::caller_for(client.clone(), "root-model");
 
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                run_admitted_fixture(
-                    client.clone(),
-                    "root-model".to_string(),
-                    "long context".to_string(),
-                    None,
-                    "child-model".to_string(),
-                    tx,
-                    0,
-                    usage.clone(),
-                    tokio::time::Instant::now() + Duration::from_secs(1),
-                    Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
-                ),
+                caller.dispatch(crate::core::engine::rlm_host::RlmInvocation {
+                    prompt: "long context".to_string(),
+                    mode: crate::core::engine::rlm_host::RlmMode::Recursive { depth_remaining: 0 },
+                    max_tokens: None,
+                    task_instructions: None,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                    gate: Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
+                    events: Some(tx),
+                    usage: usage.clone(),
+                }),
             )
             .await
             .expect("the turn deadline must interrupt in-flight work");
 
             assert_eq!(result.termination, RlmTermination::Error);
-            assert_eq!(result.answer, partial);
+            assert_eq!(
+                result.answer,
+                partial,
+                "error={:?}, iterations={}, calls={}, trace={:?}",
+                result.error,
+                result.iterations,
+                client.0.call_count(),
+                result.trace
+            );
             assert_eq!(result.iterations, if pending_model { 2 } else { 1 });
             assert!(
                 result
@@ -719,27 +733,45 @@ mod tests {
 
     #[tokio::test]
     async fn wall_clock_deadline_returns_when_event_stream_is_full() {
+        let _home = crate::test_support::SealedHome::new();
         // An empty response queue fails immediately and cannot test the deadline.
-        // Keep the admitted provider future pending while the host channel is full.
-        let client = Arc::new(PendingAfterResponses(MockLlmClient::new(Vec::new()), 0));
+        // Observe the admitted provider future before filling the host channel.
+        let client = Arc::new(PendingAfterResponses(
+            MockLlmClient::new(Vec::new()),
+            0,
+            tokio::sync::Notify::new(),
+        ));
+        let caller = crate::core::engine::tests::rlm_host::caller_for(client.clone(), "root-model");
         let usage = RlmUsageAccumulator::new();
-        let (tx, _rx) = mpsc::channel(1);
-        tx.try_send(Event::status("fixture occupies the caller event channel"))
-            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_admitted_fixture(
-                client.clone(),
-                "root-model".to_string(),
-                "long context".to_string(),
-                None,
-                "child-model".to_string(),
-                tx,
-                0,
-                usage.clone(),
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
-            ),
+            async {
+                // Completion uses the same host/deadline/Drop authority without
+                // making Python startup part of this event-channel fixture.
+                let call = caller.dispatch(crate::core::engine::rlm_host::RlmInvocation {
+                    prompt: "long context".to_string(),
+                    mode: crate::core::engine::rlm_host::RlmMode::Completion,
+                    max_tokens: None,
+                    task_instructions: None,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                    gate: None,
+                    events: Some(tx.clone()),
+                    usage: usage.clone(),
+                });
+                tokio::pin!(call);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = client.2.notified() => break,
+                        result = &mut call => panic!("provider request was not reached: {:?}", result.error),
+                        event = rx.recv() => assert!(event.is_some()),
+                    }
+                }
+                let _ = tx.try_send(Event::status("fixture occupies the caller event channel"));
+                assert_eq!(tx.capacity(), 0, "caller event channel must be full");
+                call.await
+            },
         )
         .await
         .expect("deadline hand-back must not wait on a full event stream");
@@ -750,7 +782,9 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("wall-clock deadline")
+                .contains("wall-clock deadline"),
+            "{:?}",
+            result.error
         );
         assert_eq!(client.0.call_count(), 0, "no scripted response completed");
         let snapshot = usage.snapshot().await;

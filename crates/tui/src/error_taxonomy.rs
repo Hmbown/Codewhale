@@ -156,6 +156,21 @@ impl ErrorEnvelope {
         )
     }
 
+    /// A stop Codewhale applied to itself (step ceiling, per-turn wall clock).
+    /// The turn failed, so the card is an error, but the session stays usable:
+    /// sending another message continues, so it is `recoverable` and does not
+    /// flip the session offline (#6843).
+    #[must_use]
+    pub fn budget_stop(message: impl Into<String>) -> Self {
+        Self::new(
+            ErrorCategory::Budget,
+            ErrorSeverity::Error,
+            true,
+            "turn_budget_stop",
+            message,
+        )
+    }
+
     /// Recoverable network / transport hiccup.
     #[must_use]
     #[cfg(test)]
@@ -177,10 +192,20 @@ impl ErrorEnvelope {
         let category = classify_error_message(&message);
         let severity = match category {
             ErrorCategory::Authentication => ErrorSeverity::Critical,
+            // A transient class stays amber only while the caller still
+            // expects the work to continue; `recoverable = false` means it
+            // ended (an error frame that failed the turn, a spent balance),
+            // and an ended turn is never rendered as a warning (#6795).
             ErrorCategory::RateLimit
             | ErrorCategory::Timeout
             | ErrorCategory::Network
-            | ErrorCategory::Budget => ErrorSeverity::Warning,
+            | ErrorCategory::Budget => {
+                if recoverable {
+                    ErrorSeverity::Warning
+                } else {
+                    ErrorSeverity::Error
+                }
+            }
             ErrorCategory::InvalidInput | ErrorCategory::Authorization | ErrorCategory::Parse => {
                 ErrorSeverity::Error
             }
@@ -318,15 +343,49 @@ impl From<LlmError> for ErrorEnvelope {
                 "llm_context_length",
                 message,
             ),
-            LlmError::Other(message) => Self::new(
-                ErrorCategory::Internal,
-                ErrorSeverity::Error,
-                true,
-                "llm_other",
-                message,
-            ),
+            LlmError::Other(message) => envelope_for_other_llm_error(message),
         }
     }
+}
+
+/// `LlmError::Other` is the catch-all for an HTTP status with no dedicated
+/// variant (a 402 without explicit quota evidence, a 405/409/413/422
+/// rejection). Its text still says what happened, so a determinate answer from
+/// the string classifier wins over the blanket `Internal` label (#6843): an
+/// out-of-credits 402 reads as a spent balance, a 4xx as a rejected input.
+/// Only text the classifier cannot place stays `Internal`.
+fn envelope_for_other_llm_error(message: String) -> ErrorEnvelope {
+    let category = classify_error_message(&message);
+    if matches!(
+        category,
+        ErrorCategory::Tool | ErrorCategory::State | ErrorCategory::Internal
+    ) {
+        return ErrorEnvelope::new(
+            ErrorCategory::Internal,
+            ErrorSeverity::Error,
+            true,
+            "llm_other",
+            message,
+        );
+    }
+    // Mirror the typed variants. Only a credential or authorization refusal, a
+    // rejected input and a spent balance do not heal by resending; everything
+    // else (a transient class, a spent budget, an unparseable chunk) keeps the
+    // retry tail the legacy `Internal` label had.
+    let recoverable = match category {
+        ErrorCategory::Authentication
+        | ErrorCategory::Authorization
+        | ErrorCategory::InvalidInput => false,
+        ErrorCategory::RateLimit => !is_spent_balance_text(&message.to_lowercase()),
+        _ => true,
+    };
+    let mut envelope = ErrorEnvelope::classify(message, recoverable);
+    // The typed `NetworkError` is an Error-severity card; an `Other` that reads
+    // as one must not turn amber for a turn that later fails after its retries.
+    if matches!(category, ErrorCategory::Network | ErrorCategory::Budget) {
+        envelope.severity = ErrorSeverity::Error;
+    }
+    envelope
 }
 
 /// Classify an error message string into an ErrorCategory.
@@ -337,7 +396,19 @@ impl From<LlmError> for ErrorEnvelope {
 pub fn classify_error_message(message: &str) -> ErrorCategory {
     let lower = message.to_lowercase();
 
-    if lower.contains("maximum model steps") || lower.contains("step budget exhausted") {
+    // A bare placeholder ("ERROR") carries no cause to classify. Say so
+    // instead of letting it fall to `Internal` (#6843).
+    if is_unreadable_error_text(&lower) || lower.contains("unreadable error") {
+        return ErrorCategory::Parse;
+    }
+    // Codewhale's own ceilings (step count, per-turn wall clock) and any
+    // provider text that names an exhausted budget.
+    if lower.contains("maximum model steps")
+        || lower.contains("step budget exhausted")
+        || lower.contains("wall-clock budget")
+        || lower.contains("wall clock budget")
+        || lower.contains("budget exhausted")
+    {
         return ErrorCategory::Budget;
     }
     if lower.contains("model output truncated")
@@ -348,6 +419,13 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
         || lower.contains("prompt is too long")
         || (lower.contains("requested") && lower.contains("tokens") && lower.contains("maximum"))
         || lower.contains("context window")
+        // Codewhale's own overflow stop: the request no longer fits the
+        // route's context budget and automatic recovery gave up.
+        || lower.contains("context budget")
+        // A turn that ended on a terminal stop reason with nothing usable is
+        // an incomplete model response, like the two arms above, not a tool
+        // fault that merely mentions "tool call".
+        || lower.contains("no answer or tool call")
         || lower.contains("model not exist")
         || lower.contains("model not found")
         || lower.contains("no such model")
@@ -365,15 +443,7 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
             part.trim_matches(['(', ')', '[', ']', '{', '}', ':', ';', ',', '.', '\'', '"'])
                 == "429"
         })
-        || lower.contains("quota")
-        || lower.contains("usage limit")
-        // Prepaid gateways answer an exhausted balance with HTTP 402; that is
-        // a quota condition the operator resolves by topping up, not an input
-        // or authentication fault (Concentrate: "Insufficient funds").
-        || lower.contains("insufficient credits")
-        || lower.contains("insufficient funds")
-        || lower.contains("payment required")
-        || lower.contains("http 402")
+        || is_spent_balance_text(&lower)
     {
         return ErrorCategory::RateLimit;
     }
@@ -398,6 +468,20 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
     {
         return ErrorCategory::Authorization;
     }
+    // A rejected request is determinate: the same input fails again, so it is
+    // an input fault, not an internal one (#6843). Placed after the
+    // credential, quota and timeout vocabulary so an explicit billing or auth
+    // reason inside a 400 body still wins.
+    if lower.contains("invalid request")
+        || lower.contains("invalid_request_error")
+        || lower.contains("bad request")
+        || lower.contains("unprocessable")
+        || lower.contains("payload too large")
+        || lower.contains("request entity too large")
+        || mentions_http_status(&lower, &[400, 405, 409, 410, 413, 415, 422])
+    {
+        return ErrorCategory::InvalidInput;
+    }
     if lower.contains("network")
         || lower.contains("connection")
         || lower.contains("dns")
@@ -410,6 +494,12 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
         // wording (OpenRouter); it is the upstream being unreachable.
         || lower.contains("provider returned error")
         || lower.contains("provider returned an empty response")
+        // Upstream 5xx wording, as a status or as the reason phrase.
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("internal server error")
+        || lower.contains("overloaded")
+        || mentions_http_status(&lower, &[500, 502, 503, 504, 529])
         || lower.contains(" 502 ")
         || lower.contains(" 503 ")
         || lower.contains(" 504 ")
@@ -439,6 +529,77 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
     }
 
     ErrorCategory::Internal
+}
+
+/// True when `message` reports an exhausted balance rather than a
+/// short-lived limit: quota, usage limit, or a prepaid gateway's HTTP 402
+/// ("Insufficient funds"). The operator resolves it by topping up or switching
+/// route, so resending the same request cannot help.
+pub fn is_spent_balance_message(message: &str) -> bool {
+    is_spent_balance_text(&message.to_lowercase())
+}
+
+/// True when `lower` (already lowercased) reports an exhausted balance rather
+/// than a short-lived limit: quota, usage limit, or a prepaid gateway's HTTP
+/// 402 ("Insufficient funds"). The operator resolves it by topping up or
+/// switching route, so resending the same request cannot help.
+fn is_spent_balance_text(lower: &str) -> bool {
+    lower.contains("quota")
+        || lower.contains("usage limit")
+        || lower.contains("insufficient credits")
+        || lower.contains("insufficient funds")
+        || lower.contains("payment required")
+        || lower.contains("http 402")
+}
+
+/// True when a provider "error" is only a placeholder word such as `ERROR`.
+/// `lower` is lowercased. An empty string is not a placeholder here: callers
+/// that hold an empty diagnostic mean "nothing recorded", not "unreadable".
+fn is_unreadable_error_text(lower: &str) -> bool {
+    let token = lower.trim().trim_matches(|c: char| !c.is_alphanumeric());
+    matches!(token, "error" | "err" | "unknown error")
+}
+
+/// What the transcript says instead of a bare placeholder error text, or
+/// `None` when the text is readable. The wording classifies as
+/// [`ErrorCategory::Parse`], the "unreadable" label (#6843).
+#[must_use]
+pub fn unreadable_error_notice(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if !trimmed.is_empty() && !is_unreadable_error_text(&message.to_lowercase()) {
+        return None;
+    }
+    Some(if trimmed.is_empty() {
+        "The provider reported an unreadable error: it sent no error text.".to_string()
+    } else {
+        format!(
+            "The provider reported an unreadable error: it sent only \"{trimmed}\" with no detail."
+        )
+    })
+}
+
+/// True when `lower` names one of `codes` as an HTTP status ("HTTP 422",
+/// "status 413", "status code: 500"). A bare number is never a status: digits
+/// inside a URL, an ID or a count must not classify a failure.
+fn mentions_http_status(lower: &str, codes: &[u16]) -> bool {
+    [
+        "http ",
+        "status ",
+        "status: ",
+        "status code ",
+        "status code: ",
+    ]
+    .iter()
+    .any(|prefix| {
+        lower.match_indices(prefix).any(|(at, _)| {
+            let rest = &lower[at + prefix.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.len() == 3
+                && digits
+                    .parse::<u16>()
+                    .is_ok_and(|code| codes.contains(&code))
+        })
+    })
 }
 
 impl From<ToolError> for ErrorEnvelope {

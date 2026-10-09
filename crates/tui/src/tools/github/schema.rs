@@ -64,7 +64,7 @@ pub(super) fn canonical_schema(allowed_actions: &[&str], read_only: bool) -> Val
         );
         properties.insert(
             "allow_dirty".to_string(),
-            json!({ "type": "boolean", "default": false, "description": "(action=close_issue/close_pr)" }),
+            json!({ "type": "boolean", "default": false, "description": "(action=close_issue/close_pr) Close is rejected when the worktree is dirty unless this is true." }),
         );
         properties.insert(
             "dry_run".to_string(),

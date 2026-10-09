@@ -365,14 +365,13 @@ pub fn intrinsic_model_in(catalog: &ModelsDevCatalog, model: &str) -> Option<Int
         .values()
         .flat_map(|provider| provider.models.iter())
         .filter(|(_, row)| {
-            row.base_model
-                .as_deref()
+            row.canonical_id()
                 .is_some_and(|base| base.eq_ignore_ascii_case(&id))
         })
         .collect::<Vec<_>>();
     let joins = joined
         .iter()
-        .filter_map(|(_, row)| row.base_model.as_deref())
+        .filter_map(|(_, row)| row.canonical_id())
         .map(str::to_ascii_lowercase)
         .collect::<BTreeSet<_>>();
     if joins.len() == 1 {

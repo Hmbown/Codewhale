@@ -6,6 +6,7 @@
 //! module keeps registry construction, user-command precedence, and the
 //! fall-through behaviour.
 
+mod config_policy_host;
 mod contract;
 pub mod discovery;
 mod groups;
@@ -58,7 +59,7 @@ mod session_lifecycle_regression_tests;
 
 use std::sync::OnceLock;
 
-pub(crate) use groups::config::config::set_workspace_trust;
+pub(crate) use groups::config::config::{set_workspace_trust, trust_change_note};
 
 /// Stage a rollback of the last exchange for the UI to apply, or `None` when
 /// there is no user message to roll back. Nothing is mutated here.
@@ -836,14 +837,18 @@ mod tests {
                 .message
                 .as_deref()
                 .unwrap_or_default()
-                .contains(".deepseek/handoff.md")
+                .contains(crate::prompts::HANDOFF_RELATIVE_PATH)
         );
         let Some(AppAction::SendMessage(message)) = result.action else {
             panic!("expected SendMessage action");
         };
         assert!(message.contains("session relay"));
         assert!(message.contains("接力"));
-        assert!(message.contains("Write or update `.deepseek/handoff.md`"));
+        // The relay is written where the next session reads it first.
+        assert!(message.contains(&format!(
+            "Write or update `{}`",
+            crate::prompts::HANDOFF_RELATIVE_PATH
+        )));
         assert!(message.contains("# Session relay"));
         assert!(message.contains("Requested relay focus: verify install"));
         assert!(message.contains("Goal objective: Unify the work surface"));
@@ -2130,6 +2135,9 @@ mod tests {
             "export",
             // FEAT-026 completes the session structural-copy slice.
             "structcopy",
+            // FEAT-027 config policy/status slice; remaining config stays legacy.
+            "permissions",
+            "status",
             // FEAT-029 complete debug group, including receipts and mutation.
             "tokens",
             "cost",
@@ -2945,7 +2953,7 @@ mod tests {
         let relay = execute("/relay handoff notes", &mut app);
         assert_eq!(
             relay.message.as_deref(),
-            Some("Preparing session relay at .deepseek/handoff.md...")
+            Some("Preparing session relay at .codewhale/handoff.md...")
         );
         let relay_message = match relay.action {
             Some(AppAction::SendMessage(message)) => message,
@@ -3105,3 +3113,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod config_policy_host_tests;
+#[cfg(test)]
+mod config_policy_permissions_tests;
+#[cfg(test)]
+mod config_policy_status_tests;

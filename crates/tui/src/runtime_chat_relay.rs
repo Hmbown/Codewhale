@@ -72,6 +72,11 @@ fn take_state_persist_failure(path: &Path) -> bool {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RuntimeChatPrompt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_model_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<std::num::NonZeroU32>,
     #[serde(rename = "type")]
     pub command_type: String,
@@ -762,6 +767,8 @@ impl RuntimeChatRelayHost {
             .start_turn_with_reserved_id(
                 &binding.native_thread_id,
                 StartTurnRequest {
+                    account_model_owner: command.account_model_owner.clone(),
+                    profile_constitution: command.profile_constitution.clone(),
                     expected_workspace: None,
                     max_output_tokens: command.max_output_tokens,
                     prompt: command.prompt.clone(),
@@ -982,6 +989,16 @@ impl RuntimeChatRelayHost {
     }
 
     fn validate_route(&self, command: &RuntimeChatPrompt) -> Result<(), String> {
+        if let Some(owner) = &command.account_model_owner {
+            let expected = owner_scope_fingerprint(owner, &self.target_ref, &self.session_id);
+            if self.state.lock().owner_scope_fingerprint.as_deref() != Some(expected.as_str()) {
+                return Err("The agent model belongs to another account.".to_string());
+            }
+            let mut config = (*self.config).clone();
+            return config
+                .bind_account_model_owner(owner)
+                .map_err(|error| error.to_string());
+        }
         let catalog = self.catalog("a2345678901234567890123456789012")?;
         let provider = catalog
             .get("providers")
@@ -1198,6 +1215,20 @@ impl RuntimeChatRelayHost {
 
 impl RuntimeChatPrompt {
     pub(crate) fn validate_shape(&self) -> Result<(), String> {
+        if let Some(owner) = &self.account_model_owner {
+            validate_owner_component(owner, "account")?;
+            if self.model_provider != "codewhale"
+                || self.model_provider_id != "codewhale"
+                || !self.model.contains('/')
+                || self.model.starts_with("codewhale/")
+                || !self.images.is_empty()
+                || self.reasoning_effort.is_some()
+            {
+                return Err(
+                    "The agent model requires an exact account provider and model.".to_string(),
+                );
+            }
+        }
         crate::image_attach::prepare_runtime_images(&self.images)
             .map_err(|error| error.to_string())?;
         if !self.images.is_empty() && self.model.trim().eq_ignore_ascii_case("auto") {
@@ -1224,6 +1255,19 @@ impl RuntimeChatPrompt {
             || self.prompt.contains('\0')
         {
             return Err("The Runtime Chat prompt is empty or oversized.".to_string());
+        }
+        if let Some(snapshot) = &self.profile_constitution {
+            snapshot.validate().map_err(|error| error.to_string())?;
+            if self
+                .account_model_owner
+                .as_ref()
+                .is_some_and(|owner| &snapshot.account_id != owner)
+            {
+                return Err(
+                    "The profile constitution and agent model must belong to the same account."
+                        .to_string(),
+                );
+            }
         }
         if let Some(system_prompt) = self.system_prompt.as_deref()
             && (system_prompt.trim().is_empty()
@@ -1890,6 +1934,8 @@ mod tests {
     #[test]
     fn chat_command_shape_requires_empty_tools_and_exact_chat_modes() {
         let mut prompt = RuntimeChatPrompt {
+            account_model_owner: None,
+            profile_constitution: None,
             images: Vec::new(),
             max_output_tokens: None,
             command_type: "prompt.request".to_string(),
@@ -1947,6 +1993,8 @@ mod tests {
             .unwrap();
         host.authorize_run("run_fixture").unwrap();
         let prompt = RuntimeChatPrompt {
+            account_model_owner: None,
+            profile_constitution: None,
             images: Vec::new(),
             max_output_tokens: None,
             command_type: "prompt.request".to_string(),
@@ -2015,6 +2063,8 @@ mod tests {
             .unwrap_or_else(|| provider.as_str())
             .to_string();
         let prompt = RuntimeChatPrompt {
+            account_model_owner: None,
+            profile_constitution: None,
             images: Vec::new(),
             max_output_tokens: None,
             command_type: "prompt.request".to_string(),

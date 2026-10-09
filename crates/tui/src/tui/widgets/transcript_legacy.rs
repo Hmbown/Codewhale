@@ -400,7 +400,7 @@ impl ChatWidget {
                 &cell_revisions,
                 transcript_width,
                 render_options,
-                &app.thinking_folds,
+                &app.cell_folds,
                 None,
                 provisional_action_owner,
             );
@@ -442,7 +442,7 @@ impl ChatWidget {
                 &filtered_revs,
                 transcript_width,
                 render_options,
-                &app.thinking_folds,
+                &app.cell_folds,
                 Some(&app.collapsed_cell_map),
                 provisional_action_owner,
             );

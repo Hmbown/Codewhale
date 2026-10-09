@@ -35,6 +35,9 @@ impl Engine {
         .await;
         self.record_mcp_server_instructions(&progress.tool_catalog)
             .await;
+        self.record_mcp_configured_servers(tool_policy, &progress.tool_catalog)
+            .await;
+        self.record_current_constitution().await;
         self.record_current_extension_prompt_contributions().await;
 
         // R1: the cumulative per-turn wall-clock budget. Checked at the
@@ -44,7 +47,7 @@ impl Engine {
         // never a clean success — the turn ends `Failed` with the limit
         // named, matching how the step ceiling below reports.
         if let Some(error) = self.turn_wall_clock_exhausted_error() {
-            let _ = self.send_event(Event::status(error.clone())).await;
+            self.post_turn_budget_stop(&error).await;
             return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(error)));
         }
 
@@ -192,7 +195,7 @@ impl Engine {
                     turn.max_steps,
                     turn.budget_source.key_label(),
                 );
-                let _ = self.send_event(Event::status(error.clone())).await;
+                self.post_turn_budget_stop(&error).await;
                 return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(error)));
             }
         }
@@ -742,6 +745,7 @@ impl Engine {
                 )),
             ));
         }
+        self.record_current_constitution().await;
         self.record_current_extension_prompt_contributions().await;
         let estimated = turn
             .live_input_tokens_for_compaction(

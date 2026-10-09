@@ -747,13 +747,17 @@ fn extract_media_attachment_references(input: &str) -> Vec<MediaAttachmentRefere
 // ---------------------------------------------------------------------------
 //
 // macOS parks dragged-out screenshots under a per-capture temp directory like
-// `/var/folders/…/T/Temporary Items/NSIRD_screencaptureui_XXXX/` and deletes
+// `/var/folders/…/T/Temporary Items/NSIRD_screencaptureui_XXXX/` (recent
+// releases spell it `TemporaryItems`, without the space) and deletes
 // it minutes later. Inbound references to such files are copied to a stable
 // directory the moment the message is received, so the agent later reads a
 // path that still exists.
 
 /// Marker fragments of the macOS screencapture temp directory layout.
 const SCREENCAPTURE_TEMP_DIR_MARKERS: [&str; 2] = ["Temporary Items", "screencaptureui"];
+
+/// The `Temporary Items` component as recent macOS releases spell it.
+const SCREENCAPTURE_TEMP_DIR_COMPACT: &str = "TemporaryItems";
 
 /// Stable per-session directory for stabilized screencapture files. Follows
 /// the same home-first convention as `clipboard.rs`'s clipboard-images dir.
@@ -775,7 +779,7 @@ fn is_screencapture_temp_path(path: &Path) -> bool {
         .collect();
     components
         .iter()
-        .any(|c| c == SCREENCAPTURE_TEMP_DIR_MARKERS[0])
+        .any(|c| c == SCREENCAPTURE_TEMP_DIR_MARKERS[0] || c == SCREENCAPTURE_TEMP_DIR_COMPACT)
         && components
             .iter()
             .any(|c| c.contains(SCREENCAPTURE_TEMP_DIR_MARKERS[1]))
@@ -2417,6 +2421,13 @@ mod tests {
         assert!(is_screencapture_temp_path(Path::new(
             "/var/folders/x/T/Temporary Items/NSIRD_screencaptureui_ABC/Shot.png"
         )));
+        // The spelling in the founder's failing drop (macOS 26).
+        assert!(is_screencapture_temp_path(Path::new(
+            "/var/folders/gc/x/T/TemporaryItems/NSIRD_screencaptureui_IqPorQ/Screenshot 2026-10-04 at 22.25.47.png"
+        )));
+        assert!(!is_screencapture_temp_path(Path::new(
+            "/tmp/TemporaryItems/Shot.png"
+        )));
         let (tmp, source, _) = screencapture_fixture();
         assert!(is_screencapture_temp_path(&source));
         // Only one marker is not a screencapture temp location.
@@ -2508,6 +2519,30 @@ mod tests {
         assert!(out.contains(&format!("({stable_disp})")), "got: {out}");
         assert!(out.contains(&format!("@{stable_disp}")), "got: {out}");
         assert!(!out.contains(&disp), "got: {out}");
+        let _ = tmp;
+    }
+
+    #[test]
+    fn stabilizes_a_dropped_attachment_under_compact_temporary_items() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source_dir = tmp
+            .path()
+            .join("TemporaryItems")
+            .join("NSIRD_screencaptureui_IqPorQ");
+        std::fs::create_dir_all(&source_dir).expect("mkdir");
+        let source = source_dir.join("Screenshot 2026-10-04 at 22.25.47.png");
+        std::fs::write(&source, b"screenshot").expect("write");
+        let artifact_dir = tmp.path().join("attachments");
+        let input = format!("what is this?\n[Attached image: {}]\n", source.display());
+
+        let out = stabilize_screenshot_references(&input, &artifact_dir);
+
+        let stable = artifact_dir.join("Screenshot 2026-10-04-22.25.47.png");
+        assert!(stable.is_file(), "stable copy must exist");
+        assert!(
+            out.contains(&format!("[Attached image: {}]", stable.display())),
+            "got: {out}"
+        );
         let _ = tmp;
     }
 

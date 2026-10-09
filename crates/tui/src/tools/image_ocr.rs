@@ -31,7 +31,7 @@ impl ToolSpec for ImageOcrTool {
     }
 
     fn description(&self) -> &'static str {
-        "Extract text from an image (PNG, JPEG, or TIFF) via local OCR. On macOS this uses the built-in Vision framework; otherwise it uses local tesseract when available. Use this for screenshots, scanned receipts/whiteboards, image-only PDFs, or any visual that contains text the model needs to read. Returns the extracted text inline; no file is written."
+        "Extract text from an image (PNG, JPEG, or TIFF) via local OCR. On macOS this uses the built-in Vision framework; otherwise it uses local tesseract when available. To look at an image, `read` it instead: a vision-capable model receives the image itself. Use OCR when the active model is text-only, or when you need the exact text of a scanned receipt/whiteboard or an image-only PDF. Returns the extracted text inline; no file is written."
     }
 
     fn input_schema(&self) -> Value {

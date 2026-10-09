@@ -19,7 +19,7 @@ var __export = (target, all) => {
 var define_BUILTIN_MODULE_DIGESTS_default;
 var init_define_BUILTIN_MODULE_DIGESTS = __esm({
   "<define:__BUILTIN_MODULE_DIGESTS__>"() {
-    define_BUILTIN_MODULE_DIGESTS_default = { harness: "bf685db5e808ab708ec698e1bc038d173db59f2facb6907fdbd689f336123f8f", mcp: "d5eb38941113934f9768e90ab3f1db021b93980e41be5cdf8836489b7f233b55" };
+    define_BUILTIN_MODULE_DIGESTS_default = { harness: "114addde4e6e70ade28a38fe2c1fa0b521729ab9aaa58273c77f33b2a1b608ae", mcp: "5bc04b62832310724fdfed3999362b1667bf9eddf4936e1535b5767019596839" };
   }
 });
 
@@ -6478,6 +6478,62 @@ var init_skill_filesystem = __esm({
   }
 });
 
+// src/dsh/canonical-path.ts
+import { realpathSync } from "node:fs";
+import { posix, win32 } from "node:path";
+function canonicalPath(path, platform = process.platform) {
+  if (platform !== "win32") return realpathSync(path);
+  try {
+    return stripVerbatim(realpathSync.native(path), platform);
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : void 0;
+    if (code === "EPERM" || code === "EACCES") {
+      return stripVerbatim(win32.normalize(path), platform);
+    }
+    throw error;
+  }
+}
+function stripVerbatim(path, platform = process.platform) {
+  if (platform !== "win32") return path;
+  if (/^[\\/]{2}\?[\\/]UNC[\\/]/i.test(path)) return `\\\\${path.slice(8)}`;
+  if (/^[\\/]{2}\?[\\/]/.test(path)) return path.slice(4);
+  return path;
+}
+function pathKey(path, platform = process.platform) {
+  if (platform !== "win32") return posix.normalize(path);
+  return win32.normalize(stripVerbatim(path, platform)).toLowerCase();
+}
+function samePath(a, b, platform = process.platform) {
+  return pathKey(a, platform) === pathKey(b, platform);
+}
+function insideKey(root, target, platform = process.platform) {
+  const path = platform === "win32" ? win32 : posix;
+  const inside = path.relative(stripVerbatim(root, platform), stripVerbatim(target, platform));
+  if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return void 0;
+  return platform === "win32" ? inside.split(win32.sep).join("/") : inside;
+}
+function isUnlinkedInside(root, key, target, platform = process.platform) {
+  let canonicalRoot, canonicalTarget;
+  try {
+    canonicalRoot = canonicalPath(root, platform);
+    canonicalTarget = canonicalPath(target, platform);
+  } catch {
+    return false;
+  }
+  return unlinkedKeyMatches(canonicalRoot, key, canonicalTarget, platform);
+}
+function unlinkedKeyMatches(canonicalRoot, key, canonicalTarget, platform = process.platform) {
+  if (!key || key.split("/").some((part) => !part || part === "." || part === "..")) return false;
+  const path = platform === "win32" ? win32 : posix;
+  return samePath(path.join(stripVerbatim(canonicalRoot, platform), ...key.split("/")), canonicalTarget, platform);
+}
+var init_canonical_path = __esm({
+  "src/dsh/canonical-path.ts"() {
+    "use strict";
+    init_define_BUILTIN_MODULE_DIGESTS();
+  }
+});
+
 // src/dsh/upstream/hooks/hook-protocol/src/matcher.ts
 function isMatchAll(matcher) {
   return matcher === void 0 || matcher === "" || matcher === "*";
@@ -6629,14 +6685,14 @@ var init_config2 = __esm({
 
 // src/dsh/shell-hooks.ts
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, lstatSync } from "node:fs";
+import { readFileSync, lstatSync } from "node:fs";
 import { resolve as resolve2, relative, isAbsolute, sep } from "node:path";
 function reviewedHookModule(dialect, root, files) {
   return { name: `hooks-${dialect}`, inject: ["shellHooks"], apply(ctx, config) {
     if (!config || typeof config.configPath !== "string") throw new Error("hook bridge needs its reviewed configPath");
     const path = resolve2(root, config.configPath);
     const inside = relative(root, path).split(sep).join("/");
-    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || realpathSync(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
+    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || !isUnlinkedInside(root, inside, path) || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
     const bytes = readFileSync(path);
     if (bytes.length > 1024 * 1024 || createHash("sha256").update(bytes).digest("hex") !== files[inside]) throw new Error("hook config changed after review or exceeds 1 MiB");
     if (config.projectDir !== void 0) throw new Error("explicit projectDir is unsupported; each process uses its current core workspace");
@@ -6662,6 +6718,8 @@ var init_shell_hooks = __esm({
   "src/dsh/shell-hooks.ts"() {
     "use strict";
     init_define_BUILTIN_MODULE_DIGESTS();
+    init_canonical_path();
+    init_canonical_path();
     init_config();
     init_config2();
     EVENTS = { SessionStart: "session_start", UserPromptSubmit: "message_submit", PreToolUse: "tool_call_before", PostToolUse: "tool_call_after", Stop: "turn_end", SubagentStart: "subagent_spawn", SubagentStop: "subagent_complete" };
@@ -12631,8 +12689,8 @@ var init_bun_closure = __esm({
 import * as nodeModule2 from "node:module";
 import { createHash as createHash2 } from "node:crypto";
 import { fileURLToPath as fileURLToPath2, pathToFileURL as pathToFileURL3 } from "node:url";
-import { relative as relative2, resolve as resolve3, sep as sep2, isAbsolute as isAbsolute2, dirname } from "node:path";
-import { readFileSync as readFileSync2, realpathSync as realpathSync2 } from "node:fs";
+import { resolve as resolve3, isAbsolute as isAbsolute2, dirname } from "node:path";
+import { readFileSync as readFileSync2 } from "node:fs";
 function packageName(specifier) {
   const parts = specifier.split("/");
   return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
@@ -12677,7 +12735,7 @@ function installBunResolver(modules) {
     const name = String(specifier);
     const closure = closureAt(caller);
     if (!closure) throw new Error("composition module closure is no longer admitted");
-    const target = checkedBunSpecifier(name, closure.root, closure.receipt.files, caller, false);
+    const target = checkedBunSpecifier(name, closure.receipt, caller, false);
     const singleton = classifySpecifier(target);
     if (singleton !== null) return modules[singleton];
     return import(target, options);
@@ -12703,13 +12761,13 @@ function installBunResolver(modules) {
           const loader2 = extension === "tsx" ? "tsx" : extension === "ts" || extension === "mts" || extension === "cts" ? "ts" : extension === "jsx" || extension === "js" ? "jsx" : "js";
           return { contents: readFileSync2(args.path, "utf8"), loader: loader2 };
         }
-        if (!(closure.path in closure.receipt.files) || realpathSync2(args.path) !== args.path) throw new Error("module was absent from reviewed composition closure or contains a symbolic link");
+        if (!(closure.path in closure.receipt.files) || !unlinkedInside(closure.receipt, closure.path, args.path)) throw new Error("module was absent from reviewed composition closure or contains a symbolic link");
         const bytes = readFileSync2(args.path);
         if (bytes.length > 64 * 1024 * 1024 || createHash2("sha256").update(bytes).digest("hex") !== closure.receipt.files[closure.path]) throw new Error("composition module bytes changed after review");
         if (closure.path.endsWith(".json")) return { contents: `export default JSON.parse(${JSON.stringify(bytes.toString("utf8"))});`, loader: "js" };
         let source;
         try {
-          source = prepareBunSource(bytes.toString("utf8"), args.path, (specifier, require3) => checkedBunSpecifier(specifier, closure.root, closure.receipt.files, pathToFileURL3(args.path).href, require3));
+          source = prepareBunSource(bytes.toString("utf8"), args.path, (specifier, require3) => checkedBunSpecifier(specifier, closure.receipt, pathToFileURL3(args.path).href, require3));
         } catch (error) {
           if (error instanceof SyntaxError) throw new Error("reviewed composition module has unsupported JavaScript syntax");
           throw error;
@@ -12719,7 +12777,7 @@ function installBunResolver(modules) {
     }
   });
 }
-function checkedBunSpecifier(specifier, root, files, caller, require3) {
+function checkedBunSpecifier(specifier, closure, caller, require3) {
   const key = classifySpecifier(specifier);
   if (key !== null) {
     if (!(key in globalThis[REGISTRY_KEY])) throw new UnsupportedPeerError(specifier);
@@ -12730,12 +12788,31 @@ function checkedBunSpecifier(specifier, root, files, caller, require3) {
   const path = file ? require3 && !specifier.startsWith("file:") ? resolve3(dirname(fileURLToPath2(caller)), specifier) : resolve3(fileURLToPath2(file)) : void 0;
   if (!path) throw new Error("bare dependency is absent from this reviewed composition; package its reviewed relative source");
   if (file?.search || file?.hash) throw new Error('Bun does not preserve reviewed module query or fragment identity; select [extension_host] runtime = "node" for this composition');
-  const inside = relative2(root, path).split(sep2).join("/");
-  if (inside === ".." || inside.startsWith("../") || isAbsolute2(inside) || !(inside in files)) throw new Error("composition import escapes the reviewed file closure");
+  const inside = keyIn(closure, path);
+  if (inside === void 0 || !(inside in closure.files)) throw new Error("composition import escapes the reviewed file closure");
   return require3 ? path : file.href;
 }
+function keyIn(closure, path) {
+  const canonical = insideKey(closure.canonicalRoot, path);
+  if (canonical !== void 0) return canonical;
+  for (const root of closure.rawRoots) {
+    const raw = insideKey(root, path);
+    if (raw !== void 0) return raw;
+  }
+}
+function unlinkedInside(closure, key, path) {
+  let canonical;
+  try {
+    canonical = canonicalPath(path);
+  } catch {
+    return false;
+  }
+  return unlinkedKeyMatches(closure.canonicalRoot, key, canonical);
+}
 function admitReviewedClosure(baseUrl, files) {
-  const root = realpathSync2(resolve3(fileURLToPath2(baseUrl)));
+  const rawRoot = resolve3(fileURLToPath2(baseUrl));
+  const canonicalRoot = canonicalPath(rawRoot);
+  const id = pathKey(canonicalRoot);
   const accepted = /* @__PURE__ */ Object.create(null);
   const keys = Object.keys(files);
   if (keys.length > 4096) throw new Error("reviewed composition closure exceeds its file limit");
@@ -12743,35 +12820,36 @@ function admitReviewedClosure(baseUrl, files) {
     if (!key || key.split("/").some((part) => !part || part === "." || part === "..") || key.includes("\\") || key.includes(":") || isAbsolute2(key) || !/^[a-f0-9]{64}$/.test(files[key])) throw new Error("invalid reviewed composition closure file");
     accepted[key] = files[key];
   }
-  const existing = reviewedClosures.get(root);
+  const existing = reviewedClosures.get(id);
   if (existing) {
     if (Object.keys(existing.files).length !== keys.length || keys.some((key) => existing.files[key] !== accepted[key])) throw new Error("the same composition root carries different file receipts");
     existing.refs++;
-  } else reviewedClosures.set(root, { files: Object.freeze(accepted), refs: 1 });
+    existing.rawRoots.add(rawRoot);
+  } else reviewedClosures.set(id, { files: Object.freeze(accepted), refs: 1, canonicalRoot, rawRoots: /* @__PURE__ */ new Set([rawRoot]) });
   let disposed = false;
   return () => {
     if (disposed) return;
     disposed = true;
-    const current2 = reviewedClosures.get(root);
-    if (current2 && --current2.refs === 0) reviewedClosures.delete(root);
+    const current2 = reviewedClosures.get(id);
+    if (current2 && --current2.refs === 0) reviewedClosures.delete(id);
   };
 }
 async function importReviewedModule(baseUrl, path) {
-  const root = realpathSync2(resolve3(fileURLToPath2(baseUrl)));
-  const receipt = reviewedClosures.get(root);
+  const rawRoot = resolve3(fileURLToPath2(baseUrl));
+  const id = pathKey(canonicalPath(rawRoot));
+  const receipt = reviewedClosures.get(id);
   if (!receipt) throw new Error("composition module closure is no longer admitted");
-  const entry = resolve3(root, path);
+  const entry = resolve3(rawRoot, path);
   const admitted = closureAt(pathToFileURL3(entry).href);
-  if (!admitted || admitted.root !== root || !(admitted.path in receipt.files)) throw new Error("composition module is absent from reviewed closure");
+  if (!admitted || admitted.root !== id || !(admitted.path in receipt.files)) throw new Error("composition module is absent from reviewed closure");
   return import(pathToFileURL3(entry).href);
 }
 function closureAt(url) {
   if (!url?.startsWith("file:")) return;
   const path = resolve3(fileURLToPath2(url));
   for (const [root, receipt] of reviewedClosures) {
-    const inside = relative2(root, path);
-    if (inside === ".." || inside.startsWith(`..${sep2}`) || isAbsolute2(inside)) continue;
-    return { root, receipt, path: inside.split(sep2).join("/") };
+    const inside = keyIn(receipt, path);
+    if (inside !== void 0) return { root, receipt, path: inside };
   }
 }
 function installResolveHooks(modules) {
@@ -12807,6 +12885,7 @@ function installResolveHooks(modules) {
       const closure = closureAt(url);
       if (closure) {
         if (!(closure.path in closure.receipt.files) || result.source === void 0 || result.source === null) throw new Error("module was absent from reviewed composition closure");
+        if (!unlinkedInside(closure.receipt, closure.path, fileURLToPath2(url))) throw new Error("module was absent from reviewed composition closure or contains a symbolic link");
         const source = typeof result.source === "string" ? Buffer.from(result.source) : Buffer.from(result.source);
         if (source.length > 64 * 1024 * 1024 || createHash2("sha256").update(source).digest("hex") !== closure.receipt.files[closure.path]) throw new Error("composition module bytes changed after review");
       }
@@ -12819,6 +12898,7 @@ var init_resolve_hooks = __esm({
   "src/dsh/resolve-hooks.ts"() {
     "use strict";
     init_define_BUILTIN_MODULE_DIGESTS();
+    init_canonical_path();
     init_runtime();
     init_bun_closure();
     SCHEME = "codewhale-host:";
@@ -13182,7 +13262,7 @@ var init_protocol_generated = __esm({
       },
       RegisterParams: {
         strict: true,
-        required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "prompt_template", "skill_root", "shell_hook", "mcp_server"] }, spec: { ref: "RegisterSpecWire" } },
+        required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "prompt_template", "skill_root", "avatar_pack", "shell_hook", "mcp_server"] }, spec: { ref: "RegisterSpecWire" } },
         optional: { scope: { ref: "EntryRef" } }
       },
       RegisterSpecWire: {
@@ -13297,7 +13377,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "prompt_template" || kind === "skill_root" || kind === "shell_hook" || kind === "mcp_server") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "prompt_template" || kind === "skill_root" || kind === "avatar_pack" || kind === "shell_hook" || kind === "mcp_server") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;
@@ -13677,7 +13757,7 @@ async function retryWindowsSharing(operation, beforeRetry) {
       return await operation();
     } catch (error) {
       if (process.platform !== "win32" || retry >= 10 || !["EACCES", "EBUSY", "EPERM"].includes(fsCode(error) ?? "")) throw error;
-      await delay2(50);
+      await delay2((retry + 1) * 50);
     }
   }
 }
@@ -13781,10 +13861,9 @@ function createStorage({ dataDir, isActive, onWarning }) {
       file = void 0;
       await retryWindowsSharing(async () => {
         active();
-        await rename2(temporary, join(directory2, name));
-      }, async () => {
+        await readRecordOnce(directory2, name);
         active();
-        await readRecord(directory2, name);
+        await rename2(temporary, join(directory2, name));
       });
       published = true;
       await syncDirectory(directory2);
@@ -13869,6 +13948,74 @@ var init_storage = __esm({
         super(message);
         this.code = code;
         this.name = "StorageError";
+      }
+    };
+  }
+});
+
+// src/shims/avatars.ts
+function normalizeAvatarPack(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => key !== "path")) throw new TypeError("avatar pack supports only path");
+  const { path } = value;
+  if (typeof path !== "string" || !path || Buffer.byteLength(path, "utf8") > 256 || !path.endsWith(".json") || /[\\:\u0000-\u001f\u007f-\u009f]/u.test(path) || path.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new TypeError("avatar pack path must be a bounded bundle-relative path with normal slash-separated components");
+  }
+  return Object.freeze({ path });
+}
+function defineAvatarsService(host2) {
+  class AvatarsShim extends Service {
+    constructor(ctx) {
+      super(ctx, "avatars");
+    }
+    registerPack(definition) {
+      const ctx = this.ctx;
+      const owner = host2.ownerOf(ctx);
+      if (!owner) throw new Error("avatars.registerPack called outside an extension owner");
+      const root = normalizeAvatarPack(definition);
+      return ctx.effect(() => host2.avatarPacks.register(owner, root), `avatars.registerPack(${JSON.stringify(root.path)})`);
+    }
+  }
+  Object.freeze(AvatarsShim.prototype);
+  return AvatarsShim;
+}
+var MAX_AVATAR_PACKS_PER_OWNER, MAX_AVATAR_PACKS_PER_HOST, AvatarPacks;
+var init_avatars = __esm({
+  "src/shims/avatars.ts"() {
+    "use strict";
+    init_define_BUILTIN_MODULE_DIGESTS();
+    init_lib2();
+    init_owned();
+    MAX_AVATAR_PACKS_PER_OWNER = 4;
+    MAX_AVATAR_PACKS_PER_HOST = 16;
+    AvatarPacks = class {
+      registrations;
+      owners = /* @__PURE__ */ new Map();
+      count = 0;
+      constructor(rpc2, ownedBy, warn) {
+        this.registrations = new OwnedRegistrations(rpc2, "avatar_pack", ownedBy, warn);
+      }
+      register(owner, definition) {
+        if (owner.state !== "activating" && owner.state !== "active") throw new Error("avatar owner is not live");
+        const { path } = normalizeAvatarPack(definition);
+        const roots = this.owners.get(owner) ?? /* @__PURE__ */ new Map();
+        if (roots.has(path)) throw new Error("avatar pack is already registered; dispose it before registering it again");
+        if (roots.size >= MAX_AVATAR_PACKS_PER_OWNER || this.count >= MAX_AVATAR_PACKS_PER_HOST) throw new RangeError("avatar pack owner or host registration limit reached");
+        const undo = this.registrations.add({ owner, name: path, disposed: false }, { name: path, description: "" });
+        const dispose = () => {
+          if (roots.get(path) !== dispose) return;
+          roots.delete(path);
+          this.count--;
+          if (!roots.size) this.owners.delete(owner);
+          undo();
+        };
+        roots.set(path, dispose);
+        this.owners.set(owner, roots);
+        this.count++;
+        return dispose;
+      }
+      forget(owner) {
+        for (const dispose of [...this.owners.get(owner)?.values() ?? []]) dispose();
+        this.registrations.forget(owner);
       }
     };
   }
@@ -14119,6 +14266,7 @@ var init_root = __esm({
     init_prompt();
     init_storage();
     init_mcp();
+    init_avatars();
     init_skills();
     init_tier();
     init_commands();
@@ -14143,10 +14291,11 @@ var init_root = __esm({
       "prompt",
       "storage",
       "skills",
+      "avatars",
       "mcp",
       "logger"
     ]);
-    PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "prompt", "storage", "skills", "mcp", "logger", "events", "reflect", "registry"]);
+    PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "prompt", "storage", "skills", "avatars", "mcp", "logger", "events", "reflect", "registry"]);
     ACTIVATE_DEADLINE_MS = 5e3;
     DISPOSE_DEADLINE_MS = 2e3;
     ownerStorage = new AsyncLocalStorage();
@@ -14182,6 +14331,7 @@ var init_root = __esm({
           (message, owner) => this.log("warn", message, owner)
         );
         this.mcpDefinitions = new McpDefinitions(rpc2, (owner) => owner.mcpDefinitions, (message, owner) => this.log("warn", message, owner));
+        this.avatarPacks = new AvatarPacks(rpc2, (owner) => owner.avatarPacks, (message, owner) => this.log("warn", message, owner));
         this.skillRoots = new SkillRoots(
           rpc2,
           (owner) => owner.skillRoots,
@@ -14254,6 +14404,7 @@ var init_root = __esm({
         });
         const ShellHooksShim = defineShellHooksService({ ownerOf: (ctx) => ctx[OWNER], registrations: this.shellRegistrations });
         const McpShim = defineMcpService({ ownerOf: (ctx) => ctx[OWNER], definitions: this.mcpDefinitions });
+        const AvatarsShim = defineAvatarsService({ ownerOf: (ctx) => ctx[OWNER], avatarPacks: this.avatarPacks });
         const SkillsShim = defineSkillsService({ ownerOf: (ctx) => ctx[OWNER], skillRoots: this.skillRoots });
         class StorageShim extends Service {
           constructor(ctx) {
@@ -14284,6 +14435,7 @@ var init_root = __esm({
         shimClasses.set("prompt", PromptShim);
         shimClasses.set("storage", StorageShim);
         shimClasses.set("skills", SkillsShim);
+        shimClasses.set("avatars", AvatarsShim);
         shimClasses.set("mcp", McpShim);
         shimClasses.set("shellHooks", ShellHooksShim);
         root.plugin(ToolsShim);
@@ -14291,6 +14443,7 @@ var init_root = __esm({
         root.plugin(PromptShim);
         root.plugin(StorageShim);
         root.plugin(SkillsShim);
+        root.plugin(AvatarsShim);
         root.plugin(McpShim);
         root.plugin(ShellHooksShim);
         shimClasses.set("loader", ReviewedLoader);
@@ -14306,6 +14459,7 @@ var init_root = __esm({
       hookRegistrations;
       promptSections;
       skillRoots;
+      avatarPacks;
       mcpDefinitions;
       log(level, msg, owner) {
         const params = { level, msg: msg.slice(0, 8192) };
@@ -14347,7 +14501,7 @@ var init_root = __esm({
         const scopeKey = params.scope === void 0 ? void 0 : `${params.scope.path}\0${params.scope.sha256}`;
         if (scopeKey !== void 0) {
           if (params.scope?.path !== params.entry.path || params.scope?.sha256 !== params.entry.sha256) return { status: "failed", diagnostic: "scope does not match the core-selected entry" };
-          parent ??= { ref: params.owner, pluginName: params.plugin_name, fibers: [], pendingRegistrations: /* @__PURE__ */ new Set(), refusals: [], tools: /* @__PURE__ */ new Map(), commands: /* @__PURE__ */ new Map(), hooks: /* @__PURE__ */ new Map(), shellHooks: /* @__PURE__ */ new Map(), promptSections: /* @__PURE__ */ new Map(), skillRoots: /* @__PURE__ */ new Map(), mcpDefinitions: /* @__PURE__ */ new Map(), entries: /* @__PURE__ */ new Set(), views: /* @__PURE__ */ new Map(), state: "active", ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir } };
+          parent ??= { ref: params.owner, pluginName: params.plugin_name, fibers: [], pendingRegistrations: /* @__PURE__ */ new Set(), refusals: [], tools: /* @__PURE__ */ new Map(), commands: /* @__PURE__ */ new Map(), hooks: /* @__PURE__ */ new Map(), shellHooks: /* @__PURE__ */ new Map(), promptSections: /* @__PURE__ */ new Map(), skillRoots: /* @__PURE__ */ new Map(), avatarPacks: /* @__PURE__ */ new Map(), mcpDefinitions: /* @__PURE__ */ new Map(), entries: /* @__PURE__ */ new Set(), views: /* @__PURE__ */ new Map(), state: "active", ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir } };
           if (parent.state !== "active" || parent.ref.plugin_id !== params.owner.plugin_id || parent.ref.generation !== params.owner.generation || parent.pluginName !== params.plugin_name) return { status: "failed", diagnostic: "scope owner was withdrawn" };
           parent.views ??= /* @__PURE__ */ new Map();
           this.owners.set(key, parent);
@@ -14376,6 +14530,7 @@ var init_root = __esm({
           shellHooks: /* @__PURE__ */ new Map(),
           promptSections: /* @__PURE__ */ new Map(),
           skillRoots: /* @__PURE__ */ new Map(),
+          avatarPacks: /* @__PURE__ */ new Map(),
           mcpDefinitions: /* @__PURE__ */ new Map(),
           entries: /* @__PURE__ */ new Set(),
           ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir },
@@ -14441,6 +14596,7 @@ var init_root = __esm({
             this.shellRegistrations.forget(owner);
             this.promptSections.forget(owner);
             this.skillRoots.forget(owner);
+            this.avatarPacks.forget(owner);
             this.mcpDefinitions.forget(owner);
             if (scopeKey === void 0) {
               if (this.owners.get(key) === owner) this.owners.delete(key);
@@ -14514,6 +14670,7 @@ var init_root = __esm({
           ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
           ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`),
           ...[...owner.mcpDefinitions.values()].map((server) => `mcp_server:${server.name}`),
+          ...[...owner.avatarPacks.values()].map((pack) => `avatar_pack:${pack.name}`),
           ...[...owner.skillRoots.values()].map((root) => `skill_root:${root.name}`)
         ];
         for (const fiber of owner.fibers) {
@@ -14525,6 +14682,7 @@ var init_root = __esm({
         this.shellRegistrations.forget(owner);
         this.promptSections.forget(owner);
         this.skillRoots.forget(owner);
+        this.avatarPacks.forget(owner);
         this.mcpDefinitions.forget(owner);
         if (scopeKey === void 0) this.owners.delete(ref2.owner_token);
         else parent?.views?.delete(scopeKey);
@@ -14789,7 +14947,7 @@ __export(composition_exports, {
 });
 import { createHash as createHash5 } from "node:crypto";
 import { readFile as readFile3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute4, relative as relative3, resolve as resolve4, sep as sep3 } from "node:path";
+import { isAbsolute as isAbsolute4, relative as relative2, resolve as resolve4, sep as sep2 } from "node:path";
 import { fileURLToPath as fileURLToPath5 } from "node:url";
 function digest(bytes) {
   return createHash5("sha256").update(bytes).digest("hex");
@@ -15065,8 +15223,8 @@ var init_composition = __esm({
       async importReviewed(module) {
         const root = fileURLToPath5(this.base);
         const path = resolve4(root, module.path);
-        const inside = relative3(root, path);
-        if (inside.startsWith(`..${sep3}`) || inside === ".." || isAbsolute4(inside)) throw new Error("module escapes reviewed bundle");
+        const inside = relative2(root, path);
+        if (inside.startsWith(`..${sep2}`) || inside === ".." || isAbsolute4(inside)) throw new Error("module escapes reviewed bundle");
         if (this.spec.files[module.path] !== module.sha256 || digest(await readFile3(path)) !== module.sha256) throw new Error("module changed after review");
         return importReviewedModule(this.base, module.path);
       }

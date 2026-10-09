@@ -200,7 +200,10 @@ impl CodewhaleClient {
                     self.http1_fallback_client(),
                     policy,
                 );
-                self.send_with_retry(|| {
+                // Stream open: the same retry and rate-limit handling with no
+                // total deadline — a per-request total would ride on the
+                // returned SSE body and hard-cut the live stream.
+                self.send_stream_open_with_retry(|| {
                     client
                         .post(&url)
                         .header("Content-Type", "application/json")

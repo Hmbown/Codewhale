@@ -2,6 +2,7 @@
 
 > 英文原文：[RUNTIME_API.md](../RUNTIME_API.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐设备令牌意图、逐调用变更、技能详情、持久配置与账号宪章契约。
 
 `codewhale app-server` 是本地运行时的规范 API 与控制面。本地 SDK、移动端/远程控制客户端
 以及编辑器集成都与它对话，而不是去抓取终端输出。它提供完整的 HTTP/SSE 运行时
@@ -62,6 +63,21 @@ local supervisor / SDK / automation harness
 旧式的进程内 `codewhale app-server` 在绑定非回环主机之前，同样要求显式的
 `--auth-token` 或 `CODEWHALE_APP_SERVER_TOKEN`；它生成的一次性 `cwapp_*` 令牌
 只能用于回环。
+
+### 设备令牌的 Watch / Drive 意图
+
+主令牌通过 `POST /v1/auth/client-tokens` 铸造的设备令牌有不可变的 `intent`：
+省略时为 `watch`，控制需显式指定 `drive`。标签不授予权限。Watch 可读取普通
+GET/HEAD、查看 Computer 显示并申请一次性显示票据；不能修改 Runtime 状态、
+把受保护的 HTTP 读取升级成写通道、取得/释放控制或转发输入。
+Drive 保留现有 Runtime/控制权限，但不能铸造、列举或撤销设备令牌。
+显示票据保留签发主体的意图；输入仍需该精确主体当前有效的控制租约。
+
+`GET /v1/runtime/info` 宣告 `capabilities.client_token_intents: true`，
+铸造回执返回 `device_id`、`intent` 和 `expires_at`。Relay 签发者必须先确认此能力，
+再核对回执与请求的设备/意图相同，才可暴露令牌。旧 Engine 没有此强制边界，
+签发者必须拒绝为其发放 relay grant；意图式标签或旧版铸造成功不足以证明权限。
+这不为 Engine 本地设备令牌添加账号/Computer 所有权范围。
 
 ### 工作区文件建议
 
@@ -248,6 +264,32 @@ delta 意味着什么，以及它看不到什么：
 
 Fleet 回执工件保留自己的路由
 （`GET /v1/fleet/runs/{run_id}/receipts/{task_id}/evidence`）。
+
+### 一个工具调用实际改了什么
+
+`GET /v1/threads/{id}/turns/{turn_id}/calls/{tool_call_id}/changes?limit=`
+从同一回合的 `tool:` / `post-tool:` 两个恢复点读取逐调用变更。Shell 自己写的文件
+也会出现；它没有 `metadata.mutation`，不能仅靠文件工具事件归因。
+响应含 `thread_id`、`turn_id`、`tool_call_id`、`tool_name`、`state`、`reason`、
+`truncated` 和 `files`。每个文件有 `path`、`change`、`added`、`removed`、`size`、
+`revision`、`restore_snapshot_id`、`diff` 与 `diff_truncated`。
+
+- `change` 为 `created`、`updated` 或 `deleted`；类型变更是 `updated`，
+  移动是删除加创建。二进制文件的行数是 `null`。
+- `size` / `revision` 属于区间末尾，绝不从当前工作树猜测。`revision` 是裸
+  SHA-256；传给 `file-revert` 时用 `sha256:<hex>`，该调用删除的路径用 `absent`。
+  删除或文件过大无法读取时，`size` / `revision` 为 `null`。
+- `diff` 在字符边界截到 64 KiB。二进制、无内容差异或无补丁时为 `null`。
+- `pending` 表示调用排队/执行中，快照对未完整；`files` 为空，结算后再读取。
+  `captured` 也可能是空文件列表，表示完整记录的调用没有改动。
+- `unavailable` 的 `reason` 可以是 `call_not_bounded`、`post_snapshot_missing`、
+  `pre_snapshot_missing` 或 `snapshots_pruned`。这不是“没有改动”：回执中的
+  `changed_paths` 仍可读取，但旧快照可能已被修剪或删除。
+- `limit` 默认 200、最大 1000；被截断时 `truncated` 为真，不返回省略数量。
+  读取只在旁仓执行 `git diff`，不更改工作树或索引。
+
+未知线程/回合、别的线程的回合或没有对应记录的调用返回 404；非法 `limit`
+返回 400；记录读取/解析或快照仓操作故障返回 500，不能当作快照已被修剪。
 
 ### 运行时与账号身份
 
@@ -464,6 +506,14 @@ owner 存储中的原始操作；响应丢失或来源历史后来增长不会�
 只有在非活动的本地 owner 已关闭并等待退出之后，现有 TUI 才取得会话租约和存储。
 活动 owner 或不确定的交接会拒绝挂接。`--operation-key <KEY>` 恢复原始结果；
 可以完成已验证并准备好的目标；尚未准备好或无法验证的结果保留不确定性。
+
+### 持久配置写入
+
+`app/config/set` 与 `app/config/unset` 在回复前写入规范 owner 使用的配置文件：
+显式 `--config` 路径，或默认 `config.toml`。设置在 app-server 退出后仍保留。
+变更在锁内重新读取并合并磁盘当前文件，保留其他进程已保存的编辑。
+文件无法读取、解析或写入时返回 `ok: false`，不会更改它；解析失败的文件不被重写，
+请先手工修好再 `app/config/reload`。HTTP `/app` 的非法键/值返回 400，I/O 失败返回 500。
 
 ### 回答澄清提问
 
@@ -860,7 +910,7 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 
 **线程**（持久运行时数据模型）
 - `GET /v1/threads?limit=50&include_archived=false&archived_only=false`
-- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false`
+- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false&thread_ids=<id>,<id>`
 - `GET /v1/threads/running`
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
@@ -873,6 +923,10 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
   （只读；形态见 [RECEIPTS.md](../RECEIPTS.md)）
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — 同上，针对一个回合；
   未知线程或不属于该线程的回合返回 `404`
+
+`thread_ids` 是逗号分隔的列表，最多 200 个 ID（每个 ID 最多 128 字节）。路由会在应用
+`limit` 前按精确 ID 过滤，并保留最新优先顺序。这只是选择过滤器，不是
+所有权或授权检查；Runtime bearer token 仍是访问边界。
 
 `POST /v1/threads` 除了提供商、模型、工作区与权限字段外，还接受可选的执行默认值：
 
@@ -1459,6 +1513,12 @@ direction 为空、等待 lead 计划、缺少凭据或有
 - `GET /v1/workspace/files?path=<dir>&limit=<1-2000>`、`GET /v1/workspace/files/read?path=<file>&offset=&limit=`
   与 `PUT /v1/workspace/files`（参见上文的工作区文件与会话工件）
 - `GET /v1/skills`
+- `GET /v1/skills/{name}` — 返回路由元数据（`source`、`invocation`、`aliases`、
+  `bundled_tier`、`enabled`）及完整 `SKILL.md`，让客户端为自己的下一回合组成激活指令。
+  不存在的技能或已删除的原生文件返回 404；权限已过期的插件快照返回 403。
+  客户端先查 `GET /v1/runtime/info` 的 `capabilities.skill_detail`；单凭 404
+  无法区分“没有这项技能”与“没有这条路由”。
+
 - `GET /v1/apps/mcp/servers`
 - `GET /v1/apps/mcp/tools?server=<optional>`
 
@@ -2471,3 +2531,28 @@ cargo test -p codewhale-app-server capabilities
 scripts/release/app-server-smoke.sh --matrix        # dry-run plan
 bash scripts/release/app-server-smoke.test.sh       # parser self-test (fake binary)
 ```
+
+
+## 账号宪章快照
+
+Runtime 能力 `profile_constitution` 允许 `POST /v1/threads/{id}/turns` 携带
+`profile_constitution: {accountId, revision, constitution}`。`constitution` 严格为
+`{schemaVersion: 1, detail, initiative, collaboration, notes}`，选项分别是
+`brief|balanced|detailed`、`check|judgment|moving`、`direct|critical|coach`；
+`notes` 最多 4,000 个 Unicode 字符。无效数据被拒绝。
+
+已认证的账号传输提供快照，快照参与回合重放身份。Engine 使用现有个人宪章渲染器，
+记录到原生会话历史；提供商重试、压缩、内部续接与 RLM 子调用保持已接纳的快照，
+不会中途重读宿主操作者的账号。新快照完整替换旧个人偏好；权限与审批策略不变。
+
+没有随请求提供快照时，Engine 在回合接纳时从配置的账号服务读取已登录资料。
+Engine 自行读取的资料不可用或无效时，本回合改用未登录的本地宪章，并在本会话中只提示一次；宿主随请求
+提交的 `profile_constitution` 快照无效时仍会使回合失败，`GET /v1/constitution` 仍会报告该错误。
+没有已保存偏好的账号使用显式默认
+快照，未登录账号使用现有本地宪章。托管传输始终提交所属账号快照（包括默认值），
+以免本地偏好跨账号泄露。
+
+`GET /v1/constitution` 读取下一回合的资料与模型指导，不是活跃回合已采用新编辑
+的回执。`POST /v1/constitution/preview` 接受宪章文档，返回
+`{modelGuidance, saved:false}`，不保存。两条路由遵循普通 Runtime 授权；
+旧 Runtime 必须升级后才能接收携带账号宪章的回合。

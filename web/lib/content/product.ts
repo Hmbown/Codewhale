@@ -31,47 +31,47 @@ export interface ProductAvailabilityRow {
 
 export const PRODUCT_COPY = {
   metadata: {
-    title: { en: "Product · Codewhale", zh: "产品 · Codewhale" },
+    title: { en: "Build and automate · Codewhale", zh: "构建与自动化 · Codewhale" },
     description: {
-      en: "Codewhale is an open-source agent that reads your project, edits files, runs commands, and uses connected tools with the model you choose.",
-      zh: "Codewhale 是一个开源智能体，使用你选择的模型读取项目、编辑文件、运行命令并使用连接的工具。",
+      en: "Build apps, automate workflows and work across connected tools with an open-source agent. Bring your existing model APIs or local and self-hosted inference.",
+      zh: "用开源智能体构建应用、自动处理工作，并连接你常用的工具。使用你已有的模型 API、本地模型或自托管推理服务。",
     },
   },
   title: {
-    en: "Hand off the work. Keep the controls.",
-    zh: "把工作交出去，控制权留在手里。",
+    en: "Build apps and automate workflows",
+    zh: "构建应用，自动化工作流",
   },
   lede: {
-    en: "Codewhale is an open-source agent that reads a project, edits files, runs commands, and uses connected tools. Direct it from your terminal, the local browser, or the CodeWhale GUI in VS Code, and resume any saved session.",
-    zh: "Codewhale 是一个开源智能体，能够读取项目、编辑文件、运行命令并使用连接的工具。在终端、本地浏览器或 VS Code 中的 CodeWhale GUI 里指挥它，并可继续任何已保存的会话。",
+    en: "Codewhale is an open-source agent that writes code, runs commands and works with the tools you connect. Use your existing model APIs, or run models locally and on your own servers.",
+    zh: "Codewhale 是一个开源智能体，可以编写代码、运行命令，并使用你连接的工具。使用已有的模型 API，或在本地和自己的服务器上运行模型。",
   },
 
-  gainHeading: { en: "Choose the model, split the work, set limits", zh: "选择模型、分配工作、设定限制" },
+  gainHeading: { en: "What you can build and automate", zh: "可以构建与自动化的工作" },
   gain: [
     {
-      title: { en: "Choose your models", zh: "选择你的模型" },
+      title: { en: "Build apps and useful tools", zh: "构建应用和实用工具" },
       body: {
-        en: "Connect a provider with your API key or a supported sign-in, use a gateway, or run a local model server. Switch models per session.",
-        zh: "使用你的 API 密钥或受支持的登录方式连接提供商，也可以使用网关或本地模型服务。按会话切换模型。",
+        en: "Create a new application, extend a project, turn data into a report, or write a script that saves you time. The agent can create files, run commands and test the result.",
+        zh: "做一个新应用、扩展现有项目、将数据整理成报告，或写一个节省时间的脚本。智能体可以创建文件、运行命令并测试成果。",
       },
     },
     {
-      title: { en: "Split the work", zh: "分工协作" },
+      title: { en: "Work across your apps", zh: "让应用一起参与工作" },
       body: {
-        en: "Assign parts of a larger task to agents with different models and roles. Save the team as a Fleet and reuse it.",
-        zh: "把大型任务的各部分分配给使用不同模型和角色的智能体。将团队保存为 Fleet，之后重复使用。",
+        en: "Add tools through plugins and MCP servers, or use APIs from your own scripts. Each service needs its own setup and authentication.",
+        zh: "通过插件和 MCP 服务添加工具，或在自己的脚本中使用 API。每项服务都需要单独配置并完成身份验证。",
       },
     },
     {
-      title: { en: "Set the permissions", zh: "设定权限" },
+      title: { en: "Make a workflow you can reuse", zh: "把工作变成可复用的流程" },
       body: {
-        en: "Pick the mode and approval settings, then inspect each tool call and file change. Interrupt at any point and continue from the saved session.",
-        zh: "选择模式与审批设置，然后查看每次工具调用和文件变更。随时中断，并从保存的会话继续。",
+        en: "Run tasks from scripts or CI with codewhale exec. For larger jobs, save a Fleet of agents with different roles and models and bring the team back when you need it.",
+        zh: "用 codewhale exec 从脚本或 CI 中运行任务。面对更大的工作，保存由不同角色、不同模型组成的 Fleet 智能体团队，需要时再一起上场。",
       },
     },
   ] satisfies ProductRow[],
 
-  availabilityHeading: { en: "Use it in your terminal today", zh: "现在就在终端中使用" },
+  availabilityHeading: { en: "Available now and in development", zh: "已可使用和正在开发的版本" },
   availabilityLede: {
     en: "The terminal, local browser client, and community CodeWhale GUI are available now and need no Codewhale account. The desktop and hosted web apps are in development, share the same session model, and use an account; your model connection stays your choice.",
     zh: "终端、本地浏览器客户端与社区维护的 CodeWhale GUI 现已可用，无需 Codewhale 账户。桌面和托管网页应用正在开发，共用同一会话模型，需要使用账户；模型连接仍由你选择。",
@@ -139,15 +139,15 @@ export const PRODUCT_COPY = {
     },
   ] satisfies ProductAvailabilityRow[],
 
-  controlHeading: { en: "Set what the agent may do", zh: "设定智能体可以做什么" },
+  controlHeading: { en: "Set permissions and approvals", zh: "设置权限与审批方式" },
   controlLede: {
-    en: "Use Plan to explore, Work to make changes, and Operate to coordinate agents. Approval settings decide which actions wait for you.",
-    zh: "用 Plan 探索方案、Work 执行修改、Operate 协调智能体。审批设置决定哪些操作需要等你确认。",
+    en: "Use Plan to explore, Work to carry out a task, and Operate to coordinate larger jobs. Approval settings decide which actions wait for you.",
+    zh: "用 Plan 探索方案、Work 执行任务、Operate 协调较大的工作。审批设置决定哪些操作需要等你确认。",
   },
   modes: [
     { title: { en: "Plan", zh: "Plan" }, body: { en: "Blocks file mutation and shell execution. Permitted research may contact external services; session state can still be saved.", zh: "禁止文件修改与 shell 执行。获准的研究可访问外部服务；会话状态仍可保存。" } },
     { title: { en: "Work", zh: "Work" }, body: { en: "Edits files and runs commands within the permission you set.", zh: "在你设定的权限内修改文件、运行命令。" } },
-    { title: { en: "Operate", zh: "Operate" }, body: { en: "Runs a Fleet: several agents on one job, each in its role.", zh: "运行 Fleet：多个智能体按各自角色处理同一项任务。" } },
+    { title: { en: "Operate", zh: "Operate" }, body: { en: "Coordinates larger jobs, delegating to other agents when useful. Uses the same tools and permission boundaries as Work.", zh: "协调较大的任务，按需委派其他智能体。使用与 Work 相同的工具，遵循相同的权限边界。" } },
   ] satisfies ProductRow[],
   permissions: [
     { title: { en: "Ask", zh: "Ask" }, body: { en: "Prompts according to the active approval rules; saved permissions and hard policy boundaries still apply.", zh: "按当前审批规则询问；已保存的权限与强制策略边界仍然生效。" } },
@@ -155,10 +155,10 @@ export const PRODUCT_COPY = {
     { title: { en: "Full Access", zh: "Full Access" }, body: { en: "Reduces approval prompts. It does not bypass hard policy boundaries or grant access outside the allowed scope.", zh: "减少审批提示，但不会绕过强制策略边界，也不会授予允许范围之外的访问权限。" } },
   ] satisfies ProductRow[],
 
-  surfacesHeading: { en: "Connect the tools your work needs", zh: "连接工作所需的工具" },
+  surfacesHeading: { en: "Work across files and tools", zh: "在文件与工具之间完成工作" },
   surfacesLede: {
-    en: "Tools let the agent act: edit files, run commands, or call a connected service. Codewhale runs the agent and its tools on your machine, and plugins get only the permissions you grant.",
-    zh: "工具让智能体能够行动：编辑文件、运行命令或调用连接的服务。Codewhale 在你的电脑上运行智能体及其工具，插件只获得你授予的权限。",
+    en: "Work with your project, connected services, browser tools and agent teams from one session. Choose the model, add the connections you need, and return to the work without starting over.",
+    zh: "在同一个会话中使用项目文件、已连接的服务、浏览器工具和智能体团队。选择模型，添加所需的连接，之后随时接着做，无需从头开始。",
   },
   surfacesLink: { en: "See all integrations", zh: "查看全部集成" },
 

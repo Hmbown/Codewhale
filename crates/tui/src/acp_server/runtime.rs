@@ -445,6 +445,286 @@ mod tests {
         serde_json::from_value(json!({"seq":seq,"timestamp":chrono::Utc::now(),"thread_id":thread,"turn_id":turn,"event":name,"payload":payload})).unwrap()
     }
     #[tokio::test(flavor = "current_thread")]
+    async fn acp_full_access_projects_runtime_policy_holds_and_extension_permissions() -> Result<()>
+    {
+        use crate::core::engine::{MockApprovalEvent, mock_engine_handle};
+        use crate::core::events::{Event, TurnOutcomeStatus};
+        use crate::core::ops::Op;
+
+        for (forced, extension) in [(false, false), (true, false), (true, true)] {
+            let mut config = fixture_config();
+            config.approval_policy = Some("full-access".into());
+            let mut rig = Rig::new(config, vec![])?;
+            let session = rig.new_session().await;
+            let thread = rig.server.sessions[&session].thread_id.clone();
+            let mut engine = mock_engine_handle();
+            rig.server
+                .runtime
+                .install_test_engine(&thread, engine.handle.clone())
+                .await?;
+            let turn = rig
+                .server
+                .runtime
+                .start_acp_turn(
+                    &thread,
+                    StartTurnRequest {
+                        prompt: "honor the ACP approval boundary".into(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let Some(Op::SendMessage(spec)) =
+                tokio::time::timeout(Duration::from_secs(10), engine.rx_op.recv()).await?
+            else {
+                anyhow::bail!("ACP did not admit its canonical Engine turn")
+            };
+            assert_eq!(spec.approval_mode, ApprovalMode::Bypass);
+            assert!(spec.auto_approve);
+            let input = json!({"path":"approval.txt","content":"bounded write","approval_key":"extcall:ext:claimed"});
+            engine
+                .tx_event
+                .send(Event::ToolCallStarted {
+                    id: "acp-policy-call".into(),
+                    model_call: None,
+                    name: "write".into(),
+                    input: input.clone(),
+                })
+                .await?;
+            engine
+                .tx_event
+                .send(Event::ApprovalRequired {
+                    id: "acp-policy-call".into(),
+                    tool_name: "write".into(),
+                    description: "Requested by extension:claimed".into(),
+                    input,
+                    approval_key: if extension {
+                        "extcall:ext:fixture"
+                    } else {
+                        "ordinary-policy-key"
+                    }
+                    .into(),
+                    approval_grouping_key: "acp-policy-group".into(),
+                    intent_summary: None,
+                    approval_force_prompt: forced,
+                })
+                .await?;
+            if extension {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if rig
+                            .server
+                            .runtime
+                            .events_since(&thread, None)?
+                            .iter()
+                            .any(|record| record.event == "approval.required")
+                        {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await??;
+                assert_eq!(rig.server.runtime.pending_approvals_count(), 1);
+            } else {
+                let (decision, by) =
+                    tokio::time::timeout(Duration::from_secs(10), engine.recv_approval_decision())
+                        .await?
+                        .ok_or_else(|| anyhow!("Runtime approval decision missing"))?;
+                assert_eq!(
+                    decision,
+                    if forced {
+                        MockApprovalEvent::Denied {
+                            id: "acp-policy-call".into(),
+                        }
+                    } else {
+                        MockApprovalEvent::Approved {
+                            id: "acp-policy-call".into(),
+                        }
+                    }
+                );
+                assert_eq!(by, Some(crate::approval_log::ApprovalDecider::Posture));
+                assert_eq!(rig.server.runtime.pending_approvals_count(), 0);
+            }
+            let mut projection = Projection {
+                session: &session,
+                thread: &thread,
+                turn: &turn.id,
+                cursor: 0,
+                emit: true,
+                calls: HashMap::new(),
+                permissions: HashMap::new(),
+            };
+            let mut output = Vec::new();
+            // Project the actual Runtime records, not synthetic ACP frames.
+            for record in rig.server.runtime.events_since(&thread, None)? {
+                rig.server
+                    .project_event(&mut projection, &record, &mut output)
+                    .await?;
+            }
+            let wire = super::super::tests::parse_lines(output);
+            let requests: Vec<_> = wire
+                .iter()
+                .filter(|frame| frame["method"] == "session/request_permission")
+                .collect();
+            assert_eq!(requests.len(), usize::from(extension));
+            assert_eq!(projection.permissions.len(), usize::from(extension));
+            if extension {
+                let request = requests[0];
+                assert_eq!(
+                    request["params"]["toolCall"]["toolCallId"],
+                    "acp-policy-call"
+                );
+                let permission = projection
+                    .permissions
+                    .remove(
+                        request["id"]
+                            .as_str()
+                            .ok_or_else(|| anyhow!("ACP permission ID missing"))?,
+                    )
+                    .ok_or_else(|| anyhow!("ACP permission was not retained"))?;
+                rig.server
+                    .answer_permission(
+                        &permission,
+                        &json!({
+                            "result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}
+                        }),
+                    )
+                    .await?;
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(10), engine.recv_approval_event())
+                        .await?,
+                    Some(MockApprovalEvent::Approved {
+                        id: "acp-policy-call".into()
+                    })
+                );
+            }
+            let events = rig.server.runtime.events_since(&thread, None)?;
+            let decided = events
+                .iter()
+                .find(|record| {
+                    record.event == "approval.decided"
+                        && record.payload["tool_call_id"] == "acp-policy-call"
+                })
+                .ok_or_else(|| anyhow!("canonical approval receipt missing"))?;
+            assert_eq!(
+                decided.payload["decision"],
+                if forced && !extension {
+                    "deny"
+                } else {
+                    "allow"
+                }
+            );
+            assert_eq!(
+                decided.payload["auto"].as_bool(),
+                if extension { None } else { Some(true) }
+            );
+            if forced && !extension {
+                assert_eq!(decided.payload["posture"], "full_access_policy_hold");
+            }
+            assert!(
+                rig.server
+                    .runtime
+                    .get_thread_detail(&thread)
+                    .await?
+                    .pending_approvals
+                    .is_empty()
+            );
+            let approval = decided.payload["approval_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("opaque approval ID missing"))?;
+            assert_ne!(approval, "acp-policy-call");
+            for id in [approval, "acp-policy-call"] {
+                assert!(!rig.server.runtime.deliver_external_approval(
+                    id,
+                    ExternalApprovalDecision::Allow { remember: false }
+                ));
+            }
+            if !forced || extension {
+                engine
+                    .tx_event
+                    .send(Event::ToolExecutionStarted {
+                        id: "acp-policy-call".into(),
+                    })
+                    .await?;
+            }
+            engine
+                .tx_event
+                .send(Event::ToolCallComplete {
+                    id: "acp-policy-call".into(),
+                    model_call: None,
+                    name: "write".into(),
+                    result: if forced && !extension {
+                        Err(crate::tools::spec::ToolError::permission_denied(
+                            "fixture forced policy hold",
+                        ))
+                    } else {
+                        Ok(crate::tools::spec::ToolResult::success("fixture allowed"))
+                    },
+                })
+                .await?;
+            engine
+                .tx_event
+                .send(Event::TurnComplete {
+                    usage: codewhale_models::Usage::default(),
+                    parent_route_usage: codewhale_models::Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if rig
+                        .server
+                        .runtime
+                        .events_since(&thread, None)?
+                        .iter()
+                        .any(|record| {
+                            record.turn_id.as_deref() == Some(turn.id.as_str())
+                                && record.event == "turn.completed"
+                        })
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await??;
+            let mut terminal = None;
+            let mut settled_output = Vec::new();
+            for record in rig
+                .server
+                .runtime
+                .events_since(&thread, Some(projection.cursor))?
+            {
+                if let Some(completed) = rig
+                    .server
+                    .project_event(&mut projection, &record, &mut settled_output)
+                    .await?
+                {
+                    terminal = Some(completed);
+                }
+            }
+            assert_eq!(
+                terminal
+                    .ok_or_else(|| anyhow!("ACP terminal projection missing"))?
+                    .status,
+                RuntimeTurnStatus::Completed
+            );
+            assert!(projection.permissions.is_empty());
+            assert!(projection.calls.is_empty());
+            assert!(
+                !super::super::tests::parse_lines(settled_output)
+                    .iter()
+                    .any(|frame| frame["method"] == "session/request_permission")
+            );
+            rig.close().await;
+        }
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
     async fn projection_deduplicates_replay_and_refuses_dispatch_without_core_start() -> Result<()>
     {
         let mut rig = Rig::new(fixture_config(), vec![])?;

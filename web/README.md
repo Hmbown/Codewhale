@@ -2,7 +2,7 @@
 
 Documentation and community site for [Codewhale](https://github.com/codewhale-hq/CodeWhale) — lives at **codewhale.net**.
 
-Next.js 15 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-flash` to summarise recent repo activity, and stored in Workers KV.
+Next.js 16 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-flash` to summarise recent repo activity, and stored in Workers KV.
 
 ## Local dev
 
@@ -55,35 +55,32 @@ local comparison is available without starting a deployment:
 npm run compare:deployed-facts -- --expected-revision <exact-40-character-sha>
 ```
 
-You already own `codewhale.net` on Cloudflare and have a Workers Paid plan. The deploy is two steps:
-
-1. **Provision KV namespaces once:**
-
-   ```bash
-   npx wrangler kv namespace create CURATED_KV
-   npx wrangler kv namespace create NEXT_INC_CACHE_KV
-   ```
-
-   Copy the printed `id` values into the matching `wrangler.jsonc` bindings
-   (replace each `REPLACE_WITH_KV_ID`).
-
-2. **Set secrets and deploy:**
-
-   ```bash
-   npx wrangler secret put DEEPSEEK_API_KEY
-   npx wrangler secret put GITHUB_TOKEN     # optional
-   npx wrangler secret put CRON_SECRET      # optional, for manual /api/cron?task=curate hits
-
-   npm run deploy                           # builds with OpenNext + uploads
-   ```
-
-3. **Point the domain:** in the Cloudflare dashboard, add a Worker route for `codewhale.net/*` → the deployed Worker, named `codewhale-web` (see `wrangler.jsonc`).
-
-The first cron run happens within 6 hours; you can also kick it manually:
+The Worker configuration now lives in `cloudflare.config.ts`; it retains the
+existing namespace IDs, domains, cron schedules and SQLite Durable Object.
+`npm ci` installs pinned `cf` and Cloudflare bundler versions. Use Node 22.18 or
+newer. OpenNext currently consumes a generated legacy configuration in the
+ignored `.cloudflare/` directory, derived from that same source with
+Cloudflare's configuration SDK.
 
 ```bash
-curl -H "x-cron-secret: $CRON_SECRET" "https://codewhale.net/api/cron?task=curate"
+npm run build:cloudflare          # one OpenNext build, then native cf Build Output
+npx cf deploy --prebuilt --dry-run # local validation; no upload
+npm run preview                   # local Worker with populated local cache
 ```
+
+The pinned cf beta's Next.js detection currently invokes plain `next build`,
+which does not produce the OpenNext Worker. `build:cloudflare` therefore runs
+OpenNext first and invokes cf's installed bundler (`cf-wrangler.js`) to emit
+Build Output. This is a build step; production deployment uses `cf deploy
+--prebuilt`. Do not add a custom post-cache build to `wrangler.config.ts`:
+rebuilding there changes the cache identity after OpenNext populates it.
+
+After production approval, the manual workflow runs `npm run deploy`,
+populates the remote OpenNext cache, and passes the exact prebuilt bundle to
+cf. Existing secrets remain managed in Cloudflare; namespace provisioning,
+secret changes and domain changes require separate approval. The predeploy
+guard rejects unset namespace IDs to avoid accidentally replacing live data.
+Use `npx cf cli search` to find the current resource-management commands.
 
 ## What's where
 
@@ -121,6 +118,7 @@ web/
 ├── data/
 │   └── latest-published-release.json  manually advanced only after publication
 ├── components/
+│   ├── native-terminal-gallery.tsx  six captured native terminal views
 │   ├── nav.tsx                 sticky header w/ date strip + CJK accents
 │   ├── footer.tsx              dense 5-column footer
 │   ├── whale.tsx               shared Codewhale mark
@@ -146,7 +144,8 @@ web/
 │   ├── derive-install.mjs      prebuild + vitest setup: docs/INSTALL.md → lib/install-guide.generated.ts
 │   ├── compare-deployed-facts.mjs credential-free exact-SHA receipt check
 │   └── check-kv-id.mjs         predeploy guard for KV namespace ids
-├── wrangler.jsonc              CF Worker config + cron + KV binding
+├── cloudflare.config.ts        Worker config + existing bindings, exports and cron
+├── wrangler.config.ts          cf bundler options (no separate Worker config)
 ├── open-next.config.ts         OpenNext adapter config
 └── tailwind.config.ts          design tokens
 ```

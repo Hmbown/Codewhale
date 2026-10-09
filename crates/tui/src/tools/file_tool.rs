@@ -60,7 +60,7 @@ impl ToolSpec for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file. The whole file comes back in one call when it fits this call's output budget — 100000 bytes by default, raisable to 500000 with max_bytes. There is no line cap. Use offset and limit for an exact line range; when output is budget-limited the footer names the exact offset to continue from. Every response reports the file's byte size, line count, and whether output was truncated."
+        "Read a file. A text file comes back whole in one call when it fits this call's output budget — 100000 bytes by default, raisable to 500000 with max_bytes. There is no line cap. Use offset and limit for an exact line range; when output is budget-limited the footer names the exact offset to continue from. Every text response reports the file's byte size, line count, and whether output was truncated. A PNG, JPEG, GIF or WebP image comes back as image content you can see (large images are downscaled), including one the user attached from outside the workspace; read an image instead of running OCR or taking screenshots of it."
     }
 
     fn input_schema(&self) -> Value {
@@ -464,7 +464,7 @@ impl ToolSpec for FileTool {
         let action = self.required_action(&input)?;
         if matches!(action.as_str(), "write" | "edit") && !self.allow_writes {
             return Err(ToolError::not_available(format!(
-                "File action=\"{action}\" is unavailable in the current mode; nothing was written. Available actions here: {}. Switch to Work mode (`/mode work`) for write-capable file work.",
+                "File action=\"{action}\" is unavailable in the current mode; nothing was written. Available actions here: {}. The user can change modes with /mode.",
                 self.available_actions().join(", ")
             )));
         }

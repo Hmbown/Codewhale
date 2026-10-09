@@ -37,7 +37,7 @@ use crate::config::{
 };
 use crate::llm_client::{
     LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after,
-    sanitize_http_error_body, with_retry,
+    retry_delay_from_error_body, sanitize_http_error_body, with_retry,
 };
 #[cfg(test)]
 #[path = "client/catalog_tests.rs"]
@@ -286,6 +286,11 @@ pub struct CodewhaleClient {
     /// is signed in and how to switch, appended to plan-quota errors. Holds
     /// an account label only, never token material.
     subscription_limit_guidance: Option<String>,
+    /// Reviewed runtime authority and OAuth descriptor travel with the frozen route.
+    plugin_provider: Option<Box<crate::config::ProviderConfig>>,
+    /// Read-only diagnostic probes must never migrate or refresh the grant.
+    plugin_oauth_read_only: bool,
+    claude_oauth_config: Option<Box<Config>>,
     /// Exact configured credential values removed from model-bound tool
     /// results. Structural redaction handles config/JSON assignments, while
     /// this list closes the gap for bare provider tokens with no recognizable
@@ -389,6 +394,37 @@ fn client_user_agent(_api_provider: ProviderKind) -> &'static str {
 /// (`retry_status`), so waiting requests re-poll it on this cadence instead
 /// of committing to the full remaining window up front.
 const RATE_LIMIT_PAUSE_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Total budget for one non-streaming request. Two layers use it: each
+/// attempt carries it as a reqwest per-request total (connect through body
+/// end, so a trickling body cannot extend forever), and the retry loop
+/// through `send_with_retry` is wrapped in one outer envelope of the same
+/// length (all attempts, backoff, and honored Retry-After included). The
+/// shared client intentionally has no client-level total timeout, so without
+/// these nothing bounds a non-streaming completion: a provider that accepts
+/// the connection and then stalls — or a gateway answering 429 +
+/// `Retry-After: 3600` forever — wedged the caller indefinitely.
+///
+/// Streaming paths never carry it: their opens go through
+/// `send_stream_open_with_retry`, which sets no per-request total (a total
+/// would ride on the returned body and hard-cut a live stream), so a stream
+/// stays bounded by its open cap and per-chunk idle checks only.
+pub(super) const NON_STREAMING_REQUEST_ENVELOPE: Duration = Duration::from_secs(1800);
+
+#[cfg(test)]
+static TEST_NON_STREAMING_ENVELOPE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn non_streaming_request_envelope() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = TEST_NON_STREAMING_ENVELOPE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    NON_STREAMING_REQUEST_ENVELOPE
+}
 
 pub(super) const SSE_BACKPRESSURE_HIGH_WATERMARK: usize = 1024 * 1024; // 1 MB
 pub(super) const SSE_BACKPRESSURE_SLEEP_MS: u64 = 10;
@@ -568,7 +604,9 @@ fn mark_recovery_probe_if_due(health: &mut ConnectionHealth, now: Instant) -> bo
 
 /// The one command that replaces a rejected key, by where it came from.
 fn auth_fix_hint(route: &str, key_source: &str) -> String {
-    if key_source.starts_with("--api-key") {
+    if key_source == "Claude sign-in" {
+        "codewhale auth claude".to_string()
+    } else if key_source.starts_with("--api-key") {
         "pass a valid --api-key".to_string()
     } else if let Some(rest) = key_source.strip_prefix("env var ")
         && rest.contains("api_key_env")
@@ -616,6 +654,9 @@ impl Clone for CodewhaleClient {
             api_key: self.api_key.clone(),
             api_key_source: self.api_key_source.clone(),
             subscription_limit_guidance: self.subscription_limit_guidance.clone(),
+            plugin_provider: self.plugin_provider.clone(),
+            plugin_oauth_read_only: self.plugin_oauth_read_only,
+            claude_oauth_config: self.claude_oauth_config.clone(),
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             catalog_error_secret_values: Arc::clone(&self.catalog_error_secret_values),
             model_bound_masking: self.model_bound_masking,
@@ -1603,6 +1644,29 @@ impl CodewhaleClient {
         config
             .verify_provider_identity(&admitted_identity)
             .map_err(anyhow::Error::msg)?;
+        let plugin_provider = config
+            .provider_config_for(&admitted_identity)
+            .filter(|entry| entry.plugin_authority.is_some())
+            .cloned()
+            .map(Box::new);
+        if let Some(entry) = &plugin_provider {
+            anyhow::ensure!(
+                entry.oauth.is_some()
+                    && config.auth_mode_for_provider(&admitted_identity).as_deref()
+                        == Some("oauth"),
+                "plugin provider requires host-managed OAuth"
+            );
+        }
+        let base_url = if plugin_provider.is_some() {
+            let reviewed = config.base_url_for_route(&admitted_identity);
+            anyhow::ensure!(
+                reqwest::Url::parse(&base_url)? == reqwest::Url::parse(&reviewed)?,
+                "plugin candidate changed its reviewed provider endpoint"
+            );
+            reviewed
+        } else {
+            base_url
+        };
         let openrouter_vendor = config.openrouter_vendor()?;
         let billing_surface = crate::route_billing::billing_surface_for_dispatch(
             Some(config),
@@ -1675,6 +1739,14 @@ impl CodewhaleClient {
             });
             (resolved, None, guidance, None)
         };
+        let subscription_limit_guidance = if api_key_source == "Claude sign-in" {
+            Some(crate::oauth::usage_limit_guidance(
+                crate::oauth::OAuthProvider::Claude,
+                None,
+            ))
+        } else {
+            subscription_limit_guidance
+        };
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
         // The opt-out is effective only after an explicit startup confirmation;
@@ -1694,7 +1766,34 @@ impl CodewhaleClient {
                 "HTTP/1.1 pinned (stream configuration or environment) — HTTP/2 disabled",
             );
         }
-        let http_headers = config.http_headers();
+        // A newly reviewed plugin destination must not inherit credentials or
+        // routing headers from unrelated, global provider configuration.
+        let mut http_headers = plugin_provider.as_ref().map_or_else(
+            || config.http_headers(),
+            |entry| entry.http_headers.clone().unwrap_or_default(),
+        );
+        if api_key_source == "Claude sign-in" {
+            http_headers.retain(|name, _| !is_upstream_auth_header(name));
+            let mut beta = http_headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+                .flat_map(|(_, value)| value.split(',').map(str::trim))
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            http_headers.retain(|name, _| !name.eq_ignore_ascii_case("anthropic-beta"));
+            if !beta.iter().any(|value| value == "oauth-2025-04-20") {
+                beta.push("oauth-2025-04-20".into());
+            }
+            http_headers.insert("anthropic-beta".into(), beta.join(","));
+            anyhow::ensure!(
+                config
+                    .provider_config_for(&admitted_identity)
+                    .and_then(|entry| entry.oauth_credential_generation.as_deref())
+                    .is_some_and(codewhale_config::is_valid_claude_oauth_generation),
+                "Claude sign-in generation is missing; sign in again"
+            );
+        }
         let auth_disabled = auth_mode_disables_api_key(
             config.auth_mode_for_provider(&admitted_identity).as_deref(),
         );
@@ -1751,7 +1850,12 @@ impl CodewhaleClient {
             auth_disabled,
             force_http1,
             config,
-        )?
+        )?;
+        let http_client = if plugin_provider.is_some() || api_key_source == "Claude sign-in" {
+            http_client.redirect(reqwest::redirect::Policy::none())
+        } else {
+            http_client
+        }
         .build()?;
         let models_http_client = Self::http_client_builder_with_auth_mode(
             &api_key,
@@ -1777,7 +1881,12 @@ impl CodewhaleClient {
             auth_disabled,
             true,
             config,
-        )?
+        )?;
+        let http1_client = if plugin_provider.is_some() || api_key_source == "Claude sign-in" {
+            http1_client.redirect(reqwest::redirect::Policy::none())
+        } else {
+            http1_client
+        }
         .build()?;
 
         let catalog_error_secret_values = Arc::new(catalog_error_secret_values(
@@ -1790,8 +1899,12 @@ impl CodewhaleClient {
             models_http_client,
             http1_client,
             api_key,
+            claude_oauth_config: (api_key_source == "Claude sign-in")
+                .then(|| Box::new(config.clone())),
             api_key_source,
             subscription_limit_guidance,
+            plugin_provider,
+            plugin_oauth_read_only: config.plugin_oauth_read_only,
             model_bound_secret_values,
             catalog_error_secret_values,
             model_bound_masking,
@@ -1824,6 +1937,91 @@ impl CodewhaleClient {
             stream_open_timeout,
             force_http1,
         })
+    }
+
+    /// Revalidate revocation and refresh host-owned OAuth before each actual send.
+    /// Plugin code receives neither the access token nor the refresh token.
+    pub(super) async fn authorize_plugin_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder> {
+        if let Some(config) = self.claude_oauth_config.clone() {
+            let destination = request
+                .try_clone()
+                .context("Claude request cannot be inspected")?
+                .build()?;
+            anyhow::ensure!(
+                destination.url().scheme() == "https"
+                    && destination.url().host_str() == Some("api.anthropic.com")
+                    && destination.url().port_or_known_default() == Some(443),
+                "Claude subscription request escaped the native Anthropic origin"
+            );
+            let read_only = self.plugin_oauth_read_only;
+            let token = tokio::task::spawn_blocking(move || {
+                if read_only {
+                    crate::oauth::get_owned_credentials_read_only(
+                        crate::oauth::OAuthProvider::Claude,
+                        &config,
+                    )
+                } else {
+                    crate::oauth::get_owned_credentials(
+                        crate::oauth::OAuthProvider::Claude,
+                        &config,
+                    )
+                }
+            })
+            .await
+            .context("Claude credential worker failed")??;
+            return Ok(request.bearer_auth(token.access_token));
+        }
+        let Some(provider) = self.plugin_provider.clone() else {
+            return Ok(request);
+        };
+        let authority = provider
+            .plugin_authority
+            .clone()
+            .context("plugin provider has no authority")?;
+        let name = self.admitted_identity.key.to_string();
+        let base_url = self.base_url.clone();
+        let destination = request
+            .try_clone()
+            .context("plugin request cannot be inspected")?
+            .build()?;
+        let base = reqwest::Url::parse(&base_url)?;
+        anyhow::ensure!(
+            destination.url().origin() == base.origin(),
+            "plugin request escaped its reviewed provider origin"
+        );
+        let policy = crate::plugins::activation::extension_host_policy_enabled();
+        let read_only = self.plugin_oauth_read_only;
+        let token = tokio::task::spawn_blocking(move || -> Result<String> {
+            let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+            let descriptor = provider
+                .oauth
+                .as_ref()
+                .context("plugin provider requires host-managed OAuth")?;
+            let empty_headers = std::collections::HashMap::new();
+            crate::plugins::providers::verify_provider_binding(
+                &authority,
+                &name,
+                &base_url,
+                descriptor,
+                Some(provider.http_headers.as_ref().unwrap_or(&empty_headers)),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let token =
+                crate::oauth::plugin_oauth_access_token(&name, &base_url, descriptor, read_only)?;
+            // Refresh may wait on the issuer. Do not send a model request if
+            // the review was revoked while that HTTP request was in flight.
+            crate::plugins::registry::verify_plugin_component_authority(
+                &authority,
+                crate::plugins::activation::PluginActivationCapability::Providers,
+            )
+            .map_err(anyhow::Error::msg)?;
+            Ok(token)
+        })
+        .await??;
+        Ok(request.bearer_auth(token))
     }
 
     /// Map a failed HTTP response, naming the route, host and key source on
@@ -2904,11 +3102,20 @@ impl CodewhaleClient {
     /// route that was actually installed for the turn.
     #[must_use]
     pub fn turn_route_receipt(&self) -> crate::route_receipt::TurnRouteReceipt {
+        let credential =
+            self.claude_oauth_config
+                .as_ref()
+                .map_or(self.api_key.as_str(), |config| {
+                    config
+                        .provider_config_for(&self.admitted_identity)
+                        .and_then(|entry| entry.oauth_credential_generation.as_deref())
+                        .unwrap_or_default()
+                });
         crate::route_receipt::TurnRouteReceipt::from_admitted(
             &self.admitted_identity,
             &self.default_model,
             &self.base_url,
-            &self.api_key,
+            credential,
         )
         .with_openrouter_vendor(self.openrouter_vendor.as_deref())
     }
@@ -3171,6 +3378,15 @@ impl CodewhaleClient {
             });
         let usage = parse_usage(value.get("usage"));
         let stop_reason = value["choices"][0]["finish_reason"].as_str();
+        let stop_reason = if codewhale_models::stop_contradicts_output_ceiling(
+            stop_reason,
+            usage_reported.then_some(usage.output_tokens),
+            max_tokens,
+        ) {
+            Some(codewhale_models::OUTPUT_CEILING_STOP_REASON)
+        } else {
+            stop_reason
+        };
         let usage = (usage_reported && usage != Usage::default()).then_some(usage);
         let translated = if codewhale_models::is_incomplete_stop_reason(stop_reason) {
             Err(anyhow::anyhow!(
@@ -3242,8 +3458,15 @@ impl CodewhaleClient {
         &self,
         mode: ModelsRequestMode,
     ) -> Result<(String, tokio::time::Instant), ModelsFetchError> {
-        let endpoint = reqwest::Url::parse(&api_url(&self.base_url, "models"))
+        let mut endpoint = reqwest::Url::parse(&api_url(&self.base_url, "models"))
             .map_err(|_| CatalogRefreshError::InvalidResponse)?;
+        // OrcaRouter scopes `GET /v1/models` to one capability. Ask for the chat
+        // roster so the model control is the real chat list rather than every
+        // kind the account can reach; other providers take the unfiltered
+        // listing. Non-text rows are dropped again by the chat endpoint filter.
+        if self.api_provider == ProviderKind::Orcarouter {
+            endpoint.query_pairs_mut().append_pair("capability", "chat");
+        }
         // https://platform.claude.com/docs/en/api/models/list specifies after_id.
         // Go is unpaginated. A Messages generation dialect or a custom identity
         // resembling a built-in provider does not establish this list contract.
@@ -3267,11 +3490,21 @@ impl CodewhaleClient {
                         let disclosure = ErrorBodyDisclosure::Guarded {
                             request_secrets: request_query_secret_values(&url),
                         };
-                        self.send_with_retry_error_body(build, &disclosure)
-                            .await
-                            .map_err(ModelsFetchError::Interactive)?
+                        // The pinned 30s per-attempt total survives: the retry
+                        // loop's shared envelope is not allowed to overwrite a
+                        // caller's own budget.
+                        self.send_with_retry_total_error_body(
+                            NON_STREAMING_HTTP_TIMEOUT,
+                            build,
+                            &disclosure,
+                        )
+                        .await
+                        .map_err(ModelsFetchError::Interactive)?
                     }
-                    ModelsRequestMode::Refresh => build()
+                    ModelsRequestMode::Refresh => self
+                        .authorize_plugin_request(build())
+                        .await
+                        .map_err(|_| CatalogRefreshError::Unauthorized)?
                         .send()
                         .await
                         .map_err(|_| CatalogRefreshError::Network)?,
@@ -3379,10 +3612,12 @@ impl CodewhaleClient {
     /// allowing this provider's successful roster to retire removed ids.
     ///
     /// Activated for model-list authorities that are not satisfied by the
-    /// cross-provider Models.dev snapshot: OpenRouter, named live gateways,
+    /// cross-provider Models.dev snapshot: OpenRouter, OrcaRouter, named live gateways,
     /// and Baseten's account-scoped endpoint (no static snapshot can serve a
-    /// per-credential roster). Every other custom host is an ordinary
-    /// provider served by Models.dev plus its configured models (#6289).
+    /// per-credential roster). Custom OpenAI-compatible hosts are included
+    /// too: a private relay is not in the Models.dev snapshot, so without a
+    /// probe its `/model` picker stays empty even though the chat route
+    /// already talks to the same endpoint (#6289 widened).
     /// The refresh is non-fatal: on failure, persisted prior rows and static
     /// seeds remain available with a typed failed receipt.
     pub fn spawn_active_provider_catalog_refresh(config: &Config) {
@@ -3395,21 +3630,11 @@ impl CodewhaleClient {
                 return;
             };
             let provider = identity.provider;
-            let is_baseten_endpoint = provider == ProviderKind::Custom
-                && codewhale_config::catalog::endpoint_is_baseten(
-                    &config.base_url_for_route(&identity),
-                );
-            if !matches!(
-                provider,
-                ProviderKind::Openrouter
-                    | ProviderKind::Telecomjs
-                    | ProviderKind::Edenai
-                    | ProviderKind::Zenmux
-                    | ProviderKind::Concentrate
-                    | ProviderKind::Codewhale
-                    | ProviderKind::Ollama
-            ) && !is_baseten_endpoint
-            {
+            // Custom hosts include Baseten (its `/models` dialect is detected
+            // at fetch time) and every other custom host. A private route is
+            // the only place its roster exists, and a failed probe stays
+            // non-fatal.
+            if !crate::provider_catalog_live::provider_owns_live_catalog(provider) {
                 return;
             }
 
@@ -3621,12 +3846,19 @@ impl CodewhaleClient {
             return;
         }
         let health_url = api_url(&self.base_url, "models");
-        let probe = self
+        let request = self
             .models_http_client
             .get(health_url)
-            .timeout(NON_STREAMING_HTTP_TIMEOUT)
-            .send()
-            .await;
+            .timeout(NON_STREAMING_HTTP_TIMEOUT);
+        let request = match self.authorize_plugin_request(request).await {
+            Ok(request) => request,
+            Err(_) => {
+                self.mark_request_failure("probe authorization failed")
+                    .await;
+                return;
+            }
+        };
+        let probe = request.send().await;
         match probe {
             Ok(resp) if resp.status().is_success() => {
                 // Consume the response body so the connection can be returned to the pool.
@@ -3664,6 +3896,14 @@ impl CodewhaleClient {
         status: u16,
         raw: &str,
     ) -> String {
+        // Rotated opaque bearer values are not part of this client's frozen
+        // redaction list. Do not disclose a dynamic OAuth endpoint's body.
+        if self.claude_oauth_config.is_some() {
+            return "Claude subscription request failed".into();
+        }
+        if self.plugin_provider.is_some() {
+            return "plugin provider request failed".into();
+        }
         let provider = Some(self.api_provider.provider().display_name());
         let ErrorBodyDisclosure::Guarded { request_secrets } = disclosure else {
             return sanitize_http_error_body(provider, status, raw);
@@ -3698,7 +3938,7 @@ impl CodewhaleClient {
     /// much of the body reaches retry logs, state updates and the user.
     async fn send_with_retry_error_body<F>(
         &self,
-        mut build: F,
+        build: F,
         disclosure: &ErrorBodyDisclosure,
     ) -> Result<reqwest::Response>
     where
@@ -3707,13 +3947,79 @@ impl CodewhaleClient {
         if self.isolated_request_state {
             return self.send_with_isolated_retry(build, disclosure).await;
         }
+        self.send_retry_loop(build, Some(non_streaming_request_envelope()), disclosure)
+            .await
+    }
+
+    /// [`Self::send_with_retry_error_body`] with a caller-pinned per-attempt
+    /// total (connect through body end). `list_models` pins its own 30s: the
+    /// plain variant would otherwise stretch that pinned budget out to the
+    /// shared envelope, because `.timeout()` on the builder is a pure
+    /// overwrite.
+    async fn send_with_retry_total_error_body<F>(
+        &self,
+        total: Duration,
+        build: F,
+        disclosure: &ErrorBodyDisclosure,
+    ) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        if self.isolated_request_state {
+            return self.send_with_isolated_retry(build, disclosure).await;
+        }
+        self.send_retry_loop(build, Some(total), disclosure).await
+    }
+
+    /// The streaming-open twin of [`Self::send_with_retry`]: the same retry
+    /// and rate-limit handling with no total deadline anywhere. reqwest's
+    /// per-request timeout wraps the response *body*, so a total set on the
+    /// open would ride along inside the returned body and hard-cut a live
+    /// stream mid-generation. Stream opens stay bounded by the caller's
+    /// `stream_open_timeout` around the open and per-chunk idle checks on
+    /// the returned body instead.
+    pub(super) async fn send_stream_open_with_retry<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        if self.isolated_request_state {
+            return self
+                .send_with_isolated_retry(build, &ErrorBodyDisclosure::Full)
+                .await;
+        }
+        self.send_retry_loop(build, None, &ErrorBodyDisclosure::Full)
+            .await
+    }
+
+    async fn send_retry_loop<F>(
+        &self,
+        mut build: F,
+        attempt_total: Option<Duration>,
+        disclosure: &ErrorBodyDisclosure,
+    ) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
         let retry_cfg: LlmRetryConfig = self.retry.clone().into();
         let pause_scope = self.rate_limit_scope();
         let callback_scope = pause_scope.clone();
-        let request_result = with_retry(
+        // Two bounded layers around a non-streaming completion
+        // (`attempt_total` = `Some`): the per-attempt request total (connect
+        // through body end) and an envelope around the whole retry loop (all
+        // attempts + backoff + honored Retry-After). Streaming opens
+        // (`None`) set no deadline at all: any total here would be
+        // inherited by the returned body and truncate the stream, so those
+        // calls keep only the caller's own open budget.
+        let retry_future = with_retry(
             &retry_cfg,
             || {
-                let request = build();
+                // Per-attempt total: unlike the loop envelope below,
+                // reqwest's per-request timeout also covers the response
+                // body, so a slow-drip body cannot outlive the budget.
+                let request = match attempt_total {
+                    Some(total) => build().timeout(total),
+                    None => build(),
+                };
                 let pause_scope = pause_scope.as_str();
                 async move {
                     // Sleep in bounded slices rather than the full remaining
@@ -3726,6 +4032,10 @@ impl CodewhaleClient {
                         tokio::time::sleep(delay.min(RATE_LIMIT_PAUSE_RECHECK_INTERVAL)).await;
                     }
                     self.wait_for_rate_limit().await;
+                    let request = self
+                        .authorize_plugin_request(request)
+                        .await
+                        .map_err(|error| LlmError::Other(error.to_string()))?;
                     let response = request
                         .send()
                         .await
@@ -3734,8 +4044,10 @@ impl CodewhaleClient {
                     if status.is_success() {
                         return Ok(response);
                     }
-                    let retry_after = extract_retry_after(response.headers());
+                    let header_retry_after = extract_retry_after(response.headers());
                     let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let retry_after =
+                        header_retry_after.or_else(|| retry_delay_from_error_body(&raw));
                     let body = self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                     Err(self.http_error_with_route_context(status.as_u16(), &body, retry_after))
                 }
@@ -3753,8 +4065,30 @@ impl CodewhaleClient {
                 }
                 crate::retry_status::start(attempt + 1, delay, human_reason);
             })),
-        )
-        .await;
+        );
+        let request_result = if let Some(total) = attempt_total {
+            // The loop envelope must dominate the per-attempt total it
+            // wraps: a caller-pinned budget (list_models' 30s) may exceed
+            // the shared envelope, and the envelope must never strangle
+            // its own attempts.
+            let loop_envelope = total.max(non_streaming_request_envelope());
+            match tokio::time::timeout(loop_envelope, retry_future).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    let last = LlmError::Timeout(loop_envelope);
+                    logging::warn(format!(
+                        "non-streaming request envelope exceeded ({loop_envelope:?}); retry loop aborted"
+                    ));
+                    crate::retry_status::failed(last.to_string());
+                    self.mark_request_failure("non-streaming request envelope exceeded")
+                        .await;
+                    self.maybe_probe_recovery().await;
+                    return Err(anyhow::Error::new(last));
+                }
+            }
+        } else {
+            retry_future.await
+        };
 
         match request_result {
             Ok(response) => {
@@ -3817,6 +4151,10 @@ impl CodewhaleClient {
                     let request = build();
                     async move {
                         self.wait_for_rate_limit().await;
+                        let request = self
+                            .authorize_plugin_request(request)
+                            .await
+                            .map_err(|error| LlmError::Other(error.to_string()))?;
                         let response = request
                             .send()
                             .await
@@ -3825,8 +4163,10 @@ impl CodewhaleClient {
                         if status.is_success() {
                             return Ok(response);
                         }
-                        let retry_after = extract_retry_after(response.headers());
+                        let header_retry_after = extract_retry_after(response.headers());
                         let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                        let retry_after =
+                            header_retry_after.or_else(|| retry_delay_from_error_body(&raw));
                         let body =
                             self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                         Err(self.http_error_with_route_context(status.as_u16(), &body, retry_after))
@@ -3856,6 +4196,25 @@ impl CodewhaleClient {
         let request_body =
             serde_json::to_vec(body).context("Failed to serialize JSON request body")?;
         self.send_with_retry(|| {
+            self.http_client
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(request_body.clone())
+        })
+        .await
+    }
+
+    /// JSON POST through the streaming-open retry path: no total deadline,
+    /// because the response body outlives the open (see
+    /// [`Self::send_stream_open_with_retry`]).
+    pub(super) async fn open_stream_json_with_retry(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize JSON request body")?;
+        self.send_stream_open_with_retry(|| {
             self.http_client
                 .post(url)
                 .header(CONTENT_TYPE, "application/json")
@@ -3991,9 +4350,12 @@ impl LlmClient for CodewhaleClient {
         let health_url = api_url(&self.base_url, "models");
         self.wait_for_rate_limit().await;
         let response = self
-            .models_http_client
-            .get(health_url)
-            .timeout(NON_STREAMING_HTTP_TIMEOUT)
+            .authorize_plugin_request(
+                self.models_http_client
+                    .get(health_url)
+                    .timeout(NON_STREAMING_HTTP_TIMEOUT),
+            )
+            .await?
             .send()
             .await;
         match response {
@@ -4112,6 +4474,11 @@ struct OpenRouterModelItem {
     supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     architecture: Option<OpenRouterArchitecture>,
+    /// Endpoint dialects this gateway advertises for the row. OrcaRouter
+    /// publishes this for every model it lists; it is what lets chat rows be
+    /// separated from image/video/rerank rows without guessing from the name.
+    #[serde(default)]
+    supported_endpoint_types: Option<Vec<String>>,
     #[serde(default)]
     #[expect(dead_code)]
     expiration_date: Option<String>,
@@ -4200,7 +4567,7 @@ struct BasetenModelItem {
     #[serde(default)]
     supports_structured_output: Option<bool>,
     #[serde(default)]
-    reasoning_options: Vec<serde_json::Value>,
+    reasoning_options: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4440,6 +4807,7 @@ fn codewhale_catalog_offerings_from_body(
                 base_url_fingerprint: fingerprint.to_string(),
                 fetched_at,
             },
+            ..Default::default()
         });
     }
     if offerings.is_empty() {
@@ -4471,7 +4839,40 @@ fn catalog_delta_from_models_body(
     // OpenRouter returns extended capability metadata in its /models
     // response (#3385). Capture limits, pricing, reasoning, and modalities
     // from the live API instead of leaving them unknown.
-    let offerings: Vec<CatalogOffering> = if api_provider == ProviderKind::Openrouter {
+    let offerings: Vec<CatalogOffering> = if api_provider == ProviderKind::Orcarouter {
+        // OrcaRouter serves the extended capability shape too, and adds
+        // `supported_endpoint_types` on every row. That field is what keeps a
+        // gateway model list — which mixes chat with image/video generation —
+        // from dumping non-text rows into the text selector. A row that does
+        // not advertise a chat dialect is dropped here, so the roster the
+        // picker and `/model` read is chat-only.
+        let listed = parse_orcarouter_models_response(body)?;
+        if listed.is_empty() {
+            return Err(CatalogRefreshError::EmptyList);
+        }
+        let chat_rows: Vec<_> = listed
+            .iter()
+            .filter(|item| orcarouter_row_is_chat(item))
+            .collect();
+        let non_chat = listed.len() - chat_rows.len();
+        if non_chat > 0 {
+            tracing::info!(
+                dropped = non_chat,
+                listed = listed.len(),
+                "OrcaRouter catalog refresh kept chat rows and dropped non-chat dialects"
+            );
+        }
+        let offerings: Vec<_> = chat_rows
+            .iter()
+            .filter_map(|item| {
+                orcarouter_to_catalog_offering(item, &provider, &fingerprint, fetched_at).ok()
+            })
+            .collect();
+        if offerings.is_empty() {
+            return Err(CatalogRefreshError::InvalidResponse);
+        }
+        offerings
+    } else if api_provider == ProviderKind::Openrouter {
         let or_models = parse_openrouter_models_response(body)?;
         if or_models.is_empty() {
             return Err(CatalogRefreshError::EmptyList);
@@ -4536,7 +4937,7 @@ fn catalog_delta_from_models_body(
     } else if provider == "concentrate" {
         // Concentrate's unauthenticated `GET /v1/models` is the same
         // OpenAI list shape (`{"object":"list","data":[{"id":..}]}`);
-        // rows stay unclaimed unless a same-provider bundled row exists.
+        // Rows state existence; the shared resolver owns metadata completion.
         named_gateway_catalog_offerings_from_body(
             body,
             codewhale_config::ProviderKind::Concentrate,
@@ -4582,6 +4983,7 @@ fn catalog_delta_from_models_body(
                     base_url_fingerprint: fingerprint.clone(),
                     fetched_at,
                 },
+                ..Default::default()
             })
             .collect()
     };
@@ -4617,62 +5019,21 @@ fn named_gateway_catalog_offerings_from_body(
         return Err(CatalogRefreshError::EmptyList);
     }
 
-    let bundled = codewhale_config::catalog::bundled_catalog_offerings();
     let default_model_id = kind.provider().default_model();
     Ok(models
         .into_iter()
         .map(|model| {
             let is_default = model.id.eq_ignore_ascii_case(default_model_id);
-            let same_provider_match = bundled.iter().find(|offering| {
-                offering.provider.eq_ignore_ascii_case(provider)
-                    && offering.wire_model_id.eq_ignore_ascii_case(&model.id)
-            });
-            if let Some(matched) = same_provider_match {
-                CatalogOffering {
-                    cost_source: Some(matched.pricing_source().clone()),
-                    modalities_source: Some(matched.modalities_source().clone()),
-                    provider: provider.to_string(),
-                    wire_model_id: model.id,
-                    canonical_model: matched.canonical_model.clone(),
-                    endpoint_key: "chat".to_string(),
-                    default_for_provider: is_default,
-                    family: matched.family.clone(),
-                    limit: matched.limit.clone(),
-                    cost: matched.cost.clone(),
-                    modalities: matched.modalities.clone(),
-                    attachment: matched.attachment,
-                    reasoning: matched.reasoning,
-                    tool_call: matched.tool_call,
-                    structured_output: matched.structured_output,
-                    reasoning_options: matched.reasoning_options.clone(),
-                    source: CatalogSource::Live {
-                        base_url_fingerprint: fingerprint.to_string(),
-                        fetched_at,
-                    },
-                }
-            } else {
-                CatalogOffering {
-                    cost_source: None,
-                    modalities_source: None,
-                    provider: provider.to_string(),
-                    wire_model_id: model.id,
-                    canonical_model: None,
-                    endpoint_key: "chat".to_string(),
-                    default_for_provider: is_default,
-                    family: None,
-                    limit: None,
-                    cost: None,
-                    modalities: None,
-                    attachment: None,
-                    reasoning: None,
-                    tool_call: None,
-                    structured_output: None,
-                    reasoning_options: Vec::new(),
-                    source: CatalogSource::Live {
-                        base_url_fingerprint: fingerprint.to_string(),
-                        fetched_at,
-                    },
-                }
+            CatalogOffering {
+                provider: provider.to_string(),
+                wire_model_id: model.id,
+                endpoint_key: "chat".to_string(),
+                default_for_provider: is_default,
+                source: CatalogSource::Live {
+                    base_url_fingerprint: fingerprint.to_string(),
+                    fetched_at,
+                },
+                ..Default::default()
             }
         })
         .collect())
@@ -4723,6 +5084,108 @@ fn parse_openrouter_models_response(
         return Err(CatalogRefreshError::InvalidResponse);
     }
     Ok(models)
+}
+
+/// Endpoint dialects that mean "a chat/completions text turn can be served".
+///
+/// OrcaRouter (and OpenRouter) publish `supported_endpoint_types`; a chat row
+/// must carry at least one of these, and the non-chat dialects
+/// (`image-generation`, `openai-video`, `jina-rerank`, `embeddings`) are how a
+/// generation-only model is kept out of the chat selector.
+const ORCAROUTER_CHAT_ENDPOINT_TYPES: &[&str] =
+    &["openai", "anthropic", "gemini", "openai-response"];
+
+/// Whether an OrcaRouter row is offered on a chat/completions dialect.
+///
+/// Fail-closed on silence: a row that declares no `supported_endpoint_types`
+/// is **not** assumed to be chat. On a gateway that mixes chat with image and
+/// video generation, guessing by omission would put a generation model in the
+/// text selector.
+fn orcarouter_row_is_chat(item: &OpenRouterModelItem) -> bool {
+    item.supported_endpoint_types.as_ref().is_some_and(|types| {
+        types.iter().any(|endpoint| {
+            let endpoint = endpoint.trim();
+            ORCAROUTER_CHAT_ENDPOINT_TYPES
+                .iter()
+                .any(|chat| endpoint.eq_ignore_ascii_case(chat))
+        })
+    })
+}
+
+/// Parse OrcaRouter's `/v1/models` body.
+///
+/// The gateway serves the OpenRouter extended shape: every row carries
+/// `supported_endpoint_types`, and text models add `architecture`,
+/// `context_length`, `top_provider` and `pricing`. Rows are accepted or
+/// skipped by the same id rules as [`parse_openrouter_models_response`], so one
+/// malformed row cannot fail the whole roster.
+fn parse_orcarouter_models_response(
+    payload: &str,
+) -> Result<Vec<OpenRouterModelItem>, CatalogRefreshError> {
+    let parsed: OpenRouterModelsResponse =
+        serde_json::from_str(payload).map_err(|_| CatalogRefreshError::InvalidResponse)?;
+    let listed = parsed.data.len();
+    let mut seen = std::collections::HashSet::new();
+    let mut malformed = 0usize;
+    let mut models = Vec::with_capacity(listed);
+    for row in parsed.data {
+        let Ok(item) = serde_json::from_str::<OpenRouterModelItem>(row.get()) else {
+            malformed += 1;
+            continue;
+        };
+        if item.id.starts_with('~') {
+            continue;
+        }
+        if !crate::provider_lake::valid_catalog_model_id(&item.id) {
+            malformed += 1;
+            continue;
+        }
+        if seen.insert(item.id.clone()) {
+            models.push(item);
+        }
+    }
+    if malformed > 0 {
+        tracing::warn!(
+            malformed,
+            listed,
+            "skipped malformed OrcaRouter model rows in the catalog refresh"
+        );
+    }
+    if models.is_empty() && malformed > 0 {
+        return Err(CatalogRefreshError::InvalidResponse);
+    }
+    Ok(models)
+}
+
+/// Project one OrcaRouter `/v1/models` row onto a catalog offering.
+///
+/// Pricing and limits reuse the OpenRouter projection (OrcaRouter bills the
+/// same extended fields). Two differences matter:
+///
+/// - OrcaRouter does not publish `supported_parameters` on its rows, so the
+///   OpenRouter projection's `reasoning`/`tool_call` would become a factual
+///   "no reasoning, no tools". It strips them back to unclaimed instead: on
+///   this gateway an absent parameter list is silence, not a refusal. That
+///   also keeps Codewhale's tools enabled for OrcaRouter chat models.
+/// - A row whose `architecture` names an explicit input set keeps it verbatim,
+///   so the multimodal gate downstream is reading a stated fact. Rows with no
+///   `architecture` stay unclaimed rather than inheriting a "text" default.
+fn orcarouter_to_catalog_offering(
+    item: &OpenRouterModelItem,
+    provider: &str,
+    base_url_fingerprint: &str,
+    fetched_at: u64,
+) -> Result<CatalogOffering, CatalogRefreshError> {
+    let mut offering =
+        openrouter_to_catalog_offering(item, provider, base_url_fingerprint, fetched_at)?;
+    if item.supported_parameters.is_none() {
+        offering.reasoning = None;
+        offering.tool_call = None;
+    }
+    if item.architecture.is_none() {
+        offering.modalities = None;
+    }
+    Ok(offering)
 }
 
 /// Parse Baseten's authenticated Model APIs catalog without inferring facts
@@ -4852,6 +5315,7 @@ fn baseten_to_catalog_offering(
             output: catalog_price_per_million(pricing.completion.as_ref())?,
             cache_read: catalog_price_per_million(pricing.input_cache_read.as_ref())?,
             cache_write: catalog_price_per_million(pricing.input_cache_write.as_ref())?,
+            ..Default::default()
         };
         if !codewhale_config::pricing::catalog_cost_is_valid(&cost) {
             return Err(CatalogRefreshError::InvalidResponse);
@@ -4936,7 +5400,10 @@ fn baseten_to_catalog_offering(
     let structured_output = item.supports_structured_output.or(Some(true));
 
     Ok(CatalogOffering {
-        cost_source: None,
+        cost_source: (item.pricing.is_some() && cost.is_none()).then(|| CatalogSource::Live {
+            base_url_fingerprint: base_url_fingerprint.to_string(),
+            fetched_at,
+        }),
         modalities_source: None,
         provider: provider.to_string(),
         wire_model_id: item.id.clone(),
@@ -4953,11 +5420,13 @@ fn baseten_to_catalog_offering(
         reasoning,
         tool_call,
         structured_output,
-        reasoning_options: item.reasoning_options.clone(),
+        reasoning_options: item.reasoning_options.clone().unwrap_or_default(),
+        reasoning_options_present: item.reasoning_options.is_some(),
         source: CatalogSource::Live {
             base_url_fingerprint: base_url_fingerprint.to_string(),
             fetched_at,
         },
+        ..Default::default()
     })
 }
 
@@ -5040,6 +5509,7 @@ fn openrouter_to_catalog_offering(
                 output: per_million(raw[1])?,
                 cache_read: per_million(raw[2])?,
                 cache_write: per_million(raw[3])?,
+                ..Default::default()
             };
             if !codewhale_config::pricing::catalog_cost_is_valid(&cost) {
                 return Err(CatalogRefreshError::InvalidResponse);
@@ -5090,7 +5560,10 @@ fn openrouter_to_catalog_offering(
     });
 
     Ok(CatalogOffering {
-        cost_source: None,
+        cost_source: (item.pricing.is_some() && cost.is_none()).then(|| CatalogSource::Live {
+            base_url_fingerprint: base_url_fingerprint.to_string(),
+            fetched_at,
+        }),
         modalities_source: None,
         provider: provider.to_string(),
         wire_model_id: item.id.clone(),
@@ -5110,6 +5583,7 @@ fn openrouter_to_catalog_offering(
             base_url_fingerprint: base_url_fingerprint.to_string(),
             fetched_at,
         },
+        ..Default::default()
     })
 }
 
@@ -5577,6 +6051,11 @@ pub(super) fn apply_reasoning_effort(
 }
 
 impl CodewhaleClient {
+    pub(crate) fn can_request_fim_completion(&self) -> bool {
+        self.api_provider != ProviderKind::OpencodeZen
+            && self.wire_format == WireFormat::ChatCompletions
+    }
+
     /// Call the DeepSeek `/beta/completions` FIM endpoint.
     pub async fn fim_completion(
         &self,
@@ -5587,9 +6066,7 @@ impl CodewhaleClient {
     ) -> anyhow::Result<String> {
         let _inference = self.acquire_remote_control_inference_permit().await;
         let _permit = self.acquire_provider_request_permit().await;
-        if self.api_provider == ProviderKind::OpencodeZen
-            || self.wire_format != WireFormat::ChatCompletions
-        {
+        if !self.can_request_fim_completion() {
             bail!(
                 "FIM completion is not supported for {} because the route has no proven FIM wire contract ({:?})",
                 self.api_provider.provider().display_name(),
@@ -5726,6 +6203,8 @@ mod tests {
     include!("client/test_cases_06.rs");
 
     include!("client/test_cases_07.rs");
+
+    include!("client/test_cases_08.rs");
 }
 
 #[cfg(test)]

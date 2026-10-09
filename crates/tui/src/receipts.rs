@@ -521,7 +521,7 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
 
 /// The prompt a user message carries: its text blocks, less the
 /// `<turn_meta>` block the engine appends.
-fn prompt_text(message: &Message) -> Option<String> {
+pub(crate) fn prompt_text(message: &Message) -> Option<String> {
     let meta_index = crate::runtime_handoff::turn_metadata_text(message).map(|(index, _)| index);
     message
         .content
@@ -1649,7 +1649,7 @@ fn redact(text: &str) -> String {
     codewhale_secrets::redact::redact_secrets(text)
 }
 
-use crate::diagnostics_reports::receipts::{bounded, plural};
+use codewhale_commands::diagnostics_reports::receipts::{bounded, plural};
 
 fn first_error_line(output: Option<&str>) -> Option<String> {
     let line = output?
@@ -2074,10 +2074,10 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-use crate::diagnostics_reports::receipts::code_span;
+use codewhale_commands::diagnostics_reports::receipts::code_span;
 #[cfg(test)]
-use crate::diagnostics_reports::receipts::{action_line, totals_line};
-pub use crate::diagnostics_reports::receipts::{render_json, render_markdown};
+use codewhale_commands::diagnostics_reports::receipts::{action_line, totals_line};
+pub use codewhale_commands::diagnostics_reports::receipts::{render_json, render_markdown};
 
 #[cfg(test)]
 #[path = "receipts/tests.rs"]

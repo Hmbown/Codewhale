@@ -5,6 +5,8 @@
 //! `codewhale-tui` one command group at a time. Only after every group uses
 //! these shapes will groups move physically into a commands crate.
 
+pub use crate::config_policy::{CommandConfigStatusContext, CommandPermissionsContext};
+
 use std::path::{Path, PathBuf};
 
 mod session_structcopy;
@@ -792,6 +794,8 @@ pub struct PluginDshPreview {
     pub remote_servers: Vec<String>,
     pub local_servers: Vec<String>,
     pub network_hosts: Vec<String>,
+    /// Rows that become Native host code (JavaScript run by the extension host).
+    pub native_rows: Vec<String>,
     pub requires_node: bool,
     /// One line per skipped row or patch operation (a manual port).
     pub manual_ports: Vec<String>,
@@ -1453,6 +1457,10 @@ pub struct RelayProjection {
     /// Authoritative compact-template text (`COMPACT_TEMPLATE`), echoed with
     /// a trailing trim by the handler exactly as today.
     pub compact_template: String,
+    /// Workspace-relative path the relay is written to. The host supplies
+    /// the same path its startup loader reads first, so the writer and the
+    /// loader cannot drift.
+    pub handoff_path: String,
     pub workspace: String,
     pub mode: String,
     pub model: String,

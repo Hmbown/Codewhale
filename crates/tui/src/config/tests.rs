@@ -1057,10 +1057,10 @@ reason = "read_file is allowed"
     config.validate()?;
 
     let policy = config.auto_review_policy();
-    let shell_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+    let shell_context = crate::core::authority::auto_review::AutoReviewContext::from_tool_call(
         "exec_shell",
         &serde_json::json!({"command": "cargo test"}),
-        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::core::authority::auto_review::RunOrigin::Interactive,
         codewhale_execpolicy::ApprovalMode::Auto,
         true,
         None,
@@ -1068,14 +1068,14 @@ reason = "read_file is allowed"
     let shell_decision = policy.evaluate(&shell_context);
     assert_eq!(
         shell_decision.action,
-        crate::tui::auto_review::AutoReviewAction::Block
+        crate::core::authority::auto_review::AutoReviewAction::Block
     );
     assert_eq!(shell_decision.rule_id.as_deref(), Some("block-shell"));
 
-    let read_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+    let read_context = crate::core::authority::auto_review::AutoReviewContext::from_tool_call(
         "read_file",
         &serde_json::json!({"path": "README.md"}),
-        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::core::authority::auto_review::RunOrigin::Interactive,
         codewhale_execpolicy::ApprovalMode::Auto,
         true,
         None,
@@ -1083,7 +1083,7 @@ reason = "read_file is allowed"
     let read_decision = policy.evaluate(&read_context);
     assert_eq!(
         read_decision.action,
-        crate::tui::auto_review::AutoReviewAction::Allow
+        crate::core::authority::auto_review::AutoReviewAction::Allow
     );
     assert_eq!(read_decision.rule_id.as_deref(), Some("allow-read-file"));
 
@@ -1111,7 +1111,7 @@ fn auto_review_scenario() -> Result<()> {
         assert_eq!(policy.block_rules.len(), 1);
         assert_eq!(
             policy.block_rules[0].action_kind,
-            Some(crate::tui::auto_review::ToolActionKind::External)
+            Some(crate::core::authority::auto_review::ToolActionKind::External)
         );
     }
     // from auto_review_text_contains_fails_closed_instead_of_broadening_a_rule
@@ -2075,43 +2075,51 @@ fn user_input_limits_read_from_tools_table_and_clamp() {
 }
 
 #[test]
-fn goal_max_steps_resolves_default_zero_and_clamps() {
-    let parsed: ConfigFile = toml::from_str("").expect("empty config");
-    assert_eq!(
-        parsed.base.goal_max_steps(),
-        crate::goal_loop::DEFAULT_GOAL_MAX_STEPS
-    );
+fn goal_max_steps_default_and_zero_are_uncapped() {
+    for source in ["", "[goal]", "[goal]\nmax_steps = 0\n"] {
+        let parsed: ConfigFile = toml::from_str(source).expect("goal config");
+        let resolved = parsed.base.goal_max_steps();
+        assert_eq!(resolved, u32::MAX, "{source:?}");
 
-    // An explicit 0 is the goal default (1,000), never unlimited.
-    let parsed: ConfigFile = toml::from_str(
-        r#"
-        [goal]
-        max_steps = 0
-        "#,
-    )
-    .expect("goal config");
-    assert_eq!(
-        parsed.base.goal_max_steps(),
-        crate::goal_loop::DEFAULT_GOAL_MAX_STEPS
-    );
+        // Hosts pass this resolved value directly to the goal turn. It must
+        // remain uncapped beyond the old 1,000-step ceiling and at saturation.
+        let mut turn = crate::core::turn::TurnContext::with_budget_source(
+            resolved,
+            crate::core::turn::StepBudgetSource::Goal,
+        );
+        assert_eq!(turn.step_limit(), None);
+        turn.step = 1_000;
+        assert!(turn.next_step(), "{source:?}");
+        assert!(!turn.at_max_steps(), "{source:?}");
+        turn.step = u32::MAX;
+        assert!(turn.next_step(), "{source:?}");
+        assert!(!turn.at_max_steps(), "{source:?}");
+    }
+}
 
-    let parsed: ConfigFile = toml::from_str(
-        r#"
-        [goal]
-        max_steps = 50
-        "#,
-    )
-    .expect("goal config");
-    assert_eq!(parsed.base.goal_max_steps(), 50);
+#[test]
+fn goal_max_steps_preserves_positive_limits_and_clamps() {
+    for (configured, expected) in [
+        (1, 1),
+        (50, 50),
+        (100_000, 100_000),
+        (500_000, 100_000),
+        (u32::MAX, 100_000),
+    ] {
+        let source = format!("[goal]\nmax_steps = {configured}\n");
+        let parsed: ConfigFile = toml::from_str(&source).expect("goal config");
+        let resolved = parsed.base.goal_max_steps();
+        assert_eq!(resolved, expected, "{source:?}");
 
-    let parsed: ConfigFile = toml::from_str(
-        r#"
-        [goal]
-        max_steps = 500000
-        "#,
-    )
-    .expect("goal config");
-    assert_eq!(parsed.base.goal_max_steps(), 100_000);
+        let mut turn = crate::core::turn::TurnContext::with_budget_source(
+            resolved,
+            crate::core::turn::StepBudgetSource::Goal,
+        );
+        assert_eq!(turn.step_limit(), Some(expected));
+        turn.step = expected;
+        assert!(turn.at_max_steps(), "{source:?}");
+        assert!(!turn.next_step(), "{source:?}");
+    }
 }
 
 #[test]
@@ -2683,6 +2691,25 @@ fn legacy_prefer_bwrap_env_remains_a_compatible_alias() {
     apply_env_overrides(&mut config, ConfigEnvironmentPolicy::Runtime);
 
     assert_eq!(config.prefer_bwrap, Some(true));
+}
+
+#[test]
+fn prefers_bwrap_defaults_on_and_honors_explicit_opt_out() {
+    assert!(Config::default().prefers_bwrap());
+    assert!(
+        Config {
+            prefer_bwrap: Some(true),
+            ..Config::default()
+        }
+        .prefers_bwrap()
+    );
+    assert!(
+        !Config {
+            prefer_bwrap: Some(false),
+            ..Config::default()
+        }
+        .prefers_bwrap()
+    );
 }
 
 struct EnvGuard {

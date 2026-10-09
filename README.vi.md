@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -22,9 +22,9 @@ bộ do bạn chọn.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Một phiên terminal của Codewhale" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Một phiên terminal của Codewhale" width="760">
 
-<sub>Ảnh chụp terminal thật sau một lần cài mới, không dàn dựng đầu ra.</sub>
+<sub>Ảnh chụp terminal Codewhale thật từ một phiên demo cục bộ đã được cấu hình.</sub>
 
 </div>
 
@@ -59,6 +59,12 @@ một máy sẽ xung đột với nhau về `PATH`.
 </details>
 
 ## Bắt đầu nhanh
+
+**Quản lý khóa API của các nhà cung cấp ở một nơi.** [Tạo tài khoản Codewhale](https://app.codewhale.net/register)
+hoặc chạy `codewhale login` để đăng nhập. Lưu và cập nhật khóa API trong tài khoản,
+rồi sử dụng chúng qua tuyến mô hình Codewhale trên các thiết bị đã đăng nhập.
+[Thiết lập khóa trong tài khoản](docs/CONFIGURATION.md#account-provider-keys).
+Đăng nhập không tải các khóa cục bộ hiện có lên tài khoản; bạn vẫn có thể sử dụng cục bộ mà không cần tài khoản.
 
 1. **Mở dự án của bạn.** Chạy `codewhale` trong thư mục bạn muốn làm việc.
 2. **Kết nối mô hình.** Chạy `/provider` (hoặc nhấn `F3`) để thêm khóa của mô

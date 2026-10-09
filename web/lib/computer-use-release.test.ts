@@ -15,7 +15,7 @@ const imageSha = "c".repeat(64);
 const imageAsset = () => ({ ...asset(image, 81000000), digest: `sha256:${imageSha}` });
 const imageReceipt = () => ({ ...receipt(), dmg: { archive: image, size: 81000000, sha256: imageSha, notarized: true } });
 
-const API_LATEST = "https://api.github.com/repos/Hmbown/codewhale-cu-plugin/releases/latest";
+const API_LATEST = "https://api.github.com/repos/codewhale-hq/codewhale-cu-plugin/releases/latest";
 const WEB_RECEIPT = `${COMPUTER_USE_REPO}/releases/latest/download/release.json`;
 const OBJECT_URL = "https://objects.githubusercontent.com/github-production-release-asset/1/release.json?X-Amz-Signature=x";
 const status = (code: number) => new Response(null, { status: code });
@@ -32,6 +32,26 @@ const stub = (...responses: unknown[]) => {
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 describe("Computer Use download qualification", () => {
+  it("qualifies the canonical URLs returned after the repository transfer", () => {
+    const release = fixture();
+    release.html_url = "https://github.com/codewhale-hq/codewhale-cu-plugin/releases/tag/v0.3.0";
+    release.assets[0].browser_download_url = "https://github.com/codewhale-hq/codewhale-cu-plugin/releases/download/v0.3.0/Codewhale-Computer-Use-0.3.0-macos-universal.zip";
+    release.assets[1].browser_download_url = "https://github.com/codewhale-hq/codewhale-cu-plugin/releases/download/v0.3.0/release.json";
+    expect(qualifiedComputerUseRelease(release, receipt())).toMatchObject({
+      status: "ready", verification: "github-digest",
+      url: "https://github.com/codewhale-hq/codewhale-cu-plugin/releases/tag/v0.3.0",
+      downloadUrl: release.assets[0].browser_download_url,
+    });
+  });
+  it.each(["Hmbown", "codewhale-hq-lookalike"])("refuses release metadata naming noncanonical owner %s", owner => {
+    const release = fixture();
+    const repo = `https://github.com/${owner}/codewhale-cu-plugin`;
+    release.html_url = `${repo}/releases/tag/v0.3.0`;
+    release.assets = release.assets.map(a => ({
+      ...a, browser_download_url: `${repo}/releases/download/v0.3.0/${a.name}`,
+    }));
+    expect(qualifiedComputerUseRelease(release, receipt()).status).toBe("pending");
+  });
   it("offers the exact archive when the release, receipt and GitHub digest agree", () => {
     expect(qualifiedComputerUseRelease(fixture(), receipt())).toMatchObject({
       status: "ready", version: "0.3.0", sha256, downloadUrl: asset(archive, 80000000).browser_download_url,

@@ -4,6 +4,11 @@
 //! in one place so prompt metadata, tool catalogs, and runtime gates cannot
 //! drift independently.
 
+pub mod auto_review;
+pub mod risk;
+
+pub use risk::{RiskLevel, classify_risk};
+
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -522,12 +527,7 @@ pub(crate) fn write_carve_out_posture(
 /// without git keeps the modal.
 #[must_use]
 pub(crate) fn paths_within_workspace_write_carve_out(workspace: &Path, paths: &[String]) -> bool {
-    if paths.is_empty() {
-        return false;
-    }
-    // `.git` may be a directory (normal checkout) or a file (worktree or
-    // submodule); either marks a git work tree.
-    if workspace.join(".git").symlink_metadata().is_err() {
+    if paths.is_empty() || !workspace_is_git_work_tree(workspace) {
         return false;
     }
     let Ok(workspace_canonical) = workspace.canonicalize() else {
@@ -536,6 +536,35 @@ pub(crate) fn paths_within_workspace_write_carve_out(workspace: &Path, paths: &[
     paths
         .iter()
         .all(|raw| carve_out_target_allowed(workspace, &workspace_canonical, raw))
+}
+
+/// The git work-tree marker the carve-out keys on. `.git` may be a directory
+/// (normal checkout) or a file (worktree or submodule); either counts.
+fn workspace_is_git_work_tree(workspace: &Path) -> bool {
+    workspace.join(".git").symlink_metadata().is_ok()
+}
+
+/// Whether a file-write approval card should say that the folder has no git
+/// repository: the posture is the one the carve-out (#5185) relaxes, the call
+/// is a canonical file-write tool, and the workspace has no git work tree, so
+/// the same edit would run without a card in a repository.
+///
+/// Presentation only. The engine has already decided to ask; this never
+/// opens, skips or answers a card.
+#[must_use]
+pub(crate) fn file_write_asks_without_git(
+    mode: AppMode,
+    approval_mode: ApprovalMode,
+    workspace: &Path,
+    tool_name: &str,
+    input: &Value,
+) -> bool {
+    write_carve_out_posture(mode, approval_mode, false)
+        && matches!(
+            canonical_action_alias(tool_name, input),
+            "write_file" | "edit_file" | "apply_patch"
+        )
+        && !workspace_is_git_work_tree(workspace)
 }
 
 fn carve_out_target_allowed(workspace: &Path, workspace_canonical: &Path, raw: &str) -> bool {
@@ -858,6 +887,60 @@ mod tests {
             AppMode::Plan,
             ApprovalMode::Suggest,
             false
+        ));
+    }
+
+    #[test]
+    fn file_write_card_names_the_missing_repository_only_where_git_changes_the_answer() {
+        let plain = tempfile::tempdir().expect("tempdir");
+        let repo = carve_out_workspace();
+        let edit = serde_json::json!({ "path": "notes.txt", "search": "a", "replace": "b" });
+        let asks = |mode, approval_mode, workspace: &Path, tool: &str| {
+            file_write_asks_without_git(mode, approval_mode, workspace, tool, &edit)
+        };
+
+        // The lesson-1 case: default Ask posture, plain folder, a file edit.
+        for tool in ["edit_file", "write_file", "apply_patch"] {
+            assert!(
+                asks(AppMode::Agent, ApprovalMode::Suggest, plain.path(), tool),
+                "{tool}"
+            );
+        }
+        // In a repository the same call runs without a card, so a card that
+        // does open there is asking for some other reason.
+        assert!(!asks(
+            AppMode::Agent,
+            ApprovalMode::Suggest,
+            repo.path(),
+            "edit_file"
+        ));
+        assert!(paths_within_workspace_write_carve_out(
+            repo.path(),
+            &["notes.txt".to_string()]
+        ));
+        assert!(!paths_within_workspace_write_carve_out(
+            plain.path(),
+            &["notes.txt".to_string()]
+        ));
+        // Postures the carve-out never relaxes ask with or without git.
+        assert!(!asks(
+            AppMode::Agent,
+            ApprovalMode::Auto,
+            plain.path(),
+            "edit_file"
+        ));
+        assert!(!asks(
+            AppMode::Plan,
+            ApprovalMode::Suggest,
+            plain.path(),
+            "edit_file"
+        ));
+        // Git presence never changes whether a command asks.
+        assert!(!asks(
+            AppMode::Agent,
+            ApprovalMode::Suggest,
+            plain.path(),
+            "exec_shell"
         ));
     }
 

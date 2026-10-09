@@ -125,6 +125,7 @@ pub mod composition_scope;
 pub(crate) mod core_call;
 pub(crate) mod execution;
 pub(crate) use execution::StockOperation;
+pub(crate) mod avatars;
 mod hooks;
 pub(crate) mod mcp;
 pub(crate) mod native_mcp;
@@ -962,6 +963,13 @@ impl HostEvents for Events {
                     native_mcp::admit(&shared, self.tier, self.generation, params, &cx).await;
                 Ok(serde_json::to_value(result).expect("registration result is JSON"))
             }
+            protocol::HostRequest::Register(params) if params.kind == RegisterKind::AvatarPack => {
+                let Some(shared) = self.shared.upgrade() else {
+                    return Err(refuse("extension host manager is gone"));
+                };
+                let result = avatars::admit(&shared, self.tier, self.generation, params, &cx).await;
+                Ok(serde_json::to_value(result).expect("registration result is JSON"))
+            }
             protocol::HostRequest::Register(params) if params.kind == RegisterKind::SkillRoot => {
                 let Some(shared) = self.shared.upgrade() else {
                     return Err(refuse("extension host manager is gone"));
@@ -1038,6 +1046,7 @@ impl HostEvents for Events {
                     RegisterKind::PromptSection => "prompt section",
                     RegisterKind::PromptTemplate => "prompt template",
                     RegisterKind::SkillRoot => "skill root",
+                    RegisterKind::AvatarPack => "avatar pack",
                     RegisterKind::ShellHook => "shell hook",
                     RegisterKind::McpServer => "MCP server",
                 };

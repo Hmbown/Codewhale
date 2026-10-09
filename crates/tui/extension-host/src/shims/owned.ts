@@ -42,14 +42,14 @@ export class OwnedRegistrations<O extends OwnerBase, T extends OwnedEntry<O>> {
   readonly byHandle = new Map<number, T>()
 
   private readonly rpc: RpcPeer
-  private readonly kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'prompt_template' | 'skill_root' | 'shell_hook' | 'mcp_server'
+  private readonly kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'prompt_template' | 'skill_root' | 'avatar_pack' | 'shell_hook' | 'mcp_server'
   /** The owner's own index of this kind, for the leak report at deactivation. */
   private readonly ownedBy: (owner: O) => Map<number, T>
   private readonly warn: (message: string, owner: O) => void
 
   constructor(
     rpc: RpcPeer,
-    kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'prompt_template' | 'skill_root' | 'shell_hook' | 'mcp_server',
+    kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'prompt_template' | 'skill_root' | 'avatar_pack' | 'shell_hook' | 'mcp_server',
     ownedBy: (owner: O) => Map<number, T>,
     warn: (message: string, owner: O) => void,
   ) {

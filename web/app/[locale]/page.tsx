@@ -2,11 +2,11 @@ import { Fragment } from "react";
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { HeroInstall } from "@/components/hero-install";
-import { Icon, type IconName } from "@/components/icon";
+import { Icon } from "@/components/icon";
 import { InstallCodeBlock } from "@/components/install-code-block";
 import { Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
-import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
+import { TerminalCapture } from "@/components/terminal-capture";
 import { WhaleLive } from "@/components/whale-live";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
@@ -19,35 +19,29 @@ import {
   REPO_URL,
 } from "@/lib/i18n/links";
 import { serializeJsonLd } from "@/lib/json-ld";
-import { buildSoftwareApplicationJsonLd } from "@/lib/software-application-schema";
 import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
+import { buildSoftwareApplicationJsonLd } from "@/lib/software-application-schema";
 
 // Revalidate against source-proven runtime facts without giving up static edge
 // caching. `getFacts()` rejects legacy or older KV snapshots.
 export const revalidate = 300;
 
-// Row order is shared by every locale's `gain` and `availability` lists, so
-// the marks and states follow the row, not a word.
-const GAIN_ICONS: IconName[] = ["terminal", "repeat", "shield"];
 // Released · GUI available · development preview · development build · in
 // development.
 const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
 
 /**
- * The whale-road homepage, paper above and sea below. The promise and the
- * install command sit on paper; the live v2 whale (the desktop app's own
- * Director) rests on one horizon line; the real terminal floats in the deep
- * water just under it. The reading sections return to paper, and the page
- * ends in the sea with the install command, running into the footer.
+ * The whale-road homepage: the promise, capabilities and reading
+ * sections sit on paper. The live v2 whale (the desktop app's own Director)
+ * rests beside the hero, and the page ends in the sea with the install
+ * command, running into the footer.
  *
  * One memorable thing moves: the whale. It breathes, glances toward the
- * pointer, and acts out the terminal view a reader picks. Everything else is
- * still. Reduced motion shows its poster pose.
+ * pointer, and performs its existing poses. Everything else is still.
+ * Reduced motion shows its poster pose.
  *
- * Every visible string resolves through `getHome(locale)`. The only literals
- * left here are code-owned per docs/VOICE.md: the product control vocabulary
- * (`Plan · Work · Operate`, `Ask · Auto-Review · Full Access`) and package
- * channel proper nouns.
+ * Public copy resolves through `getHome(locale)`; product names and package
+ * channels keep their canonical spelling.
  */
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -88,7 +82,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 </Fragment>
               ))}
             </p>
-            <HeroInstall ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
+            <HeroInstall locale={locale} ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
             <div className="actions">
               <Link href={`/${locale}/install`} className="btn btn-primary btn-lg">
                 {d.getCodewhale}
@@ -105,59 +99,50 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         </div>
       </section>
 
-      {/* THE SEA — the horizon, then the real terminal just under the
-          surface: live text from an exact-build PTY cell capture. No
-          fabricated conversation, connected tools or completion metrics. */}
-      <section className="home-terminal stage" aria-labelledby="home-terminal">
-        <div className="home-terminal-inner">
-          <h2 className="home-terminal-title" id="home-terminal">{d.chapterTerminalTitle}</h2>
-          <figure className="figure home-shot">
-            <div className="figure-frame">
-              <NativeTerminalGallery
-                    locale={locale}
-                    defaultFrame="composer"
-                    regionLabel={d.shotPreview}
-                    label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
-              />
-            </div>
-            <figcaption className="figure-caption">
-              <span>
-                {d.shotPreview} · {fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })}
-              </span>
-              {/* Each fact is its own translated unit; nothing is
-                  concatenated around a token. */}
-              <span
-                className="status-line"
-                data-source-state={sourceIsPublished ? "published release" : "source candidate"}
-                data-source-state-label={sourceIsPublished ? d.publishedRelease : d.figcaptionSourceCandidate}
-              >
-                <Status tone={publishedRelease ? "ready" : "idle"}>
-                  {publishedRelease
-                    ? fill(d.latestRelease, { tag: publishedRelease.tag })
-                    : d.releaseUnavailable}
-                </Status>
-                <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
-                <span>{facts.license ?? "MIT"}</span>
-              </span>
-            </figcaption>
-          </figure>
-        </div>
-      </section>
+      <div
+        className="home-release status-line"
+        data-source-state={sourceIsPublished ? "published release" : "source candidate"}
+        data-source-state-label={sourceIsPublished ? d.publishedRelease : d.sourceCandidate}
+      >
+        <Status tone={publishedRelease ? "ready" : "idle"}>
+          {publishedRelease
+            ? fill(d.latestRelease, { tag: publishedRelease.tag })
+            : d.releaseUnavailable}
+        </Status>
+        <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
+        <span>{facts.license ?? "MIT"}</span>
+      </div>
 
-      {/* PAPER AGAIN — what it does, how it connects, how to start. */}
+      <figure className="home-terminal figure">
+        <div className="figure-frame" dir="ltr">
+          <TerminalCapture
+            frame="home"
+            regionLabel={d.shotPreview}
+            label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+          />
+        </div>
+        <figcaption className="figure-caption">
+          {d.shotPreview} · {d.sourceCandidate} v{TERMINAL_SCREENSHOT.version}
+        </figcaption>
+      </figure>
+
+      {/* PAPER — models, connections, and the getting-started path. */}
       <div className="home-body">
-        <Section id="home-gain" title={d.gainHeading} scope={d.gainLede} className="home-section">
-          <div className="ruled-cols">
-            {d.gain.map(([title, body], index) => (
-              <div key={title}>
-                <span className="ruled-icon" aria-hidden="true">
-                  <Icon name={GAIN_ICONS[index] ?? "terminal"} />
-                </span>
-                <h3>{title}</h3>
-                <p>{body}</p>
+        <Section
+          id="home-capabilities"
+          layout="split"
+          className="home-section"
+          title={d.gainHeading}
+          scope={d.gainLede}
+        >
+          <dl className="ruled-list">
+            {d.gain.map(([name, description]) => (
+              <div key={name}>
+                <dt>{name}</dt>
+                <dd>{description}</dd>
               </div>
             ))}
-          </div>
+          </dl>
         </Section>
 
         <Section
@@ -180,10 +165,6 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 <dd>{description}</dd>
               </div>
             ))}
-            <div className="home-modes">
-              <dt>Plan · Work · Operate</dt>
-              <dd>Ask · Auto-Review · Full Access</dd>
-            </div>
           </dl>
         </Section>
 

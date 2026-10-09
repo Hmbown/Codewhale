@@ -3,6 +3,7 @@
     "std_fs": 1
   },
   "crates/cli/src/cloud.rs": {
+    "std_fs": 1,
     "thread_sleep": 2
   },
   "crates/cli/src/config_bundles.rs": {
@@ -210,7 +211,7 @@
     "std_fs": 2
   },
   "crates/tui/src/image_attach.rs": {
-    "std_fs": 2
+    "std_fs": 6
   },
   "crates/tui/src/import_claude.rs": {
     "std_fs": 2
@@ -270,7 +271,8 @@
     "std_fs": 1
   },
   "crates/tui/src/plugins/registry.rs": {
-    "path_canonicalize": 6
+    "path_canonicalize": 6,
+    "thread_sleep": 1
   },
   "crates/tui/src/plugins/runtime.rs": {
     "path_canonicalize": 2

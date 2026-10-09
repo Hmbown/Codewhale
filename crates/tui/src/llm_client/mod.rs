@@ -475,7 +475,8 @@ impl LlmError {
         {
             return error;
         }
-        if matches!(status, 400 | 402 | 429) && has_explicit_quota_evidence(body) {
+        // xAI refuses an exhausted account with a 403, not a 402/429.
+        if matches!(status, 400 | 402 | 403 | 429) && has_explicit_quota_evidence(body) {
             return LlmError::QuotaExhausted(QuotaExhaustionError::from_http_message(
                 body.to_string(),
             ));
@@ -872,7 +873,19 @@ fn has_explicit_quota_phrase(body: &str) -> bool {
     .into_iter()
     .any(|phrase| lower.contains(phrase));
 
-    lower.contains("billing hard limit has been reached")
+    // xAI: "You have run out of credits or need a Grok subscription."
+    let credits_exhausted = [
+        "run out of credits",
+        "out of credits",
+        "insufficient credits",
+        "used all available credits",
+        "monthly spending limit",
+    ]
+    .into_iter()
+    .any(|phrase| lower.contains(phrase));
+
+    credits_exhausted
+        || lower.contains("billing hard limit has been reached")
         || lower.contains("credit balance exhausted")
         || lower.contains("credit balance is exhausted")
         || durable_scope_exhausted
@@ -1533,6 +1546,27 @@ pub fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Durat
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_retry_after)
+}
+
+const PROVIDER_RETRY_HINT_MAX: Duration = Duration::from_secs(120);
+
+pub fn retry_delay_from_error_body(body: &str) -> Option<Duration> {
+    static HINTS: std::sync::OnceLock<[regex::Regex; 2]> = std::sync::OnceLock::new();
+    let [structured, prose] = HINTS.get_or_init(|| {
+        [
+            regex::Regex::new(r#"retryDelay\\?"\s*:\s*\\?"\s*(\d+(?:\.\d+)?)\s*s"#).unwrap(),
+            regex::Regex::new(r"(?i)retry in\s+(\d+(?:\.\d+)?)\s*s").unwrap(),
+        ]
+    });
+    structured
+        .captures(body)
+        .or_else(|| prose.captures(body))
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse::<f64>().ok())
+        .filter(|seconds| {
+            seconds.is_finite() && (0.0..=PROVIDER_RETRY_HINT_MAX.as_secs_f64()).contains(seconds)
+        })
+        .map(Duration::from_secs_f64)
 }
 
 #[cfg(test)]

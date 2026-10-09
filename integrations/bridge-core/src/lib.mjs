@@ -1,6 +1,7 @@
 import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 
 const DEFAULT_ACTION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -36,7 +37,17 @@ export async function writeFileDurable(filePath, contents, { mode = 0o600 } = {}
     await handle.sync();
     await handle.close();
     handle = null;
-    await rename(tmp, filePath);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await rename(tmp, filePath);
+        break;
+      } catch (error) {
+        // Windows readers/other writers can temporarily deny replacement.
+        // Never unlink the old record to make the rename succeed.
+        if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 10) throw error;
+        await delay(50 * (attempt + 1));
+      }
+    }
   } catch (error) {
     await handle?.close().catch(() => {});
     await rm(tmp, { force: true }).catch(() => {});

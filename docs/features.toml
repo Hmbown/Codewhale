@@ -259,7 +259,7 @@ owner = "crates/tui/src/tools/review_host.rs"
 [[feature]]
 id = "modes"
 name = "Modes"
-summary = "Plan, Work and Operate modes set what the agent may do in a session."
+summary = "Plan, Work and Operate modes set what the agent may do in a session; a finished plan offers to start the work."
 status = "stable"
 surfaces = { tui = "stable", api = "stable" }
 docs = "docs/MODES.md"
@@ -277,7 +277,7 @@ owner = "crates/execpolicy/src/approval_mode.rs"
 [[feature]]
 id = "sandbox"
 name = "Command sandbox"
-summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is opt-in."
+summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is on by default once installed and verified."
 status = "stable"
 surfaces = { tui = "stable" }
 docs = "docs/SANDBOX.md"
@@ -422,6 +422,15 @@ docs = "docs/PLUGINS.md"
 owner = "crates/tui/src/plugins"
 
 [[feature]]
+id = "computer-use"
+name = "Computer Use"
+summary = "Reviewed app control with consent, fresh element targets, observation diffs and bounded named action batches."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+docs = "docs/PLUGIN_BUNDLES.md"
+owner = "crates/tui/plugins/computer-use"
+
+[[feature]]
 id = "script-tools"
 name = "Script tools"
 summary = "Scripts in ~/.codewhale/tools become approval-gated tools; [tools.overrides] disables built-ins, never replaces them."
@@ -468,7 +477,7 @@ owner = "crates/tui/src/lsp"
 [[feature]]
 id = "runtime-api"
 name = "Runtime API"
-summary = "Local HTTP API for threads, events, approvals and the rest of the session."
+summary = "Local HTTP API for threads, events and approvals, with scoped watch/drive device tokens and account-bound model turns."
 status = "stable"
 surfaces = { api = "stable" }
 docs = "docs/RUNTIME_API.md"
@@ -550,7 +559,7 @@ owner = "crates/tui/src/voice.rs"
 [[feature]]
 id = "pet"
 name = "Pet"
-summary = "/pet turns the screen over to the Codewhale pet while it works."
+summary = "/pet on saves the animated main view; /pet inspect shows replies and agents and lets you copy finished replies."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/tui/pet_watch"
@@ -571,6 +580,15 @@ summary = "/login signs in to Codewhale or stores provider keys."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/commands/groups/config/config.rs"
+
+[[feature]]
+id = "account-computer-files"
+name = "Account computer files"
+summary = "Save computer files as account versions, restore with revision checks, and download verified bytes."
+status = "experimental"
+surfaces = { tui = "preview" }
+since = "unreleased"
+owner = "crates/cli/src/cloud.rs"
 
 [[feature]]
 id = "context-anchors"
@@ -612,6 +630,14 @@ status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/tui/sidebar.rs"
 
+[[feature]]
+id = "terminal-dock"
+name = "Terminal dock"
+summary = "/workbar terminal shows workspace PTYs with live output, human input, session selection and a fresh shell; macOS/Linux."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/tui/work_surface/terminal.rs"
+
 # --- Operations and platforms ---
 
 [[feature]]
@@ -651,6 +677,36 @@ since = "unreleased"
 docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
 owner = "crates/tui/src/oauth.rs"
 
+[[feature]]
+id = "claude-plan-sign-in"
+name = "Sign in with Claude"
+summary = "Adds Claude subscription sign-in and native Messages routing. Live provider acceptance remains unverified."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md#sign-in-with-claude"
+owner = "crates/tui/src/oauth.rs"
+
+[[feature]]
+id = "plugin-oauth-providers"
+name = "Reviewed plugin OAuth providers"
+summary = "Reviewed plugins add OpenAI-compatible routes; the host owns PKCE grants and rechecks approval at each request."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PLUGIN_PROVIDERS.md"
+owner = "crates/tui/src/plugins/providers.rs"
+
+[[feature]]
+id = "orcarouter-sign-in"
+name = "Sign in with OrcaRouter"
+summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
+status = "experimental"
+surfaces = { tui = "preview", api = "none", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md"
+owner = "crates/tui/src/oauth.rs"
+
 # Community marketing website, separate from the Runtime's local web client.
 [[feature]]
 id = "merch-interest"
@@ -661,3 +717,13 @@ surfaces = { tui = "none", web = "none", api = "none" }
 since = "unreleased"
 docs = "web/lib/merch/README.md"
 owner = "web/components/merch-interest.tsx"
+
+[[feature]]
+id = "profile-constitution"
+name = "Profile constitution"
+summary = "Account preferences are captured per turn and previewed by the Engine."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+since = "unreleased"
+docs = "docs/RUNTIME_API.md#profile-constitution"
+owner = "crates/tui/src/profile_constitution.rs"

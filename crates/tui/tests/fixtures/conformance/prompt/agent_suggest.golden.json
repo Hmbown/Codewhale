@@ -2,8 +2,8 @@
   "system_sha256": "8ff744b8ed90564a8c4754ac79cdbaf05df69ed024cc2ec154abfe581ed72d7f",
   "system_bytes": 9183,
   "system_blocks": 5,
-  "tools_sha256": "9808d142bfc2598b935865f370e2d42a52cd3dfcd9678d7c7cc51c3d34ecb610",
-  "tools_bytes": 12818,
+  "tools_sha256": "7b15a5b03aff2959f6737f323e67472d15b3d4bc41183f28e61cbce3da60fae6",
+  "tools_bytes": 13460,
   "tool_count": 11,
   "tool_names": [
     "bash",
@@ -18,7 +18,7 @@
     "execute_tools",
     "tool_search"
   ],
-  "prefix_sha256": "bd6f3709ea8d9be4d348d92a673b428aad2e6af5fc6e198cb418de11d13c4b4d",
+  "prefix_sha256": "d801d7826fb38dd5f7893ab8fb2c97bb52829fb433b42c25442b572f1d1e2989",
   "masks": [
     "<WORKSPACE>",
     "<HOME>",

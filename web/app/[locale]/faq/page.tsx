@@ -35,10 +35,10 @@ const faqEn = (p: SitePath): FaqItem[] => [
     q: "What is Codewhale?",
     a: (
       <>
-        Codewhale is a terminal-native coding agent that works across hosted and local models. It runs from the <code className="inline">codewhale</code> command, streams reasoning blocks, edits local workspaces with approval gates, and can route each turn to a configured model and thinking level. DeepSeek is the bundled default route, while OpenRouter, Anthropic, OpenAI-compatible services, and self-hosted runtimes use the same runtime and tools.
+        Codewhale is an open-source agent for building apps and tools, automating workflows, and working across files, terminal commands and connected apps. Add tools through plugins and MCP servers, or use APIs from your own scripts. Each service needs its own setup and authentication. Use the model APIs you already have or local and self-hosted inference. Start it with <code className="inline">codewhale</code> and choose the access and approvals for its work. DeepSeek is the bundled default route; the model and provider are yours to choose.
       </>
     ),
-    sources: ["README.md", "docs/ARCHITECTURE.md"],
+    sources: ["README.md", "docs/GUIDE.md", "docs/PLUGINS.md", "docs/MCP.md", "docs/PROVIDERS.md"],
   },
   {
     q: "How do I install Codewhale?",
@@ -52,7 +52,7 @@ ${GETTING_STARTED_STEPS[0].commands[0]}
 # npm alternative — no Rust toolchain needed
 npm install -g codewhale
 
-# Cargo (needs Rust 1.88+; installs the codewhale command)
+# Cargo (needs Rust 1.89+; installs the codewhale command)
 cargo install codewhale-cli --locked
 
 # Homebrew on Linux (tap; tested on Ubuntu)
@@ -117,11 +117,14 @@ codewhale auth set --provider deepseek     # prompts for the key
 
 # Check what's active:
 codewhale auth status    # shows config, keyring, and env-var state
-codewhale doctor         # full connectivity check`}
+codewhale doctor         # offline configuration checks`}
         </pre>
         <p>
           Saved keys take precedence over environment variables. Avoid putting a key directly on the command line, where it lands in shell history.
           Use <code className="inline">codewhale auth clear --provider deepseek</code> to remove a saved key.
+        </p>
+        <p>
+          To test a live connection, run <code className="inline">codewhale doctor --probe-api</code> for your hosted provider or <code className="inline">codewhale doctor --probe-local</code> for a local endpoint. The local probe may start a managed service such as Ollama.
         </p>
       </>
     ),
@@ -149,20 +152,16 @@ codewhale doctor         # full connectivity check`}
     q: "How do I use OpenRouter with Codewhale?",
     a: (
       <>
+        <p className="mb-2">
+          To make OpenRouter the default, put the provider and model settings before the provider table in <code className="inline">~/.codewhale/config.toml</code>:
+        </p>
         <pre tabIndex={0} className="code-block mb-2">
-{`# 1. Set your OpenRouter key
-export OPENROUTER_API_KEY=sk-or-v1-...
+{`# ~/.codewhale/config.toml
+provider = "openrouter"
+default_text_model = "deepseek/deepseek-v4-pro"
 
-# 2. In ~/.codewhale/config.toml:
 [providers.openrouter]
-api_key = "sk-or-v1-..."
-
-# 3. Run with the OpenRouter route:
-codewhale --provider openrouter --model deepseek/deepseek-v4-pro
-
-# Or make it the default route in config.toml:
-# provider = "openrouter"
-# default_text_model = "deepseek/deepseek-v4-pro"`}
+api_key = "sk-or-v1-..."`}
         </pre>
         <p>
           OpenRouter uses the same reasoning/cache parser as the native DeepSeek provider.
@@ -190,11 +189,11 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan</strong> — Read-only investigation. Can grep, read files, list directories, fetch URLs. Cannot write or execute shell.</li>
-          <li><strong>Work</strong> — Normal interactive coding. Tool availability and approval prompts follow the active configuration and permission posture.</li>
+          <li><strong>Work</strong> — Interactive work with files, commands and connected tools. Tool availability and approval prompts follow the active configuration and permission posture.</li>
           <li><strong>Operate</strong> — Direct tools follow the same permission, sandbox, shell, and safety rules as Work. Fleet workers are preferred for independent, parallel, background, or long-running work, but delegation is not mandatory. Workflow is optional for ordered phases and gates.</li>
         </ul>
         <p className="mt-2">
-          When the composer is idle, press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> to cycle modes.
+          When the composer is empty, press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> to cycle modes.
           Press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd> to cycle the independent Ask / Auto-Review / Full Access permission posture; Plan remains read-only.
         </p>
       </>
@@ -257,7 +256,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         provider you select receives the prompt, project context, tool definitions,
         and tool results required for that turn. Use a loopback local-model route to
         keep model inference local.
-        OS command sandboxing is platform-specific: Codewhale uses <strong>Seatbelt</strong> on macOS when available. On Linux it uses <strong>bubblewrap</strong> only when <code className="inline">prefer_bwrap = true</code> and <code className="inline">/usr/bin/bwrap</code> is executable; otherwise commands have no Codewhale OS wrapper. Windows currently reports no OS sandbox.
+        OS command sandboxing is platform-specific: Codewhale uses <strong>Seatbelt</strong> on macOS when available. On Linux it uses <strong>bubblewrap</strong> by default whenever <code className="inline">/usr/bin/bwrap</code> is installed and a probe shows it works; <code className="inline">prefer_bwrap = false</code> opts out. Otherwise commands have no Codewhale OS wrapper. Windows currently reports no OS sandbox.
         Workspace boundaries default to <code className="inline">--workspace</code>. <code className="inline">/trust</code> lifts them.
         Permission posture is configurable per session.
       </>
@@ -269,7 +268,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         Codewhale is a bidirectional MCP client and server. Define servers in <code className="inline">~/.codewhale/mcp.json</code>.
-        Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose Codewhale as an MCP server with <code className="inline">codewhale mcp</code>.
+        Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose Codewhale as an MCP server with <code className="inline">codewhale serve --mcp</code>.
         See the <Link href={p("/docs/mcp")} className="body-link">docs page</Link> for configuration examples.
       </>
     ),
@@ -344,7 +343,8 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "My API key was rejected or I get auth errors on first run.",
     a: (
       <>
-        <p className="mb-2">Run <code className="inline">codewhale doctor</code> — it prints a diagnostic report to stdout: config paths, credential-store state (values are never read or printed), provider/local/MCP probes, and release checks.</p>
+        <p className="mb-2">Start with <code className="inline">codewhale doctor</code> for an offline report of configuration paths, declared credential sources and tool setup. It does not test live connectivity by default.</p>
+        <p className="mb-2">Use <code className="inline">codewhale doctor --probe-api</code> to explicitly test your hosted provider, or <code className="inline">codewhale doctor --probe-local</code> for a local endpoint. A local probe may start a managed service such as Ollama.</p>
         <p className="mb-2">Common causes:</p>
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft">
           <li>Stale <code className="inline">DEEPSEEK_API_KEY</code> in shell startup file — open a fresh shell or use <code className="inline">codewhale auth set</code></li>
@@ -353,7 +353,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         </ul>
       </>
     ),
-    sources: ["#907", "#1545"],
+    sources: ["#907", "#1545", "docs/CONFIGURATION.md"],
   },
   {
     q: "What is Model Lab? What Hugging Face pieces are available?",
@@ -411,10 +411,10 @@ const faqZh = (p: SitePath): FaqItem[] => [
     q: "Codewhale 是什么？",
     a: (
       <>
-        Codewhale 是一个可使用托管与本地模型的终端原生编程智能体。通过 <code className="inline">codewhale</code> 命令启动，流式输出推理块，在有审批门槛的情况下编辑本地工作区，并可为每个回合选择已配置的模型和推理深度。DeepSeek 是内置默认路由；OpenRouter、Anthropic、OpenAI 兼容服务与自托管运行时使用同一套运行时和工具。
+        Codewhale 是一个开源智能体，用于构建应用和工具、自动化工作流，并在文件、终端命令和已连接的应用之间完成任务。通过插件和 MCP 服务添加工具，或在自己的脚本中使用 API。每项服务都需要单独配置并完成身份验证。使用你已有的模型 API，或连接本地、自托管推理服务。运行 <code className="inline">codewhale</code> 启动，并设定访问范围和审批方式。DeepSeek 是内置默认路由，模型与提供商仍由你选择。
       </>
     ),
-    sources: ["README.md", "docs/ARCHITECTURE.md"],
+    sources: ["README.md", "docs/GUIDE.md", "docs/PLUGINS.md", "docs/MCP.md", "docs/PROVIDERS.md"],
   },
   {
     q: "如何安装 Codewhale？",
@@ -428,7 +428,7 @@ ${GETTING_STARTED_STEPS[0].commands[0]}
 # npm 其他方式 — 无需 Rust 工具链
 npm install -g codewhale
 
-# Cargo（需要 Rust 1.88+；安装 codewhale 命令）
+# Cargo（需要 Rust 1.89+；安装 codewhale 命令）
 cargo install codewhale-cli --locked
 
 # Linux 上的 Homebrew（tap；已在 Ubuntu 上测试）
@@ -491,11 +491,14 @@ codewhale auth set --provider deepseek     # 会提示输入密钥
 
 # 查看当前状态：
 codewhale auth status    # 显示配置、密钥环和环境变量状态
-codewhale doctor         # 完整连接检查`}
+codewhale doctor         # 离线配置检查`}
         </pre>
         <p>
           已保存的密钥优先于环境变量。不要把密钥直接写在命令行里，否则会留在 Shell 历史中。
           使用 <code className="inline">codewhale auth clear --provider deepseek</code> 移除已保存的密钥。
+        </p>
+        <p>
+          要实际测试连接，运行 <code className="inline">codewhale doctor --probe-api</code> 检查托管提供商，或用 <code className="inline">codewhale doctor --probe-local</code> 检查本地端点。本地探针可能启动由桌面应用管理的 Ollama 等服务。
         </p>
       </>
     ),
@@ -523,20 +526,16 @@ codewhale doctor         # 完整连接检查`}
     q: "如何使用 OpenRouter？",
     a: (
       <>
+        <p className="mb-2">
+          要将 OpenRouter 设为默认路由，请在 <code className="inline">~/.codewhale/config.toml</code> 中把提供商和模型设置放在提供商配置表之前：
+        </p>
         <pre tabIndex={0} className="code-block mb-2">
-{`# 1. 设置 OpenRouter 密钥
-export OPENROUTER_API_KEY=sk-or-v1-...
+{`# ~/.codewhale/config.toml
+provider = "openrouter"
+default_text_model = "deepseek/deepseek-v4-pro"
 
-# 2. 在 ~/.codewhale/config.toml 中：
 [providers.openrouter]
-api_key = "sk-or-v1-..."
-
-# 3. 使用 OpenRouter 路由运行：
-codewhale --provider openrouter --model deepseek/deepseek-v4-pro
-
-# 或在 config.toml 中设为默认路由：
-# provider = "openrouter"
-# default_text_model = "deepseek/deepseek-v4-pro"`}
+api_key = "sk-or-v1-..."`}
         </pre>
         <p>
           OpenRouter 使用与原生 DeepSeek 提供商相同的推理/缓存解析器。
@@ -564,11 +563,11 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan（计划）</strong> — 只读调查。可以 grep、读文件、列目录、抓取 URL。不能写入或执行 Shell。</li>
-          <li><strong>Work（执行）</strong> — 常规交互式编码。工具是否可用以及何时请求批准，取决于当前配置和权限姿态。</li>
+          <li><strong>Work（执行）</strong> — 交互式执行任务，可处理文件、运行命令并使用已连接的工具。工具是否可用以及何时请求批准，取决于当前配置和权限姿态。</li>
           <li><strong>Operate（编排）</strong> — 直接工具遵循与 Work 相同的权限、沙箱、Shell 和安全规则。独立、并行、后台或长时间工作会优先交给 fleet worker，但不强制委派；只有需要有序阶段和门禁时才需要 Workflow。</li>
         </ul>
         <p className="mt-2">
-          输入区空闲时，按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> 切换模式。
+          输入区为空时，按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> 切换模式。
           按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd> 循环独立的 Ask / Auto-Review / Full Access 权限姿态；Plan 始终只读。
         </p>
       </>
@@ -618,7 +617,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         可用 <code className="inline">codewhale config set telemetry false</code> 或
         <code className="inline">CODEWHALE_TELEMETRY=0</code> 关闭）。也不要求经过托管中继。你选择的托管 provider 会收到本轮所需的
         prompt、项目上下文、工具定义与工具结果。若要让模型推理也保持本地，请使用回环地址上的本地模型路由。
-        OS 命令沙箱因平台而异：macOS 在可用时使用 <strong>Seatbelt</strong>。Linux 仅在 <code className="inline">prefer_bwrap = true</code> 且 <code className="inline">/usr/bin/bwrap</code> 可执行时使用 <strong>bubblewrap</strong>；否则命令没有 Codewhale OS 包装器。Windows 当前报告无 OS 沙箱。
+        OS 命令沙箱因平台而异：macOS 在可用时使用 <strong>Seatbelt</strong>。Linux 默认在 <code className="inline">/usr/bin/bwrap</code> 已安装且探测可用时使用 <strong>bubblewrap</strong>；<code className="inline">prefer_bwrap = false</code> 退出。否则命令没有 Codewhale OS 包装器。Windows 当前报告无 OS 沙箱。
         工作区边界默认为 <code className="inline">--workspace</code>。<code className="inline">/trust</code> 可解除边界。
         权限姿态可按会话配置。
       </>
@@ -630,7 +629,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         Codewhale 是双向 MCP 客户端和服务器。在 <code className="inline">~/.codewhale/mcp.json</code> 中定义服务器。
-        工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale mcp</code> 将 Codewhale 暴露为 MCP 服务器。
+        工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale serve --mcp</code> 将 Codewhale 暴露为 MCP 服务器。
         查看 <Link href={p("/docs/mcp")} className="body-link">文档页面</Link> 了解配置示例。
       </>
     ),
@@ -704,7 +703,8 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "首次运行时提示 API 密钥被拒绝或认证错误？",
     a: (
       <>
-        <p className="mb-2">运行 <code className="inline">codewhale doctor</code>——它会向 stdout 打印诊断报告：配置路径、凭据存储状态（绝不读取或打印具体值）、提供商/本地/MCP 探针以及发布检查。</p>
+        <p className="mb-2">先运行 <code className="inline">codewhale doctor</code>，查看配置路径、已声明的凭据来源和工具设置的离线报告。默认情况下，它不测试实际连接。</p>
+        <p className="mb-2">用 <code className="inline">codewhale doctor --probe-api</code> 明确测试托管提供商，或用 <code className="inline">codewhale doctor --probe-local</code> 检查本地端点。本地探针可能启动由桌面应用管理的 Ollama 等服务。</p>
         <p className="mb-2">常见原因：</p>
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft">
           <li>Shell 启动文件中的 <code className="inline">DEEPSEEK_API_KEY</code> 已过期——打开新 Shell 或使用 <code className="inline">codewhale auth set</code></li>
@@ -713,7 +713,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         </ul>
       </>
     ),
-    sources: ["#907", "#1545"],
+    sources: ["#907", "#1545", "docs/CONFIGURATION.md"],
   },
   {
     q: "Model Lab 是什么？Hugging Face 哪些部分可用？",

@@ -928,7 +928,7 @@ pub(super) fn format_task_list(tasks: &[TaskSummary]) -> String {
     for task in tasks {
         let duration = task
             .duration_ms
-            .map(crate::elapsed::format_elapsed_ms)
+            .map(codewhale_command_contract::elapsed::format_elapsed_ms)
             .unwrap_or_else(|| "-".to_string());
         let owner_session = task.owner_session_id.as_deref().unwrap_or("-");
         let owner_session = if owner_session.chars().count() > 12 {
@@ -1005,7 +1005,7 @@ fn format_task_detail(task: &TaskRecord) -> String {
     if let Some(duration) = task.duration_ms {
         lines.push(format!(
             "Duration: {}",
-            crate::elapsed::format_elapsed_ms(duration)
+            codewhale_command_contract::elapsed::format_elapsed_ms(duration)
         ));
     }
     lines.push(String::new());

@@ -797,12 +797,20 @@ mod platform {
     /// How long the stale-socket probe waits for a connect to resolve.
     const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+    #[cfg(test)]
+    type BeforeOwnerRebind = Box<dyn FnOnce(&Path)>;
+    #[cfg(test)]
+    thread_local! {
+        static BEFORE_OWNER_REBIND: std::cell::RefCell<Option<BeforeOwnerRebind>> = const { std::cell::RefCell::new(None) };
+    }
+
     /// Removes the socket file when the server stops, however it stops.
     struct SocketFileGuard {
         parent: Arc<PrivateDirectory>,
         name: String,
         identity: PrivateSocketIdentity,
         receipt: Option<(String, File)>,
+        owner_state: Option<AppState>,
         retired: bool,
     }
 
@@ -816,7 +824,9 @@ mod platform {
             let name = self.name.clone();
             let identity = self.identity;
             let receipt = self.receipt.take();
+            let owner_state = self.owner_state.take();
             Some(move || {
+                let _held_owner = owner_state;
                 if let Some((name, file)) = receipt {
                     parent.retire_private_receipt(&name, &file)?;
                 }
@@ -833,6 +843,20 @@ mod platform {
             }
             Ok(())
         }
+    }
+
+    // Blocking endpoint mutations retain the actual captured manager through
+    // its existing frontend, even after cancellation of the async caller.
+    async fn socket_owner_work<T, F>(owner_state: Option<AppState>, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        super::owner_work(move || {
+            let _held_owner = owner_state;
+            work()
+        })
+        .await
     }
 
     impl Drop for SocketFileGuard {
@@ -939,41 +963,87 @@ mod platform {
     pub async fn bind_daemon_socket(
         options: DaemonSocketOptions,
     ) -> Result<DaemonSocket, DaemonSocketError> {
-        bind_with_owner(options, None).await
+        bind_with_owner(options, None, None).await
     }
 
     pub(crate) async fn bind_captured_owner(
         state: AppState,
         owner: super::RuntimeOwnerReceipt,
+        recovery: Option<Arc<crate::daemon_client::UnavailablePublication>>,
     ) -> Result<DaemonSocket, DaemonSocketError> {
         let options = DaemonSocketOptions {
             socket_path: Some(owner.socket_path.clone()),
             config_path: None,
         };
-        bind_with_owner(options, Some((state, owner))).await
+        bind_with_owner(options, Some((state, owner)), recovery).await
     }
 
     async fn bind_with_owner(
         options: DaemonSocketOptions,
         captured: Option<(AppState, super::RuntimeOwnerReceipt)>,
+        recovery: Option<Arc<crate::daemon_client::UnavailablePublication>>,
     ) -> Result<DaemonSocket, DaemonSocketError> {
+        let owner_state = captured.as_ref().map(|(state, _)| state.clone());
         let path = resolve_socket_path(&SocketPathInputs::from_environment(options.socket_path)?)?;
         let parent_path = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or(DaemonSocketError::RuntimeDirUnavailable)?
             .to_path_buf();
-        let parent = Arc::new(
-            super::owner_work(move || PrivateDirectory::admit(&parent_path))
+        let parent = if let Some(previous) = recovery.as_ref() {
+            let owner = &captured
+                .as_ref()
+                .ok_or_else(|| {
+                    DaemonSocketError::State(anyhow::anyhow!(
+                        "stale publication requires the actual captured Runtime owner"
+                    ))
+                })?
+                .1;
+            let old = previous.receipt();
+            if old.version != owner.version
+                || old.data_dir != owner.data_dir
+                || old.execution_scope != owner.execution_scope
+                || old.socket_path != path
+                || old.config_path != owner.config_path
+                || old.principal != owner.principal
+            {
+                return Err(DaemonSocketError::State(anyhow::anyhow!(
+                    "captured stale owner belongs to another selected store/config/principal"
+                )));
+            }
+            if !previous
+                .revalidate()
+                .await
+                .map_err(DaemonSocketError::State)?
+            {
+                return Err(DaemonSocketError::State(anyhow::anyhow!(
+                    "captured stale owner changed before bind"
+                )));
+            }
+            previous.publication.parent.clone()
+        } else {
+            Arc::new(
+                socket_owner_work(owner_state.clone(), move || {
+                    PrivateDirectory::admit(&parent_path)
+                })
                 .await
                 .map_err(DaemonSocketError::State)?,
-        );
+            )
+        };
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(DaemonSocketError::RuntimeDirUnavailable)?
             .to_string();
-        clear_stale_socket(&path, &parent, &name).await?;
+        clear_stale_socket(
+            &path,
+            &parent,
+            &name,
+            recovery.clone(),
+            captured.is_some() && recovery.is_none(),
+            owner_state.clone(),
+        )
+        .await?;
         let check_parent = parent.clone();
         if !super::owner_work(move || check_parent.is_at_selected_path())
             .await
@@ -984,6 +1054,35 @@ mod platform {
             )));
         }
 
+        // Withdraw the exact dead publication before a new PID can answer on
+        // its endpoint. Contenders then re-observe absence and the held lease.
+        if let Some(previous) = recovery.as_ref() {
+            let previous = previous.clone();
+            let parent = parent.clone();
+            socket_owner_work(owner_state.clone(), move || {
+                anyhow::ensure!(
+                    previous.revalidate_receipt()?,
+                    "captured stale owner receipt changed before retirement"
+                );
+                anyhow::ensure!(
+                    parent.retire_private_receipt(
+                        &previous.publication.receipt_name,
+                        &previous.publication.file
+                    )?,
+                    "captured stale owner receipt changed during retirement"
+                );
+                Ok(())
+            })
+            .await
+            .map_err(DaemonSocketError::State)?;
+        }
+
+        #[cfg(test)]
+        BEFORE_OWNER_REBIND.with(|slot| {
+            if let Some(observe) = slot.borrow_mut().take() {
+                observe(&path);
+            }
+        });
         let listener = UnixListener::bind(&path).map_err(|source| DaemonSocketError::Io {
             context: "failed to bind the daemon socket",
             path: path.clone(),
@@ -1002,11 +1101,12 @@ mod platform {
             name,
             identity,
             receipt: None,
+            owner_state: owner_state.clone(),
             retired: false,
         };
         let protect_parent = parent.clone();
         let protect_name = socket_file.name.clone();
-        super::owner_work(move || {
+        socket_owner_work(owner_state.clone(), move || {
             anyhow::ensure!(
                 protect_parent.is_at_selected_path()?,
                 "private endpoint parent changed during bind"
@@ -1037,28 +1137,17 @@ mod platform {
             }
             let parent = parent.clone();
             let name = receipt_name.clone();
-            let expected = owner.clone();
             let guard = socket_file;
-            socket_file = super::owner_work(move || {
+            socket_file = socket_owner_work(owner_state, move || {
                 let mut guard = guard;
                 anyhow::ensure!(
                     parent.is_at_selected_path()?,
                     "private owner parent changed before publication"
                 );
-                if let Some((bytes, old)) = parent.read_private_receipt(&name, 16384)? {
-                    let previous: super::RuntimeOwnerReceipt = serde_json::from_slice(&bytes)?;
-                    anyhow::ensure!(
-                        previous.version == expected.version
-                            && previous.data_dir == expected.data_dir
-                            && previous.execution_scope == expected.execution_scope
-                            && previous.socket_path == expected.socket_path,
-                        "stale owner receipt belongs to a different selected store"
-                    );
-                    anyhow::ensure!(
-                        parent.retire_private_receipt(&name, &old)?,
-                        "stale owner receipt changed"
-                    );
-                }
+                anyhow::ensure!(
+                    parent.read_private_receipt(&name, 16384)?.is_none(),
+                    "owner publication appeared during bootstrap; refusing replacement"
+                );
                 parent.write_owned_file(&name, &bytes, false)?;
                 let (_, file) = parent
                     .read_private_receipt(&name, 16384)?
@@ -1089,24 +1178,44 @@ mod platform {
         path: &Path,
         parent: &Arc<PrivateDirectory>,
         name: &str,
+        recovery: Option<Arc<crate::daemon_client::UnavailablePublication>>,
+        expect_no_receipt: bool,
+        owner_state: Option<AppState>,
     ) -> Result<(), DaemonSocketError> {
         let inspect_parent = parent.clone();
         let inspect_name = name.to_string();
-        let Some(identity) =
-            super::owner_work(move || inspect_parent.socket_identity(&inspect_name))
-                .await
-                .map_err(|error| {
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidInput)
-                    {
-                        DaemonSocketError::NotASocket {
-                            path: path.to_path_buf(),
-                        }
-                    } else {
-                        DaemonSocketError::State(error)
-                    }
-                })?
+        let expected = recovery.clone();
+        let Some(identity) = super::owner_work(move || {
+            if let Some(previous) = expected.as_ref() {
+                anyhow::ensure!(
+                    previous.revalidate_all()?,
+                    "captured stale owner/socket changed before retirement"
+                );
+                return Ok(previous.publication.socket_identity);
+            }
+            if expect_no_receipt {
+                anyhow::ensure!(
+                    inspect_parent
+                        .read_private_receipt(&format!("{inspect_name}.owner.json"), 16384)?
+                        .is_none(),
+                    "owner publication appeared before fresh endpoint bind; refusing replacement"
+                );
+            }
+            inspect_parent.socket_identity(&inspect_name)
+        })
+        .await
+        .map_err(|error| {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidInput)
+            {
+                DaemonSocketError::NotASocket {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                DaemonSocketError::State(error)
+            }
+        })?
         else {
             return Ok(());
         };
@@ -1117,7 +1226,15 @@ mod platform {
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
                 let retire_parent = parent.clone();
                 let retire_name = name.to_string();
-                if super::owner_work(move || retire_parent.retire_socket(&retire_name, identity))
+                if socket_owner_work(owner_state, move || {
+                    if let Some(previous) = recovery.as_ref() {
+                        anyhow::ensure!(previous.revalidate_all()?, "captured stale owner/socket changed before retirement");
+                    } else if expect_no_receipt {
+                        anyhow::ensure!(retire_parent.read_private_receipt(&format!("{retire_name}.owner.json"), 16384)?.is_none(),
+                            "owner publication appeared before fresh endpoint retirement; refusing replacement");
+                    }
+                    retire_parent.retire_socket(&retire_name, identity)
+                })
                     .await
                     .map_err(DaemonSocketError::State)?
                 {
@@ -1168,6 +1285,246 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use anyhow::Context as _;
+
+        struct FrontendLifetime {
+            _held: Arc<()>,
+        }
+        impl crate::RuntimeOwnerFrontend for FrontendLifetime {
+            fn validate_selection<'a>(
+                &'a self,
+                _selection: &'a crate::RuntimeOwnerFrontendSelection,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { anyhow::bail!("lifetime-only frontend cannot admit a command") })
+            }
+            fn serve(
+                &self,
+                _selection: crate::RuntimeOwnerFrontendSelection,
+                _compatibility: AppState,
+                _input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+                _output: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>
+            {
+                Box::pin(async { anyhow::bail!("lifetime-only frontend cannot serve a command") })
+            }
+        }
+
+        #[tokio::test]
+        async fn owner_bootstrap_cancelled_mutations_and_retirement_retain_captured_frontend()
+        -> Result<()> {
+            // Proves transport custody. The TUI bootstrap tests separately
+            // prove the captured manager retains its real store lease.
+            let temporary = tempfile::Builder::new()
+                .prefix("cw-ob-cancel-")
+                .tempdir_in("/tmp")?;
+            let root = temporary.path().canonicalize()?;
+            let config = root.join("config.toml");
+            std::fs::write(&config, "")?;
+            for retirement in [false, true] {
+                let mut state =
+                    build_state_off_runtime(Some(config.clone()), None, AppTransport::Socket)
+                        .await?;
+                let held = Arc::new(());
+                let observed_owner = Arc::downgrade(&held);
+                state.owner_frontend = Some(Arc::new(FrontendLifetime { _held: held }));
+                let parent_path = root.join(if retirement { "retirement" } else { "mutation" });
+                let parent = Arc::new(PrivateDirectory::admit(&parent_path)?);
+                let path = parent_path.join("daemon.sock");
+                let socket = std::os::unix::net::UnixListener::bind(&path)?;
+                let identity = parent
+                    .socket_identity("daemon.sock")?
+                    .context("socket identity")?;
+                parent.protect_socket("daemon.sock", identity)?;
+                drop(socket);
+                parent.write_owned_file("daemon.sock.owner.json", b"{}", false)?;
+                let (_, receipt_file) = parent
+                    .read_private_receipt("daemon.sock.owner.json", 16384)?
+                    .context("receipt")?;
+                let (release, released) = std::sync::mpsc::channel();
+                let (started, observed_start) = tokio::sync::oneshot::channel();
+                let (finished, observed_finish) = tokio::sync::oneshot::channel();
+                let worker = if retirement {
+                    let mut guard = SocketFileGuard {
+                        parent,
+                        name: "daemon.sock".into(),
+                        identity,
+                        receipt: Some(("daemon.sock.owner.json".into(), receipt_file)),
+                        owner_state: Some(state.clone()),
+                        retired: false,
+                    };
+                    let retire = guard.retirement().context("first retirement")?;
+                    drop(guard);
+                    tokio::spawn(super::super::owner_work(move || {
+                        let _ = started.send(());
+                        let _ = released.recv();
+                        let result = retire();
+                        let _ = finished.send(());
+                        result
+                    }))
+                } else {
+                    tokio::spawn(socket_owner_work(Some(state.clone()), move || {
+                        let _ = started.send(());
+                        let _ = released.recv();
+                        parent.protect_socket("daemon.sock", identity)?;
+                        let _ = finished.send(());
+                        Ok(())
+                    }))
+                };
+                drop(state);
+                tokio::time::timeout(Duration::from_secs(5), observed_start).await??;
+                worker.abort();
+                let _ = worker.await;
+                assert!(
+                    observed_owner.upgrade().is_some(),
+                    "running filesystem mutation retains captured owner after waiter cancellation"
+                );
+                release.send(())?;
+                tokio::time::timeout(Duration::from_secs(5), observed_finish).await??;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while observed_owner.upgrade().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+                if retirement {
+                    assert!(!path.exists());
+                    assert!(!path.with_file_name("daemon.sock.owner.json").exists());
+                } else {
+                    assert!(path.exists(), "protection alone preserves publication");
+                    assert!(path.with_file_name("daemon.sock.owner.json").exists());
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn owner_bootstrap_withdraws_dead_receipt_before_replacement_listener_can_answer()
+        -> Result<()> {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    if self.0.try_wait().ok().flatten().is_none() {
+                        let _ = self.0.kill();
+                    }
+                    let _ = self.0.wait();
+                }
+            }
+            let temporary = tempfile::Builder::new()
+                .prefix("cw-ob-order-")
+                .tempdir_in("/tmp")?;
+            let root = temporary.path().canonicalize()?;
+            let path = root.join("run/daemon.sock");
+            let config = root.join("config.toml");
+            std::fs::write(&config, "")?;
+            let parent = PrivateDirectory::admit(path.parent().unwrap())?;
+            let stale = std::os::unix::net::UnixListener::bind(&path)?;
+            let identity = parent.socket_identity("daemon.sock")?.unwrap();
+            parent.protect_socket("daemon.sock", identity)?;
+            drop(stale);
+            let mut child = OwnedChild(
+                std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?,
+            );
+            let mut owner = codewhale_protocol::RuntimeOwnerReceipt {
+                version: 1,
+                data_dir: root.join("runtime"),
+                execution_scope: "ordering-store".into(),
+                lease_generation: "ordering-old".into(),
+                pid: child.0.id(),
+                process_start: super::super::capture_process_start(child.0.id()).await?,
+                principal: PrivateDirectory::current_user_id().to_string(),
+                socket_path: path.clone(),
+                config_path: Some(config.clone()),
+            };
+            child.0.kill()?;
+            child.0.wait()?;
+            parent.write_owned_file(
+                "daemon.sock.owner.json",
+                &serde_json::to_vec(&owner)?,
+                false,
+            )?;
+            let crate::daemon_client::HostOwnerProbe::Unavailable(captured) =
+                crate::daemon_client::probe_owner_for_host_startup(
+                    Some(config.clone()),
+                    Some(path.clone()),
+                )
+                .await?
+            else {
+                anyhow::bail!("dead owner must be captured")
+            };
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed_hook = observed.clone();
+            let selected = path.clone();
+            let selected_config = config.clone();
+            let stale_capture = captured.clone();
+            BEFORE_OWNER_REBIND.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |endpoint| {
+                    assert_eq!(endpoint, selected);
+                    assert!(!selected.with_file_name("daemon.sock.owner.json").exists());
+                    let endpoint = selected.clone();
+                    std::thread::spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(async {
+                                assert!(
+                                    !stale_capture.revalidate().await.unwrap(),
+                                    "withdrawn capture must never authorize a replacement"
+                                );
+                                assert!(matches!(
+                                    crate::daemon_client::probe_owner_for_host_startup(
+                                        Some(selected_config),
+                                        Some(endpoint),
+                                    )
+                                    .await
+                                    .unwrap(),
+                                    crate::daemon_client::HostOwnerProbe::Absent
+                                ));
+                            });
+                    })
+                    .join()
+                    .unwrap();
+                    // Force bind failure after the exact observation point;
+                    // the product must preserve this task-owned replacement.
+                    drop(std::os::unix::net::UnixListener::bind(&selected).unwrap());
+                    observed_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                }));
+            });
+            owner.pid = std::process::id();
+            owner.process_start = super::super::capture_process_start(owner.pid).await?;
+            owner.lease_generation = "ordering-new".into();
+            let result = crate::bind_runtime_frontends(
+                Some(config),
+                None,
+                owner,
+                crate::RuntimeOwnerRouting {
+                    endpoint: "127.0.0.1:1".parse()?,
+                    workspace: None,
+                    workers: None,
+                    mobile: false,
+                    web: false,
+                    acp: false,
+                    acp_only: false,
+                },
+                None,
+                Some(captured),
+            )
+            .await;
+            assert!(result.is_err(), "injected replacement prevents new bind");
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                parent.socket_identity("daemon.sock")?.is_some(),
+                "replacement endpoint preserved"
+            );
+            assert!(!path.with_file_name("daemon.sock.owner.json").exists());
+            Ok(())
+        }
 
         fn client(name: &str) -> ClientIdentity {
             ClientIdentity {

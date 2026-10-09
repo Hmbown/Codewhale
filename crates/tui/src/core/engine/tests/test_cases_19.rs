@@ -1,5 +1,3 @@
-
-
 #[tokio::test]
 async fn mcp_boot_catalog_refresh_declares_prefix_before_mailbox_delivery() {
     let tmp = tempdir().expect("tempdir");
@@ -929,11 +927,12 @@ async fn user_prompt_reaches_the_model_exactly_once_per_request() {
     task.await.expect("engine task");
 }
 
-/// A person's answer to a prompt raised for a child (`agent:…:approval:n`)
+/// An attributed answer to a prompt raised for a child (`agent:…:approval:n`)
 /// reaches the waiting child while the parent turn is idle; the parent's
 /// own approval path is untouched by ids it does not own.
 #[tokio::test]
 async fn idle_engine_routes_child_approval_decisions_to_the_waiting_child() {
+    use crate::approval_log::ApprovalDecider;
     use crate::tools::subagent::ChildApprovalOutcome;
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
@@ -945,28 +944,40 @@ async fn idle_engine_routes_child_approval_decisions_to_the_waiting_child() {
     let manager = engine.subagent_manager.clone();
     let run = tokio::spawn(engine.run());
 
-    let (approval_id, receiver) = manager
-        .write()
-        .await
-        .register_child_approval(
-            "agent_child",
-            &format!("agent:agent_child:approval:{}", uuid::Uuid::new_v4()),
-            "bash",
-            "fixture",
-        )
-        .unwrap();
-    handle
-        .approve_tool_call(approval_id.clone())
-        .await
-        .expect("approval decision accepted");
-    let outcome = tokio::time::timeout(Duration::from_secs(5), receiver)
-        .await
-        .expect("child must be answered while the engine idles")
-        .expect("child prompt resolved, not dropped");
-    assert_eq!(outcome, ChildApprovalOutcome::Approved);
-    assert_eq!(manager.read().await.pending_child_approvals(), 0);
+    for by in [
+        ApprovalDecider::User,
+        ApprovalDecider::SessionRule,
+        ApprovalDecider::Posture,
+        ApprovalDecider::Host,
+    ] {
+        for approved in [true, false] {
+            let (approval_id, receiver) = manager
+                .write()
+                .await
+                .register_child_approval(
+                    "agent_child",
+                    &format!("agent:agent_child:approval:{}", uuid::Uuid::new_v4()),
+                    "bash",
+                    "fixture",
+                )
+                .unwrap();
+            let expected = if approved {
+                handle.approve_tool_call_by(approval_id, by).await.unwrap();
+                ChildApprovalOutcome::Approved { by }
+            } else {
+                handle.deny_tool_call_by(approval_id, by).await.unwrap();
+                ChildApprovalOutcome::Denied { by }
+            };
+            let outcome = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("child must be answered while the engine idles")
+                .expect("child prompt resolved, not dropped");
+            assert_eq!(outcome, expected);
+            assert_eq!(manager.read().await.pending_child_approvals(), 0);
+        }
+    }
 
-    // A denial for a second prompt routes the same way.
+    // An expired card is still a denial for a child, attributed to the host.
     let (approval_id, receiver) = manager
         .write()
         .await
@@ -977,15 +988,16 @@ async fn idle_engine_routes_child_approval_decisions_to_the_waiting_child() {
             "fixture",
         )
         .unwrap();
-    handle
-        .deny_tool_call(approval_id)
-        .await
-        .expect("denial accepted");
-    let outcome = tokio::time::timeout(Duration::from_secs(5), receiver)
-        .await
-        .expect("child must be answered")
-        .expect("child prompt resolved");
-    assert_eq!(outcome, ChildApprovalOutcome::Denied);
+    handle.deny_tool_call_timed_out(approval_id).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("child timeout is delivered")
+            .expect("child prompt resolved"),
+        ChildApprovalOutcome::Denied {
+            by: ApprovalDecider::Host,
+        }
+    );
 
     // A decision for a parent-shaped id has no child waiter and is not routed.
     assert!(!crate::tools::subagent::SubAgentManager::is_child_approval_id("call_123"));
@@ -1032,7 +1044,7 @@ async fn turn_wall_clock_budget_stops_the_turn_before_another_model_request() {
         turn_wall_clock: std::time::Duration::ZERO,
         ..deterministic_engine_config(workspace.path())
     };
-    let (mut engine, _handle) =
+    let (mut engine, handle) =
         Engine::new_with_model_client(engine_config, &Config::default(), client);
     let context = crate::tools::ToolContext::new(workspace.path().to_path_buf());
     let registry = crate::tools::ToolRegistry::new(context);
@@ -1056,6 +1068,30 @@ async fn turn_wall_clock_budget_stops_the_turn_before_another_model_request() {
         0,
         "no billable request may be authorized once the budget is spent"
     );
+
+    // #6843: the stop also posts the one error card, so the TUI does not add
+    // its own amber warning. It is a budget error that leaves the session
+    // online (recoverable), not a warning and not an offline-flipping fault.
+    let mut cards = Vec::new();
+    {
+        let mut rx = handle.rx_event.write().await;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Error { envelope, .. } = event {
+                cards.push(envelope);
+            }
+        }
+    }
+    assert_eq!(cards.len(), 1, "one error card: {cards:?}");
+    assert_eq!(
+        cards[0].category,
+        crate::error_taxonomy::ErrorCategory::Budget
+    );
+    assert_eq!(
+        cards[0].severity,
+        crate::error_taxonomy::ErrorSeverity::Error
+    );
+    assert!(cards[0].recoverable, "a spent budget must not flip offline");
+    assert!(cards[0].message.contains("wall-clock budget exhausted"));
 }
 
 /// R1: the wall-clock budget is overridable — a generous budget lets the same

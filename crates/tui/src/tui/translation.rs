@@ -66,7 +66,7 @@ pub fn needs_translation(text: &str) -> bool {
 
 /// Check if a character is in the CJK Unified Ideographs block or is a
 /// common Chinese/Japanese/Korean character.
-fn is_cjk(ch: char) -> bool {
+pub(crate) fn is_cjk(ch: char) -> bool {
     matches!(
         ch,
         '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs

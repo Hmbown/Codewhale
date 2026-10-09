@@ -881,3 +881,208 @@ fn only_images_since_the_latest_prompt_count_as_this_turns() {
     ];
     assert_eq!(images_since_last_user_prompt(&fresh), 2);
 }
+
+/// The founder's failing drop: a macOS screencaptureui temp file whose name
+/// has spaces, delivered as a shell-escaped path.
+fn dropped_screenshot(dir: &std::path::Path) -> std::path::PathBuf {
+    write_png(dir, "Screenshot 2026-10-04 at 22.25.47.png")
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_dropped_path_in_every_terminal_spelling_is_an_image() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dropped_screenshot(dir.path());
+    let plain = shot.display().to_string();
+    let escaped = plain.replace(' ', "\\ ");
+    let file_url = url::Url::from_file_path(&shot)
+        .expect("file url")
+        .to_string();
+    assert!(file_url.contains("%20"), "{file_url}");
+
+    for spelling in [
+        escaped.clone(),
+        plain.clone(),
+        format!("\"{plain}\""),
+        format!("'{plain}'"),
+        file_url,
+        format!("  {escaped}\n"),
+    ] {
+        assert_eq!(
+            pasted_image_paths(&spelling),
+            Some(vec![shot.clone()]),
+            "{spelling}"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn several_dropped_images_attach_in_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dropped_screenshot(dir.path());
+    let second = write_png(dir.path(), "second.png");
+    let text = format!(
+        "{} {}",
+        shot.display().to_string().replace(' ', "\\ "),
+        second.display()
+    );
+    assert_eq!(pasted_image_paths(&text), Some(vec![shot, second]));
+}
+
+#[test]
+fn a_paste_that_is_not_only_image_paths_stays_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dropped_screenshot(dir.path());
+    let notes = dir.path().join("notes.txt");
+    std::fs::write(&notes, "hello").expect("write notes");
+    let escaped = shot.display().to_string().replace(' ', "\\ ");
+
+    for text in [
+        format!("look at {escaped}"),
+        "shot.png".to_string(),
+        notes.display().to_string(),
+        dir.path().join("missing.png").display().to_string(),
+        format!("{escaped} {}", notes.display()),
+        String::new(),
+    ] {
+        assert_eq!(pasted_image_paths(&text), None, "{text}");
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_dropped_screenshot_becomes_an_image_part_or_a_text_only_notice() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dropped_screenshot(dir.path());
+    let paths = pasted_image_paths(&shot.display().to_string().replace(' ', "\\ "))
+        .expect("dropped path is an image");
+    let text = format!(
+        "what is wrong here?\n[Attached image: {}]",
+        paths[0].display()
+    );
+
+    let expanded = expand_attachment_blocks(&text);
+    assert!(expanded.notices.is_empty(), "{expanded:?}");
+    let mut messages = vec![codewhale_models::Message {
+        role: Role::User,
+        content: expanded.blocks,
+    }];
+    assert!(
+        messages[0]
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ImageUrl { image_url } if image_url.url.starts_with("data:image/png;base64,"))),
+        "a vision route receives the image itself"
+    );
+
+    let stripped =
+        strip_images_when_unsupported(&mut messages, SupportState::Unsupported, "text-only-model");
+    assert_eq!(stripped, 1);
+    assert!(messages[0].content.iter().any(|block| matches!(
+        block,
+        ContentBlock::Text { text, .. } if text.contains("text-only-model") && text.contains("does not accept image input")
+    )));
+}
+
+#[test]
+fn only_an_image_the_user_attached_is_admitted_outside_the_workspace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dropped_screenshot(dir.path());
+    let other = write_png(dir.path(), "other.png");
+    let text = |text: String| ContentBlock::Text {
+        text,
+        cache_control: None,
+    };
+    let messages = vec![
+        codewhale_models::Message {
+            role: Role::User,
+            content: vec![text(format!("see\n[Attached image: {}]", shot.display()))],
+        },
+        codewhale_models::Message {
+            role: Role::Assistant,
+            content: vec![text(format!("[Attached image: {}]", other.display()))],
+        },
+    ];
+
+    let references = user_attached_image_references(&messages);
+    assert_eq!(references, vec![shot.display().to_string()]);
+    let canonical = std::fs::canonicalize(&shot).expect("canonical");
+    assert_eq!(
+        resolve_user_attached_image(&references, &shot.display().to_string()),
+        Some(canonical)
+    );
+    assert_eq!(
+        resolve_user_attached_image(&references, &other.display().to_string()),
+        None,
+        "model-authored text never widens what a read may open"
+    );
+    assert_eq!(
+        resolve_user_attached_image(&references, "Screenshot.png"),
+        None
+    );
+
+    std::fs::write(&shot, b"no longer an image").expect("overwrite");
+    assert_eq!(
+        resolve_user_attached_image(&references, &shot.display().to_string()),
+        None,
+        "admission requires image bytes, not just an attached name"
+    );
+}
+
+#[test]
+fn read_downscales_an_oversized_screenshot_instead_of_omitting_it() {
+    let png = noise_png(2880, 1800);
+    assert!(png.len() > MAX_IMAGE_BYTES, "fixture must exceed the limit");
+
+    let prepared = prepare_tool_image_bytes(&png, "image/png");
+    let codewhale_tools::ToolResultContentBlock::Image { mime_type, data } = prepared
+        .block
+        .expect("oversized screenshot is still delivered");
+    let bytes = STANDARD.decode(data).expect("base64");
+    assert!(bytes.len() <= MAX_IMAGE_BYTES);
+    assert_eq!(sniff_media_type(&bytes), Some(mime_type.as_str()));
+    assert!(prepared.note.contains("downscaled"), "{}", prepared.note);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_message_that_starts_with_a_dropped_image_attaches_it_and_keeps_the_question() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dropped_screenshot(dir.path());
+    let plain = shot.display().to_string();
+    let escaped = plain.replace(' ', "\\ ");
+    let question = "why does it show jobs 2?";
+
+    for message in [
+        format!("{escaped}  {question}"),
+        format!("{plain} {question}"),
+        format!("'{plain}' {question}"),
+        format!("{escaped}\n{question}"),
+    ] {
+        assert_eq!(
+            leading_dropped_image(&message),
+            Some((shot.clone(), question.to_string())),
+            "{message}"
+        );
+    }
+    assert_eq!(leading_dropped_image(&escaped), Some((shot, String::new())));
+}
+
+#[test]
+fn a_message_that_only_mentions_an_image_is_left_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dropped_screenshot(dir.path());
+    let notes = dir.path().join("notes.txt");
+    std::fs::write(&notes, "hello").expect("write notes");
+
+    for message in [
+        format!("look at {}", shot.display()),
+        format!("{} what is this", notes.display()),
+        format!("{} what is this", dir.path().join("missing.png").display()),
+        "/model".to_string(),
+        "shot.png what".to_string(),
+    ] {
+        assert_eq!(leading_dropped_image(&message), None, "{message}");
+    }
+}

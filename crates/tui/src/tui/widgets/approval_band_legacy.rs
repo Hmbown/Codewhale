@@ -718,14 +718,18 @@ fn build_approval_controls(
         } else {
             Span::raw("  ")
         };
-        controls.push(Line::from(vec![
+        let mut spans = vec![
             lead,
             Span::styled(
                 format!("[{}] ", opt.key_hint),
                 shortcut_style.add_modifier(Modifier::BOLD),
             ),
             Span::styled(opt.label.to_string(), option_style),
-        ]));
+        ];
+        if is_selected {
+            spans.push(Span::styled(" (Enter)", shortcut_style));
+        }
+        controls.push(Line::from(spans));
     }
     controls.push(Line::from(vec![
         Span::raw("  "),

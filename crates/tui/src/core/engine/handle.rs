@@ -24,6 +24,43 @@ use super::{
 };
 use crate::approval_log::ApprovalDecider;
 
+// This bounds host delivery/acknowledgement, never the person's time to
+// answer. No active waiter may consume a reply after its caller abandoned it.
+const USER_INPUT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn await_user_input_acceptance(
+    sender: &mpsc::Sender<UserInputDecision>,
+    decision: UserInputDecision,
+    mut accepted: oneshot::Receiver<bool>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let delivery = tokio::time::timeout(timeout, async {
+        sender
+            .send(decision)
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine is not accepting user input"))?;
+        (&mut accepted).await.map_err(|_| {
+            anyhow::anyhow!("Engine ended the user input request before accepting this decision")
+        })
+    })
+    .await;
+    let accepted = match delivery {
+        Ok(result) => result?,
+        Err(_) => {
+            // Close first: after this point Engine's verdict send cannot
+            // succeed. A verdict already delivered before the bound wins
+            // over the timeout, so a consumed answer is never called rejected.
+            accepted.close();
+            accepted.try_recv().unwrap_or(false)
+        }
+    };
+    anyhow::ensure!(
+        accepted,
+        "User input request is no longer accepting this decision"
+    );
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(super) struct TurnControl {
     pub id: u64,
@@ -281,13 +318,16 @@ impl EngineHandle {
                 );
             }
         } else {
-            let (status, _) =
-                crate::tools::goal::thread_goal_status_projection(goal.status.clone());
+            let (status, pause_reason) = crate::tools::goal::thread_goal_status_projection(
+                goal.status.clone(),
+                goal.pause_reason,
+            );
             if status != crate::tools::goal::GoalStatus::Active {
-                state.sync_from_host_status(
+                state.sync_from_host_status_with_reason(
                     current.objective.as_deref(),
                     current.token_budget,
                     status,
+                    pause_reason,
                 );
             }
         }
@@ -553,11 +593,20 @@ impl EngineHandle {
     async fn send_approval(&self, decision: ApprovalDecision) -> Result<()> {
         use crate::tools::subagent::ChildApprovalOutcome;
         let child = match &decision {
-            ApprovalDecision::Approved { id, .. } => Some((id, ChildApprovalOutcome::Approved)),
-            ApprovalDecision::Denied { id, .. } => Some((id, ChildApprovalOutcome::Denied)),
+            ApprovalDecision::Approved { id, by } => {
+                Some((id, ChildApprovalOutcome::Approved { by: *by }))
+            }
+            ApprovalDecision::Denied { id, by } => {
+                Some((id, ChildApprovalOutcome::Denied { by: *by }))
+            }
             // An agent has no timeout outcome of its own (#6101): an expired
             // card is a deny for whichever call it was answering.
-            ApprovalDecision::TimedOut { id } => Some((id, ChildApprovalOutcome::Denied)),
+            ApprovalDecision::TimedOut { id } => Some((
+                id,
+                ChildApprovalOutcome::Denied {
+                    by: ApprovalDecider::Host,
+                },
+            )),
             ApprovalDecision::Unavailable { id } => Some((id, ChildApprovalOutcome::Unavailable)),
             // A sandbox retry only exists for the parent's own tool call.
             ApprovalDecision::RetryWithPolicy { .. } => None,
@@ -651,27 +700,40 @@ impl EngineHandle {
         Ok(())
     }
 
-    /// Submit a response for request_user_input.
+    /// Submit a response for request_user_input. Success means Engine accepted
+    /// it for the live exact request, rather than merely queuing the response.
     pub async fn submit_user_input(
         &self,
         id: impl Into<String>,
         response: UserInputResponse,
     ) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Submitted {
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        await_user_input_acceptance(
+            &self.tx_user_input,
+            UserInputDecision::Submitted {
                 id: id.into(),
                 response,
-            })
-            .await?;
-        Ok(())
+                accepted: accepted_tx,
+            },
+            accepted_rx,
+            USER_INPUT_ACK_TIMEOUT,
+        )
+        .await
     }
 
     /// Cancel a request_user_input prompt.
     pub async fn cancel_user_input(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Cancelled { id: id.into() })
-            .await?;
-        Ok(())
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        await_user_input_acceptance(
+            &self.tx_user_input,
+            UserInputDecision::Cancelled {
+                id: id.into(),
+                accepted: accepted_tx,
+            },
+            accepted_rx,
+            USER_INPUT_ACK_TIMEOUT,
+        )
+        .await
     }
 
     /// Steer an in-flight turn with additional user input.
@@ -774,5 +836,61 @@ impl EngineHandle {
         rx.await
             .map_err(|_| anyhow::anyhow!("Engine dropped MCP reload oneshot"))?
             .map_err(anyhow::Error::msg)
+    }
+}
+
+#[cfg(test)]
+mod user_input_ack_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn user_input_delivery_bound_rejects_abandoned_reply_and_full_mailbox() {
+        for full in [false, true] {
+            let (sender, mut mailbox) = mpsc::channel(1);
+            if full {
+                let (accepted, receiver) = oneshot::channel();
+                drop(receiver);
+                sender
+                    .send(UserInputDecision::Cancelled {
+                        id: "blocker".into(),
+                        accepted,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (accepted, verdict) = oneshot::channel();
+            let result = await_user_input_acceptance(
+                &sender,
+                UserInputDecision::Submitted {
+                    id: "late-reply".into(),
+                    response: UserInputResponse {
+                        answers: Vec::new(),
+                    },
+                    accepted,
+                },
+                verdict,
+                std::time::Duration::from_millis(10),
+            )
+            .await;
+            assert!(result.is_err());
+            match mailbox.try_recv().unwrap() {
+                UserInputDecision::Submitted { id, accepted, .. } => {
+                    assert!(!full);
+                    assert_eq!(id, "late-reply");
+                    assert!(
+                        accepted.send(true).is_err(),
+                        "timed-out reply cannot be accepted later"
+                    );
+                }
+                UserInputDecision::Cancelled { id, .. } => {
+                    assert!(full);
+                    assert_eq!(id, "blocker");
+                }
+            }
+            assert!(
+                mailbox.try_recv().is_err(),
+                "a full mailbox must not receive the abandoned reply"
+            );
+        }
     }
 }

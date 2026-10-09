@@ -471,6 +471,45 @@ pub(crate) fn resolve_guarded_read_path(
     Ok(path)
 }
 
+/// Workspace-escape fallback for the read-only image tools (`read`,
+/// `read_media`): admit `raw` only when it is exactly an image the user
+/// attached in this session's prompts. See
+/// [`crate::image_attach::resolve_user_attached_image`] for the admission
+/// rule; the credential and deny-list guards still apply here. `Ok(None)`
+/// means "not admitted" and the caller keeps its original refusal.
+///
+/// Known limit: a path the user mentioned only in prose, never attached, is
+/// not admitted; `/trust add` remains the way to open a directory.
+pub(crate) async fn user_attached_image_read_path(
+    context: &ToolContext,
+    raw: &str,
+    tool: &str,
+) -> Result<Option<PathBuf>, ToolError> {
+    let Some(snapshot) = context.session_objects.as_ref() else {
+        return Ok(None);
+    };
+    let references = crate::image_attach::user_attached_image_references(&snapshot.messages);
+    if references.is_empty() {
+        return Ok(None);
+    }
+    let raw_owned = raw.to_string();
+    let admitted = tokio::task::spawn_blocking(move || {
+        crate::image_attach::resolve_user_attached_image(&references, &raw_owned)
+    })
+    .await
+    .map_err(|error| ToolError::execution_failed(format!("Failed to resolve {raw}: {error}")))?;
+    let Some(path) = admitted else {
+        return Ok(None);
+    };
+    if is_codewhale_credential_path(&path) {
+        return Err(ToolError::permission_denied(format!(
+            "{tool} cannot expose Codewhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection"
+        )));
+    }
+    enforce_read_denylist(&path, tool)?;
+    Ok(Some(path))
+}
+
 /// Refuse a read the sandbox read deny-list blocks (S1).
 ///
 /// `read_file`, `read`, and `read_media` all run *in-process*: they call
@@ -912,7 +951,15 @@ impl ReadFileTool {
         // raw spelling still matches by its target; the resolved check after
         // `resolve_path` stays as defense in depth for callers whose process
         // cwd is not the workspace.
-        let file_path = resolve_guarded_read_path(context, path_str, "read")?;
+        let file_path = match resolve_guarded_read_path(context, path_str, "read") {
+            Ok(path) => path,
+            Err(error @ ToolError::PathEscape { .. }) => {
+                user_attached_image_read_path(context, path_str, "read")
+                    .await?
+                    .ok_or(error)?
+            }
+            Err(error) => return Err(error),
+        };
         check_file_operation_cancelled(context)?;
         let bytes = load_contract_source(&file_path, false, context)
             .await?
@@ -928,7 +975,15 @@ impl ReadFileTool {
         let size_bytes = bytes.len();
         check_file_operation_cancelled(context)?;
         if let Some(mime_type) = primitive_image_mime(&bytes) {
-            let prepared = crate::image_attach::prepare_tool_image_bytes(&bytes, mime_type);
+            // Decoding and any downscale are CPU-bound; keep them off the
+            // runtime worker (#6149).
+            let prepared = tokio::task::spawn_blocking(move || {
+                crate::image_attach::prepare_tool_image_bytes(&bytes, mime_type)
+            })
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!("Failed to prepare image: {error}"))
+            })?;
             context.note_file_read(&file_path);
             return Ok(RichToolResult::with_content_blocks(
                 ToolResult::success(prepared.note).with_metadata(json!({
@@ -1053,7 +1108,7 @@ impl ToolSpec for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `Bash` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit` will make a narrow in-place edit. Text reads report the whole file's `content_hash=\"sha256:…\"`; pass that value back as `expected_hash` on a later `write`, `edit`, or `patch` to have the write refused if the file changed in between. Codewhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are text-extracted when the optional `pdftotext` executable (Poppler) is installed. Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns up to 500 lines or 16KB, whichever comes first. If `truncated=\"true\"` and `next_start_line` is present, continue reading from there; a byte-limited window instead shows head + tail with a `[CONTENT TRUNCATED]` marker and its note says how to narrow the range. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
+        "Read a UTF-8 file from the workspace. Compared with `cat`, `head`, `tail`, or `sed -n '..p'` in `Bash`, it is faster, sandbox-aware, and needs no approval prompt. Plain text is returned as-is and records the file snapshot required before `edit` will make a narrow in-place edit. Text reads report the whole file's `content_hash=\"sha256:…\"`; pass that value back as `expected_hash` on a later `write`, `edit`, or `patch` to have the write refused if the file changed in between. Codewhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are text-extracted when the optional `pdftotext` executable (Poppler) is installed. Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns up to 500 lines or 16KB, whichever comes first. If `truncated=\"true\"` and `next_start_line` is present, continue reading from there; a byte-limited window instead shows head + tail with a `[CONTENT TRUNCATED]` marker and its note says how to narrow the range. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
 
     fn input_schema(&self) -> Value {
@@ -1716,7 +1771,7 @@ impl ToolSpec for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Write content to a UTF-8 file in the workspace. Use this instead of heredocs (`cat <<EOF > file`) or `echo > file` in `Bash` — diffs render inline and approval is handled cleanly. Creates or overwrites; parent directories are auto-created. Pass `expected_hash` (the `content_hash` from a prior `read`) to have the overwrite refused if the file changed since that read."
+        "Write content to a UTF-8 file in the workspace. Unlike heredocs (`cat <<EOF > file`) or `echo > file` in `Bash`, its diffs render inline and its approval shows the change. Creates or overwrites; parent directories are auto-created. Pass `expected_hash` (the `content_hash` from a prior `read`) to have the overwrite refused if the file changed since that read."
     }
 
     fn input_schema(&self) -> Value {
@@ -2538,7 +2593,7 @@ impl ToolSpec for EditFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Replace text in a single file via exact search/replace after the file has been read with File `read` in this session. Use this instead of `sed -i` in `Bash` for one unambiguous in-place edit. `search` must match exactly one location by default; when no exact match is found the tool retries with leading-whitespace-tolerant fuzzy matching automatically. Returns a compact unified diff, not the full file. Pass `expected_hash` (the `content_hash` from that `read`) to have the edit refused, with the file untouched, if it changed in between. For structural, multi-block, or cross-file changes, use File `patch` or `write` instead."
+        "Replace text in a single file via exact search/replace after the file has been read with File `read` in this session. It makes one unambiguous in-place edit, the File-tool counterpart of `sed -i` in `Bash`. `search` must match exactly one location by default; when no exact match is found the tool retries with leading-whitespace-tolerant fuzzy matching automatically. Returns a compact unified diff, not the full file. Pass `expected_hash` (the `content_hash` from that `read`) to have the edit refused, with the file untouched, if it changed in between. File `patch` handles structural, multi-block, or cross-file changes, and `write` replaces a whole file."
     }
 
     fn input_schema(&self) -> Value {

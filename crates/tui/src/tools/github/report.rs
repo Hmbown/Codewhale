@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::tools::spec::{ToolContext, ToolError, ToolResult};
 
 const MAX_BYTES: usize = 32 * 1024;
-const REPOSITORY: &str = "Hmbown/CodeWhale";
+const REPOSITORY: &str = "codewhale-hq/CodeWhale";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

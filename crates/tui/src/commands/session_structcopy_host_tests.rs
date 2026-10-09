@@ -366,7 +366,10 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
         debug_diff,
         debug_undo,
         debug_diagnostics,
+        permissions,
+        config_status,
     } = bundle.contexts(capabilities).into_parts();
+    assert!(permissions.is_none() && config_status.is_none());
     assert!(presentation.is_some());
     assert!(
         session.is_none()

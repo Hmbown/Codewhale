@@ -7,6 +7,9 @@
 // fake-powershell.exe-on-PATH fixture.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 function decodeScript(args) {
   const i = args.indexOf("-EncodedCommand");
@@ -224,4 +227,33 @@ test('win32: CLIXML reports the actual PowerShell error rather than its serializ
   const mod=await import('../src/backends/win32.mjs');
   const b=mod.create({exec:{run:async()=>({code:1,stdout:'',stderr:'#< CLIXML\n<Objs><S S="Error">native failure &lt;target&gt;_x000D__x000A_</S></Objs>'})}});
   await assert.rejects(b.type({text:'x'}), error => /native failure <target>/.test(error.message) && !/CLIXML|<Objs>/.test(error.message));
+});
+
+
+test("win32: nested zooms crop only the latest backend-owned raster", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-win32-crop-"));
+  const saved = process.env.CODEWHALE_CU_RECORDINGS_DIR;
+  process.env.CODEWHALE_CU_RECORDINGS_DIR = dir;
+  t.after(() => {
+    saved === undefined ? delete process.env.CODEWHALE_CU_RECORDINGS_DIR : process.env.CODEWHALE_CU_RECORDINGS_DIR = saved;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const scripts = [];
+  const run = async (_cmd, args) => {
+    const script = decodeScript(args); scripts.push(script);
+    const output = script.match(/\$bmp\.Save\('([^']+)'/)?.[1];
+    if (output) fs.writeFileSync(output, Buffer.from("fixture"));
+    return { code: 0, stdout: '{"ok":true,"x":10,"y":20,"w":100,"h":80}', stderr: "" };
+  };
+  const { create } = await import("../src/backends/win32.mjs");
+  const backend = create({ exec: { run } });
+  const shot = await backend.screenshot();
+  const first = await backend.zoom({ region: [10, 20, 40, 30], source: "/untrusted/caller.png" });
+  const child = await backend.zoom({ region: [2, 3, 10, 8], source: "/untrusted/caller.png" });
+  const crops = scripts.filter(script => script.includes("FromFile("));
+  assert.ok(crops[0].includes(shot.file));
+  assert.ok(crops[1].includes(first.file));
+  assert.ok(crops.every(script => !script.includes("/untrusted/caller.png")));
+  assert.deepEqual(child.points, { x: 22, y: 43, w: 10, h: 8 });
+  assert.deepEqual(child.pixels, { w: 10, h: 8 });
 });

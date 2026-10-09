@@ -99,3 +99,25 @@ fn native_dock_zero_viewport_retires_every_painted_target() {
     assert!(actual.1.is_empty());
     assert!(actual.2.is_empty());
 }
+
+#[test]
+fn jobs_tab_counts_one_running_shell_as_one_job() {
+    let mut app = app();
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        exit_code: None,
+        id: "shell_a1b2c3d4".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: ls | head -40".to_string(),
+        duration_ms: Some(34_000),
+        kind: crate::tui::app::TaskPanelEntryKind::Shell,
+        stale: false,
+        elapsed_since_output_ms: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
+    });
+    // The `▾ Shells 1` heading is a selectable door, not a second job.
+    assert_eq!(dock_tab_count(&mut app, RailPanel::Background), Some(1));
+}

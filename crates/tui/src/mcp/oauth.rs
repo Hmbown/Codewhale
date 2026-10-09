@@ -1236,7 +1236,7 @@ enum OAuthLoginAnnounce {
 ///
 /// The authorization URL is available immediately so the model can relay it
 /// to the user verbatim; [`McpOAuthToolLogin::finish`] then blocks on the
-/// loopback callback (up to 5 minutes, same as `/mcp login`) and persists
+/// loopback callback (up to 15 minutes, same as `/mcp login`) and persists
 /// the issued tokens to the shared store on success.
 pub struct McpOAuthToolLogin {
     server_name: String,
@@ -1374,7 +1374,7 @@ Codewhale client, and the exact authorization URL is shown to the user in \
 the session status while this call waits. The same URL is returned in this \
 call's result; if the user reports the browser did not open, show that URL \
 to the user verbatim and ask them to complete the sign-in there.\n\
-2. The call blocks (up to 5 minutes) until the browser flow completes on the \
+2. The call blocks (up to 15 minutes) until the browser flow completes on the \
 local callback listener, is declined, or times out. Do not assume success \
 before the call returns.\n\
 3. On success the server reconnects and its real MCP tools replace this \
@@ -1718,7 +1718,8 @@ impl OauthLoginFlow {
         }
 
         let result = async {
-            let callback = timeout(Duration::from_secs(300), &mut self.rx)
+            // Allow time for the user to finish browser authentication and 2FA.
+            let callback = timeout(Duration::from_secs(900), &mut self.rx)
                 .await
                 .with_context(|| {
                     let retry_hint = match announce {

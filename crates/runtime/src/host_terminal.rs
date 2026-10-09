@@ -41,6 +41,8 @@ pub trait HostTerminal: Send + Sync {
     /// Install the process-wide notification method, category gate, sound
     /// policy and attention condition from `[notifications]`.
     fn apply_notification_settings(&self, config: &NotificationsConfig);
+
+    fn begin_turn_chrome(&self) {}
 }
 
 struct NoHostTerminal;

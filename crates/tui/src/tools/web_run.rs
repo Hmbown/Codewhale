@@ -1126,9 +1126,12 @@ async fn run_image_search(
             .await
             .map_err(ToolError::from)?
     } else {
-        seed_resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
-        })?
+        let bytes = crate::utils::read_response_body_capped(seed_resp, HARD_MAX_BYTES)
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
+            })?;
+        String::from_utf8_lossy(&bytes).into_owned()
     };
 
     if !seed_status.is_success() {
@@ -1159,9 +1162,12 @@ async fn run_image_search(
             .await
             .map_err(ToolError::from)?
     } else {
-        api_resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read image response: {e}"))
-        })?
+        let bytes = crate::utils::read_response_body_capped(api_resp, HARD_MAX_BYTES)
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read image response: {e}"))
+            })?;
+        String::from_utf8_lossy(&bytes).into_owned()
     };
 
     if !api_status.is_success() {
@@ -1476,6 +1482,10 @@ fn bounded_web_run_result(
             "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&artifact.relative_path),
             "artifact_byte_size": artifact.byte_size,
             "artifact_preview": artifact.preview,
+            // The overflow footer points at `retrieve_tool_result`; flag the
+            // evidence so the engine auto-activates that tool next turn (same
+            // contract as the shell-truncation spillover).
+            "evidence_available": true,
         })
     });
 
@@ -1917,6 +1927,12 @@ mod tests {
 
         assert!(result.content.contains("retrieve_tool_result"));
         assert!(result.content.chars().count() <= inline_char_budget(&context));
+        assert_eq!(
+            metadata["evidence_available"],
+            json!(true),
+            "overflow footer points at retrieve_tool_result; the metadata must \
+             flag the evidence so the engine auto-activates that tool:\n{metadata}"
+        );
         assert_eq!(
             serde_json::from_str::<Value>(&full).unwrap()["warnings"][0],
             output.warnings[0]

@@ -40,6 +40,7 @@ import { hookExecution, hookVerdict, type LocalHook } from './shims/hooks.ts'
 import { PromptSections, definePromptService, type LocalPromptSection } from './shims/prompt.ts'
 import { createStorage, type PluginStorage } from './shims/storage.ts'
 import {McpDefinitions,defineMcpService,type LocalMcp} from './shims/mcp.ts'
+import { AvatarPacks, defineAvatarsService, type LocalAvatarPack } from './shims/avatars.ts'
 import { SkillRoots, defineSkillsService, type LocalSkillRoot } from './shims/skills.ts'
 import { ownerTier, type HostTier } from './tier.ts'
 import {
@@ -77,12 +78,13 @@ export const REFUSED_SERVICES = new Set(['shellHooks',
   'prompt',
   'storage',
   'skills',
+  'avatars',
   'mcp',
   'logger',
 ])
 
 /** Services the root provides; `inject` of anything else fails activation. */
-const PROVIDED_SERVICES = new Set(['tools', 'commands', 'prompt', 'storage', 'skills', 'mcp', 'logger', 'events', 'reflect', 'registry'])
+const PROVIDED_SERVICES = new Set(['tools', 'commands', 'prompt', 'storage', 'skills', 'avatars', 'mcp', 'logger', 'events', 'reflect', 'registry'])
 
 const ACTIVATE_DEADLINE_MS = 5_000
 const DISPOSE_DEADLINE_MS = 2_000
@@ -113,6 +115,7 @@ export interface OwnerRecord {
   hooks: Map<number, LocalHook<OwnerRecord>>
   promptSections: Map<number, LocalPromptSection<OwnerRecord>>
   skillRoots: Map<number, LocalSkillRoot<OwnerRecord>>
+  avatarPacks: Map<number, LocalAvatarPack<OwnerRecord>>
   mcpDefinitions:Map<number,LocalMcp<OwnerRecord>>
   storage?: PluginStorage
   warnedAllow?: boolean
@@ -157,6 +160,7 @@ export class HostRoot {
   private readonly hookRegistrations: OwnedRegistrations<OwnerRecord, LocalHook<OwnerRecord>>
   private readonly promptSections: PromptSections<OwnerRecord>
   private readonly skillRoots: SkillRoots<OwnerRecord>
+  private readonly avatarPacks: AvatarPacks<OwnerRecord>
   private readonly mcpDefinitions:McpDefinitions<OwnerRecord>
 
   constructor(
@@ -185,6 +189,7 @@ export class HostRoot {
     this.promptSections = new PromptSections(rpc, (owner) => owner.promptSections,
       (message, owner) => this.log('warn', message, owner))
     this.mcpDefinitions=new McpDefinitions(rpc,(owner)=>owner.mcpDefinitions,(message,owner)=>this.log('warn',message,owner))
+    this.avatarPacks = new AvatarPacks(rpc, owner => owner.avatarPacks, (message, owner) => this.log('warn', message, owner))
     this.skillRoots = new SkillRoots(rpc, (owner) => owner.skillRoots,
       (message, owner) => this.log('warn', message, owner))
 
@@ -268,6 +273,7 @@ export class HostRoot {
     })
     const ShellHooksShim=defineShellHooksService<OwnerRecord>({ownerOf:(ctx)=>ctx[OWNER],registrations:this.shellRegistrations})
     const McpShim=defineMcpService<OwnerRecord>({ownerOf:(ctx)=>(ctx as Context & { [OWNER]?: OwnerRecord })[OWNER],definitions:this.mcpDefinitions})
+    const AvatarsShim = defineAvatarsService<OwnerRecord>({ ownerOf: (ctx) => ctx[OWNER], avatarPacks: this.avatarPacks })
     const SkillsShim = defineSkillsService<OwnerRecord>({ ownerOf: (ctx) => ctx[OWNER], skillRoots: this.skillRoots })
     class StorageShim extends Service {
       constructor(ctx: any) { super(ctx, 'storage') }
@@ -290,6 +296,7 @@ export class HostRoot {
     shimClasses.set('prompt', PromptShim)
     shimClasses.set('storage', StorageShim)
     shimClasses.set('skills', SkillsShim)
+    shimClasses.set('avatars', AvatarsShim)
     shimClasses.set('mcp',McpShim)
     shimClasses.set('shellHooks',ShellHooksShim)
     root.plugin(ToolsShim)
@@ -297,6 +304,7 @@ export class HostRoot {
     root.plugin(PromptShim)
     root.plugin(StorageShim)
     root.plugin(SkillsShim)
+    root.plugin(AvatarsShim)
     root.plugin(McpShim)
     root.plugin(ShellHooksShim)
     shimClasses.set('loader', ReviewedLoader)
@@ -348,7 +356,7 @@ export class HostRoot {
     const scopeKey=params.scope===undefined ? undefined : `${params.scope.path}\0${params.scope.sha256}`
     if (scopeKey!==undefined) {
       if (params.scope?.path!==params.entry.path || params.scope?.sha256!==params.entry.sha256) return {status:'failed',diagnostic:'scope does not match the core-selected entry'}
-      parent ??= {ref:params.owner,pluginName:params.plugin_name,fibers:[],pendingRegistrations:new Set(),refusals:[],tools:new Map(),commands:new Map(),hooks:new Map(),shellHooks:new Map(),promptSections:new Map(),skillRoots:new Map(),mcpDefinitions:new Map(),entries:new Set(),views:new Map(),state:'active',...(params.data_dir===undefined?{}:{dataDir:params.data_dir})}
+      parent ??= {ref:params.owner,pluginName:params.plugin_name,fibers:[],pendingRegistrations:new Set(),refusals:[],tools:new Map(),commands:new Map(),hooks:new Map(),shellHooks:new Map(),promptSections:new Map(),skillRoots:new Map(),avatarPacks:new Map(),mcpDefinitions:new Map(),entries:new Set(),views:new Map(),state:'active',...(params.data_dir===undefined?{}:{dataDir:params.data_dir})}
       if (parent.state!=='active' || parent.ref.plugin_id!==params.owner.plugin_id || parent.ref.generation!==params.owner.generation || parent.pluginName!==params.plugin_name) return {status:'failed',diagnostic:'scope owner was withdrawn'}
       parent.views ??=new Map()
       this.owners.set(key,parent)
@@ -377,6 +385,7 @@ export class HostRoot {
       shellHooks:new Map(),
       promptSections: new Map(),
       skillRoots: new Map(),
+      avatarPacks: new Map(),
       mcpDefinitions:new Map(),
       entries: new Set(),
       ...(params.data_dir === undefined ? {} : { dataDir: params.data_dir }),
@@ -440,7 +449,7 @@ export class HostRoot {
         this.commandRegistrations.forget(owner)
         this.hookRegistrations.forget(owner);this.shellRegistrations.forget(owner)
         this.promptSections.forget(owner)
-        this.skillRoots.forget(owner);this.mcpDefinitions.forget(owner)
+        this.skillRoots.forget(owner);this.avatarPacks.forget(owner);this.mcpDefinitions.forget(owner)
         if (scopeKey === undefined) {
           if (this.owners.get(key) === owner) this.owners.delete(key)
         } else if (parent?.views?.get(scopeKey) === owner) parent.views.delete(scopeKey)
@@ -513,6 +522,7 @@ export class HostRoot {
       ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
       ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`),
       ...[...owner.mcpDefinitions.values()].map(server=>`mcp_server:${server.name}`),
+      ...[...owner.avatarPacks.values()].map((pack) => `avatar_pack:${pack.name}`),
       ...[...owner.skillRoots.values()].map((root) => `skill_root:${root.name}`),
     ]
     for (const fiber of owner.fibers) {
@@ -522,7 +532,7 @@ export class HostRoot {
     this.commandRegistrations.forget(owner)
     this.hookRegistrations.forget(owner);this.shellRegistrations.forget(owner)
     this.promptSections.forget(owner)
-    this.skillRoots.forget(owner);this.mcpDefinitions.forget(owner)
+    this.skillRoots.forget(owner);this.avatarPacks.forget(owner);this.mcpDefinitions.forget(owner)
     if(scopeKey===undefined)this.owners.delete(ref.owner_token);else parent?.views?.delete(scopeKey)
     return { disposed, leaked }
   }

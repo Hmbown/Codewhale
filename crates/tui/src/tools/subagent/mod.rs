@@ -343,12 +343,13 @@ fn child_runtime_budget_context(
 ) -> String {
     let wall = match runtime.worker_profile.wall_deadline_ms {
         Some(deadline_ms) => {
-            let remaining =
-                crate::elapsed::format_elapsed_ms(deadline_ms.saturating_sub(epoch_millis_now()));
+            let remaining = codewhale_command_contract::elapsed::format_elapsed_ms(
+                deadline_ms.saturating_sub(epoch_millis_now()),
+            );
             match runtime.worker_profile.wall_time_secs {
                 Some(total_secs) => format!(
                     "task work stops about {remaining} from now (total run budget {}); model and tool time count against it",
-                    crate::elapsed::format_elapsed_secs(total_secs)
+                    codewhale_command_contract::elapsed::format_elapsed_secs(total_secs)
                 ),
                 None => format!("task work stops about {remaining} from now"),
             }
@@ -444,10 +445,10 @@ fn child_budget_pacing_notice(
             let remaining = deadline.saturating_duration_since(Instant::now());
             consumed.push(format!(
                 "wall clock: ~{} remains of ~{}",
-                crate::elapsed::format_elapsed_ms(
+                codewhale_command_contract::elapsed::format_elapsed_ms(
                     u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
                 ),
-                crate::elapsed::format_elapsed_ms(
+                codewhale_command_contract::elapsed::format_elapsed_ms(
                     u64::try_from(total.as_millis()).unwrap_or(u64::MAX)
                 ),
             ));
@@ -538,6 +539,7 @@ const DEFAULT_STEP_API_TIMEOUT: Duration =
 const COMPLETED_AGENT_RETENTION: Duration = Duration::from_secs(60 * 60);
 const MAX_AGENT_WORKER_RECORDS: usize = 256;
 const MAX_AGENT_WORKER_EVENTS_PER_RECORD: usize = 128;
+const MAX_QUEUED_PARENT_MESSAGES: usize = 64;
 /// Byte budget for the message tail retained in a [`SubAgentCheckpoint`]
 /// (#3882). Checkpoints fire on every step of every worker and are cloned
 /// into snapshots, projections, and `subagents.v1.json`; an unbounded
@@ -1911,6 +1913,13 @@ pub(crate) enum SubAgentThinking {
     Effort(ReasoningEffort),
 }
 
+/// The `thinking` values the `agent` schema advertises. The schema enum and
+/// the rejection message both read this list, so they cannot name different
+/// levels. Every entry must parse; `thinking_schema_values_all_parse` pins it.
+const SUBAGENT_THINKING_SCHEMA_VALUES: [&str; 9] = [
+    "inherit", "auto", "off", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
 impl SubAgentThinking {
     fn parse(value: &str) -> Result<Self, ToolError> {
         let normalized = value.trim().to_ascii_lowercase();
@@ -1922,10 +1931,10 @@ impl SubAgentThinking {
                     effort => Self::Effort(effort),
                 })
                 .map_err(|_| {
-                    ToolError::invalid_input(
-                        "thinking must be one of: inherit, auto, off, low, medium, high, max"
-                            .to_string(),
-                    )
+                    ToolError::invalid_input(format!(
+                        "thinking must be one of: {}",
+                        SUBAGENT_THINKING_SCHEMA_VALUES.join(", ")
+                    ))
                 }),
         }
     }
@@ -2931,7 +2940,7 @@ pub struct SubAgentRuntime {
     pub parent_mode: AppMode,
     /// The session's deterministic Auto-Review policy (configured allow/block
     /// rules plus the built-in safety floor), shared with every descendant.
-    pub auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
+    pub auto_review_policy: std::sync::Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
     /// Whether the host can answer an approval prompt for a child (an
     /// interactive TUI). Headless hosts keep the fail-closed denial.
     pub parent_can_prompt: bool,
@@ -3010,7 +3019,7 @@ impl SubAgentRuntime {
             todos: crate::tools::todo::new_shared_todo_list(),
             parent_mode: AppMode::Agent,
             auto_review_policy: std::sync::Arc::new(
-                crate::tui::auto_review::AutoReviewPolicy::default(),
+                crate::core::authority::auto_review::AutoReviewPolicy::default(),
             ),
             parent_can_prompt: false,
             approval_receipt_store: None,
@@ -3047,7 +3056,7 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_permission_posture(
         mut self,
-        auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
+        auto_review_policy: std::sync::Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
         parent_can_prompt: bool,
     ) -> Self {
         self.auto_review_policy = auto_review_policy;
@@ -3941,11 +3950,15 @@ pub(crate) fn child_approval_keys(agent_id: &str, name: &str, input: &Value) -> 
     )
 }
 
-/// A person's answer to an approval prompt raised for a child's tool call.
+/// An answer to a child's approval prompt, preserving who made the decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildApprovalOutcome {
-    Approved,
-    Denied,
+    Approved {
+        by: crate::approval_log::ApprovalDecider,
+    },
+    Denied {
+        by: crate::approval_log::ApprovalDecider,
+    },
     /// The host could not put the request in front of a person (for example
     /// it belongs to a conversation that is no longer shown). Recorded as
     /// `unavailable`, never as the person's denial.
@@ -7252,6 +7265,11 @@ impl SubAgentManager {
             wake,
         };
         let queue = self.queued_mail.entry(agent_id.clone()).or_default();
+        if queue.len() >= MAX_QUEUED_PARENT_MESSAGES {
+            return Err(anyhow!(
+                "Agent {agent_id} already has {MAX_QUEUED_PARENT_MESSAGES} queued parent messages; wait for it to read them before sending more"
+            ));
+        }
         queue.push_back(entry);
         let queue_depth = queue.len();
         Ok(ParentMailReceipt {
@@ -8615,7 +8633,7 @@ impl SubAgentManager {
                 let elapsed = existing.started_at.elapsed();
                 let since = format!(
                     "{} ago",
-                    crate::elapsed::format_elapsed_secs(elapsed.as_secs())
+                    codewhale_command_contract::elapsed::format_elapsed_secs(elapsed.as_secs())
                 );
                 return Err(anyhow!(
                     "Sub-agent session name '{name}' is already in use by agent_id '{}' \
@@ -10821,13 +10839,9 @@ fn instant_from_duration(duration: Duration) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-/// Per-write sequence so each `write_json_atomic` uses a distinct temp file.
 /// `persist_state_best_effort` fires a fresh thread per call, so multiple
-/// persists of the same `state.json` can be in flight at once; keying the temp
-/// name only on the pid (as before) made every thread write the *same*
-/// `state.<pid>.tmp` and a rename could publish a half-written file — corrupt
-/// state that fails to parse on reload.
-static WRITE_JSON_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// persists of the same `state.json` can be in flight at once; the publish
+/// sequence below keeps an older snapshot from replacing a newer one.
 static STATE_PUBLISH_SEQUENCES: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, u64>>> =
     std::sync::OnceLock::new();
 
@@ -10838,10 +10852,6 @@ fn write_json_atomic(state_root: &Path, path: &Path, value: &PersistedSubAgentSt
         fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(value)?;
-    let seq = WRITE_JSON_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
-    reject_root_relative_symlinks(&state_root, &tmp_path)?;
-    fs::write(&tmp_path, payload)?;
     let publish_sequences =
         STATE_PUBLISH_SEQUENCES.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let mut published = publish_sequences.lock();
@@ -10849,14 +10859,9 @@ fn write_json_atomic(state_root: &Path, path: &Path, value: &PersistedSubAgentSt
         .get(path)
         .is_some_and(|sequence| *sequence > value.snapshot_sequence)
     {
-        let _ = fs::remove_file(&tmp_path);
         return Ok(());
     }
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        // Don't leave a stray temp behind if the publish failed.
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err.into());
-    }
+    crate::utils::write_atomic(path, payload.as_bytes())?;
     published.insert(path.to_path_buf(), value.snapshot_sequence);
     Ok(())
 }
@@ -11162,7 +11167,7 @@ static AGENT_TOOL_DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock
         "Prefer type=implement for write work and type=test (or the Run tool with action=\"verifiers\") after writes settle — dispatch is not completion. ",
         "action=claim widens your own enforced write scope: pass write_roots (and optionally exact_files, coordination_contracts) before mutating anything a fail-closed write refusal named. It records a durable claim receipt and fails on contention with a peer claim; it never touches another agent's scope. ",
         "Action contract: start requires prompt; message/followup require targets and a message; followup accepts one id, agent_ids or all_parked=true and returns continuation mappings. peek/interrupt/cancel require a target; claim requires scope entries; status is compact and paginated unless an addressed detail is requested. ",
-        "In Operate, arbitrary shell remains gated. ",
+        "In Operate, a child the main session starts edits files and runs the Run tool's built-in checks without a second approval; any other shell command follows the session's approval settings. ",
         "Legacy action=status|peek|cancel remain for compatibility."
     );
     format!("{description} {}", subagent_followup_recovery("<agent_id>"))
@@ -11217,7 +11222,7 @@ impl ToolSpec for AgentTool {
                 "until": {
                     "type": "string",
                     "enum": ["completion", "all", "activity"],
-                    "description": "For action=wait. completion (default) returns when any one child settles. all returns only once every child running at call time has settled, with each outcome — the fan-out join: start the batch, make one wait, then synthesize. activity also returns on progress."
+                    "description": "For action=wait. A wait blocks until one child settles or the timeout (default 30s, max 120s) elapses; on timeout the receipt reports timed_out=true with any already-settled children, and full results still arrive as completion sentinels. completion (default) returns when any one child settles. all returns only once every child running at call time has settled, with each outcome — the fan-out join: start the batch, make one wait, then synthesize. activity also returns on progress."
                 },
                 "agent_id": {
                     "type": "string",
@@ -11294,7 +11299,7 @@ impl ToolSpec for AgentTool {
                 },
                 "thinking": {
                     "type": "string",
-                    "enum": ["inherit", "auto", "off", "low", "medium", "high", "xhigh", "max", "ultra"],
+                    "enum": SUBAGENT_THINKING_SCHEMA_VALUES,
                     "description": "Requested reasoning effort, normalized to the selected route's supported values. inherit uses role defaults then session effort; auto considers this task."
                 },
                 "worktree": {
@@ -18504,10 +18509,11 @@ fn route_source_label(route: &ModelRoute) -> String {
 
 /// When a child agent fails because its model is unavailable under the current
 /// access profile, a bare provider 403/404 (classified `Authorization` or
-/// `State`) is unactionable. Annotate it so the parent knows which provider and
-/// route produced the failing model and how to recover (#2653, #4049) without
-/// re-classifying the underlying error. Errors unrelated to model availability
-/// pass through unchanged.
+/// `State`) or a spent-balance quota refusal (classified `RateLimit`) is
+/// unactionable. Annotate it so the parent knows which provider and route
+/// produced the failing model and how to recover (#2653, #4049) without
+/// re-classifying the underlying error. Short-lived rate limits and errors
+/// unrelated to model availability pass through unchanged.
 #[cfg(test)]
 fn annotate_child_model_error(
     err: &str,
@@ -18553,6 +18559,11 @@ fn annotate_child_model_error_with_origin(
     let lower = err.to_ascii_lowercase();
     match crate::error_taxonomy::classify_error_message(err) {
         crate::error_taxonomy::ErrorCategory::Authorization => hint(),
+        crate::error_taxonomy::ErrorCategory::RateLimit
+            if crate::error_taxonomy::is_spent_balance_message(err) =>
+        {
+            hint()
+        }
         crate::error_taxonomy::ErrorCategory::State if lower.contains("model") => hint(),
         _ => {
             // #3020 (#2653): Provider rejections like "Model Not Exist" or

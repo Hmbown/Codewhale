@@ -47,7 +47,7 @@ export const chrome: ChromeDict = {
   themeTitle: "Tema · otomatik / açık / koyu",
 
   footerTagline:
-    "Seçtiğin modellerle kodu düzenle, testleri çalıştır ve değişiklikleri incele.",
+    "Kendi modellerin ve bağlı araçlarınla uygulamalar geliştir, işleri otomatikleştir.",
   footerProduct: "Ürün",
   footerProject: "Proje",
   footerDocs: "Belgeler",

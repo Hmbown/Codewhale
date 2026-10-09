@@ -20,8 +20,8 @@ and [CHANGELOG.md](../CHANGELOG.md).
 
 The maintainer rule: reports and PRs are real project work, even when the final
 patch has to be narrowed, delayed, or harvested into a maintainer branch.
-Harvested PRs keep visible credit in the commit/PR body, changelog or release
-notes, and relevant issue/PR comments.
+Adapted contributions keep visible credit in commits and PR bodies, the
+changelog or release notes, and this contributor record.
 
 ---
 
@@ -35,10 +35,34 @@ notes, and relevant issue/PR comments.
 </details>
 
 <details open>
+<summary><strong>v0.10.2 — terminal, recovery and reliability</strong></summary>
+
+**Contributions**
+
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — live network-policy updates and goal milestone hand-back ([#6928](https://github.com/codewhale-hq/Codewhale/pull/6928), [#6930](https://github.com/codewhale-hq/Codewhale/pull/6930)).
+- **[dajiaohuang](https://github.com/dajiaohuang)** — cache-write token accounting, with missing and explicit-zero usage preserved ([#6913](https://github.com/codewhale-hq/Codewhale/pull/6913)).
+- **[gaord](https://github.com/gaord)** — embedder-declared telemetry surface support without changing collection policy ([#6916](https://github.com/codewhale-hq/Codewhale/pull/6916)).
+- **[Lstarsky0](https://github.com/Lstarsky0)** — localized `/profile` replies across all 15 complete locale packs ([#6919](https://github.com/codewhale-hq/Codewhale/pull/6919)).
+- **[jayanthvee](https://github.com/jayanthvee)** — Windows npm launcher guidance and targeted process shutdown ([#6906](https://github.com/codewhale-hq/Codewhale/pull/6906)).
+- **[asto18089](https://github.com/asto18089)** — reference fix for longer browser sign-in callback windows ([#6865](https://github.com/codewhale-hq/Codewhale/issues/6865)).
+
+**Reports and verification**
+
+- **[BX166](https://github.com/BX166)** — reported three provider failure modes measured on AICraft's own traffic: a cold model that reads as a dead connection, a listed model that fails on every call, and a response cut at the output ceiling that reports `stop` ([#6889](https://github.com/codewhale-hq/Codewhale/issues/6889)).
+
+</details>
+
+<details>
 <summary><strong>v0.10.1 — reliability and first-run fixes</strong></summary>
 
 **Merged or adapted contributions**
 
+- **[gaord](https://github.com/gaord)** — exposed call-specific workspace changes to Runtime clients ([#6817](https://github.com/codewhale-hq/Codewhale/pull/6817)) and canonical skill-detail/review routes ([#6869](https://github.com/codewhale-hq/Codewhale/pull/6869)).
+- **[asto18089](https://github.com/asto18089)** — fixed preferred search-language selection ([#6860](https://github.com/codewhale-hq/Codewhale/pull/6860)), image metadata for model input ([#6858](https://github.com/codewhale-hq/Codewhale/pull/6858)), automation deletion wording and retained-run cleanup ([#6864](https://github.com/codewhale-hq/Codewhale/pull/6864)), and compaction-anchor regression coverage ([#6857](https://github.com/codewhale-hq/Codewhale/pull/6857)).
+- **[aboimpinto](https://github.com/aboimpinto)** — extracted portable config/status/permission command contracts while preserving host-owned mutation and queue-worker readiness ([#6832](https://github.com/codewhale-hq/Codewhale/pull/6832)).
+- **[hodeswildsmith455-boop](https://github.com/hodeswildsmith455-boop)** — added OrcaRouter account sign-in with PKCE and its live chat catalog ([#6867](https://github.com/codewhale-hq/Codewhale/pull/6867)).
+- **[LIghtJUNction](https://github.com/LIghtJUNction)** — added reviewed plugin-provided AI routes with host-owned OAuth PKCE credentials and request-time authority checks ([#6805](https://github.com/codewhale-hq/Codewhale/pull/6805)).
+- **[AdityaVG13](https://github.com/AdityaVG13)** — supplied the discovery-cache priority correction adapted from [#6393](https://github.com/codewhale-hq/Codewhale/pull/6393); highest-ranked tools survive cache overflow. The broader echo and fork-inheritance draft remains open.
 - **[Guan0923](https://github.com/Guan0923)** — accepted case-insensitive HTTP(S) schemes in `config doctor` without rewriting the configured URL ([#6819](https://github.com/codewhale-hq/Codewhale/pull/6819)).
 - **[harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host descriptor, with its billing basis recorded as unreviewed rather than guessed ([#6408](https://github.com/codewhale-hq/Codewhale/pull/6408)).
 - **[asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving the original contributor commits ([#6799](https://github.com/codewhale-hq/Codewhale/pull/6799)).
@@ -47,7 +71,7 @@ notes, and relevant issue/PR comments.
 - **[Andrea-Bruno](https://github.com/Andrea-Bruno)** — designed the Superfast Decision Gate and contributed its off-by-default shadow classifier ([#6604](https://github.com/codewhale-hq/Codewhale/pull/6604), [#6603](https://github.com/codewhale-hq/Codewhale/issues/6603)).
 - **[aiapienthusiast](https://github.com/aiapienthusiast)** — added Cheaper Inference to the bundled provider catalog ([#6761](https://github.com/codewhale-hq/Codewhale/pull/6761)).
 - **[gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/codewhale-hq/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/codewhale-hq/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/codewhale-hq/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/codewhale-hq/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/codewhale-hq/Codewhale/pull/6664)).
-- **[Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/codewhale-hq/Codewhale/pull/6405), [#6417](https://github.com/codewhale-hq/Codewhale/pull/6417), [#6499](https://github.com/codewhale-hq/Codewhale/pull/6499), [#6574](https://github.com/codewhale-hq/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/codewhale-hq/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/codewhale-hq/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/codewhale-hq/Codewhale/pull/6733)).
+- **[Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/codewhale-hq/Codewhale/pull/6405), [#6417](https://github.com/codewhale-hq/Codewhale/pull/6417), [#6499](https://github.com/codewhale-hq/Codewhale/pull/6499), [#6574](https://github.com/codewhale-hq/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/codewhale-hq/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/codewhale-hq/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/codewhale-hq/Codewhale/pull/6733)). Translated the session-only note after model switches across the complete TUI locale packs ([#6875](https://github.com/codewhale-hq/Codewhale/pull/6875)).
 - **[aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/codewhale-hq/Codewhale/pull/6581), [#6666](https://github.com/codewhale-hq/Codewhale/pull/6666)), and completed the session command group's shared boundary ([#6793](https://github.com/codewhale-hq/Codewhale/pull/6793)).
 - **[dajiaohuang](https://github.com/dajiaohuang)** — validated `config set` values against the settings schema ([#6568](https://github.com/codewhale-hq/Codewhale/pull/6568)).
 - **[Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/codewhale-hq/Codewhale/pull/6400)), and retired the blanket dead-code allowance and its unused feature stages, tightening the budget to match ([#6402](https://github.com/codewhale-hq/Codewhale/pull/6402)).
@@ -56,6 +80,7 @@ notes, and relevant issue/PR comments.
 
 **Reports and reproductions**
 
+- **[7jrxt42BxFZo4iAnN4CX](https://github.com/7jrxt42BxFZo4iAnN4CX)** — reported indefinite human questions being cancelled by the TUI hung-tool watchdog and supplied the timer evidence ([#6872](https://github.com/codewhale-hq/Codewhale/issues/6872)).
 - **[cenab](https://github.com/cenab)** — requested the Tsubasa provider row and supplied its endpoint, key and model values ([#6695](https://github.com/codewhale-hq/Codewhale/issues/6695)).
 - **[BX166](https://github.com/BX166)** — reported the AICraft provider row missing its key console, docs link and guidance, and supplied the values ([#6616](https://github.com/codewhale-hq/Codewhale/issues/6616)); the report also surfaced that no bundled descriptor's links reached the setup form.
 - **[jayanthvee](https://github.com/jayanthvee)** — reported and diagnosed that killing the npm launcher's `node.exe` ends Windows sessions without cleanup, with reproductions and fix directions ([#6827](https://github.com/codewhale-hq/Codewhale/issues/6827)).

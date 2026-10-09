@@ -349,11 +349,14 @@ fn finish_workflow_controller(state: &WorkflowWorkspaceState, record: &WorkflowR
         let payload =
             format!("{summary}\n<codewhale:subagent.done>{receipt}</codewhale:subagent.done>");
         debug_assert!(payload.len() <= WORKFLOW_COMPLETION_MAX_BYTES);
-        let _ = tx.try_send(SubAgentCompletion {
-            owner_session_id: controller.driver.owner_session_id.clone(),
-            agent_id: record.run_id.clone(),
-            payload,
-        });
+        send_terminal_event(
+            tx,
+            SubAgentCompletion {
+                owner_session_id: controller.driver.owner_session_id.clone(),
+                agent_id: record.run_id.clone(),
+                payload,
+            },
+        );
     }
     controllers.remove(&record.run_id);
 }
@@ -1163,10 +1166,10 @@ impl ToolSpec for WorkflowTool {
     fn description(&self) -> &'static str {
         concat!(
             "Run named steps through the existing sub-agents with a structured plan, ordered phases, shared budgets and result handoffs. Fleet configures those same sub-agents and roles. ",
-            "Inspect agent(action=\"roster\") before assigning steps; choose saved models or role/profile assignments and respect unavailable routes. ",
-            "Prefer plan for multi-step work. Saved or advanced workflows can use script/source_path; provide exactly one input form. ",
-            "Use action=start for detached orchestration and action=status with run_id to inspect progress. Use action=run when the model needs the final result before continuing. ",
-            "Start a workflow on your own only for broad or staged work (the session [workflow].automatic table, default on). An explicit /workflow invocation is authorization. Do not start a workflow for one-file edits or simple questions."
+            "A workflow is for broad or staged work: several steps with an order, phases, gates, or a fan-in of results. ",
+            "agent(action=\"roster\") lists the saved models, role/profile assignments, and route availability that steps can be assigned. ",
+            "plan is the structured input form for multi-step work; saved or advanced workflows can use script/source_path; exactly one input form is accepted. ",
+            "action=start runs the orchestration detached and action=status with run_id reports its progress. action=run waits and returns the final result."
         )
     }
 

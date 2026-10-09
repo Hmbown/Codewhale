@@ -1,15 +1,15 @@
 use super::*;
 use crate::tools::plan::PlanSnapshot;
 use crate::tui::history::{
-    ExecCell, ExecSource, HistoryCell, PlanUpdateCell, ReasoningAction, ReasoningActionTarget,
-    ThinkingFold, ToolCell, ToolStatus, TranscriptActionOwner,
+    CellFoldAction, CellFoldActionTarget, ExecCell, ExecSource, HistoryCell, PlanUpdateCell,
+    ToolCell, ToolStatus, TranscriptActionOwner, TranscriptFold,
 };
 use codewhale_localization::Locale;
 use codewhale_palette as palette;
 
 impl TranscriptViewCache {
-    pub(crate) fn reasoning_action_target(&self) -> Option<ReasoningActionTarget> {
-        self.reasoning_action_target
+    pub(crate) fn fold_action_target(&self) -> Option<CellFoldActionTarget> {
+        self.fold_action_target
     }
 
     fn streaming_lines_reflattened(&self) -> u64 {
@@ -63,6 +63,124 @@ fn reasoning_owner(cell_index: usize) -> TranscriptActionOwner {
         cell_index,
         identity_epoch: 7,
     }
+}
+
+#[test]
+fn ordinary_fold_keeps_original_owner_through_filter_and_narrow_resize() {
+    let body = (1..=12)
+        .map(|line| format!("answer line {line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let cells = [assistant_cell(&body, false)];
+    let folds = HashMap::from([(7, TranscriptFold::Collapsed)]);
+    let owner = reasoning_owner(7);
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..Default::default()
+    };
+    let mut cache = TranscriptViewCache::new();
+    for width in 1..=40 {
+        cache.ensure_split(&[&cells], &[1], width, options, &folds, Some(&[7]), None);
+        let rows = cache.total_lines();
+        assert!(rows > 0);
+        assert!(cache.lines()[0].width() <= usize::from(width));
+        cache.retarget(Some(owner), Some(&[7]));
+        assert_eq!(cache.total_lines(), rows, "hint never changes geometry");
+        assert_eq!(
+            cache.fold_action_target(),
+            Some(CellFoldActionTarget {
+                owner,
+                action: CellFoldAction::Expand
+            })
+        );
+        assert!(cache.lines()[0].width() <= usize::from(width));
+        assert_eq!(
+            cache.line_meta()[0].copy_prefix_width(),
+            cache.lines()[0].width()
+        );
+        cache.retarget(Some(reasoning_owner(0)), Some(&[7]));
+        assert!(
+            cache.fold_action_target().is_none(),
+            "filtered index is not original identity"
+        );
+    }
+}
+
+#[test]
+fn folded_streaming_answer_preserves_links_and_restores_latest_body() {
+    let content = format!(
+        "[reference](https://example.com/reference)\n\n{}",
+        (1..=12)
+            .map(|line| format!("paragraph {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    let mut cells = [assistant_cell(&content, true)];
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..Default::default()
+    };
+    let mut cache = TranscriptViewCache::new();
+    let owner = Some(reasoning_owner(0));
+    let mut folds = HashMap::from([(0, TranscriptFold::Collapsed)]);
+    cache.ensure_split(&[&cells], &[1], 80, options, &folds, None, owner);
+    assert!(plain_lines(&cache).join("\n").contains("Space:expand"));
+    assert!(!plain_lines(&cache).join("\n").contains("paragraph 12"));
+    assert!(cache.line_links[0].is_empty());
+    assert!(
+        cache
+            .line_links
+            .iter()
+            .skip(1)
+            .any(|links| !links.is_empty()),
+        "preview body retains its link"
+    );
+    let before = (cache.cells_rendered, cache.streaming_lines_reflattened());
+    cache.ensure_split(&[&cells], &[1], 80, options, &folds, None, owner);
+    assert_eq!(
+        (cache.cells_rendered, cache.streaming_lines_reflattened()),
+        before,
+        "settled folded frame does no work"
+    );
+
+    let HistoryCell::Assistant { content, .. } = &mut cells[0] else {
+        unreachable!()
+    };
+    content.push_str("\n\nlatest streamed paragraph");
+    cache.ensure_split(&[&cells], &[2], 80, options, &folds, None, owner);
+    assert!(
+        !plain_lines(&cache)
+            .join("\n")
+            .contains("latest streamed paragraph")
+    );
+    assert_eq!(
+        cache.fold_action_target().unwrap().action,
+        CellFoldAction::Expand
+    );
+    folds.insert(0, TranscriptFold::Expanded);
+    cache.ensure_split(&[&cells], &[2], 80, options, &folds, None, owner);
+    assert!(
+        plain_lines(&cache)
+            .join("\n")
+            .contains("latest streamed paragraph")
+    );
+    let mut cold = TranscriptViewCache::new();
+    cold.ensure_split(&[&cells], &[2], 80, options, &folds, None, owner);
+    assert_same_flat_output(&cache, &cold);
+
+    let HistoryCell::Assistant { content, .. } = &mut cells[0] else {
+        unreachable!()
+    };
+    content.push_str("\n\ncontinued after unfolding");
+    cache.ensure_split(&[&cells], &[3], 80, options, &folds, None, owner);
+    let mut cold = TranscriptViewCache::new();
+    cold.ensure_split(&[&cells], &[3], 80, options, &folds, None, owner);
+    assert_same_flat_output(&cache, &cold);
+    assert!(
+        plain_lines(&cache)
+            .join("\n")
+            .contains("continued after unfolding")
+    );
 }
 
 fn exec_tool_cell_with_output(command: &str, output: String) -> HistoryCell {
@@ -942,7 +1060,7 @@ fn hidden_reasoning_cache_never_advertises_or_leaks_content() {
             Some(reasoning_owner(0)),
         );
         let text = plain_lines(&cache).join("\n");
-        assert_eq!(cache.reasoning_action_target(), None);
+        assert_eq!(cache.fold_action_target(), None);
         assert!(
             !text.contains("reasoning line"),
             "hidden body leaked: {text}"
@@ -1524,7 +1642,7 @@ fn folded_thinking_cache_invalidation() {
     // Second render: fold the thinking cell → should invalidate and
     // produce fewer lines (collapsed summary).
     let mut folded = HashMap::new();
-    folded.insert(0usize, ThinkingFold::Collapsed);
+    folded.insert(0usize, TranscriptFold::Collapsed);
     cache.ensure_split(&[&cells], &revisions, width, options, &folded, None, None);
     let folded_line_count = cache.total_lines();
 
@@ -1595,7 +1713,7 @@ fn folded_thinking_with_collapsed_cells_uses_original_indices() {
     let index_map: Vec<usize> = vec![1]; // filtered 0 → original 1
 
     let mut folded = HashMap::new();
-    folded.insert(1usize, ThinkingFold::Collapsed); // fold original index 1
+    folded.insert(1usize, TranscriptFold::Collapsed); // fold original index 1
 
     let mut cache2 = TranscriptViewCache::new();
     cache2.ensure_split(
@@ -1972,10 +2090,10 @@ fn filtered_reasoning_owner_keeps_original_identity() {
     );
     assert!(plain_lines(&cache).join("\n").contains("Space:expand"));
     assert_eq!(
-        cache.reasoning_action_target(),
-        Some(ReasoningActionTarget {
+        cache.fold_action_target(),
+        Some(CellFoldActionTarget {
             owner: reasoning_owner(1),
-            action: ReasoningAction::Expand,
+            action: CellFoldAction::Expand,
         })
     );
     assert!(
@@ -1994,7 +2112,7 @@ fn filtered_reasoning_owner_keeps_original_identity() {
         Some(&original_map),
         Some(reasoning_owner(0)),
     );
-    assert!(cache.reasoning_action_target().is_none());
+    assert!(cache.fold_action_target().is_none());
     assert!(!plain_lines(&cache).join("\n").contains("Space:expand"));
 }
 
@@ -2023,7 +2141,7 @@ fn streaming_tail_fast_path_cannot_skip_reasoning_retarget() {
         None,
         None,
     );
-    assert!(cache.reasoning_action_target().is_none());
+    assert!(cache.fold_action_target().is_none());
     assert!(!plain_lines(&cache).join("\n").contains("Space:expand"));
 }
 
@@ -2395,7 +2513,7 @@ struct TranscriptModel {
     next_revision: u64,
     active: Vec<HistoryCell>,
     active_revision: u64,
-    folds: HashMap<usize, ThinkingFold>,
+    folds: HashMap<usize, TranscriptFold>,
     hidden: std::collections::HashSet<usize>,
     width: u16,
     options: TranscriptRenderOptions,
@@ -2503,8 +2621,8 @@ impl TranscriptModel {
             9 if !self.cells.is_empty() => {
                 let index = rng.below(self.cells.len() + self.active.len());
                 match rng.below(3) {
-                    0 => self.folds.insert(index, ThinkingFold::Expanded),
-                    1 => self.folds.insert(index, ThinkingFold::Collapsed),
+                    0 => self.folds.insert(index, TranscriptFold::Expanded),
+                    1 => self.folds.insert(index, TranscriptFold::Collapsed),
                     _ => self.folds.remove(&index),
                 };
                 "fold"
@@ -2653,8 +2771,8 @@ fn cached_transcript_matches_a_cold_render_after_every_mutation() {
                 context()
             );
             assert_eq!(
-                warm.reasoning_action_target(),
-                cold.reasoning_action_target(),
+                warm.fold_action_target(),
+                cold.fold_action_target(),
                 "{}",
                 context()
             );

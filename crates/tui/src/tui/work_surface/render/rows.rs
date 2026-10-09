@@ -73,7 +73,7 @@ pub(super) fn agent_receipt(facts: &AgentRowFacts, tier: AgentRowTier) -> String
     let elapsed = facts
         .elapsed_secs
         .filter(|_| matches!(tier, AgentRowTier::Full | AgentRowTier::NoTokens))
-        .map(crate::elapsed::format_elapsed_secs);
+        .map(codewhale_command_contract::elapsed::format_elapsed_secs);
     let tokens = facts
         .tokens
         .filter(|_| tier == AgentRowTier::Full)

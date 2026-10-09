@@ -28,9 +28,9 @@ pub(super) struct StagedPlugin {
 
 pub(super) fn fresh_staging_dir(user_plugins_dir: &Path) -> Result<PathBuf> {
     ensure_plugins_dir(user_plugins_dir)?;
-    // A crashed stage can leave residue that discovery will surface as an
-    // untrusted, disabled bundle; the next install attempt cleans it up by
-    // using a fresh uuid path and never reuses the stale one.
+    // Discovery excludes this reserved staging namespace. A crashed stage
+    // can remain for recovery; later attempts reserve a fresh UUID path and
+    // never treat the stale copy as an installed bundle or reuse its path.
     let staged_path = user_plugins_dir.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir(&staged_path)
         .with_context(|| format!("failed to create staging dir {}", staged_path.display()))?;

@@ -162,8 +162,8 @@ jobs:
       - name: Check Cloudflare deploy environment
         run: npm run check:deploy-env
       # npm's deploy script performs one OpenNext build, then deploys that exact
-      # bundle. Wrangler must not run a custom post-cache build: OpenNext
-      # populates the remote cache before it hands the bundle to Wrangler.
+      # bundle. OpenNext populates the remote cache before cf deploy --prebuilt;
+      # the bundler has no custom build that could invalidate that cache.
       - name: Build and deploy exact OpenNext bundle
         run: npm run deploy
       - name: Verify exact deployed revision

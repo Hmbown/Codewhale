@@ -111,7 +111,7 @@ fn repeated_provider_id_ask_rejects_stale_answer_and_keeps_local_artifact_origin
                                         .await
                                         .expect("queued decisions are consumed")
                                         .unwrap(),
-                                    ChildApprovalOutcome::Approved
+                                    ChildApprovalOutcome::Approved { by: crate::approval_log::ApprovalDecider::User }
                                 );
                                 let receipts = receipt_store.load(&session_id).unwrap();
                                 assert_eq!(receipts.len(), 3, "stale answer cannot decide the second Ask");
@@ -676,6 +676,7 @@ fn active_goal_message_op(
     token_budget: Option<u32>,
 ) -> Op {
     Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),
@@ -716,6 +717,7 @@ fn system_prompt_text(prompt: SystemPrompt) -> String {
 
 fn external_user_message_op(content: &str, mode: AppMode, config: &Config) -> Op {
     Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),
@@ -745,6 +747,7 @@ fn external_user_message_op(content: &str, mode: AppMode, config: &Config) -> Op
 
 fn auto_review_message_op(content: &str, config: &Config) -> Op {
     Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),

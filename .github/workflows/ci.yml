@@ -429,6 +429,11 @@ jobs:
         # `tsc` ever running in CI. `npm test` compiles first (tsc -p ./), so
         # this is the type-check gate for the extension too.
         run: npm test
+      # @vscode/vsce 4 is a build-only packager that requires Node >=22. The
+      # extension itself still compiles and tests on Node 20 above.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
       - name: Package VS Code extension
         run: npm run package
 
@@ -459,12 +464,7 @@ jobs:
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config bubblewrap apparmor-profiles
           sh scripts/prepare-linux-test-sandbox.sh
       - name: Ubuntu build headroom
         shell: bash
@@ -525,12 +525,7 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true'
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - name: Ubuntu build headroom
         if: needs.changes.outputs.heavy == 'true'
         shell: bash
@@ -749,12 +744,7 @@ jobs:
           toolchain: "1.89"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -877,6 +867,12 @@ jobs:
         run: ./scripts/installer/installer-path-regression.tests.ps1 -AllowUserPathMutation
       - uses: dtolnay/rust-toolchain@stable
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - name: Omit macOS test debug metadata
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest'
+        shell: bash
+        # Match the existing full-workspace CNB gate. Keep debug assertions and
+        # every test; only disposable test debug tables change on this lane.
+        run: echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
       - uses: mozilla-actions/sccache-action@v0.0.11
         id: sccache
         continue-on-error: true
@@ -892,12 +888,7 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config bubblewrap apparmor-profiles
           sh scripts/prepare-linux-test-sandbox.sh
       - name: Ubuntu build headroom
         # Reuse the same fixed hosted-runner provisioning as Safety and Lint.
@@ -912,6 +903,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - name: Check portable config policy boundary
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: |
+          python3 -B scripts/test_check_command_config_policy_proof.py
+          sh scripts/check-portable-config-policy.sh
       - uses: actions/setup-node@v7
         # The extension-host integration tests spawn the real bundle under
         # Node >= 22.19; CODEWHALE_EXT_HOST_TESTS below makes a missing Node a
@@ -988,6 +985,19 @@ jobs:
         run: cargo build -p codewhale-cli --bin codewhale --all-features --locked
         env:
           RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && env.RUSTC_WRAPPER || '' }}
+      - name: Windows Terminal clipboard acceptance
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
+        timeout-minutes: 5
+        shell: pwsh
+        run: node scripts/release/windows-terminal-clipboard.mjs target/debug/codewhale.exe "${{ runner.temp }}/windows-clipboard"
+      - name: Retain Windows Terminal clipboard evidence
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' && needs.changes.outputs.heavy == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-clipboard-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-clipboard/
+          if-no-files-found: error
+          retention-days: 7
       - name: Run tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one
         # process per test, all runner cores busy, slow tests named instead
@@ -1012,6 +1022,7 @@ jobs:
           if [ -n "$monitor" ]; then kill "$monitor" 2>/dev/null || true; fi
           exit "$status"
         env:
+          QA_PTY_DIAGNOSTICS_DIR: ${{ runner.temp }}/pty-failures
           CODEWHALE_EXT_HOST_TESTS: '1'
           CODEWHALE_EXT_HOST_BUN_TESTS: '1'
           # sccache 0.17 panics resolving its config directory under the
@@ -1035,6 +1046,15 @@ jobs:
           # forced 32 MiB lives in spawned binaries, which size their own
           # stacks explicitly and never read this variable.
           RUST_MIN_STACK: '16777216'
+      - name: Retain sealed terminal failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: terminal-failures-${{ runner.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pty-failures/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Shared-process workspace qualification
         if: github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && matrix.os == 'ubuntu-latest'
         shell: bash
@@ -1234,7 +1254,9 @@ jobs:
     # The explicit Ubuntu-only qualification has no warm Test macOS leg, so
     # retain these gates on the hosted fallback even when self-hosting is on.
     if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && ((github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice') || !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true'))
-    timeout-minutes: 75
+    # Cold hosted builds consumed 73 minutes before eval could start (F run
+    # 37497498829). Match Test's compile allowance; RSS/eval limits stay intact.
+    timeout-minutes: 165
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -1263,9 +1285,9 @@ jobs:
     # leg was a ~28-minute hosted-Mac build on every main push while hosted
     # macOS is capped at 5 concurrent jobs; it stays in the manual
     # workflow_dispatch (full CI) matrix and in the release pipeline.
-    # A cold Windows build can take 29 minutes before the smoke even starts.
-    # Leave room for installation; bound the smoke itself independently below.
-    timeout-minutes: 45
+    # A cold Windows compile can take 42 minutes; leave room for cache save
+    # after the separately bounded five-minute install/entrypoint smoke test.
+    timeout-minutes: 60
     runs-on: ${{ needs.changes.outputs.heavy == 'true' && matrix.os || 'ubuntu-latest' }}
     strategy:
       matrix:
@@ -1297,12 +1319,7 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
@@ -1360,12 +1377,7 @@ jobs:
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -1413,12 +1425,7 @@ jobs:
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false

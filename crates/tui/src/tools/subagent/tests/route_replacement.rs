@@ -1,7 +1,7 @@
 //! Operator-approved route replacement at the first-request seam.
 //!
 //! The observed failure: a saved reviewer pin answered its first request with
-//! `Authorization failed: You have run out of credits or need a Grok
+//! `Provider plan quota exhausted: You have run out of credits or need a Grok
 //! subscription.` and no review was produced.
 use super::*;
 
@@ -194,7 +194,7 @@ replacements = ["BackupRoute/fixture-backup-model"]
     let note = route.fallback_note.expect("replacement note");
     for fact in [
         "fixture-pin-model",
-        "provider refused authorization",
+        "quota exhausted",
         "run out of credits",
         "BackupRoute/fixture-backup-model",
         "attempt 1 of 1",
@@ -220,8 +220,8 @@ model = "PinRoute/fixture-pin-model"
         panic!("an exact refused pin fails: {:?}", result.status);
     };
     for fact in [
-        "Authorization failed",
-        "[redacted]",
+        "quota exhausted",
+        "run out of credits",
         "requested model `fixture-pin-model`",
         "config.toml role pin for \"reviewer\" routes PinRoute/fixture-pin-model",
     ] {
@@ -234,8 +234,17 @@ model = "PinRoute/fixture-pin-model"
 #[test]
 fn replacement_reasons_are_typed_never_message_matched() {
     let refusal = |status| anyhow::Error::new(LlmError::from_http_response(status, REFUSAL));
+    // A 403 whose body is quota evidence is a typed quota refusal.
     assert_eq!(
         route_replacement_reason(&refusal(403)),
+        Some("quota exhausted")
+    );
+    // A 403 without quota evidence is still an authorization refusal.
+    assert_eq!(
+        route_replacement_reason(&anyhow::Error::new(LlmError::from_http_response(
+            403,
+            "Forbidden"
+        ))),
         Some("provider refused authorization")
     );
     assert_eq!(

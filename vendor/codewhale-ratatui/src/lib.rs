@@ -36,10 +36,15 @@ pub mod theme;
 #[path = "../vendor/codewhale-design/tokens.rs"]
 pub mod tokens;
 
+#[path = "../assets/avatar-pack/contract.rs"]
+pub mod avatar;
+pub mod avatar_sprite;
 mod components;
 pub mod gallery;
 pub mod testing;
 pub mod whale;
+#[path = "../assets/whale-girl/player.rs"]
+pub mod whale_girl;
 pub mod whale_motion;
 
 // Every component module is re-exported whole (see `components/mod.rs`), so

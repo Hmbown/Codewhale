@@ -14,6 +14,13 @@ function plugin(t, body) {
   return entry
 }
 
+test('fake core drops late replies after host shutdown closes stdin', async () => {
+  const host = await startHost()
+  const stopping = host.stop()
+  assert.equal(host.send({ jsonrpc: '2.0', method: '$/cancel', params: { id: 1 } }), false)
+  await stopping
+})
+
 test('prompt sections detach text, allow owner-local ids and dispose exact registrations', async (t) => {
   const host = await startHost()
   t.after(() => host.stop())

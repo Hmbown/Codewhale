@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` has twenty-two independently optional facet slots, all
+//! `CommandContexts` has twenty-five independently optional facet slots, all
 //! constructed here. The diagnostics adapter joins the host bundle in FEAT-029. Important behavior (mode transitions, model
 //! invalidation, cost accounting, skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -31,9 +31,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub(in crate::commands) mod config_policy;
+#[cfg(test)]
+mod config_policy_baseline;
+use config_policy::{ConfigStatusAdapter, PermissionsAdapter};
 mod debug_diagnostics;
 pub(in crate::commands) mod debug_operations;
 use debug_operations::DebugOperationsAdapter;
+mod config_policy_messages;
 mod diagnostics_messages;
 #[cfg(test)]
 pub(crate) use debug_diagnostics::CostComponents as DebugCostComponents;
@@ -1070,6 +1075,7 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         };
         RelayProjection {
             compact_template: crate::prompts::COMPACT_TEMPLATE.to_string(),
+            handoff_path: crate::prompts::HANDOFF_RELATIVE_PATH.to_string(),
             workspace: app.workspace.display().to_string(),
             mode: app.mode.label().to_string(),
             model: app.model_display_label(),
@@ -2102,6 +2108,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| key_to_plugin_message_id(key))
             .or_else(|| key_to_session_message_id(key))
             .or_else(|| diagnostics_messages::resolve(key))
+            .or_else(|| config_policy_messages::resolve(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -3964,6 +3971,11 @@ impl CommandPluginContext for PluginAdapter<'_> {
         }
         let mut app = self.host.app.borrow_mut();
         std::sync::Arc::make_mut(&mut app.plugin_registry).enable(selector)?;
+        // Rediscover, as install and reload do: an in-place enable keeps the
+        // pinned Native selection, so a host plugin enabled after a preset
+        // catalog was already active would never be activated.
+        let workspace = app.workspace.clone();
+        app.plugin_registry = app.plugin_registry.rediscover_for_workspace(&workspace);
         app.refresh_skill_cache();
         Ok(())
     }
@@ -4189,37 +4201,58 @@ impl CommandPluginContext for PluginAdapter<'_> {
         &self,
         package: &Path,
     ) -> Result<codewhale_command_contract::facets::PluginDshPreview, String> {
-        let canonical = package
-            .canonicalize()
-            .map_err(|_| format!("DSH package not found at {}", package.display()))?;
-        let (conversion, content_hash) = crate::plugins::install::preview_dsh(&canonical)
-            .map_err(|error| format!("{error:#}"))?;
-        Ok(codewhale_command_contract::facets::PluginDshPreview {
-            package_path: canonical,
-            plugin_name: conversion.plugin_name,
-            source_package: conversion.source_package,
-            source_version: conversion.source_version,
-            content_hash,
-            skills: conversion.skills,
-            remote_servers: conversion.remote_servers,
-            local_servers: conversion.local_servers,
-            network_hosts: conversion.network_hosts,
-            requires_node: conversion.requires_node,
-            manual_ports: conversion
-                .outcomes
-                .iter()
-                .filter(|outcome| outcome.needs_manual_port())
-                .map(|outcome| {
-                    format!(
-                        "{} ({}) {}: {}",
-                        outcome.row.as_deref().unwrap_or("unlabeled"),
-                        outcome.package.as_deref().unwrap_or("unlabeled"),
-                        outcome.kind,
-                        outcome.reason
-                    )
-                })
-                .collect(),
-            diagnostics: conversion.diagnostics,
+        let package = package.to_path_buf();
+        let preview = move || {
+            let canonical = package
+                .canonicalize()
+                .map_err(|_| format!("DSH package not found at {}", package.display()))?;
+            let (conversion, content_hash) = crate::plugins::install::preview_dsh(&canonical)
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(codewhale_command_contract::facets::PluginDshPreview {
+                package_path: canonical,
+                plugin_name: conversion.plugin_name,
+                source_package: conversion.source_package,
+                source_version: conversion.source_version,
+                content_hash,
+                skills: conversion.skills,
+                remote_servers: conversion.remote_servers,
+                local_servers: conversion.local_servers,
+                network_hosts: conversion.network_hosts,
+                native_rows: conversion.native_rows,
+                requires_node: conversion.requires_node,
+                manual_ports: conversion
+                    .outcomes
+                    .iter()
+                    .filter(|outcome| outcome.needs_manual_port())
+                    .map(|outcome| {
+                        format!(
+                            "{} ({}) {}: {}",
+                            outcome.row.as_deref().unwrap_or("unlabeled"),
+                            outcome.package.as_deref().unwrap_or("unlabeled"),
+                            outcome.kind,
+                            outcome.reason
+                        )
+                    })
+                    .collect(),
+                diagnostics: conversion.diagnostics,
+            })
+        };
+        // Native composition review owns a bounded async process runner. Like
+        // the Runtime API and installer, keep the complete filesystem/reviewer
+        // operation off the TUI worker before entering that runner.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return preview();
+        }
+        #[cfg(test)]
+        let ticket = crate::test_support::env_scope_ticket();
+        run_async(async move {
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                preview()
+            })
+            .await
+            .map_err(|error| format!("DSH preview task failed: {error}"))?
         })
     }
 
@@ -4470,7 +4503,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns twenty-three facet objects sharing one synchronous TUI host proxy.
+/// Owns twenty-five facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -4499,6 +4532,8 @@ pub(crate) struct CommandContextBundle<'a> {
     debug_diff: DebugOperationsAdapter<'a>,
     debug_undo: DebugOperationsAdapter<'a>,
     debug_diagnostics: DebugDiagnosticsAdapter<'a>,
+    permissions: PermissionsAdapter<'a>,
+    config_status: ConfigStatusAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4574,6 +4609,12 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::DEBUG_DIAGNOSTICS) {
             contexts = contexts.with_debug_diagnostics(&mut self.debug_diagnostics);
         }
+        if capabilities.contains(CommandCapabilities::PERMISSIONS) {
+            contexts = contexts.with_permissions(&mut self.permissions);
+        }
+        if capabilities.contains(CommandCapabilities::CONFIG_STATUS) {
+            contexts = contexts.with_config_status(&mut self.config_status);
+        }
         contexts
     }
 
@@ -4602,7 +4643,9 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::DEBUG_HISTORY)
             .union(CommandCapabilities::DEBUG_DIFF)
             .union(CommandCapabilities::DEBUG_UNDO)
-            .union(CommandCapabilities::DEBUG_DIAGNOSTICS);
+            .union(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .union(CommandCapabilities::PERMISSIONS)
+            .union(CommandCapabilities::CONFIG_STATUS);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4646,7 +4689,9 @@ impl App {
             debug_history: DebugOperationsAdapter { host: host.clone() },
             debug_diff: DebugOperationsAdapter { host: host.clone() },
             debug_undo: DebugOperationsAdapter { host: host.clone() },
-            debug_diagnostics: DebugDiagnosticsAdapter { host },
+            debug_diagnostics: DebugDiagnosticsAdapter { host: host.clone() },
+            permissions: PermissionsAdapter { host: host.clone() },
+            config_status: ConfigStatusAdapter { host },
         }
     }
 }
@@ -6481,6 +6526,37 @@ mod tests {
         assert!(plugin.validation_is_clean());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_adapter_dsh_preview_runs_from_live_runtime() {
+        let _home = crate::test_support::SealedHome::new();
+        if crate::extension_host::tests::node_for_tests(
+            "plugin_adapter_dsh_preview_runs_from_live_runtime",
+        )
+        .is_none()
+        {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut app = plugin_test_app(&tmp);
+        let before = app.plugin_registry.len();
+        let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/extension_host/raw-agent-presets/source");
+        let mut bundle = app.command_contexts();
+        let mut parts = bundle.contexts(CommandCapabilities::PLUGIN).into_parts();
+        let plugin = parts.plugin.as_deref_mut().unwrap();
+        let review = plugin
+            .dsh_preview(&package)
+            .expect("live TUI Native review");
+        assert_eq!(review.plugin_name, "raw-agent-presets");
+        assert_eq!(
+            review.source_package.as_deref(),
+            Some("@demo/raw-agent-presets")
+        );
+        assert_eq!(review.content_hash.len(), 64);
+        assert!(review.manual_ports.is_empty(), "{:?}", review.manual_ports);
+        assert_eq!(plugin.len(), before, "preview must not install a bundle");
+    }
+
     #[test]
     fn plugin_adapter_registry_mutations_and_suggest_are_behavior_faithful() {
         let tmp = TempDir::new().unwrap();
@@ -7006,6 +7082,10 @@ mod tests {
             assert_eq!(
                 projection.compact_template.trim(),
                 crate::prompts::COMPACT_TEMPLATE.trim()
+            );
+            assert_eq!(
+                projection.handoff_path,
+                crate::prompts::HANDOFF_RELATIVE_PATH
             );
             assert!(matches!(projection.todos, TodoProjection::Absent));
             assert!(matches!(projection.plan, PlanProjection::Absent));

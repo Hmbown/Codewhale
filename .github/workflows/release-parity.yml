@@ -21,7 +21,9 @@ env:
 jobs:
   parity:
     name: Workspace parity
-    timeout-minutes: 45
+    # Cold check, Clippy, executable and test builds exceeded the old 45m
+    # limit before the suite started. Retain the full CI test-job budget.
+    timeout-minutes: 165
     runs-on: ubuntu-latest
     steps:
       # Every caller's resolve job already proved GITHUB_SHA equals the
@@ -53,7 +55,8 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 15s"
             sleep 15
           done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          sh scripts/prepare-linux-test-sandbox.sh
       # Restore after the trusted lockfile is on disk. Key is OS + arch +
       # explicit stable toolchain + rust-cache's Cargo.lock / rust-toolchain
       # hash. Never interpolate github.event, github.ref, github.sha, or inputs.

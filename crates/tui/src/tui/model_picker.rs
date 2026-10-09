@@ -2599,17 +2599,10 @@ fn provider_catalog_receipt_for_route(
     .ok()?;
     (admitted.provider == provider).then_some(())?;
     let identity = admitted.key.as_str();
-    // A custom route owns its catalog only on Baseten's endpoint, whose
-    // account-scoped roster no snapshot can serve (#6289).
-    let owns_provider_catalog = matches!(
-        provider,
-        ProviderKind::Openrouter
-            | ProviderKind::Telecomjs
-            | ProviderKind::Edenai
-            | ProviderKind::Zenmux
-    ) || (provider == ProviderKind::Custom
-        && codewhale_config::catalog::endpoint_is_baseten(&config.base_url_for_route(&admitted)));
-    if !owns_provider_catalog {
+    // One predicate with the active-provider refresh: any route whose roster
+    // is probed (named live gateways and custom hosts) reports its freshness
+    // here, so a widened probe cannot leave this receipt behind.
+    if !crate::provider_catalog_live::provider_owns_live_catalog(provider) {
         return None;
     }
 

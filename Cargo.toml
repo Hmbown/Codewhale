@@ -6,6 +6,7 @@ members = [
     "crates/cli",
     "crates/cloud-facts",
     "crates/command-contract",
+    "crates/commands",
     "crates/config",
     "crates/core",
     "crates/execpolicy",
@@ -28,15 +29,15 @@ members = [
     "crates/tui",
     "crates/workflow",
     "crates/workflow-js",
-    "tests/portable-debug-diagnostics",
     "tests/portable-session",
+    "tests/portable-config-policy",
 ]
 exclude = ["vendor/codewhale-ratatui"]
 default-members = ["crates/cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.1"
+version = "0.10.2"
 edition = "2024"
 # The floor is what CI's MSRV job builds (1.89): Rust 1.88 stabilized the
 # `let_chains` the codebase relies on, but a locked dependency
@@ -135,3 +136,9 @@ codegen-units = 1
 # them as 2 columns, causing cell-offset rendering glitches. (#4479)
 [patch.crates-io]
 unicode-width = { path = "patches/unicode-width-0.2.2" }
+# Windows Terminal paste dropped every non-BMP character (emoji): upstream pairs a
+# surrogate half with its own key-up record. See patches/crossterm-0.29.0 parse.rs.
+# Same change as crossterm-rs/crossterm#1073 (open); drop this once a release carries it.
+# Also drops one redundant pair of parentheses and allows upstream warnings, because a
+# path crate is built under our `-D warnings`.
+crossterm = { path = "patches/crossterm-0.29.0" }

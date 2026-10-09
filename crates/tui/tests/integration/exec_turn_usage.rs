@@ -610,6 +610,135 @@ async fn plain_exec_bounds_output_limit_continuations() {
     }
 }
 
+/// SSE for a response that reports `finish_reason: stop` while its usage says
+/// the whole requested output allowance was used (#6889). `completion_tokens`
+/// echoes the ceiling the request carried, whichever key it used.
+fn stop_at_ceiling_response(content: Option<&'static str>) -> impl wiremock::Respond {
+    move |request: &wiremock::Request| {
+        let body: Value = serde_json::from_slice(&request.body).expect("request body JSON");
+        let ceiling = body
+            .get("max_tokens")
+            .or_else(|| body.get("max_completion_tokens"))
+            .and_then(Value::as_u64)
+            .expect("the request names an output ceiling");
+        let delta = content.map_or_else(|| json!({}), |text| json!({ "content": text }));
+        sse_response(
+            [
+                sse_chunk(json!({
+                    "id": "chatcmpl-ceiling",
+                    "object": "chat.completion.chunk",
+                    "model": TEST_MODEL,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+                })),
+                sse_chunk(json!({
+                    "id": "chatcmpl-ceiling",
+                    "object": "chat.completion.chunk",
+                    "model": TEST_MODEL,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": ceiling,
+                        "total_tokens": ceiling + 20
+                    }
+                })),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .join(""),
+        )
+    }
+}
+
+/// #6889: a provider can cut a response at the requested ceiling and still
+/// report `finish_reason: stop`. Its own usage gives it away: the completion
+/// tokens equal the ceiling. That response follows the same policy as a
+/// `length` stop, so the partial answer is kept and the model is asked to
+/// continue instead of the cut-off answer passing for a finished one.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_continues_past_a_stop_that_used_the_whole_output_allowance() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(json_response(json!({
+            "object": "list",
+            "data": [{ "id": TEST_MODEL, "object": "model" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(stop_at_ceiling_response(Some("first half")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse_response(answer_sse_without_usage(" second half")))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let json_stdout = run_exec(
+        &server,
+        &["--json", "--model", TEST_MODEL, "answer briefly"],
+    );
+    let receipt: Value = serde_json::from_str(&json_stdout)
+        .unwrap_or_else(|err| panic!("--json receipt should parse: {err}\n{json_stdout}"));
+    assert_eq!(receipt["success"], true, "{receipt}");
+    let output = receipt["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("first half") && output.contains("second half"),
+        "{receipt}"
+    );
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(bodies.len(), 2, "one continuation request: {bodies:#?}");
+    assert!(
+        bodies[1]["messages"]
+            .to_string()
+            .contains("stopped generation at its output limit"),
+        "the continuation names the truncation: {}",
+        bodies[1]["messages"]
+    );
+}
+
+/// #6889: when the allowance was spent before any answer was written, the
+/// response is empty and still says `stop`. Asking again reproduces it, so
+/// the run fails after that one request instead of re-requesting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_does_not_re_request_an_empty_stop_at_the_output_ceiling() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(json_response(json!({
+            "object": "list",
+            "data": [{ "id": TEST_MODEL, "object": "model" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(stop_at_ceiling_response(None))
+        .mount(&server)
+        .await;
+
+    let (success, stdout, stderr) = run_exec_unchecked(
+        &server,
+        &["--json", "--model", TEST_MODEL, "answer briefly"],
+    );
+    assert!(
+        !success,
+        "an answerless response must not exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "a stop at the ceiling is not re-requested: {bodies:#?}"
+    );
+}
+
 /// A stdio MCP server that reads `initialize`, closes its stdin, answers, and
 /// stays alive: the client's next write (`notifications/initialized`) always
 /// hits a pipe with no reader. That is the shape of the real failure, where a

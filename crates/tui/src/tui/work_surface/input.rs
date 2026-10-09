@@ -101,6 +101,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
         }
         return None;
     }
+    if app.focus() == crate::tui::shell_key_routing::Focus::TerminalPanel {
+        return super::terminal::handle_key(app, key).then_some(None);
+    }
     if app.work_surface.focused {
         let tabs = app
             .work_surface
@@ -151,7 +154,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
     // opened empty view still owns Esc (close) so cycling into "no files
     // touched" is never a trap.
     let rows = visible_rows_for_panel(app);
-    if rows.is_empty() && !(app.work_surface.focused && app.work_surface.explicit_view) {
+    if rows.is_empty()
+        && !(app.work_surface.explicit_view
+            && (app.work_surface.focused || app.work_surface.panel == RailPanel::Terminal))
+    {
         return None;
     }
     if !app.work_surface.focused {
@@ -437,6 +443,13 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
         {
             app.needs_redraw = true;
         }
+    }
+
+    if super::terminal::handle_mouse(app, mouse) {
+        return MouseOutcome {
+            consumed: true,
+            action: None,
+        };
     }
 
     match mouse.kind {

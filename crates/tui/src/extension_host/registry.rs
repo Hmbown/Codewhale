@@ -252,6 +252,7 @@ pub struct OwnerRegistry {
     shell_hooks: BTreeMap<u64, ShellHookRegistration>,
     prompt_sections: BTreeMap<u64, PromptSectionRegistration>,
     skill_roots: BTreeMap<u64, super::skills::SkillRootRegistration>,
+    avatar_packs: BTreeMap<u64, super::avatars::AvatarRegistration>,
     mcp_servers: BTreeMap<u64, super::native_mcp::McpRegistration>,
     /// Lower-cased names of every native tool any engine's turn build has
     /// reported, plus the static set. Only ever grows: engines in one
@@ -571,6 +572,12 @@ impl OwnerRegistry {
                     .map(|r| r.handle),
             )
             .chain(
+                self.avatar_packs
+                    .values()
+                    .filter(|r| r.owner == *owner && r.scope.as_ref() == Some(scope))
+                    .map(|r| r.handle),
+            )
+            .chain(
                 self.mcp_servers
                     .values()
                     .filter(|r| r.owner == *owner && r.scope == *scope)
@@ -596,6 +603,9 @@ impl OwnerRegistry {
             }
             RegisterKind::McpServer => {
                 Err("MCP definitions require reviewed snapshot admission".into())
+            }
+            RegisterKind::AvatarPack => {
+                Err("avatar packs require reviewed snapshot admission".into())
             }
             RegisterKind::SkillRoot => {
                 Err("skill roots require reviewed snapshot admission".to_string())
@@ -677,6 +687,79 @@ impl OwnerRegistry {
                 && owner.state == OwnerState::Active
                 && self.check_scope(&r.owner, Some(&r.scope), true).is_ok()
         })
+    }
+
+    pub(crate) fn register_avatar(
+        &mut self,
+        params: &RegisterParams,
+        pack: codewhale_ratatui::avatar::Pack,
+        png: Vec<Vec<u8>>,
+        host_generation: u64,
+    ) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
+        params.check_spec()?;
+        if params.kind != RegisterKind::AvatarPack || !params.spec.description.is_empty() {
+            return Err("invalid avatar pack registration".into());
+        }
+        pack.validate()?;
+        if png.len() != pack.atlases.len() {
+            return Err("avatar pages do not match manifest".into());
+        }
+        for page in &png {
+            pack.validate_png(page)?;
+        }
+        let entry = self.current(&params.owner).ok_or("stale avatar owner")?;
+        if entry.tier != HostTier::Plugin || entry.authority.is_none() {
+            return Err("avatar pack owner has no reviewed bundle".into());
+        }
+        let content_hash = entry.content_hash.clone();
+        let owned: Vec<_> = self
+            .avatar_packs
+            .values()
+            .filter(|r| r.owner == params.owner)
+            .collect();
+        if owned.len() >= 4
+            || self.avatar_packs.len() >= 16
+            || self
+                .avatar_packs
+                .values()
+                .map(|r| r.png.iter().map(Vec::len).sum::<usize>())
+                .sum::<usize>()
+                + png.iter().map(Vec::len).sum::<usize>()
+                > 32 * 1024 * 1024
+            || owned
+                .iter()
+                .any(|r| r.pack.id == pack.id && r.scope == params.scope)
+        {
+            return Err("avatar pack duplicate or registration budget exceeded".into());
+        }
+        self.next_handle += 1;
+        let handle = self.next_handle;
+        self.avatar_packs.insert(
+            handle,
+            super::avatars::AvatarRegistration {
+                handle,
+                owner: params.owner.clone(),
+                scope: params.scope.clone(),
+                host_generation,
+                content_hash,
+                pack,
+                png: Arc::new(png),
+            },
+        );
+        Ok(handle)
+    }
+
+    pub(crate) fn live_avatars(&self) -> Vec<super::avatars::AvatarRegistration> {
+        self.avatar_packs
+            .values()
+            .filter(|r| {
+                self.current(&r.owner)
+                    .is_some_and(|entry| entry.state == OwnerState::Active)
+                    && self.check_scope(&r.owner, r.scope.as_ref(), true).is_ok()
+            })
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn register_skill_root(
@@ -1308,6 +1391,14 @@ impl OwnerRegistry {
             return;
         }
         if self
+            .avatar_packs
+            .get(&handle)
+            .is_some_and(|r| r.owner == *owner)
+        {
+            self.avatar_packs.remove(&handle);
+            return;
+        }
+        if self
             .skill_roots
             .get(&handle)
             .is_some_and(|root| root.owner == *owner)
@@ -1425,6 +1516,8 @@ impl OwnerRegistry {
             .retain(|_, h| h.owner.plugin_id != plugin_id);
         self.skill_roots
             .retain(|_, root| root.owner.plugin_id != plugin_id);
+        self.avatar_packs
+            .retain(|_, r| r.owner.plugin_id != plugin_id);
         self.prompt_sections
             .retain(|_, section| section.owner.plugin_id != plugin_id);
         self.hooks
@@ -1491,6 +1584,7 @@ impl OwnerRegistry {
 
         if tier == HostTier::Plugin {
             self.skill_roots.clear();
+            self.avatar_packs.clear();
         }
         self.prompt_sections
             .retain(|_, section| section.tier != tier);

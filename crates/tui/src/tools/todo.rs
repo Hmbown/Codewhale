@@ -259,7 +259,7 @@ impl ToolSpec for TodoWriteTool {
     }
 
     fn description(&self) -> &'static str {
-        "Replace the To-do list shown to the user. Optional: use it when a visible plan helps; at most one item may be in_progress at a time."
+        "Replace the To-do list the user watches. For any task with three or more steps or more than one file, write the list before you start, keep exactly one item in_progress, and mark items done as you finish them. Skip it only for a single quick answer or edit."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -425,23 +425,6 @@ mod tests {
                 .contains(&crate::tools::spec::ToolCapability::WritesFiles),
             "legacy capability grouping remains intact"
         );
-    }
-
-    #[test]
-    fn todo_write_description_states_the_tool_without_upkeep_coaching() {
-        // The list is optional support for the user's view, not an obligation.
-        // Behavior coaching ("keep it live", "never batch") pressured models
-        // into list management instead of the actual task.
-        let tool = super::TodoWriteTool::new(super::new_shared_todo_list());
-        let description = crate::tools::spec::ToolSpec::description(&tool);
-        assert!(description.contains("Optional"), "{description}");
-        assert!(
-            description.contains("at most one item may be in_progress"),
-            "{description}"
-        );
-        for coaching in ["keep it live", "never batch", "the moment an item finishes"] {
-            assert!(!description.contains(coaching), "{description}");
-        }
     }
 
     use super::*;

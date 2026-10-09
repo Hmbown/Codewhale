@@ -48,7 +48,17 @@ pub struct DebugConversationUndo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebugDiffObservation {
     GitUnavailable,
-    Output { names: String, stat: String },
+    /// Nothing to compare against: the session has saved no restore point
+    /// for this workspace and the workspace is not a git repository.
+    NoBaseline,
+    Output {
+        names: String,
+        stat: String,
+        /// The unified patch behind `names` and `stat`, bounded by the host.
+        patch: String,
+        /// The host cut `patch` at its bound; `names` and `stat` are whole.
+        patch_truncated: bool,
+    },
     Failed(String),
 }
 
@@ -71,8 +81,15 @@ pub struct DebugRestoredFile {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DebugUndoRestored {
-    pub label: String,
-    pub snapshot_id: String,
+    /// First line of the undone request's prompt, when its restore point
+    /// recorded one.
+    pub request: Option<String>,
+    /// Whether the request and its reply were also removed from the
+    /// conversation. `false` when the conversation no longer held it.
+    pub conversation_removed: bool,
+    /// The request had no recorded end and `/undo force` ran it, so edits
+    /// made to these files since it started went back too.
+    pub forced: bool,
     pub files: Vec<DebugRestoredFile>,
     pub skipped: Vec<PathBuf>,
     pub sync: SessionSyncPayload,
@@ -80,16 +97,23 @@ pub struct DebugUndoRestored {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DebugUndoOutcome {
-    RepoUnavailable { workspace: PathBuf, error: String },
+    RepoUnavailable {
+        workspace: PathBuf,
+        error: String,
+    },
     SnapshotPending,
     NoSnapshots,
     NoSession,
     NoOwnedSteps,
     NoDifference,
-    Untrusted,
+    /// The last request has no recorded end, so undoing it would also put
+    /// back edits made since. Nothing was written; `force` runs it.
+    OpenEnded,
     CompareFailed(String),
     SnapshotFailed(String),
-    ChangedSince { label: String, paths: Vec<String> },
+    ChangedSince {
+        paths: Vec<String>,
+    },
     ListFailed(String),
     RestoreBlocked(String),
     RestoreFailed(String),
@@ -97,8 +121,12 @@ pub enum DebugUndoOutcome {
 }
 
 pub trait CommandDebugUndoContext {
-    /// Preserves snapshot ownership, trust, regular-file checks, backup,
-    /// preflight, pruning and transcript receipt. Never falls back to chat
-    /// truncation: the portable handler decides that from the typed outcome.
-    fn undo_files(&mut self) -> DebugUndoOutcome;
+    /// Undoes the last request's file changes, and removes that request from
+    /// the conversation when it is still its last one. Preserves snapshot
+    /// ownership, regular-file checks, backup and preflight, and asks for no
+    /// trust: it only puts back, inside the workspace, what that request
+    /// changed. `force` accepts a request with no recorded end. Never falls
+    /// back to chat truncation: the portable handler decides that from the
+    /// typed outcome.
+    fn undo_files(&mut self, force: bool) -> DebugUndoOutcome;
 }

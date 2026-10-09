@@ -483,6 +483,19 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
         return app.view_stack.handle_mouse(mouse);
     }
 
+    if crate::tui::pet_watch::main_view(app) {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse_hits_rect(mouse, app.pet_watch.inspect_area)
+        {
+            crate::tui::pet_watch::open_habitat(app);
+            return Vec::new();
+        }
+        if mouse_hits_rect(mouse, app.pet_watch.area) {
+            crate::tui::pet_watch::command(app, crate::tui::pet_watch::Control::Mouse(mouse));
+            return Vec::new();
+        }
+    }
+
     // A drag can finish outside the composer/transcript that started it.
     // Publish once before other visible surfaces consume the release event.
     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))

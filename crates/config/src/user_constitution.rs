@@ -109,6 +109,162 @@ pub const MAX_ITEM_LEN: usize = 280;
 /// (generous for BCP-47; blocks prose smuggled into a metadata field).
 pub const MAX_LANGUAGE_LEN: usize = 35;
 
+/// Account-profile controls. This is data, not another prompt authority: the
+/// conversion below reuses the accepted-clause renderer. Model suggestions
+/// must stay drafts until the existing account or local edit action accepts them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileConstitution {
+    pub schema_version: u32,
+    pub detail: ResponseDetail,
+    pub initiative: InitiativePreference,
+    pub collaboration: CollaborationPreference,
+    pub notes: String,
+}
+
+/// Immutable account preference admitted with one turn. The transport supplies
+/// data and provenance; only the Engine renders its model-facing instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileConstitutionSnapshot {
+    pub account_id: String,
+    pub revision: u64,
+    pub constitution: ProfileConstitution,
+}
+
+impl ProfileConstitutionSnapshot {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.account_id.is_empty()
+                && self.account_id.len() <= 240
+                && self
+                    .account_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')),
+            "Invalid constitution account identity"
+        );
+        anyhow::ensure!(
+            self.revision <= 9_007_199_254_740_991,
+            "Invalid constitution revision"
+        );
+        self.constitution.validate()
+    }
+
+    pub fn render(&self) -> Result<String> {
+        self.validate()?;
+        Ok(format!(
+            "Account profile constitution, settings revision {}.\n{}",
+            self.revision,
+            self.constitution.as_user_constitution()?.render_body()
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseDetail {
+    Brief,
+    Balanced,
+    Detailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitiativePreference {
+    Check,
+    Judgment,
+    Moving,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationPreference {
+    Direct,
+    Critical,
+    Coach,
+}
+
+impl Default for ProfileConstitution {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            detail: ResponseDetail::Balanced,
+            initiative: InitiativePreference::Judgment,
+            collaboration: CollaborationPreference::Direct,
+            notes: String::new(),
+        }
+    }
+}
+
+impl ProfileConstitution {
+    /// Never use the legacy bounding operation to silently truncate a saved
+    /// profile. The exact accepted document must survive a round trip.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 1,
+            "Unsupported profile constitution version"
+        );
+        anyhow::ensure!(
+            self.notes.chars().count() <= MAX_NOTES_LEN,
+            "Constitution notes cannot exceed {MAX_NOTES_LEN} characters"
+        );
+        anyhow::ensure!(
+            !self
+                .notes
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')),
+            "Constitution notes contain unsupported control characters"
+        );
+        Ok(())
+    }
+
+    pub fn as_user_constitution(&self) -> Result<UserConstitution> {
+        self.validate()?;
+        let detail = match self.detail {
+            ResponseDetail::Brief => {
+                "Lead with the result. Keep routine explanations brief; include important evidence and failed checks."
+            }
+            ResponseDetail::Balanced => {
+                "Lead with the result. Give enough explanation to assess the work without narrating every step."
+            }
+            ResponseDetail::Detailed => {
+                "Explain significant decisions and tradeoffs with concrete examples. Keep failures and uncertainty visible."
+            }
+        };
+        let initiative = match self.initiative {
+            InitiativePreference::Check => {
+                "Check with the user about nontrivial approach decisions before implementation. Continue independently useful authorized work."
+            }
+            InitiativePreference::Judgment => {
+                "Act on clear, reversible work within the request. Ask when ambiguity would materially change the outcome."
+            }
+            InitiativePreference::Moving => {
+                "Keep clear, reversible work moving within the user's request. Batch routine decisions and surface consequential choices."
+            }
+        };
+        let collaboration = match self.collaboration {
+            CollaborationPreference::Direct => {
+                "Offer a clear recommendation and the evidence behind it."
+            }
+            CollaborationPreference::Critical => {
+                "Test material assumptions and distinguish supporting evidence from uncertainty. Avoid contrarianism for its own sake."
+            }
+            CollaborationPreference::Coach => {
+                "Explain a useful decision in plain language. Offer a learning opportunity without withholding completion when the user asks for it."
+            }
+        };
+        Ok(UserConstitution {
+            clauses: vec![
+                ConstitutionClause::accepted("profile.detail", detail),
+                ConstitutionClause::accepted("profile.initiative", initiative),
+                ConstitutionClause::accepted("profile.collaboration", collaboration),
+            ],
+            notes: (!self.notes.is_empty()).then(|| self.notes.clone()),
+            ..UserConstitution::default()
+        })
+    }
+}
+
 /// Model-facing autonomy preference. **Guidance only** — it may recommend a
 /// runtime posture but never applies one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

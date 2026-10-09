@@ -175,6 +175,7 @@ impl InteractionTargetId {
     pub const DOCK_TAB_AGENTS: Self = Self("dock.tab.agents");
     pub const DOCK_TAB_TASKS: Self = Self("dock.tab.tasks");
     pub const DOCK_TAB_BACKGROUND: Self = Self("dock.tab.background");
+    pub const DOCK_TAB_TERMINAL: Self = Self("dock.tab.terminal");
     pub const DOCK_TAB_FILES: Self = Self("dock.tab.files");
     pub const DOCK_TAB_NOTEPAD: Self = Self("dock.tab.notepad");
     pub const DOCK_TAB_CONTEXT: Self = Self("dock.tab.context");

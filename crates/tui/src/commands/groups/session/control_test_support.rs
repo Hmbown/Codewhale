@@ -150,6 +150,7 @@ impl CommandSessionControlContext for FakeControl {
 pub(crate) fn relay_projection_fixture() -> RelayProjection {
     RelayProjection {
         compact_template: "# Session relay".to_string(),
+        handoff_path: ".codewhale/handoff.md".to_string(),
         workspace: "/work".to_string(),
         mode: "operate".to_string(),
         model: "model-x".to_string(),

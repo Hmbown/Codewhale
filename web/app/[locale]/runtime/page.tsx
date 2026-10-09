@@ -1,8 +1,9 @@
+import Link from "next/link";
 import { Icon, type IconName } from "@/components/icon";
 import { PageHeader, Section } from "@/components/page-header";
 import { Status } from "@/components/status-badge";
 import { getFacts } from "@/lib/facts";
-import { getRuntime, pickText } from "@/lib/i18n/dictionaries";
+import { getChrome, getRuntime, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
 
 const REPO_BLOB_BASE = "https://github.com/codewhale-hq/CodeWhale/blob/main";
@@ -85,8 +86,8 @@ const INTEGRATIONS: Integration[] = [
     name: "Feishu / Lark Bridge",
     icon: "message",
     desc: {
-      en: "First-party Feishu / Lark bot bridge. Chat-native agent loop inside your Feishu workspace with approval cards, session linking, and audit trail.",
-      zh: "官方飞书 / Lark 机器人桥接。在飞书工作区内实现聊天原生 Agent 循环，支持审批卡片、会话关联和审计日志。",
+      en: "First-party Feishu / Lark bot bridge. Chat-native agent loop inside your Feishu workspace with approval messages, session linking, and audit trail.",
+      zh: "官方飞书 / Lark 机器人桥接。在飞书工作区内实现聊天原生 Agent 循环，支持审批消息、会话关联和审计日志。",
     },
     href: "https://github.com/codewhale-hq/CodeWhale/tree/main/integrations/feishu-bridge",
   },
@@ -135,6 +136,7 @@ const TRUST = [
 
 export default async function RuntimePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
+  const chrome = getChrome(locale);
   const t = getRuntime(locale);
   const facts = await getFacts();
 
@@ -148,6 +150,16 @@ export default async function RuntimePage({ params }: { params: Promise<{ locale
         titleAsideLang={t.titleAsideLang}
         lede={t.lede}
         pose="run"
+        actions={
+          <>
+            <Link href={`/${locale}/plugins`} className="btn btn-primary btn-lg">
+              {chrome.navPlugins}
+            </Link>
+            <Link href={`/${locale}/docs/mcp`} className="btn btn-secondary btn-lg">
+              {t.mcpDoc}
+            </Link>
+          </>
+        }
       />
 
       <div className="page-body">

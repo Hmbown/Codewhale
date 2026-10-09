@@ -65,7 +65,7 @@ async function retryWindowsSharing<T>(operation: () => Promise<T>, beforeRetry?:
     if (retry) await beforeRetry?.()
     try { return await operation() } catch (error) {
       if (process.platform !== 'win32' || retry >= 10 || !['EACCES', 'EBUSY', 'EPERM'].includes(fsCode(error) ?? '')) throw error
-      await delay(50)
+      await delay((retry + 1) * 50)
     }
   }
 }
@@ -191,12 +191,12 @@ export function createStorage({ dataDir, isActive, onWarning }: StorageOptions):
       await file.close()
       file = undefined
       await retryWindowsSharing(async () => {
+        // Revalidation and publication share one bounded retry budget. A
+        // sharing error while checking the destination must not escape it.
+        active()
+        await readRecordOnce(directory, name)
         active()
         await rename(temporary, join(directory, name))
-      }, async () => {
-        // A retry never bypasses a newly corrupt/linked destination or revocation.
-        active()
-        await readRecord(directory, name)
       })
       published = true
       await syncDirectory(directory)

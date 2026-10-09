@@ -309,6 +309,10 @@ lifecycle generation you observed.
     /// Run the offline evaluation harness.
     Eval(TuiPassthroughArgs),
     /// Manage MCP servers.
+    #[command(
+        override_usage = "codewhale mcp [OPTIONS] <COMMAND>",
+        after_help = codewhale_tui::mcp_subcommand_help()
+    )]
     Mcp(TuiPassthroughArgs),
     /// Run the shared ambient pet owner (`pet serve`). Internal: spawned
     /// lazily by clients when no owner is running.
@@ -343,14 +347,17 @@ New integrations should prefer `codewhale app-server`.")]
         after_help = "The browser receives a one-time loopback bootstrap capability, never the Runtime token.\nThe capability is exchanged for a bounded, process-local HttpOnly, SameSite=Strict web session and then invalidated."
     )]
     Web(WebArgs),
-    /// Sign in to your Codewhale account (browser device flow).
+    /// Sign in to your Codewhale account to manage provider API keys in one place.
+    #[command(
+        after_help = "Create an account at https://app.codewhale.net/register or sign in through the browser.\nSave a provider key with `codewhale account keys set deepseek`, then choose Codewhale in /provider to use it across your signed-in devices.\nSigning in does not upload existing local keys. Local use does not require an account."
+    )]
     Login(LoginArgs),
     /// Remove saved authentication state (every provider key, OAuth login,
-    /// the account session and the Daytona token). Asks before deleting.
+    /// the Codewhale account session). Asks before deleting.
     Logout(LogoutArgs),
     /// Manage authentication credentials and provider mode.
     Auth(AuthArgs),
-    /// Sign in to your Codewhale account and manage account-scoped provider keys.
+    /// Manage your Codewhale account and centrally stored provider keys.
     #[command(visible_alias = "cloud")]
     Account(cloud::CloudArgs),
     /// Offload a coding agent to the Codewhale cloud. Never spends or pushes without --confirm.
@@ -1632,6 +1639,19 @@ struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Sign in to a reviewed plugin-defined OAuth provider (PKCE loopback).
+    #[command(name = "plugin-login")]
+    PluginLogin {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove host-owned credentials for a plugin-defined provider.
+    #[command(name = "plugin-logout")]
+    PluginLogout {
+        #[arg(long)]
+        provider: String,
+    },
+
     /// Sign in to xAI/Grok with an SSH-friendly device code; run again to switch accounts.
     ///
     /// The account you approve on the xAI page replaces the Codewhale-owned
@@ -1652,6 +1672,19 @@ enum AuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    #[command(name = "claude", alias = "anthropic")]
+    Claude,
+    #[command(name = "claude-revoke")]
+    ClaudeRevoke,
+    /// Sign in to OrcaRouter with OAuth 2.0 + PKCE and store the issued key.
+    ///
+    /// Opens the OrcaRouter consent screen on a loopback callback and
+    /// exchanges the authorization code for a durable `sk-orca-...` API key.
+    /// The key is billed to your OrcaRouter account and revocable there.
+    /// To paste an existing key instead, use
+    /// `codewhale auth set --provider orcarouter`.
+    #[command(name = "orcarouter")]
+    Orcarouter,
     /// Explicitly allow read-only access to one credential file owned by
     /// another CLI. Managed mutation is currently unsupported and fails closed.
     #[command(name = "external-consent")]
@@ -2420,7 +2453,7 @@ fn run() -> Result<()> {
                 args.no_open,
                 args.timeout_seconds,
                 cli.profile.as_deref(),
-                &store,
+                &mut store,
             )
         }
         Some(Commands::Logout(args)) => {
@@ -2428,12 +2461,51 @@ fn run() -> Result<()> {
             run_logout_command(&mut store, cli.profile.as_deref())
         }
         Some(Commands::Auth(args)) => match args.command {
+            AuthCommand::PluginLogin { provider } => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec![
+                        "auth".to_string(),
+                        "plugin-login".to_string(),
+                        "--provider".to_string(),
+                        provider,
+                    ],
+                )
+            }
+            AuthCommand::PluginLogout { provider } => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec![
+                        "auth".to_string(),
+                        "plugin-logout".to_string(),
+                        "--provider".to_string(),
+                        provider,
+                    ],
+                )
+            }
             AuthCommand::XaiDevice => {
                 let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
                 run_tui_in_process(
                     &cli,
                     &resolved_runtime,
                     vec!["auth".to_string(), "xai-device".to_string()],
+                )
+            }
+            command @ (AuthCommand::Claude | AuthCommand::ClaudeRevoke) => {
+                let route = if matches!(command, AuthCommand::Claude) {
+                    "claude"
+                } else {
+                    "claude-revoke"
+                };
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec!["auth".to_string(), route.to_string()],
                 )
             }
             AuthCommand::Chatgpt => {
@@ -2450,6 +2522,14 @@ fn run() -> Result<()> {
                     &cli,
                     &resolved_runtime,
                     vec!["auth".to_string(), "chatgpt-revoke".to_string()],
+                )
+            }
+            AuthCommand::Orcarouter => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec!["auth".to_string(), "orcarouter".to_string()],
                 )
             }
             command @ AuthCommand::Status {
@@ -2477,7 +2557,7 @@ fn run() -> Result<()> {
         },
         Some(Commands::Account(args)) => {
             cloud::reject_inline_api_key(cli.api_key.as_deref())?;
-            cloud::run(args, cli.profile.as_deref(), &store)
+            cloud::run(args, cli.profile.as_deref(), &mut store)
         }
         Some(Commands::Dispatch(args)) => dispatch::run(args),
         Some(Commands::McpServer) => {
@@ -2854,7 +2934,7 @@ fn reject_legacy_login_provider_args(args: &LoginArgs) -> Result<()> {
 }
 
 const LOGOUT_CONFIRM_PROMPT: &str = "This deletes every saved provider API key and OAuth login, \
-the Codewhale account session and the Daytona token. Type 'yes' to log out: ";
+the Codewhale account session. Type 'yes' to log out: ";
 
 /// `codewhale logout` wipes every provider credential at once, so it must not
 /// run on a stray keystroke. Non-interactive callers opt in with `--yes`.
@@ -2923,6 +3003,14 @@ fn run_logout_command_with_secrets_unlocked(
     let xai = store.config.providers.for_provider_mut(ProviderKind::Xai);
     xai.oauth_credential_generation = None;
     xai.auth_mode = None;
+    let anthropic = store
+        .config
+        .providers
+        .for_provider_mut(ProviderKind::Anthropic);
+    anthropic.oauth_credential_generation = None;
+    if anthropic.auth_mode.as_deref() == Some("oauth") {
+        anthropic.auth_mode = None;
+    }
     let openai_codex = store
         .config
         .providers
@@ -2945,6 +3033,9 @@ fn run_logout_command_with_secrets_unlocked(
     let mut keyring_failures = clear_all_provider_api_keys_from_keyring(secrets);
     // Already inside with_xai_oauth_revocation_transaction: the locked
     // variant must not re-enter the non-reentrant lifecycle mutex.
+    if let Err(error) = codewhale_config::clear_all_claude_oauth_credentials_locked() {
+        keyring_failures.push(format!("Claude sign-in: {error}"));
+    }
     if let Err(error) = codewhale_config::clear_all_chatgpt_oauth_credentials_locked() {
         keyring_failures.push(format!("chatgpt oauth: {error}"));
     }
@@ -4601,9 +4692,28 @@ fn run_auth_command_with_secrets_and_runtime(
     runtime_overrides: &CliRuntimeOverrides,
 ) -> Result<()> {
     match command {
+        AuthCommand::PluginLogin { .. } | AuthCommand::PluginLogout { .. } => {
+            bail!("plugin OAuth commands must run through the runtime dispatch")
+        }
         AuthCommand::XaiDevice => {
             let argv = vec!["auth".to_string(), "xai-device".to_string()];
             let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
+            std::process::exit(if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            })
+        }
+        command @ (AuthCommand::Claude | AuthCommand::ClaudeRevoke) => {
+            let route = if matches!(command, AuthCommand::Claude) {
+                "claude"
+            } else {
+                "claude-revoke"
+            };
+            let code = codewhale_tui::run(
+                codewhale_tui::RuntimeOptions::default(),
+                vec!["auth".to_string(), route.to_string()],
+            );
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0
             } else {
@@ -4621,6 +4731,15 @@ fn run_auth_command_with_secrets_and_runtime(
         }
         AuthCommand::ChatgptRevoke => {
             let argv = vec!["auth".to_string(), "chatgpt-revoke".to_string()];
+            let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
+            std::process::exit(if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            })
+        }
+        AuthCommand::Orcarouter => {
+            let argv = vec!["auth".to_string(), "orcarouter".to_string()];
             let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0
@@ -5575,19 +5694,23 @@ fn run_model_command(
     top_level_provider: Option<ProviderKind>,
     resolved_runtime: &ResolvedRuntimeOptions,
 ) -> Result<()> {
-    let registry = ModelRegistry::default();
     match command {
         ModelCommand::List { provider } => {
             let filter = model_command_provider_hint(provider, top_level_provider);
-            for model in registry.list().into_iter().filter(|m| match filter {
-                Some(p) => m.provider == p,
-                None => true,
-            }) {
-                println!("{} ({})", model.id, model.provider.as_str());
+            codewhale_tui::maybe_load_persisted_cache();
+            let providers: &[ProviderKind] = match &filter {
+                Some(provider) => std::slice::from_ref(provider),
+                None => ProviderKind::all(),
+            };
+            for provider in providers {
+                for model in codewhale_tui::all_catalog_models_for_provider(*provider) {
+                    println!("{model} ({})", provider.as_str());
+                }
             }
             Ok(())
         }
         ModelCommand::Resolve { model, provider } => {
+            let registry = ModelRegistry::default();
             // Only `model resolve --provider X` is a hypothetical. The
             // top-level `--provider` is the route this process is actually on,
             // and it is already folded into `resolved_runtime` — treating it as
@@ -9572,8 +9695,12 @@ verbosity = "concise"
             "login help must describe account sign-in: {help}"
         );
         assert!(
-            !help.to_lowercase().contains("api key"),
-            "login help must not advertise provider API keys: {help}"
+            help.contains("manage provider API keys"),
+            "login help must explain the account's immediate benefit: {help}"
+        );
+        assert!(
+            help.contains("Signing in does not upload existing local keys"),
+            "login help must explain the local-key upload boundary: {help}"
         );
     }
 
@@ -13012,6 +13139,33 @@ verbosity = "concise"
         assert!(exec.contains("codewhale exec --model MODEL"), "{exec}");
         let rc = help_for(&["codewhale", "rc", "--help"]);
         assert!(rc.contains("hand it to the Codewhale web app"), "{rc}");
+    }
+
+    /// `codewhale mcp --help` printed `Usage: codewhale mcp [OPTIONS]
+    /// [ARGS]...` and nothing else, so `add`, `list`, `tools`, `connect` and
+    /// `remove` could only be found by already knowing them.
+    #[test]
+    fn mcp_help_lists_its_subcommands() {
+        for flag in ["--help", "-h"] {
+            let help = help_for(&["codewhale", "mcp", flag]);
+            assert!(
+                help.contains("Usage: codewhale mcp [OPTIONS] <COMMAND>"),
+                "{help}"
+            );
+            for subcommand in [
+                "list", "init", "connect", "tools", "add", "login", "logout", "remove", "enable",
+                "disable", "validate", "add-self",
+            ] {
+                assert!(
+                    help.lines().any(|line| line
+                        .strip_prefix("  ")
+                        .and_then(|line| line.strip_prefix(subcommand))
+                        .is_some_and(|rest| rest.starts_with("  "))),
+                    "mcp help must list `{subcommand}` with its description:\n{help}"
+                );
+            }
+            assert!(help.contains("codewhale mcp <COMMAND> --help"), "{help}");
+        }
     }
 
     #[test]

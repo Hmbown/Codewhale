@@ -22,7 +22,7 @@ export const docsSandbox: DocsSandboxDict = {
         {
           rows: [
             ["macOS", "Seatbelt, automatically, when its startup check succeeds. Commands get broad read access, writes limited by the sandbox mode, and network only when the mode allows it."],
-            ["Linux", "Bubblewrap, but only if you turn it on (below). Without it, commands run with no OS sandbox."],
+            ["Linux", "Bubblewrap, automatically, once it is installed and verified working (opt out below). Without it, commands run with no OS sandbox."],
             ["Windows", "No OS sandbox today. Your approval setting and Windows permissions still apply."],
             ["External service", "With `sandbox_backend = \"opensandbox\"`, shell commands run on an OpenSandbox-compatible service you configure; its isolation is that service's to guarantee."],
           ],
@@ -36,18 +36,18 @@ export const docsSandbox: DocsSandboxDict = {
     },
     {
       id: "linux",
-      title: "Turn on the Linux sandbox",
+      title: "Enable (or turn off) the Linux sandbox",
       blocks: [
-        { p: "Install bubblewrap, then opt in with one line in `~/.codewhale/config.toml`:" },
+        { p: "Install bubblewrap — Codewhale uses it by default. To run Linux commands unwrapped instead, opt out with one line in `~/.codewhale/config.toml`:" },
         {
           code: `sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap
 
 # ~/.codewhale/config.toml
-prefer_bwrap = true`,
+prefer_bwrap = false`,
           lang: "Terminal / config.toml",
         },
         {
-          p: "Codewhale uses `/usr/bin/bwrap` only when that file exists and is executable. Commands then see a read-only view of the system, write only where the sandbox mode allows, and have no network unless the mode enables it.",
+          p: "Codewhale uses `/usr/bin/bwrap` only when that file exists, is executable, and a probe shows it can create its sandbox namespaces — an installed-but-blocked bwrap is treated as absent, not used. Commands then see a read-only view of the system, write only where the sandbox mode allows, and have no network unless the mode enables it.",
         },
       ],
     },

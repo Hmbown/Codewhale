@@ -390,6 +390,10 @@ fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
     // so wire submitters observe `TurnStarted.submission_id` always absent
     // and cannot correlate submissions on that channel.
     wire_op::TurnSpec {
+        profile_constitution: spec
+            .profile_constitution
+            .as_ref()
+            .map(|snapshot| serde_json::json!(snapshot)),
         max_output_tokens: spec.max_output_tokens,
         content: spec.content.clone(),
         images: spec.images.clone(),
@@ -535,21 +539,25 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
         Event::OperationActivityStarted {
             span_id,
             activity_kind,
+            action_id,
         } => wire::EventMsg::OperationActivityStarted {
             thread_id,
             session_id,
             span_id: span_id.clone(),
             activity_kind: *activity_kind,
+            action_id: action_id.clone(),
         },
         Event::OperationActivityCompleted {
             span_id,
             activity_kind,
+            action_id,
             outcome,
         } => wire::EventMsg::OperationActivityCompleted {
             thread_id,
             session_id,
             span_id: span_id.clone(),
             activity_kind: *activity_kind,
+            action_id: action_id.clone(),
             outcome: *outcome,
         },
         Event::TurnStarted {

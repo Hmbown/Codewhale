@@ -189,7 +189,7 @@ async fn shutdown_drains_accepted_user_input_receipt_after_caller_disconnects() 
     let thread = runtime
         .create_thread(CreateThreadRequest::default())
         .await?;
-    let harness = mock_engine_handle();
+    let mut harness = mock_engine_handle();
     runtime
         .install_test_engine(&thread.id, harness.handle.clone())
         .await?;
@@ -238,7 +238,15 @@ async fn shutdown_drains_accepted_user_input_receipt_after_caller_disconnects() 
         "accepted detached receipt is still part of shutdown"
     );
     drop(hold_receipt);
-    tokio::time::timeout(Duration::from_secs(5), drain).await???;
+    let (drained, consumed) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), drain),
+        harness.recv_user_input_submission(),
+    );
+    drained???;
+    assert!(
+        consumed.is_some(),
+        "shutdown must include Engine acceptance"
+    );
     let events = runtime.events_since(&thread.id, None)?;
     assert_eq!(
         events

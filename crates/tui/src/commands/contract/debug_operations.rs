@@ -9,7 +9,6 @@ use crate::dependencies::{ExternalTool, Git};
 use crate::tui::app::App;
 use crate::tui::history::HistoryCell;
 use codewhale_command_contract::facets::*;
-use codewhale_models::ContentBlock;
 use std::path::PathBuf;
 
 pub(super) struct DebugOperationsAdapter<'a> {
@@ -85,34 +84,93 @@ impl CommandDebugHistoryContext for DebugOperationsAdapter<'_> {
 }
 
 impl CommandDebugUndoContext for DebugOperationsAdapter<'_> {
-    fn undo_files(&mut self) -> DebugUndoOutcome {
-        undo_files(&mut self.host.app.borrow_mut())
+    fn undo_files(&mut self, force: bool) -> DebugUndoOutcome {
+        undo_files(&mut self.host.app.borrow_mut(), force)
     }
 }
 
 impl CommandDebugDiffContext for DebugOperationsAdapter<'_> {
     fn diff(&self) -> DebugDiffObservation {
-        let workspace = self.host.app.borrow().workspace.clone();
-        let Some(mut name_only_cmd) = Git::command() else {
+        let app = self.host.app.borrow();
+        if !Git::available() {
             return DebugDiffObservation::GitUnavailable;
-        };
-        let Some(mut stat_cmd) = Git::command() else {
-            return DebugDiffObservation::GitUnavailable;
-        };
-        let names = name_only_cmd
-            .args(["diff", "--name-only"])
-            .current_dir(&workspace)
-            .output();
-        let stat = stat_cmd
-            .args(["diff", "--stat"])
-            .current_dir(&workspace)
-            .output();
-        match (names, stat) {
-            (Ok(names), Ok(stat)) => DebugDiffObservation::Output {
+        }
+        match session_diff(&app) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => workspace_git_diff(&app.workspace),
+            Err(error) => DebugDiffObservation::Failed(error.to_string()),
+        }
+    }
+}
+
+/// Most patch text `/diff` hands to the pager. The file list and the stat
+/// are never cut.
+const MAX_DIFF_PATCH_BYTES: usize = 256 * 1024;
+
+/// What changed in the workspace since this session's first restore point,
+/// or `None` when the session has none here (no turn has run yet, or
+/// snapshots are off for this workspace).
+///
+/// The restore points are the session's own record of where it started, so
+/// this works the same in a folder that is not a git repository, and it
+/// includes files created since. Reads only: no snapshot is taken and the
+/// side repo is not created.
+fn session_diff(app: &App) -> std::io::Result<Option<DebugDiffObservation>> {
+    let Some(session_id) = app.current_session_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(repo) = crate::snapshot::SnapshotRepo::open_existing(&app.workspace)? else {
+        return Ok(None);
+    };
+    // Newest first, so the session's first restore point is the last match.
+    let Some(start) = repo
+        .list(usize::MAX)?
+        .into_iter()
+        .rev()
+        .find(|snapshot| snapshot.session_id.as_deref() == Some(session_id))
+    else {
+        return Ok(None);
+    };
+    let changes = repo.work_tree_changes_since(&start.tree, MAX_DIFF_PATCH_BYTES)?;
+    Ok(Some(DebugDiffObservation::Output {
+        names: changes.names,
+        stat: changes.stat,
+        patch: changes.patch,
+        patch_truncated: changes.patch_truncated,
+    }))
+}
+
+/// The workspace repository's own uncommitted changes: what `/diff` shows
+/// before the session has a restore point to compare against.
+fn workspace_git_diff(workspace: &std::path::Path) -> DebugDiffObservation {
+    let git = |args: &[&str]| Git::output(args, workspace);
+    // Outside a repository `git diff` prints nothing on stdout, which would
+    // read as "no changes".
+    match git(&["rev-parse", "--is-inside-work-tree"]) {
+        Ok(probe)
+            if probe.status.success()
+                && String::from_utf8_lossy(&probe.stdout).trim() == "true" => {}
+        Ok(_) => return DebugDiffObservation::NoBaseline,
+        Err(error) => return DebugDiffObservation::Failed(error.to_string()),
+    }
+    let names = git(&["diff", "--name-only"]);
+    let stat = git(&["diff", "--stat"]);
+    let patch = git(&["diff", "--no-color", "--no-ext-diff", "--no-textconv"]);
+    match (names, stat, patch) {
+        (Ok(names), Ok(stat), Ok(patch)) => {
+            let (patch, patch_truncated) = crate::snapshot::repo::truncate_at_char_boundary(
+                &String::from_utf8_lossy(&patch.stdout),
+                MAX_DIFF_PATCH_BYTES,
+            );
+            DebugDiffObservation::Output {
                 names: String::from_utf8_lossy(&names.stdout).into_owned(),
                 stat: String::from_utf8_lossy(&stat.stdout).into_owned(),
-            },
-            (Err(error), _) | (_, Err(error)) => DebugDiffObservation::Failed(error.to_string()),
+                patch,
+                patch_truncated,
+            }
+        }
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            DebugDiffObservation::Failed(error.to_string())
         }
     }
 }
@@ -148,98 +206,100 @@ fn session_sync_payload(app: &App) -> SessionSyncPayload {
     }
 }
 
-pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
-    // A display/control id alone must not choose between duplicated or mixed
-    // legacy/local history. Refuse to prune when the source is ambiguous.
-    let mut matches = app
-        .api_messages
+/// Full text of this conversation's requests, oldest first. Missing text is
+/// retained: an image-only request is a boundary, not a request to skip.
+fn request_prompts(app: &App) -> Vec<Option<String>> {
+    if app.api_messages.is_empty() {
+        return app
+            .history
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::User { content } => Some(Some(content.clone())),
+                _ => None,
+            })
+            .collect();
+    }
+    app.api_messages
         .iter()
-        .enumerate()
-        .flat_map(|(msg_idx, msg)| {
-            msg.content
+        .filter(|message| {
+            !matches!(
+                crate::runtime_handoff::classify_user_turn_prompt(message),
+                crate::runtime_handoff::UserTurnPromptKind::NotPrompt
+            )
+        })
+        .map(|message| {
+            let meta_index =
+                crate::runtime_handoff::turn_metadata_text(message).map(|(index, _)| index);
+            let mut content = message
+                .content
                 .iter()
                 .enumerate()
-                .filter_map(move |(block_idx, block)| {
-                    (matches!(block, ContentBlock::ToolUse { .. })
-                        && block.tool_call_key().is_some_and(|key| {
-                            !key.as_str().trim().is_empty() && key.as_str() == tool_id
-                        }))
-                    .then_some((msg_idx, block_idx))
-                })
-        });
-    let Some((msg_idx, block_idx)) = matches.next() else {
-        return;
+                .filter(|(index, _)| Some(*index) != meta_index);
+            // A text label cannot identify the rest of a multipart request.
+            match (content.next(), content.next()) {
+                (Some((_, codewhale_models::ContentBlock::Text { text, .. })), None) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+type RequestPositionResult = Result<Option<bool>, Box<DebugUndoOutcome>>;
+
+/// Match only lossless, unique prompt labels. Display snippets are not durable
+/// request identities: repeated, multiline, truncated or multipart prompts cannot
+/// authorize a combined file/conversation rollback. `/restore` remains explicit.
+fn request_is_last(
+    requests: &[Option<String>],
+    owned_request_snippets: &[Option<String>],
+    label: &str,
+) -> RequestPositionResult {
+    use crate::core::turn::{parse_snapshot_label, snapshot_label_prompt_snippet};
+    if requests.is_empty() {
+        return Ok(None);
+    }
+    let refusal = || {
+        Box::new(DebugUndoOutcome::RestoreBlocked(
+            concat!(
+                "Nothing was undone. This restore point cannot be matched safely to a request ",
+                "in the conversation. Use /restore to choose a restore point explicitly.",
+            )
+            .to_string(),
+        ))
     };
-    if matches.next().is_some() {
-        return;
+    // A held request with missing or shortened text could be the candidate
+    // even when its display label appears to name an older request.
+    if requests.iter().any(|prompt| {
+        prompt.as_deref().is_none_or(|prompt| {
+            prompt.is_empty() || snapshot_label_prompt_snippet(prompt).as_deref() != Some(prompt)
+        })
+    }) {
+        return Err(refusal());
     }
-    drop(matches);
-    if let Some(history_idx) = app.tool_cells.get(tool_id).copied() {
-        app.truncate_history_to(history_idx);
-    }
-    let kept_blocks = app.api_messages[msg_idx].content[..block_idx].to_vec();
-    let kept_tool_ids: std::collections::HashSet<_> = kept_blocks
+    let request = parse_snapshot_label(label).prompt_snippet;
+    let Some(prompt) = request.as_deref().filter(|prompt| {
+        !prompt.is_empty() && snapshot_label_prompt_snippet(prompt).as_deref() == Some(*prompt)
+    }) else {
+        return Err(refusal());
+    };
+    let matches = requests
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => block.tool_call_key().map(|key| (key, id.as_str())),
-            _ => None,
-        })
-        .collect();
-    if kept_blocks.is_empty() {
-        app.truncate_api_messages(msg_idx);
-        return;
-    }
-    // Preserve surviving result blocks even when a message also contains the
-    // undone result; retain the stamp of the original message.
-    let preserved_tool_results: Vec<_> = app
-        .api_messages_stamped()
-        .skip(msg_idx + 1)
-        .take_while(|(msg, _)| {
-            msg.role == "user"
-                && !msg.content.is_empty()
-                && msg
-                    .content
-                    .iter()
-                    .all(|block| tool_result_id(block).is_some())
-        })
-        .filter_map(|(msg, stamp)| {
-            let mut retained = msg.clone();
-            retained.content.retain(|block| {
-                tool_result_id(block).is_some_and(|key| kept_tool_ids.contains(&key))
-            });
-            (!retained.content.is_empty()).then_some((retained, stamp))
-        })
-        .collect();
-    app.truncate_api_messages(msg_idx + 1);
-    app.api_messages_mut()[msg_idx].content = kept_blocks;
-    for (message, stamp) in preserved_tool_results {
-        app.push_api_message_stamped(message, stamp);
-    }
-}
-
-fn prune_undone_turn_context(app: &mut App) {
-    if let Some(history_idx) = app
-        .history
-        .iter()
-        .rposition(|cell| matches!(cell, HistoryCell::User { .. }))
+        .filter(|candidate| candidate.as_deref() == Some(prompt))
+        .count();
+    if matches != 1
+        || owned_request_snippets
+            .iter()
+            .filter(|candidate| candidate.as_deref() == Some(prompt))
+            .count()
+            > 1
     {
-        app.truncate_history_to(history_idx);
+        // Snapshots outlive conversation rewinds, so checking only the held
+        // prompts would still confuse an older occurrence with the latest.
+        return Err(refusal());
     }
-
-    if let Some(api_idx) = app.api_messages.iter().rposition(|msg| msg.role == "user") {
-        app.truncate_api_messages(api_idx);
-    }
-}
-
-fn tool_result_id(block: &ContentBlock) -> Option<(codewhale_models::ToolCallKey<'_>, &str)> {
-    match block {
-        ContentBlock::ToolResult { tool_use_id, .. }
-        | ContentBlock::ToolSearchToolResult { tool_use_id, .. }
-        | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => {
-            block.tool_call_key().map(|key| (key, tool_use_id.as_str()))
-        }
-        _ => None,
-    }
+    Ok(Some(requests.last() == Some(&request)))
 }
 
 /// Deepest fork chain [`snapshot_owners`] follows. A chain this long is
@@ -315,15 +375,17 @@ pub(in crate::commands) fn snapshot_owners(app: &App) -> Vec<SnapshotOwner> {
     owners
 }
 
-/// Labels a `/undo` step starts at: before one tool call, or before a turn.
+/// Label a `/undo` step starts at: before one request (a turn). `/undo`,
+/// `/retry`, Esc Esc and the Runtime's `patch-undo` all go back by request;
+/// the per-tool `tool:` restore points stay available to `/restore`.
 fn is_undo_step_label(label: &str) -> bool {
-    label.starts_with("tool:") || label.starts_with("pre-turn:")
+    label.starts_with("pre-turn:")
 }
 
-/// Labels of the restore points an engine takes for a turn. A step runs from
-/// one of them to the next one the conversation owns.
+/// Labels of the restore points that bound a request. A step runs from its
+/// `pre-turn:` point to the next one of these the conversation owns.
 fn is_restore_point_label(label: &str) -> bool {
-    is_undo_step_label(label) || label.starts_with("post-tool:") || label.starts_with("post-turn:")
+    is_undo_step_label(label) || label.starts_with("post-turn:")
 }
 
 /// One `/undo` step, planned but not applied.
@@ -343,6 +405,11 @@ pub(in crate::commands) struct UndoStep {
     /// The `pre-restore:` snapshot planning took of the workspace, when the
     /// step ends now; the restore reuses it as its safety backup.
     pub(in crate::commands) backup: Option<crate::snapshot::SnapshotId>,
+    /// The step has no recorded end and runs only because the user typed
+    /// `force`: it also puts back edits made since the request started.
+    pub(in crate::commands) forced: bool,
+    /// The validated request boundary, captured before any backup is taken.
+    request_is_last: Option<bool>,
 }
 
 /// Find the newest step of `snapshots` (newest first) that `owners` own and
@@ -352,14 +419,29 @@ pub(in crate::commands) struct UndoStep {
 /// the next one: edits to any other file (the user's, another session's)
 /// are never touched. A path the step changed that changed again since is
 /// refused rather than overwritten. A step whose paths are all back at its
-/// restore point is already undone, so `/undo` walks back one tool call (or
-/// turn) at a time (#384). A changed path that is not a regular file is
+/// restore point is already undone, so `/undo` walks back one request at a
+/// time. A changed path that is not a regular file is
 /// left in place and reported (file-scoped restore never writes symlinks or
 /// directories); it does not block the step's other paths or older steps.
 ///
+/// Trust is never asked. A step that runs from a request's `pre-turn:` point
+/// to that same request's `post-turn:` point puts back, inside the
+/// workspace, only what changed while that request ran, and only where the
+/// file is still as the request left it: the reverse of writes the session
+/// already made. Any other step has no recorded end (the request never
+/// finished, or its post-turn snapshot is missing), so it also takes in
+/// whatever was edited since; that one is refused unless the user typed
+/// `force`.
+///
+/// `request_position` validates each non-no-op candidate before any backup or
+/// restore write and says whether it names the last held request. An earlier held request means
+/// the conversation still holds a request newer than this restore point. Such a
+/// request left no file change to undo and comes off first (the caller's
+/// conversation-only undo), so the conversation never keeps a request whose files went back,
+/// and a refusal about an older request never blocks taking a newer one off.
+///
 /// Planning writes nothing, except when the newest step ends now: the
-/// workspace is then snapshotted, and only when `trusted`, since `/undo`
-/// outside trusted mode refuses to touch files anyway.
+/// workspace is then snapshotted, and only with `force`.
 ///
 /// Known limits: the TUI records no per-tool receipts (the Runtime's
 /// `post-tool:` spans and declared write paths), so a step owns everything
@@ -376,7 +458,8 @@ fn plan_undo_step(
     repo: &crate::snapshot::SnapshotRepo,
     snapshots: Vec<crate::snapshot::Snapshot>,
     owners: &[SnapshotOwner],
-    trusted: bool,
+    force: bool,
+    request_position: &dyn Fn(&str) -> RequestPositionResult,
 ) -> Result<UndoStep, Box<DebugUndoOutcome>> {
     let owned: Vec<crate::snapshot::Snapshot> = snapshots
         .into_iter()
@@ -401,6 +484,11 @@ fn plan_undo_step(
             continue;
         }
         let mut backup = None;
+        let bounded = index.checked_sub(1).is_some_and(|newer| {
+            let start = crate::core::turn::parse_snapshot_label(&target.label);
+            let end = crate::core::turn::parse_snapshot_label(&owned[newer].label);
+            end.kind == "post-turn" && end.seq.is_some() && end.seq == start.seq
+        });
         let end = match index.checked_sub(1) {
             Some(newer) => owned[newer].tree.clone(),
             // The newest step has no later restore point (the turn is still
@@ -413,8 +501,14 @@ fn plan_undo_step(
                 {
                     continue;
                 }
-                if !trusted {
-                    return Err(Box::new(DebugUndoOutcome::Untrusted));
+                // An open-ended step can write its backup while planning:
+                // establish identity before force can take that snapshot.
+                let request_is_last = request_position(&target.label)?;
+                if request_is_last == Some(false) {
+                    return Err(Box::new(DebugUndoOutcome::NoDifference));
+                }
+                if !force {
+                    return Err(Box::new(DebugUndoOutcome::OpenEnded));
                 }
                 let short = &target.id.as_str()[..target.id.as_str().len().min(12)];
                 let taken = repo
@@ -466,16 +560,24 @@ fn plan_undo_step(
             }
             changed_since.push(path.display().to_string());
         }
-        if !changed_since.is_empty() {
-            return Err(Box::new(DebugUndoOutcome::ChangedSince {
-                label: target.label.clone(),
-                paths: changed_since,
-            }));
-        }
-        if restore.is_empty() {
+        if restore.is_empty() && changed_since.is_empty() {
             // Already undone, changed nothing, or changed only paths `/undo`
             // cannot restore: keep walking back.
             continue;
+        }
+        // No-op and already-undone snapshots outlive conversation rewinds.
+        // Only a candidate with remaining changes needs request identity.
+        let request_is_last = request_position(&target.label)?;
+        if request_is_last == Some(false) {
+            return Err(Box::new(DebugUndoOutcome::NoDifference));
+        }
+        if !changed_since.is_empty() {
+            return Err(Box::new(DebugUndoOutcome::ChangedSince {
+                paths: changed_since,
+            }));
+        }
+        if !bounded && !force {
+            return Err(Box::new(DebugUndoOutcome::OpenEnded));
         }
         skipped.sort();
         skipped.dedup();
@@ -485,6 +587,8 @@ fn plan_undo_step(
             restore,
             skipped,
             backup,
+            forced: !bounded,
+            request_is_last,
         });
     }
     Err(Box::new(DebugUndoOutcome::NoDifference))
@@ -493,16 +597,6 @@ fn plan_undo_step(
 /// How long `/undo` waits for a post-turn snapshot still being written.
 const POST_TURN_SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Revert the most recent write tool (apply_patch/edit_file/write_file) or turn.
-///
-/// Opens the side-git snapshot repo and finds the newest `tool:*` or
-/// `pre-turn:*` restore point this conversation owns (see
-/// [`snapshot_owners`]) whose step is not undone yet, then restores only the
-/// files that step changed (see [`plan_undo_step`]). Falls back to
-/// conversation undo when no snapshots exist.
-///
-/// Posts a `HistoryCell::System` entry so the user can see what was
-/// reverted in the transcript.
 /// Why workspace files may not be rolled back right now, if they may not.
 ///
 /// A running turn is reading and writing this workspace: restoring files
@@ -519,7 +613,26 @@ pub(in crate::commands) fn active_turn_restore_refusal(app: &App) -> Option<Stri
     })
 }
 
-pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
+/// Undo the most recent request: its file changes and its messages.
+///
+/// Opens the side-git snapshot repo and finds the newest `pre-turn:*` restore
+/// point this conversation owns (see [`snapshot_owners`]) whose step is not
+/// undone yet, then restores only the files that request changed (see
+/// [`plan_undo_step`]), whichever tool or shell command changed them.
+///
+/// The conversation moves with the files. The step's request is matched to
+/// the conversation by the prompt its label carries: when it is the last
+/// request, that request and its reply are removed; when newer requests are
+/// still in the conversation, nothing is restored and the caller's
+/// conversation-only undo takes the newest one off first; when it is no
+/// longer in the conversation (Esc Esc rewound past it), only its files go
+/// back. The outcome says which happened.
+///
+/// Trust mode and Full Access are not consulted: the restore is confined to
+/// regular files inside the workspace that the request itself changed.
+/// `force` (the user typed `/undo force`) accepts a request with no recorded
+/// end, never an ambiguous request identity.
+pub(in crate::commands) fn undo_files(app: &mut App, force: bool) -> DebugUndoOutcome {
     if let Some(refusal) = active_turn_restore_refusal(app) {
         return DebugUndoOutcome::RestoreBlocked(refusal);
     }
@@ -564,19 +677,20 @@ pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
         return DebugUndoOutcome::NoSession;
     }
 
-    // Restoring workspace files is a mutation. Apply the trust gate only
-    // after finding a real, owned step so chat-only `/undo` can still fall
-    // back to conversation history in ordinary mode; planning itself writes
-    // nothing outside trusted mode.
-    let trusted = app.yolo || app.trust_mode;
-    let step = match plan_undo_step(&repo, snapshots, &owners, trusted) {
+    let requests = request_prompts(app);
+    let owned_request_snippets: Vec<_> = snapshots
+        .iter()
+        .filter(|snapshot| is_undo_step_label(&snapshot.label))
+        .filter(|snapshot| owners.iter().any(|owner| owner.owns(snapshot)))
+        .map(|snapshot| crate::core::turn::parse_snapshot_label(&snapshot.label).prompt_snippet)
+        .collect();
+    let request_position = |label: &str| request_is_last(&requests, &owned_request_snippets, label);
+    let step = match plan_undo_step(&repo, snapshots, &owners, force, &request_position) {
         Ok(step) => step,
         Err(outcome) => return *outcome,
     };
     let target = &step.target;
-    if !trusted {
-        return DebugUndoOutcome::Untrusted;
-    }
+    let is_last_request = step.request_is_last;
 
     let plan: Vec<(PathBuf, crate::snapshot::SnapshotId)> = step
         .restore
@@ -621,24 +735,24 @@ pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
         Err(e) => return DebugUndoOutcome::RestoreFailed(e.to_string()),
     };
 
-    if let Some(tool_id) = target.label.strip_prefix("tool:") {
-        prune_undone_tool_context(app, tool_id);
-    } else if target.label.starts_with("pre-turn:") {
-        prune_undone_turn_context(app);
-    }
-
-    let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
-    // Post a system cell so the reverted state is visible in the transcript.
-    app.push_history_cell(HistoryCell::System {
-        content: format!(
-            "/undo reverted workspace files to snapshot '{}' ({})",
-            target.label, short
-        ),
-    });
+    // The files are back. Take the request off the conversation at the same
+    // boundary a conversation-only undo uses (the user's prompt, never a
+    // tool result), or leave a conversation that no longer holds it alone.
+    let (conversation_removed, sync) = if is_last_request == Some(true) {
+        let before = app.api_messages.len();
+        let undone = undo_conversation_for_engine(app);
+        app.truncate_history_to(app.history.len() - undone.removed);
+        app.truncate_api_messages(undone.sync.messages.len());
+        let removed = undone.removed > 0 || undone.sync.messages.len() < before;
+        (removed, undone.sync)
+    } else {
+        (false, session_sync_payload(app))
+    };
 
     DebugUndoOutcome::Restored(DebugUndoRestored {
-        label: target.label.clone(),
-        snapshot_id: target.id.as_str().to_string(),
+        request: crate::core::turn::parse_snapshot_label(&target.label).prompt_snippet,
+        conversation_removed,
+        forced: step.forced,
         files: outcomes
             .into_iter()
             .map(|outcome| DebugRestoredFile {
@@ -651,6 +765,6 @@ pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
             })
             .collect(),
         skipped: step.skipped,
-        sync: session_sync_payload(app),
+        sync,
     })
 }

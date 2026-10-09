@@ -486,6 +486,7 @@ mod tests {
         engine.config.features.disable(Feature::Mcp);
         let message = |content: &str| {
             Op::SendMessage(TurnSpec {
+                profile_constitution: None,
                 max_output_tokens: None,
                 content: content.into(),
                 images: Vec::new(),

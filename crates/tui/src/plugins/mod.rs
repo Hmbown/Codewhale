@@ -14,6 +14,7 @@ pub mod matcher;
 pub mod mutation;
 pub(crate) mod native_presets;
 mod path_identity;
+pub mod providers;
 pub mod recommend;
 pub mod registry;
 pub mod runtime;

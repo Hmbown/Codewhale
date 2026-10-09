@@ -801,69 +801,30 @@ pub(crate) mod test_max_snapshots {
     }
 }
 
-/// Which gate turned snapshots off. Each variant selects its own consequence
-/// and recovery copy: only [`Self::WorkspaceTooLarge`] is lifted by
-/// [`SNAPSHOTS_CAP_CONFIG_KEY`], so the other two must never advertise it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotsDisabledScope {
-    /// Snapshot-eligible content exceeds `[snapshots] max_workspace_gb`.
-    WorkspaceTooLarge,
-    /// The bounded walk hit the entry ceiling. Raising (or zeroing) the GB cap
-    /// does not lift this bound.
-    TooManyFiles,
-    /// Home, filesystem root, or a top-level home folder: refused for safety,
-    /// and no config value changes that.
-    UnsafeLocation,
-    /// The side repo's HEAD named a missing commit; history was restarted, so
-    /// earlier restore points are gone although new turns are protected.
-    HistoryRepaired,
-    /// Snapshots open but fail (a real git or disk error, not a gate): undo
-    /// cannot restore the turns taken since. `limit` carries the error.
-    Failing,
-}
+// Shared snapshot data; host localization and session retention stay here.
+#[cfg(test)]
+pub use codewhale_command_contract::config_policy::SNAPSHOTS_CAP_CONFIG_KEY;
+pub use codewhale_command_contract::config_policy::{
+    StatusSnapshotNotice as SnapshotsDisabledNotice, StatusSnapshotScope as SnapshotsDisabledScope,
+};
 
-/// Snapshot availability observed for a session and its workspace. Delivering
-/// the notice does not erase the status: `/status` can still explain why undo
-/// is unavailable after the transient toast has expired (#5930).
-///
-/// The notice carries the gate, not prose: every surface renders exactly one
-/// localized line from it, so the workspace, the limit, and the recovery are
-/// each stated once (#6042).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotsDisabledNotice {
-    pub workspace: String,
-    pub scope: SnapshotsDisabledScope,
-    /// Preformatted limit for the scope that names one (`2.0 GB`, `200000`),
-    /// or the failure detail for [`SnapshotsDisabledScope::Failing`]. Empty
-    /// for scopes whose message names neither.
-    pub limit: String,
+/// Host localization of the shared semantic notice, including the toast surface.
+pub trait SnapshotsDisabledNoticeUi {
+    fn localize(&self, locale: codewhale_localization::Locale) -> String;
 }
-
-impl SnapshotsDisabledNotice {
-    fn message_id(&self) -> codewhale_localization::MessageId {
+impl SnapshotsDisabledNoticeUi for SnapshotsDisabledNotice {
+    fn localize(&self, locale: codewhale_localization::Locale) -> String {
         use codewhale_localization::MessageId;
-        match self.scope {
+        let id = match self.scope {
             SnapshotsDisabledScope::WorkspaceTooLarge => MessageId::SnapshotsDisabledTooLarge,
             SnapshotsDisabledScope::TooManyFiles => MessageId::SnapshotsDisabledTooManyFiles,
             SnapshotsDisabledScope::UnsafeLocation => MessageId::SnapshotsDisabledUnsafeLocation,
             SnapshotsDisabledScope::HistoryRepaired => MessageId::SnapshotsHistoryRepaired,
             SnapshotsDisabledScope::Failing => MessageId::SnapshotsFailing,
-        }
-    }
-
-    /// The single user-facing line: what is off, for which workspace, why, and
-    /// the recovery that actually applies to this gate.
-    pub fn localize(&self, locale: codewhale_localization::Locale) -> String {
-        codewhale_localization::tr(locale, self.message_id())
-            .replace("{workspace}", &self.workspace)
-            .replace("{limit}", &self.limit)
-            .replace("{config_key}", SNAPSHOTS_CAP_CONFIG_KEY)
+        };
+        self.render(&codewhale_localization::tr(locale, id))
     }
 }
-
-/// The config key that lifts the size gate. Named only by the size-gate
-/// notice: it is not a remedy for the entry ceiling or the safety refusal.
-pub const SNAPSHOTS_CAP_CONFIG_KEY: &str = "[snapshots] max_workspace_gb";
 
 /// Human-readable byte cap for the size-gate notice. Keeps small test caps
 /// from rendering as a misleading `0 GB`.

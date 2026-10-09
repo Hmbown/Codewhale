@@ -474,7 +474,7 @@ fn user_codes_and_key_inputs_match_the_server_contract() {
 #[test]
 fn device_flow_handles_pending_then_authorized_without_printing_tokens() {
     for (no_open, browser_opens) in [(false, true), (false, false), (true, false)] {
-        let (temp, config) = test_config();
+        let (temp, mut config) = test_config();
         let _keep_temp = temp;
         let (secrets, _) = test_secrets();
         let transport = FakeTransport::new(vec![
@@ -512,7 +512,7 @@ fn device_flow_handles_pending_then_authorized_without_printing_tokens() {
             }),
             "work",
             "https://api.codewhale.net",
-            &config,
+            &mut config,
             &secrets,
             &secrets,
             &machine::MachineKeyEnv::default(),
@@ -559,6 +559,113 @@ fn device_flow_handles_pending_then_authorized_without_printing_tokens() {
     }
 }
 
+fn login_responses() -> Vec<CloudResponse> {
+    vec![
+        response(
+            200,
+            json!({
+                "deviceCode": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "userCode": "ABCD-EFGH-JKLM",
+                "verificationUri": "https://app.codewhale.net/cli/authorize",
+                "verificationUriComplete": "https://app.codewhale.net/cli/authorize?user_code=ABCD-EFGH-JKLM",
+                "expiresIn": 600,
+                "interval": 1
+            }),
+        ),
+        response(
+            200,
+            auth_json("access-never-print", "refresh-never-print", "acct-123"),
+        ),
+        response(200, account("acct-123")),
+    ]
+}
+
+fn run_login(config: &mut ConfigStore, secrets: &Secrets) -> String {
+    let transport = FakeTransport::new(login_responses());
+    let mut output = Vec::new();
+    let mut key_reader = |_| bail!("key reader should not be called");
+    let mut opener = |_: String| false;
+    let mut sleeper = |_| {};
+    run_with(
+        command(&["codewhale", "cloud", "login", "--no-open"]),
+        "work",
+        "https://api.codewhale.net",
+        config,
+        secrets,
+        secrets,
+        &machine::MachineKeyEnv::default(),
+        &transport,
+        &mut output,
+        &mut key_reader,
+        &mut opener,
+        &mut sleeper,
+    )
+    .unwrap();
+    String::from_utf8(output).unwrap()
+}
+
+#[test]
+fn login_selects_managed_route_when_provider_is_default() {
+    let (temp, mut config) = test_config();
+    assert_eq!(config.config.provider, ProviderKind::default());
+    let (secrets, _) = test_secrets();
+    let output = run_login(&mut config, &secrets);
+    assert!(
+        output.contains("Using your Codewhale account route"),
+        "{output}"
+    );
+    let saved = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    assert_eq!(saved.config.provider, ProviderKind::Codewhale);
+    assert_eq!(saved.config.model.as_deref(), Some("auto"));
+}
+
+#[test]
+fn login_keeps_explicitly_configured_route() {
+    let (temp, mut config) = test_config();
+    config.config.provider = ProviderKind::Openai;
+    config.save().unwrap();
+    let (secrets, _) = test_secrets();
+    let output = run_login(&mut config, &secrets);
+    assert!(
+        output.contains("Keeping your configured openai route."),
+        "{output}"
+    );
+    let saved = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    assert_eq!(saved.config.provider, ProviderKind::Openai);
+    assert_eq!(saved.config.model, None);
+}
+
+#[test]
+fn login_keeps_an_explicit_deepseek_route() {
+    // DeepSeek is the default provider; choosing it explicitly must survive sign-in.
+    let (temp, _) = test_config();
+    std::fs::write(temp.path().join("config.toml"), "provider = \"deepseek\"\n").unwrap();
+    let mut config = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    let (secrets, _) = test_secrets();
+    let output = run_login(&mut config, &secrets);
+    assert!(
+        output.contains("Keeping your configured deepseek route."),
+        "{output}"
+    );
+    let saved = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    assert_eq!(saved.config.provider, ProviderKind::Deepseek);
+    assert_eq!(saved.config.model, None);
+}
+
+#[test]
+fn login_keeps_the_default_route_when_it_has_a_local_key() {
+    let (temp, mut config) = test_config();
+    let (secrets, _) = test_secrets();
+    secrets.set("deepseek", "sk-local-never-print").unwrap();
+    let output = run_login(&mut config, &secrets);
+    assert!(
+        output.contains("Keeping your configured deepseek route."),
+        "{output}"
+    );
+    let saved = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    assert_eq!(saved.config.provider, ProviderKind::Deepseek);
+}
+
 #[test]
 fn cloud_sessions_are_isolated_by_profile_and_api_origin() {
     let (secrets, _) = test_secrets();
@@ -598,7 +705,7 @@ fn cloud_sessions_are_isolated_by_profile_and_api_origin() {
 
 #[test]
 fn status_refreshes_once_on_unauthorized_and_never_displays_tokens() {
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let _keep_temp = temp;
     let (secrets, _) = test_secrets();
     let transport = FakeTransport::new(vec![
@@ -624,7 +731,7 @@ fn status_refreshes_once_on_unauthorized_and_never_displays_tokens() {
         CloudCommand::Status,
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -653,7 +760,7 @@ fn status_refreshes_once_on_unauthorized_and_never_displays_tokens() {
 
 #[test]
 fn account_pull_refuses_to_claim_unimplemented_local_import() {
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let config_path = config.path().to_path_buf();
     let (secrets, _) = test_secrets();
     let transport = FakeTransport::new(vec![]);
@@ -666,7 +773,7 @@ fn account_pull_refuses_to_claim_unimplemented_local_import() {
         command(&["codewhale", "account", "pull"]),
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -697,7 +804,7 @@ fn account_pull_refuses_to_claim_unimplemented_local_import() {
 
 #[test]
 fn account_pull_dry_run_is_truthful_and_read_only() {
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let config_path = config.path().to_path_buf();
     let (secrets, _) = test_secrets();
     let transport = FakeTransport::new(vec![response(200, account("acct-pull"))]);
@@ -713,7 +820,7 @@ fn account_pull_dry_run_is_truthful_and_read_only() {
         command(&["codewhale", "account", "pull", "--dry-run"]),
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -921,7 +1028,7 @@ fn terminal_refresh_auth_failures_clear_the_local_session() {
 
 #[test]
 fn set_list_and_remove_use_account_routes_without_secret_output() {
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let _keep_temp = temp;
     let (secrets, _) = test_secrets();
     let list_account = json!({
@@ -972,7 +1079,7 @@ fn set_list_and_remove_use_account_routes_without_secret_output() {
             cmd,
             "default",
             "https://api.codewhale.net",
-            &config,
+            &mut config,
             &secrets,
             &secrets,
             &machine::MachineKeyEnv::default(),
@@ -1040,7 +1147,7 @@ fn from_local_uses_config_without_printing_or_requiring_an_inline_key() {
         ]),
         "work",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -1095,7 +1202,7 @@ fn catalog_ids_map_to_local_providers_through_the_catalog_not_a_compiled_table()
         ]),
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -1119,7 +1226,7 @@ fn catalog_ids_map_to_local_providers_through_the_catalog_not_a_compiled_table()
 
 #[test]
 fn an_id_outside_the_account_catalog_is_refused_and_names_what_is_available() {
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let _keep_temp = temp;
     let (secrets, _) = test_secrets();
     let transport = FakeTransport::new(vec![
@@ -1137,7 +1244,7 @@ fn an_id_outside_the_account_catalog_is_refused_and_names_what_is_available() {
         command(&["codewhale", "cloud", "keys", "remove", "not-a-provider"]),
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -1203,7 +1310,7 @@ fn from_local_uses_config_before_the_provider_secret_store() {
 
 #[test]
 fn logout_recovers_from_a_corrupt_local_session_record() {
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let _keep_temp = temp;
     let (secrets, store) = test_secrets();
     let slot = cloud_auth_slot("default", "https://api.codewhale.net");
@@ -1217,7 +1324,7 @@ fn logout_recovers_from_a_corrupt_local_session_record() {
         CloudCommand::Logout,
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -1318,7 +1425,7 @@ fn account_login_timeout_fails_the_command() {
     // must return Err so run_cli maps it to ExitCode::FAILURE. Verified live
     // against a stub server: `error: Codewhale account login timed out` now
     // exits 1.
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let _keep_temp = temp;
     let (secrets, _) = test_secrets();
     // Device start succeeds once; every token poll stays pending forever.
@@ -1361,7 +1468,7 @@ fn account_login_timeout_fails_the_command() {
         ]),
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         &secrets,
         &secrets,
         &machine::MachineKeyEnv::default(),
@@ -1399,7 +1506,7 @@ fn run_account(
     secrets: &Secrets,
     transport: &FakeTransport,
 ) -> (Result<()>, String) {
-    let (temp, config) = test_config();
+    let (temp, mut config) = test_config();
     let _keep_temp = temp;
     let mut output = Vec::new();
     let mut key_reader = |_| bail!("key reader should not be called");
@@ -1409,7 +1516,7 @@ fn run_account(
         command(argv),
         "default",
         "https://api.codewhale.net",
-        &config,
+        &mut config,
         secrets,
         secrets,
         machine,
@@ -1975,7 +2082,7 @@ fn logout_preserves_custody_until_server_confirms_revocation_or_dead_session() {
 #[test]
 fn account_computers_use_the_same_account_api_and_report_queued_starts() {
     const ID: &str = "123e4567-e89b-42d3-a456-426614174000";
-    let (_temp, config) = test_config();
+    let (_temp, mut config) = test_config();
     let (secrets, _) = test_secrets();
     let store = AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE);
     store
@@ -2007,14 +2114,21 @@ fn account_computers_use_the_same_account_api_and_report_queued_starts() {
         vec!["codewhale", "account", "computers", "show", ID],
         vec!["codewhale", "account", "computers", "start", ID],
         vec!["codewhale", "account", "computers", "pause", ID],
-        vec!["codewhale", "account", "computers", "delete", ID],
+        vec![
+            "codewhale",
+            "account",
+            "computers",
+            "delete",
+            ID,
+            "--discard-files",
+        ],
     ];
     for argv in commands {
         run_with(
             command(&argv),
             "default",
             DEFAULT_API_BASE,
-            &config,
+            &mut config,
             &secrets,
             &secrets,
             &machine::MachineKeyEnv::default(),
@@ -2106,7 +2220,7 @@ fn account_computers_refuse_unsafe_ids_machine_keys_and_unconfirmed_delete() {
 #[test]
 fn account_computers_json_preserves_server_metering_and_entitlement() {
     const ID: &str = "123e4567-e89b-42d3-a456-426614174000";
-    let (_temp, config) = test_config();
+    let (_temp, mut config) = test_config();
     let (secrets, _) = test_secrets();
     let account = AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE);
     account
@@ -2146,7 +2260,7 @@ fn account_computers_json_preserves_server_metering_and_entitlement() {
             command(&argv),
             "default",
             DEFAULT_API_BASE,
-            &config,
+            &mut config,
             &secrets,
             &secrets,
             &machine::MachineKeyEnv::default(),
@@ -2167,7 +2281,7 @@ fn account_computers_json_preserves_server_metering_and_entitlement() {
 #[test]
 fn account_computers_boat_trial_and_usage_send_explicit_consent_and_read_receipts() {
     const ID: &str = "123e4567-e89b-42d3-a456-426614174000";
-    let (_temp, config) = test_config();
+    let (_temp, mut config) = test_config();
     let (secrets, _) = test_secrets();
     AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE)
         .save(auth("access-secret", "refresh-secret", "acct-123"))
@@ -2209,7 +2323,7 @@ fn account_computers_boat_trial_and_usage_send_explicit_consent_and_read_receipt
             command(&argv),
             "default",
             DEFAULT_API_BASE,
-            &config,
+            &mut config,
             &secrets,
             &secrets,
             &machine::MachineKeyEnv::default(),
@@ -2249,7 +2363,7 @@ fn account_computers_boat_trial_and_usage_send_explicit_consent_and_read_receipt
 
 #[test]
 fn account_agents_create_model_bound_thread_and_send_with_same_session() {
-    let (_temp, config) = test_config();
+    let (_temp, mut config) = test_config();
     let (secrets, _) = test_secrets();
     AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE)
         .save(auth("access-secret", "refresh-secret", "acct-123"))
@@ -2336,7 +2450,7 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
             command(&argv),
             "default",
             DEFAULT_API_BASE,
-            &config,
+            &mut config,
             &secrets,
             &secrets,
             &machine::MachineKeyEnv::default(),

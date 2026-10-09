@@ -904,6 +904,7 @@ pub(crate) async fn spawned_dispatch_inner(
         batch: Some(initial_routed_usage.clone()),
     };
     let op = Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: prepare.content.clone(),
         images: Vec::new(),
@@ -1300,15 +1301,12 @@ pub(crate) async fn steer_user_message(
     let content = content.trim().to_string();
     let message_index = app.api_messages.len();
 
-    // A foreground shell blocks the turn loop that consumes steer input.
-    // Ask the shared shell manager to detach it before enqueueing the steer so
-    // the loop can leave the foreground wait and process this message (#4930).
-    if active_foreground_shell_running(app)
-        && let Err(err) = request_active_foreground_shell_background(app)
-    {
+    // A shell wait blocks the turn boundary that consumes steer input. Release
+    // only this session's live waits; the owned commands keep running (#6909).
+    if let Err(err) = request_active_shell_wait_detach(app) {
         restore_steer_paused_state(app, &paused_snapshot);
         engine_handle.set_paused(paused_snapshot.paused);
-        return Err(err.context("could not move foreground shell to /jobs before steering"));
+        return Err(err.context("could not release shell wait before steering"));
     }
 
     if let Err(err) = engine_handle.steer(content.clone()).await {

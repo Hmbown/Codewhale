@@ -65,6 +65,7 @@ async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() 
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "claim the next turn".to_string(),
             images: Vec::new(),

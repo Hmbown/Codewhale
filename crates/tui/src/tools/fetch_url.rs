@@ -481,6 +481,14 @@ fn artifact_metadata(write: ArtifactWrite) -> Value {
         "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&write.relative_path),
         "artifact_byte_size": write.byte_size,
         "artifact_preview": write.preview,
+        // Every artifact this tool writes is retrievable evidence, so flag it
+        // for the engine's `activate_result_dependencies` (same contract as
+        // the shell-truncation spillover): the next turn auto-activates
+        // `retrieve_tool_result`. Text overflows name that tool in their
+        // footer; binary PDF/media saves name only the saved-artifact path in
+        // their inline pointer, so this flag is what makes that pointer
+        // actionable rather than a dead end.
+        "evidence_available": true,
     })
 }
 
@@ -675,8 +683,17 @@ mod tests {
         assert!(inline.contains("retrieve_tool_result"));
         assert!(inline.chars().count() <= inline_char_budget(&context));
         assert_eq!(
-            std::fs::read_to_string(artifact.absolute_path).unwrap(),
+            std::fs::read_to_string(&artifact.absolute_path).unwrap(),
             full
+        );
+        // The footer names `retrieve_tool_result` as the recovery path; the
+        // evidence flag is what makes the engine auto-activate that tool on
+        // the next turn, so the named tool is actually present.
+        let metadata = artifact_metadata(artifact);
+        assert_eq!(
+            metadata.get("evidence_available"),
+            Some(&json!(true)),
+            "artifact metadata must flag retrievable evidence:\n{metadata}"
         );
     }
 

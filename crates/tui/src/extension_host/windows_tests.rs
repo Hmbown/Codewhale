@@ -8,6 +8,95 @@ use crate::plugins::activation::TestPolicyGuard;
 use crate::tools::spec::ToolContext;
 use serde_json::json;
 
+const ACL_LOCK_FIXTURE_DIR: &str = "CODEWHALE_WINDOWS_ACL_LOCK_FIXTURE_DIR";
+
+#[test]
+fn windows_acl_edit_guard_fixture() {
+    let Some(root) = std::env::var_os(ACL_LOCK_FIXTURE_DIR).map(PathBuf::from) else {
+        return;
+    };
+    fs::write(root.join("ready"), b"ready").unwrap();
+    let _guard = AclEditGuard::acquire().unwrap();
+    fs::write(root.join("acquired"), b"acquired").unwrap();
+}
+
+#[test]
+fn windows_acl_edit_guard_serializes_processes() {
+    // Retain the owned child even during an assertion panic. This fixture
+    // starts no descendants; cleanup never targets any other process.
+    struct FixtureChild(std::process::Child);
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let ready = root.path().join("ready");
+    let acquired = root.path().join("acquired");
+    let guard = AclEditGuard::acquire().unwrap();
+    let mut child = FixtureChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "extension_host::windows::tests::windows_acl_edit_guard_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            // The unique marker directory is supplied only to this child.
+            // No process-global environment mutation or env lock is needed.
+            .env(ACL_LOCK_FIXTURE_DIR, root.path())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "ACL fixture exited before its ready marker; exact fixture must run"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ACL fixture was not ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let held_until = std::time::Instant::now() + Duration::from_millis(200);
+    while std::time::Instant::now() < held_until {
+        assert!(
+            !acquired.exists(),
+            "child acquired the parent's held ACL lock"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "ACL fixture exited while the parent still held the lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!acquired.exists(), "child acquired before parent release");
+    drop(guard);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "ACL fixture failed: {status}");
+            assert!(
+                acquired.exists(),
+                "fixture exited without acquiring the lock"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ACL fixture did not acquire and exit after parent release"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn runtime(choice: ExtensionHostRuntime, override_path: Option<&Path>) -> Option<HostRuntime> {
     let resolution = crate::dependencies::resolve_extension_host_runtime(
         choice,
@@ -554,6 +643,36 @@ fn windows_profile_retirement_removes_only_its_grants_and_inherited_data_on_rest
 }
 
 #[test]
+fn windows_bundle_directory_listing_never_grants_children_and_retires_exactly() {
+    let root = tempfile::tempdir().unwrap();
+    let sibling = root.path().join("builtin-private.json");
+    fs::write(&sibling, b"retained private data").unwrap();
+    let before = acl_snapshot_view(root.path(), None, true);
+    let sibling_before = acl_snapshot_view(&sibling, None, true);
+    let sandbox = NativeSandbox {
+        profile: Arc::new(Profile::create().unwrap()),
+        _assets: Arc::new(tempfile::tempdir().unwrap()),
+        program: PathBuf::new(),
+        data: root.path().to_path_buf(),
+    };
+    sandbox.grant_directory(root.path()).unwrap();
+    assert_ne!(acl_snapshot_view(root.path(), None, true), before);
+    assert_eq!(
+        acl_snapshot_view(root.path(), Some(sandbox.profile.sid), true),
+        before,
+        "directory listing must preserve every pre-existing ACE and control bit"
+    );
+    assert_no_profile_grant(&sibling, sandbox.profile.sid);
+    let created = root.path().join("created-after-grant.json");
+    fs::write(&created, b"private after admission").unwrap();
+    assert_no_profile_grant(&created, sandbox.profile.sid);
+    drop(sandbox);
+    assert_eq!(acl_snapshot_view(root.path(), None, true), before);
+    assert_eq!(acl_snapshot_view(&sibling, None, true), sibling_before);
+    assert_eq!(fs::read(&created).unwrap(), b"private after admission");
+}
+
+#[test]
 fn windows_profile_directory_budget_and_recorded_identity_refuse_before_overwrite() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("first"), b"one").unwrap();
@@ -567,13 +686,17 @@ fn windows_profile_directory_budget_and_recorded_identity_refuse_before_overwrit
     let profile = Profile::create().unwrap();
     let path = root.path().join("first");
     let original = File::open(&path).unwrap();
-    profile.remember(&path, &original, false).unwrap();
+    profile.remember(&path, &original, GrantKind::File).unwrap();
     let identity = profile.grants.lock().unwrap().get(&path).unwrap().identity;
     drop(original);
     fs::rename(&path, root.path().join("moved-original")).unwrap();
     fs::write(&path, b"different object").unwrap();
     let replacement = File::open(&path).unwrap();
-    assert!(profile.remember(&path, &replacement, false).is_err());
+    assert!(
+        profile
+            .remember(&path, &replacement, GrantKind::File)
+            .is_err()
+    );
     assert_eq!(
         profile.grants.lock().unwrap().get(&path).unwrap().identity,
         identity

@@ -158,8 +158,12 @@ replacements = ["BackupRoute/fixture-backup-model"]
         );
         let body = bodies.lock().unwrap().last().unwrap().clone();
         assert_eq!(body["model"], "fixture-backup-model");
+        // `body` is searched as serialized JSON, so search for `expected` in
+        // its JSON-escaped form: a Windows cwd's `\` serializes as `\\`.
+        let expected_json = serde_json::Value::String(expected.clone()).to_string();
+        let expected_json = &expected_json[1..expected_json.len() - 1];
         assert!(
-            body.to_string().contains(&expected),
+            body.to_string().contains(expected_json),
             "the actual replacement request must include the new captured model: {body}"
         );
         let other = if tag == "B" { "A" } else { "B" };

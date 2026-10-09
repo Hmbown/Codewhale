@@ -1390,12 +1390,10 @@ pub struct GoalConfig {
     #[serde(default)]
     pub max_continuations: Option<u32>,
 
-    /// Per-engine-turn step allowance while a goal is active (#5994). Goal
-    /// work gets a larger but still finite budget than an ordinary
-    /// interactive turn: `None` or `0` resolves to
-    /// [`crate::goal_loop::DEFAULT_GOAL_MAX_STEPS`] (1,000); values clamp to
-    /// `1..=100,000`. This bounds each turn, never the number of
-    /// continuation passes; explicit per-invocation ceilings
+    /// Optional per-engine-turn step ceiling while a goal is active (#6512).
+    /// Like ordinary turns, `None` or `0` leaves model steps uncapped;
+    /// positive values clamp to `1..=100,000`. This bounds each turn, never
+    /// the number of continuation passes; explicit per-invocation ceilings
     /// (`exec --max-turns`, child-worker caps) still win.
     #[serde(default)]
     pub max_steps: Option<u32>,
@@ -2198,10 +2196,17 @@ pub(crate) struct AccountModelAccess {
 /// Resolved CLI configuration, including defaults and environment overrides.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub(crate) account_profile: Option<String>,
+    /// Diagnostic clones must never refresh or mutate plugin OAuth credentials.
+    #[serde(skip)]
+    pub(crate) plugin_oauth_read_only: bool,
     /// Never deserialized from disk or exposed as provider configuration.
     #[serde(skip)]
     pub(crate) account_model_access:
         std::sync::Arc<parking_lot::RwLock<Option<AccountModelAccess>>>,
+    #[serde(skip)]
+    pub(crate) required_account_model_owner: Option<String>,
     /// Persisted exact-route declarations, separate from provider credentials.
     #[serde(
         default,
@@ -2349,10 +2354,14 @@ pub struct Config {
     /// Optional API key for the external sandbox backend (sent as Bearer token).
     #[serde(alias = "sandboxApiKey")]
     pub sandbox_api_key: Option<String>,
-    /// When true and `/usr/bin/bwrap` is executable on Linux, route exec_shell
-    /// through bubblewrap (#2184).
-    /// Defaults to false. Requires the `bubblewrap` package to be installed
-    /// separately — we do NOT vendor bwrap.
+    /// When true and bubblewrap actually works on this Linux host, route
+    /// sandboxed exec_shell commands through it (#2184).
+    /// Defaults to true — an unset key means sandboxed commands run under
+    /// bwrap whenever `/usr/bin/bwrap` is installed and can create its
+    /// namespaces. An explicit `prefer_bwrap = false` opts out and leaves
+    /// Linux commands unwrapped (the posture then reports policy-only).
+    /// Requires the `bubblewrap` package to be installed separately — we do
+    /// NOT vendor bwrap.
     #[serde(alias = "preferBwrap")]
     pub prefer_bwrap: Option<bool>,
     /// Additional host paths to bind read-only inside the bubblewrap sandbox
@@ -2586,6 +2595,13 @@ pub struct Config {
     #[serde(skip)]
     pub loaded_config_path: Option<PathBuf>,
 
+    /// Runtime-only receipt that a higher-precedence layer supplied `[network]`
+    /// — a managed overlay. The resolved policy is then not the user
+    /// document's to replace: a mid-session re-read of that document must not
+    /// widen what the higher layer set.
+    #[serde(skip)]
+    pub(crate) network_layer_is_managed: bool,
+
     /// A resolved startup snapshot never reads remembered route choices again.
     /// False means an explicit config/profile owns the route instead.
     #[serde(skip)]
@@ -2743,14 +2759,17 @@ pub struct AutoReviewRuleConfig {
 }
 
 impl AutoReviewConfig {
-    fn to_runtime_policy(&self) -> crate::tui::auto_review::AutoReviewPolicy {
-        crate::tui::auto_review::AutoReviewPolicy {
+    fn to_runtime_policy(&self) -> crate::core::authority::auto_review::AutoReviewPolicy {
+        crate::core::authority::auto_review::AutoReviewPolicy {
             allow_rules: self
                 .allow
                 .iter()
                 .enumerate()
                 .map(|(index, rule)| {
-                    rule.to_runtime_rule(index, crate::tui::auto_review::AutoReviewAction::Allow)
+                    rule.to_runtime_rule(
+                        index,
+                        crate::core::authority::auto_review::AutoReviewAction::Allow,
+                    )
                 })
                 .collect(),
             block_rules: self
@@ -2758,7 +2777,10 @@ impl AutoReviewConfig {
                 .iter()
                 .enumerate()
                 .map(|(index, rule)| {
-                    rule.to_runtime_rule(index, crate::tui::auto_review::AutoReviewAction::Block)
+                    rule.to_runtime_rule(
+                        index,
+                        crate::core::authority::auto_review::AutoReviewAction::Block,
+                    )
                 })
                 .collect(),
         }
@@ -2775,12 +2797,12 @@ impl AutoReviewRuleConfig {
     fn to_runtime_rule(
         &self,
         index: usize,
-        action: crate::tui::auto_review::AutoReviewAction,
-    ) -> crate::tui::auto_review::AutoReviewRule {
+        action: crate::core::authority::auto_review::AutoReviewAction,
+    ) -> crate::core::authority::auto_review::AutoReviewRule {
         let id_prefix = match action {
-            crate::tui::auto_review::AutoReviewAction::Allow => "allow",
-            crate::tui::auto_review::AutoReviewAction::Block => "block",
-            crate::tui::auto_review::AutoReviewAction::AskUser => "ask",
+            crate::core::authority::auto_review::AutoReviewAction::Allow => "allow",
+            crate::core::authority::auto_review::AutoReviewAction::Block => "block",
+            crate::core::authority::auto_review::AutoReviewAction::AskUser => "ask",
         };
         let id = self
             .id
@@ -2797,14 +2819,14 @@ impl AutoReviewRuleConfig {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("configured auto-review {id_prefix} rule"));
         let mut rule = match action {
-            crate::tui::auto_review::AutoReviewAction::Allow => {
-                crate::tui::auto_review::AutoReviewRule::allow(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::Allow => {
+                crate::core::authority::auto_review::AutoReviewRule::allow(id, reason)
             }
-            crate::tui::auto_review::AutoReviewAction::Block => {
-                crate::tui::auto_review::AutoReviewRule::block(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::Block => {
+                crate::core::authority::auto_review::AutoReviewRule::block(id, reason)
             }
-            crate::tui::auto_review::AutoReviewAction::AskUser => {
-                crate::tui::auto_review::AutoReviewRule::block(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::AskUser => {
+                crate::core::authority::auto_review::AutoReviewRule::block(id, reason)
             }
         };
 
@@ -2877,16 +2899,20 @@ fn validate_auto_review_rules(kind: &str, rules: &[AutoReviewRuleConfig]) -> Res
     Ok(())
 }
 
-fn parse_auto_review_action_kind(raw: &str) -> Option<crate::tui::auto_review::ToolActionKind> {
+fn parse_auto_review_action_kind(
+    raw: &str,
+) -> Option<crate::core::authority::auto_review::ToolActionKind> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "read" | "mcp_read" => Some(crate::tui::auto_review::ToolActionKind::Read),
-        "write" => Some(crate::tui::auto_review::ToolActionKind::Write),
-        "shell" => Some(crate::tui::auto_review::ToolActionKind::Shell),
+        "read" | "mcp_read" => Some(crate::core::authority::auto_review::ToolActionKind::Read),
+        "write" => Some(crate::core::authority::auto_review::ToolActionKind::Write),
+        "shell" => Some(crate::core::authority::auto_review::ToolActionKind::Shell),
         "external" | "network" | "git" | "mcp_action" | "browser" | "unknown" => {
-            Some(crate::tui::auto_review::ToolActionKind::External)
+            Some(crate::core::authority::auto_review::ToolActionKind::External)
         }
-        "publish" => Some(crate::tui::auto_review::ToolActionKind::Publish),
-        "destructive" | "secret" => Some(crate::tui::auto_review::ToolActionKind::Destructive),
+        "publish" => Some(crate::core::authority::auto_review::ToolActionKind::Publish),
+        "destructive" | "secret" => {
+            Some(crate::core::authority::auto_review::ToolActionKind::Destructive)
+        }
         _ => None,
     }
 }
@@ -3050,6 +3076,33 @@ impl NetworkPolicyToml {
     }
 }
 
+/// Re-read the `[network]` table from a configuration document.
+///
+/// Deliberately narrower than [`Config::load`]: this runs on the tool-context
+/// build path, where re-applying the environment, managed, and credential
+/// layers would be both wasteful and wrong. Only the document's own table comes
+/// back — the same table `/network allow <host>` edits.
+///
+/// `None` means there is nothing usable to adopt: the document is missing,
+/// unreadable, unparseable, or carries no `[network]` table. Callers keep the
+/// policy they already hold, which is the conservative direction for an
+/// allow/deny gate.
+///
+/// Known limitation: `[profiles.<name>.network]` is not consulted. `/network`
+/// does not write it either, so a live session and the command agree on this
+/// base table.
+#[must_use]
+pub fn network_policy_from_document(path: &Path) -> Option<crate::network_policy::NetworkPolicy> {
+    #[derive(Deserialize)]
+    struct NetworkTable {
+        network: Option<NetworkPolicyToml>,
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    let parsed: NetworkTable = toml::from_str(&contents).ok()?;
+    parsed.network.map(NetworkPolicyToml::into_runtime)
+}
+
 /// `[lsp]` table — mirrors [`crate::lsp::LspConfig`]. Documented in
 /// `config.example.toml`. When omitted, defaults from `LspConfig::default()`
 /// apply (enabled, 5 s poll, 20 diagnostics/file, errors only, no overrides).
@@ -3139,6 +3192,9 @@ pub struct ProviderConfig {
     pub wire: Option<String>,
     #[serde(alias = "authMode")]
     pub auth_mode: Option<String>,
+    /// Core-owned public-client OAuth descriptor for a named plugin provider.
+    #[serde(default)]
+    pub oauth: Option<crate::oauth::PluginOAuthConfig>,
     /// Validated basename of the active Codewhale-owned xAI OAuth generation.
     /// The file always lives below Codewhale's private credentials directory.
     #[serde(default, alias = "oauthCredentialGeneration")]
@@ -3174,6 +3230,9 @@ pub struct ProviderConfig {
     /// than silently routing as OpenAI. Built-in providers leave this unset.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Runtime-only receipt; a config file cannot manufacture plugin authority.
+    #[serde(skip)]
+    pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
     /// Name of the environment variable holding this custom provider's API key
     /// (#1519), e.g. `api_key_env = "EXAMPLE_API_KEY"`. The key value itself is
     /// never stored in config; only the env var name is.
@@ -3683,6 +3742,17 @@ impl Config {
     #[must_use]
     pub fn effective_sandbox_denied_read_paths(&self) -> Vec<std::path::PathBuf> {
         self.read_denylist().subtree_paths()
+    }
+
+    /// Whether Linux shell commands prefer bubblewrap confinement.
+    ///
+    /// On by default: an unset `prefer_bwrap` means sandboxed commands use
+    /// the OS wrapper whenever `/usr/bin/bwrap` works on this host, matching
+    /// the Seatbelt behavior macOS already has. An explicit `false` opts out
+    /// and leaves Linux commands unwrapped.
+    #[must_use]
+    pub fn prefers_bwrap(&self) -> bool {
+        self.prefer_bwrap.unwrap_or(true)
     }
 
     #[must_use]
@@ -4262,7 +4332,7 @@ impl Config {
     }
 
     #[must_use]
-    pub fn auto_review_policy(&self) -> crate::tui::auto_review::AutoReviewPolicy {
+    pub fn auto_review_policy(&self) -> crate::core::authority::auto_review::AutoReviewPolicy {
         self.auto_review
             .as_ref()
             .map(AutoReviewConfig::to_runtime_policy)
@@ -4304,6 +4374,7 @@ impl Config {
         })?;
         let legacy_root = parsed.legacy_root.clone();
         let mut config = apply_profile(parsed, profile)?;
+        config.account_profile = profile.map(str::to_owned);
         config.legacy_root = legacy_root;
         Ok(config)
     }
@@ -4336,6 +4407,7 @@ impl Config {
         };
 
         // Scope and profile choices outrank device startup memory. Environment
+        config.account_profile = profile.map(str::to_owned);
         // and managed values are applied afterwards, so their models win too.
         if profile.is_none() && path.as_deref().is_some_and(is_home_config_path) {
             if let Ok(settings) =
@@ -4350,6 +4422,7 @@ impl Config {
         apply_env_overrides(&mut config, environment_policy);
         apply_managed_overrides(&mut config)?;
         apply_requirements(&mut config)?;
+        crate::plugins::providers::apply_startup_providers(&mut config)?;
         normalize_model_config(&mut config);
         config.exec_policy_engine = load_sibling_exec_policy_engine(path.as_deref())?;
         config.loaded_config_path = path.as_deref().map(std::path::absolute).transpose()?;
@@ -6281,6 +6354,30 @@ impl Config {
                 && base_url_uses_local_host(&self.active_route_base_url()))
     }
 
+    pub(crate) fn bind_account_model_owner(&mut self, owner: &str) -> Result<()> {
+        anyhow::ensure!(
+            !owner.is_empty()
+                && owner.len() <= 240
+                && !owner.chars().any(|c| c.is_control() || c.is_whitespace()),
+            "Invalid account model owner"
+        );
+        let access = self
+            .account_model_access
+            .read()
+            .clone()
+            .context("Connect account model access before running the Codewhale agent")?;
+        self.account_model_access = std::sync::Arc::new(parking_lot::RwLock::new(Some(access)));
+        self.required_account_model_owner = Some(owner.to_string());
+        let identity = self
+            .resolve_persisted_provider_identity(Some("codewhale"), Some("codewhale"))
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            self.account_model_api_key(&identity).is_some(),
+            "Codewhale agent model access must belong to the signed-in account"
+        );
+        Ok(())
+    }
+
     pub(crate) fn account_model_api_key(&self, identity: &ProviderIdentity) -> Option<String> {
         let provider = identity.provider;
         // Exact endpoint binding, including path. A custom Codewhale route
@@ -6309,7 +6406,11 @@ impl Config {
         .runtime_info_at(chrono::Utc::now())
         .ok()?;
         (account.state == codewhale_secrets::account::AccountSessionState::Authenticated
-            && account.session_id.as_deref() == Some(access.session_id.as_str()))
+            && account.session_id.as_deref() == Some(access.session_id.as_str())
+            && self
+                .required_account_model_owner
+                .as_ref()
+                .is_none_or(|owner| account.account_id.as_ref() == Some(owner)))
         .then(|| access.credential.expose_secret().to_string())
     }
 
@@ -6320,6 +6421,9 @@ impl Config {
         &self,
         identity: &ProviderIdentity,
     ) -> Option<crate::route_receipt::CredentialGeneration> {
+        if self.required_account_model_owner.is_some() {
+            return None;
+        }
         self.verify_provider_identity(identity).ok()?;
         let mut scoped = self.clone();
         scoped.scope_to_provider_identity(identity).ok()?;
@@ -6475,8 +6579,22 @@ impl Config {
             .active_provider_identity()
             .map_err(anyhow::Error::msg)?;
 
-        let api_key = self.active_route_api_key_read_only()?;
         let mut diagnostic = self.clone();
+        if identity.provider == ProviderKind::Anthropic
+            && self.auth_mode_for_provider(&identity).as_deref() == Some("oauth")
+        {
+            diagnostic.plugin_oauth_read_only = true;
+            return Ok(diagnostic);
+        }
+        if identity.provider == ProviderKind::Custom
+            && self
+                .provider_config_for(&identity)
+                .is_some_and(|entry| entry.oauth.is_some())
+        {
+            diagnostic.plugin_oauth_read_only = true;
+            return Ok(diagnostic);
+        }
+        let api_key = self.active_route_api_key_read_only()?;
         diagnostic.set_provider_api_key_override(&identity, Some(api_key))?;
         Ok(diagnostic)
     }
@@ -6490,6 +6608,11 @@ impl Config {
             .map_err(anyhow::Error::msg)?;
         self.verify_provider_identity(&identity)
             .map_err(anyhow::Error::msg)?;
+        if self.required_account_model_owner.is_some() {
+            return self.account_model_api_key(&identity)
+                .map(|key| (key, "Codewhale account".to_string()))
+                .context("The selected account model access is unavailable; no credential fallback is allowed");
+        }
         let provider = identity.provider;
         let keyless = || (String::new(), "none (keyless route)".to_string());
 
@@ -6497,8 +6620,51 @@ impl Config {
             anyhow::bail!(codewhale_config::LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE);
         }
         let auth_mode = self.auth_mode_for_provider(&identity);
+        if provider == ProviderKind::Custom
+            && let Some(entry) = self.provider_config_for(&identity)
+            && let Some(oauth) = entry.oauth.as_ref()
+        {
+            entry
+                .plugin_authority
+                .as_ref()
+                .context("Plugin OAuth route lacks an approved plugin authority")?;
+            anyhow::ensure!(
+                auth_mode.as_deref() == Some("oauth"),
+                "Plugin OAuth route requires auth_mode = oauth"
+            );
+            self.provider
+                .as_deref()
+                .context("Plugin OAuth route has no provider name")?;
+            oauth.validate()?;
+            // Generic config/client construction must never read secure storage,
+            // hash plugin files or refresh OAuth on an async caller's thread.
+            // The request worker verifies the receipt, resolves the bound token
+            // and checks revocation again immediately before each actual send.
+            return Ok((String::new(), "host-managed plugin OAuth".to_string()));
+        }
+
         if auth_mode_disables_api_key(auth_mode.as_deref()) {
             return Ok(keyless());
+        }
+        if provider == ProviderKind::Anthropic && auth_mode.as_deref() == Some("oauth") {
+            anyhow::ensure!(
+                matches!(
+                    self.base_url_for_route(&identity).trim_end_matches('/'),
+                    "https://api.anthropic.com" | "https://api.anthropic.com/v1"
+                ),
+                "Claude subscription credentials require the native Anthropic endpoint"
+            );
+            if read_only {
+                return Ok((
+                    crate::oauth::get_owned_credentials_read_only(
+                        crate::oauth::OAuthProvider::Claude,
+                        self,
+                    )?
+                    .access_token,
+                    "Claude sign-in".to_string(),
+                ));
+            }
+            return Ok((String::new(), "Claude sign-in".to_string()));
         }
         let custom_endpoint = self.provider_uses_custom_endpoint(&identity);
         let explicit_cli_key = explicit_cli_api_key_override();
@@ -6988,22 +7154,20 @@ impl Config {
             .unwrap_or(crate::goal_loop::DEFAULT_MAX_GOAL_CONTINUATIONS)
     }
 
-    /// Per-engine-turn step allowance while a goal is active (#5994). Goal
-    /// turns get [`crate::goal_loop::DEFAULT_GOAL_MAX_STEPS`] by default —
-    /// five times the ordinary interactive allowance — while staying finite.
+    /// Per-engine-turn model-step budget while a goal is active (#6512).
+    /// Uses the ordinary turn resolver: omitted or zero is uncapped, and
+    /// explicit positive ceilings are clamped to its supported range.
     #[must_use]
     pub fn goal_max_steps(&self) -> u32 {
         let configured = self.goal.as_ref().and_then(|goal| goal.max_steps);
-        match configured {
-            None | Some(0) => crate::goal_loop::DEFAULT_GOAL_MAX_STEPS,
-            Some(steps) => {
-                let clamped = steps.clamp(1, 100_000);
-                if clamped != steps {
-                    tracing::warn!("[goal] max_steps={steps} out of range; clamping to {clamped}");
-                }
-                clamped
-            }
+        let resolved = crate::core::engine::turn_budget::resolve_max_model_steps(configured);
+        if let Some(steps) = configured
+            && steps > 0
+            && resolved != steps
+        {
+            tracing::warn!("[goal] max_steps={steps} out of range; clamping to {resolved}");
         }
+        resolved
     }
 
     /// Whether a goal's `token_budget` is a hard stop (#6013). Default `false`
@@ -7777,9 +7941,9 @@ impl Config {
         self.approval.unwrap_or_default().default_selection
     }
 
-    /// Effective expiry for the interactive approval card (#6101).
+    /// Effective expiry for the Engine-held approval request (#6101).
     /// `None` (absent or an explicit `0`) waits indefinitely; a positive
-    /// value bounds the wait and expiry resolves to deny (fail-closed).
+    /// value bounds the wait, including a hidden card, and expiry blocks the call.
     /// Values above 24h clamp with a warning.
     #[must_use]
     pub fn approval_timeout(&self) -> Option<std::time::Duration> {
@@ -7942,13 +8106,28 @@ fn root_deepseek_model_is_foreign_to_direct_provider(provider: ProviderKind, mod
 // the workspace-trust/config-load logic that stays in this file (#3311).
 mod home;
 mod paths;
+#[cfg(test)]
+pub(crate) use paths::clipboard_images_dir_for_home;
 use paths::{
     canonicalize_or_keep, codewhale_home_dir, default_config_path, default_managed_config_path,
     default_mcp_config_path, default_memory_path, default_notes_path, default_requirements_path,
     default_skills_dir, env_config_path, expand_pathbuf, try_default_config_path,
     workspace_config_key,
 };
-pub(crate) use paths::{effective_home_dir, expand_path, home_config_path, is_home_config_path};
+pub(crate) use paths::{
+    clipboard_images_dir, effective_home_dir, expand_path, home_config_path, is_home_config_path,
+};
+
+/// Activate facts only at accepted inference runtime settings boundaries.
+/// Identical settings preserve the shared ticket; readers track its generation.
+pub(crate) fn initialize_cloud_facts(config: &Config) {
+    let settings = config.cloud_facts_config().settings();
+    codewhale_cloud_facts::configure(&settings);
+    codewhale_cloud_facts::maybe_load_persisted_cache(&settings);
+    if tokio::runtime::Handle::try_current().is_ok() {
+        codewhale_cloud_facts::spawn_background_refresh(settings, None);
+    }
+}
 
 pub(crate) fn workspace_trust_config_candidate_paths() -> Vec<PathBuf> {
     #[cfg(test)]
@@ -8177,7 +8356,11 @@ fn provider_env_base_url_override(provider: ProviderKind) -> Option<String> {
         ProviderKind::Openai => &["OPENAI_BASE_URL"],
         ProviderKind::Atlascloud => &["ATLASCLOUD_BASE_URL"],
         ProviderKind::Openrouter => &["OPENROUTER_BASE_URL"],
-        ProviderKind::Orcarouter => &["ORCAROUTER_BASE_URL"],
+        // The inference/catalog origin. OrcaRouter's **auth** origin is a
+        // different host and is resolved by
+        // `crate::oauth::resolve_orcarouter_auth_base`; the two never derive
+        // from each other.
+        ProviderKind::Orcarouter => &["ORCA_API_BASE_URL", "ORCA_BASE_URL", "ORCAROUTER_BASE_URL"],
         ProviderKind::XiaomiMimo => &["XIAOMI_MIMO_BASE_URL", "MIMO_BASE_URL"],
         ProviderKind::WanjieArk => &[
             "WANJIE_ARK_BASE_URL",
@@ -10142,7 +10325,7 @@ fn model_for_provider(provider: ProviderKind, normalized: String) -> String {
     }
 }
 
-fn normalize_base_url(base: &str) -> String {
+pub(crate) fn normalize_base_url(base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     let deepseek_domains = ["api.deepseek.com", "api.deepseeki.com"];
     if deepseek_domains
@@ -10383,6 +10566,8 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         notifications: override_cfg.notifications.or(base.notifications),
         approval: override_cfg.approval.or(base.approval),
         network: override_cfg.network.or(base.network),
+        network_layer_is_managed: override_cfg.network_layer_is_managed
+            || base.network_layer_is_managed,
         verifier: override_cfg.verifier.or(base.verifier),
         advisor: override_cfg.advisor.or(base.advisor),
         skills: merge_skills_config(base.skills, override_cfg.skills),
@@ -10417,6 +10602,9 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         legacy_root: base.legacy_root,
         legacy_root_custom_generation: base.legacy_root_custom_generation,
         account_model_access: base.account_model_access,
+        required_account_model_owner: base.required_account_model_owner,
+        account_profile: override_cfg.account_profile.or(base.account_profile),
+        plugin_oauth_read_only: base.plugin_oauth_read_only || override_cfg.plugin_oauth_read_only,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
         runtime_thread_inference_unrelated: override_cfg.runtime_thread_inference_unrelated
             || base.runtime_thread_inference_unrelated,
@@ -10490,6 +10678,8 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         mode: override_cfg.mode.or(base.mode),
         wire: override_cfg.wire.or(base.wire),
         auth_mode: override_cfg.auth_mode.or(base.auth_mode),
+        oauth: override_cfg.oauth.or(base.oauth),
+        plugin_authority: base.plugin_authority,
         oauth_credential_generation: override_cfg
             .oauth_credential_generation
             .or(base.oauth_credential_generation),
@@ -10903,6 +11093,12 @@ fn apply_managed_overrides(config: &mut Config) -> Result<()> {
             merged.provider_config_for_mut(&owner)?.base_url = None;
         }
         merged.base_url_env_receipt = BaseUrlEnvReceipt::NoOwner;
+    }
+    // A managed `[network]` table outranks the user document. Record that the
+    // resolved policy is not the document's to replace, so a mid-session
+    // re-read of that document folds onto it instead of widening it.
+    if managed.network.is_some() {
+        merged.network_layer_is_managed = true;
     }
     *config = merged;
     Ok(())
@@ -11403,6 +11599,8 @@ fn provider_uses_oauth_credentials(config: &Config, identity: &ProviderIdentity)
     !auth_mode_disables_api_key(config.auth_mode_for_provider(identity).as_deref())
         && !config.provider_uses_custom_endpoint(identity)
         && (provider == ProviderKind::OpenaiCodex
+            || (provider == ProviderKind::Anthropic
+                && config.auth_mode_for_provider(identity).as_deref() == Some("oauth"))
             || (provider == ProviderKind::Moonshot
                 && config
                     .provider_config_for(identity)
@@ -11492,21 +11690,35 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
 
 #[must_use]
 pub fn active_provider_has_env_api_key(config: &Config) -> bool {
-    let Ok(identity) = config.active_provider_identity() else {
-        return false;
-    };
+    active_provider_env_api_key_source(config).is_some()
+}
+
+/// Where the active provider's environment key comes from, in the resolver's
+/// env precedence (`credential_resolve` steps 2-4): `--api-key`, the route's
+/// `api_key_env` variable, or the provider's own ambient variable. Returns the
+/// place's name only; any value read to test presence is dropped here.
+#[must_use]
+pub(crate) fn active_provider_env_api_key_source(config: &Config) -> Option<String> {
+    let identity = config.active_provider_identity().ok()?;
     let provider = identity.provider;
     if provider == ProviderKind::OpenaiCodex && !config.provider_uses_custom_endpoint(&identity) {
-        return false;
+        return None;
     }
     if auth_mode_disables_api_key(config.auth_mode_for_provider(&identity).as_deref()) {
-        return false;
+        return None;
     }
-    (!provider_uses_oauth_credentials(config, &identity)
-        && explicit_cli_api_key_override().is_some())
-        || provider_config_env_api_key(config, &identity).is_some()
-        || (!config.should_skip_secret_store_for_provider(&identity)
-            && provider_env_api_key(provider).is_some())
+    if !provider_uses_oauth_credentials(config, &identity)
+        && explicit_cli_api_key_override().is_some()
+    {
+        return Some("--api-key".to_string());
+    }
+    if provider_config_env_api_key(config, &identity).is_some() {
+        return bound_provider_api_key_env_name(config, &identity);
+    }
+    if config.should_skip_secret_store_for_provider(&identity) {
+        return None;
+    }
+    provider_env_api_key_named(provider).map(|(name, _)| name.to_string())
 }
 
 #[must_use]
@@ -11582,6 +11794,14 @@ fn user_global_config_api_key(identity: &ProviderIdentity) -> Option<String> {
 /// prompt for a key inline.
 #[must_use]
 pub fn has_api_key_for(config: &Config, identity: &ProviderIdentity) -> bool {
+    if identity.provider == ProviderKind::Custom
+        && config
+            .provider_config_for(identity)
+            .is_some_and(|entry| entry.oauth.is_some())
+    {
+        return crate::provider_readiness::credential_state_for_provider(config, identity)
+            == crate::provider_readiness::CredentialState::Saved;
+    }
     credential_resolve::resolve_credential_source(config, identity).is_present()
 }
 
@@ -11762,6 +11982,15 @@ pub(crate) fn save_api_key_for_identity(
             save_api_key_for_identity_unlocked(identity, route_config, api_key)
         });
     }
+    if identity.provider == ProviderKind::Anthropic {
+        return codewhale_config::with_xai_oauth_lifecycle_lock(|_| {
+            let saved = save_api_key_for_identity_unlocked(identity, route_config, api_key)?;
+            codewhale_config::clear_all_claude_oauth_credentials_locked().context(
+                "API-key billing was selected and saved, but old Claude sign-in cleanup failed",
+            )?;
+            Ok(saved)
+        });
+    }
     save_api_key_for_identity_unlocked(identity, route_config, api_key)
 }
 
@@ -11852,7 +12081,7 @@ fn save_api_key_for_identity_unlocked(
                                     doc,
                                     &["providers", key_inside, "external_credentials"],
                                 )?;
-                                if provider == ProviderKind::Xai {
+                                if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
                                     crate::config_persistence::unset_document_value(
                                         doc,
                                         &["providers", key_inside, "oauth_credential_generation"],
@@ -11939,7 +12168,7 @@ fn save_api_key_for_identity_unlocked(
             doc,
             &["providers", key_inside, "external_credentials"],
         )?;
-        if provider == ProviderKind::Xai {
+        if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
             crate::config_persistence::unset_document_value(
                 doc,
                 &["providers", key_inside, "oauth_credential_generation"],
@@ -12259,8 +12488,10 @@ fn provider_config_table_name(identity: &ProviderIdentity) -> Result<String> {
     Ok(format!("providers.{}", provider_config_key(identity)?))
 }
 
-fn provider_env_api_key(provider: ProviderKind) -> Option<String> {
-    provider_env_api_key_named(provider).map(|(_, value)| value)
+/// Name of the ambient provider variable that currently holds a non-empty key
+/// for `provider`. Presence only: the value is dropped here.
+pub(crate) fn provider_env_api_key_var(provider: ProviderKind) -> Option<&'static str> {
+    provider_env_api_key_named(provider).map(|(name, _)| name)
 }
 
 /// The provider's ambient env key and the variable that supplied it,

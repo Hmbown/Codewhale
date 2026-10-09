@@ -578,7 +578,7 @@ fn calls_blocked_before_running_are_not_counted_as_run() {
         tool_use("p1", "exec_shell", json!({"command": "rm notes.md"})),
         tool_result(
             "p1",
-            "Error: Tool 'exec_shell' was denied: 'exec_shell' is not available in Plan mode - switch to Work mode (`/mode work`) to modify files or run write-capable tools.",
+            "Error: Tool 'exec_shell' was denied: 'exec_shell' is not available in Plan mode: Plan has no file-writing or write-capable tools. The user can change modes with /mode.",
             true,
         ),
     ];

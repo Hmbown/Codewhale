@@ -6053,6 +6053,61 @@ var init_skill_filesystem = __esm({
   }
 });
 
+// src/dsh/canonical-path.ts
+import { realpathSync } from "node:fs";
+import { posix, win32 } from "node:path";
+function canonicalPath(path, platform = process.platform) {
+  if (platform !== "win32") return realpathSync(path);
+  try {
+    return stripVerbatim(realpathSync.native(path), platform);
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : void 0;
+    if (code === "EPERM" || code === "EACCES") {
+      return stripVerbatim(win32.normalize(path), platform);
+    }
+    throw error;
+  }
+}
+function stripVerbatim(path, platform = process.platform) {
+  if (platform !== "win32") return path;
+  if (/^[\\/]{2}\?[\\/]UNC[\\/]/i.test(path)) return `\\\\${path.slice(8)}`;
+  if (/^[\\/]{2}\?[\\/]/.test(path)) return path.slice(4);
+  return path;
+}
+function pathKey(path, platform = process.platform) {
+  if (platform !== "win32") return posix.normalize(path);
+  return win32.normalize(stripVerbatim(path, platform)).toLowerCase();
+}
+function samePath(a, b, platform = process.platform) {
+  return pathKey(a, platform) === pathKey(b, platform);
+}
+function insideKey(root, target, platform = process.platform) {
+  const path = platform === "win32" ? win32 : posix;
+  const inside = path.relative(stripVerbatim(root, platform), stripVerbatim(target, platform));
+  if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return void 0;
+  return platform === "win32" ? inside.split(win32.sep).join("/") : inside;
+}
+function isUnlinkedInside(root, key, target, platform = process.platform) {
+  let canonicalRoot, canonicalTarget;
+  try {
+    canonicalRoot = canonicalPath(root, platform);
+    canonicalTarget = canonicalPath(target, platform);
+  } catch {
+    return false;
+  }
+  return unlinkedKeyMatches(canonicalRoot, key, canonicalTarget, platform);
+}
+function unlinkedKeyMatches(canonicalRoot, key, canonicalTarget, platform = process.platform) {
+  if (!key || key.split("/").some((part) => !part || part === "." || part === "..")) return false;
+  const path = platform === "win32" ? win32 : posix;
+  return samePath(path.join(stripVerbatim(canonicalRoot, platform), ...key.split("/")), canonicalTarget, platform);
+}
+var init_canonical_path = __esm({
+  "src/dsh/canonical-path.ts"() {
+    "use strict";
+  }
+});
+
 // src/dsh/upstream/hooks/hook-protocol/src/matcher.ts
 function isMatchAll(matcher) {
   return matcher === void 0 || matcher === "" || matcher === "*";
@@ -6201,14 +6256,14 @@ var init_config2 = __esm({
 
 // src/dsh/shell-hooks.ts
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, lstatSync } from "node:fs";
+import { readFileSync, lstatSync } from "node:fs";
 import { resolve, relative, isAbsolute, sep } from "node:path";
 function reviewedHookModule(dialect, root, files) {
   return { name: `hooks-${dialect}`, inject: ["shellHooks"], apply(ctx, config) {
     if (!config || typeof config.configPath !== "string") throw new Error("hook bridge needs its reviewed configPath");
     const path = resolve(root, config.configPath);
     const inside = relative(root, path).split(sep).join("/");
-    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || realpathSync(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
+    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || !isUnlinkedInside(root, inside, path) || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
     const bytes = readFileSync(path);
     if (bytes.length > 1024 * 1024 || createHash("sha256").update(bytes).digest("hex") !== files[inside]) throw new Error("hook config changed after review or exceeds 1 MiB");
     if (config.projectDir !== void 0) throw new Error("explicit projectDir is unsupported; each process uses its current core workspace");
@@ -6233,6 +6288,8 @@ var EVENTS;
 var init_shell_hooks = __esm({
   "src/dsh/shell-hooks.ts"() {
     "use strict";
+    init_canonical_path();
+    init_canonical_path();
     init_config();
     init_config2();
     EVENTS = { SessionStart: "session_start", UserPromptSubmit: "message_submit", PreToolUse: "tool_call_before", PostToolUse: "tool_call_after", Stop: "turn_end", SubagentStart: "subagent_spawn", SubagentStop: "subagent_complete" };
@@ -11956,10 +12013,19 @@ var init_bun_closure = __esm({
 
 // src/dsh/resolve-hooks.ts
 import { fileURLToPath as fileURLToPath2, pathToFileURL as pathToFileURL2 } from "node:url";
-import { relative as relative2, resolve as resolve2, sep as sep2, isAbsolute as isAbsolute2, dirname } from "node:path";
-import { readFileSync as readFileSync2, realpathSync as realpathSync2 } from "node:fs";
+import { resolve as resolve2, isAbsolute as isAbsolute2, dirname } from "node:path";
+function keyIn(closure, path) {
+  const canonical = insideKey(closure.canonicalRoot, path);
+  if (canonical !== void 0) return canonical;
+  for (const root of closure.rawRoots) {
+    const raw = insideKey(root, path);
+    if (raw !== void 0) return raw;
+  }
+}
 function admitReviewedClosure(baseUrl, files) {
-  const root = realpathSync2(resolve2(fileURLToPath2(baseUrl)));
+  const rawRoot = resolve2(fileURLToPath2(baseUrl));
+  const canonicalRoot = canonicalPath(rawRoot);
+  const id = pathKey(canonicalRoot);
   const accepted = /* @__PURE__ */ Object.create(null);
   const keys = Object.keys(files);
   if (keys.length > 4096) throw new Error("reviewed composition closure exceeds its file limit");
@@ -11967,41 +12033,43 @@ function admitReviewedClosure(baseUrl, files) {
     if (!key || key.split("/").some((part) => !part || part === "." || part === "..") || key.includes("\\") || key.includes(":") || isAbsolute2(key) || !/^[a-f0-9]{64}$/.test(files[key])) throw new Error("invalid reviewed composition closure file");
     accepted[key] = files[key];
   }
-  const existing = reviewedClosures.get(root);
+  const existing = reviewedClosures.get(id);
   if (existing) {
     if (Object.keys(existing.files).length !== keys.length || keys.some((key) => existing.files[key] !== accepted[key])) throw new Error("the same composition root carries different file receipts");
     existing.refs++;
-  } else reviewedClosures.set(root, { files: Object.freeze(accepted), refs: 1 });
+    existing.rawRoots.add(rawRoot);
+  } else reviewedClosures.set(id, { files: Object.freeze(accepted), refs: 1, canonicalRoot, rawRoots: /* @__PURE__ */ new Set([rawRoot]) });
   let disposed = false;
   return () => {
     if (disposed) return;
     disposed = true;
-    const current2 = reviewedClosures.get(root);
-    if (current2 && --current2.refs === 0) reviewedClosures.delete(root);
+    const current2 = reviewedClosures.get(id);
+    if (current2 && --current2.refs === 0) reviewedClosures.delete(id);
   };
 }
 async function importReviewedModule(baseUrl, path) {
-  const root = realpathSync2(resolve2(fileURLToPath2(baseUrl)));
-  const receipt = reviewedClosures.get(root);
+  const rawRoot = resolve2(fileURLToPath2(baseUrl));
+  const id = pathKey(canonicalPath(rawRoot));
+  const receipt = reviewedClosures.get(id);
   if (!receipt) throw new Error("composition module closure is no longer admitted");
-  const entry = resolve2(root, path);
+  const entry = resolve2(rawRoot, path);
   const admitted = closureAt(pathToFileURL2(entry).href);
-  if (!admitted || admitted.root !== root || !(admitted.path in receipt.files)) throw new Error("composition module is absent from reviewed closure");
+  if (!admitted || admitted.root !== id || !(admitted.path in receipt.files)) throw new Error("composition module is absent from reviewed closure");
   return import(pathToFileURL2(entry).href);
 }
 function closureAt(url) {
   if (!url?.startsWith("file:")) return;
   const path = resolve2(fileURLToPath2(url));
   for (const [root, receipt] of reviewedClosures) {
-    const inside = relative2(root, path);
-    if (inside === ".." || inside.startsWith(`..${sep2}`) || isAbsolute2(inside)) continue;
-    return { root, receipt, path: inside.split(sep2).join("/") };
+    const inside = keyIn(receipt, path);
+    if (inside !== void 0) return { root, receipt, path: inside };
   }
 }
 var reviewedClosures;
 var init_resolve_hooks = __esm({
   "src/dsh/resolve-hooks.ts"() {
     "use strict";
+    init_canonical_path();
     init_runtime();
     init_bun_closure();
     reviewedClosures = /* @__PURE__ */ new Map();
@@ -12122,6 +12190,14 @@ var init_storage = __esm({
   }
 });
 
+// src/shims/avatars.ts
+var init_avatars = __esm({
+  "src/shims/avatars.ts"() {
+    "use strict";
+    init_owned();
+  }
+});
+
 // src/tier.ts
 var init_tier = __esm({
   "src/tier.ts"() {
@@ -12156,6 +12232,7 @@ var init_root = __esm({
     init_prompt();
     init_storage();
     init_mcp();
+    init_avatars();
     init_skills();
     init_tier();
     init_commands();
@@ -12477,7 +12554,7 @@ var init_composition_inventory = __esm({
 
 // src/dsh/agent-presets.ts
 import { createHash as createHash2 } from "node:crypto";
-import { resolve as resolve4, relative as relative3, dirname as dirname3, sep as sep3 } from "node:path";
+import { resolve as resolve4, relative as relative2, dirname as dirname3, sep as sep2 } from "node:path";
 import { fileURLToPath as fileURLToPath4, pathToFileURL as pathToFileURL5 } from "node:url";
 function plain(path) {
   return typeof path === "string" && path.length > 0 && path.length <= 4096 && !/[\\:\u0000-\u001f\u007f]/u.test(path) && !path.startsWith("/") && path.split("/").every((p) => p !== "" && p !== "." && p !== "..");
@@ -12529,9 +12606,9 @@ async function reviewAgentPresets(input) {
   const files = composition.files;
   if (!files || Object.keys(files).length > 4096 || !Array.isArray(input.directories) || input.directories.length > 4096) fail("invalid source inventory");
   const base = resolve4("codewhale-reviewed-agent-presets");
-  const baseUrl = pathToFileURL5(`${base}${sep3}`).href;
+  const baseUrl = pathToFileURL5(`${base}${sep2}`).href;
   function key(path) {
-    const inside = relative3(base, path).split(sep3).join("/");
+    const inside = relative2(base, path).split(sep2).join("/");
     if (!plain(inside)) fail("path escapes the admitted source root");
     return inside;
   }
@@ -12550,9 +12627,9 @@ async function reviewAgentPresets(input) {
   const parsed = /* @__PURE__ */ new Map();
   const io = {
     async readFile(path) {
-      const relative5 = key(path);
-      if (invalid.has(relative5)) throw new Error("composition exceeds its data/shape bound");
-      const text2 = documents.get(relative5);
+      const relative4 = key(path);
+      if (invalid.has(relative4)) throw new Error("composition exceeds its data/shape bound");
+      const text2 = documents.get(relative4);
       if (text2 === void 0) throw new Error("document not admitted");
       return text2;
     },
@@ -12603,7 +12680,7 @@ async function reviewAgentPresets(input) {
       }
     });
     if (candidates.length !== 1) fail("shipped root requires exactly one admitted agent-presets package");
-    const folder = dirname3(candidates[0][0]).split(sep3).join("/");
+    const folder = dirname3(candidates[0][0]).split(sep2).join("/");
     const root = folder === "." ? "presets" : `${folder}/presets`;
     if (!directories.has(root)) fail("shipped preset root was not admitted");
     roots.push({ path: resolve4(base, root), trust: "system" });
@@ -12786,7 +12863,7 @@ __export(composition_exports, {
 });
 import { createHash as createHash3 } from "node:crypto";
 import { readFile as readFile2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute4, relative as relative4, resolve as resolve5, sep as sep4 } from "node:path";
+import { isAbsolute as isAbsolute4, relative as relative3, resolve as resolve5, sep as sep3 } from "node:path";
 import { fileURLToPath as fileURLToPath5 } from "node:url";
 function digest(bytes) {
   return createHash3("sha256").update(bytes).digest("hex");
@@ -13061,8 +13138,8 @@ var init_composition = __esm({
       async importReviewed(module) {
         const root = fileURLToPath5(this.base);
         const path = resolve5(root, module.path);
-        const inside = relative4(root, path);
-        if (inside.startsWith(`..${sep4}`) || inside === ".." || isAbsolute4(inside)) throw new Error("module escapes reviewed bundle");
+        const inside = relative3(root, path);
+        if (inside.startsWith(`..${sep3}`) || inside === ".." || isAbsolute4(inside)) throw new Error("module escapes reviewed bundle");
         if (this.spec.files[module.path] !== module.sha256 || digest(await readFile2(path)) !== module.sha256) throw new Error("module changed after review");
         return importReviewedModule(this.base, module.path);
       }

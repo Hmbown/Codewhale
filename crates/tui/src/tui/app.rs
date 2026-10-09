@@ -37,7 +37,7 @@ use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::history::{
-    HistoryCell, ThinkingFold, TranscriptActionOwner, TranscriptRenderOptions,
+    HistoryCell, TranscriptActionOwner, TranscriptFold, TranscriptRenderOptions,
 };
 use crate::tui::hotbar::HotbarActionRegistry;
 use crate::tui::motion::MotionPolicy;
@@ -1486,8 +1486,7 @@ pub type DispatchApplyFn = Box<
 #[allow(clippy::struct_excessive_bools)]
 /// A route change made in-session that the user has not yet decided how to
 /// save. Route changes are temporary by default; persisting them requires an
-/// explicit choice (Update this Fleet / Save as a new Fleet / Remember as my
-/// default / Keep for this session only).
+/// explicit command (`/fleet save`, `/fleet save-as` or `/model save-default`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRouteSave {
     /// Provider identity the session is now on.
@@ -1501,13 +1500,14 @@ pub struct PendingRouteSave {
 /// Write `provider_identity`/`model` to the user-global config as the route the next
 /// launch should open with, and return the line to show the operator.
 fn persist_route_as_startup_default(
+    locale: Locale,
     identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> String {
     let route = format!("{}/{model}", identity.key);
     match try_persist_route_as_startup_default(identity, model) {
-        Ok(()) => format!("Remembered {route} as the startup default (config.toml)."),
-        Err(err) => format!("Save failed: {err}"),
+        Ok(()) => tr(locale, MessageId::RouteSaveRememberedDefault).replace("{route}", &route),
+        Err(err) => tr(locale, MessageId::RouteSaveFailed).replace("{error}", &err.to_string()),
     }
 }
 
@@ -1594,6 +1594,8 @@ pub struct App {
     /// Receipts are aligned to transcript cells because provider context can
     /// be compacted or purged without changing what remains visible.
     completed_assistant_outputs: Vec<CompletedAssistantOutputReceipt>,
+    /// Exact completed Plan text awaiting this session/turn's host answer.
+    pub(crate) pending_plan_handoff: Option<crate::tui::plan_handoff::PendingPlanHandoff>,
     pub(crate) context_token_cache: RefCell<ContextTokenCache>,
     /// Typed account-owned browser relay for this exact TUI session.
     pub remote_control: crate::remote_control::RemoteControlController,
@@ -1780,8 +1782,9 @@ pub struct App {
     pub configured_sandbox_network: Option<bool>,
     /// The sandbox backend this platform+config can actually enforce with,
     /// resolved once at startup. `None` means there is NO enforcement
-    /// available (default Linux without `prefer_bwrap`, and all Windows), so
-    /// surfaces must not claim the session is sandboxed (2026-08-04 audit).
+    /// available (Linux with `prefer_bwrap = false` or no working bwrap, and
+    /// all Windows), so surfaces must not claim the session is sandboxed
+    /// (2026-08-04 audit).
     pub sandbox_backend: Option<crate::sandbox::SandboxType>,
     /// Off-event-loop worker for durable Lane control writes. `/lane interrupt`
     /// submits here instead of tearing down a Runtime on the composer thread
@@ -2611,15 +2614,16 @@ pub struct App {
     /// Transcript cells the user has collapsed (hidden from view).
     /// Stores **original** virtual cell indices (pre-filtering).
     pub collapsed_cells: HashSet<usize>,
-    /// Explicit expand/collapse intents the user has recorded for thinking
-    /// cells, keyed by **original** virtual cell index. Set by Space when the
-    /// composer is empty and the cursor is on a thinking cell.
+    /// Explicit expand/collapse intents for transcript cells, keyed by
+    /// **original** virtual cell index. Space preserves a visible preview;
+    /// context-menu Hide uses `collapsed_cells` instead.
     ///
     /// An absent index means the user has not touched that cell, so the
-    /// display preferences decide it. A present index is absolute, so
+    /// thinking display preferences decide it; other cells start expanded.
+    /// A present index is absolute, so
     /// changing `verbose` or `thinking_default_expanded` afterwards leaves
     /// the user's own choice alone (#5847).
-    pub thinking_folds: HashMap<usize, ThinkingFold>,
+    pub cell_folds: HashMap<usize, TranscriptFold>,
     /// Mapping from filtered cell index → original virtual index.
     /// Populated during `ChatWidget::new` by filtering out collapsed cells.
     /// Used by `build_context_menu_entries` to convert line-meta indices
@@ -2775,6 +2779,15 @@ fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, _is_wind
 }
 
 impl App {
+    pub(crate) fn should_adopt_live_local_ollama(&mut self) -> bool {
+        crate::local_ollama::should_adopt_live_local_ollama(
+            self.startup_route_configured,
+            self.api_provider,
+            self.view_stack.provider_picker_interacted(),
+            self.onboarding_needs_api_key || self.onboarding_missing_key_recovery,
+        )
+    }
+
     /// A retained roster remains readable only in its owning conversation.
     pub(crate) fn current_agent_roster(&self) -> &[crate::agent_roster::AgentRosterRow] {
         if self
@@ -2812,6 +2825,9 @@ impl App {
             return Focus::Launch;
         }
         if self.work_surface.focused {
+            if self.work_surface.panel == crate::tui::work_surface::RailPanel::Terminal {
+                return Focus::TerminalPanel;
+            }
             return Focus::Panel;
         }
         Focus::Composer
@@ -2837,16 +2853,15 @@ impl App {
     ) -> String {
         use crate::fleet::store::{FleetFile, FleetOperator, save_fleet, set_selected};
         use crate::tui::views::route_save_prompt::RouteSaveChoice;
+        let locale = self.ui_locale;
         let Some(pending) = self.pending_route_save.take() else {
-            return "No pending route change to save.".to_string();
+            return tr(locale, MessageId::RouteSaveNothingPending).into_owned();
         };
         let route = format!("{}/{}", pending.provider_identity, pending.model);
         match choice {
             RouteSaveChoice::UpdateFleet => {
                 let Some((name, scope)) = pending.fleet.clone() else {
-                    return "Nothing to update — no team is selected. Use /fleet save-as to \
-                             save this route as a new team."
-                        .to_string();
+                    return tr(locale, MessageId::RouteSaveNoTeamSelected).into_owned();
                 };
                 match crate::fleet::store::load_fleet_in_scope(&name, scope, &self.workspace) {
                     Ok((mut fleet, _source_path)) => {
@@ -2856,18 +2871,16 @@ impl App {
                             reasoning: fleet.operator.as_ref().and_then(|op| op.reasoning.clone()),
                         });
                         match save_fleet(&fleet, scope, &self.workspace) {
-                            Ok(path) => format!(
-                                "Team `{}` now runs on {route} — wrote {}",
-                                fleet.name,
-                                path.display()
-                            ),
-                            Err(err) => format!("Team update failed: {err}"),
+                            Ok(path) => tr(locale, MessageId::RouteSaveTeamUpdated)
+                                .replace("{name}", &fleet.name)
+                                .replace("{route}", &route)
+                                .replace("{path}", &path.display().to_string()),
+                            Err(err) => tr(locale, MessageId::RouteSaveTeamUpdateFailed)
+                                .replace("{error}", &err.to_string()),
                         }
                     }
-                    Err(err) => format!(
-                        "Team update failed: {err} — the saved team may have moved. Use \
-                         /fleet save-as to persist the route."
-                    ),
+                    Err(err) => tr(locale, MessageId::RouteSaveTeamUpdateFailedMoved)
+                        .replace("{error}", &err.to_string()),
                 }
             }
             RouteSaveChoice::SaveAsNewFleet => {
@@ -2882,7 +2895,7 @@ impl App {
                     display.clone(),
                     Some("Saved from a session route choice.".to_string()),
                 ) else {
-                    return "Could not create the team.".to_string();
+                    return tr(locale, MessageId::RouteSaveTeamCreateFailed).into_owned();
                 };
                 fleet.operator = Some(FleetOperator {
                     provider: pending.provider_identity.clone(),
@@ -2900,19 +2913,20 @@ impl App {
                             crate::fleet::store::FleetScope::Personal,
                             &self.workspace,
                         ) {
-                            Ok(sel_path) => format!(
-                                " — selected as your user-global default; wrote {}",
-                                sel_path.display()
-                            ),
-                            Err(err) => format!(" — selection failed: {err}"),
+                            Ok(sel_path) => tr(locale, MessageId::RouteSaveSelectedNote)
+                                .replace("{path}", &sel_path.display().to_string()),
+                            Err(err) => tr(locale, MessageId::RouteSaveSelectionFailedNote)
+                                .replace("{error}", &err.to_string()),
                         };
-                        format!(
-                            "Saved route {route} as new team `{}` — wrote {}{selected_note}",
-                            display,
-                            path.display()
-                        )
+                        tr(locale, MessageId::RouteSaveSavedAsNewTeam)
+                            .replace("{route}", &route)
+                            .replace("{name}", &display)
+                            .replace("{path}", &path.display().to_string())
+                            .replace("{note}", &selected_note)
                     }
-                    Err(err) => format!("Save failed: {err}"),
+                    Err(err) => {
+                        tr(locale, MessageId::RouteSaveFailed).replace("{error}", &err.to_string())
+                    }
                 }
             }
             RouteSaveChoice::SaveAsDefault => {
@@ -2922,17 +2936,16 @@ impl App {
                         != self.provider_id_for_persistence())
                     || pending.model != active_model
                 {
-                    return "Save failed: the pending provider/model route is no longer active."
-                        .to_string();
+                    return tr(locale, MessageId::RouteSaveRouteNoLongerActive).into_owned();
                 }
                 let identity = match self.admitted_provider_identity() {
                     Ok(identity) => identity,
-                    Err(error) => return format!("Save failed: {error}"),
+                    Err(error) => {
+                        return tr(locale, MessageId::RouteSaveFailed)
+                            .replace("{error}", &error.to_string());
+                    }
                 };
-                persist_route_as_startup_default(identity, &pending.model)
-            }
-            RouteSaveChoice::SessionOnly => {
-                format!("Model {route} kept for this session only — nothing was written.")
+                persist_route_as_startup_default(locale, identity, &pending.model)
             }
         }
     }
@@ -2952,7 +2965,9 @@ impl App {
     pub fn save_live_route_as_startup_default(&mut self) -> String {
         match self.try_save_live_route_as_startup_default() {
             Ok(receipt) => receipt,
-            Err(err) => format!("Save failed: {err}"),
+            Err(err) => self
+                .tr(MessageId::RouteSaveFailed)
+                .replace("{error}", &err.to_string()),
         }
     }
 
@@ -2973,9 +2988,9 @@ impl App {
         // Resolve the prompt only after the write lands. If persistence fails,
         // keep the retry available instead of discarding the operator's route.
         self.pending_route_save = None;
-        Ok(format!(
-            "Remembered {provider_identity}/{model} as the startup default (config.toml)."
-        ))
+        Ok(self
+            .tr(MessageId::RouteSaveRememberedDefault)
+            .replace("{route}", &format!("{provider_identity}/{model}")))
     }
 
     /// Record that the live session route changed to `provider_identity` /
@@ -3512,6 +3527,7 @@ impl App {
                     self.tr(match subject {
                         StartupDefaultSubject::Mode => MessageId::StartupDefaultSubjectMode,
                         StartupDefaultSubject::Thinking => MessageId::StartupDefaultSubjectThinking,
+                        StartupDefaultSubject::PetMode => MessageId::ConfigLabelPetMode,
                     })
                     .into_owned()
                 })
@@ -3963,21 +3979,32 @@ impl App {
     }
 
     /// Host path for `/auto`: persist Auto-Review as the TUI permission
-    /// posture without inventing a second runtime. Same write as Shift+Tab
-    /// landing on Auto-Review; Plan stays read-only and only the Act baseline
-    /// moves.
+    /// posture without inventing a second runtime.
     pub fn apply_auto_review_posture(&mut self) -> Result<(), String> {
+        self.apply_agent_posture(ApprovalMode::Auto)
+    }
+
+    /// Persist `next` as the TUI permission posture. Same write as Shift+Tab
+    /// landing on it; Plan stays read-only and only the Act baseline moves.
+    /// Shared by `/auto` and the Plan hand-off.
+    pub fn apply_agent_posture(&mut self, next: ApprovalMode) -> Result<(), String> {
         if self.reject_setting_change_while_busy(MessageId::SettingSubjectPermissions) {
             return Err(self.setting_locked_message(MessageId::SettingSubjectPermissions));
         }
         if self.approval_policy_locked() {
             return Err("Permissions are controlled by config or managed requirements".to_string());
         }
-        Self::persist_permission_posture(ApprovalMode::Auto)
+        Self::persist_permission_posture(next)
             .map_err(|err| format!("could not save TUI posture ({err})"))?;
-        self.set_agent_approval_posture(ApprovalMode::Auto);
+        self.set_agent_approval_posture(next);
         self.needs_redraw = true;
         Ok(())
+    }
+
+    /// The durable Act permission posture, whichever mode is live.
+    #[must_use]
+    pub(crate) fn agent_approval_baseline(&self) -> ApprovalMode {
+        self.mode_prefs.agent_approval_mode
     }
 
     /// Update the durable Act approval choice. Entering Full Access enables
@@ -4575,13 +4602,6 @@ impl App {
         })
     }
 
-    pub fn format_cost_amount_precise(&self, amount: f64) -> String {
-        crate::pricing::format_cost_amount_precise(
-            amount,
-            self.cost_display_currency(self.cost_currency),
-        )
-    }
-
     pub(crate) fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
         if currency == CostCurrency::Cny
             && self.session.cost_cny_priced_turns == 0
@@ -4718,7 +4738,7 @@ impl App {
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
-        self.thinking_folds.clear();
+        self.cell_folds.clear();
         self.expanded_tool_runs = std::mem::take(&mut self.expanded_tool_runs)
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
@@ -5006,6 +5026,7 @@ impl App {
         self.history.clear();
         self.history_revisions.clear();
         self.completed_assistant_outputs.clear();
+        self.pending_plan_handoff = None;
         self.context_references_by_cell.clear();
         self.session_context_references.clear();
         self.session_artifacts.clear();
@@ -5065,6 +5086,85 @@ impl App {
             .map(|receipt| receipt.text.as_str())
     }
 
+    /// Freeze only output completed inside this turn's transcript boundary.
+    /// Restored/older receipts cannot cause a new hand-off.
+    pub(crate) fn prepare_plan_handoff(
+        &mut self,
+        status: crate::core::events::TurnOutcomeStatus,
+        turn_id: Option<&str>,
+        has_open_todos: bool,
+    ) -> Option<String> {
+        let receipt = self
+            .completed_assistant_outputs
+            .iter()
+            .rev()
+            .find(|receipt| {
+                receipt.history_index >= self.ocean_turn_history_start
+                    && receipt.history_index < self.history.len()
+            });
+        if !crate::tui::plan_handoff::plan_ready(
+            self.mode,
+            status,
+            receipt.map(|receipt| receipt.text.as_str()),
+        ) {
+            return None;
+        }
+        let session_id = self.current_session_id.as_ref()?;
+        let turn_id = turn_id.filter(|id| self.runtime_turn_id.as_deref() == Some(*id))?;
+        if self.pending_plan_handoff.is_some() {
+            return None;
+        }
+        let request_id = format!(
+            "{}:{}:{}:{}",
+            crate::tui::plan_handoff::REQUEST_ID,
+            session_id.len(),
+            session_id,
+            turn_id
+        );
+        self.pending_plan_handoff = Some(crate::tui::plan_handoff::PendingPlanHandoff {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            turn_id: turn_id.to_string(),
+            history_start: self.ocean_turn_history_start,
+            transcript_epoch: self.transcript_identity_epoch,
+            text: receipt?.text.clone(),
+            // Only successful typed receipts inside this turn can preserve a
+            // checklist. Tool evidence can outlive UI-initiated dispatch.
+            has_current_checklist: has_open_todos
+                && self.history.get(self.ocean_turn_history_start..).is_some_and(|cells| {
+                    cells.iter().any(|cell| {
+                        matches!(cell, HistoryCell::Tool(crate::tui::history::ToolCell::Generic(tool))
+                            if tool.status == crate::tui::history::ToolStatus::Success
+                                && crate::tui::history::is_checklist_tool_name(&tool.name))
+                    })
+                }),
+            seeded_todo_id: None,
+        });
+        Some(request_id)
+    }
+
+    pub(crate) fn plan_handoff_is_current(
+        &self,
+        plan: &crate::tui::plan_handoff::PendingPlanHandoff,
+        request_id: &str,
+    ) -> bool {
+        plan.request_id == request_id
+            && self.current_session_id.as_deref() == Some(plan.session_id.as_str())
+            && self.runtime_turn_id.as_deref() == Some(plan.turn_id.as_str())
+            && self.ocean_turn_history_start == plan.history_start
+            && self.transcript_identity_epoch == plan.transcript_epoch
+            && self.mode == AppMode::Plan
+            && !self.is_loading
+            && !self.dispatch_in_flight
+            && self.pending_steers.is_empty()
+            && !self.remote_control.runtime_chat_blocks_local_dispatch()
+            && self.queued_message_count() == 0
+            && self.queued_draft.is_none()
+            && self.input.is_empty()
+            && self.view_stack.is_empty()
+            && self.agent_focus.is_none()
+    }
+
     /// Pop the trailing history cell, keeping revisions in sync.
     pub fn pop_history(&mut self) -> Option<HistoryCell> {
         let cell = self.history.pop();
@@ -5120,7 +5220,7 @@ impl App {
     pub(crate) fn prune_transcript_index_state(&mut self, len: usize) {
         self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
         self.collapsed_cells.retain(|idx| *idx < len);
-        self.thinking_folds.retain(|idx, _| *idx < len);
+        self.cell_folds.retain(|idx, _| *idx < len);
         self.expanded_tool_runs.retain(|idx| *idx < len);
         self.collapsed_cell_map.clear();
     }
@@ -5216,28 +5316,6 @@ impl App {
         self.api_message_stamps
             .resize_with(messages.len(), Utc::now);
         self.api_messages = Arc::new(messages);
-    }
-
-    /// Append a message with the stamp it earned earlier — used when an
-    /// undo prune re-inserts preserved tool results that were already in the
-    /// log.
-    pub fn push_api_message_stamped(&mut self, message: Message, stamp: DateTime<Utc>) {
-        self.api_message_stamps
-            .resize_with(self.api_messages.len(), Utc::now);
-        self.api_messages_mut().push(message);
-        self.api_message_stamps.push(stamp);
-    }
-
-    /// `created_at` of each `api_messages` entry, paired positionally.
-    /// Preserve messages even if older state lacks a stamp; missing times
-    /// fall back to observation time, as they do when restoring a session.
-    pub fn api_messages_stamped(&self) -> impl Iterator<Item = (&Message, DateTime<Utc>)> {
-        self.api_messages.iter().zip(
-            self.api_message_stamps
-                .iter()
-                .copied()
-                .chain(std::iter::repeat_with(Utc::now)),
-        )
     }
 
     pub fn truncate_api_messages(&mut self, new_len: usize) {
@@ -5500,6 +5578,36 @@ impl App {
             return;
         }
         let boundary = self.history.len();
+        // The same positional shift applies to presentation state. A late
+        // orphan result must not inherit the active row's fold or Hide choice.
+        self.cell_folds = std::mem::take(&mut self.cell_folds)
+            .into_iter()
+            .map(|(index, fold)| {
+                (
+                    if index >= boundary {
+                        index.saturating_add(added)
+                    } else {
+                        index
+                    },
+                    fold,
+                )
+            })
+            .collect();
+        for indices in [&mut self.collapsed_cells, &mut self.expanded_tool_runs] {
+            *indices = std::mem::take(indices)
+                .into_iter()
+                .map(|index| {
+                    if index >= boundary {
+                        index.saturating_add(added)
+                    } else {
+                        index
+                    }
+                })
+                .collect();
+        }
+        // A pre-insertion action still names the old virtual index. Reject
+        // it until the renderer establishes the owner's new position.
+        self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
         for index in self.tool_cells.values_mut() {
             if *index >= boundary {
                 *index = index.saturating_add(added);

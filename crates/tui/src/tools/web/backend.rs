@@ -323,12 +323,15 @@ impl SearchBackend for ConfiguredSearchBackend<'_> {
     fn capabilities(&self) -> QueryCapabilities {
         // All current adapters enforce result count. Recency and locale are
         // forwarded where the backend's API takes them (see `QueryFilters` in
-        // `web_search.rs`); every other knob is post-filtered by the shared
-        // harness or reported as not honored.
+        // `web_search.rs`) — and the keyless Bing and DuckDuckGo scrapes
+        // honor `locale` directly in the request (Bing mkt/setlang,
+        // DuckDuckGo kl, plus a matching Accept-Language); every other knob
+        // is post-filtered by the shared harness or reported as not honored.
         let (recency, locale) = match self.provider() {
             SearchProvider::Firecrawl | SearchProvider::Searxng => (true, true),
             SearchProvider::Tavily => (true, false),
             SearchProvider::Serply => (false, true),
+            SearchProvider::Bing | SearchProvider::DuckDuckGo => (false, true),
             _ => (false, false),
         };
         let state = |supported: bool| {
@@ -592,6 +595,39 @@ mod tests {
             assert_eq!(
                 backend.capabilities().max_results,
                 super::super::contract::CapabilityState::Supported
+            );
+        }
+    }
+
+    #[test]
+    fn keyless_scrape_backends_declare_locale_support() {
+        // The keyless Bing and DuckDuckGo scrapes honor the locale knob in
+        // their scrape requests; every other configured adapter must keep
+        // reporting locale per its own API so the receipt does not overclaim.
+        let cases = [
+            (SearchProvider::Bing, QueryCapabilityState::Supported),
+            (SearchProvider::DuckDuckGo, QueryCapabilityState::Supported),
+            (SearchProvider::Firecrawl, QueryCapabilityState::Supported),
+            (SearchProvider::Searxng, QueryCapabilityState::Supported),
+            (SearchProvider::Serply, QueryCapabilityState::Supported),
+            (SearchProvider::Tavily, QueryCapabilityState::Unsupported),
+            (SearchProvider::Bocha, QueryCapabilityState::Unsupported),
+            (SearchProvider::Metaso, QueryCapabilityState::Unsupported),
+            (SearchProvider::Baidu, QueryCapabilityState::Unsupported),
+            (
+                SearchProvider::Volcengine,
+                QueryCapabilityState::Unsupported,
+            ),
+            (SearchProvider::Sofya, QueryCapabilityState::Unsupported),
+        ];
+        for (provider, expected_locale) in cases {
+            let mut context = ToolContext::new(std::path::PathBuf::from("."));
+            context.search_provider = provider;
+            let backend = ConfiguredSearchBackend::from_provider(&context, provider);
+            assert_eq!(
+                backend.capabilities().locale,
+                expected_locale,
+                "{provider:?}"
             );
         }
     }

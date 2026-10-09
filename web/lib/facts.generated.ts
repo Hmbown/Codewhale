@@ -37,10 +37,10 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-10-02T18:06:32.682Z",
+  "generatedAt": "2026-10-09T08:24:58.686Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
-  "version": "0.10.1",
+  "version": "0.10.2",
   "crates": [
     "agent",
     "app-server",
@@ -48,6 +48,7 @@ export const FACTS: RepoFacts = {
     "cli",
     "cloud-facts",
     "command-contract",
+    "commands",
     "config",
     "core",
     "execpolicy",
@@ -73,7 +74,7 @@ export const FACTS: RepoFacts = {
   ],
   "sandboxBackends": [
     "seatbelt (macOS, when available)",
-    "bubblewrap (Linux, opt-in when installed)"
+    "bubblewrap (Linux, default when installed and working)"
   ],
   "providers": [
     {
@@ -958,9 +959,9 @@ export const FACTS: RepoFacts = {
   "toolCount": 80,
   "license": "MIT",
   "latestPublishedRelease": {
-    "tag": "v0.10.0",
-    "version": "0.10.0",
-    "publishedAt": "2026-09-22T17:28:34Z",
-    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.0"
+    "tag": "v0.10.1",
+    "version": "0.10.1",
+    "publishedAt": "2026-10-08T01:47:44Z",
+    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.1"
   }
 };

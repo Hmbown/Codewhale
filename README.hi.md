@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ Codewhale आपका प्रोजेक्ट पढ़ता है, फ�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="टर्मिनल में चलता Codewhale सेशन" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="टर्मिनल में चलता Codewhale सेशन" width="760">
 
-<sub>नए इंस्टॉल का असली टर्मिनल कैप्चर — कोई तैयार किया हुआ आउटपुट नहीं।</sub>
+<sub>कॉन्फ़िगर किए गए स्थानीय डेमो सत्र से Codewhale के असली टर्मिनल का कैप्चर।</sub>
 
 </div>
 
@@ -56,6 +56,12 @@ Docker, Linux पर Nix और Homebrew, Android/Termux, चेकसम सत
 </details>
 
 ## क्विकस्टार्ट
+
+**अपने प्रदाताओं की API कुंजियाँ एक ही जगह सँभालें।** [Codewhale खाता बनाएँ](https://app.codewhale.net/register)
+या साइन इन करने के लिए `codewhale login` चलाएँ। अपने खाते में API कुंजियाँ सहेजें और अपडेट करें,
+फिर साइन इन किए हुए उपकरणों पर Codewhale के मॉडल रूट के ज़रिए उनका इस्तेमाल करें।
+[खाते की कुंजियाँ सेट अप करें](docs/CONFIGURATION.md#account-provider-keys)।
+साइन इन करने से मौजूदा स्थानीय कुंजियाँ अपलोड नहीं होतीं; बिना खाते के भी स्थानीय रूप से काम कर सकते हैं।
 
 1. **अपना प्रोजेक्ट खोलें।** जिस फ़ोल्डर में काम करना है, उसमें `codewhale` चलाएँ।
 2. **कोई मॉडल जोड़ें।** होस्टेड कुंजी जोड़ने या कोई लोकल रनटाइम चुनने के लिए `/provider`

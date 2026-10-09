@@ -526,6 +526,165 @@
         client
     }
 
+    /// Swap in a short non-streaming envelope for the test's duration,
+    /// restoring the previous value on drop.
+    struct NonStreamingEnvelopeGuard(u64);
+
+    impl NonStreamingEnvelopeGuard {
+        fn millis(ms: u64) -> Self {
+            Self(TEST_NON_STREAMING_ENVELOPE_MS.swap(ms, std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    impl Drop for NonStreamingEnvelopeGuard {
+        fn drop(&mut self) {
+            TEST_NON_STREAMING_ENVELOPE_MS.store(self.0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The provider accepts the connection but stalls far past the budgeted
+    /// envelope before answering: the non-streaming request must be cut off
+    /// with a timeout instead of wedging the caller (mid-turn compaction,
+    /// translate, provider-native search) indefinitely.
+    #[tokio::test]
+    async fn non_streaming_envelope_bounds_a_stalled_provider() {
+        // The injected budget is process-global; serialize against other tests
+        // (which may issue non-streaming requests with their own timing
+        // assumptions) through the shared test-env lock.
+        let _env_lock = crate::test_support::lock_test_env();
+        let _envelope = NonStreamingEnvelopeGuard::millis(2000);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "id": "chatcmpl_envelope",
+                        "object": "chat.completion",
+                        "model": "deepseek-v4-pro",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "late"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = deepseek_request_boundary_client(&server.uri(), server.uri());
+        let err = client
+            .create_message(k3_request_fixture("deepseek-v4-pro", Some("off"), false))
+            .await
+            .expect_err("a provider that never answers must hit the envelope");
+        assert!(
+            err.to_string().to_lowercase().contains("timed out"),
+            "envelope timeout must be reported as such; got {err:#}"
+        );
+    }
+
+    /// Every attempt answers 429 with an hour-long Retry-After. Honoring the
+    /// header must not hand the total budget to the server: the retry loop is
+    /// capped by the envelope, so a gateway answering 429 + Retry-After: 3600
+    /// forever fails the turn in bounded time instead of wedging it for hours.
+    #[tokio::test]
+    async fn retry_after_honoring_cannot_extend_the_non_streaming_envelope() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _envelope = NonStreamingEnvelopeGuard::millis(2000);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "3600")
+                    .set_body_string("rate limited"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = deepseek_request_boundary_client(&server.uri(), server.uri());
+        let started = std::time::Instant::now();
+        let err = client
+            .create_message(k3_request_fixture("deepseek-v4-pro", Some("off"), false))
+            .await
+            .expect_err("unbounded Retry-After honoring must still hit the envelope");
+        assert!(
+            err.to_string().to_lowercase().contains("timed out"),
+            "the envelope must cut off the Retry-After wait; got {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "a 3600s Retry-After must not run past the envelope; took {:?}",
+            started.elapsed()
+        );
+        crate::retry_status::clear();
+        crate::retry_status::clear_rate_limit();
+    }
+
+    /// The open answers past the injected non-streaming envelope. The
+    /// streaming-open path must not inherit any total: reqwest's per-request
+    /// timeout wraps the response body, so a total set on the open would ride
+    /// on the returned body and hard-cut a live stream mid-generation.
+    #[tokio::test]
+    async fn stream_open_retry_path_sets_no_total_deadline() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _envelope = NonStreamingEnvelopeGuard::millis(2000);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("data: [DONE]\n\n")
+                    .set_delay(Duration::from_millis(2500)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = deepseek_request_boundary_client(&server.uri(), server.uri());
+        let response = client
+            .send_stream_open_with_retry(|| {
+                client
+                    .http_client
+                    .post(format!("{}/chat/completions", server.uri()))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body("{}".to_string())
+            })
+            .await
+            .expect("stream open must not carry the non-streaming envelope");
+        assert!(response.status().is_success());
+        let text = response.text().await.expect("read stream-open body");
+        assert_eq!(text, "data: [DONE]\n\n");
+    }
+
+    /// A caller that pins its own, larger per-attempt total (`list_models`
+    /// pins 30s) must keep it: `.timeout()` on the builder is a pure
+    /// overwrite, so an unconditional envelope would silently replace the
+    /// pinned budget with the injected 2s and fail this 2.5s-late response.
+    #[tokio::test]
+    async fn pinned_request_total_survives_the_shared_retry_envelope() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _envelope = NonStreamingEnvelopeGuard::millis(2000);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{}")
+                    .set_delay(Duration::from_millis(2500)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = deepseek_request_boundary_client(&server.uri(), server.uri());
+        let response = client
+            .send_with_retry_total_error_body(
+                Duration::from_secs(5),
+                || client.http_client.get(format!("{}/models", server.uri())),
+                &ErrorBodyDisclosure::Full,
+            )
+            .await
+            .expect("caller-pinned total must not be overwritten by the envelope");
+        assert!(response.status().is_success());
+    }
+
     /// The per-chunk line cap is backpressure relief, not a data budget. When
     /// one transport chunk carries more SSE lines than the cap, the drain loop
     /// stops mid-buffer and the outer loop waits for the *next* chunk before

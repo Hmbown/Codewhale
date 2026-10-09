@@ -1,5 +1,3 @@
-
-
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn auto_review_asks_the_user_and_returns_the_answer() {
@@ -92,6 +90,7 @@ async fn auto_review_asks_the_user_and_returns_the_answer() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "continue autonomously".to_string(),
             images: Vec::new(),
@@ -175,7 +174,7 @@ async fn auto_review_asks_the_user_and_returns_the_answer() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floor() {
+async fn full_access_permission_allow_runs_background_destructive_shell_without_a_hold() {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -184,11 +183,9 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
     let server = MockServer::start().await;
     let victim = workspace.path().join("must-survive");
     fs::write(&victim, "guarded\n").expect("write guarded fixture");
-    // Keep the engine-boundary regression intrinsically harmless on every
-    // runner: the quoted payload trips the same built-in catastrophic-command
-    // detector, while an execution regression would only overwrite the
-    // sentinel. The policy-level sibling tests exercise real destructive
-    // command shapes directly without ever dispatching them to a shell.
+    // Full Access owns the call: neither a remembered workspace grant nor the
+    // built-in hold may strand it. The fixture writes its own sentinel, so an
+    // execution regression is visible without any destructive command running.
     let command = format!("echo \"rm -rf /\" > \"{}\"", victim.display());
     let allow_rule = codewhale_execpolicy::ToolAskRule::exec_shell(command.clone())
         .into_exact_workspace_allow(workspace.path().to_string_lossy().into_owned());
@@ -227,7 +224,7 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(body_string_contains("destructive background/headless"))
+        .and(body_string_contains("call_bg"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -272,13 +269,14 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
             ApprovalMode::Bypass,
         ),
         Some(ToolAskRuleDecision::Allow),
-        "precondition: the remembered grant must match before the safety floor tightens the plan"
+        "precondition: the remembered grant matches and Full Access adds no hold"
     );
     let (engine, handle) = Engine::new(engine_config, &api_config);
     let run_task = tokio::spawn(engine.run());
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please run a background shell".to_string(),
             images: Vec::new(),
@@ -316,16 +314,13 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
     {
         match event {
             Event::ApprovalRequired { .. } => {
-                panic!("Full Access safety holds must fail closed without prompting")
+                panic!("Full Access must not prompt for a remembered grant")
             }
             Event::ToolCallComplete { name, result, .. } => {
                 if name == "Bash" {
                     saw_tool_result = true;
-                    let err = result.expect_err("blocked shell should not execute");
-                    assert!(
-                        err.to_string().contains("Built-in safety gate"),
-                        "unexpected shell denial: {err:?}"
-                    );
+                    let result = result.expect("Full Access runs the granted command");
+                    assert!(result.success, "unexpected shell failure: {result:?}");
                 }
             }
             Event::TurnComplete { status, .. } => {
@@ -344,8 +339,8 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
     assert!(saw_complete);
     assert_eq!(
         fs::read_to_string(&victim).expect("read guarded fixture"),
-        "guarded\n",
-        "blocked command must not touch its target"
+        "rm -rf /\n",
+        "the granted command must run to completion"
     );
 }
 
@@ -354,8 +349,8 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
 async fn yolo_mode_does_not_prompt_for_background_shell() {
     // #3883: the durable-review floor keys on what the command does, not on
     // "not provably read-only". An ordinary background command in YOLO must
-    // run without a prompt; genuinely destructive and publish-like background
-    // work still holds (see the sibling tests).
+    // run without a prompt. Full Access skips the floor entirely; the
+    // reviewing postures keep it (see the policy-level tests).
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -422,6 +417,7 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please run a background shell".to_string(),
             images: Vec::new(),
@@ -561,6 +557,7 @@ async fn yolo_mode_executes_publish_like_shell_without_prompt() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please publish this crate".to_string(),
             images: Vec::new(),
@@ -704,6 +701,7 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please open the PR".to_string(),
             images: Vec::new(),
@@ -1575,5 +1573,197 @@ fn turn_tool_context_uses_planned_authority_and_route_not_installed_session() {
             .expect("session object snapshot")
             .model,
         "planned-next-model"
+    );
+}
+
+/// `/network allow <host>` edits `config.toml` and tells the operator to retry
+/// the command. The engine holds its policy by value, so that retry only works
+/// when the tool context re-reads the document — this is the regression guard
+/// for a session that kept refusing a host the file already allowed.
+#[test]
+fn tool_context_network_policy_follows_the_config_document_mid_session() {
+    use crate::network_policy::{Decision, DecisionToml, NetworkPolicy, NetworkPolicyDecider};
+
+    let dir = tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "[network]\ndefault = \"prompt\"\nallow = [\"api.github.com\"]\n",
+    )
+    .expect("write config");
+
+    let api_config = Config {
+        loaded_config_path: Some(config_path),
+        ..Config::default()
+    };
+
+    // The snapshot the engine was spawned with does not allow the host yet.
+    let engine_config = EngineConfig {
+        network_policy: Some(NetworkPolicyDecider::new(
+            NetworkPolicy {
+                default: DecisionToml::Prompt,
+                ..NetworkPolicy::default()
+            },
+            None,
+        )),
+        ..EngineConfig::default()
+    };
+    let (engine, _handle) = Engine::new(engine_config, &api_config);
+
+    let authority = crate::core::authority::TurnAuthority::from_effective_fields(
+        AppMode::Agent,
+        true,
+        true,
+        true,
+        ApprovalMode::Bypass,
+    );
+    let route = TurnRouteContext {
+        provider: ProviderKind::Deepseek,
+        model: "network-refresh-model".to_string(),
+        capabilities: codewhale_config::route::RouteCapabilities::default(),
+        limits: None,
+        client: None,
+        api_config: Box::new(Config::default()),
+        locale_tag: engine.config.locale_tag.clone(),
+        role_models: engine.subagent_role_models(),
+        auto_model: false,
+        reasoning_effort: None,
+        reasoning_effort_auto: false,
+    };
+
+    let context = engine.build_tool_context_for_turn(&authority, &route);
+    let decider = context
+        .network_policy
+        .as_ref()
+        .expect("the configured policy is injected");
+    assert_eq!(
+        decider.evaluate("api.github.com", "Bash"),
+        Decision::Allow,
+        "the document already allows the host; the retry must see it"
+    );
+    assert_eq!(
+        decider.evaluate("unlisted.example.com", "Bash"),
+        Decision::Prompt,
+        "a host the document does not name still prompts"
+    );
+}
+
+/// `/network deny <host>` writes the same `[network]` table `/network allow`
+/// does. A session that started without one has to adopt it — otherwise
+/// tightening the policy mid-session needs the restart this fix removes — and a
+/// session that started gated must not lose its policy because the table went
+/// away.
+#[test]
+fn tool_context_adopts_a_policy_written_mid_session_and_never_ungates_one() {
+    use crate::network_policy::{Decision, DecisionToml, NetworkPolicy, NetworkPolicyDecider};
+
+    let dir = tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "[network]\ndefault = \"prompt\"\ndeny = [\"evil.example.com\"]\n",
+    )
+    .expect("write config");
+
+    let api_config = Config {
+        loaded_config_path: Some(config_path.clone()),
+        ..Config::default()
+    };
+
+    // A session that started with no `[network]` table at all adopts the deny.
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &api_config);
+    let authority = crate::core::authority::TurnAuthority::from_effective_fields(
+        AppMode::Agent,
+        true,
+        true,
+        true,
+        ApprovalMode::Bypass,
+    );
+    let route = TurnRouteContext {
+        provider: ProviderKind::Deepseek,
+        model: "network-adopt-model".to_string(),
+        capabilities: codewhale_config::route::RouteCapabilities::default(),
+        limits: None,
+        client: None,
+        api_config: Box::new(Config::default()),
+        locale_tag: engine.config.locale_tag.clone(),
+        role_models: engine.subagent_role_models(),
+        auto_model: false,
+        reasoning_effort: None,
+        reasoning_effort_auto: false,
+    };
+    let context = engine.build_tool_context_for_turn(&authority, &route);
+    let decider = context
+        .network_policy
+        .as_ref()
+        .expect("a table written mid-session is adopted");
+    assert_eq!(
+        decider.evaluate("evil.example.com", "Bash"),
+        Decision::Deny,
+        "the deny direction must land mid-session too"
+    );
+
+    // Removing the table must not ungate a session that started gated.
+    fs::write(&config_path, "# `[network]` removed\n").expect("rewrite config");
+    let engine_config = EngineConfig {
+        network_policy: Some(NetworkPolicyDecider::new(
+            NetworkPolicy {
+                default: DecisionToml::Deny,
+                ..NetworkPolicy::default()
+            },
+            None,
+        )),
+        ..EngineConfig::default()
+    };
+    let (gated, _handle) = Engine::new(engine_config, &api_config);
+    let context = gated.build_tool_context_for_turn(&authority, &route);
+    let decider = context
+        .network_policy
+        .as_ref()
+        .expect("a gated session stays gated");
+    assert_eq!(
+        decider.evaluate("unlisted.example.com", "Bash"),
+        Decision::Deny,
+        "removing the table must not hand a gated session an open policy"
+    );
+}
+
+/// Both continuation dispatchers test `is_active()` before re-arming. A goal the
+/// model handed back must therefore land as `Inactive` at the gate the loop
+/// actually consults — the unit tests pin `GoalState`, not this decision.
+#[test]
+fn a_yielded_goal_is_not_rearmed_by_the_continuation_gate() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    {
+        let mut state = engine.config.goal_state.lock().expect("goal lock");
+        state.replace("ship the milestone", None, Some("goal-1".to_string()));
+        state.mark_yielded().expect("yield an active goal");
+    }
+
+    assert!(
+        matches!(
+            engine.goal_continuation_if_active(),
+            GoalContinuationAction::Inactive
+        ),
+        "a handed-back goal must not be re-armed by the cross-turn gate"
+    );
+}
+
+/// The same gate, against an active goal, still dispatches — so the test above
+/// is measuring the yield and not a gate that is dead in test conditions.
+#[test]
+fn an_active_goal_is_still_rearmed_by_the_continuation_gate() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    {
+        let mut state = engine.config.goal_state.lock().expect("goal lock");
+        state.replace("ship the milestone", None, Some("goal-1".to_string()));
+    }
+
+    assert!(
+        matches!(
+            engine.goal_continuation_if_active(),
+            GoalContinuationAction::Dispatch { .. }
+        ),
+        "an active goal still continues; otherwise the yield test proves nothing"
     );
 }

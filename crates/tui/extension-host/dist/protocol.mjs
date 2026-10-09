@@ -209,7 +209,7 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "prompt_template", "skill_root", "shell_hook", "mcp_server"] }, spec: { ref: "RegisterSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "prompt_template", "skill_root", "avatar_pack", "shell_hook", "mcp_server"] }, spec: { ref: "RegisterSpecWire" } },
     optional: { scope: { ref: "EntryRef" } }
   },
   RegisterSpecWire: {
@@ -360,7 +360,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "prompt_template" || kind === "skill_root" || kind === "shell_hook" || kind === "mcp_server") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "prompt_template" || kind === "skill_root" || kind === "avatar_pack" || kind === "shell_hook" || kind === "mcp_server") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;

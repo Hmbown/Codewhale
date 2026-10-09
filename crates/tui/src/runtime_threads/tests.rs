@@ -2485,6 +2485,7 @@ fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> Tur
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: Vec::new(),
         steer_count: 0,
@@ -5527,6 +5528,7 @@ fn turn_record_round_trips_frozen_provider_live_pricing_and_drops_hostile_quotes
                 output: Some(output),
                 cache_read: Some(0.25),
                 cache_write: None,
+                ..Default::default()
             }),
             ..Default::default()
         }],
@@ -9460,6 +9462,104 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
             submission_id: None,
         })
         .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallHeartbeat)
+        .await?;
+    for (span_id, activity_kind, action_id) in [
+        (
+            "outer-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Executing,
+            "execute_tools",
+        ),
+        (
+            "nested-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Reading,
+            "read_file",
+        ),
+    ] {
+        harness
+            .tx_event
+            .send(EngineEvent::OperationActivityStarted {
+                span_id: span_id.to_string(),
+                activity_kind,
+                action_id: Some(action_id.to_string()),
+            })
+            .await?;
+    }
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallHeartbeat)
+        .await?;
+    let active_detail = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let detail = manager.get_thread_detail(&thread.id).await?;
+            if detail.turns.iter().any(|turn| {
+                turn.operation_activity
+                    .as_ref()
+                    .is_some_and(|activity| activity.active.len() == 2)
+            }) {
+                break Ok::<_, anyhow::Error>(detail);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let active = active_detail
+        .turns
+        .iter()
+        .find(|turn| turn.id == first.id)
+        .unwrap()
+        .operation_activity
+        .as_ref()
+        .unwrap();
+    assert!(!active.overflowed);
+    assert_eq!(active.active[1].action_id.as_deref(), Some("read_file"));
+    assert!(
+        active
+            .active
+            .iter()
+            .all(|span| span.span_id.starts_with("operation:")
+                && span.span_id.len() == 74
+                && span.started_at <= active.observed_at)
+    );
+    assert!(!serde_json::to_string(active)?.contains("private-call"));
+    assert!(
+        manager
+            .events_since(&thread.id, Some(active_detail.latest_seq))?
+            .iter()
+            .all(|event| event.event != "operation.activity_started")
+    );
+    for (span_id, activity_kind, action_id) in [
+        (
+            "nested-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Reading,
+            "read_file",
+        ),
+        (
+            "outer-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Executing,
+            "execute_tools",
+        ),
+    ] {
+        harness
+            .tx_event
+            .send(EngineEvent::OperationActivityCompleted {
+                span_id: span_id.to_string(),
+                activity_kind,
+                action_id: Some(action_id.to_string()),
+                outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Succeeded,
+            })
+            .await?;
+    }
+    harness
+        .tx_event
+        .send(EngineEvent::OperationActivityStarted {
+            span_id: "terminal-interruption".to_string(),
+            activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Tool,
+            action_id: Some("mcp_example_probe".to_string()),
+        })
+        .await?;
     let mut tool = catalog_tool("mcp_computer_get_app_state");
     tool.description = "Inspect app; api_key=sk-fixture-private-value".to_string();
     let pre_request = crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
@@ -9536,6 +9636,56 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
         .await?;
 
     let completed = wait_for_terminal_turn(&manager, &first.id).await?;
+    let operation_activity = completed
+        .operation_activity
+        .as_ref()
+        .expect("admitted operation snapshot");
+    assert!(operation_activity.active.is_empty());
+    assert_eq!(
+        operation_activity
+            .last_completed
+            .as_ref()
+            .unwrap()
+            .action_id
+            .as_deref(),
+        Some("execute_tools")
+    );
+    let operations = manager
+        .events_since(&thread.id, None)?
+        .into_iter()
+        .filter(|event| event.event.starts_with("operation."))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "operation.activity_started",
+            "operation.activity_started",
+            "operation.heartbeat",
+            "operation.activity_completed",
+            "operation.activity_completed",
+            "operation.activity_started"
+        ]
+    );
+    assert!(operations.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert_eq!(
+        operations[0].payload["span_id"],
+        operations[4].payload["span_id"]
+    );
+    assert_eq!(
+        operations[1].payload["span_id"],
+        operations[3].payload["span_id"]
+    );
+    assert_eq!(operations[3].payload["outcome"], "succeeded");
+    assert!(
+        operations
+            .iter()
+            .all(|event| event.turn_id.as_deref() == Some(first.id.as_str())
+                && event.payload["observed_at"].is_string())
+    );
+    assert!(operations[3].seq > active_detail.latest_seq);
     assert_eq!(
         completed.model_request_diagnostics,
         Some(RuntimeTurnRequestDiagnostics {
@@ -12741,8 +12891,8 @@ async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Re
         "Continue with the check?"
     );
 
-    manager
-        .submit_user_input(
+    let (submitted, delivered) = tokio::join!(
+        manager.submit_user_input(
             &thread.id,
             "input_reload",
             crate::tools::user_input::UserInputResponse {
@@ -12752,9 +12902,11 @@ async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Re
                     value: "Yes".to_string(),
                 }],
             },
-        )
-        .await?;
-    match harness.recv_user_input_submission().await {
+        ),
+        harness.recv_user_input_submission(),
+    );
+    submitted?;
+    match delivered {
         Some((id, response)) => {
             assert_eq!(id, "input_reload");
             assert_eq!(response.answers[0].id, "continue");
@@ -12828,6 +12980,417 @@ async fn unknown_user_input_id_is_not_delivered_to_engine() -> Result<()> {
 }
 
 #[tokio::test]
+async fn user_input_tool_timeout_and_cancel_clear_snapshot_before_turn_end() -> Result<()> {
+    for error in [
+        crate::tools::spec::ToolError::Timeout { seconds: 1 },
+        crate::tools::spec::ToolError::cancelled("turn canceled"),
+    ] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "ask before continuing work".into(),
+                    ..StartTurnRequest::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(_))
+        ));
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallStarted {
+                id: "input-timeout".into(),
+                model_call: None,
+                name: "request_user_input".into(),
+                input: json!({"questions": []}),
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::UserInputRequired {
+                id: "input-timeout".into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .get_thread_detail(&thread.id)
+                    .await?
+                    .pending_user_inputs
+                    .len()
+                    == 1
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("question was not registered")??;
+
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallComplete {
+                id: "input-timeout".into(),
+                model_call: None,
+                name: "request_user_input".into(),
+                result: Err(error),
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = manager.get_thread_detail(&thread.id).await?;
+                let events = manager.events_since(&thread.id, None)?;
+                if detail.pending_user_inputs.is_empty()
+                    && events.iter().any(|event| {
+                        event.event == "user_input.canceled"
+                            && event.turn_id.as_deref() == Some(turn.id.as_str())
+                            && event.payload.get("input_id").and_then(Value::as_str)
+                                == Some("input-timeout")
+                            && event.payload.get("terminal").and_then(Value::as_bool) == Some(false)
+                    })
+                {
+                    assert!(!events.iter().any(|event| event.event == "turn.completed"));
+                    return Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("completed tool left its question pending")??;
+        assert_eq!(
+            manager.store.load_turn(&turn.id)?.status,
+            RuntimeTurnStatus::InProgress
+        );
+        assert!(
+            !manager
+                .submit_user_input(
+                    &thread.id,
+                    "input-timeout",
+                    crate::tools::user_input::UserInputResponse {
+                        answers: Vec::new()
+                    },
+                )
+                .await?,
+            "an expired question accepted a late answer"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                harness.recv_user_input_cancellation()
+            )
+            .await
+            .is_err(),
+            "a completed waiter must not receive another cancellation"
+        );
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        wait_for_terminal_turn(&manager, &turn.id).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_tool_settlement_preserves_other_request_ids_turns_and_retryable_receipts()
+-> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    for (id, turn_id) in [
+        ("inner-question", "turn-question"),
+        ("new-question", "turn-new"),
+    ] {
+        manager.register_pending_user_input(
+            &thread.id,
+            PendingUserInputRequest {
+                id: id.into(),
+                turn_id: turn_id.into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            },
+        );
+    }
+    // Completing an enclosing execute_tools call is not the inner question's
+    // terminal fact. Neither may a delayed prior-turn event own a reused id.
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "outer-call")
+        .await?;
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-old", "inner-question")
+        .await?;
+    assert_eq!(manager.pending_requests_for_thread(&thread.id).1.len(), 2);
+    assert!(
+        manager
+            .events_since(&thread.id, None)?
+            .iter()
+            .all(|event| event.event != "user_input.canceled")
+    );
+
+    let fault = EventAppendFaultGuard::arm(&thread.id, EventAppendTestFault::AfterSync);
+    let error = manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "inner-question")
+        .await
+        .expect_err("injected append failure must retain the request");
+    drop(fault);
+    assert!(format!("{error:#}").contains("rolled back"));
+    assert_eq!(manager.pending_requests_for_thread(&thread.id).1.len(), 2);
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "inner-question")
+        .await?;
+    let pending = manager.pending_requests_for_thread(&thread.id).1;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "new-question");
+    // Duplicate completion is idempotent and never manufactures a receipt.
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "inner-question")
+        .await?;
+    assert_eq!(
+        manager
+            .events_since(&thread.id, None)?
+            .iter()
+            .filter(|event| event.event == "user_input.canceled")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_tool_settlement_waits_for_answer_receipt_and_recovers_failed_claim()
+-> Result<()> {
+    for answered in [false, true] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager.register_pending_user_input(
+            &thread.id,
+            PendingUserInputRequest {
+                id: "input-race".into(),
+                turn_id: "turn-race".into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            },
+        );
+        let PendingUserInputClaim::Claimed(request) =
+            manager.claim_pending_user_input(&thread.id, "input-race", None)
+        else {
+            bail!("answer did not own the request");
+        };
+        let settlement =
+            manager.settle_user_input_for_completed_tool(&thread.id, "turn-race", "input-race");
+        tokio::pin!(settlement);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut settlement)
+                .await
+                .is_err(),
+            "tool completion must wait for the answer receipt's owner"
+        );
+        if answered {
+            manager
+                .settle_claimed_user_input(
+                    &thread.id,
+                    None,
+                    request,
+                    UserInputTerminalOutcome::Answered(
+                        crate::tools::user_input::UserInputResponse {
+                            answers: Vec::new(),
+                        },
+                    ),
+                )
+                .await?;
+        } else {
+            // The API worker restores its claim after a retryable append
+            // error. The already-completed waiter still needs retirement.
+            manager.restore_pending_user_input_claim(&thread.id, &request);
+        }
+        tokio::time::timeout(Duration::from_secs(2), &mut settlement)
+            .await
+            .context("tool settlement did not follow the answer receipt")??;
+        assert!(manager.pending_requests_for_thread(&thread.id).1.is_empty());
+        let events = manager.events_since(&thread.id, None)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "user_input.canceled")
+                .count(),
+            usize::from(!answered)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "user_input.answered")
+                .count(),
+            usize::from(answered)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_rejected_answer_or_cancel_restores_exact_question_for_retry() -> Result<()> {
+    for cancel in [false, true] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        manager.register_pending_user_input(
+            &thread.id,
+            PendingUserInputRequest {
+                id: "input-rejected".into(),
+                turn_id: "turn-rejected".into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            },
+        );
+        let delivery = async {
+            if cancel {
+                manager
+                    .cancel_user_input(&thread.id, "input-rejected")
+                    .await
+            } else {
+                manager
+                    .submit_user_input(
+                        &thread.id,
+                        "input-rejected",
+                        crate::tools::user_input::UserInputResponse {
+                            answers: Vec::new(),
+                        },
+                    )
+                    .await
+            }
+        };
+        let (result, rejected) = tokio::join!(delivery, harness.reject_user_input_decision());
+        assert!(
+            result.is_err(),
+            "Engine rejection cannot report delivery success"
+        );
+        assert_eq!(rejected.as_deref(), Some("input-rejected"));
+        let pending = manager.pending_requests_for_thread(&thread.id).1;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "input-rejected");
+        assert!(manager.events_since(&thread.id, None)?.iter().any(|event| {
+            event.event == "user_input.required" && event.payload.get("delivery_error").is_some()
+        }));
+        let (accepted, consumed) = tokio::join!(
+            manager.submit_user_input(
+                &thread.id,
+                "input-rejected",
+                crate::tools::user_input::UserInputResponse {
+                    answers: Vec::new()
+                }
+            ),
+            harness.recv_user_input_submission(),
+        );
+        assert!(accepted?);
+        assert!(consumed.is_some());
+        assert!(manager.pending_requests_for_thread(&thread.id).1.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_terminal_tool_result_does_not_resurrect_rejected_inflight_answer() -> Result<()>
+{
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager.register_pending_user_input(
+        &thread.id,
+        PendingUserInputRequest {
+            id: "input-expired-race".into(),
+            turn_id: "turn-expired-race".into(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        },
+    );
+    let terminal = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .pending_user_inputs
+                    .lock()
+                    .get(&(thread.id.clone(), "input-expired-race".into()))
+                    .is_some_and(|entry| entry.settling)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        manager
+            .settle_user_input_for_completed_tool(
+                &thread.id,
+                "turn-expired-race",
+                "input-expired-race",
+            )
+            .await
+    };
+    let (submitted, completed, rejected) = tokio::join!(
+        manager.submit_user_input(
+            &thread.id,
+            "input-expired-race",
+            crate::tools::user_input::UserInputResponse {
+                answers: Vec::new()
+            }
+        ),
+        terminal,
+        harness.reject_user_input_decision(),
+    );
+    assert!(submitted.is_err());
+    completed?;
+    assert_eq!(rejected.as_deref(), Some("input-expired-race"));
+    assert!(manager.pending_requests_for_thread(&thread.id).1.is_empty());
+    let events = manager.events_since(&thread.id, None)?;
+    let last = events
+        .iter()
+        .rfind(|event| event.event.starts_with("user_input."))
+        .unwrap();
+    assert_eq!(last.event, "user_input.canceled");
+    assert!(
+        !manager
+            .submit_user_input(
+                &thread.id,
+                "input-expired-race",
+                crate::tools::user_input::UserInputResponse {
+                    answers: Vec::new()
+                }
+            )
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_input_receipt_append_failure_restores_request_without_delivery() -> Result<()> {
     const SECRET: &str = "answer-only-for-engine-after-retry";
     let manager = test_manager(test_runtime_dir())?;
@@ -12879,17 +13442,12 @@ async fn user_input_receipt_append_failure_restores_request_without_delivery() -
         "answer reached the engine before its receipt was durable"
     );
 
-    assert!(
-        manager
-            .submit_user_input(&thread.id, "input_retry", response())
-            .await?,
-        "restored request was not retryable"
+    let (submitted, delivered) = tokio::join!(
+        manager.submit_user_input(&thread.id, "input_retry", response()),
+        harness.recv_user_input_submission(),
     );
-    let (_, delivered) =
-        tokio::time::timeout(Duration::from_secs(2), harness.recv_user_input_submission())
-            .await
-            .context("retried answer did not reach the engine")?
-            .context("retried answer was canceled")?;
+    assert!(submitted?, "restored request was not retryable");
+    let (_, delivered) = delivered.context("retried answer was not consumed")?;
     assert_eq!(delivered.answers[0].value, SECRET);
     let events = manager.events_since(&thread.id, None)?;
     assert_eq!(
@@ -12973,6 +13531,16 @@ async fn user_input_settlement_outlives_canceled_api_future() -> Result<()> {
             .context("detached settlement did not reach the engine")?
             .context("detached settlement was canceled")?;
     assert_eq!(delivered.answers[0].value, SECRET);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager.pending_requests_for_thread(&thread.id).1.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("accepted detached reply did not retire its request")?;
     let detail = manager.get_thread_detail(&thread.id).await?;
     assert!(detail.pending_user_inputs.is_empty());
     let events = manager.events_since(&thread.id, None)?;
@@ -13039,16 +13607,9 @@ async fn terminal_user_input_cancellation_is_durable_before_engine_delivery() ->
         "terminal cancellation reached the engine before durable append"
     );
     drop(emit_guard);
-    settlement
-        .await
-        .context("terminal settlement task panicked")??;
-    assert!(
-        tokio::time::timeout(Duration::from_secs(2), harness.recv_user_input_submission())
-            .await
-            .context("engine did not receive terminal cancellation")?
-            .is_none(),
-        "terminal cancellation delivered a submitted response"
-    );
+    let (settled, delivered) = tokio::join!(settlement, harness.recv_user_input_cancellation());
+    settled.context("terminal settlement task panicked")??;
+    assert_eq!(delivered.as_deref(), Some("input_terminal_order"));
     let events = manager.events_since(&thread.id, None)?;
     let canceled = events
         .iter()
@@ -14914,6 +15475,19 @@ async fn dynamic_tool_timeout_clears_snapshot_and_emits_once() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn dynamic_tool_result_backstop_matches_mcp_tools_call_budget() {
+    // The dynamic-result wait is a backstop for client-executed tools, not a
+    // cap on the tool itself: the MCP `tools/call` budget legitimately allows
+    // 1800s executions, so the backstop must not fire earlier than that.
+    assert_eq!(
+        DYNAMIC_TOOL_RESULT_TIMEOUT,
+        Duration::from_secs(crate::mcp::McpTimeouts::default().execute_timeout),
+        "dynamic tool-result backstop must not undercut the MCP tools/call budget"
+    );
+    assert_eq!(DYNAMIC_TOOL_RESULT_TIMEOUT, Duration::from_secs(1800));
+}
+
 #[tokio::test]
 async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()> {
     use crate::tools::spec::DynamicToolExecutor;
@@ -15475,6 +16049,302 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
                 base_url: None,
             })
             .await?;
+    }
+    Ok(())
+}
+
+/// Drive Runtime's actual event monitor and inspect the Engine inbox, rather
+/// than restating the pure resolver's truth table (#6471).
+#[tokio::test]
+async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Result<()> {
+    use crate::approval_log::ApprovalDecider;
+
+    for (posture, forced, remembered, approved, denied_posture) in [
+        ("full-access", false, false, true, None),
+        ("full-access", false, true, true, None),
+        (
+            "full-access",
+            true,
+            false,
+            false,
+            Some("full_access_policy_hold"),
+        ),
+        (
+            "full-access",
+            true,
+            true,
+            false,
+            Some("full_access_policy_hold"),
+        ),
+        ("never", false, false, false, Some("never")),
+        ("never", false, true, false, Some("never")),
+        ("ask", false, true, true, None),
+    ] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                permission_posture: Some(
+                    if posture == "never" { "ask" } else { posture }.to_string(),
+                ),
+                ..Default::default()
+            })
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "honor the exact approval disposition".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ));
+        // Never is an internal live authority, not a public Runtime posture.
+        if posture == "never" {
+            harness.handle.publish_turn_authority(
+                AppMode::Agent,
+                true,
+                false,
+                false,
+                ApprovalMode::Never,
+                None,
+            );
+        }
+        let grant = if remembered {
+            Some(
+                manager
+                    .add_session_grant(&thread.id, &turn.id, "bash", "policy-group", "s")
+                    .await
+                    .context("fixture conversation grant")?,
+            )
+        } else {
+            None
+        };
+        harness
+            .tx_event
+            .send(EngineEvent::ApprovalRequired {
+                approval_key: "policy-key".to_string(),
+                approval_grouping_key: "policy-group".to_string(),
+                id: "policy-call".to_string(),
+                tool_name: "bash".to_string(),
+                // Text and input cannot impersonate a Rust-minted origin key.
+                description: "Requested by extension:claimed".to_string(),
+                input: json!({"approval_key": "extcall:ext:claimed", "command": "echo fixture"}),
+                intent_summary: None,
+                approval_force_prompt: forced,
+            })
+            .await?;
+        let decision =
+            tokio::time::timeout(APPROVAL_READINESS_TIMEOUT, harness.recv_approval_decision())
+                .await
+                .context("automatic disposition must not open a modal")?;
+        let expected = if approved {
+            MockApprovalEvent::Approved {
+                id: "policy-call".to_string(),
+            }
+        } else {
+            MockApprovalEvent::Denied {
+                id: "policy-call".to_string(),
+            }
+        };
+        let by = if approved && posture == "ask" {
+            ApprovalDecider::SessionRule
+        } else {
+            ApprovalDecider::Posture
+        };
+        assert_eq!(
+            decision,
+            Some((expected, Some(by))),
+            "{posture}/{forced}/{remembered}"
+        );
+        assert_eq!(manager.pending_approvals_count(), 0);
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        assert!(detail.pending_approvals.is_empty());
+        assert_eq!(detail.approval_grants.len(), usize::from(remembered));
+        let decided = manager
+            .events_since(&thread.id, None)?
+            .into_iter()
+            .find(|event| {
+                event.event == "approval.decided" && event.payload["tool_call_id"] == "policy-call"
+            })
+            .context("automatic decision receipt")?;
+        assert_eq!(
+            decided.payload["decision"],
+            if approved { "allow" } else { "deny" }
+        );
+        assert_eq!(decided.payload["auto"], true);
+        assert_eq!(decided.payload["remember"], false);
+        if let Some(posture) = denied_posture {
+            assert_eq!(decided.payload["posture"], posture);
+        }
+        if approved && posture == "ask" {
+            assert_eq!(decided.payload["grant_id"], grant.unwrap().grant_id);
+        } else {
+            assert!(decided.payload.get("grant_id").is_none());
+        }
+        let approval_id = decided.payload["approval_id"]
+            .as_str()
+            .context("opaque decision identity")?;
+        assert!(approval_id.starts_with("approval_"));
+        assert_ne!(approval_id, "policy-call");
+        for id in ["policy-call", approval_id] {
+            assert!(!manager.deliver_external_approval(
+                id,
+                ExternalApprovalDecision::Allow { remember: false },
+            ));
+        }
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        assert_eq!(
+            wait_for_terminal_turn(&manager, &turn.id).await?.status,
+            RuntimeTurnStatus::Completed,
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_approval_disposition_forced_requests_require_human() -> Result<()> {
+    use crate::approval_log::ApprovalDecider;
+
+    for (posture, tool_name, extension_origin) in [
+        ("full-access", "bash", true),
+        ("full-access", "web_search", true),
+        ("ask", "bash", false),
+    ] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                permission_posture: Some(posture.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "wait for the exact human decision".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ));
+        let input = json!({"command": "echo fixture", "query": "fixture"});
+        let (key, group) = if extension_origin {
+            crate::tools::approval_cache::extension_origin_approval_keys(
+                "ext:fixture@reviewed-hash",
+                None,
+                tool_name,
+                &input,
+            )
+        } else {
+            crate::tools::approval_cache::approval_keys_for_call(None, tool_name, &input)
+        };
+        let grant = manager
+            .add_session_grant(&thread.id, &turn.id, tool_name, &group.0, "s")
+            .await
+            .context("fixture conversation grant")?;
+        harness
+            .tx_event
+            .send(EngineEvent::ApprovalRequired {
+                approval_key: key.0,
+                approval_grouping_key: group.0,
+                id: "human-call".to_string(),
+                tool_name: tool_name.to_string(),
+                description: "exact human approval required".to_string(),
+                input,
+                intent_summary: None,
+                approval_force_prompt: true,
+            })
+            .await?;
+        let approval_id = await_approval_identity(&manager, &thread.id, "human-call").await?;
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        assert_eq!(detail.pending_approvals.len(), 1, "{posture}/{tool_name}");
+        assert_eq!(detail.pending_approvals[0].id, approval_id);
+        assert_eq!(detail.pending_approvals[0].turn_id, turn.id);
+        assert_eq!(
+            detail.pending_approvals[0].tool_call_id.as_deref(),
+            Some("human-call")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.recv_approval_decision())
+                .await
+                .is_err(),
+            "neither Full Access nor a remembered grant may answer: {posture}/{tool_name}"
+        );
+        assert!(!manager.deliver_external_approval(
+            "human-call",
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert!(manager.deliver_external_approval(
+            &approval_id,
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert_eq!(
+            tokio::time::timeout(APPROVAL_READINESS_TIMEOUT, harness.recv_approval_decision())
+                .await?,
+            Some((
+                MockApprovalEvent::Approved {
+                    id: "human-call".to_string()
+                },
+                Some(ApprovalDecider::User),
+            )),
+        );
+        assert_eq!(manager.pending_approvals_count(), 0);
+        assert!(!manager.deliver_external_approval(
+            &approval_id,
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert_eq!(
+            manager.approval_grants_for_thread(&thread.id)[0].grant_id,
+            grant.grant_id
+        );
+        let decided = manager
+            .events_since(&thread.id, None)?
+            .into_iter()
+            .find(|event| {
+                event.event == "approval.decided" && event.payload["approval_id"] == approval_id
+            })
+            .context("human decision receipt")?;
+        assert_eq!(decided.payload["decision"], "allow");
+        assert_ne!(
+            decided.payload.get("auto").and_then(Value::as_bool),
+            Some(true)
+        );
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        assert_eq!(
+            wait_for_terminal_turn(&manager, &turn.id).await?.status,
+            RuntimeTurnStatus::Completed,
+        );
     }
     Ok(())
 }
@@ -17305,6 +18175,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![completed_item.id.clone(), in_progress_item.id.clone()],
         steer_count: 0,
@@ -17344,6 +18215,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![queued_item.id.clone()],
         steer_count: 0,
@@ -17541,6 +18413,7 @@ fn seed_turns_with_user_messages(
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: None,
             item_ids: vec![user_item_id, asst_item_id],
             steer_count: 0,
@@ -18361,6 +19234,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![user_item.id.clone(), call_item.id.clone()],
         steer_count: 0,
@@ -18467,6 +19341,7 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![call_item.id.clone()],
         steer_count: 0,
@@ -18568,6 +19443,7 @@ fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![delivered.id.clone(), dropped.id.clone(), pending.id.clone()],
         steer_count: 0,
@@ -18670,6 +19546,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![user_item.id.clone(), legacy_tool_item.id.clone()],
         steer_count: 0,
@@ -19367,6 +20244,37 @@ mod runtime_image_inputs {
             };
             assert_eq!(images, request.images);
             assert_eq!(turn.schema_version, IMAGE_RUNTIME_SCHEMA_VERSION);
+            // The next fork shares this workspace. Finish the mock normally
+            // and observe its durable settlement before restoring that case.
+            for event in [
+                EngineEvent::TurnStarted {
+                    turn_id: turn.id.clone(),
+                    created_at: Utc::now(),
+                    route: None,
+                    submission_id: None,
+                },
+                EngineEvent::MessageStarted { index: 0 },
+                EngineEvent::MessageDelta {
+                    index: 0,
+                    content: "stored image fixture response".into(),
+                },
+                EngineEvent::MessageComplete { index: 0 },
+                EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    parent_route_usage: Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                },
+            ] {
+                harness.tx_event.send(event).await?;
+            }
+            assert_eq!(
+                wait_for_terminal_turn(&manager, &turn.id).await?.status,
+                RuntimeTurnStatus::Completed
+            );
         }
         Ok(())
     }
@@ -22051,9 +22959,9 @@ async fn a_pending_turn_workspace_is_reconciled_on_restart() -> Result<()> {
     Ok(())
 }
 /// #6582: a Runtime API `bash` completion hands the command's exit code and
-/// status to `tool_call_after` and `on_error`, as the TUI does. The runtime
-/// path used to pass `None`; and a failing command, which `bash` reports as a
-/// `ToolError`, reached hooks with no exit code on either surface.
+/// status to `tool_call_after` and `on_error`, as the TUI does. A nonzero
+/// exit is a `ToolError`. A foreground wait that expires is not: the command
+/// moves to the background and stays running, so `on_error` does not fire.
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Result<()> {
@@ -22121,7 +23029,7 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
     let (after, errors) = loop {
         let after = read_lines(&after_log);
         let errors = read_lines(&error_log);
-        if (after.len() >= 4 && errors.len() >= 3) || Instant::now() >= deadline {
+        if (after.len() >= 4 && errors.len() >= 2) || Instant::now() >= deadline {
             break (after, errors);
         }
         sleep(Duration::from_millis(20)).await;
@@ -22132,7 +23040,7 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
             "call-exit-0 0 completed true",
             "call-exit-1 1 failed false",
             "call-exit-127 127 failed false",
-            "call-timeout unset timed_out false",
+            "call-timeout unset running true",
         ]
     );
     assert_eq!(
@@ -22140,7 +23048,6 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
         vec![
             "call-exit-1 1 failed false",
             "call-exit-127 127 failed false",
-            "call-timeout unset timed_out false",
         ]
     );
     Ok(())
@@ -22877,4 +23784,63 @@ fn runtime_transport_retry_counts_default_old_bytes_and_preserve_new_receipts() 
         serde_json::from_value::<RuntimeTurnRequestDiagnostics>(encoded).unwrap(),
         facts
     );
+}
+
+#[tokio::test]
+async fn profile_constitution_runtime_admission_binds_the_complete_snapshot_to_replay() -> Result<()>
+{
+    use codewhale_config::user_constitution::{ProfileConstitution, ProfileConstitutionSnapshot};
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let request = StartTurnRequest {
+        prompt: "Use this profile".into(),
+        operation_key: Some("constitution-once".into()),
+        profile_constitution: Some(ProfileConstitutionSnapshot {
+            account_id: "acct_fixture".into(),
+            revision: 4,
+            constitution: ProfileConstitution {
+                notes: "Exact preference".into(),
+                ..Default::default()
+            },
+        }),
+        ..Default::default()
+    };
+    let turn = manager.start_turn(&thread.id, request.clone()).await?;
+    let Some(Op::SendMessage(spec)) = harness.rx_op.recv().await else {
+        bail!("missing Engine operation");
+    };
+    assert_eq!(spec.profile_constitution, request.profile_constitution);
+    assert_eq!(
+        manager.start_turn(&thread.id, request.clone()).await?.id,
+        turn.id
+    );
+    let mut changed = request.clone();
+    changed
+        .profile_constitution
+        .as_mut()
+        .unwrap()
+        .constitution
+        .notes = "New preference".into();
+    assert!(manager.start_turn(&thread.id, changed).await.is_err());
+    let mut changed = request.clone();
+    changed.profile_constitution = None;
+    assert!(manager.start_turn(&thread.id, changed).await.is_err());
+    assert!(harness.rx_op.try_recv().is_err());
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id).await?;
+    Ok(())
 }

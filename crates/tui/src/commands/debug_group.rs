@@ -1,14 +1,14 @@
 //! Host registration/action adapter for the portable debug group. Replaces
-//! groups/debug/mod.rs's concrete-App dispatcher; the existing central
+//! the portable command crate's handlers; the existing central
 //! dispatcher still constructs the declared envelope and consumes the result.
 
 use super::CommandResult;
-use super::groups::debug::*;
 use super::traits::{Command, CommandGroup, ContextualCommand};
 use crate::tui::app::AppAction;
 use codewhale_command_contract::handler::CommandHandler;
 use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 use codewhale_command_contract::outcome::{DebugAction, DebugCommandResult};
+use codewhale_commands::debug::*;
 use std::marker::PhantomData;
 
 pub(super) struct DebugCommands;
@@ -94,6 +94,7 @@ pub(in crate::commands) fn host_result(result: DebugCommandResult) -> CommandRes
         DebugAction::OpenTextPager { title, content } => {
             AppAction::OpenTextPager { title, content }
         }
+        DebugAction::OpenDiffPager { title, diff } => AppAction::OpenDiffPager { title, diff },
         DebugAction::OpenContextInspector => AppAction::OpenContextInspector,
         DebugAction::SendMessage(input) => AppAction::SendMessage(input),
         DebugAction::SyncSession(sync) => sync_session(sync),

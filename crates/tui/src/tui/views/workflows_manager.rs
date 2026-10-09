@@ -288,7 +288,7 @@ impl WorkflowsManagerView {
                 Span::styled(
                     format!(
                         "  ·  {}  ·  {} children",
-                        crate::elapsed::format_elapsed_secs(elapsed),
+                        codewhale_command_contract::elapsed::format_elapsed_secs(elapsed),
                         detail.line.child_count
                     ),
                     Style::default().fg(palette::TEXT_DIM),
@@ -328,7 +328,7 @@ impl WorkflowsManagerView {
                 format!(
                     "  run {}  ·  {}  ·  {} children",
                     detail.line.run_id,
-                    crate::elapsed::format_elapsed_secs(elapsed),
+                    codewhale_command_contract::elapsed::format_elapsed_secs(elapsed),
                     detail.line.child_count
                 ),
                 Style::default().fg(palette::TEXT_DIM),

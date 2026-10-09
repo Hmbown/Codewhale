@@ -2218,12 +2218,13 @@ fn is_context_window_error(e: &anyhow::Error) -> bool {
         return false;
     }
 
+    // Only genuine overflow wording drops history. The category alone is far
+    // too wide: it now covers every rejected request (#6843), so a bare
+    // `token` or `maximum` ("max_tokens must be <= 8192", "temperature exceeds
+    // maximum 2") must not peel the summary input away on each retry.
     let lower = text.to_lowercase();
-    lower.contains("context")
-        || lower.contains("token")
-        || lower.contains("prompt is too long")
-        || lower.contains("requested")
-        || lower.contains("maximum")
+    is_context_window_error_message(&text)
+        || (lower.contains("requested") && lower.contains("tokens") && lower.contains("maximum"))
 }
 
 /// Collect text from a user message without treating tool-result payloads
@@ -2341,6 +2342,60 @@ mod tests {
             restore_compaction_checkpoint(vec![legacy.clone(), legacy], Some(&summary));
         assert_eq!(legacy_restored.len(), 1);
         assert!(is_wire_compaction_checkpoint_message(&legacy_restored[0]));
+    }
+
+    #[test]
+    fn restore_anchors_at_the_real_carrier_when_a_pasted_summary_precedes_it() {
+        // Mirror order of the duplicate-carrier test above: the pasted full
+        // summary comes BEFORE the real provenance carrier — the order in
+        // which a content-based anchor would land on the pasted turn's
+        // index. Restore must anchor at the real carrier's index, replace
+        // the carrier with the saved summary there, and keep the pasted
+        // turn verbatim as user content. The carrier's text differs from
+        // the saved summary so the assertions cannot pass by leaving the
+        // history untouched.
+        let pasted_summary = SystemPrompt::Text(build_compaction_summary_block_text(
+            "Please analyze this text",
+            "",
+        ));
+        let pasted = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: summary_prompt_text(&pasted_summary),
+                cache_control: None,
+            }],
+        };
+        assert!(
+            !is_wire_compaction_checkpoint_message(&pasted),
+            "a pasted summary without the provenance block is user content"
+        );
+        let carrier = compaction_checkpoint_message(&SystemPrompt::Text(
+            build_compaction_summary_block_text("Compacted summary", ""),
+        ));
+        let authoritative = SystemPrompt::Text(build_compaction_summary_block_text(
+            "Authoritative summary",
+            "",
+        ));
+        let restored =
+            restore_compaction_checkpoint(vec![pasted.clone(), carrier], Some(&authoritative));
+        assert_eq!(
+            restored.len(),
+            2,
+            "restore must not drop the pasted turn: {restored:?}"
+        );
+        assert_eq!(
+            restored[0], pasted,
+            "the pasted full summary must survive restore verbatim"
+        );
+        assert!(
+            is_wire_compaction_checkpoint_message(&restored[1]),
+            "the real carrier keeps the anchor position: {restored:?}"
+        );
+        assert_eq!(
+            restored[1],
+            compaction_checkpoint_message(&authoritative),
+            "the saved summary replaces the carrier at its index: {restored:?}"
+        );
     }
 
     #[test]
@@ -2554,6 +2609,17 @@ mod tests {
         assert!(!is_context_window_error(&anyhow::anyhow!(
             "503 Service Unavailable"
         )));
+        // A rejected parameter names a token or a maximum without being a
+        // length overflow; dropping history cannot fix it.
+        for msg in [
+            r#"Invalid request (400): {"message":"max_tokens must be <= 8192","type":"invalid_request_error"}"#,
+            "HTTP 422: temperature exceeds maximum 2",
+        ] {
+            assert!(
+                !is_context_window_error(&anyhow::anyhow!(msg)),
+                "a non-length rejection must not trigger the drop-oldest ladder: `{msg}`",
+            );
+        }
     }
 
     #[test]

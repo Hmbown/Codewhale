@@ -19,7 +19,7 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--ground), var(--bg);
+  background: var(--ground, var(--bg));
   background-repeat: no-repeat;
   color: var(--text);
   font-family: var(--font-body);

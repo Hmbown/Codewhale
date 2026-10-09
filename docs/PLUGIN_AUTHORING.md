@@ -7,6 +7,9 @@ The [hello-codewhale example](examples/plugins/hello-codewhale/plugin.json)
 contains two files, declares no server or hook, and asks for no tool use.
 This walkthrough takes it from source files to a reviewed, enabled skill.
 
+For a custom AI provider with host-owned OAuth, see [Plugin providers](PLUGIN_PROVIDERS.md)
+and the [provider example](examples/plugins/oauth-provider/plugin.json).
+
 ## 1. Create the bundle
 
 Use the checked-in example, or create this directory outside an installed
@@ -204,9 +207,10 @@ paths, parser rules and count/byte limits are documented in
 [the skill-root contract](EXTENSIONS.md#skill-roots). This API adds instructions;
 tool permissions remain with the shared engine.
 
-Custom Ratatui/GPUI widgets, DSH browser UI slots,
-native `dsh.bundle.patch` execution and DSH's agent runtime are not provided.
-The static importer described below still converts only its portable subset.
+The DSH importer described below can prepare a reviewed Native composition
+from a closed package, as well as convert portable declarative components.
+Custom Ratatui/GPUI widgets, DSH browser UI slots and DSH's agent runtime
+are not provided.
 Compatible Claude bundles still use the existing declarative component adapters;
 this Native API does not load Claude's agent loop or automatically adapt Pi's
 extension API. Port executable mod behavior against the documented host contract.
@@ -317,7 +321,7 @@ the same review as `POST /v1/apps/plugins/import/dsh/preview`, whose
 `install_source` and `content_hash` go to `POST /v1/apps/plugins/install`.
 Those two are the only import surfaces today: the TUI slash command
 (`/plugin import dsh <dir>` and `approve`) and the Runtime API. There is no
-`codewhale plugin` CLI subcommand for DSH import. This static import is also
+`codewhale plugin` CLI subcommand for DSH import. This bundle import is also
 not the external-launcher integration `codewhale integrations dsh`, which runs
 the user's installed `dsh` (see [INTEGRATIONS_DSH.md](INTEGRATIONS_DSH.md)).
 
@@ -329,7 +333,24 @@ whole field: `config` is **not** deep-merged. This is not a complete profile
 resolver: other bundles, user overlays and deployment configuration are absent.
 Plain YAML scalars follow the YAML 1.2 core schema, as DSH's own parser does.
 
-Disabled groups propagate their state to descendants. Disabled MCP declarations
+Packages containing supported local modules, contained ESM package exports or
+the supported DSH service bridges can produce a Native composition. The importer
+seals the contained source files and module hashes, then generates the Native
+entry or entries. A Native graph with an unresolved or unsupported row is
+refused as a whole. It does not silently install the parts that happened to
+resolve. Reviewed agent-preset packages can produce separate Native entries;
+the selected default or child preset scopes their contributions.
+
+Import and review never execute plugin code. A generated Native composition
+remains inactive until `extension_host` is explicitly enabled and the installed
+bundle is reviewed, trusted and enabled. The host verifies its source closure
+before loading it, and Rust retains tool approval and session authority. The
+supported services, runtime limits and teardown behavior are documented in
+[EXTENSIONS.md](EXTENSIONS.md). DSH UI code and the upstream agent loop are
+outside this contract.
+
+For portable declarative conversion, disabled groups propagate their state to
+descendants. Disabled MCP declarations
 stay disabled. Disabled skills are omitted with an explicit receipt because the
 native skill format has no disabled state. A conditional/non-boolean `disabled`
 value on a group or portable row refuses the import rather than assuming it is
@@ -337,15 +358,14 @@ enabled. Unsupported entry policy/dependency fields, including `inject`,
 `intercept` and `isolate`, also refuse the import on those rows or their groups.
 Preserve their activation and authority rules in a manual port.
 
-The importer never executes plugin code. Foreign runtime plugins and
-`dsh.client` UI code are not executed or translated.
-Other unrepresentable components are reported in the bundle's `CONVERSION.md` and
+Unrepresentable portable components are reported in the bundle's `CONVERSION.md` and
 structured `CONVERSION.json`, with source package/version, manifest and
 ordered-layer SHA-256 hashes, converter version, per-row outcomes and required
 manual ports. Unapplied patch operations also appear in the structured
 manual-port list, with their source layer and one-based operation index.
 
-The only lowered `!!js` expressions are `process.execPath` (becomes `node`) and
+In portable conversion, the only lowered `!!js` expressions are
+`process.execPath` (becomes `node`) and
 simple quoted/template literals without escapes or interpolation. Environment
 expressions—including fallbacks—are never resolved against this machine.
 Packaged Node MCP converts only when its relative entry resolves inside the
@@ -354,12 +374,13 @@ package is skipped, and host paths are never copied. Rows of
 `@deepseek-ai/dsh-skill-filesystem` contribute their literal `customSkillDirs`
 children only when those directories live inside the package. Default user and
 project skill roots, watchers and foreign service dependencies are not imported.
-Arbitrary DSH TypeScript plugin execution is outside this importer's scope.
-DSH TypeScript plugin code runs only through the experimental TypeScript
-extension host (`[features] extension_host`, off by default), which now supports
-tools, slash commands, scoped pre-execute proposals, additive prompt sections
-and owner-local storage through an explicitly authored Native entry. It does
-not execute the imported `dsh.bundle.patch` composition. See [EXTENSIONS.md](EXTENSIONS.md) and
+DSH modules run through the experimental TypeScript extension host
+(`[features] extension_host`, off by default), using either an explicitly
+authored Native entry or a generated reviewed composition. Tools, commands,
+prompt sections, skills, hooks and owner-local storage use Codewhale's existing
+consumers and approval rules. This is a supported compatibility subset; a
+successful import is not evidence that every upstream DSH service is available.
+See [EXTENSIONS.md](EXTENSIONS.md) and
 [design/TS_EXTENSION_HOST.md](design/TS_EXTENSION_HOST.md).
 
 ### Local Node MCP servers

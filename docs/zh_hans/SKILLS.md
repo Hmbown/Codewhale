@@ -2,6 +2,7 @@
 
 > 英文原文：[SKILLS.md](../SKILLS.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐平铺根目录、冲突优先级与 Codewhale 专用扫描范围。
 
 在终端中，`/skills` 会打开 **Extensions → Skills**。在某个 skill 上按 Enter 会打开专用管理器（也可直接用 `/skills manage` 打开），用于现有 skill 的安装、更新、移除和信任操作。`/skill <name>` 仍然用于激活 skill，显式的检查、远程、同步和建议子命令也仍然可用。
 
@@ -56,9 +57,19 @@ Skills 是可复用的 `SKILL.md` 指令包。Codewhale 从多个根目录发现
 
 **仅审计（不参与运行时）**
 
+- 平铺的 `<workspace>/skills` 默认只是审计候选；设置 `[skills] flat_workspace_root = true`
+  后才参加发现，显式 `skills_dir` 也可以选中它。
 - `.codex/skills` 会出现在**兼容**审计扫描中，方便操作员查看。它**不会**加入运行时发现集合。
 
 配置的 `skills_dir` 如果不是 Codewhale 拥有的根目录之一，则保持只读。发现与管理器可以列出它；变更仍只作用于拥有的项目 / 全局根目录。
+
+同一范围内，自有 `.codewhale/skills` 优先。项目顺序为 `.codewhale`、`.agents`、
+`.claude`、`.opencode`、`.cursor`，最后是明确启用的平铺 `skills`；全局顺序为
+`.codewhale`、`.agents`、`.claude`、旧 `.deepseek`。项目先于全局。
+遮蔽警告说明两个副本；安装/更新选择该范围的自有副本。
+
+`[skills] scan_codewhale_only = true` 将运行时扫描限制到自有项目/全局根及显式
+`skills_dir`。管理器的兼容审计开关仍独立工作；它不会让只读来源获得写入权限。
 
 工作区内的每个根目录——无论是 Codewhale 自有目录、兼容目录，还是解析到工作区内的自定义 `skills_dir`——都只会在工作区受信任后加载（`/trust on --save`）。在此之前，发现过程会在警告中列出跳过的目录，会话的技能目录则回退到全局目录。
 

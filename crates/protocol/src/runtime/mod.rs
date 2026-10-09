@@ -53,8 +53,14 @@ fn default_runtime_event_envelope_schema_version() -> u32 {
 /// All fields are required on serialization so clients can rely on the shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
+    /// Device client tokens have immutable watch/drive intent. Watch cannot
+    /// mutate Runtime state, acquire control, or forward display input.
+    #[serde(default)]
+    pub client_token_intents: bool,
     #[serde(default)]
     pub account_session: bool,
+    #[serde(default)]
+    pub account_model_owner: bool,
     pub threads: bool,
     /// Explicit per-thread shell opt-in is checked against loaded policy and
     /// cannot broaden a conversation while it has an active turn.
@@ -74,6 +80,9 @@ pub struct RuntimeCapabilities {
     /// Per-turn maxOutputTokens is validated and intersected with the route ceiling.
     #[serde(default)]
     pub turn_output_token_limit: bool,
+    /// Account profile snapshots and Engine-owned constitution preview.
+    #[serde(default)]
+    pub profile_constitution: bool,
     pub turn_steer: bool,
     pub turn_interrupt: bool,
     pub event_replay: bool,
@@ -109,6 +118,12 @@ pub struct RuntimeCapabilities {
     /// are available via the HTTP API.
     #[serde(default)]
     pub skill_lifecycle: bool,
+    /// `GET /v1/skills/{name}` returns one skill's full body and routing
+    /// metadata, so a client can compose an activation instruction for its
+    /// next turn. `GET /v1/skills` rows also carry `invocation`, `aliases`,
+    /// and `bundled_tier` routing fields when this flag is set.
+    #[serde(default)]
+    pub skill_detail: bool,
     /// Plugin bundle and marketplace lifecycle operations (list/detail,
     /// install/update/uninstall, trust/enable/disable/revoke, marketplace
     /// add/remove/install) are available via the `/v1/apps/plugins` and
@@ -418,8 +433,11 @@ mod tests {
     #[test]
     fn runtime_capabilities_serializes_expected_shape() {
         let caps = RuntimeCapabilities {
+            client_token_intents: true,
             turn_output_token_limit: false,
+            profile_constitution: false,
             account_session: true,
+            account_model_owner: false,
             threads: true,
             thread_shell_consent: true,
             turns: true,
@@ -441,6 +459,7 @@ mod tests {
             memory: true,
             mcp_server_management: false,
             skill_lifecycle: false,
+            skill_detail: false,
             plugin_management: false,
             agent_mail: true,
             terminal_stream: false,
@@ -451,6 +470,17 @@ mod tests {
         };
         let value = serde_json::to_value(&caps).unwrap();
         let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("client_token_intents"), Some(&json!(true)));
+        let mut legacy_intents = value.clone();
+        legacy_intents
+            .as_object_mut()
+            .unwrap()
+            .remove("client_token_intents");
+        assert!(
+            !serde_json::from_value::<RuntimeCapabilities>(legacy_intents)
+                .unwrap()
+                .client_token_intents
+        );
         assert_eq!(obj.get("threads").unwrap(), &json!(true));
         assert_eq!(obj.get("thread_shell_consent"), Some(&json!(true)));
         assert!(

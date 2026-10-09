@@ -9,6 +9,7 @@ use crate::extension_host::{ExtensionHostManager, HostAttachment, TestManagerGua
 use crate::mcp::{McpBackend, McpPool};
 use crate::plugins::activation::TestPolicyGuard;
 use serde_json::json;
+use std::path::Path;
 use std::time::Duration;
 
 fn selected(fixture: &FixturePlugins, tag: &str) -> Arc<PluginRegistry> {
@@ -112,21 +113,18 @@ async fn mixed_native_graphs_use_one_core_catalog_and_selected_child_pool_on_bot
     );
     // Same owner and public names, distinct exact selected entry handles.
     assert_eq!(a_defs[0].0, b_defs[0].0);
+    // Path::ends_with is separator-agnostic. A string suffix of "native/a.mjs"
+    // fails on Windows because scope paths keep backslashes (and may carry a
+    // verbatim prefix from canonicalize).
     assert!(
-        a_defs[0]
-            .3
-            .registration
-            .scope
-            .path
-            .ends_with("native/a.mjs")
+        Path::new(&a_defs[0].3.registration.scope.path).ends_with(Path::new("native/a.mjs")),
+        "{}",
+        a_defs[0].3.registration.scope.path
     );
     assert!(
-        b_defs[0]
-            .3
-            .registration
-            .scope
-            .path
-            .ends_with("native/b.mjs")
+        Path::new(&b_defs[0].3.registration.scope.path).ends_with(Path::new("native/b.mjs")),
+        "{}",
+        b_defs[0].3.registration.scope.path
     );
     for backend in [McpBackend::Rust, McpBackend::Host] {
         let mut parent = pool(&fixture, &a, backend);

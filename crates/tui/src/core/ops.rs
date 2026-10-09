@@ -170,6 +170,8 @@ impl UserInputProvenance {
 /// variant; the serializable twin is `codewhale_protocol::op::TurnSpec`.
 #[derive(Debug)]
 pub struct TurnSpec {
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
     /// Admitted allowance for this turn only; never changes session settings.
     pub max_output_tokens: Option<std::num::NonZeroU32>,
     pub content: String,

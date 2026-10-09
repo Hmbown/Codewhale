@@ -48,7 +48,7 @@ before(async () => {
   server = spawn("node", [path.join(ROOT, "mcp", "server.mjs")], {
     env: {
       ...process.env,
-      CODEWHALE_CU_TEST_REMOTE: "1",
+      CODEWHALE_CU_TEST_REMOTE: process.env.CODEWHALE_CU_WIRE_TEST_ROUTE === "direct" ? "" : "1",
       CODEWHALE_CU_STATE_DIR: stateDir,
       CODEWHALE_CU_RECORDINGS_DIR: recDir,
       CODEWHALE_CU_TEST_BACKEND: path.join(__dirname, "fixtures", "fake-backend.mjs"),
@@ -147,9 +147,95 @@ test("element targets retain their identity and AX path on the out-of-process po
 test("out-of-process OCR observation binds the raster that its text targets use", async () => {
   const state = await tool("get_app_state", { include_ocr: true });
   assert.equal(state.ocr.status, "ok");
+  assert.equal(typeof state.ocr.raster.raster_id, "string");
+  assert.equal(state.ocr.blocks[0].target.raster_id, state.ocr.raster.raster_id);
   const clicked = await tool("left_click", { target: state.ocr.blocks[0].target });
   assert.equal(clicked.ok, true);
+  assert.equal(clicked.target_raster_id, state.ocr.raster.raster_id);
   const target = calls().filter(c => c.method === "left_click").at(-1).args.target;
   assert.deepEqual({ x: target.x, y: target.y }, { x: 140, y: 70 });
   assert.equal((await tool("left_click", { target: { type: "coordinate", x: 400, y: 0 } })).error.code, "target_outside_raster");
+});
+
+test("capture pins refuse superseded coordinates before input, while legacy latest-raster calls still work", async () => {
+  const first = await tool("screenshot", { region: [100, 50, 200, 100] });
+  const latest = await tool("screenshot", { region: [700, 500, 200, 100] });
+  assert.notEqual(first.raster_id, latest.raster_id);
+  const before = calls().filter(c => c.method === "left_click").length;
+  const stale = await tool("left_click", { target: { type: "coordinate", x: 80, y: 40, raster_id: first.raster_id } });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.error.code, "raster_stale");
+  assert.equal(calls().filter(c => c.method === "left_click").length, before);
+  const pinned = await tool("left_click", { target: { type: "coordinate", x: 80, y: 40, raster_id: latest.raster_id } });
+  assert.equal(pinned.ok, true);
+  assert.equal(pinned.target_raster_id, latest.raster_id);
+  const sent = calls().filter(c => c.method === "left_click").at(-1).args.target;
+  assert.deepEqual({ x: sent.x, y: sent.y }, { x: 740, y: 520 });
+  assert.equal("raster_id" in sent, false, "old helpers receive only the resolved target");
+  assert.equal((await tool("left_click", { target: { type: "coordinate", x: 1, y: 1 } })).ok, true);
+});
+
+test("a pin cannot be malformed or change its coordinate space", async () => {
+  const shot = await tool("screenshot");
+  const before = calls().filter(c => c.method === "left_click").length;
+  for (const raster_id of [null, 7, "", "x".repeat(129)]) {
+    const res = await tool("left_click", { target: { type: "coordinate", x: 1, y: 1, raster_id } });
+    assert.equal(res.error.code, "bad_target");
+  }
+  const screen = await tool("left_click", { target: { type: "coordinate", x: 1, y: 1, raster_id: shot.raster_id, space: "screen" } });
+  assert.equal(screen.error.code, "bad_target");
+  assert.equal(calls().filter(c => c.method === "left_click").length, before);
+});
+
+test("nested zooms crop the bound parent file and issue a child identity and geometry", async () => {
+  const shot = await tool("screenshot", { region: [100, 50, 200, 100] });
+  const first = await tool("zoom", { region: [40, 20, 100, 80], raster_id: shot.raster_id, source: "/untrusted/caller.png" });
+  assert.equal(first.ok, true);
+  assert.equal(first.parent_raster_id, shot.raster_id);
+  assert.notEqual(first.raster_id, shot.raster_id);
+  assert.equal(calls().filter(c => c.method === "zoom").at(-1).args.source, shot.file);
+  const before = calls().filter(c => c.method === "zoom").length;
+  const stale = await tool("zoom", { region: [0, 0, 10, 10], raster_id: shot.raster_id });
+  assert.equal(stale.error.code, "raster_stale");
+  assert.equal(calls().filter(c => c.method === "zoom").length, before);
+  const child = await tool("zoom", { region: [20, 10, 30, 20], raster_id: first.raster_id });
+  assert.equal(child.ok, true);
+  assert.equal(child.parent_raster_id, first.raster_id);
+  assert.equal(calls().filter(c => c.method === "zoom").at(-1).args.source, first.file);
+  const click = await tool("left_click", { target: { type: "coordinate", x: 10, y: 8, raster_id: child.raster_id } });
+  assert.equal(click.ok, true);
+  const target = calls().filter(c => c.method === "left_click").at(-1).args.target;
+  assert.deepEqual({ x: target.x, y: target.y }, { x: 135, y: 69 });
+  assert.equal((await tool("left_click", { target: { type: "coordinate", x: 30, y: 0, raster_id: child.raster_id } })).error.code, "target_outside_raster");
+});
+
+test("binding an app retires earlier captures before another coordinate action", async () => {
+  const shot = await tool("screenshot");
+  assert.equal((await tool("open_application", { name: "FakeApp", activate: false })).ok, true);
+  const before = calls().filter(c => c.method === "left_click").length;
+  const stale = await tool("left_click", { target: { type: "coordinate", x: 1, y: 1, raster_id: shot.raster_id } });
+  assert.equal(stale.error.code, "no_raster");
+  assert.equal(calls().filter(c => c.method === "left_click").length, before);
+});
+
+test("a successful launch without resolved app identity still retires capture pins", async () => {
+  const shot = await tool("screenshot");
+  fs.writeFileSync(callsFile + ".control.json", JSON.stringify({ open_without_resolved: true }));
+  try {
+    const opened = await tool("open_application", { name: "FakeApp", activate: false });
+    assert.equal(opened.ok, true, JSON.stringify(opened));
+    assert.equal(opened.launched, true);
+    assert.equal(opened.resolved, undefined, "Windows/Linux-style launch receipt has no resolved identity");
+    const before = calls().filter(c => c.method === "left_click").length;
+    const stale = await tool("left_click", { target: { type: "coordinate", x: 1, y: 1, raster_id: shot.raster_id } });
+    assert.equal(stale.error.code, "no_raster");
+    assert.equal(calls().filter(c => c.method === "left_click").length, before, "retired pin dispatches no input");
+    const fresh = await tool("screenshot");
+    const clicked = await tool("left_click", { target: { type: "coordinate", x: 1, y: 1, raster_id: fresh.raster_id } });
+    assert.equal(clicked.ok, true, JSON.stringify(clicked));
+    assert.equal(clicked.target_raster_id, fresh.raster_id);
+    assert.equal(calls().filter(c => c.method === "left_click").length, before + 1);
+  } finally {
+    fs.unlinkSync(callsFile + ".control.json");
+  }
 });

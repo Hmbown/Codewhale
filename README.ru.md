@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -22,9 +22,9 @@ Codewhale читает ваш проект, редактирует файлы, �
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Сессия Codewhale в терминале" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Сессия Codewhale в терминале" width="760">
 
-<sub>Настоящий снимок терминала после чистой установки — без постановочного вывода.</sub>
+<sub>Настоящий снимок терминала Codewhale из настроенного локального демонстрационного сеанса.</sub>
 
 </div>
 
@@ -59,6 +59,12 @@ Docker, Nix, Homebrew в Linux, Android/Termux, ручная загрузка с
 </details>
 
 ## Быстрый старт
+
+**Ключи API ваших провайдеров — в одном месте.** [Создайте аккаунт Codewhale](https://app.codewhale.net/register)
+или выполните `codewhale login`, чтобы войти. Сохраняйте и обновляйте ключи API в аккаунте,
+затем используйте их через маршрут моделей Codewhale на устройствах, где вы вошли в аккаунт.
+[Настройка ключей аккаунта](docs/CONFIGURATION.md#account-provider-keys).
+Вход не загружает существующие локальные ключи в аккаунт; локальная работа доступна и без аккаунта.
 
 1. **Откройте проект.** Запустите `codewhale` в папке, с которой хотите
    работать.

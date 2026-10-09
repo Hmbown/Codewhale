@@ -357,9 +357,10 @@ impl Engine {
                 let message = if zero_tool_text_call {
                     "Model answered only with a tool call, and this turn offers no tools."
                         .to_string()
-                } else if has_provider_reasoning
-                    && stop_reason_is_output_limit(stop_reason.as_deref())
-                {
+                } else if stop_reason_is_output_limit(stop_reason.as_deref()) {
+                    // With or without streamed reasoning: a provider that
+                    // keeps its reasoning to itself still spends the
+                    // allowance on it (#6889).
                     format!(
                         "Model reached the response output limit with no answer or tool call (requested allowance: {} tokens, including reasoning).",
                         prepared_output_tokens

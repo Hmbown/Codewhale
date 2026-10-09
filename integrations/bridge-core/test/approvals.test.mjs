@@ -351,11 +351,27 @@ test("Telegram and Feishu shipping inbound events retain the actual admitted hum
       const lib = await import(`../../${bridge}/src/lib.mjs`);
       let delivered;
       const delivery = new Promise((resolve) => { delivered = resolve; });
+      let markCleared;
+      const activeCleared = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${bridge} did not durably clear its accepted turn`)), 5000);
+        markCleared = () => { clearTimeout(timer); resolve(); };
+      });
+      const patchChat = store.patchChat.bind(store);
+      store.patchChat = async (chat, patch) => {
+        const result = await patchChat(chat, patch);
+        if (patch?.activeTurnId === null && runtime.state.accepted.length) {
+          const reopened = await ThreadStore.open(store.filePath, { actions: true });
+          assert.equal((await reopened.getChat(chat)).activeTurnId, null, `${bridge} clear must be durable before fixture cleanup`);
+          markCleared();
+        }
+        return result;
+      };
       const values = environment(store, runtime, {
         ...lib, activeTurnTasks: new Map(),
         config: { allowGroups: true, allowUnlisted: false, allowlist: [chatId], requirePrefixInGroup: false },
         streamTurnEvents: async (chat, thread, turn) => {
           const reopened = await ThreadStore.open(store.filePath, { actions: true });
+          assert.equal((await reopened.getChat(chat)).activeTurnId, turn, `${bridge} must persist the accepted turn before streaming`);
           assert.equal(reopened.turnOrigin(chat, thread, turn).actorId, actors[bridge]);
           delivered();
         }
@@ -373,6 +389,8 @@ test("Telegram and Feishu shipping inbound events retain the actual admitted hum
           message: { chat_id: chatId, chat_type: "group", message_id: "message-a", message_type: "text",
             content: JSON.stringify({ text: "hello" }) } });
       }
+      await delivery;
+      await activeCleared;
       assert.equal(runtime.state.accepted.length, 1);
       assert.equal(store.turnOrigin(chatId, threadId, runtime.state.accepted[0]).actorId, actors[bridge]);
     }));

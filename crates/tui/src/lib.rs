@@ -57,6 +57,8 @@ mod external_credentials;
 mod features;
 mod fleet;
 mod fs_confined;
+mod git_status;
+use crate::fleet::executor::exec_stream_final_answer_excerpt;
 mod hooks;
 mod image_attach;
 mod import_claude;
@@ -73,6 +75,7 @@ mod model_profile;
 mod model_relevance;
 mod model_routing;
 mod models_dev_live;
+pub use models_dev_live::maybe_load_persisted_cache;
 mod network_policy;
 mod notify;
 mod oauth;
@@ -80,11 +83,13 @@ mod operate;
 mod plugins;
 mod pricing;
 mod process_tree;
+mod profile_constitution;
 mod project_context;
 mod project_context_cache;
 mod prompts;
 mod provider_catalog_live;
 mod provider_lake;
+pub use provider_lake::all_catalog_models_for_provider;
 mod provider_readiness;
 mod purge;
 pub mod reasoning_preference;
@@ -144,12 +149,11 @@ use codewhale_release::tls;
 // re-exports; the split deletes it by rewriting these paths to
 // `codewhale_runtime::` (docs/design/TUI_DECONSTRUCTION.md).
 use codewhale_runtime::{
-    context_budget, continual_harness, elapsed, fast_hash, goal_loop, hashing, host_terminal,
+    context_budget, continual_harness, fast_hash, goal_loop, hashing, host_terminal,
     llm_response_cache, media_originals, model_context, native_memory, prompt_zones, regex_cache,
     retry_status, safe_label, session_tree, skill_state, sleep_guard, tool_history_repair,
     workspace_discovery,
 };
-mod diagnostics_reports;
 mod todo_snapshot;
 mod tool_inspection;
 mod tool_output_receipts;
@@ -169,6 +173,7 @@ mod workspace_trust;
 
 use crate::config::{
     Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_dir,
+    initialize_cloud_facts,
 };
 use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};
 use crate::features::{Feature, render_feature_table};
@@ -540,6 +545,27 @@ enum TuiAuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    #[command(name = "claude", alias = "anthropic")]
+    Claude,
+    #[command(name = "claude-revoke")]
+    ClaudeRevoke,
+    /// Sign in to OrcaRouter with OAuth 2.0 + PKCE; run again to switch accounts.
+    #[command(name = "orcarouter")]
+    Orcarouter,
+    /// Revoke the saved OrcaRouter credential. The OrcaRouter console also
+    /// revokes every key it issued to this app in one click.
+    #[command(name = "orcarouter-revoke")]
+    OrcarouterRevoke,
+    /// Sign in to a provider contributed by an enabled, reviewed plugin.
+    PluginLogin {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove credentials for one plugin provider without changing trust.
+    PluginLogout {
+        #[arg(long)]
+        provider: String,
+    },
 }
 
 const CODEWHALE_TOOL_SURFACE_ENV: &str = "CODEWHALE_TOOL_SURFACE";
@@ -1527,7 +1553,8 @@ enum McpCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Connect to MCP servers and report status
+    /// Connect to MCP servers and report status (does not attach to a
+    /// running session)
     Connect {
         /// Optional server name to connect to
         #[arg(value_name = "SERVER")]
@@ -1565,7 +1592,7 @@ enum McpCommand {
         #[arg(long = "scope", requires = "url", value_delimiter = ',')]
         scopes: Vec<String>,
         /// Arguments for command-based servers
-        #[arg(long = "arg")]
+        #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Authenticate to a URL-based MCP server using OAuth
@@ -1614,6 +1641,35 @@ enum McpCommand {
         #[arg(long)]
         workspace: Option<String>,
     },
+}
+
+/// The `codewhale mcp` subcommands with their one-line descriptions, for the
+/// dispatcher's `codewhale mcp --help`.
+///
+/// That help exits in the dispatcher's parser, before this crate's parser
+/// runs, and the dispatcher only sees forwarded arguments. Reading the list
+/// off `McpCommand` keeps it from naming a subcommand that does not exist
+/// or missing one that does.
+#[must_use]
+pub fn mcp_subcommand_help() -> String {
+    use std::fmt::Write as _;
+
+    let command = McpCommand::augment_subcommands(clap::Command::new("mcp"));
+    let width = command
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().len())
+        .max()
+        .unwrap_or(0);
+    let mut help = String::from("Commands:\n");
+    for subcommand in command.get_subcommands() {
+        let about = subcommand
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let _ = writeln!(help, "  {:<width$}  {about}", subcommand.get_name());
+    }
+    help.push_str("\nRun `codewhale mcp <COMMAND> --help` for a command's options.");
+    help
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1757,8 +1813,6 @@ enum SandboxCommand {
         command: Vec<String>,
     },
 }
-
-const CODEWHALE_MAIN_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 /// Pre-clap seam feeding `apply_process_hardening` (#5723): resolve only the
 /// *startup* sandbox posture — `CODEWHALE_SANDBOX_MODE` /
@@ -1961,6 +2015,8 @@ fn run_with_args(options: RuntimeOptions, args: Vec<String>) -> Result<()> {
     let plugin_registry = plugin_registry
         .expect("plugin discovery initialization must precede workspace dotenv loading");
 
+    crate::plugins::providers::install_startup_registry(plugin_registry.clone());
+
     // The interactive runtime intentionally carries a large state machine:
     // terminal rendering, modal dispatch, provider setup, and fleet/workflow
     // events all share one async owner. Debug builds retain enough stack
@@ -1982,7 +2038,7 @@ fn run_with_args(options: RuntimeOptions, args: Vec<String>) -> Result<()> {
     // address space only, since thread stacks commit lazily.
     let runtime_thread = std::thread::Builder::new()
         .name("codewhale-main".to_string())
-        .stack_size(CODEWHALE_MAIN_STACK_BYTES)
+        .stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES)
         .spawn(move || run_async_main(cli, command, plugin_discovery, plugin_registry))
         .context("Failed to start the Codewhale runtime thread")?;
     match runtime_thread.join() {
@@ -2091,7 +2147,7 @@ fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
-        .thread_stack_size(CODEWHALE_MAIN_STACK_BYTES);
+        .thread_stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES);
     builder
 }
 
@@ -2101,6 +2157,19 @@ fn tokio_runtime_builder() -> tokio::runtime::Builder {
 /// binary serves at least five surfaces, so `current_exe()` would label all of
 /// them the same.
 fn telemetry_surface(command: Option<&Commands>) -> codewhale_telemetry::Surface {
+    telemetry_surface_with(command, embedded_surface_override())
+}
+
+/// The injectable form of [`telemetry_surface`].
+///
+/// The declared surface is a parameter rather than an environment read inside
+/// the match, so the "only the server branch consults it" rule can be proven
+/// without a test mutating process-wide environment — which would race every
+/// other test in this binary.
+fn telemetry_surface_with(
+    command: Option<&Commands>,
+    declared: Option<codewhale_telemetry::Surface>,
+) -> codewhale_telemetry::Surface {
     use codewhale_telemetry::Surface;
     match command {
         None | Some(Commands::Resume { .. } | Commands::Fork { .. } | Commands::Pr { .. }) => {
@@ -2111,11 +2180,53 @@ fn telemetry_surface(command: Option<&Commands>) -> codewhale_telemetry::Surface
             if args.mcp {
                 Surface::McpServer
             } else {
-                Surface::Serve
+                declared.unwrap_or(Surface::Serve)
             }
         }
         Some(_) => Surface::Cli,
     }
+}
+
+/// The surface name an embedding client declared for a server it started.
+///
+/// An API server is the one surface a third party legitimately *starts*, so it
+/// is the one surface an embedder may name. The editor extension, for instance,
+/// runs `codewhale serve --http` and declares itself, so its sessions are not
+/// counted as anonymous `serve` traffic from nobody in particular.
+///
+/// Three properties are deliberate:
+///
+/// 1. **`serve` only.** The variable is inherited by any process this one
+///    starts, and an agent running a shell command is running `codewhale`
+///    descendants with this environment. A nested `codewhale exec` that
+///    inherited the label would report itself as the embedder — wrong, and
+///    invisible. Consulting it only in the branch that *is* the embedder's own
+///    server bounds that to a process the embedder actually started.
+/// 2. **`tui` is refused.** Nothing starts the interactive terminal UI on a
+///    user's behalf, and reporting a server as `tui` would put it in the one
+///    surface whose numbers are the terminal's. `mcp` is decided before this is
+///    consulted, so a server that *is* an MCP server still says so.
+/// 3. **Unrecognised is not an error.** A name outside [`Surface::ALL`] is
+///    ignored and the caller falls back, rather than failing a startup over a
+///    field that is only a label. The value is not "sanitised" into a variant
+///    it resembles; it is dropped.
+fn embedded_surface_override() -> Option<codewhale_telemetry::Surface> {
+    embedded_surface_override_from(std::env::var("CODEWHALE_TELEMETRY_SURFACE").ok())
+}
+
+/// The injectable form of [`embedded_surface_override`], used by tests.
+///
+/// Separate from the environment read for the same reason
+/// `load_setup_state_for_decision_at` is separate from
+/// `load_setup_state_for_decision`: a test that mutated process-wide
+/// environment for this would race every other test in the binary.
+fn embedded_surface_override_from(raw: Option<String>) -> Option<codewhale_telemetry::Surface> {
+    use codewhale_telemetry::Surface;
+    let surface = Surface::parse(raw?.trim())?;
+    if surface == Surface::Tui {
+        return None;
+    }
+    Some(surface)
 }
 
 /// How this session was started, for `session_start`.
@@ -2477,8 +2588,50 @@ async fn run_async_main_dispatch(
             Commands::Logout => run_logout(),
             Commands::Auth(args) => match args.command {
                 TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()).await,
+                TuiAuthCommand::Claude => run_claude_auth(cli.config.as_deref()).await,
+                TuiAuthCommand::ClaudeRevoke => {
+                    crate::oauth::revoke_owned_login(
+                        crate::oauth::OAuthProvider::Claude,
+                        cli.config.as_deref(),
+                        None,
+                    )?;
+                    println!(
+                        "Removed Codewhale's saved Claude sign-in. Manage remote access in Claude account settings."
+                    );
+                    Ok(())
+                }
                 TuiAuthCommand::Chatgpt => run_chatgpt_pkce_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::ChatgptRevoke => run_chatgpt_pkce_revoke(cli.config.as_deref()),
+                TuiAuthCommand::Orcarouter => run_orcarouter_pkce_auth(cli.config.as_deref()).await,
+                TuiAuthCommand::OrcarouterRevoke => run_orcarouter_revoke(cli.config.as_deref()),
+                TuiAuthCommand::PluginLogin { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    crate::oauth::plugin_oauth_login(
+                        provider,
+                        entry.base_url.clone().unwrap(),
+                        entry.oauth.clone().unwrap(),
+                        entry.plugin_authority.clone().unwrap(),
+                    )
+                    .await
+                }
+                TuiAuthCommand::PluginLogout { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    let policy = crate::plugins::activation::extension_host_policy_enabled();
+                    tokio::task::spawn_blocking(move || {
+                        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+                        crate::plugins::registry::verify_plugin_component_authority(
+                            entry.plugin_authority.as_ref().unwrap(),
+                            crate::plugins::activation::PluginActivationCapability::Providers,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        crate::oauth::plugin_oauth_logout(
+                            &provider,
+                            entry.base_url.as_deref().unwrap(),
+                            entry.oauth.as_ref().unwrap(),
+                        )
+                    })
+                    .await?
+                }
             },
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -2491,6 +2644,7 @@ async fn run_async_main_dispatch(
             }
             Commands::Exec(args) => {
                 let config = load_config_from_cli(&cli)?;
+                let plugin_registry = policy_current_registry(plugin_registry);
                 let workspace = cli.workspace.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                 });
@@ -2797,7 +2951,7 @@ async fn run_async_main_dispatch(
                             show_qr: args.qr,
                             config_path: cli.config.clone(),
                             config_profile,
-                            control_frontend: None,
+                            control_frontend: cli.control_frontend.clone(),
                         },
                     )
                     .await
@@ -2843,6 +2997,7 @@ async fn run_async_main_dispatch(
                     io::stdout().is_terminal(),
                 )?;
                 let config = load_config_from_cli(&cli)?;
+                let plugin_registry = policy_current_registry(plugin_registry);
                 let prepared = prepare_interactive_config(&cli, &config, true)?;
                 let source_id = resolve_session_id(session_id, last, &prepared.workspace)?;
                 let (prepared, new_session_id) = prepare_mounted_session(
@@ -4200,9 +4355,8 @@ fn run_setup(
         println!("    Next: run `/plugin validate`, review `example`, then trust and enable it.");
     }
 
-    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-        config.prefer_bwrap.unwrap_or(false),
-    );
+    let sandbox =
+        crate::sandbox::get_platform_sandbox_with_bwrap_preference(config.prefers_bwrap());
     if let Some(kind) = sandbox {
         println!("  ✓ Sandbox available: {kind}");
     } else {
@@ -4592,9 +4746,8 @@ fn run_setup_status(
         crate::utils::display_path(&plugins_dir)
     );
 
-    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-        config.prefer_bwrap.unwrap_or(false),
-    );
+    let sandbox =
+        crate::sandbox::get_platform_sandbox_with_bwrap_preference(config.prefers_bwrap());
     match sandbox {
         Some(kind) => println!(
             "  {} sandbox: {kind}",
@@ -4761,14 +4914,45 @@ async fn run_doctor(
             .bold()
     );
     println!("{}", "==================".truecolor(sky_r, sky_g, sky_b));
-    // Verdict first (U7): the answer and the next step, before the detail.
+    // The answer comes before the detail (U7). A requested live probe runs
+    // first so that answer can include it; the probe line is the only thing
+    // printed while that check is in flight.
     let (verdict_state, _) = doctor_setup_state(config, workspace);
     let identity = config.active_provider_identity().ok();
+    let api_target = doctor_api_target(config);
+    let live_api_requested = identity.as_ref().is_some_and(|identity| {
+        doctor_should_probe_api(identity.provider, &api_target.base_url, probes)
+    });
+    // The opt-in live check runs once, before the verdict, so the verdict,
+    // the credential lines and API Connectivity all report the same result.
+    let live_probe = if doctor_should_probe_auth(config) && live_api_requested {
+        println!("{} Testing connection...", "·".dimmed());
+        // Resolve a credential through the diagnostic-only store first, then
+        // probe with an in-memory clone. Constructing the normal client from
+        // the original config could otherwise trigger its legacy secret-store
+        // migration while a user merely asks doctor to test connectivity.
+        Some(match config.with_read_only_api_key_for_diagnostic() {
+            Ok(diagnostic_config) => test_api_connectivity(&diagnostic_config).await,
+            Err(error) => Err(error),
+        })
+    } else {
+        None
+    };
+    // Presence and variable name only; the value is never held here.
+    let env_key_source = crate::config::active_provider_env_api_key_source(config);
     let verdict = doctor_verdict(
         &verdict_state,
         identity
             .as_ref()
             .map_or("unavailable", |identity| identity.key.as_str()),
+        &DoctorVerdictFacts {
+            onboarded: crate::tui::onboarding::is_onboarded(),
+            env_key_source: env_key_source.clone(),
+            live_probe: live_probe.as_ref().map(Result::is_ok),
+            live_probe_timed_out: live_probe
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_err_and(doctor_probe_timed_out)),
+        },
     );
     println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
     println!();
@@ -4942,10 +5126,19 @@ async fn run_doctor(
                     == crate::config::ConfigApiKeyValueKind::Literal
             })
         });
-        let env_source_declared = provider_config
+        let declared_env = provider_config
             .and_then(|entry| entry.api_key_env.as_deref())
-            .is_some_and(|name| !name.trim().is_empty());
-        let icon = if config_declared || env_source_declared {
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let env_source_declared = declared_env.is_some();
+        // Presence only: name the variable that holds a key, never its value.
+        let env_set = declared_env
+            .filter(|name| {
+                std::env::var_os(name)
+                    .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+            })
+            .or_else(|| crate::config::provider_env_api_key_var(provider));
+        let icon = if config_declared || env_source_declared || env_set.is_some() {
             "·".truecolor(aqua_r, aqua_g, aqua_b)
         } else {
             "·".dimmed()
@@ -4953,10 +5146,10 @@ async fn run_doctor(
         println!(
             "  {} {slot}: env_source={}, config_source={}",
             icon,
-            if env_source_declared {
-                "declared (value not inspected)"
-            } else {
-                "not inspected"
+            match env_set {
+                Some(var) => doctor_env_key_label(var),
+                None if env_source_declared => "declared (value not inspected)".to_string(),
+                None => "not inspected".to_string(),
             },
             if config_declared {
                 "declared (value not inspected)"
@@ -5001,19 +5194,41 @@ async fn run_doctor(
         ApiKeySource::LocalRuntime => "local runtime; credentials not required",
         ApiKeySource::Unknown => "unknown; credential environment and stores not inspected",
     };
-    println!(
-        "  {} active provider credential source: {source_label}",
-        "·".dimmed()
-    );
+    match env_key_source.as_deref() {
+        Some(source) => println!(
+            "  {} active provider credential source: {}",
+            "·".dimmed(),
+            doctor_env_key_label(source)
+        ),
+        None => println!(
+            "  {} active provider credential source: {source_label}",
+            "·".dimmed()
+        ),
+    }
     println!(
         "  · active provider credential availability: {}",
         credential.availability.label()
     );
+    match &live_probe {
+        Some(Ok(())) => println!(
+            "  {} active provider credential: accepted by the live API check",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
+        // #6889: no answer in time says nothing about the credential.
+        Some(Err(error)) if doctor_probe_timed_out(error) => println!(
+            "  {} active provider credential: not confirmed, the live API check got no answer in time (see API Connectivity)",
+            "·".dimmed()
+        ),
+        Some(Err(_)) => println!(
+            "  {} active provider credential: live API check failed (see API Connectivity)",
+            "✗".truecolor(red_r, red_g, red_b)
+        ),
+        None => {}
+    }
 
     // API connectivity test
     println!();
     println!("{}", "API Connectivity:".bold());
-    let api_target = doctor_api_target(config);
     // Configured-vs-active honesty (DGF-01): doctor describes the route a
     // session launched NOW would resolve. It cannot see inside an already
     // running session, which keeps the route it resolved at its own launch.
@@ -5069,52 +5284,52 @@ async fn run_doctor(
             alias.alias, alias.retirement_date, alias.replacement
         );
     }
-    let live_api_requested = identity.as_ref().is_some_and(|identity| {
-        doctor_should_probe_api(identity.provider, &api_target.base_url, probes)
-    });
     let endpoint_is_local = identity.as_ref().is_some_and(|identity| {
         crate::config::provider_route_is_keyless_self_hosted(
             identity.provider,
             &api_target.base_url,
         ) || crate::config::base_url_uses_local_host(&api_target.base_url)
     });
-    if doctor_should_probe_auth(config) && live_api_requested {
-        print!("  {} Testing connection...", "·".dimmed());
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-
-        // Resolve a credential through the diagnostic-only store first, then
-        // probe with an in-memory clone. Constructing the normal client from
-        // the original config could otherwise trigger its legacy secret-store
-        // migration while a user merely asks doctor to test connectivity.
-        let connectivity_result = match config.with_read_only_api_key_for_diagnostic() {
-            Ok(diagnostic_config) => test_api_connectivity(&diagnostic_config).await,
-            Err(error) => Err(error),
-        };
+    if let Some(connectivity_result) = &live_probe {
         match connectivity_result {
             Ok(()) => {
                 println!(
-                    "\r  {} API connection successful",
+                    "  {} API connection successful",
                     "✓".truecolor(aqua_r, aqua_g, aqua_b)
                 );
             }
             Err(e) => {
                 let error_msg = e.to_string();
+                let timed_out = doctor_probe_timed_out(e);
                 println!(
-                    "\r  {} API connection failed",
-                    "✗".truecolor(red_r, red_g, red_b)
+                    "  {} {}",
+                    "✗".truecolor(red_r, red_g, red_b),
+                    if timed_out {
+                        "API check got no answer in time"
+                    } else {
+                        "API connection failed"
+                    }
                 );
                 let names_status =
                     |status| crate::mcp::oauth::text_names_http_status(&error_msg, status);
+                let provider = identity
+                    .as_ref()
+                    .map(|identity| identity.provider)
+                    .unwrap_or(crate::config::ProviderKind::Deepseek);
                 if names_status("401") || error_msg.contains("Unauthorized") {
                     println!(
-                        "    Invalid API key. Check `codewhale auth status`, DEEPSEEK_API_KEY, or config.toml"
+                        "    Invalid API key. Check `codewhale auth status`, {}, or config.toml",
+                        doctor_provider_key_place(provider)
                     );
                 } else if names_status("403") || error_msg.contains("Forbidden") {
                     println!(
-                        "    API key lacks permissions. Verify key is active at platform.deepseek.com"
+                        "    API key lacks permissions. Verify the {} key is active.",
+                        provider.provider().display_name()
                     );
-                } else if error_msg.contains("timeout") || error_msg.contains("Timeout") {
+                } else if timed_out
+                    || error_msg.contains("timeout")
+                    || error_msg.contains("Timeout")
+                {
                     for line in doctor_timeout_recovery_lines(config) {
                         println!("    {line}");
                     }
@@ -5839,9 +6054,8 @@ async fn run_doctor(
     println!("  OS: {}", std::env::consts::OS);
     println!("  Arch: {}", std::env::consts::ARCH);
 
-    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-        config.prefer_bwrap.unwrap_or(false),
-    );
+    let sandbox =
+        crate::sandbox::get_platform_sandbox_with_bwrap_preference(config.prefers_bwrap());
     if let Some(kind) = sandbox {
         println!(
             "  {} sandbox available: {}",
@@ -5859,29 +6073,105 @@ async fn run_doctor(
     println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
 }
 
+/// Human-facing facts the verdict uses beyond the setup-state record. None of
+/// these change structural Setup/Fleet readiness (the JSON contract): a set
+/// environment variable is reported, never certified, until a live probe.
+#[derive(Debug, Clone, Default)]
+struct DoctorVerdictFacts {
+    /// The TUI's own first-run receipt (`.onboarded`). TUI onboarding finishes
+    /// after its key gate but never fills the `/setup` wizard's language and
+    /// constitution steps, so `first_run_ready()` alone misreads it.
+    onboarded: bool,
+    /// Name of the env place holding the active provider's key, from
+    /// `config::active_provider_env_api_key_source`; never the value.
+    env_key_source: Option<String>,
+    /// Outcome of the opt-in live API check; `None` when it did not run.
+    live_probe: Option<bool>,
+    /// The live check failed by running out of time, not by being refused
+    /// (#6889). A model the provider is still loading looks exactly like this.
+    live_probe_timed_out: bool,
+}
+
+/// `set via <VAR> (value not shown; not checked offline)`.
+fn doctor_env_key_label(source: &str) -> String {
+    format!("set via {source} (value not shown; not checked offline)")
+}
+
+/// Where a rejected key might live, named without reading it. A route that
+/// binds `api_key_env` is named by that variable; otherwise the provider's
+/// first ambient variable.
+fn doctor_provider_key_place(provider: crate::config::ProviderKind) -> String {
+    provider
+        .provider()
+        .env_vars()
+        .first()
+        .copied()
+        .unwrap_or("the provider environment variable")
+        .to_string()
+}
+
 /// Doctor's one-line answer: ready, or the single next step (U7). Readiness
-/// is the setup lane's own verdict; doctor never reads the environment or the
-/// secret store to decide it, so a key saved outside setup shows as an
-/// unverified route (`credential: availability=not_probed`), not a missing one.
-fn doctor_verdict(state: &codewhale_config::SetupState, provider: &str) -> String {
+/// starts from the setup lane's record. Offline doctor never reads the secret
+/// store, so a stored key is "not checked", not missing; "Not ready" is kept
+/// for a missing route, a key nothing can account for, or a failed probe.
+fn doctor_verdict(
+    state: &codewhale_config::SetupState,
+    provider: &str,
+    facts: &DoctorVerdictFacts,
+) -> String {
     use codewhale_config::StepStatus;
+    const PROBE_HINT: &str = "run `codewhale doctor --probe-api` to verify";
+    match facts.live_probe {
+        Some(false) if facts.live_probe_timed_out => {
+            return format!(
+                "Not confirmed: the live {provider} API check got no answer in time → the model may still be loading, so wait a minute and run `codewhale doctor --probe-api` again; see API Connectivity below."
+            );
+        }
+        Some(false) => {
+            return format!(
+                "Not ready: the live {provider} API check failed → see API Connectivity below; `codewhale auth set --provider {provider}` replaces a rejected key."
+            );
+        }
+        Some(true) => return format!("Ready: the live {provider} API check passed."),
+        None => {}
+    }
+    let env_ready = facts.env_key_source.as_deref().map(|source| {
+        format!("Ready: {provider} key is set via {source} (not checked offline; {PROBE_HINT}).")
+    });
     // NeedsAction means a named route exists but its key is missing, unchecked
     // or failed. Configured routes can be used without a prior probe.
     // `first_run_ready` accepts NeedsAction (a failed key still reaches the
     // wizard's ready screen), so check the provider first.
     match state.status(codewhale_config::SetupStep::ProviderModel) {
-        StepStatus::Configured | StepStatus::Verified => {
-            if state.first_run_ready() {
-                "Ready: setup is complete.".to_string()
-            } else {
-                "Not ready: first-run setup is unfinished → run `codewhale setup`.".to_string()
-            }
+        StepStatus::Verified if state.first_run_ready() || facts.onboarded => {
+            "Ready: setup is complete.".to_string()
         }
-        StepStatus::NeedsAction => format!(
-            "Not ready: the {provider} route has no verified key → save one with /provider in Codewhale or `codewhale auth set --provider {provider}`; `codewhale doctor --probe-api` checks a key already saved."
-        ),
-        _ => "Not ready: no model provider set up → run /provider in Codewhale, or `codewhale setup`."
-            .to_string(),
+        StepStatus::Configured | StepStatus::Verified
+            if state.first_run_ready() || facts.onboarded =>
+        {
+            format!("Ready: setup is complete (saved key not checked offline; {PROBE_HINT}).")
+        }
+        StepStatus::Configured | StepStatus::Verified => env_ready.unwrap_or_else(|| {
+            "Not ready: first-run setup is unfinished → run `codewhale setup`.".to_string()
+        }),
+        StepStatus::NeedsAction => env_ready.unwrap_or_else(|| {
+            // A derived NeedsAction only means offline doctor cannot see the
+            // stored key; onboarding already gated on one. A NeedsAction the
+            // setup lane persisted is a real missing or failed key.
+            if state.inherited && facts.onboarded {
+                format!(
+                    "Ready: onboarding is complete (saved {provider} key not checked offline; {PROBE_HINT})."
+                )
+            } else {
+                format!(
+                    "Not ready: the {provider} route has no verified key → save one with /provider in Codewhale or `codewhale auth set --provider {provider}`; `codewhale doctor --probe-api` checks a key already saved."
+                )
+            }
+        }),
+        _ => env_ready.unwrap_or_else(|| {
+            "Not ready: no model provider set up → run /provider in Codewhale, or `codewhale setup`."
+                .to_string()
+        }),
     }
 }
 
@@ -5889,7 +6179,11 @@ fn doctor_verdict(state: &codewhale_config::SetupState, provider: &str) -> Strin
 mod doctor_verdict_tests {
     #[test]
     fn a_fresh_home_is_not_ready_and_names_the_provider_step() {
-        let verdict = super::doctor_verdict(&codewhale_config::SetupState::default(), "deepseek");
+        let verdict = super::doctor_verdict(
+            &codewhale_config::SetupState::default(),
+            "deepseek",
+            &super::DoctorVerdictFacts::default(),
+        );
         assert!(verdict.starts_with("Not ready"), "{verdict}");
         assert!(verdict.contains("/provider"), "{verdict}");
     }
@@ -5905,7 +6199,8 @@ mod doctor_verdict_tests {
             SetupStep::ProviderModel,
             StepEntry::new(StepStatus::NeedsAction, true, "inherited"),
         );
-        let verdict = super::doctor_verdict(&state, "deepseek");
+        let verdict =
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default());
         assert!(verdict.starts_with("Not ready"), "{verdict}");
         assert!(!verdict.contains("no model provider"), "{verdict}");
         assert!(
@@ -5932,7 +6227,8 @@ mod doctor_verdict_tests {
         state.runtime_posture_source = RuntimePostureSource::Confirmed;
         state.constitution_choice = ConstitutionChoice::Bundled;
         assert!(state.first_run_ready(), "fixture must be wizard-ready");
-        let verdict = super::doctor_verdict(&state, "deepseek");
+        let verdict =
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default());
         assert!(verdict.starts_with("Not ready"), "{verdict}");
         assert!(verdict.contains("/provider"), "{verdict}");
 
@@ -5941,8 +6237,172 @@ mod doctor_verdict_tests {
             StepEntry::new(StepStatus::Verified, true, "0.10.1"),
         );
         assert_eq!(
-            super::doctor_verdict(&state, "deepseek"),
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default()),
             "Ready: setup is complete."
+        );
+    }
+
+    fn facts(
+        onboarded: bool,
+        env_key_source: Option<&str>,
+        live_probe: Option<bool>,
+    ) -> super::DoctorVerdictFacts {
+        super::DoctorVerdictFacts {
+            onboarded,
+            env_key_source: env_key_source.map(str::to_string),
+            live_probe,
+            live_probe_timed_out: false,
+        }
+    }
+
+    #[test]
+    fn completed_tui_onboarding_is_not_unfinished_setup() {
+        // TUI onboarding records the route step only; never the wizard's
+        // language/constitution steps.
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Configured, true, "0.10.1"),
+        );
+        assert!(!state.first_run_ready(), "fixture is not wizard-ready");
+        let verdict = super::doctor_verdict(&state, "openai", &facts(true, None, None));
+        assert!(verdict.starts_with("Ready: setup is complete"), "{verdict}");
+        assert!(verdict.contains("--probe-api"), "{verdict}");
+        assert!(!verdict.contains("unfinished"), "{verdict}");
+
+        // Without the receipt (or a key) the wizard's verdict stands.
+        let verdict = super::doctor_verdict(&state, "openai", &facts(false, None, None));
+        assert!(
+            verdict.contains("first-run setup is unfinished"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn onboarded_home_without_a_record_is_ready_but_a_recorded_failure_is_not() {
+        use codewhale_config::{InheritedConfigFacts, SetupState};
+        let derived = SetupState::derive_inherited(&InheritedConfigFacts {
+            has_provider_route: true,
+            ..Default::default()
+        });
+        let verdict = super::doctor_verdict(&derived, "openai", &facts(true, None, None));
+        assert!(
+            verdict.starts_with("Ready: onboarding is complete"),
+            "{verdict}"
+        );
+
+        let mut recorded = derived.clone();
+        recorded.inherited = false;
+        let verdict = super::doctor_verdict(&recorded, "openai", &facts(true, None, None));
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+    }
+
+    #[test]
+    fn a_set_env_key_is_ready_and_named_for_any_provider() {
+        use codewhale_config::{InheritedConfigFacts, SetupState};
+        // Structural derivation keeps NeedsAction: env never certifies it.
+        let derived = SetupState::derive_inherited(&InheritedConfigFacts {
+            has_provider_route: true,
+            ..Default::default()
+        });
+        let verdict = super::doctor_verdict(
+            &derived,
+            "anthropic",
+            &facts(false, Some("ANTHROPIC_API_KEY"), None),
+        );
+        assert_eq!(
+            verdict,
+            "Ready: anthropic key is set via ANTHROPIC_API_KEY (not checked offline; run `codewhale doctor --probe-api` to verify)."
+        );
+    }
+
+    #[test]
+    fn the_live_probe_result_decides_the_verdict() {
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::NeedsAction, true, "0.10.1"),
+        );
+        let verdict = super::doctor_verdict(&state, "openai", &facts(false, None, Some(true)));
+        assert!(
+            verdict.starts_with("Ready: the live openai API check passed"),
+            "{verdict}"
+        );
+
+        let verdict = super::doctor_verdict(
+            &state,
+            "openai",
+            &facts(true, Some("OPENAI_API_KEY"), Some(false)),
+        );
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(verdict.contains("API Connectivity"), "{verdict}");
+    }
+
+    /// #6889: a live check that ran out of time has not shown the key or the
+    /// route to be wrong, so the verdict does not say "Not ready" or point at
+    /// replacing the key.
+    #[test]
+    fn a_live_probe_that_timed_out_is_not_reported_as_a_rejected_key() {
+        let state = codewhale_config::SetupState::default();
+        let verdict = super::doctor_verdict(
+            &state,
+            "openai",
+            &super::DoctorVerdictFacts {
+                live_probe_timed_out: true,
+                ..facts(true, Some("OPENAI_API_KEY"), Some(false))
+            },
+        );
+        assert!(verdict.starts_with("Not confirmed"), "{verdict}");
+        assert!(verdict.contains("may still be loading"), "{verdict}");
+        assert!(verdict.contains("--probe-api"), "{verdict}");
+        assert!(!verdict.contains("auth set"), "{verdict}");
+
+        let timed_out = anyhow::Error::new(crate::llm_client::LlmError::Timeout(
+            super::DOCTOR_PROBE_TIMEOUT,
+        ))
+        .context("live check");
+        assert!(super::doctor_probe_timed_out(&timed_out));
+        let refused = anyhow::Error::new(crate::llm_client::LlmError::ServerError {
+            status: 502,
+            message: "resources busy".to_string(),
+        });
+        assert!(!super::doctor_probe_timed_out(&refused));
+        assert!(!super::doctor_probe_timed_out(&anyhow::anyhow!(
+            "connect timeout"
+        )));
+    }
+
+    #[test]
+    fn env_key_source_names_the_providers_own_variable_without_its_value() {
+        let _lock = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let _openai = crate::test_support::EnvVarGuard::set("OPENAI_API_KEY", "MUST-NOT-BE-SHOWN");
+        let config = crate::config::Config {
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let source = crate::config::active_provider_env_api_key_source(&config)
+            .expect("ambient key present");
+        assert_eq!(source, "OPENAI_API_KEY");
+        let label = super::doctor_env_key_label(&source);
+        assert_eq!(
+            label,
+            "set via OPENAI_API_KEY (value not shown; not checked offline)"
+        );
+        assert!(!label.contains("MUST-NOT-BE-SHOWN"));
+        // The structural contract is untouched: env presence is not readiness.
+        assert!(
+            !super::resolve_credential_diagnostic(&config)
+                .availability
+                .certifies_ready()
+        );
+
+        let _openai = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        assert_eq!(
+            crate::config::active_provider_env_api_key_source(&config),
+            None
         );
     }
 }
@@ -7804,7 +8264,7 @@ fn run_doctor_json(
             },
         },
         "sandbox": match crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-            config.prefer_bwrap.unwrap_or(false),
+            config.prefers_bwrap(),
         ) {
             Some(kind) => json!({"available": true, "kind": kind.to_string()}),
             None => json!({"available": false, "kind": null}),
@@ -8124,14 +8584,36 @@ fn doctor_search_provider_line(config: &Config) -> String {
     } else {
         ""
     };
+    // Firecrawl search works without a key. Say so, or a default with no
+    // credential reads as a broken setup. Stdout-only, like the missing-key note.
+    let keyless = if search_provider.provider == crate::config::SearchProvider::Firecrawl
+        && !search_provider_has_firecrawl_key(config)
+    {
+        "; works without an API key (limited quota; set FIRECRAWL_API_KEY or [search] api_key to raise it)"
+    } else {
+        ""
+    };
 
     format!(
-        "search_provider: {} (source: {}{}){}",
+        "search_provider: {} (source: {}{}){}{}",
         search_provider.provider.as_str(),
         search_provider.source.as_str(),
         switch_hint,
-        missing_key
+        missing_key,
+        keyless
     )
+}
+
+/// Whether `web_search` would send a Firecrawl key. Mirrors the adapter:
+/// `[search] api_key` shadows `FIRECRAWL_API_KEY`, and a blank value is no key.
+fn search_provider_has_firecrawl_key(config: &Config) -> bool {
+    let env_key = std::env::var("FIRECRAWL_API_KEY").ok();
+    config
+        .search
+        .as_ref()
+        .and_then(|search| search.api_key.as_deref())
+        .or(env_key.as_deref())
+        .is_some_and(|key| !key.trim().is_empty())
 }
 
 /// Whether *any* Tavily key is reachable: the dedicated env var, or a
@@ -8342,10 +8824,16 @@ fn recommended_strict_base_url(_config: &Config, _base_url: &str) -> &'static st
 
 fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
     let target = doctor_api_target(config);
-    let mut lines = vec![format!(
-        "Connection timed out while reaching {}.",
-        crate::doctor::structural_url_authority(&target.base_url)
-    )];
+    let mut lines = vec![
+        format!(
+            "Connection timed out while reaching {}.",
+            crate::doctor::structural_url_authority(&target.base_url)
+        ),
+        // #6889: some providers load a model on its first call, which can
+        // take longer than this check waits.
+        "If the key and endpoint are right, the model may still be loading: a first call to a model that has not been used recently can take a minute or two. Wait and run the check again."
+            .to_string(),
+    ];
 
     match config
         .active_provider_identity()
@@ -8619,13 +9107,31 @@ async fn test_api_connectivity(config: &Config) -> Result<()> {
         top_p: None,
     };
 
-    // Use tokio timeout to catch hanging requests
-    let timeout_duration = std::time::Duration::from_secs(15);
-    match tokio::time::timeout(timeout_duration, client.create_message(request)).await {
+    // Use tokio timeout to catch hanging requests. The timeout is typed so
+    // the report can tell "no answer yet" from a refusal (#6889).
+    match tokio::time::timeout(DOCTOR_PROBE_TIMEOUT, client.create_message(request)).await {
         Ok(Ok(_response)) => Ok(()),
         Ok(Err(e)) => Err(e),
-        Err(_) => anyhow::bail!("Request timeout after 15 seconds"),
+        Err(_) => Err(anyhow::Error::new(crate::llm_client::LlmError::Timeout(
+            DOCTOR_PROBE_TIMEOUT,
+        ))),
     }
+}
+
+/// How long the opt-in live check waits for its one-token answer.
+const DOCTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether the live check ran out of time instead of being refused (#6889).
+/// A provider that loads a model on its first call can take longer than the
+/// check waits, so this means "no answer yet", not a rejected key or a route
+/// that does not work.
+fn doctor_probe_timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::llm_client::LlmError>(),
+            Some(crate::llm_client::LlmError::Timeout(_))
+        )
+    })
 }
 
 fn rustc_version() -> String {
@@ -8988,15 +9494,21 @@ fn resolve_workspace(cli: &Cli) -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// Activate facts only at accepted inference runtime settings boundaries.
-/// Identical settings preserve the shared ticket; readers track its generation.
-pub(crate) fn initialize_cloud_facts(config: &Config) {
-    let settings = config.cloud_facts_config().settings();
-    codewhale_cloud_facts::configure(&settings);
-    codewhale_cloud_facts::maybe_load_persisted_cache(&settings);
-    if tokio::runtime::Handle::try_current().is_ok() {
-        codewhale_cloud_facts::spawn_background_refresh(settings, None);
-    }
+async fn plugin_auth_entry_from_cli(
+    cli: &Cli,
+    provider: &str,
+) -> Result<crate::config::ProviderConfig> {
+    let path = cli.config.clone();
+    let profile = effective_config_profile(cli);
+    let options = cli.options.clone();
+    let provider = provider.to_owned();
+    let policy = crate::plugins::activation::extension_host_policy_enabled();
+    tokio::task::spawn_blocking(move || {
+        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+        let config = load_config_with_cli_preferences(path, profile.as_deref(), &options)?;
+        crate::plugins::providers::plugin_auth_entry(&config, &provider)
+    })
+    .await?
 }
 
 fn load_config_from_cli(cli: &Cli) -> Result<Config> {
@@ -9025,7 +9537,7 @@ fn load_structural_config_from_cli(cli: &Cli) -> Result<Config> {
     Ok(config)
 }
 
-/// Select the plugin activation policy (v3, or v4 with the experimental
+/// Select the plugin activation policy (v5, or v6 with the experimental
 /// extension host) and the host's runtime settings, once per process, before
 /// any plugin discovery. Later config reloads never flip either.
 fn install_extension_host_boot_config(config: &Config) {
@@ -9064,21 +9576,31 @@ fn effective_config_profile(cli: &Cli) -> Option<String> {
 
 fn load_config_from_cli_with_effective_profile(cli: &Cli) -> Result<(Config, Option<String>)> {
     let profile = effective_config_profile(cli);
-    let mut config = Config::load(cli.config.clone(), profile.as_deref())?;
+    let config =
+        load_config_with_cli_preferences(cli.config.clone(), profile.as_deref(), &cli.options)?;
+    Ok((config, profile))
+}
+
+fn load_config_with_cli_preferences(
+    path: Option<PathBuf>,
+    profile: Option<&str>,
+    options: &RuntimeOptions,
+) -> Result<Config> {
+    let mut config = Config::load(path, profile)?;
     // Config loading is shared by diagnostics and mutating runtimes. Read the
     // saved preference without migrating or creating state here; interactive
     // startup performs any permitted migration later through `Settings::load`.
     if let Ok(settings) = crate::settings::Settings::load_read_only() {
         apply_saved_reasoning_preference(&mut config, &settings);
     }
-    cli.options.apply_features(&mut config)?;
+    options.apply_features(&mut config)?;
     install_extension_host_boot_config(&config);
     // Install the foreign-instruction opt-in before anything can load project
     // context. This is the single funnel every runtime goes through — TUI,
     // exec, ACP, and the app-server passthrough all resolve config here — so
     // the loader never has to be handed the setting at each of its call sites.
     install_foreign_instruction_imports(&config);
-    Ok((config, profile))
+    Ok(config)
 }
 
 /// Apply the selected v2 Fleet's operator to a fresh root session.
@@ -9243,6 +9765,21 @@ async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+async fn run_claude_auth(config_path: Option<&Path>) -> Result<()> {
+    let pending = crate::oauth::login(crate::oauth::OAuthProvider::Claude).await?;
+    let path = config_path.map(Path::to_path_buf);
+    let activation = tokio::task::spawn_blocking(move || {
+        crate::oauth::activate_login(pending, path.as_deref(), None)
+    })
+    .await
+    .context("Claude activation worker failed")??;
+    println!("{}", activation.summary(codewhale_localization::Locale::En));
+    println!(
+        "Use `codewhale --provider anthropic` or `/provider anthropic`. Sign out with `codewhale auth claude-revoke`."
+    );
+    Ok(())
+}
+
 async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
     let config = Config::load(config_path.map(Path::to_path_buf), None)?;
     let pending =
@@ -9277,6 +9814,62 @@ async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
 fn run_chatgpt_pkce_revoke(config_path: Option<&Path>) -> Result<()> {
     crate::oauth::revoke_owned_login(crate::oauth::OAuthProvider::Chatgpt, config_path, None)?;
     println!("Removed Codewhale's saved ChatGPT sign-in.");
+    Ok(())
+}
+
+/// OrcaRouter account sign-in: OAuth 2.0 + PKCE on a loopback redirect,
+/// exchanged for a durable `sk-orca-...` key.
+///
+/// This is the "OrcaRouter - Auth" entry point. It never replaces the
+/// API-key path (`codewhale auth set --provider orcarouter`); both land in the
+/// same credential slot and are independently usable.
+async fn run_orcarouter_pkce_auth(config_path: Option<&Path>) -> Result<()> {
+    let inputs = crate::oauth::OrcaLoginInputs::from_env();
+    if inputs.auth_base == crate::oauth::ORCAROUTER_AUTH_BASE
+        && std::env::var_os("ORCA_AUTH_BASE_URL").is_none()
+    {
+        println!(
+            "Signing in to OrcaRouter at {} (consent is granted on the OrcaRouter site).",
+            crate::oauth::ORCAROUTER_AUTH_BASE
+        );
+    }
+    let api_base = inputs.api_base.clone();
+    if api_base != crate::oauth::ORCAROUTER_API_BASE {
+        println!("OrcaRouter inference and model discovery will use {api_base}.");
+    }
+    let mut challenge = crate::oauth::cli_challenge_writer()?;
+    let credential = tokio::task::spawn_blocking(move || {
+        crate::oauth::orcarouter_pkce_login(&inputs, challenge.as_mut())
+    })
+    .await
+    .context("OrcaRouter PKCE login worker failed")??;
+    let saved = crate::oauth::activate_orcarouter_credential(&credential, config_path)?;
+    println!(
+        "OrcaRouter is ready; stored the key in {}",
+        saved.describe()
+    );
+    if !credential.scope_satisfies_purpose() {
+        println!(
+            "Note: OrcaRouter granted scope \"{}\"; this client asked for \"{}\". The narrower grant is reused as-is.",
+            credential.granted_scope(),
+            crate::oauth::ORCAROUTER_SCOPE
+        );
+    }
+    println!(
+        "Revoke access any time at https://www.orcarouter.ai/console/authorized-apps. To switch accounts, run `codewhale auth orcarouter` again."
+    );
+    Ok(())
+}
+
+/// Clear the saved OrcaRouter credential from the secret store and config.
+fn run_orcarouter_revoke(config_path: Option<&Path>) -> Result<()> {
+    let mut store = codewhale_config::ConfigStore::load(config_path.map(Path::to_path_buf))?;
+    let Some(secrets) = crate::config::credential_secret_store() else {
+        anyhow::bail!("no credential store is available in this environment");
+    };
+    let provider = codewhale_config::ProviderKind::Orcarouter;
+    codewhale_config::credentials::clear_provider_api_key(&mut store, &secrets, provider)?;
+    println!("Removed Codewhale's saved OrcaRouter credential.");
     Ok(())
 }
 
@@ -11201,6 +11794,40 @@ fn mcp_server_listing(command: Option<&str>, args: &[String], url: Option<&str>)
     }
 }
 
+/// Printed after `mcp connect` and `mcp validate` succeed. docs/MCP.md
+/// § Connection Lifecycle already states that these commands inspect their
+/// own process's pool and never attach transports to a running TUI or exec
+/// session; the success line alone reads as a real fix for the running
+/// session otherwise (issue #6828).
+const MCP_OWN_PROCESS_NOTE: [&str; 2] = [
+    "Note: this command ran in its own process; it does not attach to a running TUI or exec session.",
+    "In a running session, use in-session discovery: search for the server name or an mcp_<server>_ tool name, or call one of its tools directly.",
+];
+
+fn print_mcp_own_process_note() {
+    for line in MCP_OWN_PROCESS_NOTE {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod mcp_own_process_note_tests {
+    use super::MCP_OWN_PROCESS_NOTE;
+
+    #[test]
+    fn mcp_own_process_note_states_the_session_boundary_and_recovery() {
+        let note = MCP_OWN_PROCESS_NOTE.join("\n");
+        assert!(
+            note.contains("own process") && note.contains("does not attach"),
+            "the connect/validate note must name the process boundary: {note}"
+        );
+        assert!(
+            note.contains("search for the server name"),
+            "the note must point at in-session discovery: {note}"
+        );
+    }
+}
+
 async fn run_mcp_command(
     config: &Config,
     workspace: &Path,
@@ -11299,10 +11926,12 @@ async fn run_mcp_command(
                     return Err(err);
                 }
                 println!("Connected to MCP server: {name}");
+                print_mcp_own_process_note();
             } else {
                 let errors = pool.connect_all().await;
                 if errors.is_empty() {
                     println!("Connected to all configured MCP servers.");
+                    print_mcp_own_process_note();
                 } else {
                     for (name, err) in errors {
                         eprintln!("Failed to connect {name}: {err:#}");
@@ -11507,6 +12136,7 @@ async fn run_mcp_command(
             let errors = pool.connect_all().await;
             if errors.is_empty() {
                 println!("MCP config is valid. All enabled servers connected.");
+                print_mcp_own_process_note();
                 return Ok(());
             }
             eprintln!("MCP validation failed:");
@@ -12644,6 +13274,26 @@ fn normalize_windows_config_path_str(path: &str) -> String {
     normalized.to_ascii_lowercase()
 }
 
+/// Startup discovery runs before config can select the extension-host policy,
+/// so it judged every reviewed Native plugin `CapabilitiesChanged`. Call this
+/// after the config load to re-judge under the installed policy, as
+/// `/plugin reload` does, so trusted host plugins survive a restart. With the
+/// flag off it returns the startup snapshot unchanged.
+///
+/// Known limits: plugin-declared providers keep the startup snapshot, and the
+/// `mcp`, `doctor`, `setup`, `pr`, `review` and workflow-tool subcommands do
+/// not call this yet.
+fn policy_current_registry(
+    registry: Arc<crate::plugins::PluginRegistry>,
+) -> Arc<crate::plugins::PluginRegistry> {
+    if crate::plugins::activation::extension_host_policy_enabled() {
+        let workspace = registry.workspace().to_path_buf();
+        registry.rediscover_for_workspace(&workspace)
+    } else {
+        registry
+    }
+}
+
 fn interactive_tui_allow_shell(yolo: bool, config: &Config) -> bool {
     yolo || config.interactive_allow_shell()
 }
@@ -12681,6 +13331,7 @@ async fn run_interactive_with_notice(
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
 ) -> Result<()> {
     tui::ui::require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
+    let plugin_registry = policy_current_registry(plugin_registry);
     let prepared = prepare_interactive_config(cli, config, resume_session_id.is_some())?;
     let (prepared, resume_session_id) = if let Some(selector) = resume_session_id {
         let (prepared, id) = prepare_mounted_session(
@@ -14084,13 +14735,6 @@ fn exec_stream_resume_hint(session_id: &str) -> String {
     }
 }
 
-/// Character bound for `metadata.visible_final_answer_excerpt`. The excerpt
-/// is a status surface (fleet receipts, event labels, runtime API payloads),
-/// not the transcript: the full answer lives in the saved session and the
-/// worker's stream-json log, and `visible_final_answer_chars` carries the real
-/// length so a consumer can tell a bounded excerpt from a short answer.
-const EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS: usize = 4_000;
-
 /// The final visible assistant reply for the terminal receipt: the text
 /// blocks of the last assistant-like message after the current user prompt.
 /// Tool results also use the user role, so they must not start a new turn.
@@ -14126,22 +14770,6 @@ fn exec_stream_final_answer_text(
         .trim()
         .to_string();
     (!text.is_empty()).then_some(text)
-}
-
-/// Bound and secret-redact the visible final answer once, at the emitter, so
-/// every downstream consumer reads the same excerpt.
-fn exec_stream_final_answer_excerpt(output: &str) -> String {
-    let redacted = codewhale_config::persistence::redact_secrets(output.trim());
-    let mut chars = redacted.chars();
-    let excerpt: String = chars
-        .by_ref()
-        .take(EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS)
-        .collect();
-    if chars.next().is_some() {
-        format!("{excerpt}...")
-    } else {
-        excerpt
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -14295,13 +14923,19 @@ fn exec_network_policy(
     // Fleet caps are an outer authority boundary: user configuration may
     // narrow them further, but it may never widen an explicit network denial.
     if outer_network_access == Some(false) {
-        return Some(crate::network_policy::NetworkPolicyDecider::new(
-            crate::network_policy::NetworkPolicy {
-                default: crate::network_policy::DecisionToml::Deny,
-                ..crate::network_policy::NetworkPolicy::default()
-            },
-            None,
-        ));
+        // A Fleet denial is an outer authority the user's document may never
+        // widen, so mark the decider authoritative: a mid-session re-read of
+        // that document folds onto it instead of replacing it.
+        return Some(
+            crate::network_policy::NetworkPolicyDecider::new(
+                crate::network_policy::NetworkPolicy {
+                    default: crate::network_policy::DecisionToml::Deny,
+                    ..crate::network_policy::NetworkPolicy::default()
+                },
+                None,
+            )
+            .with_authoritative(),
+        );
     }
     config.network.clone().map(|toml_cfg| {
         crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
@@ -16282,6 +16916,51 @@ mod doctor_endpoint_tests {
     }
 
     #[test]
+    fn doctor_search_provider_line_says_firecrawl_needs_no_key_until_one_is_set() {
+        use crate::test_support::EnvVarGuard;
+        let _guard = crate::test_support::lock_test_env();
+        let _env = [
+            "CODEWHALE_SEARCH_PROVIDER",
+            "DEEPSEEK_SEARCH_PROVIDER",
+            "TAVILY_API_KEY",
+            "FIRECRAWL_API_KEY",
+        ]
+        .map(EnvVarGuard::remove);
+        let with_config_key = |api_key: &str| Config {
+            search: Some(crate::config::SearchConfig {
+                provider: Some(crate::config::SearchProvider::Firecrawl),
+                base_url: None,
+                api_key: Some(api_key.to_string()),
+                native: None,
+            }),
+            ..Default::default()
+        };
+
+        let keyless = doctor_search_provider_line(&Config::default());
+        let config_key = doctor_search_provider_line(&with_config_key("fc-test"));
+        let env_key = {
+            let _key = EnvVarGuard::set("FIRECRAWL_API_KEY", "fc-test");
+            // web_search lets a blank `[search] api_key` shadow the env key.
+            let shadowed = doctor_search_provider_line(&with_config_key(" "));
+            assert!(shadowed.contains("without an API key"), "got `{shadowed}`");
+            doctor_search_provider_line(&Config::default())
+        };
+
+        assert_eq!(
+            keyless,
+            "search_provider: firecrawl (source: default; set [search] provider = \"baidu\" | \"metaso\" | \"volcengine\" for China); works without an API key (limited quota; set FIRECRAWL_API_KEY or [search] api_key to raise it)"
+        );
+        assert_eq!(config_key, "search_provider: firecrawl (source: config)");
+        assert!(!env_key.contains("without an API key"), "got `{env_key}`");
+        assert!(
+            doctor_search_provider_json(&Config::default())
+                .get("keyless")
+                .is_none(),
+            "the note is stdout-only"
+        );
+    }
+
+    #[test]
     fn doctor_search_provider_line_omits_switch_hint_when_bing_is_configured() {
         let _guard = crate::test_support::lock_test_env();
         let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
@@ -16331,6 +17010,8 @@ mod doctor_endpoint_tests {
         assert!(text.contains("/v1/models"));
         assert!(text.contains("/v1/chat/completions"));
         assert!(!text.contains("api.deepseeki.com"));
+        // #6889: a timeout may be a model that is still loading.
+        assert!(text.contains("the model may still be loading"), "{text}");
     }
 }
 
@@ -19604,5 +20285,31 @@ mod private_listing_tests {
         assert!(!url.contains("url-s10-synthetic"));
         assert!(!url.contains("query-s10-synthetic"));
         assert!(url.contains("team=core"));
+    }
+}
+
+#[cfg(test)]
+mod mcp_add_arg_tests {
+    use super::*;
+    #[test]
+    fn mcp_add_arg_accepts_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "codewhale",
+            "mcp",
+            "add",
+            "srv",
+            "--command",
+            "npx",
+            "--arg",
+            "-y",
+        ])
+        .expect("mcp add parses hyphen-led --arg values");
+        let Some(Commands::Mcp { command }) = cli.command else {
+            panic!("expected mcp command");
+        };
+        let McpCommand::Add { args, .. } = command else {
+            panic!("expected mcp add subcommand");
+        };
+        assert_eq!(args, vec!["-y".to_string()]);
     }
 }

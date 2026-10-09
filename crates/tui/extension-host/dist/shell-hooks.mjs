@@ -1,7 +1,57 @@
 // src/dsh/shell-hooks.ts
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, lstatSync } from "node:fs";
+import { readFileSync, lstatSync } from "node:fs";
 import { resolve, relative, isAbsolute, sep } from "node:path";
+
+// src/dsh/canonical-path.ts
+import { realpathSync } from "node:fs";
+import { posix, win32 } from "node:path";
+function canonicalPath(path, platform = process.platform) {
+  if (platform !== "win32") return realpathSync(path);
+  try {
+    return stripVerbatim(realpathSync.native(path), platform);
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : void 0;
+    if (code === "EPERM" || code === "EACCES") {
+      return stripVerbatim(win32.normalize(path), platform);
+    }
+    throw error;
+  }
+}
+function stripVerbatim(path, platform = process.platform) {
+  if (platform !== "win32") return path;
+  if (/^[\\/]{2}\?[\\/]UNC[\\/]/i.test(path)) return `\\\\${path.slice(8)}`;
+  if (/^[\\/]{2}\?[\\/]/.test(path)) return path.slice(4);
+  return path;
+}
+function pathKey(path, platform = process.platform) {
+  if (platform !== "win32") return posix.normalize(path);
+  return win32.normalize(stripVerbatim(path, platform)).toLowerCase();
+}
+function samePath(a, b, platform = process.platform) {
+  return pathKey(a, platform) === pathKey(b, platform);
+}
+function insideKey(root, target, platform = process.platform) {
+  const path = platform === "win32" ? win32 : posix;
+  const inside = path.relative(stripVerbatim(root, platform), stripVerbatim(target, platform));
+  if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return void 0;
+  return platform === "win32" ? inside.split(win32.sep).join("/") : inside;
+}
+function isUnlinkedInside(root, key, target, platform = process.platform) {
+  let canonicalRoot, canonicalTarget;
+  try {
+    canonicalRoot = canonicalPath(root, platform);
+    canonicalTarget = canonicalPath(target, platform);
+  } catch {
+    return false;
+  }
+  return unlinkedKeyMatches(canonicalRoot, key, canonicalTarget, platform);
+}
+function unlinkedKeyMatches(canonicalRoot, key, canonicalTarget, platform = process.platform) {
+  if (!key || key.split("/").some((part) => !part || part === "." || part === "..")) return false;
+  const path = platform === "win32" ? win32 : posix;
+  return samePath(path.join(stripVerbatim(canonicalRoot, platform), ...key.split("/")), canonicalTarget, platform);
+}
 
 // src/dsh/upstream/hooks/hook-protocol/src/matcher.ts
 function isMatchAll(matcher) {
@@ -136,7 +186,7 @@ function reviewedHookModule(dialect, root, files) {
     if (!config || typeof config.configPath !== "string") throw new Error("hook bridge needs its reviewed configPath");
     const path = resolve(root, config.configPath);
     const inside = relative(root, path).split(sep).join("/");
-    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || realpathSync(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
+    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || !isUnlinkedInside(root, inside, path) || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
     const bytes = readFileSync(path);
     if (bytes.length > 1024 * 1024 || createHash("sha256").update(bytes).digest("hex") !== files[inside]) throw new Error("hook config changed after review or exceeds 1 MiB");
     if (config.projectDir !== void 0) throw new Error("explicit projectDir is unsupported; each process uses its current core workspace");
@@ -158,5 +208,10 @@ function reviewedHookModule(dialect, root, files) {
   } };
 }
 export {
-  reviewedHookModule
+  insideKey,
+  pathKey,
+  reviewedHookModule,
+  samePath,
+  stripVerbatim,
+  unlinkedKeyMatches
 };

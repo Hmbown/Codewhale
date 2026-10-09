@@ -7,7 +7,7 @@ export const PLUGINS_COPY = {
     zh: "用 Computer Use 让代理操作你选定的桌面应用，并从 Codewhale 目录、GitHub 仓库或压缩包安装经过审阅的插件。",
   },
   kicker: { en: "Plugins and marketplace", zh: "插件与市场" },
-  title: { en: "Give the agent your apps, on your terms.", zh: "按你的规则，把应用交给代理。" },
+  title: { en: "Add tools and skills with plugins", zh: "通过插件添加工具和技能" },
   lead: {
     en: "Add capabilities from the first-party Codewhale catalog, a GitHub repository, or a tarball. Nothing runs until you read the manifest and trust it.",
     zh: "从官方 Codewhale 目录、GitHub 仓库或压缩包添加能力。在你阅读清单并信任它之前，不会运行任何内容。",
@@ -16,7 +16,7 @@ export const PLUGINS_COPY = {
   docsCta: { en: "Plugin authoring guide", zh: "插件编写指南" },
 
   cuLabel: { en: "First-party plugin · macOS beta", zh: "官方插件 · macOS Beta" },
-  cuTitle: { en: "Computer Use: let the agent operate your apps.", zh: "Computer Use：让代理操作你的应用。" },
+  cuTitle: { en: "Control apps with Computer Use", zh: "使用 Computer Use 操作应用" },
   cuLead: {
     en: "The agent observes the apps you choose, reads their controls through the accessibility tree, types and clicks, and records each action in a receipt. macOS is the qualified beta platform; Windows, Linux and HarmonyOS backends remain experimental and source-only.",
     zh: "代理观察你选择的应用，通过无障碍树读取控件，执行输入与点击，并在回执中记录每一步操作。macOS 是完成认证的 Beta 平台；Windows、Linux 与 HarmonyOS 后端仍为实验性、仅提供源码。",
@@ -31,49 +31,49 @@ export const PLUGINS_COPY = {
       },
     },
     {
-      title: { en: "Reads the UI, not just pixels", zh: "读懂界面，而非只看像素" },
+      title: { en: "Read app controls", zh: "读取应用控件" },
       detail: {
         en: "The accessibility tree (macOS AX, Windows UIA, Linux AT-SPI) returns controls, values, and advertised actions, so a text-only model can drive an app without screenshots.",
         zh: "无障碍树（macOS AX、Windows UIA、Linux AT-SPI）返回控件、值与可执行动作，因此纯文本模型无需截图也能驱动应用。",
       },
     },
     {
-      title: { en: "Sees when it has to", zh: "必要时才看" },
+      title: { en: "Screenshots and local text recognition", zh: "截图与本地文字识别" },
       detail: {
         en: "Screenshots and zoom feed compatible vision models. On macOS, local OCR reads window text on-device with no remote service or vision model.",
         zh: "截图与缩放供兼容的视觉模型使用。在 macOS 上，本地 OCR 直接在设备上读取窗口文字，无需远程服务或视觉模型。",
       },
     },
     {
-      title: { en: "One agent, many computers", zh: "一个代理，多台计算机" },
+      title: { en: "Connect remote computers", zh: "连接远程计算机" },
       detail: {
         en: "Control the local machine, registered SSH hosts (the remote agent installs itself), or HarmonyOS devices over hdc. Every receipt names the computer it happened on.",
         zh: "控制本机、已注册的 SSH 主机（远程代理自动安装）或通过 hdc 连接的 HarmonyOS 设备。每条回执都标明它发生在哪台计算机上。",
       },
     },
     {
-      title: { en: "Permissions stay yours", zh: "权限仍归你所有" },
+      title: { en: "Manage system permissions", zh: "管理系统权限" },
       detail: {
         en: "Accessibility and Screen Recording grants stay in System Settings under your control. The agent tells you once what is missing instead of opening dialogs.",
         zh: "辅助功能与屏幕录制权限保留在系统设置中，由你掌控。代理只会告诉你一次缺少什么，不会弹出对话框。",
       },
     },
     {
-      title: { en: "Fails closed, with receipts", zh: "失败即停，回执为证" },
+      title: { en: "Stop when an action cannot be verified", zh: "无法确认操作时停止" },
       detail: {
         en: "Stale observations, unexpected foreground changes, and unavailable capabilities refuse with a receipt instead of guessing. Each task owns its session; stopping releases every held input.",
         zh: "过期的观察结果、意外的前台变化与不可用的能力都会携带回执拒绝执行，而非猜测。每个任务独占自己的会话；停止即释放所有按住的输入。",
       },
     },
     {
-      title: { en: "Drives a browser, in its own profile", zh: "以独立配置文件驱动浏览器" },
+      title: { en: "Automate a separate browser profile", zh: "在独立浏览器配置中自动操作" },
       detail: {
         en: "The agent drives a Chromium-family browser over the DevTools protocol in its own profile, clicking by CSS selector or page pixel. It never attaches to your profile, tabs, or logins.",
         zh: "代理通过 DevTools 协议在自己的配置文件中驱动 Chromium 系浏览器，按 CSS 选择器或页面像素点击。它绝不会连接你的配置文件、标签页或登录信息。",
       },
     },
     {
-      title: { en: "Watch it, bound it, replay it", zh: "可看、可限、可重放" },
+      title: { en: "Preview, stop and replay sessions", zh: "预览、停止与回放会话" },
       detail: {
         en: "A live preview shows the bound app while a session works, and list_sessions names every live session. The stop switch halts input, trajectories record every call (refusals included) for replay, and a launch-time grant fixes what a session may call.",
         zh: "会话工作时，实时预览显示所绑定的应用；list_sessions 列出每个活动会话。停止开关终止输入，轨迹记录每一次调用（包括被拒绝的调用）以供重放，启动时的授权固定会话可调用的范围。",
@@ -86,7 +86,7 @@ export const PLUGINS_COPY = {
   },
 
   catalogLabel: { en: "First-party catalog", zh: "官方目录" },
-  catalogTitle: { en: "The Codewhale marketplace.", zh: "Codewhale 市场。" },
+  catalogTitle: { en: "Browse Codewhale plugins", zh: "浏览 Codewhale 插件" },
   catalogLead: {
     en: "An offline snapshot of the Codewhale catalog ships with the terminal, so browsing never fetches or runs anything. Install from it with one command.",
     zh: "终端内置 Codewhale 目录的离线快照，浏览时不会拉取或运行任何内容。一条命令即可安装。",
@@ -157,7 +157,7 @@ export const PLUGINS_COPY = {
   ],
 
   trustLabel: { en: "Trust lifecycle", zh: "信任生命周期" },
-  trustTitle: { en: "Installed is not enabled.", zh: "已安装不等于已启用。" },
+  trustTitle: { en: "Review and enable a plugin", zh: "审阅并启用插件" },
   trustLead: {
     en: "Every bundle lands disabled and untrusted. Review the manifest and declared capabilities, then trust and enable it. An update with changed bytes requires review again.",
     zh: "每个 bundle 安装后均为未启用、未信任状态。审阅清单与声明的能力后，再信任并启用。内容有变更的更新需要重新审阅。",

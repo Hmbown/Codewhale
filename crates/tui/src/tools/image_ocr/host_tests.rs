@@ -291,33 +291,99 @@ async fn real_host_ocr_cancellation_bounds_parser_tree_and_never_replays() {
     drop(warm);
     let marker = root.path().join("launched");
     let child = root.path().join("descendant-survived");
+    let parser_pid = root.path().join("parser.pid");
+    let descendant_pid = root.path().join("descendant.pid");
+    let ready = root.path().join("descendant-ready");
+    let release = root.path().join("release-descendant");
     let tess = binary(
         root.path(),
         &format!(
-            "printf x >> '{}'; (/bin/sleep 1; printf alive > '{}') &\n/bin/sleep 30",
+            concat!(
+                "printf '%s\\n' \"$$\" > '{}'\n",
+                "printf x >> '{}'\n",
+                "(printf ready > '{}'; while [ ! -e '{}' ]; do /bin/sleep 0.02; done; printf alive > '{}') &\n",
+                "printf '%s\\n' \"$!\" > '{}'\nwait",
+            ),
+            parser_pid.display(),
             marker.display(),
-            child.display()
+            ready.display(),
+            release.display(),
+            child.display(),
+            descendant_pid.display(),
         ),
     );
     let _override = overrides(Ok(None), Some(tess.into_os_string()));
     let cancel = CancellationToken::new();
-    let stop = cancel.clone();
-    let check = marker.clone();
-    let waiter = tokio::spawn(async move {
-        for _ in 0..1000 {
-            if check.exists() {
-                stop.cancel();
-                return;
+    // Backstop assertion/timeout failures without leaving a latched parser tree.
+    struct ParserCleanup {
+        cancel: CancellationToken,
+        pid_file: PathBuf,
+        armed: bool,
+    }
+    impl Drop for ParserCleanup {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+            if self.armed
+                && let Some(pid) = std::fs::read_to_string(&self.pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+                    .filter(|pid| *pid > 0)
+            {
+                // SAFETY: this private fixture records the contained parser's
+                // process-group leader; a negative PID targets only that group.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("OCR parser never launched");
+    }
+    let mut cleanup = ParserCleanup {
+        cancel: cancel.clone(),
+        pid_file: parser_pid.clone(),
+        armed: true,
+    };
+    let stop = cancel.clone();
+    let waiter = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() || !descendant_pid.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("OCR descendant never became ready");
+        let pids = tokio::task::spawn_blocking(move || {
+            (
+                crate::process_tree::read_pid_file(&parser_pid, Duration::from_secs(5)),
+                crate::process_tree::read_pid_file(&descendant_pid, Duration::from_secs(5)),
+            )
+        })
+        .await
+        .unwrap();
+        stop.cancel();
+        pids
     });
     let ctx = context(root.path(), true).with_cancel_token(cancel);
-    let err = ocr_image_path(&image, &ctx).await.unwrap_err();
+    let err = tokio::time::timeout(Duration::from_secs(20), ocr_image_path(&image, &ctx))
+        .await
+        .expect("OCR cancellation did not return")
+        .unwrap_err();
     assert!(matches!(err, ToolError::Cancelled { .. }));
-    waiter.await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (parser, descendant) = waiter.await.unwrap();
+    // Host cancellation returns before its retained worker has cleaned up.
+    // Observe that cleanup while allowing the current-thread runtime to run it.
+    let stopped = tokio::task::spawn_blocking(move || {
+        let descendant_stopped =
+            crate::process_tree::wait_for_pid_exit(descendant, Duration::from_secs(5));
+        let parser_stopped = crate::process_tree::wait_for_pid_exit(parser, Duration::from_secs(5));
+        descendant_stopped && parser_stopped
+    })
+    .await
+    .unwrap();
+    if stopped {
+        cleanup.armed = false;
+    }
+    assert!(stopped, "cancelled OCR parser tree is still running");
+    // A delayed cancellation observer can no longer race a one-second writer:
+    // the descendant could not write before this explicit release.
+    std::fs::write(release, b"release").unwrap();
     assert_eq!(std::fs::read(marker).unwrap(), b"x");
     assert!(!child.exists());
     manager.shutdown().await;

@@ -7782,7 +7782,7 @@ async fn needs_auth_server_advertises_synthetic_authenticate_tool() {
         auth_tool.description
     );
     assert!(
-        auth_tool.description.contains("blocks (up to 5 minutes)"),
+        auth_tool.description.contains("blocks (up to 15 minutes)"),
         "{}",
         auth_tool.description
     );
@@ -10840,5 +10840,11 @@ fn configured_mcp_search_excludes_disabled_and_namespace_denied_servers() {
         pool.configured_servers_for_search("mcp_.*", "regex", |_| true)
             .unwrap(),
         ["enabled"]
+    );
+    // The list named to the model passes the same gates, plus the turn's.
+    assert_eq!(pool.discoverable_configured_servers(|_| true), ["enabled"]);
+    assert!(
+        pool.discoverable_configured_servers(|name| name != "enabled")
+            .is_empty()
     );
 }

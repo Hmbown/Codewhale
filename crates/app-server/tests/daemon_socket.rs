@@ -85,6 +85,277 @@ impl Drop for Harness {
     }
 }
 
+struct OwnedBootstrapChild(std::process::Child);
+impl Drop for OwnedBootstrapChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+/// Transport-only publication fixture; actual store-lease proof lives in TUI.
+struct BootstrapPublicationFixture {
+    harness: Harness,
+    parent: codewhale_config::private_directory::PrivateDirectory,
+    owner: codewhale_protocol::RuntimeOwnerReceipt,
+    bytes: Vec<u8>,
+}
+impl BootstrapPublicationFixture {
+    async fn new(label: &str, dead: bool, reused: bool) -> Self {
+        use codewhale_config::private_directory::PrivateDirectory;
+        let harness = Harness::new(label);
+        let parent = PrivateDirectory::admit(harness.socket_path.parent().unwrap()).unwrap();
+        let socket = std::os::unix::net::UnixListener::bind(&harness.socket_path).unwrap();
+        let identity = parent.socket_identity("daemon.sock").unwrap().unwrap();
+        parent.protect_socket("daemon.sock", identity).unwrap();
+        drop(socket);
+        let (pid, mut process_start) = if dead {
+            let mut child = OwnedBootstrapChild(
+                std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = child.0.id();
+            let start = codewhale_app_server::daemon_socket::capture_process_start(pid)
+                .await
+                .unwrap();
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            (pid, start)
+        } else {
+            (
+                std::process::id(),
+                codewhale_app_server::daemon_socket::capture_process_start(std::process::id())
+                    .await
+                    .unwrap(),
+            )
+        };
+        if reused {
+            process_start.push_str("-different-generation");
+        }
+        let owner = codewhale_protocol::RuntimeOwnerReceipt {
+            version: 1,
+            data_dir: harness.root.join("runtime"),
+            execution_scope: "bootstrap-transport-store".into(),
+            lease_generation: "bootstrap-dead-generation".into(),
+            pid,
+            process_start,
+            principal: PrivateDirectory::current_user_id().to_string(),
+            socket_path: harness.socket_path.clone(),
+            config_path: harness.options().config_path,
+        };
+        let bytes = serde_json::to_vec(&owner).unwrap();
+        parent
+            .write_owned_file("daemon.sock.owner.json", &bytes, false)
+            .unwrap();
+        Self {
+            harness,
+            parent,
+            owner,
+            bytes,
+        }
+    }
+
+    async fn capture(
+        &self,
+    ) -> std::sync::Arc<codewhale_app_server::daemon_client::UnavailablePublication> {
+        match codewhale_app_server::daemon_client::probe_owner_for_host_startup(
+            self.owner.config_path.clone(),
+            Some(self.owner.socket_path.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            codewhale_app_server::daemon_client::HostOwnerProbe::Unavailable(publication) => {
+                publication
+            }
+            _ => panic!("refused private endpoint must be captured before bootstrap"),
+        }
+    }
+
+    async fn bind_replacement(
+        &self,
+        recovery: Option<
+            std::sync::Arc<codewhale_app_server::daemon_client::UnavailablePublication>,
+        >,
+    ) -> anyhow::Result<codewhale_app_server::daemon_socket::DaemonSocket> {
+        let mut owner = self.owner.clone();
+        owner.pid = std::process::id();
+        owner.process_start =
+            codewhale_app_server::daemon_socket::capture_process_start(owner.pid).await?;
+        owner.lease_generation = "bootstrap-new-generation".into();
+        let (daemon, _) = codewhale_app_server::bind_runtime_frontends(
+            owner.config_path.clone(),
+            None,
+            owner,
+            codewhale_app_server::RuntimeOwnerRouting {
+                endpoint: "127.0.0.1:1".parse().unwrap(),
+                workspace: None,
+                workers: None,
+                mobile: false,
+                web: false,
+                acp: false,
+                acp_only: false,
+            },
+            None,
+            recovery,
+        )
+        .await?;
+        Ok(daemon)
+    }
+
+    fn assert_publication(&self, bytes: &[u8]) {
+        assert_eq!(
+            self.parent
+                .read_private_receipt("daemon.sock.owner.json", 16384)
+                .unwrap()
+                .unwrap()
+                .0,
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn owner_bootstrap_unavailable_is_host_only_and_read_only() {
+    let fixture = BootstrapPublicationFixture::new("boot-read", true, false).await;
+    let identity = fixture.parent.socket_identity("daemon.sock").unwrap();
+    let captured = fixture.capture().await;
+    assert_eq!(captured.receipt(), &fixture.owner);
+    assert!(captured.revalidate().await.unwrap());
+    assert!(
+        codewhale_app_server::daemon_client::connect_if_published(
+            fixture.owner.config_path.clone(),
+            Some(fixture.owner.socket_path.clone()),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        codewhale_app_server::daemon_client::connect(
+            fixture.owner.config_path.clone(),
+            Some(fixture.owner.socket_path.clone()),
+        )
+        .await
+        .is_err()
+    );
+    fixture.assert_publication(&fixture.bytes);
+    assert_eq!(
+        fixture.parent.socket_identity("daemon.sock").unwrap(),
+        identity
+    );
+    assert!(
+        !fixture.owner.data_dir.exists(),
+        "standalone control must not open or mint a store"
+    );
+}
+
+#[tokio::test]
+async fn owner_bootstrap_live_process_and_reused_pid_refuse_retirement() {
+    for reused in [false, true] {
+        let fixture = BootstrapPublicationFixture::new("boot-live", false, reused).await;
+        let captured = fixture.capture().await;
+        let error = captured.revalidate().await.err().unwrap().to_string();
+        assert!(
+            error.contains(if reused { "reused" } else { "still present" }),
+            "{error}"
+        );
+        assert!(fixture.bind_replacement(Some(captured)).await.is_err());
+        fixture.assert_publication(&fixture.bytes);
+        assert!(
+            fixture
+                .parent
+                .socket_identity("daemon.sock")
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn owner_bootstrap_equal_bytes_do_not_authorize_replaced_receipt() {
+    let fixture = BootstrapPublicationFixture::new("boot-file", true, false).await;
+    let captured = fixture.capture().await;
+    let identity = fixture.parent.socket_identity("daemon.sock").unwrap();
+    std::fs::rename(
+        fixture
+            .harness
+            .socket_path
+            .with_file_name("daemon.sock.owner.json"),
+        fixture.harness.socket_path.with_file_name("old.owner.json"),
+    )
+    .unwrap();
+    fixture
+        .parent
+        .write_owned_file("daemon.sock.owner.json", &fixture.bytes, false)
+        .unwrap();
+    assert!(!captured.revalidate().await.unwrap());
+    assert!(fixture.bind_replacement(Some(captured)).await.is_err());
+    fixture.assert_publication(&fixture.bytes);
+    assert_eq!(
+        fixture.parent.socket_identity("daemon.sock").unwrap(),
+        identity
+    );
+}
+
+#[tokio::test]
+async fn owner_bootstrap_same_inode_content_change_is_preserved() {
+    let fixture = BootstrapPublicationFixture::new("boot-edit", true, false).await;
+    let captured = fixture.capture().await;
+    let mut edited = fixture.bytes.clone();
+    edited.push(b'\n');
+    std::fs::write(
+        fixture
+            .harness
+            .socket_path
+            .with_file_name("daemon.sock.owner.json"),
+        &edited,
+    )
+    .unwrap();
+    assert!(!captured.revalidate().await.unwrap());
+    assert!(fixture.bind_replacement(Some(captured)).await.is_err());
+    fixture.assert_publication(&edited);
+}
+
+#[tokio::test]
+async fn owner_bootstrap_replaced_socket_is_preserved() {
+    let fixture = BootstrapPublicationFixture::new("boot-sock", true, false).await;
+    let captured = fixture.capture().await;
+    std::fs::rename(
+        &fixture.harness.socket_path,
+        fixture.harness.socket_path.with_file_name("old.sock"),
+    )
+    .unwrap();
+    let replacement = std::os::unix::net::UnixListener::bind(&fixture.harness.socket_path).unwrap();
+    let identity = fixture.parent.socket_identity("daemon.sock").unwrap();
+    drop(replacement);
+    assert!(!captured.revalidate().await.unwrap());
+    assert!(fixture.bind_replacement(Some(captured)).await.is_err());
+    assert_eq!(
+        fixture.parent.socket_identity("daemon.sock").unwrap(),
+        identity
+    );
+    fixture.assert_publication(&fixture.bytes);
+}
+
+#[tokio::test]
+async fn owner_bootstrap_fresh_bind_cannot_retire_uncaptured_publication() {
+    let fixture = BootstrapPublicationFixture::new("boot-fresh", true, false).await;
+    let identity = fixture.parent.socket_identity("daemon.sock").unwrap();
+    assert!(fixture.bind_replacement(None).await.is_err());
+    fixture.assert_publication(&fixture.bytes);
+    assert_eq!(
+        fixture.parent.socket_identity("daemon.sock").unwrap(),
+        identity
+    );
+}
+
 struct Client {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
@@ -790,6 +1061,7 @@ async fn canonical_cli_scoped_resume_fork_keep_exact_owner_workers_and_refuse_wr
             acp_only: false,
         },
         Some(frontend),
+        None,
     )
     .await
     .unwrap();

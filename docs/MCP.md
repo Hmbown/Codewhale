@@ -486,9 +486,11 @@ something asks for it — a turn whose `allowed_tools`/`tools.always_load`
 selection covers its `mcp_<server>_*` names, a model call that resolves to
 one of its tools, or an explicit `/mcp retry <name>`. Servers marked
 `required` still connect eagerly at boot so their failure surfaces before the
-first turn. A configured-but-unstarted server shows as `configured`, never
-`connecting`; the connecting label only describes handshakes actually in
-flight.
+first turn. A configured-but-unstarted server shows as `not connected` in
+`/mcp`, never `connecting`; the connecting label only describes handshakes
+actually in flight. `codewhale mcp tools` and `codewhale mcp connect` run in
+their own process, so a server they just reached from the shell still reads
+`not connected` inside a running session until that session needs it.
 
 An MCP-focused `tool_search` is also explicit discovery intent: search a
 configured server name (for example `engram`), an exact `mcp_<server>_...`
@@ -499,6 +501,15 @@ force. General searches do not boot all optional servers. Only actual
 `tools/list` schemas enter the deferred catalogue; failed, disabled, or
 revoked servers do not acquire fabricated tools. Narrow a broad search by
 server name when more than eight configured servers match.
+
+So that a plain question can reach a server the user never names, each turn
+tells the model which configured servers it may load: one short runtime note
+in session history listing the enabled, allowed server names (at most 24) and
+asking it to `tool_search` a name before searching files or reporting that no
+tool exists. The note is appended to history, never to the cached system
+prompt, and is repeated only when the list changes or a compaction dropped
+it. It carries names only — no server is started and no schema is loaded
+until the model searches. Disabled or denied servers are never named.
 
 `codewhale mcp connect`, `validate`, and `tools` inspect their own process's
 pool. They do not attach transports to a running TUI or exec session. Use

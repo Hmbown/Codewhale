@@ -81,16 +81,38 @@ const SECRET_QUERY_KEYS: &[&str] = &[
 // State
 // ---------------------------------------------------------------------------
 
-/// Who a request speaks for. `Owner` is the master runtime token (or an
-/// Engine started with explicit insecure no-auth); `Client` is a device
-/// token minted through `POST /v1/auth/client-tokens`.
+/// Immutable authority minted into a device token; a label is never a grant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ClientTokenIntent {
+    #[default]
+    Watch,
+    Drive,
+}
+
+/// `Owner` is the master Runtime token; a device token retains its mint intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Principal {
     Owner,
-    Client { token_id: String, device_id: String },
+    Client {
+        token_id: String,
+        device_id: String,
+        intent: ClientTokenIntent,
+    },
 }
 
 impl Principal {
+    pub(super) fn can_drive(&self) -> bool {
+        matches!(
+            self,
+            Principal::Owner
+                | Principal::Client {
+                    intent: ClientTokenIntent::Drive,
+                    ..
+                }
+        )
+    }
+
     fn holder(&self) -> String {
         match self {
             Principal::Owner => "owner".to_string(),
@@ -109,6 +131,7 @@ impl Principal {
 struct ClientToken {
     id: String,
     device_id: String,
+    intent: ClientTokenIntent,
     label: Option<String>,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
@@ -258,6 +281,7 @@ impl ComputerState {
         (token.expires_at > now).then(|| Principal::Client {
             token_id: token.id.clone(),
             device_id: token.device_id.clone(),
+            intent: token.intent,
         })
     }
 
@@ -280,6 +304,7 @@ impl ComputerState {
         device_id: String,
         ttl_secs: u64,
         label: Option<String>,
+        intent: ClientTokenIntent,
     ) -> Result<(String, ClientTokenView), ApiErr> {
         let now = Utc::now();
         let mut tokens = self.inner.client_tokens.lock();
@@ -299,6 +324,7 @@ impl ComputerState {
         let token = ClientToken {
             id,
             device_id,
+            intent,
             label,
             created_at: now,
             expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
@@ -445,9 +471,12 @@ impl ComputerState {
     }
 
     fn holds_lease(&self, principal: &Principal) -> bool {
-        self.inner.lease.lock().as_ref().is_some_and(|lease| {
-            lease.principal == *principal && lease.last_activity.elapsed() < self.inner.lease_ttl
-        })
+        principal.can_drive()
+            && self.principal_is_live(principal)
+            && self.inner.lease.lock().as_ref().is_some_and(|lease| {
+                lease.principal == *principal
+                    && lease.last_activity.elapsed() < self.inner.lease_ttl
+            })
     }
 
     fn note_input(&self, principal: &Principal, count: u64) {
@@ -487,6 +516,7 @@ struct LeaseView {
 struct ClientTokenView {
     id: String,
     device_id: String,
+    intent: ClientTokenIntent,
     label: Option<String>,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
@@ -497,6 +527,7 @@ impl From<&ClientToken> for ClientTokenView {
         Self {
             id: t.id.clone(),
             device_id: t.device_id.clone(),
+            intent: t.intent,
             label: t.label.clone(),
             created_at: t.created_at,
             expires_at: t.expires_at,
@@ -1098,6 +1129,17 @@ fn require_principal(state: &RouteState, headers: &HeaderMap) -> Result<Principa
     principal_from_headers(state, headers).ok_or_else(ApiErr::unauthorized)
 }
 
+fn require_driver(state: &RouteState, headers: &HeaderMap) -> Result<Principal, ApiErr> {
+    let principal = require_principal(state, headers)?;
+    if !principal.can_drive() {
+        return Err(ApiErr::new(
+            StatusCode::FORBIDDEN,
+            "watch client tokens cannot control this Computer",
+        ));
+    }
+    Ok(principal)
+}
+
 /// Routes for the computer surface, merged into the Runtime API router
 /// outside the `/v1` auth layer (each handler authenticates itself).
 pub(super) fn router<S>(computer: ComputerState, runtime_token: Option<String>) -> Router<S>
@@ -1128,9 +1170,7 @@ async fn computer_status(State(state): State<RouteState>, headers: HeaderMap) ->
         Err(e) => return e.into_response(),
     };
     let lease = state.computer.sweep_lease();
-    let you_hold = lease
-        .as_ref()
-        .is_some_and(|l| l.holder == principal.holder());
+    let you_hold = state.computer.holds_lease(&principal);
     let (_, seq) = state.computer.events_since(u64::MAX);
     Json(json!({
         "display": {
@@ -1194,7 +1234,7 @@ async fn control_acquire(
     headers: HeaderMap,
     body: Option<Json<AcquireBody>>,
 ) -> Response {
-    let principal = match require_principal(&state, &headers) {
+    let principal = match require_driver(&state, &headers) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -1211,7 +1251,7 @@ async fn control_acquire(
 }
 
 async fn control_release(State(state): State<RouteState>, headers: HeaderMap) -> Response {
-    let principal = match require_principal(&state, &headers) {
+    let principal = match require_driver(&state, &headers) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -1312,10 +1352,13 @@ async fn connect_upstream(_computer: &ComputerState) -> Result<tokio::io::Duplex
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateClientTokenBody {
     device_id: String,
     ttl_seconds: Option<u64>,
     label: Option<String>,
+    #[serde(default)]
+    intent: ClientTokenIntent,
 }
 
 fn valid_device_id(id: &str) -> bool {
@@ -1370,13 +1413,17 @@ async fn create_client_token(
         .label
         .map(|l| l.chars().take(128).collect::<String>())
         .filter(|l| !l.trim().is_empty());
-    match state.computer.mint_client_token(device_id, ttl, label) {
+    match state
+        .computer
+        .mint_client_token(device_id, ttl, label, body.intent)
+    {
         Ok((token, view)) => (
             StatusCode::CREATED,
             Json(json!({
                 "token": token,
                 "id": view.id,
                 "device_id": view.device_id,
+                "intent": view.intent,
                 "label": view.label,
                 "created_at": view.created_at,
                 "expires_at": view.expires_at,

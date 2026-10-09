@@ -19,6 +19,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use wait_timeout::ChildExt as _;
+
 use crate::dependencies::ExternalTool;
 
 use super::paths::{ensure_snapshot_dir, snapshot_git_dir};
@@ -94,6 +96,26 @@ pub struct SnapshotPathChange {
     pub added: Option<u64>,
     pub removed: Option<u64>,
 }
+
+/// What the work tree holds now that a snapshot did not
+/// ([`SnapshotRepo::work_tree_changes_since`]), as `git diff` writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkTreeChanges {
+    /// One changed path per line, as `git diff --name-only` writes them.
+    pub names: String,
+    /// `git diff --stat`.
+    pub stat: String,
+    /// The unified patch, cut at the caller's bound on a char boundary; empty
+    /// when more than [`WORK_TREE_PATCH_MAX_LINES`] lines changed.
+    pub patch: String,
+    /// Whether the patch was cut or left out.
+    pub patch_truncated: bool,
+}
+
+/// Changed lines past which [`SnapshotRepo::work_tree_changes_since`] does
+/// not read the patch at all: git's whole output is buffered before it can be
+/// cut, so a generated multi-gigabyte file must not be diffed into memory.
+pub const WORK_TREE_PATCH_MAX_LINES: u64 = 200_000;
 
 /// What a file-scoped restore did to one path, relative to the working tree
 /// it was applied to.
@@ -476,13 +498,11 @@ impl SnapshotRepo {
         // and stores metadata in `.git`. We then continue to use
         // explicit `--git-dir` / `--work-tree` flags for every other
         // command so behaviour is invariant of cwd.
-        let init = crate::dependencies::Git::command()
-            .ok_or_else(|| io_other("git not found on PATH"))?
-            .arg("init")
-            .arg("--quiet")
-            .arg(parent)
-            .output()
-            .map_err(|e| io_other(format!("failed to spawn git init: {e}")))?;
+        let mut git =
+            crate::dependencies::Git::command().ok_or_else(|| io_other("git not found on PATH"))?;
+        let init = git.arg("init").arg("--quiet").arg(parent);
+        let init = run_bounded_git(init, "init")
+            .map_err(|e| io_other(format!("failed to run git init: {e}")))?;
         if !init.status.success() {
             return Err(io_other(format!(
                 "git init failed: {}",
@@ -1420,6 +1440,96 @@ impl SnapshotRepo {
         git_diff_matches(diff)
     }
 
+    /// Everything in the work tree that differs from snapshot `from`: files
+    /// changed, deleted, and created since, including ones no snapshot has
+    /// recorded yet. New ignored paths stay out, as they stay out of a
+    /// snapshot; a path `from` holds is compared even if it is ignored now,
+    /// as the next snapshot would still record it.
+    ///
+    /// Read-only for the user and for the snapshot history: the work tree is
+    /// compared through a throwaway index, seeded with `from`'s paths and
+    /// then given every other path as "intent to add" (name and stat data, no
+    /// content), so the side repo's index is not written, no file content is
+    /// stored, and no snapshot is taken. (Git stores the empty blob those
+    /// entries name.) Renames are not detected, matching
+    /// [`Self::patch_between`]. The patch is cut at `max_patch_bytes`, and
+    /// left out past [`WORK_TREE_PATCH_MAX_LINES`] changed lines.
+    pub fn work_tree_changes_since(
+        &self,
+        from: &SnapshotId,
+        max_patch_bytes: usize,
+    ) -> io::Result<WorkTreeChanges> {
+        let scratch = tempfile::tempdir()?;
+        let index = scratch.path().join("index");
+        let run = |args: &[&str]| -> io::Result<String> {
+            let subcommand = args.first().copied().unwrap_or("git");
+            let mut cmd = crate::dependencies::Git::command()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?;
+            cmd.env("GIT_INDEX_FILE", &index)
+                .arg("--git-dir")
+                .arg(&self.git_dir)
+                .arg("--work-tree")
+                .arg(&self.work_tree)
+                .args(args);
+            let output = run_bounded_git(&mut cmd, subcommand)?;
+            if !output.status.success() {
+                return Err(io_other(format!(
+                    "git {subcommand} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        // Seed with `from` first: on an empty index a file the snapshot holds
+        // but a later `.gitignore` covers would be skipped by `add` and read
+        // as deleted while it is still on disk.
+        run(&["read-tree", from.as_str()])?;
+        run(&["add", "--intent-to-add", "--", ":/"])?;
+        let diff = |format: &str| {
+            run(&[
+                "diff",
+                "--no-renames",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                format,
+                "--end-of-options",
+                from.as_str(),
+                "--",
+                ":/",
+            ])
+        };
+        // `--numstat`: `added\tremoved\tpath` per line, `-` for a binary side.
+        let numstat = diff("--numstat")?;
+        let mut names = String::new();
+        let mut changed_lines = 0_u64;
+        for record in numstat.lines() {
+            let mut fields = record.splitn(3, '\t');
+            let (Some(added), Some(removed), Some(path)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            for count in [added, removed] {
+                changed_lines = changed_lines.saturating_add(count.parse().unwrap_or(0));
+            }
+            names.push_str(path);
+            names.push('\n');
+        }
+        let stat = diff("--stat")?;
+        let (patch, patch_truncated) = if changed_lines > WORK_TREE_PATCH_MAX_LINES {
+            (String::new(), true)
+        } else {
+            truncate_at_char_boundary(&diff("--unified=3")?, max_patch_bytes)
+        };
+        Ok(WorkTreeChanges {
+            names,
+            stat,
+            patch,
+            patch_truncated,
+        })
+    }
+
     /// Paths that differ between snapshots `from` and `to`, in git's order,
     /// one [`SnapshotPathChange`] each: its `status` is git's `A`/`M`/`D`/`T`
     /// letter and its line counts are `None` for a binary file. Paths come
@@ -1488,6 +1598,88 @@ impl SnapshotRepo {
             });
         }
         Ok((changes, truncated))
+    }
+
+    /// Whether a tree is still in this repo.
+    ///
+    /// The side repo keeps only the newest snapshots, while the receipt that
+    /// names one is durable in the turn record: a restore point can outlive
+    /// the object it names. A caller about to diff two trees asks this first,
+    /// so "these restore points are gone" is answered with the pruning it is
+    /// rather than as a git failure over an object nobody can bring back.
+    /// IO and repository failures remain errors rather than evidence of pruning.
+    pub fn has_tree(&self, id: &SnapshotId) -> io::Result<bool> {
+        let spec = format!("{}^{{tree}}", id.as_str());
+        let output = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &spec,
+            ],
+        )?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(io_other(format!(
+                "git tree lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
+    }
+
+    /// The unified diff of one path between snapshots `from` and `to`, as
+    /// `git diff` writes it — the patch behind the [`SnapshotPathChange`]
+    /// [`Self::path_changes_between`] counts for the same two trees.
+    ///
+    /// Both trees are read from the side repo: neither the work tree nor the
+    /// index is touched. The path is taken literally, so a name holding glob
+    /// characters is one path rather than a pattern. Renames are not
+    /// detected, matching `path_changes_between`, so a moved file reads as a
+    /// deletion plus an addition.
+    ///
+    /// The text is cut at `max_bytes` on a char boundary; the flag says
+    /// whether anything was dropped. A binary path yields git's own binary
+    /// notice, and a path that does not differ yields an empty string: the
+    /// caller reports what git wrote rather than inventing a patch.
+    pub fn patch_between(
+        &self,
+        from: &SnapshotId,
+        to: &SnapshotId,
+        path: &str,
+        max_bytes: usize,
+    ) -> io::Result<(String, bool)> {
+        let output = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &[
+                "--literal-pathspecs",
+                "diff",
+                "--no-renames",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=3",
+                "--end-of-options",
+                from.as_str(),
+                to.as_str(),
+                "--",
+                path,
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(io_other(format!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(truncate_at_char_boundary(
+            &String::from_utf8_lossy(&output.stdout),
+            max_bytes,
+        ))
     }
 
     fn tree_paths(&self, treeish: &str) -> io::Result<HashSet<PathBuf>> {
@@ -1863,16 +2055,17 @@ impl SnapshotRepo {
     /// age instead of stamping "now".
     fn commit_tree_preserving_date(&self, args: &[&str], timestamp: i64) -> io::Result<String> {
         let date = format!("{timestamp} +0000");
-        let out = crate::dependencies::Git::command()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?
+        let mut command = crate::dependencies::Git::command()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?;
+        command
             .arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
             .arg(&self.work_tree)
             .env("GIT_AUTHOR_DATE", &date)
             .env("GIT_COMMITTER_DATE", &date)
-            .args(args)
-            .output()?;
+            .args(args);
+        let out = run_bounded_git(&mut command, args.first().copied().unwrap_or("git"))?;
         if !out.status.success() {
             return Err(io_other(format!(
                 "commit-tree failed: {}",
@@ -2188,15 +2381,157 @@ fn cleanup_stale_pack_temps_in(
     Ok(removed)
 }
 
+// Generous budget: `git add -A` on a large workspace is legitimately slow,
+// but a wedged git (stalled NFS/FUSE, hung hook) must not block the turn
+// pipeline forever — every caller treats a snapshot error as
+// snapshot-disabled-with-warning and proceeds without the git data. Tests
+// use a tighter budget so a regression that deadlocks a child on its own
+// output fails in seconds instead of hanging for the full window.
+#[cfg(not(test))]
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Grace granted to the pipe readers after git has exited. A clean git
+/// closes its own write ends, so EOF is already waiting; only a grandchild
+/// that inherited the pipes (a post-checkout hook, a `git gc` pack worker)
+/// can hold them past exit, and it must not hold the turn pipeline either.
+const GIT_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Run a pre-configured git command under [`GIT_COMMAND_TIMEOUT`] with both
+/// pipes drained while the child runs (the same concurrent drain
+/// `Command::output` performs). Every git invocation in this module goes
+/// through here, so a wedged git — stalled NFS/FUSE, hung hook — degrades
+/// the snapshot with an error instead of hanging the turn pipeline.
+/// (`delta.rs`'s read-view git commands are not routed here yet; that is a
+/// known follow-up.)
+///
+/// The timeout path kills the child and reaps it on a detached thread: on a
+/// hard-wedged mount git can sit in uninterruptible kernel I/O where even
+/// SIGKILL is deferred, and a blocking `wait()` would hang the pipeline
+/// exactly like the wedged git would. Killing without git's own cleanup can
+/// leave a fresh `index.lock` behind; later snapshots then fail fast on the
+/// lock with an error naming it.
+fn run_bounded_git(cmd: &mut std::process::Command, subcommand: &str) -> io::Result<Output> {
+    run_bounded_git_with_timeout(cmd, subcommand, GIT_COMMAND_TIMEOUT)
+}
+
+fn run_bounded_git_with_timeout(
+    cmd: &mut std::process::Command,
+    subcommand: &str,
+    timeout: Duration,
+) -> io::Result<Output> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // Drain both pipes while waiting: the restore path's `ls-tree -r` and
+    // the diff commands emit output that grows with workspace size, and a
+    // child blocked on a full pipe buffer never exits — it would turn every
+    // such call into a guaranteed timeout. Readers stream into shared
+    // buffers, and the completion channel lets the collect below bound how
+    // long a grandchild-held pipe may hold the call after git has exited.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let buf = std::sync::Arc::clone(&stdout_buf);
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(mut reader) = stdout_pipe {
+                read_pipe_to_buffer(&mut reader, &buf);
+            }
+            let _ = done_tx.send(());
+        });
+    }
+    {
+        let buf = std::sync::Arc::clone(&stderr_buf);
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(mut reader) = stderr_pipe {
+                read_pipe_to_buffer(&mut reader, &buf);
+            }
+            let _ = done_tx.send(());
+        });
+    }
+    drop(done_tx);
+
+    let Some(status) = child.wait_timeout(timeout)? else {
+        let _ = child.kill();
+        // Reap off the pipeline thread (see the doc comment): the kernel may
+        // not deliver the kill until an uninterruptible syscall returns.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("git {subcommand} timed out after {}s", timeout.as_secs()),
+        ));
+    };
+    // Wait for the readers up to the grace, then return what was captured. A
+    // clean git already closed its write ends, so both readers deliver
+    // immediately; the grace only covers a pipe still held open by an
+    // inherited copy (a daemonizing hook). On expiry the captured output is
+    // returned with a note on stderr instead of silently truncating; the
+    // reader itself ends whenever whatever holds the pipe exits, holding
+    // only a pipe read — never the turn pipeline.
+    let mut partial = false;
+    let mut drained = 0;
+    while drained < 2 {
+        match done_rx.recv_timeout(GIT_PIPE_DRAIN_GRACE) {
+            Ok(()) => drained += 1,
+            Err(_) => {
+                partial = true;
+                break;
+            }
+        }
+    }
+    let stdout = stdout_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
+    let mut stderr = stderr_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
+    if partial {
+        if !stderr.is_empty() && stderr.last() != Some(&b'\n') {
+            stderr.push(b'\n');
+        }
+        stderr.extend_from_slice(
+            b"[codewhale] git output pipes did not close after git exited \
+              (kept open by a hook or subprocess?); captured output may be partial\n",
+        );
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read a child's pipe to end into a shared buffer, tolerating interruption.
+fn read_pipe_to_buffer(reader: &mut impl io::Read, buf: &std::sync::Mutex<Vec<u8>>) {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => {
+                if let Ok(mut buf) = buf.lock() {
+                    buf.extend_from_slice(&chunk[..read]);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+}
+
 fn run_git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> io::Result<Output> {
-    crate::dependencies::Git::command()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?
-        .arg("--git-dir")
+    let mut cmd = crate::dependencies::Git::command()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?;
+    cmd.arg("--git-dir")
         .arg(git_dir)
         .arg("--work-tree")
         .arg(work_tree)
-        .args(args)
-        .output()
+        .args(args);
+    run_bounded_git(&mut cmd, args.first().copied().unwrap_or("git"))
 }
 
 fn git_diff_matches(output: Output) -> io::Result<bool> {
@@ -2212,6 +2547,19 @@ fn git_diff_matches(output: Output) -> io::Result<bool> {
 
 fn io_other(msg: impl Into<String>) -> io::Error {
     io::Error::other(msg.into())
+}
+
+/// `text` whole, or the longest prefix that fits in `max_bytes` and ends on a
+/// char boundary; the flag says which of the two the caller got.
+pub(crate) fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
 }
 
 /// Walk `workspace` and accumulate file sizes, returning `Ok(total)`
@@ -4536,5 +4884,256 @@ mod tests {
         assert_eq!(list[0].session_id.as_deref(), Some("sess-a"));
         assert_eq!(list[1].session_id, None);
         assert_eq!(list[1].label, "pre-turn:1");
+    }
+
+    /// The patch a per-call change record shows comes from the side repo's
+    /// own two trees, names one path, and names it literally: a bracketed
+    /// filename must not drag its glob sibling into the diff.
+    #[test]
+    fn patch_between_diffs_one_literal_path_between_two_snapshots() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha\n").unwrap();
+        std::fs::write(repo.work_tree().join("b.txt"), b"keep\n").unwrap();
+        std::fs::write(repo.work_tree().join("file[12].txt"), b"literal-before\n").unwrap();
+        std::fs::write(repo.work_tree().join("file1.txt"), b"sibling-before\n").unwrap();
+        let before = repo.snapshot("tool:call-1").expect("snapshot");
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha\nbeta\n").unwrap();
+        std::fs::write(repo.work_tree().join("b.txt"), b"changed\n").unwrap();
+        std::fs::write(repo.work_tree().join("file[12].txt"), b"literal-after\n").unwrap();
+        let after = repo.snapshot("post-tool:call-1").expect("snapshot");
+
+        let (patch, truncated) = repo
+            .patch_between(&before, &after, "a.txt", 1 << 20)
+            .expect("patch");
+        assert!(!truncated);
+        assert!(patch.contains("+beta"), "{patch}");
+        assert!(
+            !patch.contains("b.txt"),
+            "only the named path belongs in this patch: {patch}"
+        );
+
+        let (literal, _) = repo
+            .patch_between(&before, &after, "file[12].txt", 1 << 20)
+            .expect("patch");
+        assert!(literal.contains("+literal-after"), "{literal}");
+        assert!(
+            !literal.contains("file1.txt"),
+            "a bracketed filename must not diff its glob sibling: {literal}"
+        );
+
+        // A path that does not differ writes nothing rather than an empty
+        // hunk the caller would have to interpret.
+        let unchanged = repo
+            .patch_between(&before, &before, "a.txt", 1 << 20)
+            .expect("patch");
+        assert!(unchanged.0.is_empty(), "{unchanged:?}");
+        assert!(!unchanged.1);
+    }
+
+    /// The work tree is compared as it is now, not as the newest snapshot
+    /// left it: a file created since, which no snapshot or index holds, is in
+    /// the diff with its content, and reading it moves neither the repo's
+    /// HEAD nor its index.
+    #[test]
+    fn work_tree_changes_since_sees_edits_deletions_and_unrecorded_new_files() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let ws = repo.work_tree().to_path_buf();
+        std::fs::write(ws.join(".gitignore"), b"ignored/\n").unwrap();
+        std::fs::write(ws.join("keep.txt"), b"same\n").unwrap();
+        std::fs::write(ws.join("edit.txt"), b"one\ntwo\n").unwrap();
+        std::fs::write(ws.join("gone.txt"), b"bye\n").unwrap();
+        std::fs::write(ws.join("late.txt"), b"still here\n").unwrap();
+        let before = repo.snapshot("pre-turn:1").expect("snapshot");
+        let head = git_output(&repo, &["rev-parse", "HEAD"]);
+        let index = git_output(&repo, &["ls-files", "--stage"]);
+
+        std::fs::write(ws.join("edit.txt"), b"one\nTWO\n").unwrap();
+        std::fs::remove_file(ws.join("gone.txt")).unwrap();
+        std::fs::write(ws.join("new file.txt"), b"fresh\n").unwrap();
+        std::fs::create_dir_all(ws.join("ignored")).unwrap();
+        std::fs::write(ws.join("ignored/skip.txt"), b"skip\n").unwrap();
+        // Ignored only after the snapshot recorded it, and untouched: it is
+        // not a deletion.
+        std::fs::write(ws.join(".gitignore"), b"ignored/\nlate.txt\n").unwrap();
+
+        let changes = repo
+            .work_tree_changes_since(&before, 1 << 20)
+            .expect("changes");
+        let mut names: Vec<&str> = changes.names.lines().collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [".gitignore", "edit.txt", "gone.txt", "new file.txt"]
+        );
+        assert!(!changes.patch.contains("still here"), "{}", changes.patch);
+        assert!(changes.stat.contains("edit.txt"), "{}", changes.stat);
+        assert!(!changes.patch_truncated);
+        for expected in ["-two", "+TWO", "-bye", "+fresh"] {
+            assert!(changes.patch.contains(expected), "{}", changes.patch);
+        }
+        assert!(!changes.patch.contains("skip"), "{}", changes.patch);
+        assert_eq!(git_output(&repo, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git_output(&repo, &["ls-files", "--stage"]), index);
+
+        let cut = repo.work_tree_changes_since(&before, 40).expect("changes");
+        assert!(cut.patch_truncated);
+        assert!(cut.patch.len() <= 40);
+        assert_eq!(cut.names, changes.names);
+
+        // Back at the snapshot: nothing differs, and nothing is invented.
+        std::fs::write(ws.join(".gitignore"), b"ignored/\n").unwrap();
+        std::fs::write(ws.join("edit.txt"), b"one\ntwo\n").unwrap();
+        std::fs::write(ws.join("gone.txt"), b"bye\n").unwrap();
+        std::fs::remove_file(ws.join("new file.txt")).unwrap();
+        let none = repo
+            .work_tree_changes_since(&before, 1 << 20)
+            .expect("changes");
+        assert_eq!(none.names, "");
+        assert_eq!(none.patch, "");
+    }
+
+    /// A tree the repo no longer holds — the receipt outlived the object —
+    /// is reported as absent rather than as a diff failure, so a caller can
+    /// tell pruning from a broken repo without reading git's stderr.
+    #[test]
+    fn has_tree_separates_a_pruned_object_from_a_present_one() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha").unwrap();
+        let taken = repo.take_snapshot("tool:call-1", None).expect("snapshot");
+
+        assert!(
+            repo.has_tree(&taken.tree).expect("tree lookup"),
+            "the snapshot's own tree resolves"
+        );
+        // Valid hex, never written: exactly what a pruned receipt names.
+        let pruned = SnapshotId::parse(&"deadbeef".repeat(5)).unwrap();
+        assert!(!repo.has_tree(&pruned).expect("missing tree lookup"));
+    }
+
+    #[test]
+    fn has_tree_reports_broken_repository_metadata_as_an_error() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha").unwrap();
+        let taken = repo.take_snapshot("tool:call-1", None).expect("snapshot");
+        std::fs::write(
+            repo.git_dir().join("HEAD"),
+            b"invalid snapshot repository metadata\n",
+        )
+        .unwrap();
+        let error = repo
+            .has_tree(&taken.tree)
+            .expect_err("broken repo is not pruning");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    /// A patch larger than the caller's bound is cut on a char boundary and
+    /// reported as cut, so a client never receives half a character.
+    #[test]
+    fn patch_between_cuts_an_over_long_patch_on_a_char_boundary() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("d.txt"), "start\n").unwrap();
+        let before = repo.snapshot("tool:call-1").expect("snapshot");
+        let long = format!("{}\n", "汉字宽字符行".repeat(400));
+        std::fs::write(repo.work_tree().join("d.txt"), long).unwrap();
+        let after = repo.snapshot("post-tool:call-1").expect("snapshot");
+
+        let (patch, truncated) = repo
+            .patch_between(&before, &after, "d.txt", 64)
+            .expect("patch");
+        assert!(truncated, "a 64-byte bound must cut this patch");
+        assert!(patch.len() <= 64, "{} bytes kept", patch.len());
+        assert!(patch.is_char_boundary(patch.len()));
+
+        let (whole, not_truncated) = repo
+            .patch_between(&before, &after, "d.txt", 1 << 20)
+            .expect("patch");
+        assert!(!not_truncated);
+        assert!(whole.contains("汉字宽字符行"), "{whole}");
+    }
+
+    #[test]
+    fn run_git_drains_output_larger_than_the_pipe_buffer() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        // ~5000 paths is well past the 64 KiB OS pipe buffer: output of this
+        // size is only reachable when the pipes are drained while the child
+        // runs. A bounded read that only starts after the child exits would
+        // deadlock the child on its own output and die at the command
+        // timeout instead of returning the tree listing.
+        for i in 0..5000 {
+            std::fs::write(repo.work_tree().join(format!("file_{i:05}.txt")), b"x").unwrap();
+        }
+        let id = repo.snapshot("large-output").expect("snapshot");
+        let paths = repo
+            .tree_paths(id.as_str())
+            .expect("tree_paths must drain output instead of timing out");
+        assert!(
+            paths.len() >= 5000,
+            "expected every file in the tree listing, got {}",
+            paths.len()
+        );
+    }
+}
+
+/// The bounded-git tests drive the core with real children, so they need a
+/// POSIX shell; the timeout pin also depends on wall-clock behavior.
+#[cfg(all(test, unix))]
+mod bounded_git_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_git_times_out_a_wedged_child_and_reports_timed_out() {
+        // A child that never exits stands in for a wedged git (stalled
+        // mount, hung hook): the call must come back with a TimedOut error
+        // promptly instead of blocking the turn pipeline forever.
+        let started = std::time::Instant::now();
+        let mut wedged = std::process::Command::new("sh");
+        wedged.arg("-c").arg("sleep 30");
+        let err = run_bounded_git_with_timeout(&mut wedged, "sleep", Duration::from_millis(250))
+            .expect_err("a wedged child must hit the bound");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("timed out after"),
+            "the error must report the bound; got {err}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the bound must be enforced promptly; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_git_returns_promptly_when_a_grandchild_holds_the_pipes() {
+        // The direct child (sh) exits after the echo; the backgrounded
+        // sleep inherits both pipes and holds them for 30s. The call must
+        // still return promptly with the output captured before the grace,
+        // annotated on stderr — not wait out the grandchild.
+        let started = std::time::Instant::now();
+        let mut sh = std::process::Command::new("sh");
+        sh.arg("-c").arg("echo bounded-git-grandchild; sleep 30 &");
+        let output = run_bounded_git(&mut sh, "sh").expect("sh must succeed");
+        let elapsed = started.elapsed();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("bounded-git-grandchild"),
+            "output captured before the grace must survive: {:?}",
+            output.stdout
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("git output pipes did not close after git exited"),
+            "the partial-output note must explain the early return: {:?}",
+            output.stderr
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "a pipe-holding grandchild must not hold the call past the grace; took {elapsed:?}"
+        );
     }
 }

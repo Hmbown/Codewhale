@@ -200,7 +200,7 @@ export function validateMessage(
             ? 'a tool registration has no `spec.argument_hint`'
             : kind === 'command' && spec.input_schema != null
               ? 'a command registration has no `spec.input_schema`'
-              : (kind === 'hook' || kind === 'prompt_section' || kind === 'prompt_template' || kind === 'skill_root' || kind === 'shell_hook' || kind === 'mcp_server') && (spec.input_schema != null || spec.argument_hint != null)
+              : (kind === 'hook' || kind === 'prompt_section' || kind === 'prompt_template' || kind === 'skill_root' || kind === 'avatar_pack' || kind === 'shell_hook' || kind === 'mcp_server') && (spec.input_schema != null || spec.argument_hint != null)
                 ? 'a hook, prompt or skill root registration has no input schema or argument hint'
               : undefined
       if (reason !== undefined) throw new ProtocolError(`${method}: ${reason}`)

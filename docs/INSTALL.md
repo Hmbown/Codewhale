@@ -1,6 +1,6 @@
 # Installing Codewhale
 
-> 阅读简体中文版：[zh_hans/INSTALL.md](zh_hans/INSTALL.md) (not yet updated for this revision)
+> 阅读简体中文版：[zh_hans/INSTALL.md](zh_hans/INSTALL.md)
 
 Codewhale is an open-source coding agent that runs in your terminal. You give
 it a task ("fix the failing test", "add a CLI flag"). It reads your repository,
@@ -11,9 +11,9 @@ works with many model providers. **DeepSeek** is the default.
 
 The command is `codewhale`. `codew` is a shorter alias for the same program.
 
-This guide was written by installing **v0.10.0** (released 2026-09-22) on a
-fresh **Ubuntu 24.04 x86_64** machine, on every path described here. Every
-command shown was run and its output checked (see the [install receipts](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)). Steps that
+The installation paths were first checked with **v0.10.0** (released 2026-09-22) on a
+fresh **Ubuntu 24.04 x86_64** machine. The dated
+[install receipts](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md) record the commands and output checked at that time. Steps that
 could not be run on that machine are marked **(untested on this VM: reason)**.
 macOS, Windows and Android are out of scope, apart from a few notes. A second
 pass re-ran the installer, manual-download, archive and npm paths, the no-key
@@ -23,9 +23,53 @@ there.
 
 Install commands that use `latest` resolve to the latest **published** GitHub
 Release or package. Between releases, `main` may already describe the next
-version (for example a v0.10.1 source candidate before its tag). A
-candidate isn't installable until its tag, checksums and release assets
-exist.
+version (for example a v0.10.2 source candidate before its tag). A
+prebuilt candidate is available through the official installer only after its
+tag, checksums and release assets exist. Contributors can build `main` now.
+
+## One account for your provider keys
+
+[Register](https://app.codewhale.net/register) or [sign in](https://app.codewhale.net/login)
+to keep your model providers' API keys in one place. Add, replace or remove
+keys in your account's [Providers settings](https://app.codewhale.net/providers),
+or use the terminal commands below. On another device, sign in and select the
+Codewhale model route to use the same account keys without pasting them again.
+
+```bash
+codewhale login
+codewhale account keys set deepseek  # asks for the key without echoing it
+codewhale account keys list         # shows status, never the key itself
+codewhale --provider codewhale      # use your account's model route
+```
+
+The account setup here describes the 0.10.1 source candidate. Signing in does
+not upload existing local keys. To copy one deliberately, use
+`codewhale account keys set deepseek --from-local`. Account keys stay on the
+service; they are used for account-routed requests, not downloaded into each
+device's local key store. You can keep using local keys or a local model
+without an account. See [account key settings](CONFIGURATION.md#account-provider-keys)
+for updating keys and switching between these options.
+
+## Test and contribute to current source
+
+`latest` selects the latest published release. To test unreleased repairs,
+build canonical GitHub `main`, or CNB `main` after verifying its commit matches.
+The source version number alone does not establish a published package.
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/CodeWhale.git
+cd CodeWhale
+cargo build --release --locked -p codewhale-cli
+target/release/codewhale --version
+```
+
+See the Cargo section for build prerequisites; use the repository's stable Rust
+selection (declared minimum 1.89). Windows uses `target/release/codewhale.exe`
+and needs MSVC. A development build is separate from a signed release package.
+For mainland-China downloads and source validation, see [CNB mirror](CNB_MIRROR.md).
+The [Tencent Lighthouse bootstrap](../scripts/tencent-lighthouse/README.md) is
+bilingual. An npm registry mirror serves the wrapper; native binary downloads
+still need an available release asset source.
 
 ---
 
@@ -650,9 +694,10 @@ codewhale doctor --probe-api
 #   · Testing connection...  ✓ API connection successful
 ```
 
-Use `auth status`. Plain `codewhale doctor` does **not** tell you: it prints
-`deepseek: env_source=not inspected` even when the key is set, and it exits 0
-even when no key is found.
+Plain `codewhale doctor` names an environment key it can see
+(`deepseek: env_source=set via DEEPSEEK_API_KEY (value not shown; not checked offline)`)
+but does not read the secret store or check the key; `--probe-api` does both.
+Doctor exits 0 even when no key is found, so scripts should use `auth status`.
 
 ### Remove a stored key
 

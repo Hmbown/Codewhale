@@ -78,8 +78,11 @@ export async function startHost({ admit, env, ownGroup = false, tier = 'plugin',
     nextHandle: 1,
     exit: new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal }))),
     send(message) {
+      // Shutdown abandons queued fake-core replies; never write them to stdin
+      // after `stop()` has ended the stream (Windows reports this as an error).
+      if (stopping || child.exitCode !== null || child.signalCode !== null || child.stdin.destroyed || child.stdin.writableEnded) return false
       validateMessage(message, 'core_to_host', tier ?? 'plugin')
-      child.stdin.write(encodeFrame(message))
+      return child.stdin.write(encodeFrame(message))
     },
     request(method, params) {
       const id = host.nextId++

@@ -1463,23 +1463,29 @@ async fn apply_conversation_undo(
     Ok(())
 }
 
-pub(crate) async fn apply_command_result(
-    terminal: &mut AppTerminal,
-    app: &mut App,
-    engine_handle: &mut EngineHandle,
-    task_manager: &SharedTaskManager,
-    config: &mut Config,
+// The event loop awaits this dispatcher at several call sites. In debug
+// builds, embedding its entire state machine at each site gives the caller
+// separate large stack slots even though only one action runs at a time.
+// Construct it here so callers carry one pointer, as modal dispatch already does.
+pub(crate) fn apply_command_result<'a>(
+    terminal: &'a mut AppTerminal,
+    app: &'a mut App,
+    engine_handle: &'a mut EngineHandle,
+    task_manager: &'a SharedTaskManager,
+    config: &'a mut Config,
     result: commands::CommandResult,
-) -> Result<bool> {
-    let outcome =
-        apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
-            .await;
-    // A save the command made may have moved legacy top-level `base_url` /
-    // `api_key` into their provider tables (#6394); say so once.
-    for notice in codewhale_config::legacy_root::take_notices() {
-        app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
-    }
-    outcome
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + 'a>> {
+    Box::pin(async move {
+        let outcome =
+            apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
+                .await;
+        // A save the command made may have moved legacy top-level `base_url` /
+        // `api_key` into their provider tables (#6394); say so once.
+        for notice in codewhale_config::legacy_root::take_notices() {
+            app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
+        }
+        outcome
+    })
 }
 
 async fn apply_command_result_inner(
@@ -1756,6 +1762,11 @@ async fn apply_command_result_inner(
                             StatusToastLevel::Info,
                             None,
                         );
+                        // The toast fades and the footer does not show trust
+                        // mode: leave a line that says what changed.
+                        app.add_message(HistoryCell::System {
+                            content: crate::commands::trust_change_note(trusted, save),
+                        });
                     }
                     Err(error) => app.push_status_toast(
                         tr(app.ui_locale, MessageId::AutomationEditorSaveFailed)
@@ -1976,6 +1987,10 @@ async fn apply_command_result_inner(
             }
             AppAction::OpenTextPager { title, content } => {
                 open_text_pager(app, title, content);
+            }
+            AppAction::OpenDiffPager { title, diff } => {
+                open_diff_pager(app, title, &diff);
+                app.needs_redraw = true;
             }
             AppAction::OpenCommandReview {
                 title,
@@ -2401,7 +2416,7 @@ async fn apply_command_result_inner(
             AppAction::OpenWorktreeManager => {
                 if app.view_stack.top_kind() != Some(ModalKind::WorktreeManager) {
                     // Non-blocking: git_status caches; manager never shells on paint.
-                    crate::tui::git_status::refresh_if_stale(&app.workspace);
+                    crate::git_status::refresh_if_stale(&app.workspace);
                     app.view_stack
                         .push(crate::tui::worktree_manager::WorktreeManagerView::new(
                             app.workspace.clone(),
@@ -2459,12 +2474,54 @@ async fn apply_command_result_inner(
                 let _switched =
                     run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
             }
+            AppAction::StartClaudeLogin => {
+                let _ = run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
+            }
+            AppAction::StartClaudeRevoke => {
+                let path = app.config_path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::oauth::revoke_owned_login(
+                        crate::oauth::OAuthProvider::Claude,
+                        path.as_deref(),
+                        None,
+                    )
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("Claude sign-out worker failed: {error}"))
+                .and_then(|result| result);
+                if result.is_ok() {
+                    let identity = config
+                        .builtin_provider_identity(ProviderKind::Anthropic)
+                        .map_err(anyhow::Error::msg)?;
+                    let entry = config.provider_config_for_mut(&identity)?;
+                    entry.oauth_credential_generation = None;
+                }
+                let (message, level) = match result {
+                    Ok(()) => (
+                        "Removed Codewhale's saved Claude sign-in.".to_string(),
+                        StatusToastLevel::Info,
+                    ),
+                    Err(error) => (
+                        format!("Claude sign-out failed: {error}"),
+                        StatusToastLevel::Error,
+                    ),
+                };
+                app.push_status_toast(message, level, Some(8_000));
+            }
             AppAction::StartChatgptPkceLogin => {
                 let _switched =
                     run_chatgpt_pkce_login_from_tui(terminal, app, engine_handle, config).await?;
             }
             AppAction::StartChatgptRevoke => {
                 run_chatgpt_revoke_from_tui(app, config).await;
+            }
+            AppAction::StartOrcarouterPkceLogin => {
+                let _switched =
+                    run_orcarouter_pkce_login_from_tui(terminal, app, engine_handle, config)
+                        .await?;
+            }
+            AppAction::StartOrcarouterRevoke => {
+                run_orcarouter_revoke_from_tui(app, config).await;
             }
             AppAction::SetScreenMode(mode) => {
                 // The terminal transition is the only fallible part; a failed
@@ -2851,7 +2908,7 @@ async fn apply_command_result_inner(
                             new_config,
                             &validated_route,
                         );
-                        crate::initialize_cloud_facts(config);
+                        crate::config::initialize_cloud_facts(config);
                         // Rebuild the engine with the new config so API key/model/base URL take effect.
                         let _ = engine_handle.send(Op::Shutdown).await;
                         let engine_config = build_engine_config(app, config);
@@ -2869,18 +2926,23 @@ async fn apply_command_result_inner(
                                 })
                                 .await;
                         }
-                        app.add_message(HistoryCell::System {
-                            content: format!(
-                                "Switched to profile '{profile}'. Model: {new_model}, Provider: {}",
-                                app.provider_identity_for_persistence()
-                            ),
-                        });
-                        app.status_message = Some(format!("Profile: {profile}"));
+                        let provider = app.provider_identity_for_persistence();
+                        let content = app
+                            .tr(MessageId::ProfileSwitched)
+                            .replace("{model}", &new_model)
+                            .replace("{provider}", provider)
+                            .replace("{name}", &profile);
+                        app.add_message(HistoryCell::System { content });
+                        app.status_message =
+                            Some(app.tr(MessageId::ProfileStatus).replace("{name}", &profile));
                     }
                     Err(err) => {
                         app.config_profile = previous_profile;
-                        app.status_message =
-                            Some(format!("Failed to switch to profile '{profile}': {err}"));
+                        app.status_message = Some(
+                            app.tr(MessageId::ProfileSwitchFailed)
+                                .replace("{name}", &profile)
+                                .replace("{error}", &err.to_string()),
+                        );
                     }
                 }
             }
@@ -3111,20 +3173,71 @@ pub(crate) fn apply_hotbar_setup_saved(
     app.needs_redraw = true;
 }
 
-pub(crate) fn settle_user_input_request(app: &mut App, tool_id: &str) {
+pub(crate) fn settle_user_input_request(app: &mut App, tool_id: &str) -> bool {
     app.retire_action_notices(Some(tool_id));
-    if app
+    let removed_view = app.view_stack.remove_user_input_by_id(tool_id);
+    let matched = app
         .pending_user_input_prompt
         .as_ref()
-        .is_some_and(|(id, _)| id == tool_id)
-    {
+        .is_some_and(|(id, _)| id == tool_id);
+    if matched {
         app.pending_user_input_prompt = None;
+    }
+    app.needs_redraw |= removed_view || matched;
+    matched
+}
+
+pub(crate) fn settle_pending_human_requests(app: &mut App) {
+    if let Some((id, _)) = app.pending_user_input_prompt.as_ref() {
+        let id = id.clone();
+        settle_user_input_request(app, &id);
+    }
+    // A completed/cancelled parent turn cannot still await an approval.
+    // Children own their separate lifecycle and may legitimately remain live.
+    for id in app.view_stack.tool_decision_request_ids() {
+        if !crate::tools::subagent::SubAgentManager::is_child_approval_id(&id) {
+            crate::tui::pending_requests::retire(app, &id);
+            app.retire_action_notices(Some(&id));
+        }
+    }
+}
+
+/// The Engine's terminal tool event retires the exact request even when its
+/// presentation is filtered after a local cancel. An outer Code Mode call's
+/// completion cannot settle a different, inner request id.
+pub(crate) fn observe_human_request_settlement(app: &mut App, event: &EngineEvent) {
+    match event {
+        EngineEvent::ToolCallComplete { id, .. } => {
+            settle_user_input_request(app, id);
+            crate::tui::pending_requests::retire(app, id);
+        }
+        EngineEvent::TurnComplete { .. }
+            if !(app.suppress_stream_events_until_turn_complete && app.is_loading) =>
+        {
+            settle_pending_human_requests(app);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn note_human_decision_delivered(app: &mut App, tool_id: &str) {
+    if (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
+        && !app.suppress_stream_events_until_turn_complete
+        && !crate::tui::pending_requests::is_foreign_child_request(app, tool_id)
+    {
+        // The reply resumes Engine work before its next event reaches this
+        // frame. Give that work its own inactivity window after a long wait.
+        app.turn_last_activity_at = Some(Instant::now());
     }
 }
 
 pub(crate) fn apply_user_input_submission_result(app: &mut App, tool_id: &str, result: Result<()>) {
     match result {
-        Ok(()) => settle_user_input_request(app, tool_id),
+        Ok(()) => {
+            if settle_user_input_request(app, tool_id) {
+                note_human_decision_delivered(app, tool_id);
+            }
+        }
         Err(error) => {
             tracing::warn!(tool_id, error = %error, "user input submit failed");
             if let Some((id, request)) = app
@@ -3200,6 +3313,7 @@ pub(crate) async fn apply_approval_decision(
                 .await
                 .is_ok()
             {
+                note_human_decision_delivered(app, &event.tool_id);
                 app.retire_action_notices(Some(&event.tool_id));
             }
         }
@@ -3224,6 +3338,7 @@ pub(crate) async fn apply_approval_decision(
                 engine_handle.deny_tool_call(event.tool_id.clone()).await
             };
             if denied.is_ok() {
+                note_human_decision_delivered(app, &event.tool_id);
                 app.retire_action_notices(Some(&event.tool_id));
             }
         }
@@ -3414,8 +3529,10 @@ pub(crate) fn apply_backtrack(app: &mut App, depth: usize) {
     if app.view_stack.top_kind() == Some(ModalKind::LiveTranscript) {
         app.view_stack.pop();
     }
+    // Backtrack rewinds the conversation only. State the file fact first,
+    // and name the command that puts the files back.
     app.status_message =
-        Some("Rewound to previous user message — edit and Enter to resend".to_string());
+        Some("Files not changed. /undo puts them back. Conversation rewound.".to_string());
     app.scroll_to_bottom();
     app.mark_history_updated();
     app.needs_redraw = true;
@@ -3960,7 +4077,7 @@ pub(crate) async fn apply_provider_picker_setup_confirmed(
     switched
 }
 
-async fn apply_codewhale_owned_login(
+pub(crate) async fn apply_codewhale_owned_login(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
@@ -3969,8 +4086,18 @@ async fn apply_codewhale_owned_login(
     status_prefix: &str,
     login_kind: &str,
 ) -> bool {
-    match crate::oauth::activate_login(pending, app.config_path.as_deref(), Some(&mut *config)) {
-        Ok(activation) => {
+    let path = app.config_path.clone();
+    let mut live = config.clone();
+    let activation = tokio::task::spawn_blocking(move || {
+        crate::oauth::activate_login(pending, path.as_deref(), Some(&mut live))
+            .map(|activation| (activation, live))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("OAuth activation worker failed: {error}"))
+    .and_then(|result| result);
+    match activation {
+        Ok((activation, live)) => {
+            config.refresh_provider_routes_from(&live);
             // The account line goes to the transcript: the status line is
             // overwritten by the route summary once the switch lands.
             let locale = app.ui_locale;
@@ -4092,6 +4219,42 @@ pub(crate) async fn run_chatgpt_revoke_from_tui(app: &mut App, config: &mut Conf
         (Err(err), Ok(())) => format!("ChatGPT revoke failed: {err:#}"),
         (Err(err), Err(live_err)) => format!(
             "ChatGPT revoke failed: {err:#}. The live route could not be refreshed: {live_err:#}"
+        ),
+    };
+    app.add_message(HistoryCell::System {
+        content: message.clone(),
+    });
+    app.status_message = Some(message);
+    app.needs_redraw = true;
+}
+
+/// `/auth orcarouter-revoke`. OrcaRouter mints a durable API key with no remote
+/// revocation endpoint this client owns, so revoke is local-only: clear the
+/// `orcarouter` secret-store slot, the route's saved key, and the in-memory
+/// override. Re-authenticating is a fresh PKCE sign-in or a freshly pasted key.
+pub(crate) async fn run_orcarouter_revoke_from_tui(app: &mut App, config: &mut Config) {
+    let provider = ProviderKind::Orcarouter;
+    let provider_name = provider.as_str().to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::config::clear_active_provider_api_key(&provider_name)
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("OrcaRouter revoke task was lost: {err}"))
+    .and_then(|result| result);
+    let live_clear = match config.builtin_provider_identity(provider) {
+        Ok(identity) => config
+            .set_provider_api_key_override(&identity, None)
+            .map_err(|error| anyhow::anyhow!(error.to_string())),
+        Err(err) => Err(anyhow::anyhow!(err)),
+    };
+    let message = match (outcome, live_clear) {
+        (Ok(()), Ok(())) => "Removed Codewhale's saved OrcaRouter credential.".to_string(),
+        (Ok(()), Err(err)) => {
+            format!("OrcaRouter credential removed; the live route could not be refreshed: {err:#}")
+        }
+        (Err(err), Ok(())) => format!("OrcaRouter revoke failed: {err:#}"),
+        (Err(err), Err(live_err)) => format!(
+            "OrcaRouter revoke failed: {err:#}. The live route could not be refreshed: {live_err:#}"
         ),
     };
     app.add_message(HistoryCell::System {
@@ -4493,7 +4656,7 @@ pub(crate) fn apply_loaded_session_config_snapshot(
         );
     *config = next_config;
     app.configured_models = config.custom_models.clone().unwrap_or_default();
-    crate::initialize_cloud_facts(config);
+    crate::config::initialize_cloud_facts(config);
     app.refresh_notification_settings(config);
     Ok(respawn)
 }

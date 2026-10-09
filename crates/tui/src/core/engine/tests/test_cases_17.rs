@@ -545,6 +545,7 @@ async fn run_headless_turn_with_flaky_network(
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -896,6 +897,7 @@ async fn terminal_output_limit_followed_by_stream_error_is_charged_and_not_retri
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -989,6 +991,7 @@ async fn error_frame_turn_events(turns: Vec<Vec<StreamEvent>>) -> (Vec<Event>, u
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -1098,6 +1101,70 @@ async fn transient_error_frame_with_no_content_is_retried_and_terminal_frame_is_
     )));
 }
 
+/// #6795: when the retry budget is spent on a transient error frame, the turn
+/// fails once with the provider's reason, and the one card it posts is an
+/// error that does not promise a retry.
+#[tokio::test]
+async fn exhausted_transient_error_frame_posts_one_error_envelope() {
+    let frame = || {
+        vec![StreamEvent::Error {
+            error: serde_json::json!({ "message": "Provider returned an empty response" }),
+        }]
+    };
+    let (events, requests) = error_frame_turn_events((0..8).map(|_| frame()).collect()).await;
+    assert!(
+        (2..8).contains(&requests),
+        "the frame is retried within the budget, then given up on: {requests}"
+    );
+    let cards: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Error { envelope, .. } => Some(envelope),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards.len(), 1, "one card, after the budget: {cards:?}");
+    assert_eq!(
+        cards[0].severity,
+        crate::error_taxonomy::ErrorSeverity::Error
+    );
+    assert!(!cards[0].recoverable);
+    assert!(
+        cards[0]
+            .message
+            .contains("Provider returned an empty response")
+    );
+    assert!(events.iter().any(|event| matches!(event,
+        Event::TurnComplete { status: TurnOutcomeStatus::Failed, error: Some(error), .. }
+            if error.contains("Provider returned an empty response")
+    )));
+}
+
+/// #6843: a frame whose whole message is a placeholder is not retried and the
+/// transcript says the upstream error was unreadable.
+#[tokio::test]
+async fn placeholder_error_frame_is_reported_as_unreadable_and_not_retried() {
+    use crate::llm_client::mock::canned;
+    let (events, requests) = error_frame_turn_events(vec![
+        vec![StreamEvent::Error {
+            error: serde_json::json!({ "message": "ERROR" }),
+        }],
+        canned::simple_text_turn("must never be requested"),
+    ])
+    .await;
+    assert_eq!(requests, 1, "an unreadable error is not retryable");
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Error { envelope, .. }
+            if envelope.category == crate::error_taxonomy::ErrorCategory::Parse
+                && envelope.severity == crate::error_taxonomy::ErrorSeverity::Error
+                && envelope.message.contains("unreadable error")
+    )));
+    assert!(events.iter().any(|event| matches!(event,
+        Event::TurnComplete { status: TurnOutcomeStatus::Failed, error: Some(error), .. }
+            if error.contains("unreadable error")
+    )));
+}
+
 #[tokio::test]
 async fn midstream_error_frame_stops_the_stream_and_drops_trailing_deltas() {
     // The reported incident: a provider delivered a chunk-level error
@@ -1130,6 +1197,7 @@ async fn midstream_error_frame_stops_the_stream_and_drops_trailing_deltas() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -1383,6 +1451,7 @@ async fn run_interactive_turn_with_flaky_network(
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),

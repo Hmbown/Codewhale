@@ -23,7 +23,6 @@ use crate::config::{
 
 use crate::config::ProviderKind;
 use crate::llm_client::StreamEventBox;
-use crate::llm_client::sanitize_http_error_body;
 use crate::logging;
 use codewhale_models::{
     ContentBlock, ContentBlockStart, Delta, Message, MessageDelta, MessageRequest, MessageResponse,
@@ -1271,7 +1270,7 @@ impl CodewhaleClient {
     ) -> Result<MessageResponse> {
         let body = &prepared.body;
 
-        let response_cache_key = if cacheable {
+        let response_cache_key = if cacheable && self.plugin_provider.is_none() {
             let wire_body =
                 serde_json::to_vec(&body).context("Failed to serialize Chat API cache key")?;
             let key = crate::llm_response_cache::ResponseCache::make_key(
@@ -1299,8 +1298,8 @@ impl CodewhaleClient {
         crate::client::record_provider_response(self.api_provider, status.as_u16());
         if !status.is_success() {
             let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-            let error_text = sanitize_http_error_body(
-                Some(self.api_provider.provider().display_name()),
+            let error_text = self.disclosed_http_error_body(
+                &super::ErrorBodyDisclosure::Full,
                 status.as_u16(),
                 &raw_error_text,
             );
@@ -1343,15 +1342,22 @@ impl CodewhaleClient {
                         self.http1_fallback_client(),
                         policy,
                     );
-                    Ok(client
-                        .post(url)
-                        .header(reqwest::header::CONTENT_TYPE, "application/json")
-                        .json(body)
+                    Ok(self
+                        .authorize_plugin_request(
+                            client
+                                .post(url)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .json(body),
+                        )
+                        .await?
                         .send()
                         .await?)
                 }
                 super::stream_entry::StreamHttpPolicy::DualWithH1Fallback => {
-                    self.send_json_with_retry(url, body).await
+                    // Stream open, not a JSON retry: the response body outlives
+                    // the open, so this path must not carry any total deadline
+                    // (`open_stream_json_with_retry`, not `send_json_with_retry`).
+                    self.open_stream_json_with_retry(url, body).await
                 }
             }
         })
@@ -1382,8 +1388,8 @@ impl CodewhaleClient {
         crate::client::record_provider_response(self.api_provider, status.as_u16());
         if !status.is_success() {
             let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-            let error_text = sanitize_http_error_body(
-                Some(self.api_provider.provider().display_name()),
+            let error_text = self.disclosed_http_error_body(
+                &super::ErrorBodyDisclosure::Full,
                 status.as_u16(),
                 &raw_error_text,
             );

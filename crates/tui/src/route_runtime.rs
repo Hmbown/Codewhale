@@ -2123,6 +2123,7 @@ mod tests {
                 output: Some(3.5),
                 cache_read: None,
                 cache_write: None,
+                ..Default::default()
             }),
             modalities: Some(codewhale_config::models_dev::ModelsDevModalities {
                 input: vec!["text".to_string(), "image".to_string()],

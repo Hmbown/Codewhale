@@ -123,7 +123,6 @@ const HOME_PROSE_KEYS = [
   "heroInstallAria",
   "exploreProduct",
   "shotPreview",
-  "shotBuild",
   "screenshotAlt",
   "gainHeading",
   "gainLede",
@@ -157,10 +156,14 @@ function flattenStrings(dict: object): Record<string, string> {
     if (typeof value === "string") {
       out[key] = value;
     } else if (Array.isArray(value)) {
-      value.forEach((row: string[], i: number) => {
-        row.forEach((cell, j) => {
-          out[`${key}[${i}][${j}]`] = cell;
-        });
+      value.forEach((row: string | string[], i: number) => {
+        if (typeof row === "string") {
+          out[`${key}[${i}]`] = row;
+        } else {
+          row.forEach((cell, j) => {
+            out[`${key}[${i}][${j}]`] = cell;
+          });
+        }
       });
     }
   }

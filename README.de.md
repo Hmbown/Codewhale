@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -21,9 +21,9 @@ Arbeit — in deinem Terminal, mit einem gehosteten oder lokalen Modell deiner W
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Eine Codewhale-Terminalsitzung" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Eine Codewhale-Terminalsitzung" width="760">
 
-<sub>Echte Terminalaufnahme einer frischen Installation — keine inszenierte Ausgabe.</sub>
+<sub>Echte Codewhale-Terminalaufnahme einer eingerichteten lokalen Demositzung.</sub>
 
 </div>
 
@@ -57,6 +57,12 @@ auf einem Rechner streiten sich am Ende um den `PATH`.
 </details>
 
 ## Schnellstart
+
+**Die API-Schlüssel deiner Anbieter an einem Ort verwalten.** [Erstelle ein Codewhale-Konto](https://app.codewhale.net/register)
+oder führe `codewhale login` aus, um dich anzumelden. Speichere und aktualisiere deine API-Schlüssel im Konto
+und nutze sie über die Codewhale-Modellroute auf deinen angemeldeten Geräten.
+[Kontoschlüssel einrichten](docs/CONFIGURATION.md#account-provider-keys).
+Beim Anmelden werden vorhandene lokale Schlüssel nicht hochgeladen; die lokale Nutzung ist weiterhin ohne Konto möglich.
 
 1. **Öffne dein Projekt.** Starte `codewhale` in dem Ordner, an dem du arbeiten willst.
 2. **Verbinde ein Modell.** Starte `/provider` (oder drücke `F3`), um einen gehosteten Schlüssel

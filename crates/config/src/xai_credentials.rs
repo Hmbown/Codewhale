@@ -28,6 +28,9 @@ pub const LEGACY_XAI_OAUTH_FILE_NAME: &str = "xai-auth.json";
 pub const CHATGPT_OAUTH_GENERATION_PREFIX: &str = "chatgpt-auth-";
 pub const CHATGPT_OAUTH_GENERATION_SUFFIX: &str = ".json";
 pub const LEGACY_CHATGPT_OAUTH_FILE_NAME: &str = "chatgpt-oauth.json";
+pub const CLAUDE_OAUTH_GENERATION_PREFIX: &str = "claude-auth-";
+pub const CLAUDE_OAUTH_GENERATION_SUFFIX: &str = ".json";
+pub const LEGACY_CLAUDE_OAUTH_FILE_NAME: &str = "claude-oauth.json";
 /// Stable local host and registration metadata, retained across token logout.
 pub const CHATGPT_HOST_FILE_NAME: &str = "chatgpt-host.json";
 const XAI_OAUTH_LIFECYCLE_LOCK_FILE_NAME: &str = ".xai-oauth.lock";
@@ -91,6 +94,26 @@ pub fn validate_chatgpt_oauth_generation(value: &str) -> Result<&str> {
         );
     }
     Ok(value)
+}
+
+pub fn is_valid_claude_oauth_generation(value: &str) -> bool {
+    is_valid_owned_oauth_generation(
+        value,
+        CLAUDE_OAUTH_GENERATION_PREFIX,
+        CLAUDE_OAUTH_GENERATION_SUFFIX,
+    )
+}
+
+pub fn validate_claude_oauth_generation(value: &str) -> Result<&str> {
+    anyhow::ensure!(
+        is_valid_claude_oauth_generation(value),
+        "invalid Codewhale-owned Claude OAuth generation"
+    );
+    Ok(value)
+}
+
+pub fn claude_oauth_generation_path(value: &str) -> Result<PathBuf> {
+    Ok(xai_oauth_credentials_dir()?.join(validate_claude_oauth_generation(value)?))
 }
 
 fn is_valid_owned_oauth_generation(value: &str, prefix: &str, suffix: &str) -> bool {
@@ -289,7 +312,19 @@ impl XaiOAuthCredentialStore {
 
     pub fn clear_chatgpt(&self) -> Result<usize> {
         let mut removed = 0;
-        for name in chatgpt_auth_names_in_store(self)? {
+        for name in owned_auth_names_for(self, is_chatgpt_owned_auth_name)? {
+            if self.remove(&name)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn clear_claude(&self) -> Result<usize> {
+        let mut removed = 0;
+        for name in owned_auth_names_for(self, |name| {
+            name == LEGACY_CLAUDE_OAUTH_FILE_NAME || is_valid_claude_oauth_generation(name)
+        })? {
             if self.remove(&name)? {
                 removed += 1;
             }
@@ -411,7 +446,10 @@ fn owned_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<Stri
 }
 
 #[cfg(unix)]
-fn chatgpt_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<String>> {
+fn owned_auth_names_for(
+    store: &XaiOAuthCredentialStore,
+    accept: fn(&str) -> bool,
+) -> Result<Vec<String>> {
     use std::ffi::CStr;
     use std::os::fd::AsRawFd as _;
 
@@ -449,7 +487,7 @@ fn chatgpt_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<St
         let Ok(name) = name.to_str() else {
             continue;
         };
-        if is_chatgpt_owned_auth_name(name) {
+        if accept(name) {
             names.push(name.to_string());
         }
     }
@@ -491,7 +529,10 @@ fn owned_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<Stri
 }
 
 #[cfg(not(unix))]
-fn chatgpt_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<String>> {
+fn owned_auth_names_for(
+    store: &XaiOAuthCredentialStore,
+    accept: fn(&str) -> bool,
+) -> Result<Vec<String>> {
     let mut names = Vec::new();
     let entries = fs::read_dir(&store.directory).with_context(|| {
         format!(
@@ -510,7 +551,7 @@ fn chatgpt_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<St
         let Some(name) = name.to_str() else {
             continue;
         };
-        if is_chatgpt_owned_auth_name(name) {
+        if accept(name) {
             names.push(name.to_string());
         }
     }
@@ -570,6 +611,8 @@ fn validate_owned_auth_name(name: &str) -> Result<()> {
         name == LEGACY_XAI_OAUTH_FILE_NAME
             || name == LEGACY_CHATGPT_OAUTH_FILE_NAME
             || name == CHATGPT_HOST_FILE_NAME
+            || name == LEGACY_CLAUDE_OAUTH_FILE_NAME
+            || is_valid_claude_oauth_generation(name)
             || is_valid_xai_oauth_generation(name)
             || is_valid_chatgpt_oauth_generation(name),
         "invalid Codewhale-owned OAuth basename"
@@ -635,6 +678,10 @@ pub fn clear_all_chatgpt_oauth_credentials() -> Result<usize> {
 pub fn clear_all_chatgpt_oauth_credentials_locked() -> Result<usize> {
     let store = XaiOAuthCredentialStore::open()?;
     XaiOAuthCredentialStore::clear_chatgpt(&store)
+}
+
+pub fn clear_all_claude_oauth_credentials_locked() -> Result<usize> {
+    XaiOAuthCredentialStore::clear_claude(&XaiOAuthCredentialStore::open()?)
 }
 
 pub fn remove_chatgpt_oauth_generation(generation: &str) -> Result<bool> {

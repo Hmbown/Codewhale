@@ -1,80 +1,76 @@
 import type { HomeDict } from "../types";
 
-/**
- * English reference home dictionary — the copy contract for the whale-road
- * landing page. Public-copy and public-surface tests assert against these
- * values, not against raw JSX strings.
- *
- * The page leads with what a person gains — their own models, capable
- * agents, and control on their own machine — and states availability per
- * surface as it is today. Nothing here claims cloud execution, and the
- * screenshot is described as the development build it is.
- */
+/** English reference home copy: useful work with chosen models and connected tools. */
 export const home: HomeDict = {
-  metaTitle: "Codewhale: the open-source coding agent for any model",
+  metaTitle: "Codewhale: build with your models and tools",
   metaDescription:
-    "Codewhale is an open-source coding agent for your terminal. It reads your project, edits files, and runs your tests with the hosted or local model you choose.",
+    "Build apps, automate workflows, and work across connected tools with Codewhale. Open source, with your own model APIs or local and self-hosted inference.",
 
-  heroTitle: "The open-source coding agent for any model",
+  heroTitle: "Build apps and automate your work.",
   heroIntro:
-    "{brand} reads your project, edits files, and runs your tests from your terminal. Connect a hosted or local model, and choose which actions need your approval.",
+    "{brand} is an open-source agent that writes code, runs commands and works with the tools you connect. Use your existing model APIs, or run models locally and on your own servers.",
   getCodewhale: "Install Codewhale",
   heroInstallAria: "Install command",
-  exploreProduct: "See how it works",
+  exploreProduct: "Explore Codewhale",
 
   shotPreview: "Terminal preview",
-  shotBuild: "v{version} pre-release build",
   screenshotAlt:
-    "Codewhale v{version} pre-release build: whale mark, new session, message composer, Ask permissions, Work mode and model status. Rendered from an isolated terminal capture.",
+    "Codewhale v{version}: a captured terminal view with the conversation, message composer and session controls.",
 
   latestRelease: "Latest release {tag}",
   releaseUnavailable: "Release status unavailable",
   currentSource: "Source",
   sourceCandidate: "Unreleased",
   publishedRelease: "released",
-  figcaptionSourceCandidate: "unreleased",
-  chapterTerminal: "Your terminal",
-  chapterTerminalTitle: "Follow each edit and command as it runs",
 
-  gainHeading: "Delegate the task and keep control",
+  gainHeading: "What you can do",
   gainLede:
-    "Ask for a result: fix a bug, explain a module, or automate a task you repeat. Start with one agent, and add more agents when the job grows.",
+    "Describe what you want to build or automate. Codewhale can edit files, run commands and check the result, with access you control.",
   gain: [
     [
-      "Change code and check it",
-      "The agent inspects your project, edits files, and runs your tests. Follow each edit and command result as it works."
+      "Build apps and tools",
+      "Create an app, add a feature or write a script. Codewhale can work through the project files, run the code and test what it builds."
     ],
     [
-      "Automate repeated work",
-      "Run codewhale exec from scripts and CI. Use a Fleet to divide a larger job among several agents."
+      "Automate the work you repeat",
+      "Run workflows from your terminal, scripts or CI. For larger tasks, delegate parts of the work to a Fleet of agents with different models."
     ],
     [
-      "Stay in control",
-      "Set permissions before work starts, answer approval requests, and stop a task at any point. Run /receipts to list every file, command, and approval in a session."
+      "Connect the tools you use",
+      "Add tools through plugins and MCP servers, or use APIs from your own scripts. Each service needs its own setup and authentication."
     ]
   ],
 
   chapterModels: "Your models",
-  modelsHeading: "Choose a model for each task",
+  modelsHeading: "Use the models you choose",
   modelsBody:
-    "Choose a built-in provider, any OpenAI-compatible endpoint, or a local model for each session. Your model connection stays separate from any Codewhale account.",
+    "Connect your provider accounts, an OpenAI-compatible endpoint, or local and self-hosted models. Pick a model for the session and for each agent in a Fleet.",
   modelsFacts: [
-    ["Hosted", "Your own API key, saved with codewhale auth set --provider <id>"],
-    ["Gateway", "One endpoint for many models; you still choose the provider"],
-    ["Local", "vLLM, SGLang, or Ollama on localhost, usually with no key"],
+    [
+      "Your API accounts",
+      "Connect providers such as OpenAI, Anthropic, Google or DeepSeek with your own keys."
+    ],
+    [
+      "Your gateway",
+      "Use an OpenAI-compatible endpoint and choose the models it serves."
+    ],
+    [
+      "Your inference",
+      "Run local or self-hosted models with Ollama, vLLM or SGLang."
+    ]
   ],
   modelsLink: "Browse models and providers",
 
-  startHeading: "Install, connect a model, run a task",
+  startHeading: "Get started",
   startLede:
-    "Run your first task in three steps from your project folder. Add a Fleet later if the work needs several agents.",
+    "Install Codewhale, connect a model and open a project folder. You can add plugins and more agents as you need them.",
   startGuideLink: "Follow the getting-started guide",
   startVocabularyLink: "Look up a term",
 
   chapterAvailability: "Where it runs",
-  availabilityHeading: "Use it in your terminal today",
+  availabilityHeading: "Available now and in development",
   availabilityLede:
-    "Use the terminal, the local browser client, or the community CodeWhale GUI now. The desktop app and the rebuilt hosted web app are in development and share the same session model.",
+    "The terminal and local browser client are available now. A native desktop app and a rebuilt hosted web app are in development.",
   availability: [
     [
       "Terminal and local browser",
@@ -104,18 +100,33 @@ export const home: HomeDict = {
     ],
   ],
   availabilityNote:
-    "The terminal, local browser, and GUI need no Codewhale account. Hosted web and desktop use an account, which does not replace your model connection; your provider bills usage on your own key.",
+    "The terminal, local browser, and GUI need no Codewhale account. Hosted web and desktop use an account. When you use your own provider key, your provider bills that usage.",
   accountLink: "Create an account",
 
-  surfacesHeading: "Extend what the agent can reach",
+  surfacesHeading: "Work across files and tools",
   surfaces: [
-    ["Files and commands", "Read the project, edit files, run tests, and inspect output within the permissions you set."],
-    ["Plugins and MCP", "Connect more tools and services. Each plugin stays off until you review and enable it."],
-    ["Computer Use · preview", "A plugin that lets the agent see and operate other apps. You enable it and grant the system permissions it asks for."],
-    ["Saved sessions", "Keep the conversation and tool results together, and resume instead of starting over. The local browser opens the same session on your computer."],
-    ["Fleet", "Assign parts of a task to agents with different models and roles, then follow their progress."],
+    [
+      "Files and terminal",
+      "Create files, run commands, inspect data and test what you build. You set the working folder and permissions."
+    ],
+    [
+      "Plugins and connected apps",
+      "Add skills and tools through plugins and MCP. Review and enable the connections you want the agent to use."
+    ],
+    [
+      "Browser and computer · preview",
+      "Use browser tools and the Computer Use plugin for work in apps and websites, with the access you grant."
+    ],
+    [
+      "Sessions you can return to",
+      "Keep the conversation, tool results and work history together. Resume the task in the terminal or its local browser client."
+    ],
+    [
+      "Teams of agents",
+      "Use Fleet to split a larger job between agents with different roles and models, and follow their progress in one place."
+    ]
   ],
-  runtimeLink: "See all integrations",
+  runtimeLink: "Explore tools and integrations",
 
   installBandHeading: "Install on macOS or Linux",
   copy: "Copy",
@@ -124,9 +135,9 @@ export const home: HomeDict = {
   chinaMirrors: "China mirrors",
   installGuideLink: "Read the install guide",
 
-  communityHeading: "Build Codewhale with us",
+  communityHeading: "Contribute to Codewhale",
   communityBody:
-    "Report a bug, propose a feature, or send your first pull request on GitHub. Small, tested fixes are welcome.",
+    "Report a bug, improve the docs or contribute code on GitHub. You can also build plugins and share workflows with others.",
   communityLinksAria: "Community links",
-  contribute: "Send a pull request",
+  contribute: "Contribute on GitHub",
 };

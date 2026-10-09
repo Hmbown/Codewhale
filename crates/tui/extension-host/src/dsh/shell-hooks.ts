@@ -1,7 +1,10 @@
 /** Pinned configuration/matcher semantics adapted onto the existing core hook catalog. No agent/session runtime. */
 import { createHash } from 'node:crypto'
-import { readFileSync,realpathSync,lstatSync } from 'node:fs'
+import { readFileSync,lstatSync } from 'node:fs'
 import { resolve,relative,isAbsolute,sep } from 'node:path'
+import { isUnlinkedInside } from './canonical-path.ts'
+// Re-exported for the pure path-normalization unit test (test/canonical-path.test.mjs).
+export { insideKey, pathKey, samePath, stripVerbatim, unlinkedKeyMatches } from './canonical-path.ts'
 import { parseClaudeCodeConfig } from './upstream/hooks/hooks-claude-code/src/config.ts'
 import { parseCodexConfig } from './upstream/hooks/hooks-codex/src/config.ts'
 const EVENTS:Record<string,string>={SessionStart:'session_start',UserPromptSubmit:'message_submit',PreToolUse:'tool_call_before',PostToolUse:'tool_call_after',Stop:'turn_end',SubagentStart:'subagent_spawn',SubagentStop:'subagent_complete'}
@@ -9,7 +12,7 @@ export function reviewedHookModule(dialect:'claude-code'|'codex',root:string,fil
  return {name:`hooks-${dialect}`,inject:['shellHooks'],apply(ctx:any,config:any) {
   if(!config || typeof config.configPath!=='string')throw new Error('hook bridge needs its reviewed configPath')
   const path=resolve(root,config.configPath);const inside=relative(root,path).split(sep).join('/')
-  if(!inside || inside.startsWith('../') || isAbsolute(inside) || !files[inside] || realpathSync(path)!==path || !lstatSync(path).isFile())throw new Error('hook config is absent from the reviewed regular-file closure')
+  if(!inside || inside.startsWith('../') || isAbsolute(inside) || !files[inside] || !isUnlinkedInside(root,inside,path) || !lstatSync(path).isFile())throw new Error('hook config is absent from the reviewed regular-file closure')
   const bytes=readFileSync(path)
   if(bytes.length>1024*1024 || createHash('sha256').update(bytes).digest('hex')!==files[inside])throw new Error('hook config changed after review or exceeds 1 MiB')
   // The only substitutions are the sealed bundle and current per-call core workspace.

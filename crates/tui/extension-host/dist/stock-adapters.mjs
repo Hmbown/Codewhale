@@ -326,7 +326,7 @@ function transformWebSnapshot(operation, value) {
 }
 
 // src/builtin/shared/github-adapter.ts
-var REPOSITORY = "Hmbown/CodeWhale";
+var REPOSITORY = "codewhale-hq/CodeWhale";
 function row2(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid GitHub snapshot");
   return value;

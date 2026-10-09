@@ -23,9 +23,11 @@ use crate::tools::spec::{
 /// Bounds for `agents/wait`. Short on purpose: a blocked wait makes the
 /// session deaf to typed input, and settled children already report back as
 /// `<codewhale:subagent.done>` sentinels that start a fresh turn (#4097).
-const COORD_WAIT_DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// `pub(crate)` so the description-pinning test can tie the advertised
+/// numbers to the runtime constants.
+pub(crate) const COORD_WAIT_DEFAULT_TIMEOUT_SECS: u64 = 30;
 const COORD_WAIT_MIN_TIMEOUT_SECS: u64 = 1;
-const COORD_WAIT_MAX_TIMEOUT_SECS: u64 = 120;
+pub(crate) const COORD_WAIT_MAX_TIMEOUT_SECS: u64 = 120;
 const COORD_WAIT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const RECENT_PROGRESS_LIMIT: usize = 8;
 pub(super) const COORDINATION_RECORD_LIMIT: usize = 128;
@@ -672,7 +674,7 @@ impl ToolSpec for AgentsWaitTool {
     }
 
     fn description(&self) -> &'static str {
-        "Block briefly until watched children settle or the timeout elapses. Keep waits short: on timeout, end your turn — settled children wake you automatically as completion sentinels; polling agents/list in a loop is not the right shape either. until=all is the fan-out join: it returns only when every child running at call time has left running, with each child's outcome. until=completion (default) returns as soon as any one child settles. until=activity also returns on progress."
+        "Block briefly until one child settles or timeout_secs (default 30, max 120) elapses; on timeout the receipt reports timed_out=true and any settled children. Keep waits short: on timeout, end your turn — settled children wake you automatically as completion sentinels; polling agents/list in a loop is not the right shape either. until=all is the fan-out join: it returns only when every child running at call time has left running, with each child's outcome. until=completion (default) returns as soon as any one child settles. until=activity also returns on progress."
     }
 
     fn input_schema(&self) -> Value {

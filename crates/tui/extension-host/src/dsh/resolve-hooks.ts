@@ -19,8 +19,9 @@
 import * as nodeModule from 'node:module'
 import {createHash} from 'node:crypto'
 import {fileURLToPath,pathToFileURL} from 'node:url'
-import {relative,resolve,sep,isAbsolute,dirname} from 'node:path'
-import {readFileSync,realpathSync} from 'node:fs'
+import {resolve,isAbsolute,dirname} from 'node:path'
+import {readFileSync} from 'node:fs'
+import { canonicalPath, insideKey, pathKey, unlinkedKeyMatches } from './canonical-path.ts'
 import { RUNTIME } from '../runtime.ts'
 import { prepareBunSource, REVIEWED_IMPORT } from './bun-closure.ts'
 
@@ -124,7 +125,7 @@ function installBunResolver(modules: Record<string, Record<string, unknown>>) {
     const name=String(specifier)
     const closure=closureAt(caller)
     if(!closure)throw new Error('composition module closure is no longer admitted')
-    const target=checkedBunSpecifier(name,closure.root,closure.receipt.files,caller,false)
+    const target=checkedBunSpecifier(name,closure.receipt,caller,false)
     const singleton=classifySpecifier(target)
     if(singleton!==null)return modules[singleton]
     return import(target,options as any)
@@ -152,14 +153,14 @@ function installBunResolver(modules: Record<string, Record<string, unknown>>) {
               :extension==='jsx' || extension==='js'?'jsx':'js'
           return {contents:readFileSync(args.path,'utf8'),loader}
         }
-        if(!(closure.path in closure.receipt.files) || realpathSync(args.path)!==args.path)throw new Error('module was absent from reviewed composition closure or contains a symbolic link')
+        if(!(closure.path in closure.receipt.files) || !unlinkedInside(closure.receipt,closure.path,args.path))throw new Error('module was absent from reviewed composition closure or contains a symbolic link')
         const bytes=readFileSync(args.path)
         if(bytes.length>64*1024*1024 || createHash('sha256').update(bytes).digest('hex')!==closure.receipt.files[closure.path])throw new Error('composition module bytes changed after review')
         // Bun 1.4 runtime onLoad treats its JSON loader as JS. Preserve exact
         // JSON semantics (including __proto__ data keys) via a JS data module.
         if(closure.path.endsWith('.json'))return {contents:`export default JSON.parse(${JSON.stringify(bytes.toString('utf8'))});`,loader:'js'}
         let source:string
-        try {source=prepareBunSource(bytes.toString('utf8'),args.path,(specifier,require)=>checkedBunSpecifier(specifier,closure.root,closure.receipt.files,pathToFileURL(args.path).href,require))}
+        try {source=prepareBunSource(bytes.toString('utf8'),args.path,(specifier,require)=>checkedBunSpecifier(specifier,closure.receipt,pathToFileURL(args.path).href,require))}
         catch(error){if(error instanceof SyntaxError)throw new Error('reviewed composition module has unsupported JavaScript syntax');throw error}
         return {contents:source,loader:'js'}
       })
@@ -167,7 +168,7 @@ function installBunResolver(modules: Record<string, Record<string, unknown>>) {
   })
 }
 
-function checkedBunSpecifier(specifier:string,root:string,files:Readonly<Record<string,string>>,caller:string,require:boolean):string {
+function checkedBunSpecifier(specifier:string,closure:ReviewedClosure,caller:string,require:boolean):string {
   const key=classifySpecifier(specifier)
   if(key!==null) {
     if(!(key in (globalThis as any)[REGISTRY_KEY]))throw new UnsupportedPeerError(specifier)
@@ -179,17 +180,39 @@ function checkedBunSpecifier(specifier:string,root:string,files:Readonly<Record<
   const path=file?(require && !specifier.startsWith('file:')?resolve(dirname(fileURLToPath(caller)),specifier):resolve(fileURLToPath(file))):undefined
   if(!path)throw new Error('bare dependency is absent from this reviewed composition; package its reviewed relative source')
   if(file?.search || file?.hash)throw new Error('Bun does not preserve reviewed module query or fragment identity; select [extension_host] runtime = \"node\" for this composition')
-  const inside=relative(root,path).split(sep).join('/')
-  if(inside==='..' || inside.startsWith('../') || isAbsolute(inside) || !(inside in files))throw new Error('composition import escapes the reviewed file closure')
+  const inside=keyIn(closure,path)
+  if(inside===undefined || !(inside in closure.files))throw new Error('composition import escapes the reviewed file closure')
   return require?path:file!.href
 }
 
 // Module graph admission for an already-reviewed composition. This is an
 // ephemeral resolver index over the existing tree's file receipt, not an owner,
 // session or plugin state store. Native JS remains arbitrary co-resident code.
-const reviewedClosures=new Map<string,{files:Readonly<Record<string,string>>,refs:number}>()
+//
+// Keyed by the canonical root's `pathKey`. A module path is matched lexically
+// against the canonical root or a raw root it was admitted under — never a raw
+// spelling against a canonical one (see canonical-path.ts): on Windows the two
+// differ in prefix, 8.3 names and case for the very same directory.
+interface ReviewedClosure {files:Readonly<Record<string,string>>,refs:number,canonicalRoot:string,rawRoots:Set<string>}
+const reviewedClosures=new Map<string,ReviewedClosure>()
+function keyIn(closure:ReviewedClosure,path:string):string|undefined {
+  const canonical=insideKey(closure.canonicalRoot,path)
+  if(canonical!==undefined)return canonical
+  for(const root of closure.rawRoots) {
+    const raw=insideKey(root,path)
+    if(raw!==undefined)return raw
+  }
+}
+/** `path` is `root/key` with no link inside the root (both sides canonicalized). */
+function unlinkedInside(closure:ReviewedClosure,key:string,path:string):boolean {
+  let canonical:string
+  try {canonical=canonicalPath(path)} catch {return false}
+  return unlinkedKeyMatches(closure.canonicalRoot,key,canonical)
+}
 export function admitReviewedClosure(baseUrl:string,files:Readonly<Record<string,string>>):()=>void {
-  const root=realpathSync(resolve(fileURLToPath(baseUrl)))
+  const rawRoot=resolve(fileURLToPath(baseUrl))
+  const canonicalRoot=canonicalPath(rawRoot)
+  const id=pathKey(canonicalRoot)
   const accepted:Record<string,string>=Object.create(null)
   const keys=Object.keys(files)
   if (keys.length>4096) throw new Error('reviewed composition closure exceeds its file limit')
@@ -197,31 +220,34 @@ export function admitReviewedClosure(baseUrl:string,files:Readonly<Record<string
     if (!key || key.split('/').some(part=>!part || part==='.' || part==='..') || key.includes('\\') || key.includes(':') || isAbsolute(key) || !/^[a-f0-9]{64}$/.test(files[key])) throw new Error('invalid reviewed composition closure file')
     accepted[key]=files[key]
   }
-  const existing=reviewedClosures.get(root)
+  const existing=reviewedClosures.get(id)
   if(existing) {
     if(Object.keys(existing.files).length!==keys.length || keys.some(key=>existing.files[key]!==accepted[key])) throw new Error('the same composition root carries different file receipts')
     existing.refs++
-  } else reviewedClosures.set(root,{files:Object.freeze(accepted),refs:1})
+    existing.rawRoots.add(rawRoot)
+  } else reviewedClosures.set(id,{files:Object.freeze(accepted),refs:1,canonicalRoot,rawRoots:new Set([rawRoot])})
   let disposed=false
-  return ()=>{if(disposed)return;disposed=true;const current=reviewedClosures.get(root);if(current && --current.refs===0)reviewedClosures.delete(root)}
+  return ()=>{if(disposed)return;disposed=true;const current=reviewedClosures.get(id);if(current && --current.refs===0)reviewedClosures.delete(id)}
 }
 /** Both runtimes consume the same exact admitted source-file receipt. */
 export async function importReviewedModule(baseUrl:string,path:string):Promise<unknown> {
-  const root=realpathSync(resolve(fileURLToPath(baseUrl)))
-  const receipt=reviewedClosures.get(root)
+  const rawRoot=resolve(fileURLToPath(baseUrl))
+  const id=pathKey(canonicalPath(rawRoot))
+  const receipt=reviewedClosures.get(id)
   if(!receipt)throw new Error('composition module closure is no longer admitted')
-  const entry=resolve(root,path)
+  // The entry keeps the caller's spelling of the root: the one the composition
+  // already read and hashed the module through.
+  const entry=resolve(rawRoot,path)
   const admitted=closureAt(pathToFileURL(entry).href)
-  if(!admitted || admitted.root!==root || !(admitted.path in receipt.files))throw new Error('composition module is absent from reviewed closure')
+  if(!admitted || admitted.root!==id || !(admitted.path in receipt.files))throw new Error('composition module is absent from reviewed closure')
   return import(pathToFileURL(entry).href)
 }
 function closureAt(url:string|undefined) {
   if(!url?.startsWith('file:'))return
   const path=resolve(fileURLToPath(url))
   for(const [root,receipt] of reviewedClosures) {
-    const inside=relative(root,path)
-    if(inside==='..' || inside.startsWith(`..${sep}`) || isAbsolute(inside))continue
-    return {root,receipt,path:inside.split(sep).join('/')}
+    const inside=keyIn(receipt,path)
+    if(inside!==undefined)return {root,receipt,path:inside}
   }
 }
 
@@ -264,6 +290,9 @@ export function installResolveHooks(modules: Record<string, Record<string, unkno
       const closure=closureAt(url)
       if(closure) {
         if(!(closure.path in closure.receipt.files) || result.source===undefined || result.source===null) throw new Error('module was absent from reviewed composition closure')
+        // Windows runs Node with --preserve-symlinks, so a linked module keeps
+        // its in-closure URL; refuse it here as the Bun loader does.
+        if(!unlinkedInside(closure.receipt,closure.path,fileURLToPath(url))) throw new Error('module was absent from reviewed composition closure or contains a symbolic link')
         const source=typeof result.source==='string'?Buffer.from(result.source):Buffer.from(result.source as Uint8Array)
         if(source.length>64*1024*1024 || createHash('sha256').update(source).digest('hex')!==closure.receipt.files[closure.path]) throw new Error('composition module bytes changed after review')
       }

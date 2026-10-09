@@ -444,6 +444,7 @@ pub enum RegisterKind {
     PromptSection,
     PromptTemplate,
     SkillRoot,
+    AvatarPack,
     ShellHook,
     McpServer,
 }
@@ -499,7 +500,7 @@ impl RegisterParams {
             RegisterKind::Command if spec.input_schema.is_some() => {
                 Err("a command registration has no `spec.input_schema`".to_string())
             }
-            RegisterKind::Hook | RegisterKind::PromptSection | RegisterKind::PromptTemplate | RegisterKind::SkillRoot | RegisterKind::ShellHook | RegisterKind::McpServer
+            RegisterKind::Hook | RegisterKind::PromptSection | RegisterKind::PromptTemplate | RegisterKind::SkillRoot | RegisterKind::AvatarPack | RegisterKind::ShellHook | RegisterKind::McpServer
                 if spec.input_schema.is_some() || spec.argument_hint.is_some() =>
             {
                 Err(

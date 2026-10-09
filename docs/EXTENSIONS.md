@@ -166,8 +166,10 @@ require another review. See [bundle rules](PLUGIN_BUNDLES.md).
 Export a Cordis plugin function or an object with `apply`. The host supplies
 one shared Cordis and the supported DSH compatibility services. The example's
 `inject = ['tools', 'commands']` asks for the tool and command registries. The
-supplied service names are `tools`, `commands`, `prompt`, `storage`, `skills`, `shellHooks`, `mcp`, `logger`,
-`events`, `reflect` and `registry`. A tool can ask the core to run a core tool through
+supplied service names are `tools`, `commands`, `prompt`, `storage`, `skills`, `shellHooks`, `avatars`, `mcp`, `logger`,
+`events`, `reflect` and `registry`. `ctx.avatars.registerPack({path})` registers a
+reviewed bundle-relative avatar pack; see
+[the whale-avatar example](examples/plugins/whale-avatar/README.md). A tool can ask the core to run a core tool through
 `exec.core` (see [Asking the core to run a tool](#asking-the-core-to-run-a-tool));
 Reviewed Native entries can propose MCP definitions through `ctx.mcp` as
 described below. Programmable pre-execute listeners use `ctx.on` as described below. A required

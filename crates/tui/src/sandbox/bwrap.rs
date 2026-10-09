@@ -6,9 +6,11 @@
 //!
 //! # How it works
 //!
-//! When `/usr/bin/bwrap` is executable AND the top-level config key
-//! `prefer_bwrap` is set to `true`, exec_shell commands are routed through
-//! bwrap. The bwrap invocation looks like:
+//! When `/usr/bin/bwrap` actually works — it is executable AND it can create
+//! its namespaces on this host — sandboxed exec_shell commands are routed
+//! through it by default. `prefer_bwrap = false` in the config opts out and
+//! leaves Linux commands unwrapped; the posture then reports policy-only.
+//! The bwrap invocation looks like:
 //!
 //! ```text
 //! bwrap \
@@ -43,9 +45,10 @@
 //! - Fedora: `dnf install bubblewrap`
 //! - Arch: `pacman -S bubblewrap`
 //!
-//! If bwrap is not executable, Codewhale reports no Linux OS sandbox and runs
-//! the command without an OS wrapper. It never labels that fallback as
-//! sandboxed.
+//! If bwrap is missing or cannot run (e.g. user namespaces are restricted,
+//! as on Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns`),
+//! Codewhale reports no Linux OS sandbox and runs the command without an OS
+//! wrapper. It never labels that fallback as sandboxed.
 
 #[cfg(target_os = "linux")]
 use super::policy::WritableRoot;
@@ -66,10 +69,61 @@ pub(crate) fn existing_directory_shim(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 pub const BWRAP_PATH: &str = "/usr/bin/bwrap";
 
-/// Check if bubblewrap is installed and executable.
+/// How long the availability probe may take. A working bwrap runs a wrapped
+/// `/bin/true` in well under a second, even on a loaded host.
+#[cfg(target_os = "linux")]
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether bwrap is executable AND can actually confine a child here.
+///
+/// The exec bit alone lies on hosts where user namespaces are restricted:
+/// bwrap starts but cannot create the sandbox, so every wrapped command
+/// would fail instead of running unsandboxed. The check therefore runs a
+/// real wrapped `/bin/true` once, built by [`build_bwrap_command`] itself so
+/// the probe covers the same argument shape the real path uses, and caches
+/// the verdict for the process.
 #[cfg(target_os = "linux")]
 pub fn is_available() -> bool {
-    is_executable(std::path::Path::new(BWRAP_PATH))
+    fn probe() -> bool {
+        use wait_timeout::ChildExt as _;
+        if !is_executable(std::path::Path::new(BWRAP_PATH)) {
+            return false;
+        }
+        let command = build_bwrap_command(
+            std::path::Path::new("/"),
+            "/bin/true",
+            &[],
+            &[],
+            false,
+            &crate::sandbox::BwrapMountExtensions::default(),
+            &[],
+            &[],
+        );
+        let Some((program, args)) = command.split_first() else {
+            return false;
+        };
+        let mut child = match std::process::Command::new(program)
+            .args(args)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        match child.wait_timeout(PROBE_DEADLINE) {
+            Ok(Some(status)) => status.success(),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                false
+            }
+        }
+    }
+    static VERDICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERDICT.get_or_init(probe)
 }
 
 #[cfg(target_os = "linux")]

@@ -2,6 +2,8 @@
 
 > 英文原文：[PLUGIN_AUTHORING.md](../PLUGIN_AUTHORING.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 核对 DSH 静态转换、显式 Native 入口及本地 Node MCP 工作目录边界。
+> 2026-10-07 同步 DSH 经审查 Native 组合与 skill 根目录注册的说明。
 
 先从一个 skill 开始：把 Markdown 指令文件放进一个小型插件包。
 [hello-codewhale 示例](../examples/plugins/hello-codewhale/plugin.json)
@@ -182,9 +184,15 @@ ESM 插件包，不需要安装依赖或运行编译器。它注册 `mod_counter
 这些是标识标签，不是运行时操作句柄。目前没有已发布的插件编写 SDK，示例使用文档
 规定的宿主适配服务。
 
-自定义 Ratatui/GPUI 控件、DSH 浏览器 UI 插槽、skill 根目录注册、原生执行
-`dsh.bundle.patch` 及 DSH 自身的 agent 运行时尚未提供。下文的静态导入器仍只转换
-可移植子集。兼容的 Claude 插件包仍使用原有的声明组件适配器；此 Native API 不加载
+`ctx.skills.registerRoot({path: 'profiles/review-skills'})` 把已审查包内的子 `SKILL.md`
+技能包加入现有的 Rust 技能目录；其 disposer 会撤销该根目录，禁用、撤销信任和宿主退出
+同样会撤销。发现或加载 skill 时 Rust 会重新检查 Native 审查凭据、文件哈希和当前注册；
+进程或宿主重启后，先前保存的 Native 选择失效。路径规则与数量/字节上限见
+[技能根目录契约](./EXTENSIONS.md#注册技能目录)。该 API 只增加
+指令，工具权限仍由共享引擎掌握。
+
+下文的 DSH 导入器既能转换可移植的声明式组件，也能为封闭的包准备一份经审查的 Native
+组合。自定义 Ratatui/GPUI 控件、DSH 浏览器 UI 插槽及 DSH 自身的 agent 运行时尚未提供。兼容的 Claude 插件包仍使用原有的声明组件适配器；此 Native API 不加载
 Claude 的 agent loop，也不会自动适配 Pi 扩展 API。可执行 mod 需按文档中的宿主契约
 移植。扩展工具只有在模型直接调用它、且共享 turn gate 正在处理本次调用时，
 才能使用 `exec.core.call`。命令及激活代码没有 core 句柄。嵌套 shell 和网络调用必须
@@ -287,26 +295,33 @@ npm 包）由 Codewhale 原生导入，而不是通过此脚本（`--bundle` 已
 `config` **不会**做深度合并。这不是完整的 profile 解析器：其他插件包、用户叠加层和
 部署配置都不在其中。普通 YAML 标量遵循 YAML 1.2 core schema，与 DSH 自己的解析器一致。
 
-被禁用的组会把禁用状态传递给其后代。被禁用的 MCP 声明保持禁用。被禁用的 skill 会被
+在可移植的声明式转换中，被禁用的组会把禁用状态传递给其后代。被禁用的 MCP 声明保持禁用。被禁用的 skill 会被
 省略并给出明确的回执，因为原生 skill 格式没有禁用状态。组或可移植条目上带条件的/
 非布尔的 `disabled` 值会使导入被拒绝，而不会假定它已启用。不受支持的条目策略/依赖字段
 （包括 `inject`、`intercept` 和 `isolate`）同样会使包含它们的条目或组的导入被拒绝。
 请在手工移植时保留它们的激活规则和权限规则。
 
-外部运行时插件和 `dsh.client` 界面代码不会被执行或转换。其他无法表示的组件会记录在
+包含受支持的本地模块、包内 ESM 导出或受支持的 DSH 服务桥的包可以生成 Native 组合：
+导入器封存包内源文件和模块哈希，然后生成一个或多个 Native 入口。只要 Native 图中有一行
+无法解析或不受支持，整个图都会被拒绝，不会悄悄安装恰好能解析的部分。经审查的 agent 预设包可以生成各自的 Native 入口，
+其贡献范围由所选的默认或子预设决定。导入和审查永远
+不会执行插件代码。`dsh.client` 界面代码和上游 agent loop 不在此契约之内。无法表示的可移植组件会记录在
 插件包的 `CONVERSION.md` 和结构化的 `CONVERSION.json` 中，其中包含源包名/版本、清单和
 有序各层的 SHA-256 哈希、转换器版本、逐条目的结果，以及需要手工移植的内容。未应用的
 patch 操作也会出现在结构化的手工移植列表中，并附带其来源层和从 1 开始的操作序号。
 
-能被转换（lowering）的 `!!js` 表达式只有 `process.execPath`（变成 `node`）和不含转义或插值的
+在可移植转换中，能被转换（lowering）的 `!!js` 表达式只有 `process.execPath`（变成 `node`）和不含转义或插值的
 简单带引号/模板字面量。环境变量表达式（包括带回退值的）永远不会按本机环境求值。
 已打包的 Node MCP 只有在其相对入口（以及声明的相对工作目录）解析后位于包内时才会被
 转换；包外的服务器会被跳过，宿主路径永远不会被复制。`@deepseek-ai/dsh-skill-filesystem`
 条目只有在其字面的 `customSkillDirs` 子目录位于包内时，才会贡献这些子目录。默认的用户
-和项目 skill 根目录、文件监视器以及外部服务依赖都不会被导入。任意 DSH TypeScript
-插件的执行不在此静态导入器的兼容范围内。明确编写 Native 入口的插件可通过实验性的
-TypeScript 扩展宿主提供工具、用户命令、执行前提议、提示词片段和插件本地状态；
-宿主不会执行导入的 `dsh.bundle.patch` 组合。参见[扩展编写指南](./EXTENSIONS.md)。
+和项目 skill 根目录、文件监视器以及外部服务依赖都不会被导入。DSH 模块仅通过实验性的
+TypeScript 扩展宿主运行（`[features] extension_host`，默认关闭），可以来自明确编写的 Native 入口，
+也可以来自导入器生成并经过审查的组合。生成的 Native 组合在显式启用 `extension_host`、且已安装的包
+经过审查、信任并启用之前保持不活动；宿主在加载前校验其源文件闭包，Rust 保留工具审批和会话权限。
+工具、命令、提示词片段、技能、钩子和 owner 本地存储沿用 Codewhale 现有的消费者与审批规则。
+这是受支持的兼容子集：导入成功并不表示每个上游 DSH 服务都可用。参见[扩展编写指南](./EXTENSIONS.md)与
+[宿主设计](../design/TS_EXTENSION_HOST.md)。
 
 ### 本地 Node MCP 服务器
 

@@ -67,7 +67,7 @@ pub(crate) fn record(app: &mut App, approval_id: &str, request: PendingChildRequ
 /// wait): forget it and retire its card wherever it sits in the stack.
 pub(crate) fn resolve(app: &mut App, approval_id: &str) -> bool {
     let known = app.pending_child_requests.remove(approval_id).is_some();
-    let removed_card = app.view_stack.remove_approval_by_id(approval_id);
+    let removed_card = app.view_stack.remove_tool_decision_by_id(approval_id);
     if known || removed_card {
         app.needs_redraw = true;
     }
@@ -185,7 +185,7 @@ pub(crate) fn clear_all(app: &mut App) {
 /// One footer row per agent that is waiting on the person and whose card is
 /// not the view on top: "Approval needed in {agent} — /agents".
 pub(crate) fn footer_rows(app: &App) -> Vec<String> {
-    let top = app.view_stack.top_approval_id();
+    let top = app.view_stack.top_tool_decision_id();
     let mut agents: Vec<&str> = Vec::new();
     for (id, request) in &app.pending_child_requests {
         if top == Some(id.as_str()) || agents.contains(&request.agent_id.as_str()) {
@@ -219,7 +219,7 @@ pub(crate) fn repush_for_agent(
         .pending_child_requests
         .iter()
         .filter(|(id, request)| {
-            request.agent_id == agent_id && !app.view_stack.contains_approval_id(id)
+            request.agent_id == agent_id && !app.view_stack.contains_tool_decision_id(id)
         })
         .map(|(id, request)| (id.clone(), request.clone()))
         .collect();

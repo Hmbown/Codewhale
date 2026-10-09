@@ -20,12 +20,12 @@
     ]
   },
   "sourceCandidate": {
-    "version": "0.10.1",
+    "version": "0.10.2",
     "providerCount": 50,
     "toolCount": 80,
     "sandboxBackends": [
       "seatbelt (macOS, when available)",
-      "bubblewrap (Linux, opt-in when installed)"
+      "bubblewrap (Linux, default when installed and working)"
     ],
     "sources": [
       "Cargo.toml",
@@ -36,10 +36,10 @@
     "providerCountDefinition": "Website descriptor identities in this source snapshot, excluding Custom and retired identities; includes protocol/plan variants. Not a count of distinct vendors, ProviderKind identities, live catalogs, or providers in any published release."
   },
   "latestPublishedRelease": {
-    "tag": "v0.10.0",
-    "version": "0.10.0",
-    "publishedAt": "2026-09-22T17:28:34Z",
-    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.0",
+    "tag": "v0.10.1",
+    "version": "0.10.1",
+    "publishedAt": "2026-10-08T01:47:44Z",
+    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.1",
     "sources": [
       "web/data/latest-published-release.json"
     ]
@@ -103,6 +103,7 @@
       "read",
       "write",
       "edit",
+      "file_search",
       "bash",
       "agent",
       "workflow",
@@ -182,10 +183,10 @@
     "localRuntime": "runtime, workspace state, and audit log stay on the user's machine",
     "hostedProviderBoundary": "the selected hosted provider receives turn context required for inference",
     "localInference": "a loopback local-model route can keep inference local",
-    "telemetry": "Codewhale 0.10.1 counts anonymous usage by default and discloses it at first launch (policy notice version 5, naming Codewhale and PostHog as processors), while the earlier 0.9.11 release asked first; turning it off is a saved choice that later versions keep, an opt-out recorded under the earlier opt-in policy stays off, and showing the notice never records any acceptance on the user's behalf; Codewhale does not collect conversations, code, prompts, files, file/repo/branch names, model content, credentials, or per-turn/per-tool timelines; while on, sessions post aggregate counts and closed enums to the first-party endpoint https://telemetry.codewhale.net/v1/telemetry, whose storage has no IP, country, or geo column and a fixed three-month retention; optional PostHog forwarding requires separate operator configuration and verified IP-safe egress, and its retention is a separate project setting; telemetry_endpoint = \"\" writes only to a local dry-run file; no mandatory hosted relay",
+    "telemetry": "Codewhale 0.10.2 counts anonymous usage by default and discloses it at first launch (policy notice version 5, naming Codewhale and PostHog as processors), while the earlier 0.9.11 release asked first; turning it off is a saved choice that later versions keep, an opt-out recorded under the earlier opt-in policy stays off, and showing the notice never records any acceptance on the user's behalf; Codewhale does not collect conversations, code, prompts, files, file/repo/branch names, model content, credentials, or per-turn/per-tool timelines; while on, sessions post aggregate counts and closed enums to the first-party endpoint https://telemetry.codewhale.net/v1/telemetry, whose storage has no IP, country, or geo column and a fixed three-month retention; optional PostHog forwarding requires separate operator configuration and verified IP-safe egress, and its retention is a separate project setting; telemetry_endpoint = \"\" writes only to a local dry-run file; no mandatory hosted relay",
     "account": "no account required for the local runtime",
     "plan": "Plan centrally refuses file mutation and shell execution; policy-allowed research may contact external services and local session state can still be persisted.",
-    "sandbox": "Seatbelt is used on macOS when available; Linux bubblewrap is opt-in and must be installed; Windows currently reports no OS sandbox",
+    "sandbox": "Seatbelt is used on macOS when available; Linux bubblewrap is on by default once installed and verified working, and prefer_bwrap = false opts out; Windows currently reports no OS sandbox",
     "audit": "sensitive events append best-effort to $CODEWHALE_HOME/audit.log (default ~/.codewhale/audit.log); write failures are logged",
     "usage": "provider token and cache usage is shown locally when available",
     "sources": [
@@ -226,36 +227,27 @@
       "docs/CONTRIBUTORS.md",
       "web/lib/release-credits.ts"
     ],
-    "requiredCandidateCredits": [
-      "@gaord",
-      "@Lstarsky0",
-      "@aboimpinto",
-      "@dajiaohuang",
-      "@Water-Run",
-      "@harryvgiunta",
-      "@wuisabel-gif",
-      "@BX166",
-      "@SparkofSpike",
-      "@cenab",
-      "@jayanthvee"
-    ]
+    "requiredCandidateCredits": ["@BX166"]
   },
   "screenshot": {
-    "readme": "web/public/codewhale-tui-8ba2bbf.png",
-    "website": "web/public/codewhale-tui-8ba2bbf.png",
-    "sourceVersion": "0.10.1",
-    "sourceCommit": "8ba2bbf805e1393ba27493bb5970db88b14ff7b3",
-    "sourceSha256": "7634edb50482ad098743ab14accc1b5836766211359ffa4fc763072cac396316",
-    "terminal": "real PTY cell capture; the website renders native cells as selectable HTML text, and the README image is the same frame exported as SVG by web/scripts/render-terminal-capture.mjs and rasterized as PNG",
+    "readme": "web/public/codewhale-tui-0102-demo.png",
+    "website": "web/public/codewhale-tui-0102-demo.png",
+    "sourceVersion": "0.10.2",
+    "sourceCommit": "bd0c32567024d5bc3efac7d13331c68711de031e",
+    "sourceSha256": "43ebde941cedb690612945b712e9565e92a441045c78646bf8841f3ad43ac369",
+    "sourceDirty": true,
+    "sourceDiffSha256": "499468bbf066901c9b229c912fe64d7fdcb672674483ce8dbe59db7c66110c45",
+    "binarySha256": "6ac94bff89046b5de4386c4ed39da2b86b2c53233d3c652f09022c83095e14dd",
+    "terminal": "real PTY cell capture; the product page renders native cells as selectable HTML text, and the README image is the same frame exported as SVG by web/scripts/render-terminal-capture.mjs and rasterized as PNG",
     "theme": "Underwater (default)",
-    "capture": "Captured on 2026-10-04 from the commit-stamped development build of source 8ba2bbf805e1 (0.10.1) by the opt-in website_current_terminal_capture test, using crates/tui/tests/support/qa_harness. Sealed HOME with workspace ~/my-project, no provider connected, no submitted prompts or fixture history, no network probes, no animations. Home, unsent composer, provider selection, help, Tasks and Fleet workbar are actual application output. The capture describes this build, not newer unqualified source work or a published release. Ask/Work is the captured posture, not a default claim.",
+    "capture": "Captured on 2026-10-08 from the development build of a dirty 0.10.2 candidate based on bd0c32567024d5bc3efac7d13331c68711de031e by the opt-in website_current_terminal_capture test using crates/tui/tests/support/qa_harness. Exact source diff and binary hashes are recorded here and in the capture manifest. A deterministic loopback provider drives the real Engine to edit a JSON exporter, run three passing local Python tests and delegate a source-grounded read-only review. Home, unsent composer, configured provider manager, help, Tasks and Fleet are actual application output with no retouched cells or fixture history. Sealed HOME and Full Access apply only to the isolated demo workspace. This is a local scripted demo, not published-release or external-provider qualification.",
     "sources": [
       "crates/tui/tests/support/qa_harness",
       "crates/tui/tests/cucumber/launch_card_pty.rs",
       "web/lib/terminal-captures/manifest.json",
       "web/lib/terminal-captures/website-home-100x24.json",
       "web/scripts/render-terminal-capture.mjs",
-      "web/public/codewhale-tui-8ba2bbf.png"
+      "web/public/codewhale-tui-0102-demo.png"
     ]
   }
 }

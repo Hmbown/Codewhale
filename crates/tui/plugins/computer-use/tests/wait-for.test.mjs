@@ -112,13 +112,76 @@ test("wait_for absent is satisfied immediately when nothing matches", async () =
   assert.equal(r.timed_out, undefined);
 });
 
+test("wait_for rechecks its condition on the observation returned for targeting", async () => {
+  const baseline = await tool("get_app_state");
+  setControl({ observations: [
+    { elements: [{ index: 0, path: [0], windowIndex: 0, role: "AXButton", label: "flashing" }] },
+    { elements: [] },
+  ] });
+  try {
+    const result = await tool("wait_for", { query: "flashing", timeout: 0.5, interval: 100 });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.matched, false, "a vanished control must not satisfy a wait");
+    assert.equal(result.timed_out, true);
+    assert.equal(result.state_id, undefined);
+  } finally { setControl(null); }
+  assert.equal((await tool("left_click", { target: { type: "element", index: 1 } })).ok, true,
+    "an unsuccessful recheck must not replace the last usable implicit target state");
+  const next = await tool("get_app_state");
+  assert.equal(Number(next.state_id.slice(2)), Number(baseline.state_id.slice(2)) + 1,
+    "unsuccessful rechecks never enter or evict states from the bounded cache");
+});
+
+test("wait_for absent succeeds without a target state when the app closes during the bound read", async () => {
+  setControl({ observations: [
+    { elements: [] },
+    { error: { code: "app_not_found", message: "application not found" } },
+  ] });
+  try {
+    const result = await tool("wait_for", { query: "Saving", state: "absent", timeout: 0.5 });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.matched, true);
+    assert.equal(result.matched_count, 0);
+    assert.equal(result.polls, 2);
+    assert.equal(result.state_id, undefined);
+    assert.deepEqual(result.elements, []);
+  } finally { setControl(null); }
+});
+
+test("wait_for absent never turns denied or fatal follow-up reads into absence", async () => {
+  for (const error of [
+    { code: "access_denied", message: "accessibility permission denied" },
+    { code: "control_stopped", message: "application not found after control stopped" },
+  ]) {
+    setControl({ observations: [{ elements: [] }, { error }] });
+    try {
+      const result = await tool("wait_for", { query: "Saving", state: "absent", timeout: 0.5 });
+      assert.equal(result.ok, false, JSON.stringify(result));
+      assert.equal(result.error.code, error.code);
+      assert.equal(result.matched, false);
+      assert.equal(result.state_id, undefined);
+    } finally { setControl(null); }
+  }
+});
+
+test("wait_for cannot prove absence from a truncated native walk", async () => {
+  setControl({ observation: { elements: [], truncated: true } });
+  try {
+    const result = await tool("wait_for", { query: "Saving", state: "absent", timeout: 0.5, interval: 100 });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.error.code, "observation_incomplete");
+    assert.notEqual(result.matched, true);
+    assert.equal(result.state_id, undefined);
+  } finally { setControl(null); }
+});
+
 test("wait_for times out honestly when the predicate never holds", async () => {
   const before = calls("get_app_state").length;
   const r = await tool("wait_for", { query: "never-present-label", timeout: 0.6, interval: 150 });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.matched, false);
   assert.equal(r.timed_out, true);
-  assert.ok(r.polls >= 2, `expected several polls, got ${r.polls}`);
+  assert.ok(r.polls >= 1, `expected an observation before the deadline, got ${r.polls}`);
   assert.equal(r.state_id, undefined, "a timed-out wait binds nothing");
   assert.ok(calls("get_app_state").length - before >= r.polls - 1, "ephemeral polls reached the backend");
 });
@@ -126,11 +189,18 @@ test("wait_for times out honestly when the predicate never holds", async () => {
 test("ephemeral wait_for polls do not evict earlier states", async () => {
   const st = await tool("get_app_state", { app_ref: { name: "FakeApp" } });
   assert.ok(st.state_id);
-  // ~30 polls: more than the 24-state cache cap. If polls were cached, st
-  // would be evicted; ephemeral polling keeps it targetable.
-  const w = await tool("wait_for", { query: "never-present-label", timeout: 3, interval: 100 });
-  assert.equal(w.timed_out, true);
-  assert.ok(w.polls > 24, `expected >24 polls to prove non-caching, got ${w.polls}`);
+  // Count actual observations beyond the 24-state cache cap. A loaded runner
+  // may complete fewer polls per deadline; at most 25 bounded waits suffice.
+  const before = calls("get_app_state").length;
+  let polls = 0;
+  while (polls <= 24) {
+    const w = await tool("wait_for", { query: "never-present-label", timeout: 0.5, interval: 100 });
+    assert.equal(w.ok, true, JSON.stringify(w));
+    assert.equal(w.timed_out, true);
+    assert.ok(Number.isSafeInteger(w.polls) && w.polls > 0, `expected completed polls, got ${w.polls}`);
+    polls += w.polls;
+  }
+  assert.ok(calls("get_app_state").length - before > 24, "more than a cache capacity of observations reached the backend");
   const focus = await tool("focus", { target: { type: "element", state_id: st.state_id, index: 1 } });
   assert.equal(focus.ok, true, JSON.stringify(focus.error));
 });

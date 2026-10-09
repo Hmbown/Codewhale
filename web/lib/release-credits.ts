@@ -20,20 +20,12 @@
 
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
-  "@Guan0923",
-  "@Andrea-Bruno",
-  "@aiapienthusiast",
+  "@SparkofSpike",
+  "@dajiaohuang",
   "@gaord",
   "@Lstarsky0",
-  "@aboimpinto",
-  "@dajiaohuang",
-  "@Water-Run",
-  "@wuisabel-gif",
-  "@SparkofSpike",
-  "@zhuowp",
-  "@harryvgiunta",
+  "@jayanthvee",
   "@asto18089",
-  "@qiuYliangM",
 ];
 
 /**
@@ -45,6 +37,6 @@ export const UNRELEASED_CONTRIBUTORS: string[] = [];
 
 /**
  * Contributors who helped with reports, reproductions, and verification.
- * Credit covers the 0.10.1 reports recorded in docs/CONTRIBUTORS.md.
+ * Credit covers the 0.10.2 reports recorded in docs/CONTRIBUTORS.md.
  */
-export const RELEASE_HELPERS: string[] = ["@BX166", "@cenab", "@jayanthvee"];
+export const RELEASE_HELPERS: string[] = ["@BX166"];

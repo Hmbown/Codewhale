@@ -30,7 +30,7 @@ pub enum PluginMutationRequest {
         source: PluginInstallSource,
         expected_content_hash: String,
     },
-    /// Re-download a previously installed bundle by name or id. A changed
+    /// Refresh a previously installed bundle by name or id. A changed
     /// bundle automatically invalidates its trust receipt at next discovery.
     Update { selector: String },
     /// Delete an installed bundle and prune its persisted state entry.

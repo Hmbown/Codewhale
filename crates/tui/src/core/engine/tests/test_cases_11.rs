@@ -538,6 +538,7 @@ async fn operate_model_shell_uses_normal_approval_and_workspace_sandbox() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "Write the requested local fixture to the workspace".to_string(),
             images: Vec::new(),
@@ -694,6 +695,7 @@ async fn posture_change_during_approval_wait(
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "Record the approval fixture in the workspace".to_string(),
             images: Vec::new(),
@@ -909,6 +911,7 @@ async fn full_access_subagent_handoff_keeps_model_shell_free_of_approval_prompts
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "continue from the completed child".to_string(),
             images: Vec::new(),
@@ -1048,6 +1051,7 @@ async fn assert_full_access_model_tool_batch_is_blocked(
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "exercise the Full Access execution boundary".to_string(),
             images: Vec::new(),
@@ -1256,6 +1260,7 @@ async fn assert_full_access_model_tool_batch_runs(
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "exercise the Full Access auto-approval boundary".to_string(),
             images: Vec::new(),

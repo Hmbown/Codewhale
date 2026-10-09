@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:c28f2ad5a8ed -->
 <div align="center">
 
 <picture>
@@ -22,9 +22,9 @@ pilihan Anda.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-<img src="web/public/codewhale-tui-8ba2bbf.png" alt="Sesi terminal Codewhale" width="760">
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Sesi terminal Codewhale" width="760">
 
-<sub>Tangkapan terminal sungguhan dari instalasi baru, tanpa keluaran yang direkayasa.</sub>
+<sub>Tangkapan terminal Codewhale sungguhan dari sesi demo lokal yang sudah dikonfigurasi.</sub>
 
 </div>
 
@@ -59,6 +59,12 @@ satu mesin akan saling berebut `PATH`.
 </details>
 
 ## Mulai cepat
+
+**Kelola kunci API penyedia Anda di satu tempat.** [Buat akun Codewhale](https://app.codewhale.net/register)
+atau jalankan `codewhale login` untuk masuk. Simpan dan perbarui kunci API di akun Anda,
+lalu gunakan melalui rute model Codewhale pada perangkat yang sudah masuk.
+[Siapkan kunci akun](docs/CONFIGURATION.md#account-provider-keys).
+Masuk tidak mengunggah kunci lokal yang sudah ada; penggunaan lokal tetap tersedia tanpa akun.
 
 1. **Buka proyek Anda.** Jalankan `codewhale` di folder yang ingin Anda kerjakan.
 2. **Hubungkan model.** Jalankan `/provider` (atau tekan `F3`) untuk menambahkan

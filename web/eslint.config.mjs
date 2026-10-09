@@ -16,6 +16,7 @@ const eslintConfig = [
       ".next/**",
       ".open-next/**",
       ".wrangler/**",
+      ".cloudflare/**",
       "out/**",
       "build/**",
       "dist/**",

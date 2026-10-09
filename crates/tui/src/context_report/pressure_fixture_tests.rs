@@ -74,6 +74,7 @@ fn fixture_compaction() -> CompactionConfig {
 fn turn_op(content: &str, route: &ResolvedRuntimeRoute) -> Op {
     let compaction = fixture_compaction();
     Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),

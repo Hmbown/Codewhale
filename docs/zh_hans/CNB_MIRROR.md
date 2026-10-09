@@ -1,12 +1,26 @@
 # CNB Cool 镜像
 
 > 英文原文：[CNB_MIRROR.md](../CNB_MIRROR.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-30。
+> 最后与英文同步日期（last synced with English revision）：2026-10-06。
 
 `cnb.cool/codewhale.net/codewhale` 是这个 GitHub 仓库的单向镜像，服务那些
 GitHub 慢或无法访问的网络环境（主要是中国大陆）。镜像会收到：`main` 的每一次
 推送，第一方发布工作用到的每个 `fix/*`、`rebrand/*` 和 `work/v*` 分支，以及
 每个完整 GitHub Release 已发布后的 `v*` 发布标签。
+
+## 源码与下载分别验证（2026-10-06 审核）
+
+本次审核确认 CNB `main` 与权威 GitHub `main` 同步；这不等于二进制发布完成。
+GitHub、npm 与 npmmirror 的最新已发布版本为 **0.10.0**，两个 npm 注册表的
+包装器压缩包字节与完整性值一致。CNB 最新二进制 release 仍是 **0.9.9**；
+`v0.10.0` 的源码标签存在，但其标签构建在发布说明检查处失败，编译和上传未完成。
+该版本 CNB 校验清单返回 404，所以不能宣称 `CODEWHALE_USE_CNB_MIRROR=1`
+可安装 0.10.0。0.10.1 在发布前仅是 `main` 上的源码候选版。
+
+先验证标签指向相同源码，再验证该版本的 release、资产和校验清单实际存在。
+只看 GitHub 同步工作流成功，或看到源码标签，都不足以证明下载可用。
+恢复已存在标签不会产生一次新的标签推送；维护者需单独恢复 CNB 构建/发布并审核
+结果，不能移动或重打已经发布的标签。发布之后应重新审核本段版本状态。
 
 ## 来源
 
@@ -38,8 +52,8 @@ sha256sum -c codewhale-artifacts-sha256.txt --ignore-missing
 - **范围：** 只推送触发本次运行的那个 ref。标签推送就推送该标签。分支推送镜像
   `main`、第一方 `fix/*`/`rebrand/*` 分支，或显式匹配的发布分支。其他功能分支
   和 dependabot ref 有意*不*镜像。
-- **并发：** 各次运行通过 `cnb-sync` 并发组串行化，这样 `auto-tag.yml` 接连
-  发出的 `main` 推送和标签推送不会互相竞争。
+- **并发：** 按 `cnb-sync-${{ github.ref }}` 为每个 ref 单独串行化。
+  不同标签不会互相挤掉待运行任务；同一分支只保留最新待同步推送。
 - **重试：** 每次推送最多重试三次，采用线性退避（5s、10s），之后工作流放弃。
 
 CNB 流水线配置也纳入 GitHub 的源码管理，位置是
@@ -222,6 +236,8 @@ https://cnb.cool/codewhale.net/codewhale.git
 镜像会收到 `main`、发布标签和匹配到的发布分支。当 CNB 工作流或凭据不健康时，
 GitHub 是回退方案。
 
-CNB 部署按钮的示例放在 `deploy/tencent-lighthouse/cnb/`。只有把它们复制进
+腾讯云 Lighthouse 自建服务器的中文/英文操作步骤见
+[`scripts/tencent-lighthouse/README.md`](../../scripts/tencent-lighthouse/README.md)。
+CNB 部署按钮示例见 [`deploy/tencent-lighthouse/cnb/`](../../deploy/tencent-lighthouse/cnb/README.md)。只有把它们复制进
 `.cnb.yml` 和 `.cnb/tag_deploy.yml` 之后才会生效，因为实际部署任务需要
 Lighthouse 部署密钥、目标主机，以及明确的 CNB 配额/计费策略。

@@ -649,7 +649,7 @@ async fn execute_tools_dispatches_through_common_executor() {
 }
 
 #[tokio::test]
-async fn dispatch_reports_typed_operation_activity_without_names_or_arguments() {
+async fn dispatch_reports_typed_operation_activity_with_safe_identity_without_arguments() {
     use crate::tools::file_tool::ReadTool;
     use crate::tools::registry::ToolRegistryBuilder;
     use crate::tools::spec::ToolContext;
@@ -702,13 +702,12 @@ async fn dispatch_reports_typed_operation_activity_without_names_or_arguments() 
         matches!(
             events.as_slice(),
             [
-                Event::OperationActivityStarted { span_id: started, activity_kind: OwnerActivityKind::Reading },
+                Event::OperationActivityStarted { span_id: started, activity_kind: OwnerActivityKind::Reading, action_id: Some(action) },
                 Event::OperationActivityCompleted {
                     span_id: completed,
                     activity_kind: OwnerActivityKind::Reading,
-                    outcome: OwnerOperationOutcome::Succeeded,
-                },
-            ] if started == completed && started.starts_with("call-1#")
+                    outcome: OwnerOperationOutcome::Succeeded, action_id: Some(completed_action) },
+            ] if started == completed && started.starts_with("call-1#") && action == "read_file" && completed_action == action
         ),
         "unexpected activity: {events:?}"
     );
@@ -798,9 +797,10 @@ async fn dropped_operation_span_completes_as_cancelled() {
     // opened must still close, or every host leaks an active operation.
     let (tx_event, mut rx_event) = mpsc::channel(16);
     let span = super::tool_execution::OperationSpanGuard::start(
-        tx_event,
+        &tx_event,
         "call-x",
         OwnerActivityKind::Editing,
+        Some("edit_file".into()),
         None,
     )
     .await;
@@ -814,6 +814,7 @@ async fn dropped_operation_span_completes_as_cancelled() {
             span_id,
             activity_kind: OwnerActivityKind::Editing,
             outcome: OwnerOperationOutcome::Cancelled,
+            ..
         }) => assert_eq!(span_id, started),
         other => panic!("unexpected event: {other:?}"),
     }
@@ -1660,4 +1661,40 @@ fn stream_retry_scenario() {
              provider on real outages"
         );
     }
+}
+
+#[test]
+fn mode_notice_is_recorded_on_entering_plan_and_on_leaving_it() {
+    let _lock = lock_test_env();
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    let notices = |engine: &Engine| {
+        engine
+            .session
+            .messages
+            .iter()
+            .filter_map(crate::runtime_handoff::mode_notice_display)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // A Work session that never entered Plan carries no notice.
+    engine.record_mode_notice(AppMode::Agent);
+    assert!(notices(&engine).is_empty());
+
+    engine.record_mode_notice(AppMode::Plan);
+    engine.record_mode_notice(AppMode::Plan);
+    let recorded = notices(&engine);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert!(recorded[0].starts_with("Mode: Plan."), "{recorded:?}");
+
+    // Leaving Plan is announced so history never ends on a stale mode.
+    engine.record_mode_notice(AppMode::Agent);
+    let recorded = notices(&engine);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(recorded[1].starts_with("Mode: Work."), "{recorded:?}");
 }

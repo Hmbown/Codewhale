@@ -122,11 +122,9 @@ describe("role tokens", () => {
     }
   });
 
-  it("starts terminal-section text only where the tide is deep enough", () => {
+  it("keeps stage text readable over the deep tide stops", () => {
     // The tide runs paper -> aqua -> logo light -> logo deep -> mid -> navy.
-    // Headings (text ink) start past the logo-deep stop; muted ink (the
-    // terminal's description and caption) only past the mid stop. home.css
-    // pads the section so its first line sits below 9rem.
+    // Only its deep stops can carry stage text; the pale stops cannot.
     const ramp = stops("tide");
     const deep = ramp.indexOf(hex("var(--brand-deep)"));
     const mid = ramp.indexOf(hex("var(--sea-mid)"));
@@ -138,6 +136,5 @@ describe("role tokens", () => {
     for (const stop of ramp.slice(mid)) {
       expect(contrast(hex(stage().muted), stop), `muted on ${stop}`).toBeGreaterThanOrEqual(4.5);
     }
-    expect(CSS).toMatch(/\.home-terminal-inner\s*\{[^}]*padding-block:\s*clamp\(9rem/);
   });
 });

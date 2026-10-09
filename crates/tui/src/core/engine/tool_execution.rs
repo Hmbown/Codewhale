@@ -49,20 +49,20 @@ impl Drop for ReplaySpanSequenceGuard {
 
 /// Pairs an observed `OperationActivityStarted` with at most one completion.
 ///
-/// The turn loop drops an in-flight tool future when the user cancels
-/// (`tokio::select!` on the cancel token, or `drop(tool_tasks)` for a parallel
-/// batch), so a Completed sent inline after the await would never be sent.
-/// Dropping an unfinished span sends `Completed { Cancelled }` with
-/// `try_send`: best effort, like the other guards here, because `Drop` cannot
-/// await a full channel. Cancellation may release a completion parked on a
-/// full queue; the turn's reserved terminal observation settles its lifecycle.
-pub(super) struct OperationSpanGuard {
-    tx: mpsc::Sender<Event>,
-    span: Option<(String, codewhale_protocol::engine_owner::OwnerActivityKind)>,
-    cancel: Option<CancellationToken>,
+/// The turn loop drops an in-flight tool future when the user cancels.
+/// Capacity reserved before admission keeps completion synchronous even when
+/// a nested call is withdrawn while its parent continues.
+pub(crate) struct OperationSpanGuard<'a> {
+    start: Option<mpsc::Permit<'a, Event>>,
+    span: Option<(
+        mpsc::Permit<'a, Event>,
+        String,
+        codewhale_protocol::engine_owner::OwnerActivityKind,
+        Option<String>,
+    )>,
 }
 
-impl OperationSpanGuard {
+impl<'a> OperationSpanGuard<'a> {
     /// A process-unique span id. The model's tool-call id is not unique:
     /// gateways that elide ids fall back to `call_{block_index}`, which
     /// repeats every step, and a consumer deduplicates completed spans.
@@ -83,62 +83,87 @@ impl OperationSpanGuard {
         format!("{call_id}#{seq}")
     }
 
-    pub(super) async fn start(
-        tx: mpsc::Sender<Event>,
+    pub(crate) async fn reserve(
+        tx: &'a mpsc::Sender<Event>,
         call_id: &str,
         activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        action_id: Option<String>,
         cancel: Option<CancellationToken>,
     ) -> Self {
-        let span_id = Self::span_id(call_id);
-        // Reservation is cancel safe: if this future is dropped the event
-        // was either sent or not, and the guard is armed only once it was.
-        let sent = match super::streaming::reserve_event_capacity(
-            &tx,
-            cancel.as_ref(),
-            super::streaming::EventReservationPolicy::Strict,
-        )
-        .await
-        {
-            Ok(permit) => {
-                permit.send(Event::OperationActivityStarted {
-                    span_id: span_id.clone(),
-                    activity_kind,
-                });
-                true
-            }
-            Err(_) => false,
+        let reserve = tx.reserve_many(2);
+        let permits = match cancel.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                result = reserve => result.ok(),
+            },
+            None => reserve.await.ok(),
         };
+        let Some(mut permits) = permits else {
+            return Self {
+                start: None,
+                span: None,
+            };
+        };
+        let start = permits.next().expect("reserved activity start");
+        let completion = permits.next().expect("reserved activity completion");
         Self {
-            tx,
-            span: sent.then_some((span_id, activity_kind)),
-            cancel,
+            start: Some(start),
+            span: Some((completion, Self::span_id(call_id), activity_kind, action_id)),
         }
     }
 
-    async fn complete(mut self, outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome) {
-        if let Some((span_id, activity_kind)) = self.span.take()
-            && let Ok(permit) = super::streaming::reserve_event_capacity(
-                &self.tx,
-                self.cancel.as_ref(),
-                super::streaming::EventReservationPolicy::Receipt,
-            )
+    pub(crate) fn activate(mut self) -> Self {
+        if let Some(start) = self.start.take()
+            && let Some((_, span_id, activity_kind, action_id)) = &self.span
+        {
+            start.send(Event::OperationActivityStarted {
+                span_id: span_id.clone(),
+                activity_kind: *activity_kind,
+                action_id: action_id.clone(),
+            });
+        }
+        self
+    }
+
+    pub(crate) async fn start(
+        tx: &'a mpsc::Sender<Event>,
+        call_id: &str,
+        activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        action_id: Option<String>,
+        cancel: Option<CancellationToken>,
+    ) -> Self {
+        Self::reserve(tx, call_id, activity_kind, action_id, cancel)
             .await
+            .activate()
+    }
+
+    pub(crate) async fn complete(
+        mut self,
+        outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome,
+    ) {
+        if self.start.is_none()
+            && let Some((permit, span_id, activity_kind, action_id)) = self.span.take()
         {
             permit.send(Event::OperationActivityCompleted {
                 span_id,
                 activity_kind,
+                action_id,
                 outcome,
             });
         }
     }
 }
 
-impl Drop for OperationSpanGuard {
+impl Drop for OperationSpanGuard<'_> {
     fn drop(&mut self) {
-        if let Some((span_id, activity_kind)) = self.span.take() {
-            let _ = self.tx.try_send(Event::OperationActivityCompleted {
+        if self.start.is_none()
+            && let Some((permit, span_id, activity_kind, action_id)) = self.span.take()
+        {
+            permit.send(Event::OperationActivityCompleted {
                 span_id,
                 activity_kind,
+                action_id,
                 outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Cancelled,
             });
         }
@@ -590,7 +615,7 @@ impl Engine {
         // Typed owner activity: classified only after every gate above has
         // passed, from the same authority that dispatches the call (the MCP
         // pool's resolved server map, the interpreter, or the registry plus
-        // the canonical action alias). Names and arguments never leave here.
+        // the canonical action alias). Arguments never leave here.
         let activity_kind = match activity_call_id.as_ref() {
             None => None,
             Some(_) if McpPool::is_mcp_tool(&tool_name) => match mcp_pool.as_ref() {
@@ -610,25 +635,11 @@ impl Engine {
             {
                 Some(codewhale_protocol::engine_owner::OwnerActivityKind::Executing)
             }
-            // The code-mode wrapper is not itself an operation.
-            Some(_) if tool_name == EXECUTE_TOOLS_TOOL_NAME => None,
             Some(_) => registry
                 .filter(|registry| registry.get(&tool_name).is_some())
                 .and_then(|_| {
                     crate::tools::activity::registry_activity_kind(&tool_name, &tool_input)
                 }),
-        };
-        let operation_span = match (activity_call_id.as_deref(), activity_kind) {
-            (Some(call_id), Some(activity_kind)) => Some(
-                OperationSpanGuard::start(
-                    tx_event.clone(),
-                    call_id,
-                    activity_kind,
-                    cancel_token.clone(),
-                )
-                .await,
-            ),
-            _ => None,
         };
         if cancel_token
             .as_ref()
@@ -660,135 +671,171 @@ impl Engine {
         } else {
             None
         };
-        if let Some(context) = context_override
+        let context = context_override
             .as_ref()
-            .or_else(|| registry.map(|registry| registry.context()))
-            && (context.acp_host.is_some() || context.child_host.is_some())
+            .or_else(|| registry.map(|registry| registry.context()));
+        let execution_receipt = if context
+            .is_some_and(|context| context.acp_host.is_some() || context.child_host.is_some())
+            && activity_call_id.is_some()
         {
-            let spec = registry
-                .and_then(|registry| registry.get(&tool_name))
-                .ok_or_else(|| {
-                    ToolError::not_available("ACP call has no admitted registered tool")
-                })?;
-            crate::tools::registry::enforce_tool_authority(
-                &tool_name,
-                &tool_input,
-                spec.as_ref(),
-                context,
-            )?;
-            crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
-                .map_err(ToolError::not_available)?;
-            if let Some(id) = activity_call_id.as_ref() {
-                if let Ok(permit) = super::streaming::reserve_event_capacity(
+            Some(
+                super::streaming::reserve_event_capacity(
                     &tx_event,
                     cancel_token.as_ref(),
                     super::streaming::EventReservationPolicy::Receipt,
                 )
                 .await
-                {
-                    // Event backpressure is an await boundary. Recheck the
-                    // exact captured authority before claiming dispatch.
-                    if cancel_token
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
-                        return Err(ToolError::cancelled("ACP dispatch admission cancelled"));
-                    }
-                    crate::tools::registry::enforce_tool_authority(
-                        &tool_name,
-                        &tool_input,
-                        spec.as_ref(),
-                        context,
-                    )?;
-                    crate::extension_host::validate_caller_plugins(
-                        context.plugin_registry.as_deref(),
-                    )
-                    .map_err(ToolError::not_available)?;
-                    permit.send(Event::ToolExecutionStarted { id: id.clone() });
-                } else {
-                    return Err(ToolError::cancelled("ACP dispatch observation unavailable"));
-                }
+                .map_err(|_| ToolError::cancelled("ACP dispatch observation unavailable"))?,
+            )
+        } else {
+            None
+        };
+        let operation_span = match (activity_call_id.as_deref(), activity_kind) {
+            (Some(call_id), Some(kind)) => Some(
+                OperationSpanGuard::reserve(
+                    &tx_event,
+                    call_id,
+                    kind,
+                    Some(crate::tools::activity::action_id(&tool_name, &tool_input)),
+                    cancel_token.clone(),
+                )
+                .await,
+            ),
+            _ => None,
+        };
+        let on_admitted = || {
+            if cancel_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(ToolError::cancelled("Tool activity admission cancelled."));
             }
-        }
-        let outcome: Result<RichToolResult, ToolError> = if McpPool::is_mcp_tool(&tool_name) {
-            if let Some(pool) = mcp_pool {
-                let disallowed_tools = context_override
+            if let Some(context) = context
+                && (context.acp_host.is_some() || context.child_host.is_some())
+            {
+                let spec = registry
+                    .and_then(|registry| registry.get(&tool_name))
+                    .ok_or_else(|| {
+                        ToolError::not_available("ACP call has no admitted registered tool")
+                    })?;
+                crate::tools::registry::enforce_tool_authority(
+                    &tool_name,
+                    &tool_input,
+                    spec.as_ref(),
+                    context,
+                )?;
+                crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
+                    .map_err(ToolError::not_available)?;
+            }
+            if let Some(permit) = execution_receipt {
+                permit.send(Event::ToolExecutionStarted {
+                    id: activity_call_id
+                        .as_ref()
+                        .expect("reserved execution identity")
+                        .clone(),
+                });
+            }
+            Ok(operation_span.map(OperationSpanGuard::activate))
+        };
+        let registry_dispatch = !McpPool::is_mcp_tool(&tool_name)
+            && !matches!(
+                tool_name.as_str(),
+                CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME | EXECUTE_TOOLS_TOOL_NAME
+            );
+        let outcome = if registry_dispatch {
+            match registry {
+                Some(registry) => {
+                    registry
+                        .execute_rich_full_with_context(
+                            &tool_name,
+                            tool_input.clone(),
+                            context_override.as_ref(),
+                            on_admitted,
+                        )
+                        .await
+                }
+                None => Err(ToolError::not_available(format!(
+                    "tool '{tool_name}' is not registered"
+                ))),
+            }
+        } else {
+            let operation_span = on_admitted()?;
+            let outcome: Result<RichToolResult, ToolError> = if McpPool::is_mcp_tool(&tool_name) {
+                if let Some(pool) = mcp_pool {
+                    let disallowed_tools = context_override
+                        .as_ref()
+                        .or_else(|| registry.map(|registry| registry.context()))
+                        .map(|context| context.disallowed_tools.as_slice())
+                        .unwrap_or_default();
+                    // Only a per-call override can carry a person's decision; the
+                    // registry's shared context never does.
+                    let decision = context_override
+                        .as_ref()
+                        .and_then(|context| context.human_decision.as_ref());
+                    Engine::execute_mcp_tool_with_pool(
+                        pool,
+                        &tx_event,
+                        &tool_name,
+                        tool_input,
+                        disallowed_tools,
+                        decision,
+                    )
+                    .await
+                } else {
+                    Err(ToolError::not_available(format!(
+                        "tool '{tool_name}' is not registered"
+                    )))
+                }
+            } else if matches!(
+                tool_name.as_str(),
+                CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+            ) {
+                if let Some(context) = context_override
                     .as_ref()
                     .or_else(|| registry.map(|registry| registry.context()))
-                    .map(|context| context.disallowed_tools.as_slice())
-                    .unwrap_or_default();
-                // Only a per-call override can carry a person's decision; the
-                // registry's shared context never does.
-                let decision = context_override
-                    .as_ref()
-                    .and_then(|context| context.human_decision.as_ref());
-                Engine::execute_mcp_tool_with_pool(
-                    pool,
-                    &tx_event,
-                    &tool_name,
-                    tool_input,
-                    disallowed_tools,
-                    decision,
-                )
-                .await
-            } else {
-                Err(ToolError::not_available(format!(
-                    "tool '{tool_name}' is not registered"
-                )))
-            }
-        } else if matches!(
-            tool_name.as_str(),
-            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
-        ) {
-            if let Some(context) = context_override
-                .as_ref()
-                .or_else(|| registry.map(|registry| registry.context()))
-            {
-                let result = if tool_name == CODE_EXECUTION_TOOL_NAME {
-                    execute_code_execution_tool(&tool_input, &workspace, context).await
+                {
+                    let result = if tool_name == CODE_EXECUTION_TOOL_NAME {
+                        execute_code_execution_tool(&tool_input, &workspace, context).await
+                    } else {
+                        execute_js_execution_tool(&tool_input, &workspace, context).await
+                    };
+                    result.map(RichToolResult::plain)
                 } else {
-                    execute_js_execution_tool(&tool_input, &workspace, context).await
-                };
-                result.map(RichToolResult::plain)
-            } else {
-                Err(ToolError::not_available(
-                    "local code execution requires an effective tool context",
-                ))
-            }
-        } else if tool_name == EXECUTE_TOOLS_TOOL_NAME {
-            if let Some(registry) = registry {
-                let context = context_override
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| registry.context().clone());
-                crate::tools::codemode::execute_tools_tool(&tool_input, registry, &context)
-                    .await
-                    .map(RichToolResult::plain)
+                    Err(ToolError::not_available(
+                        "local code execution requires an effective tool context",
+                    ))
+                }
+            } else if tool_name == EXECUTE_TOOLS_TOOL_NAME {
+                if let Some(registry) = registry {
+                    let context = context_override
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| registry.context().clone());
+                    crate::tools::codemode::execute_tools_tool(&tool_input, registry, &context)
+                        .await
+                        .map(RichToolResult::plain)
+                } else {
+                    Err(ToolError::not_available(format!(
+                        "tool '{tool_name}' is not registered"
+                    )))
+                }
             } else {
                 Err(ToolError::not_available(format!(
                     "tool '{tool_name}' is not registered"
                 )))
+            };
+            if let Some(operation_span) = operation_span {
+                operation_span
+                    .complete(crate::tools::activity::operation_outcome(
+                        &outcome,
+                        cancel_token
+                            .as_ref()
+                            .is_some_and(CancellationToken::is_cancelled),
+                    ))
+                    .await;
             }
-        } else if let Some(registry) = registry {
-            registry
-                .execute_rich_full_with_context(&tool_name, tool_input, context_override.as_ref())
-                .await
-        } else {
-            Err(ToolError::not_available(format!(
-                "tool '{tool_name}' is not registered"
-            )))
+            outcome
         };
-
-        if let Some(operation_span) = operation_span {
-            let cancelled = cancel_token
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled);
-            operation_span
-                .complete(crate::tools::activity::operation_outcome(
-                    &outcome, cancelled,
-                ))
-                .await;
-        }
 
         if outcome.as_ref().is_ok_and(|result| result.result.success)
             && let Some((authority, writes)) = child_mcp_call
@@ -888,9 +935,10 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(2);
             let cancel = CancellationToken::new();
             let span = OperationSpanGuard::start(
-                tx,
+                &tx,
                 "completed-call",
                 OwnerActivityKind::Tool,
+                Some("tool".into()),
                 Some(cancel.clone()),
             )
             .await;
@@ -901,6 +949,7 @@ mod tests {
             let Event::OperationActivityStarted {
                 span_id,
                 activity_kind,
+                action_id,
             } = rx.try_recv().unwrap()
             else {
                 panic!("activity start");
@@ -909,6 +958,7 @@ mod tests {
                 span_id: completed_span,
                 activity_kind: completed_kind,
                 outcome: completed_outcome,
+                action_id: completed_action,
             } = rx
                 .try_recv()
                 .expect("cancellation must not discard the completion")
@@ -917,6 +967,7 @@ mod tests {
             };
             assert_eq!(completed_span, span_id);
             assert_eq!(completed_kind, activity_kind);
+            assert_eq!(completed_action, action_id);
             assert_eq!(
                 completed_outcome, outcome,
                 "retain the observed outcome exactly"
@@ -924,30 +975,41 @@ mod tests {
             assert!(rx.try_recv().is_err(), "exactly one completion");
         }
 
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut spans = Vec::new();
+        for i in 0..256 {
+            spans.push(
+                OperationSpanGuard::start(
+                    &tx,
+                    &format!("full-call-{i}"),
+                    OwnerActivityKind::Tool,
+                    Some("tool".into()),
+                    None,
+                )
+                .await,
+            );
+        }
+        assert_eq!(tx.capacity(), 0);
+        drop(spans);
+        let mut starts = 0;
+        let mut cancelled = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Event::OperationActivityStarted { .. } => starts += 1,
+                Event::OperationActivityCompleted {
+                    outcome: OwnerOperationOutcome::Cancelled,
+                    ..
+                } => cancelled += 1,
+                other => panic!("unexpected activity receipt: {other:?}"),
+            }
+        }
+        assert_eq!((starts, cancelled), (256, 256));
+        assert_eq!(tx.capacity(), 512);
         let (tx, mut rx) = mpsc::channel(1);
-        let cancel = CancellationToken::new();
-        let span = OperationSpanGuard::start(
-            tx,
-            "full-call",
-            OwnerActivityKind::Tool,
-            Some(cancel.clone()),
-        )
-        .await;
-        cancel.cancel();
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            span.complete(OwnerOperationOutcome::Succeeded),
-        )
-        .await
-        .expect("a full queue cannot retain a cancelled activity sender");
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            Event::OperationActivityStarted { .. }
-        ));
-        assert!(
-            rx.try_recv().is_err(),
-            "no sender survives to publish after draining"
-        );
+        let span =
+            OperationSpanGuard::start(&tx, "too-small", OwnerActivityKind::Tool, None, None).await;
+        drop(span);
+        assert!(rx.try_recv().is_err(), "never publish an unpaired start");
     }
 
     #[tokio::test]

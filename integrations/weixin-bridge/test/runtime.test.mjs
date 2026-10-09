@@ -14,12 +14,12 @@ async function until(check, message, timeout = 8000) {
   while (Date.now() < deadline) { if (await check()) return; await delay(25); }
   assert.fail(message);
 }
-function incoming(id, text, user = "alice") {
-  return { message_id: id, from_user_id: user, message_type: 1, context_token: "context-fixture", item_list: [{ type: 1, text_item: { text } }] };
+function incoming(id, text, user = "alice", contextToken = "context-fixture") {
+  return { message_id: id, from_user_id: user, message_type: 1, context_token: contextToken, item_list: [{ type: 1, text_item: { text } }] };
 }
 async function fixture(t, options = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "weixin-runtime-"));
-  const state = { polls: 0, batches: [], posts: [], sent: [], lookups: 0, streams: new Set(), turns: [], items: [], seq: 0, approvals: [], decisions: [], logs: "" };
+  const state = { polls: 0, batches: [], posts: [], sent: [], summaryQueries: [], lookups: 0, threadCreates: 0, threadReads: [], streams: new Set(), turns: [], items: [], seq: 0, approvals: [], decisions: [], logs: "" };
   const json = (response, body, status = 200) => { response.writeHead(status, { "Content-Type": "application/json" }); response.end(JSON.stringify(body)); };
   const server = http.createServer(async (req, res) => {
     let raw = ""; for await (const chunk of req) raw += chunk;
@@ -42,9 +42,13 @@ async function fixture(t, options = {}) {
     if (url.pathname === "/v1/workspace/status") return json(res, { workspace: dir });
     if (url.pathname === "/v1/threads" && req.method === "POST") {
       state.threadRequest = body;
-      return json(res, { id: "thread-1" });
+      return json(res, { id: `thread-${++state.threadCreates}` });
     }
-    if (url.pathname === "/v1/threads/thread-1") return json(res, { id: "thread-1", latest_seq: state.seq, turns: state.turns, items: state.items, pending_approvals: state.approvals });
+    if (url.pathname === "/v1/threads/summary") { state.summaryQueries.push((url.searchParams.get("thread_ids") || "").split(",").filter(Boolean)); return json(res, options.summaries || []); }
+    if (/^\/v1\/threads\/[^/]+$/.test(url.pathname)) {
+      state.threadReads.push(url.pathname);
+      return json(res, { id: url.pathname.split("/").at(-1), latest_seq: state.seq, turns: state.turns, items: state.items, pending_approvals: state.approvals });
+    }
     if (url.pathname === "/v1/threads/thread-1/turns") {
       state.posts.push(body);
       const turn = { id: "turn-1", thread_id: "thread-1", status: "in_progress" };
@@ -107,7 +111,7 @@ test("production process keeps polling and owner approvals live, dedupes real me
   f.event("approval.required", f.approvals[0]);
   await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("approval_id=approval-1")), "approval notice missing");
   f.batches.push([incoming(0, "private original prompt"), incoming(2, "/allow approval-1", "bob"), incoming(3, "/allow approval-1")]);
-  await until(() => f.decisions.length === 1, "initiating owner could not approve during stream");
+  await until(() => f.decisions.length === 1 && f.polls > polls, "initiating owner could not approve or polling stopped during stream");
   assert.equal(f.posts.length, 1); assert.ok(f.polls > polls); assert.deepEqual(f.decisions, [{ decision: "allow", remember: false }]);
   f.event("item.delta", { kind: "agent_message", delta: "answer" }); f.complete("answer");
   await until(async () => !(await f.disk()).chats?.alice?.activeTurnId, "accepted output did not settle");
@@ -153,7 +157,19 @@ test("changed bot account cannot reuse or flush a retained old conversation", as
   f.batches.push([incoming(2, "new account prompt")]); f.start();
   await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("pending turn or retained reply")), "replacement account prompt was not handled");
   assert.equal(f.posts.length, 1); assert.equal(f.sent.some((msg) => msg.item_list[0].text_item.text.includes("old private answer")), false);
+  assert.equal(f.sent.find((msg) => msg.item_list[0].text_item.text.includes("pending turn or retained reply")).context_token, undefined);
   assert.equal((await f.disk()).chats.alice.turnDelivery.accountId, "bot-A");
+});
+
+test("unattributed legacy context token is not reused for an outgoing message", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({
+    chats: { alice: { bindingAccountId: "bot-A", contextToken: "legacy-context" } },
+    messages: [], inflight: {},
+  }));
+  f.batches.push([incoming(1, "/help", "alice", "")]); f.start();
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("显示此帮助")), "help response was not sent");
+  assert.equal(f.sent.at(-1).context_token, undefined);
 });
 
 test("both Engine capability flags are required before reconciling an uncertain admission", async (t) => {
@@ -210,4 +226,142 @@ test("unanswered admission response leaves polling and status controls live", as
   await until(() => f.polls > polls, "inbound polling did not advance while admission remained unanswered", 3500);
   assert.ok(Date.now() - started < 7000); assert.equal(f.posts.length, 1);
   assert.equal((await f.disk()).chats.alice.pendingAdmission.submitted, true);
+});
+
+test("replacement account explicitly starts fresh while retaining the old uncertain receipt", async (t) => {
+  const f = await fixture(t);
+  const old = { threadId: "old-thread", bindingAccountId: "bot-A", activeTurnId: "old-turn", contextToken: "old-context", turnDelivery: {
+    accountId: "bot-A", actorId: "weixin-account:bot-A:user:alice", messageKey: "old-key", turnId: "old-turn",
+    outputs: [{ text: "old private answer", status: "uncertain", clientId: "old-client" }],
+  } };
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({ chats: { alice: old }, messages: [], inflight: {} }));
+  await fs.writeFile(path.join(f.dir, "account.json"), JSON.stringify({ ...f.account, accountId: "bot-B" }));
+  f.batches.push([incoming(1, "/new", "alice", "bot-B-context")]); f.start();
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text === "Created thread thread-1"), "replacement account remained blocked");
+  const current = (await f.disk()).chats.alice;
+  assert.equal(current.bindingAccountId, "bot-B"); assert.equal(current.activeTurnId, null); assert.equal(current.turnDelivery, undefined);
+  assert.equal(current.contextToken, "bot-B-context"); assert.equal(current.contextTokenAccountId, "bot-B");
+  const retained = Object.values(current.retiredAccountStates);
+  assert.equal(retained.length, 1); assert.equal(retained[0].threadId, "old-thread");
+  assert.deepEqual(retained[0].turnDelivery, old.turnDelivery); assert.equal(retained[0].activeTurnId, "old-turn");
+  assert.equal(retained[0].contextToken, "old-context");
+  assert.equal(f.sent.find((msg) => msg.item_list[0].text_item.text === "Created thread thread-1").context_token, "bot-B-context");
+  await delay(1100); assert.equal(f.posts.length, 0); assert.equal(f.threadReads.length, 0);
+  assert.equal(f.sent.some((msg) => msg.item_list[0].text_item.text.includes("old private answer")), false);
+});
+
+for (const receiptKind of ["pendingAdmission", "turnDelivery"]) test(`unbound ${receiptKind} keeps its account context until explicit replacement`, async (t) => {
+  const f = await fixture(t);
+  const receipt = { accountId: "bot-A", actorId: "weixin-account:bot-A:user:alice", messageKey: "old-key",
+    ...(receiptKind === "pendingAdmission"
+      ? { request: { prompt: "old private prompt" }, submitted: false }
+      : { outputs: [{ text: "old private answer", status: "uncertain" }] }),
+  };
+  const old = { contextToken: "bot-A-context", contextTokenAccountId: "bot-A", [receiptKind]: receipt };
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({ chats: { alice: old }, messages: [], inflight: {} }));
+  await fs.writeFile(path.join(f.dir, "account.json"), JSON.stringify({ ...f.account, accountId: "bot-B" }));
+  f.batches.push([incoming(1, "/help", "alice", "bot-B-context")]); f.start();
+  await until(() => f.sent.length === 1, "new account help was not handled");
+  assert.equal(f.sent[0].context_token, undefined);
+  assert.equal((await f.disk()).chats.alice.contextToken, "bot-A-context");
+  assert.deepEqual((await f.disk()).chats.alice[receiptKind], receipt);
+  f.batches.push([incoming(2, "/new", "alice", "bot-B-context")]);
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text === "Created thread thread-1"), "explicit replacement did not complete");
+  const current = (await f.disk()).chats.alice;
+  const retained = Object.values(current.retiredAccountStates);
+  assert.equal(retained.length, 1);
+  assert.equal(retained[0].contextToken, "bot-A-context");
+  assert.equal(retained[0].contextTokenAccountId, "bot-A");
+  assert.deepEqual(retained[0][receiptKind], receipt);
+  assert.equal(current.contextToken, "bot-B-context");
+  assert.equal(current.contextTokenAccountId, "bot-B");
+  assert.equal(current.bindingAccountId, "bot-B");
+  assert.equal(current[receiptKind], undefined);
+  assert.equal(f.sent.at(-1).context_token, "bot-B-context");
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.threadReads.length, 0);
+});
+
+test("unattributed pending admission cannot have its context replaced by an inbound token", async (t) => {
+  const f = await fixture(t);
+  const old = { contextToken: "unattributed-context", pendingAdmission: { request: { prompt: "retained prompt" } } };
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({ chats: { alice: old }, messages: [], inflight: {} }));
+  f.batches.push([incoming(1, "/help")]); f.start();
+  await until(() => f.sent.length === 1, "help was not handled");
+  assert.equal(f.sent[0].context_token, undefined);
+  assert.equal((await f.disk()).chats.alice.contextToken, old.contextToken);
+  assert.deepEqual((await f.disk()).chats.alice.pendingAdmission, old.pendingAdmission);
+  assert.equal(f.threadCreates, 0);
+});
+
+for (const limit of ["count", "bytes"]) test(`replacement account refuses ${limit} overflow without losing private receipts`, async (t) => {
+  const f = await fixture(t);
+  const retiredAccountStates = limit === "count"
+    ? Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`receipt-${i}`, { threadId: `old-${i}` }]))
+    : { receipt: { prompt: "x".repeat(1024 * 1024) } };
+  const old = { threadId: "old-thread", bindingAccountId: "bot-A", retiredAccountStates,
+    pendingAdmission: { accountId: "bot-A", request: { prompt: "retained private prompt" } } };
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({ chats: { alice: old }, messages: [], inflight: {} }));
+  await fs.writeFile(path.join(f.dir, "account.json"), JSON.stringify({ ...f.account, accountId: "bot-B" }));
+  f.batches.push([incoming(1, "/new", "alice", "bot-B-context")]); f.start();
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("Retired account receipt storage is full")), "retirement storage limit was not reported");
+  const current = (await f.disk()).chats.alice;
+  assert.equal(f.threadCreates, 0);
+  assert.equal(current.threadId, old.threadId);
+  assert.equal(current.bindingAccountId, old.bindingAccountId);
+  assert.deepEqual(current.retiredAccountStates, retiredAccountStates);
+  assert.deepEqual(current.pendingAdmission, old.pendingAdmission);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.sent.some((msg) => msg.item_list[0].text_item.text.includes("retained private prompt")), false);
+});
+
+test("same-account new-thread command cannot discard a pending admission", async (t) => {
+  const f = await fixture(t, { admission: () => {} }); f.batches.push([incoming(1, "pending")]); f.start();
+  await until(() => f.posts.length === 1, "pending admission missing");
+  f.batches.push([incoming(2, "/new")]);
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("New conversation failed: This chat still has a pending turn or retained reply")), "same-account pending state was overwritten or the control gave no answer");
+  assert.equal(f.threadCreates, 1); assert.equal((await f.disk()).chats.alice.pendingAdmission.request.prompt, "pending");
+});
+
+test("resume and thread summaries retain account-and-chat ownership across new conversations", async (t) => {
+  const f = await fixture(t, { summaries: [
+    { id: "thread-1", title: "Alice private title" }, { id: "unbound-thread", title: "Other account private title" },
+  ] });
+  f.batches.push([incoming(1, "/new"), incoming(2, "/resume thread-1", "bob"), incoming(3, "/threads", "bob"), incoming(4, "/threads")]);
+  f.start();
+  await until(() => f.sent.length === 4, "ownership controls were not handled");
+  const texts = f.sent.map((msg) => msg.item_list[0].text_item.text);
+  assert.match(texts[1], /not owned by this account and chat/);
+  assert.match(texts[2], /No recent runtime threads owned/);
+  assert.match(texts[3], /Alice private title/); assert.ok(!texts.some((text) => text.includes("Other account private title")));
+  assert.deepEqual(f.summaryQueries, [["thread-1"]], "the bridge requests only locally bound threads owned by this account and chat");
+  assert.equal(f.threadReads.length, 0, "rejected resume must not read another chat's thread");
+  assert.equal((await f.disk()).chats.bob.threadId, undefined);
+  f.batches.push([incoming(5, "/new"), incoming(6, "/resume thread-1")]);
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text === "Resumed thread thread-1"), "owner could not resume its prior conversation");
+  assert.equal((await f.disk()).chats.alice.threadId, "thread-1"); assert.equal(f.threadCreates, 2); assert.equal(f.threadReads.length, 1);
+});
+
+test("replacement account cannot resume the retired account's owned thread", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({ chats: { alice: { threadId: "thread-1", bindingAccountId: "bot-A" } }, messages: [], inflight: {} }));
+  await fs.writeFile(path.join(f.dir, "account.json"), JSON.stringify({ ...f.account, accountId: "bot-B" }));
+  f.batches.push([incoming(1, "/resume thread-1")]); f.start();
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("not owned by this account and chat")), "foreign account resumed a private conversation");
+  assert.equal(f.threadReads.length, 0); assert.equal((await f.disk()).chats.alice.bindingAccountId, "bot-A");
+});
+
+test("restart between durable thread binding and admission update keeps the frozen prompt", async (t) => {
+  const f = await fixture(t); const key = JSON.stringify(["bot-A", "alice", "1"]);
+  const request = { prompt: "durable prompt", input_summary: "durable prompt", model: "frozen-model", mode: "agent", allow_shell: false, trust_mode: false, auto_approve: false, operation_key: "frozen-operation" };
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({ chats: { alice: {
+    threadId: "thread-1", bindingAccountId: "bot-A", pendingAdmission: {
+      accountId: "bot-A", actorId: "weixin-account:bot-A:user:alice", messageKey: key, request,
+      operationKey: request.operation_key, threadId: null, submitted: false, sinceSeq: null,
+    },
+  } }, messages: [key], inflight: { [key]: "interrupted" } }));
+  f.batches.push([incoming(1, "durable prompt")]); f.start();
+  await until(() => f.streams.size, "durable thread binding lost its pending prompt on restart");
+  assert.equal(f.threadCreates, 0); assert.equal(f.posts.length, 1); assert.deepEqual(f.posts[0], request);
+  assert.equal((await f.disk()).chats.alice.turnDelivery.messageKey, key);
 });

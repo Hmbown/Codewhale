@@ -77,8 +77,6 @@ test("a crash mid-batch replays the batch without losing or re-running prompts",
       messages: batch, nextCursor: "buf-2", store: first, keyOf,
       handle: async (msg) => {
         if (msg.message_id === 2) {
-          // What a restarted process finds on disk while message 2 runs.
-          afterCrash = await ThreadStore.open(statePath, { messageLimit: 50 });
           throw crash;
         }
         handled.push(msg.message_id);
@@ -86,6 +84,8 @@ test("a crash mid-batch replays the batch without losing or re-running prompts",
       interrupted: async () => assert.fail("nothing is interrupted on the first pass"),
       commitCursor: async (buf) => cursors.push(buf),
     }), crash);
+    afterCrash = await ThreadStore.open(statePath, { messageLimit: 50 });
+    assert.ok(afterCrash.data.inflight["u:2"], "a failed handler must remain inflight on disk after rejection");
     assert.deepEqual(cursors, [], "the cursor does not move past unhandled messages");
 
     const reported = [];

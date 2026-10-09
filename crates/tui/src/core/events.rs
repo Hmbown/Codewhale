@@ -267,15 +267,17 @@ pub enum Event {
 
     /// Trusted operation activity emitted only after dispatch and authority
     /// gates resolve the underlying operation. The payload deliberately
-    /// excludes tool names, arguments, commands, and results.
+    /// excludes arguments, commands, and results.
     OperationActivityStarted {
         span_id: String,
         activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        action_id: Option<String>,
     },
     OperationActivityCompleted {
         span_id: String,
         activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
         outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome,
+        action_id: Option<String>,
     },
 
     // === Turn Lifecycle ===

@@ -6,7 +6,7 @@ Thank you for your interest in contributing to codewhale! This document provides
 
 ### Prerequisites
 
-- Rust 1.88 or later (edition 2024)
+- Rust 1.89 or later (edition 2024)
 - Cargo package manager
 - Git
 
@@ -18,20 +18,42 @@ Thank you for your interest in contributing to codewhale! This document provides
    cd CodeWhale
    ```
 
-2. Build the project:
+2. Build the current engine and terminal:
    ```bash
-   cargo build
+   CODEWHALE_BUILD_SHA="$(git rev-parse HEAD)" cargo build --locked -p codewhale-cli
    ```
 
-3. Run tests:
+3. Run the tests near your change (see [Fast local loop](#fast-local-loop)):
    ```bash
-   cargo test --workspace --all-features
+   scripts/dev-test.sh tui your_test_filter
    ```
 
 4. Run with development settings:
    ```bash
-   cargo run --bin codewhale
+   ./target/debug/codewhale --version
+   ./target/debug/codewhale
    ```
+
+### Testing the latest source
+
+The canonical source is [`codewhale-hq/Codewhale`'s `main` branch](https://github.com/codewhale-hq/Codewhale/tree/main).
+Release candidates land there after their CI gates pass, so contributors can
+test and build on the same source. Tagged downloads remain the latest published
+release; their version can lag the development version on `main`.
+
+For a fresh checkout of the current source:
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/Codewhale.git
+cd Codewhale
+CODEWHALE_BUILD_SHA="$(git rev-parse HEAD)" cargo build --release --locked -p codewhale-cli
+./target/release/codewhale --version
+./target/release/codewhale
+```
+
+Include the commit shown by `--version` when reporting a problem. If you work
+from a fork, add the canonical repository as `upstream` and fetch `upstream/main`
+before starting a change; preserve any local work when updating your branch.
 
 ## Development Workflow
 
@@ -98,7 +120,7 @@ scripts/dev-cargo.sh check -p codewhale-tui
 
 # 2. Run only the tests near your change (one crate, one filter).
 scripts/dev-test.sh tui fleet_setup
-# or: scripts/dev-test.sh crates/runtime/src/elapsed.rs
+# or: scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 
 # 3. Run a whole crate's unit suite. scripts/dev-test.sh uses nextest when
 #    it is installed (one process per test, all cores busy, slow tests

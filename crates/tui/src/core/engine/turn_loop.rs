@@ -152,6 +152,10 @@ struct StreamOutcome {
     first_token_at: Option<Instant>,
     request_dispatched_at: Instant,
     stream_error: Option<String>,
+    /// Envelope of a retryable provider error frame (#6795), held back so a
+    /// retry that succeeds leaves no error card. Posted by the caller when the
+    /// request is not re-issued.
+    frame_error: Option<ErrorEnvelope>,
 }
 
 pub(super) fn initial_stream_error_user_message(
@@ -933,6 +937,47 @@ impl Engine {
         })
     }
 
+    /// Post the retryable error frame `process_stream` held back (#6795), once,
+    /// for a turn that ends without re-issuing the request. Every return that
+    /// ends the turn between the stream and the retry decision calls this, so
+    /// no exit leaves the TUI to synthesize its own amber warning instead.
+    ///
+    /// Boxed so the several call sites embed a pointer, not this future, in
+    /// the already very large model-step state machine (a debug-build test
+    /// thread has a 2 MiB stack).
+    pub(super) fn post_held_frame_error<'a>(
+        &'a self,
+        frame_error: &'a Option<ErrorEnvelope>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(envelope) = frame_error {
+                let _ = self.send_stream_event(Event::error(envelope.clone())).await;
+            }
+        })
+    }
+
+    /// Tell the transcript why a turn stopped on one of Codewhale's own
+    /// ceilings (step count, wall clock). Without an error event the TUI adds
+    /// its own hard-coded amber warning for a failed turn (#6843); this card
+    /// is a budget error that leaves the session online. A child run reports
+    /// through its parent's receipt, so it posts only the status line.
+    ///
+    /// Boxed for the same reason as [`Self::post_held_frame_error`].
+    pub(super) fn post_turn_budget_stop<'a>(
+        &'a self,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.send_event(Event::status(message)).await;
+            if self.child_host.is_some() {
+                return;
+            }
+            let _ = self
+                .send_event(Event::error(ErrorEnvelope::budget_stop(message)))
+                .await;
+        })
+    }
+
     /// A connection completed during inference must be discoverable in this
     /// turn, without widening its command policy or making every MCP tool eager.
     pub(super) async fn refresh_boot_mcp_catalog(
@@ -1251,14 +1296,17 @@ impl Engine {
     async fn consult_auto_review_guardian(
         &self,
         client: &dyn crate::core::model_client::ModelClient,
-        context: &crate::tui::auto_review::AutoReviewContext<'_>,
+        context: &crate::core::authority::auto_review::AutoReviewContext<'_>,
         tool_input: &Value,
         held_reason: &str,
         tool_id: &str,
         turn: &mut TurnContext,
     ) -> Result<(), ToolError> {
-        let context_text =
-            crate::tui::auto_review::build_reviewer_context(context, held_reason, tool_input);
+        let context_text = crate::core::authority::auto_review::build_reviewer_context(
+            context,
+            held_reason,
+            tool_input,
+        );
         let _ = self
             .send_event(Event::status(format!(
                 "Auto-Review checking '{}'",
@@ -1383,8 +1431,7 @@ impl Engine {
             .terminal_chrome_enabled
             .then(crate::sleep_guard::SleepGuard::hold);
         if self.config.terminal_chrome_enabled {
-            crate::tui::notifications::set_taskbar_progress_busy();
-            crate::tui::notifications::start_title_animation("codewhale");
+            crate::host_terminal::host().begin_turn_chrome();
         }
 
         let client = self
@@ -1759,7 +1806,7 @@ impl Engine {
 
             if mode_blocks_command_execution(mode, &tool_name) {
                 blocked_error = Some(ToolError::permission_denied(format!(
-                    "'{tool_name}' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code."
+                    "'{tool_name}' is not available in Plan mode: Plan has no shell or code-execution tools. The user can change modes with /mode."
                 )));
             }
 
@@ -2042,7 +2089,7 @@ impl Engine {
                 && mode_blocks_write_capable_tool(mode, &tool_name, &tool_input, read_only)
             {
                 blocked_error = Some(ToolError::permission_denied(format!(
-                    "'{tool_name}' is not available in Plan mode - switch to Work mode (`/mode work`) to modify files or run write-capable tools."
+                    "'{tool_name}' is not available in Plan mode: Plan has no file-writing or write-capable tools. The user can change modes with /mode."
                 )));
             }
 
@@ -2105,7 +2152,7 @@ impl Engine {
 
             if blocked_error.is_none() {
                 let review_context =
-                    crate::tui::auto_review::AutoReviewContext::from_tool_call_async(
+                    crate::core::authority::auto_review::AutoReviewContext::from_tool_call_async(
                         &tool_name,
                         &tool_input,
                         if self.is_acp_turn() {
@@ -2145,10 +2192,10 @@ impl Engine {
                                 }
                             }
                             AutoReviewPlanDecision::ForcePrompt(reason) => {
-                                // The built-in safety floor is deliberately
-                                // non-bypassable. Ask/Auto-Review surface the hold;
-                                // Full Access turns this disposition into a hard
-                                // block below, without opening a modal.
+                                // The built-in safety floor holds outside Full
+                                // Access. Ask surfaces the hold as a real
+                                // decision; the non-interactive postures turn
+                                // this disposition into a hard block below.
                                 approval_required = true;
                                 approval_description = reason;
                                 approval_force_prompt = true;
@@ -2932,6 +2979,15 @@ impl Engine {
 
                     if is_tool_search_tool(&tool_name) {
                         let started_at = Instant::now();
+                        let activity_tx = self.tx_event.clone();
+                        let activity = super::tool_execution::OperationSpanGuard::start(
+                            &activity_tx,
+                            &tool_id,
+                            codewhale_protocol::engine_owner::OwnerActivityKind::Searching,
+                            Some(crate::tools::activity::action_id(&tool_name, &tool_input)),
+                            Some(self.cancel_token.clone()),
+                        )
+                        .await;
                         // Tool-search activation changes the request-visible
                         // catalog for the rest of the turn; declare it so the
                         // next request re-pins under `change:tool_surface`
@@ -2955,6 +3011,12 @@ impl Engine {
                                 &mut self.session.tool_activation_cache,
                             )
                         });
+                        activity
+                            .complete(crate::tools::activity::operation_outcome(
+                                &result.clone().map(RichToolResult::plain),
+                                self.cancel_token.is_cancelled(),
+                            ))
+                            .await;
                         if *active_tool_names != active_before_search {
                             self.session.pending_prefix_change_reason =
                                 Some("tool_surface".to_string());
@@ -2989,12 +3051,31 @@ impl Engine {
                             &tool_input,
                             self.config.user_input_limits,
                         ) {
-                            Ok(request) => self.await_user_input(&tool_id, request).await.and_then(
-                                |response| {
-                                    ToolResult::json(&response)
-                                        .map_err(|e| ToolError::execution_failed(e.to_string()))
-                                },
-                            ),
+                            Ok(request) => {
+                                let activity_tx = self.tx_event.clone();
+                                let activity = super::tool_execution::OperationSpanGuard::start(
+                                    &activity_tx,
+                                    &tool_id,
+                                    codewhale_protocol::engine_owner::OwnerActivityKind::Tool,
+                                    Some("request_user_input".into()),
+                                    Some(self.cancel_token.clone()),
+                                )
+                                .await;
+                                let result = self
+                                    .await_user_input(&tool_id, request)
+                                    .await
+                                    .and_then(|response| {
+                                        ToolResult::json(&response)
+                                            .map_err(|e| ToolError::execution_failed(e.to_string()))
+                                    });
+                                activity
+                                    .complete(crate::tools::activity::operation_outcome(
+                                        &result.clone().map(RichToolResult::plain),
+                                        self.cancel_token.is_cancelled(),
+                                    ))
+                                    .await;
+                                result
+                            }
                             Err(err) => Err(err),
                         };
 
@@ -3870,6 +3951,15 @@ impl Engine {
         // nothing is activated, so the session-pinned tool array and prefix
         // never change.
         if is_tool_search_tool(&plan.name) {
+            let activity_tx = self.tx_event.clone();
+            let activity = super::tool_execution::OperationSpanGuard::start(
+                &activity_tx,
+                &nested_id,
+                codewhale_protocol::engine_owner::OwnerActivityKind::Searching,
+                Some(crate::tools::activity::action_id(&plan.name, &plan.input)),
+                Some(self.cancel_token.clone()),
+            )
+            .await;
             if let Err(error) = self
                 .discover_mcp_for_tool_search(
                     (&plan.name, &plan.input),
@@ -3880,13 +3970,25 @@ impl Engine {
                 )
                 .await
             {
+                activity
+                    .complete(crate::tools::activity::operation_outcome(
+                        &Err(error.clone()),
+                        self.cancel_token.is_cancelled(),
+                    ))
+                    .await;
                 return NestedCallVerdict::Refused {
                     error,
                     decision: NestedDecision::Refused,
                 };
             }
-            return match super::tool_catalog::describe_tools_for_program(&plan.input, tool_catalog)
-            {
+            let result = super::tool_catalog::describe_tools_for_program(&plan.input, tool_catalog);
+            activity
+                .complete(crate::tools::activity::operation_outcome(
+                    &result.clone().map(RichToolResult::plain),
+                    self.cancel_token.is_cancelled(),
+                ))
+                .await;
+            return match result {
                 Ok(result) => NestedCallVerdict::Answered {
                     result,
                     hook_context,
@@ -4247,6 +4349,9 @@ impl Engine {
         let mut stream = stream;
         let mut stream_error: Option<String> = None;
         let mut terminal_stream_error = false;
+        // #6795: the envelope of a retryable error frame, posted only if the
+        // retry budget does not re-issue the request.
+        let mut frame_error: Option<ErrorEnvelope> = None;
 
         let mut current_text_raw = String::new();
         let mut current_text_visible = String::new();
@@ -4913,10 +5018,14 @@ impl Engine {
                     // the same typed envelope contract, record it as the
                     // turn's stream error, and stop consuming. Deltas that
                     // arrive after the failure frame are never forwarded.
-                    let message = error
+                    let raw_message = error
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("provider stream error");
+                    // A bare placeholder ("ERROR") says nothing about the
+                    // cause; the transcript states that instead (#6843).
+                    let unreadable = crate::error_taxonomy::unreadable_error_notice(raw_message);
+                    let message = unreadable.as_deref().unwrap_or(raw_message);
                     crate::logging::warn(format!("Provider stream error event: {message}"));
                     // #6795: a gateway can report a transient upstream failure
                     // as an error frame inside a 200. With nothing actionable
@@ -4929,14 +5038,22 @@ impl Engine {
                     // card behind. Auth, invalid-model and every other class
                     // stays terminal on the first frame, as does any frame
                     // after content (replaying would duplicate side effects).
+                    //
+                    // Either way the turn-ending envelope is non-recoverable,
+                    // so its severity is Error. A retryable frame holds it back
+                    // (`frame_error`): the post-loop retry either re-issues the
+                    // request and discards it, or the budget is spent and it is
+                    // posted then, once, so the card never promises a retry the
+                    // engine will not make.
+                    let envelope = ErrorEnvelope::classify(message.to_string(), false);
                     let transient = matches!(
-                        crate::error_taxonomy::classify_error_message(message),
+                        envelope.category,
                         ErrorCategory::Network | ErrorCategory::Timeout
                     );
                     if transient && !any_content_received {
                         stream_errors = stream_errors.saturating_add(1);
+                        frame_error = Some(envelope);
                     } else {
-                        let envelope = ErrorEnvelope::classify(message.to_string(), false);
                         let _ = self.send_stream_event(Event::error(envelope)).await;
                     }
                     stream_error.get_or_insert(message.to_string());
@@ -4997,6 +5114,7 @@ impl Engine {
             first_token_at,
             request_dispatched_at,
             stream_error,
+            frame_error,
         }
     }
 

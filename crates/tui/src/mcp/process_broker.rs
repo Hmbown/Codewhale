@@ -108,15 +108,26 @@ impl BrokerSession {
         } else {
             None
         };
+        // Windows: Path::canonicalize yields a verbatim prefix. Node's ESM loader
+        // (and several other Windows tools) refuse that spelling for ordinary
+        // paths under MAX_PATH, so the reviewed peer exits 1 before handshake.
+        // Strip only at the child boundary; containment kept the prefixed form.
         let mut cmd = reviewed_launch.as_ref().map_or_else(
             || {
-                let mut command_process = tokio::process::Command::new(command);
-                command_process.args(&config.args);
+                let mut command_process =
+                    tokio::process::Command::new(super::strip_windows_verbatim_for_child(command));
+                for arg in &config.args {
+                    command_process.arg(super::strip_windows_verbatim_for_child(arg.as_str()));
+                }
                 command_process
             },
             |launch| {
-                let mut command_process = tokio::process::Command::new(&launch.command);
-                command_process.args(&launch.args);
+                let mut command_process = tokio::process::Command::new(
+                    super::strip_windows_verbatim_for_child(&launch.command),
+                );
+                for arg in &launch.args {
+                    command_process.arg(super::strip_windows_verbatim_for_child(arg));
+                }
                 command_process
             },
         );
@@ -130,7 +141,7 @@ impl BrokerSession {
             .and_then(|launch| launch.cwd.as_ref())
             .or(config.cwd.as_ref().filter(|_| reviewed_launch.is_none()));
         if let Some(cwd) = launch_cwd {
-            cmd.current_dir(cwd);
+            cmd.current_dir(super::strip_windows_verbatim_for_child(cwd.as_os_str()));
         }
         #[cfg(unix)]
         if let Some(cwd_fd) = reviewed_launch

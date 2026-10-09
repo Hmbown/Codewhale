@@ -7,11 +7,26 @@
 //  - a host or user is a destination, never an option: neither may start
 //    with "-", and "--" ends the options before the destination
 
+import path from "node:path";
+
 export const SSH_HOST_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 export const SSH_USER_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 
 export class SshTargetError extends Error {
   constructor(code, message) { super(message); this.name = "SshTargetError"; this.code = code; }
+}
+
+// OpenSSH accepts forward slashes on Windows. Validate the native absolute
+// path first, then avoid interpreting its backslashes as config escapes.
+function knownHostsFile(value) {
+  if (typeof value !== "string" || !path.isAbsolute(value)) {
+    throw new SshTargetError("invalid_known_hosts", "knownHosts must be an absolute path without spaces or quotes");
+  }
+  const file = process.platform === "win32" ? value.replaceAll("\\", "/") : value;
+  if (/[\s"\\]/.test(file)) {
+    throw new SshTargetError("invalid_known_hosts", "knownHosts must be an absolute path without spaces or quotes");
+  }
+  return file;
 }
 
 /** Throw when an ssh computer entry cannot be used as a destination. */
@@ -25,9 +40,7 @@ export function validateSshTarget({ host, user, port, knownHosts } = {}) {
   if (port != null && (!Number.isInteger(port) || port < 1 || port > 65535)) {
     throw new SshTargetError("invalid_port", "port must be an integer in 1..65535");
   }
-  if (knownHosts != null && (typeof knownHosts !== "string" || !knownHosts.startsWith("/") || /[\s"\\]/.test(knownHosts))) {
-    throw new SshTargetError("invalid_known_hosts", "knownHosts must be an absolute path without spaces or quotes");
-  }
+  if (knownHosts != null) knownHostsFile(knownHosts);
 }
 
 /** ssh options (no destination) for a computer entry. */
@@ -39,7 +52,7 @@ export function sshOptions(computer, { portFlag = "-p" } = {}) {
     "-o", "UpdateHostKeys=no",
   ];
   if (computer.knownHosts) {
-    options.push("-o", `UserKnownHostsFile=${computer.knownHosts}`, "-o", "GlobalKnownHostsFile=/dev/null");
+    options.push("-o", `UserKnownHostsFile=${knownHostsFile(computer.knownHosts)}`, "-o", `GlobalKnownHostsFile=${process.platform === "win32" ? "NUL" : "/dev/null"}`);
   }
   if (computer.port) options.push(portFlag, String(computer.port));
   return options;

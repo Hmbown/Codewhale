@@ -207,6 +207,7 @@ pub(super) fn send_message_op(case: &Value, config: &Config) -> Op {
     )
     .expect("resolve conformance route");
     Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         submission_id: None,
         content: case["user_message"]

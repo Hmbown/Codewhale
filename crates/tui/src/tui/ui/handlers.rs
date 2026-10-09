@@ -1481,6 +1481,245 @@ async fn handle_theme_selection_updated(
     Ok(false)
 }
 
+/// Whether a settled question is the host's own Plan hand-off rather than an
+/// engine `request_user_input` call. The engine's request is recorded in
+/// `pending_user_input_prompt` before its view opens, so a provider-chosen
+/// tool-call id equal to the hand-off id still reaches the engine.
+pub(crate) fn is_plan_handoff_request(app: &App, tool_id: &str) -> bool {
+    (tool_id == crate::tui::plan_handoff::REQUEST_ID
+        || tool_id.starts_with(&format!("{}:", crate::tui::plan_handoff::REQUEST_ID)))
+        && app
+            .pending_user_input_prompt
+            .as_ref()
+            .is_none_or(|(id, _)| id != tool_id)
+}
+
+fn plan_handoff_seed_title(plan: &crate::tui::plan_handoff::PendingPlanHandoff) -> String {
+    // Match the graph's trimmed title without changing the approved message.
+    plan.text
+        .trim()
+        .chars()
+        .take(1024)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Stage one graph-owned item for a prose plan without replacing existing work.
+async fn seed_plan_handoff_todos(
+    app: &App,
+    plan: &mut crate::tui::plan_handoff::PendingPlanHandoff,
+) -> Result<(), String> {
+    if plan.has_current_checklist {
+        return Ok(());
+    }
+    let work = app
+        .runtime_services
+        .work
+        .as_ref()
+        .ok_or_else(|| "Work state is unavailable".to_string())?;
+    let mut todos = work.current_todos().await?;
+    let content = plan_handoff_seed_title(plan);
+    if let Some(id) = plan.seeded_todo_id {
+        return if todos.items.iter().any(|item| {
+            item.id == id
+                && item.content == content
+                && item.status == crate::tools::todo::TodoStatus::Pending
+        }) {
+            Ok(())
+        } else {
+            Err("The approved plan's To-do changed; review the plan again".to_string())
+        };
+    }
+    let id = todos
+        .items
+        .iter()
+        .map(|item| item.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| "To-do item IDs are exhausted".to_string())?;
+    todos.items.push(crate::tools::todo::TodoItem {
+        id,
+        content,
+        status: crate::tools::todo::TodoStatus::Pending,
+    });
+    work.apply_todo_update(&plan.session_id, "todo_write", &todos)
+        .await?;
+    plan.seeded_todo_id = Some(id);
+    Ok(())
+}
+
+/// Remove only this unchanged seed from the latest projection. Unprojected
+/// graph history remains; operation_parent cannot adopt an unprojected step.
+async fn rollback_plan_handoff_seed(
+    app: &App,
+    plan: &mut crate::tui::plan_handoff::PendingPlanHandoff,
+) -> Result<(), String> {
+    let Some(id) = plan.seeded_todo_id else {
+        return Ok(());
+    };
+    if app.current_session_id.as_deref() != Some(plan.session_id.as_str()) {
+        return Err("The plan belongs to another session".to_string());
+    }
+    let work = app
+        .runtime_services
+        .work
+        .as_ref()
+        .ok_or_else(|| "Work state is unavailable".to_string())?;
+    let mut todos = work.current_todos().await?;
+    if let Some(item) = todos.items.iter().find(|item| item.id == id) {
+        if item.content != plan_handoff_seed_title(plan)
+            || item.status != crate::tools::todo::TodoStatus::Pending
+        {
+            return Err(
+                "The approved plan's To-do changed; review it before continuing".to_string(),
+            );
+        }
+        todos.items.retain(|item| item.id != id);
+        work.apply_todo_update(&plan.session_id, "todo_write", &todos)
+            .await?;
+    }
+    plan.seeded_todo_id = None;
+    Ok(())
+}
+
+fn reopen_plan_handoff(
+    app: &mut App,
+    plan: &crate::tui::plan_handoff::PendingPlanHandoff,
+    reason: &str,
+) {
+    app.view_stack.push(UserInputView::new(
+        plan.request_id.clone(),
+        crate::tui::plan_handoff::request(app.ui_locale),
+    ));
+    let notice = app
+        .tr(MessageId::SessionSaveFailed)
+        .replace("{id}", &plan.session_id)
+        .replace("{error}", reason);
+    app.push_status_toast(notice, StatusToastLevel::Warning, Some(8_000));
+}
+
+/// Carry out only the answer bound to this exact completed Plan response.
+pub(crate) async fn apply_plan_handoff(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    request_id: &str,
+    choice: crate::tui::plan_handoff::PlanHandoffChoice,
+) -> Result<()> {
+    apply_plan_handoff_with_checkpoint(app, config, engine_handle, request_id, choice, |app| {
+        Box::pin(persist_pending_work_checkpoint(app))
+    })
+    .await
+}
+
+type PlanHandoffCheckpoint =
+    for<'a> fn(&'a mut App) -> Pin<Box<dyn Future<Output = Result<bool, String>> + 'a>>;
+
+/// The checkpoint callback keeps the existing admission boundary explicit;
+/// tests can refuse admission without mutating the global persistence actor.
+pub(crate) async fn apply_plan_handoff_with_checkpoint(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    request_id: &str,
+    choice: crate::tui::plan_handoff::PlanHandoffChoice,
+    checkpoint: PlanHandoffCheckpoint,
+) -> Result<()> {
+    use crate::tui::plan_handoff::PlanHandoffChoice;
+
+    let Some(mut plan) = app
+        .pending_plan_handoff
+        .clone()
+        .filter(|plan| app.plan_handoff_is_current(plan, request_id))
+    else {
+        return Ok(());
+    };
+    if !matches!(&choice, PlanHandoffChoice::Work(_))
+        && let Err(reason) = rollback_plan_handoff_seed(app, &mut plan).await
+    {
+        app.pending_plan_handoff = Some(plan.clone());
+        reopen_plan_handoff(app, &plan, &reason);
+        return Ok(());
+    }
+    let message = match choice {
+        PlanHandoffChoice::KeepPlanning => {
+            app.pending_plan_handoff = None;
+            return Ok(());
+        }
+        PlanHandoffChoice::Revise(feedback) => QueuedMessage::new(feedback, None),
+        PlanHandoffChoice::Work(posture) => {
+            if !enter_work_for_plan(app, config, engine_handle, posture).await {
+                return Ok(());
+            }
+            let staged = seed_plan_handoff_todos(app, &mut plan).await;
+            app.pending_plan_handoff = Some(plan.clone());
+            let checkpoint = match staged {
+                Ok(()) => checkpoint(app).await.map(|_| ()),
+                Err(reason) => Err(reason),
+            };
+            if let Err(reason) = checkpoint {
+                // Undo our unpublished projection before the event loop can
+                // retry an ordinary checkpoint. Never roll back other work.
+                // An already queued write cannot be recalled by this repair.
+                let reason = match rollback_plan_handoff_seed(app, &mut plan).await {
+                    Ok(()) => reason,
+                    Err(cleanup) => format!("{reason}; {cleanup}"),
+                };
+                app.pending_plan_handoff = Some(plan.clone());
+                apply_mode_update(app, engine_handle, config, AppMode::Plan).await;
+                reopen_plan_handoff(app, &plan, &reason);
+                return Ok(());
+            }
+            QueuedMessage::new(
+                format!("{}\n\n{}", app.tr(MessageId::PlanHandoffProceed), plan.text),
+                None,
+            )
+        }
+    };
+    // Consume before ordinary composer admission. Its existing recovery owns
+    // the exact user message on an offline/failed send; a repeated answer
+    // cannot enqueue another execution.
+    app.pending_plan_handoff = None;
+    let action = ComposerSubmitAction::Submit(app.decide_submit_disposition());
+    dispatch_composer_message(
+        app,
+        config,
+        engine_handle,
+        message,
+        DispatchRecovery::Immediate,
+        action,
+    )
+    .await
+}
+
+/// Leave Plan for Work with the chosen permission. Returns `false`, with the
+/// reason on screen, when the permission or the mode could not be applied;
+/// the session then stays where it was and nothing is sent.
+pub(crate) async fn enter_work_for_plan(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    posture: ApprovalMode,
+) -> bool {
+    if engine_handle.tx_op.is_closed() {
+        return false;
+    }
+    if app.agent_approval_baseline() != posture
+        && let Err(reason) = app.apply_agent_posture(posture)
+    {
+        app.push_status_toast(reason, StatusToastLevel::Warning, Some(8_000));
+        return false;
+    }
+    apply_mode_update(app, engine_handle, config, AppMode::Agent).await;
+    if engine_handle.tx_op.is_closed() {
+        app.set_mode(AppMode::Plan);
+        return false;
+    }
+    app.mode == AppMode::Agent
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_view_events(
     terminal: &mut AppTerminal,
@@ -1655,8 +1894,26 @@ pub(crate) async fn handle_view_events(
                     }
                 };
                 if result.is_ok() {
+                    note_human_decision_delivered(app, &tool_id);
                     app.retire_action_notices(Some(&tool_id));
                 }
+            }
+            ViewEvent::UserInputSubmitted { tool_id, response }
+                if is_plan_handoff_request(app, &tool_id) =>
+            {
+                let choice = crate::tui::plan_handoff::choice(app.ui_locale, &response);
+                apply_plan_handoff(app, config, engine_handle, &tool_id, choice).await?;
+            }
+            // Esc follows the same owned-seed cleanup as Keep planning.
+            ViewEvent::UserInputCancelled { tool_id } if is_plan_handoff_request(app, &tool_id) => {
+                apply_plan_handoff(
+                    app,
+                    config,
+                    engine_handle,
+                    &tool_id,
+                    crate::tui::plan_handoff::PlanHandoffChoice::KeepPlanning,
+                )
+                .await?;
             }
             ViewEvent::UserInputSubmitted { tool_id, response } => {
                 let result = engine_handle
@@ -2791,6 +3048,15 @@ pub(crate) async fn handle_view_events(
                 );
                 refresh_config_view_if_open(app, "provider");
             }
+            ViewEvent::ProviderPickerClaudeOAuthRequested => {
+                let switched =
+                    run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Anthropic,
+                    switched,
+                );
+            }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 let switched =
                     run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
@@ -2802,6 +3068,16 @@ pub(crate) async fn handle_view_events(
                 complete_provider_picker_onboarding_if_switched(
                     app,
                     ProviderKind::OpenaiCodex,
+                    switched,
+                );
+            }
+            ViewEvent::ProviderPickerOrcarouterOAuthRequested => {
+                let switched =
+                    run_orcarouter_pkce_login_from_tui(terminal, app, engine_handle, config)
+                        .await?;
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Orcarouter,
                     switched,
                 );
             }

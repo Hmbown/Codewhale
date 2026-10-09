@@ -121,6 +121,7 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "Record three approval fixtures in the workspace".to_string(),
             images: Vec::new(),

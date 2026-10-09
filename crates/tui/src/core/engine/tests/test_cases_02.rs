@@ -118,7 +118,9 @@ async fn an_agent_approval_answer_reaches_the_agent_while_the_engine_is_busy() {
         .expect("answer");
     assert_eq!(
         outcome,
-        crate::tools::subagent::ChildApprovalOutcome::Approved
+        crate::tools::subagent::ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
     );
 }
 
@@ -591,6 +593,7 @@ async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_bui
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "verify exact route".to_string(),
             images: Vec::new(),
@@ -768,6 +771,7 @@ async fn main_turn_dispatch_freezes_declared_custom_model_rate() {
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "price this turn".to_string(),
             images: Vec::new(),
@@ -1087,6 +1091,7 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "first turn".to_string(),
             images: Vec::new(),
@@ -1370,6 +1375,7 @@ async fn saturated_mailbox_does_not_deadlock_goal_continuation_self_dispatch() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "start the saturated goal turn".to_string(),
             images: Vec::new(),
@@ -1503,6 +1509,7 @@ async fn queued_ordinary_turn_does_not_multiply_engine_goal_continuations() {
     let run_task = tokio::spawn(engine.run());
     let send_message = |content: &str| {
         Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: content.to_string(),
             images: Vec::new(),

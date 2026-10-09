@@ -160,11 +160,12 @@ fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
         let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
         let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
-        let config = fixture_config();
+        let config = boxed_phase(|| async { Box::new(fixture_config()) }).await;
         let sessions = SessionManager::default_location()?;
         let task_config =
             TaskManagerConfig::from_runtime(&config, root.path().into(), None, Some(1));
-        let (root, config, task_config, sessions) = (&root, &config, &task_config, &sessions);
+        let (root, config, task_config, sessions) =
+            (&root, config.as_ref(), &task_config, &sessions);
 
         // Phase 1: launch over a saved conversation and bind its Runtime store.
         let (initial_id, saved_id, binding, automation) = boxed_phase(move || async move {
@@ -226,12 +227,12 @@ fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result
         );
         let loaded = sessions.load_session(&saved_id)?;
         assert_eq!(loaded.metadata.runtime_store.as_ref(), Some(&binding));
-        let mut resumed_config = config.clone();
+        let mut resumed_config = boxed_phase(|| async { Box::new(config.clone()) }).await;
         let (loaded, automation) = (&loaded, &automation);
 
         // Phase 2: resume with the binding and run the automation for real.
         {
-            let resumed_config = &mut resumed_config;
+            let resumed_config = resumed_config.as_mut();
             boxed_phase(move || async move {
                 let mut resumed = Box::new(create_test_app());
                 apply_loaded_session_with_goal(&mut resumed, resumed_config, loaded.clone(), None)
@@ -284,13 +285,18 @@ fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result
         // Phase 3: reproduce the old resume path — deriving a store from the
         // saved conversation id without its binding opens a foreign scope and
         // cannot run.
-        let foreign = TaskManager::start(
-            task_config.clone(),
-            config.clone(),
-            Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
-            &loaded.metadata.id,
-            None,
-        )
+        // Keep this start future out of the outer poll frame too. Its Config
+        // temporaries otherwise stay on the stack underneath every boxed phase.
+        let foreign = boxed_phase(move || async move {
+            TaskManager::start(
+                task_config.clone(),
+                config.clone(),
+                Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+                &loaded.metadata.id,
+                None,
+            )
+            .await
+        })
         .await?;
         let foreign = &foreign;
         boxed_phase(move || async move {
@@ -327,7 +333,7 @@ fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result
         // Phase 4: a host that already owns a foreign scope refuses the switch
         // and keeps its pending input.
         {
-            let resumed_config = &mut resumed_config;
+            let resumed_config = resumed_config.as_mut();
             boxed_phase(move || async move {
                 let mut other_app = Box::new(create_test_app());
                 other_app.runtime_services.task_manager = Some(foreign.clone());

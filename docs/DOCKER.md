@@ -5,8 +5,12 @@
 Codewhale publishes a multi-arch Linux image to GitHub Container Registry
 for each release.
 
+The latest published image is 0.10.0 at `ghcr.io/hmbown/codewhale`.
+To test the current `main` source, use [Building locally](#building-locally)
+in a checkout of [`codewhale-hq/Codewhale`](https://github.com/codewhale-hq/Codewhale).
+
 ```bash
-docker pull ghcr.io/codewhale-hq/codewhale:latest
+docker pull ghcr.io/hmbown/codewhale:latest
 ```
 
 ## Quick start
@@ -21,7 +25,7 @@ docker run --rm -it \
   -v codewhale-home:/home/codewhale/.codewhale \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/codewhale-hq/codewhale:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 Use a pinned release tag for reproducible installs:
@@ -32,15 +36,14 @@ docker run --rm -it \
   -v codewhale-home:/home/codewhale/.codewhale \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/codewhale-hq/codewhale:vX.Y.Z
+  ghcr.io/hmbown/codewhale:v0.10.0
 ```
 
-Replace `vX.Y.Z` with a tag from
-[GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases).
+The pinned example uses the [0.10.0 release](https://github.com/codewhale-hq/Codewhale/releases/tag/v0.10.0).
 
 ## Default image contract
 
-`ghcr.io/codewhale-hq/codewhale:latest` and the semver tags are conservative runtime
+`ghcr.io/hmbown/codewhale:latest` and the semver tags are conservative runtime
 images:
 
 - the container runs as the non-root `codewhale` user with UID/GID `1000:1000`
@@ -64,7 +67,7 @@ environments:
 
 ```bash
 docker build -f docs/examples/Dockerfile.toolbox \
-  --build-arg CODEWHALE_IMAGE=ghcr.io/codewhale-hq/codewhale:vX.Y.Z \
+  --build-arg CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:v0.10.0 \
   --build-arg TOOLBOX_PACKAGES="git openssh-client curl build-essential pkg-config python3 python3-pip nodejs npm" \
   -t codewhale-toolbox:my-project .
 ```
@@ -103,7 +106,7 @@ the toolbox image from [`docs/examples/Dockerfile.toolbox`](examples/Dockerfile.
 and keeps the project state volume explicit:
 
 ```bash
-CODEWHALE_IMAGE=ghcr.io/codewhale-hq/codewhale:vX.Y.Z \
+CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:v0.10.0 \
 CODEWHALE_TOOLBOX_IMAGE=codewhale-toolbox:my-project \
 CODEWHALE_HOME_VOLUME=codewhale-my-project-home \
 CODEWHALE_WORKSPACE="$PWD" \
@@ -252,7 +255,7 @@ sudo chown -R 1000:1000 ~/.codewhale
 docker run --rm -it \
   -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
   -v ~/.codewhale:/home/codewhale/.codewhale \
-  ghcr.io/codewhale-hq/codewhale:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 That `chown` changes ownership of the host `~/.codewhale` directory. Skip it if
@@ -266,7 +269,7 @@ When stdin is not a TTY, `codewhale` drops to the dispatcher's one-shot mode
 
 ```bash
 echo "Explain the Cargo.toml in structured English." | \
-  docker run --rm -i -e DEEPSEEK_API_KEY ghcr.io/codewhale-hq/codewhale:latest
+  docker run --rm -i -e DEEPSEEK_API_KEY ghcr.io/hmbown/codewhale:latest
 ```
 
 ## Building locally

@@ -35,6 +35,38 @@ fn require(condition: bool, message: &str) -> Result<()> {
     if condition { Ok(()) } else { refuse(message) }
 }
 
+/// A refusal names at most this many rows and counts the rest.
+const MAX_REFUSAL_ROWS: usize = 5;
+/// Longest package-authored fragment quoted in a refusal, in characters.
+const MAX_REFUSAL_TEXT: usize = 120;
+
+/// Package-authored text for a one-line refusal: bounded, with control and
+/// bidirectional-format characters shown as escapes. A refusal is plain text
+/// (error line, Runtime API), so this is not the review's Markdown escape.
+fn refusal_text(text: &str) -> String {
+    let mut shown = String::new();
+    for ch in text.chars().take(MAX_REFUSAL_TEXT) {
+        match ch {
+            '\'' | '"' => shown.push(ch),
+            _ => shown.extend(ch.escape_debug()),
+        }
+    }
+    if text.chars().nth(MAX_REFUSAL_TEXT).is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// The first rows of a refusal, then how many more were left out.
+fn refusal_list(mut rows: impl Iterator<Item = String>) -> String {
+    let mut shown: Vec<String> = rows.by_ref().take(MAX_REFUSAL_ROWS).collect();
+    let more = rows.count();
+    if more > 0 {
+        shown.push(format!("and {more} more"));
+    }
+    shown.join("; ")
+}
+
 fn pattern(source: &str) -> Regex {
     Regex::new(source).expect("static pattern")
 }
@@ -1677,10 +1709,12 @@ fn native_composition_files(
     {
         return Ok(Vec::new());
     }
-    require(
-        unresolved.is_empty(),
-        "Native composition contains an unsupported or missing row with no exact admitted module; no partial graph was installed.",
-    )?;
+    if !unresolved.is_empty() {
+        return refuse(format!(
+            "Native composition contains an unsupported or missing row with no exact admitted module ({}); no partial graph was installed.",
+            refusal_list(unresolved.iter().map(|name| refusal_text(name)))
+        ));
+    }
     let mut files = serde_json::Map::new();
     walk_files(&package.root, |path, is_dir| {
         let lower = path
@@ -1898,10 +1932,28 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
                     .to_string();
         }
     }
-    require(
-        !output_files.files.is_empty() || !components.servers.is_empty(),
-        "No portable components in this package: nothing to import.",
-    )?;
+    if output_files.files.is_empty() && components.servers.is_empty() {
+        let skipped = refusal_list(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.needs_manual_port())
+                .map(|outcome| {
+                    format!(
+                        "{} ({}): {}",
+                        refusal_text(outcome.row.as_deref().unwrap_or("unlabeled")),
+                        refusal_text(outcome.package.as_deref().unwrap_or("unlabeled")),
+                        refusal_text(&outcome.reason)
+                    )
+                }),
+        );
+        return refuse(if skipped.is_empty() {
+            "No portable components in this package: nothing to import.".to_string()
+        } else {
+            format!(
+                "No portable components in this package: nothing to import. Skipped rows, each needing a manual port: {skipped}"
+            )
+        });
+    }
 
     let mut hosts = components.hosts.clone();
     hosts.sort();
@@ -2181,6 +2233,7 @@ mod shell_hook_import_tests {
     use super::*;
     #[test]
     fn raw_mixed_preset_import_keeps_mcp_and_skills_selected_without_global_duplicates() {
+        let _home = crate::test_support::SealedHome::new();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir_all(source.join("presets/a")).unwrap();
@@ -2244,6 +2297,7 @@ mod shell_hook_import_tests {
 
     #[test]
     fn native_shell_bridge_import_seals_assets_without_executing_commands() {
+        let _home = crate::test_support::SealedHome::new();
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path().join("bundle");
         fs::create_dir(&bundle).unwrap();

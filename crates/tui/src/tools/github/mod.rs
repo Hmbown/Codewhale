@@ -142,16 +142,16 @@ impl ToolSpec for GithubTool {
                 "Post an evidence-backed GitHub issue/PR comment with gh. Requires approval. Use blocker comments for partial work; do not claim closure without evidence."
             }
             Some("close_issue") => {
-                "Close a GitHub issue only when structured acceptance evidence is present and approved. For pull requests use github_close_pr; do not call PRs issues in user-facing output. Never close merely because the agent is stopping."
+                "Close a GitHub issue only when structured acceptance evidence is present and approved. Rejected when the worktree is dirty unless allow_dirty=true. For pull requests use github_close_pr; do not call PRs issues in user-facing output. Never close merely because the agent is stopping."
             }
             Some("close_pr") => {
-                "Close a GitHub pull request only when structured acceptance evidence is present and approved. Use this for PRs instead of github_close_issue so the UI, audit trail, and comments keep PR wording clear."
+                "Close a GitHub pull request only when structured acceptance evidence is present and approved. Rejected when the worktree is dirty unless allow_dirty=true. Use this for PRs instead of github_close_issue so the UI, audit trail, and comments keep PR wording clear."
             }
             _ if self.read_only => {
                 "Read GitHub issue/PR context using gh (issue_context, pr_context), or read a local current-session Codewhale issue draft with report_read. Local report publication is unavailable."
             }
             _ => {
-                "GitHub context (issue_context, pr_context) and guarded comment/close_issue/close_pr actions. Also report_draft and report_read: save/revise/read a LOCAL structured Codewhale issue draft in this session, without network or publication. When you observe evidence of a likely Codewhale/runtime/tool defect, you may draft it yourself, separate observations from inferences, offer /feedback review, and continue the original task. Ordinary user-code failures alone are not Codewhale defects; avoid repeated reports. Include only bounded narrative evidence, never prompts, logs, private code, credentials or paths. report_draft revises an existing draft when revises is supplied; exact repeats converge. Draft publication and duplicate search are unavailable: do not use other tools to post the draft without separate explicit user authorization. No push/merge."
+                "GitHub context (issue_context, pr_context) and guarded comment/close_issue/close_pr actions. Closes are rejected when the worktree is dirty unless allow_dirty=true. Also report_draft and report_read: save/revise/read a LOCAL structured Codewhale issue draft in this session, without network or publication. When you observe evidence of a likely Codewhale/runtime/tool defect, you may draft it yourself, separate observations from inferences, offer /feedback review, and continue the original task. Ordinary user-code failures alone are not Codewhale defects; avoid repeated reports. Include only bounded narrative evidence, never prompts, logs, private code, credentials or paths. report_draft revises an existing draft when revises is supplied; exact repeats converge. Draft publication and duplicate search are unavailable: do not use other tools to post the draft without separate explicit user authorization. No push/merge."
             }
         }
     }
@@ -336,6 +336,30 @@ mod tests {
             GithubTool::alias("github_close_pr", "close_pr")
                 .description()
                 .contains("pull request")
+        );
+    }
+
+    // The dirty-worktree refusal is easy to hit on a real close; the
+    // model-facing text must disclose it and the flag that overrides it.
+    #[test]
+    fn close_disclosure_names_the_dirty_worktree_refusal() {
+        for description in [
+            GithubTool::alias("github_close_issue", "close_issue").description(),
+            GithubTool::alias("github_close_pr", "close_pr").description(),
+            GithubTool::new("github").description(),
+        ] {
+            assert!(
+                description.contains("dirty") && description.contains("allow_dirty"),
+                "close descriptions must disclose the dirty-worktree refusal: {description}"
+            );
+        }
+        let schema = GithubTool::new("github").input_schema();
+        let allow_dirty = schema["properties"]["allow_dirty"]["description"]
+            .as_str()
+            .expect("allow_dirty must carry a description");
+        assert!(
+            allow_dirty.contains("rejected when the worktree is dirty"),
+            "allow_dirty must disclose the refusal it overrides: {allow_dirty}"
         );
     }
 

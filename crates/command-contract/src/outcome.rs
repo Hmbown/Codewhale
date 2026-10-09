@@ -63,6 +63,12 @@ pub enum DebugAction {
         title: String,
         content: String,
     },
+    /// Show a unified diff in a pager, rendered as the transcript renders an
+    /// edit, without copying it into transcript history.
+    OpenDiffPager {
+        title: String,
+        diff: String,
+    },
     OpenContextInspector,
     SendMessage(String),
     SyncSession(SessionSyncPayload),
@@ -98,3 +104,11 @@ pub enum SessionRemoteControlAction {
 }
 
 pub type SessionCommandResult = CommandResult<SessionAction>;
+
+/// Only permission removal can request a host action in the config policy slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPolicyAction {
+    PermissionRulesChanged,
+}
+pub type ConfigPolicyCommandResult = CommandResult<ConfigPolicyAction>;
+pub type ConfigStatusCommandResult = CommandResult<std::convert::Infallible>;

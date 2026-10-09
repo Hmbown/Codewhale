@@ -19,6 +19,8 @@ use super::types::{
     PluginTrustStatus,
 };
 
+pub(crate) mod gc;
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_REVIEW_HISTORY: usize = 32;
 
@@ -962,6 +964,7 @@ fn persist_plugin_state_with_directory_sync(
 #[cfg(windows)]
 fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Foundation::WIN32_ERROR;
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileAttributesW,
@@ -989,14 +992,35 @@ fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Resul
         format!("failed to prepare private plugin state temp file for publication: {error}")
     })?;
 
+    // The state lock serializes writers, but not everything that opens the
+    // stable file: another registry re-applies the state directory's
+    // inheritable ACL before it takes that lock, and Defender or the indexer
+    // can scan the file. Each holds the destination only briefly, and
+    // MoveFileExW then reports a refusal that clears on its own. Re-attempt
+    // only the rename, on the schedule the other atomic writers share; the
+    // hardened temporary and the stable file are both left untouched.
+    let mut attempt = 0;
     // SAFETY: both paths are NUL-terminated and live.
-    if let Err(error) = unsafe {
+    while let Err(error) = unsafe {
         MoveFileExW(
             PCWSTR::from_raw(temporary_wide.as_ptr()),
             PCWSTR::from_raw(destination_wide.as_ptr()),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     } {
+        // MoveFileExW reports an HRESULT; the shared classifier reads the
+        // Win32 code it wraps.
+        let backoff = WIN32_ERROR::from_error(&error).and_then(|code| {
+            crate::utils::windows_publish_retry_delay(
+                &std::io::Error::from_raw_os_error(code.0 as i32),
+                attempt,
+            )
+        });
+        if let Some(backoff) = backoff {
+            std::thread::sleep(backoff);
+            attempt += 1;
+            continue;
+        }
         // Restore tempfile's cleanup hint on the still-private source. The
         // stable state path remains untouched when MoveFileExW fails.
         // SAFETY: `temporary_wide` is NUL-terminated and live.
@@ -1375,15 +1399,20 @@ fn builtin_predecessor<'a>(
         .filter(|entry| entry.trust.is_some())
 }
 
-fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+/// Directory name of a plugin id's runtime snapshots under `.runtime/v2`.
+fn runtime_stage_key(id: &PluginId) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codewhale-plugin-stage-v2\0");
     hasher.update(id.as_str().as_bytes());
-    let key = hasher
+    hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+        .collect::<String>()
+}
+
+fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+    let key = runtime_stage_key(id);
     let state_parent = state_path.parent().unwrap_or_else(|| Path::new("."));
     let state_parent = state_parent
         .canonicalize()
@@ -2869,6 +2898,42 @@ mod windows_acl_tests {
             b"old-authoritative-state"
         );
         drop(retained);
+    }
+
+    #[test]
+    fn transient_state_replacement_contention_is_retried() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        std::fs::write(&state_path, b"old-authoritative-state").unwrap();
+        // FILE_SHARE_READ alone omits delete sharing: the short-lived handle a
+        // concurrent ACL pass or scanner holds on the stable file.
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&state_path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(retained);
+        });
+
+        save_state_with_hardener(
+            &state_path,
+            &PluginStateFile::default(),
+            harden_plugin_state_file,
+        )
+        .expect("retry contended plugin state replacement");
+
+        release.join().unwrap();
+        let published = std::fs::read_to_string(&state_path).unwrap();
+        assert!(published.contains("\"schema_version\": 1"));
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("state.json")]);
     }
 
     #[test]

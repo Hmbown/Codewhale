@@ -738,6 +738,10 @@ impl App {
         if let Some(pending) = self.paste_burst.flush_before_modified_input() {
             self.insert_str(&pending);
         }
+        if self.attach_pasted_image_paths(text) {
+            self.paste_burst.clear_after_explicit_paste();
+            return;
+        }
         let normalized = normalize_paste_text(text);
         if !normalized.is_empty() {
             self.insert_str(&normalized);
@@ -748,6 +752,32 @@ impl App {
         // an @paste-...md mention before dispatch, so no path silently
         // truncates user input.
         // self.consolidate_large_input_if_oversized(); // deferred to submit time
+    }
+
+    /// A file dragged onto the terminal arrives as a paste of its path. When
+    /// the whole paste names local image files, attach them on the same
+    /// `[Attached image: …]` line a clipboard image gets, so each shows as a
+    /// composer attachment and is sent to the model as an image part (the
+    /// engine expands the line when it builds the user message, and the
+    /// route's vision capability decides per request; a text-only route gets
+    /// the omission notice there). Returns whether the paste was consumed.
+    ///
+    /// A command line (`/…`) or shell line (`!…`) keeps the literal path.
+    pub(crate) fn attach_pasted_image_paths(&mut self, text: &str) -> bool {
+        if self.input.trim_start().starts_with(['/', '!']) {
+            return false;
+        }
+        let Some(paths) = crate::image_attach::pasted_image_paths(text) else {
+            return false;
+        };
+        for path in &paths {
+            self.insert_media_attachment("image", path, None);
+        }
+        self.status_message = Some(match paths.as_slice() {
+            [path] => format!("Attached image: {}", path.display()),
+            paths => format!("Attached {} images", paths.len()),
+        });
+        true
     }
 
     pub fn insert_media_attachment(&mut self, kind: &str, path: &Path, description: Option<&str>) {
@@ -1699,6 +1729,20 @@ impl App {
         // bytes lost after the composer accepted them — never fall through
         // to the prose-prompt branch; hold it instead.
         let claimed_command = self.command_line_claimed();
+        // A dropped image path that was not converted at paste time (typed
+        // keys, or the question written on the same line) still attaches.
+        if !claimed_command
+            && !self.input.trim_start().starts_with('!')
+            && let Some((path, rest)) = crate::image_attach::leading_dropped_image(&self.input)
+        {
+            let reference = media_attachment_reference("image", &path, None);
+            self.input = if rest.is_empty() {
+                reference
+            } else {
+                format!("{reference}\n{rest}")
+            };
+            self.cursor_position = char_count(&self.input);
+        }
         // Safety net: if any earlier path filled the buffer above the
         // safety cap without going through `insert_paste_text`, fold it
         // into a workspace paste file now (#553). Bracketed pastes hit

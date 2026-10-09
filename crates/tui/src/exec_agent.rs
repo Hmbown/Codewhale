@@ -617,7 +617,7 @@ pub(crate) async fn run_exec_agent(
         subagent_heartbeat_timeout: std::time::Duration::from_secs(
             execution_config.subagent_heartbeat_timeout_secs_for_provider(&effective_identity),
         ),
-        prefer_bwrap: execution_config.prefer_bwrap.unwrap_or(false),
+        prefer_bwrap: execution_config.prefers_bwrap(),
         bwrap_extensions: crate::sandbox::BwrapMountExtensions {
             read_only_roots: execution_config.bwrap_ro_roots.clone(),
             device_roots: execution_config.bwrap_dev_roots.clone(),
@@ -691,12 +691,61 @@ pub(crate) async fn run_exec_agent(
     // The Full Access posture travels in the op's auto_approve/approval_mode
     // fields; modes no longer carry permission.
     let mode = AppMode::Agent;
+    let turn_approval_mode = if auto_approve {
+        ApprovalMode::Bypass
+    } else {
+        execution_config
+            .approval_policy
+            .as_deref()
+            .and_then(ApprovalMode::from_config_value)
+            .unwrap_or_default()
+    };
+    // A restricted posture that resolves to no enforcing sandbox must reach
+    // the person running exec, not only the model's posture line: policy-only
+    // is accepted (read-only already fails closed in the shell tool), but it
+    // is never silent. Mirrors the enforcement detection in `Engine::new`.
+    let turn_sandbox_policy = crate::core::authority::sandbox_policy_for_turn(
+        mode,
+        turn_approval_mode,
+        execution_config.sandbox_mode.as_deref(),
+        &workspace,
+        crate::core::authority::SandboxNetworkAccess::from_config(
+            execution_config.sandbox_network_access,
+        ),
+    );
+    let enforcement_unavailable = crate::sandbox::backend::SandboxKind::parse(
+        execution_config
+            .sandbox_backend
+            .as_deref()
+            .unwrap_or("none"),
+    )
+    .is_none()
+        && crate::sandbox::get_platform_sandbox_with_bwrap_preference(
+            execution_config.prefers_bwrap(),
+        )
+        .is_none();
+    if enforcement_unavailable && turn_sandbox_policy.should_sandbox() {
+        eprintln!(
+            "warning: {} — shell commands will run unrestricted",
+            turn_sandbox_policy.posture_label_with_enforcement(
+                crate::sandbox::policy::SandboxEnforcement::Unavailable,
+            )
+        );
+    }
 
     let resuming_session = resume_session.is_some();
     let mut loaded_session_id = None;
     if let Some(saved) = resume_session {
         let saved_id = saved.metadata.id.clone();
-        if saved.metadata.workspace != workspace && output_format == ExecOutputFormat::Text {
+        let saved_workspace = tokio::fs::canonicalize(&saved.metadata.workspace)
+            .await
+            .unwrap_or_else(|_| saved.metadata.workspace.clone());
+        let launch_workspace = tokio::fs::canonicalize(&workspace)
+            .await
+            .unwrap_or_else(|_| workspace.clone());
+        if !paths_equal_for_config(&saved_workspace, &launch_workspace)
+            && output_format == ExecOutputFormat::Text
+        {
             eprintln!(
                 "Warning: session {} was created in a different workspace ({}). Resuming anyway.",
                 truncate_id(&saved_id),
@@ -742,6 +791,7 @@ pub(crate) async fn run_exec_agent(
 
     engine_handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: prompt.to_string(),
             images: Vec::new(),
@@ -762,15 +812,7 @@ pub(crate) async fn run_exec_agent(
             trust_mode,
             auto_approve,
             translation_enabled: false,
-            approval_mode: if auto_approve {
-                ApprovalMode::Bypass
-            } else {
-                execution_config
-                    .approval_policy
-                    .as_deref()
-                    .and_then(ApprovalMode::from_config_value)
-                    .unwrap_or_default()
-            },
+            approval_mode: turn_approval_mode,
             verbosity: execution_config.verbosity.clone(),
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
             // Headless exec does not correlate submissions.

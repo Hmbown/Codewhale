@@ -43,6 +43,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
+mod constitution;
 mod notification_delivery;
 
 #[cfg(test)]
@@ -98,6 +99,7 @@ use codewhale_protocol::fleet::{
 };
 
 mod auth;
+mod avatars;
 mod computer_display;
 mod context;
 mod diagnostics;
@@ -959,6 +961,9 @@ struct ThreadSummaryQuery {
     limit: Option<usize>,
     search: Option<String>,
     include_archived: Option<bool>,
+    /// Comma-separated exact IDs let callers filter before applying the result
+    /// limit. One parameter, because axum's `Query` cannot collect repeated keys.
+    thread_ids: Option<String>,
     /// When `true`, returns archived threads only (overrides `include_archived`).
     /// Whalescale#260 / #563.
     archived_only: Option<bool>,
@@ -998,6 +1003,10 @@ struct ThreadSummary {
     pending_attention_count: usize,
 }
 
+/// `GET /v1/skills` row. Routing metadata (`invocation`, `aliases`,
+/// `bundled_tier`) rides along so a client can build a picker or autocomplete
+/// without a second request per row; the body itself stays behind
+/// `GET /v1/skills/{name}`.
 #[derive(Debug, Serialize)]
 struct SkillEntry {
     name: String,
@@ -1011,6 +1020,12 @@ struct SkillEntry {
     plugin_content_hash: Option<String>,
     enabled: bool,
     is_bundled: bool,
+    /// `model+user` | `explicit-only` | `model-only` | `disabled`.
+    invocation: &'static str,
+    /// Alternate lookup names for the same body; never separate entries.
+    aliases: Vec<String>,
+    /// `core` | `tools` for bundled skills, absent for custom ones.
+    bundled_tier: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1019,6 +1034,18 @@ struct SkillsResponse {
     directories: Vec<PathBuf>,
     warnings: Vec<String>,
     skills: Vec<SkillEntry>,
+}
+
+/// `GET /v1/skills/{name}` — one skill's body plus the routing metadata a
+/// client needs to offer activation: the `/v1/skills` row, plus the full
+/// SKILL.md body. Flattened rather than repeated field-by-field so the two
+/// shapes cannot drift apart.
+#[derive(Debug, Serialize)]
+struct SkillDetailResponse {
+    #[serde(flatten)]
+    skill: SkillEntry,
+    /// Full SKILL.md body (frontmatter stripped) for client-side activation.
+    body: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1207,7 +1234,9 @@ struct RuntimeInfoResponse {
 
 fn default_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
+        client_token_intents: true,
         account_session: true,
+        account_model_owner: true,
         threads: true,
         thread_shell_consent: true,
         turns: true,
@@ -1215,6 +1244,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         turn_operation_lookup: true,
         turn_image_inputs: true,
         turn_output_token_limit: true,
+        profile_constitution: true,
         turn_steer: true,
         turn_interrupt: true,
         event_replay: true,
@@ -1230,6 +1260,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         memory: true,
         mcp_server_management: true,
         skill_lifecycle: true,
+        skill_detail: true,
         plugin_management: true,
         agent_mail: true,
         // SSE journal frames carry their durable `seq` as the event id, and the
@@ -1465,6 +1496,10 @@ struct McpServerActionReceipt {
 #[derive(Debug, Deserialize)]
 struct AutomationRunsQuery {
     limit: Option<usize>,
+    /// Serve the terminal-run archive kept for deleted automations instead of
+    /// the live run history.
+    #[serde(default)]
+    archived: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1554,7 +1589,15 @@ fn open_runtime_threads_for_server(
     SharedRuntimeThreadManager,
     crate::tools::large_output_router::WorkshopConfig,
 )> {
-    open_runtime_threads_for_host(config, workspace, manager_config, plugin_registry, false)
+    open_runtime_threads_for_host(
+        config,
+        workspace,
+        manager_config,
+        plugin_registry,
+        false,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn open_runtime_threads_for_host(
@@ -1563,6 +1606,8 @@ pub(crate) fn open_runtime_threads_for_host(
     manager_config: RuntimeThreadManagerConfig,
     plugin_registry: Arc<crate::plugins::PluginRegistry>,
     acp: bool,
+    preheld_lock: Option<crate::runtime_threads::RuntimeProcessOwnerLock>,
+    binding: Option<&crate::runtime_threads::RuntimeStoreBinding>,
 ) -> Result<(
     SharedRuntimeThreadManager,
     crate::tools::large_output_router::WorkshopConfig,
@@ -1572,21 +1617,98 @@ pub(crate) fn open_runtime_threads_for_host(
     // thread manager can spawn any of those engines, matching interactive and
     // headless exec startup.
     let workshop_activation = install_runtime_server_workshop_budgets(config);
-    let manager = Arc::new(if acp {
-        RuntimeThreadManager::open_acp(config.clone(), workspace, manager_config, plugin_registry)
+    let profile = if acp {
+        crate::core::engine::EngineHostProfile::Acp
     } else {
-        RuntimeThreadManager::open_with_plugin_registry(
-            config.clone(),
-            workspace,
-            manager_config,
-            plugin_registry,
-        )
-    }?);
+        crate::core::engine::EngineHostProfile::Normal
+    };
+    let manager = Arc::new(RuntimeThreadManager::open_host(
+        config.clone(),
+        workspace,
+        manager_config,
+        plugin_registry,
+        profile,
+        preheld_lock,
+        binding,
+    )?);
     // Publish the same exact endpoint-scoped catalog as interactive startup
     // before the server admits turns. A cached model list alone does not make
     // its capabilities available to route resolution.
     crate::provider_catalog_live::maybe_load_persisted_cache_for_config(config);
     Ok((manager, workshop_activation))
+}
+
+#[cfg(unix)]
+enum RuntimeHostAdmission {
+    Attached(Box<codewhale_app_server::daemon_client::OwnerClient>),
+    Bootstrap {
+        lock: crate::runtime_threads::RuntimeProcessOwnerLock,
+        binding: Option<crate::runtime_threads::RuntimeStoreBinding>,
+        recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
+    },
+}
+
+/// Observe first, then hold the existing store lease through all recovery.
+/// Only pre-write publication changes or lease contention can re-observe.
+#[cfg(unix)]
+async fn admit_runtime_host(
+    config_path: Option<PathBuf>,
+    selected_socket: Option<PathBuf>,
+    selected_store: PathBuf,
+) -> Result<RuntimeHostAdmission> {
+    use codewhale_app_server::daemon_client::{HostOwnerProbe, PublicationChangedBeforeAttach};
+    use codewhale_app_server::daemon_socket::owner_work;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let probe = match codewhale_app_server::daemon_client::probe_owner_for_host_startup(
+                config_path.clone(), selected_socket.clone(),
+            ).await {
+                Err(error) if error.is::<PublicationChangedBeforeAttach>() => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                result => result?,
+            };
+            let (binding, recovery) = match probe {
+                HostOwnerProbe::Attached(client) => return Ok(RuntimeHostAdmission::Attached(client)),
+                HostOwnerProbe::Absent => (None, None),
+                HostOwnerProbe::Unavailable(publication) => {
+                    let binding = validate_selected_owner_receipt(publication.receipt().clone(), selected_store.clone()).await?;
+                    (Some(binding), Some(publication))
+                }
+            };
+            let store = selected_store.clone();
+            let existing = binding.clone();
+            let create = recovery.is_none();
+            let lock = owner_work(move || {
+                if let Some(binding) = existing.as_ref() { binding.validate_existing_store()?; }
+                crate::runtime_threads::RuntimeProcessOwnerLock::try_acquire_for_host(&store, create)
+            }).await?;
+            let Some(lock) = lock else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            let store = selected_store.clone();
+            let existing = binding.clone();
+            let lock = owner_work(move || {
+                lock.validate_at_root(&store)?;
+                if let Some(binding) = existing.as_ref() { binding.validate_existing_store()?; }
+                Ok(lock)
+            }).await?;
+            let current = match recovery.as_ref() {
+                Some(publication) => publication.revalidate().await?,
+                None => codewhale_app_server::daemon_client::publication_is_absent(
+                    config_path.clone(), selected_socket.clone(),
+                ).await?,
+            };
+            if !current {
+                drop(lock);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            return Ok(RuntimeHostAdmission::Bootstrap { lock, binding, recovery });
+        }
+    }).await.context("Runtime host admission deadline expired; attachment outcome may be uncertain and is not replayed")?
 }
 
 /// Prefix of the first line the Runtime prints once it holds its listener.
@@ -1612,12 +1734,34 @@ pub async fn run_http_server(
         Some(task_default_model.clone()),
         Some(options.workers),
     );
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
+    let admission = admit_runtime_host(
+        options.config_path.clone(),
+        selected_control_socket(&options),
+        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()).data_dir,
+    )
+    .await?;
+    #[cfg(unix)]
+    let (published, preheld_lock, existing_binding, recovery) = match admission {
+        RuntimeHostAdmission::Attached(client) => (Some(*client), None, None, None),
+        RuntimeHostAdmission::Bootstrap {
+            lock,
+            binding,
+            recovery,
+        } => (None, Some(lock), binding, recovery),
+    };
+    #[cfg(windows)]
     let published = codewhale_app_server::daemon_client::connect_if_published(
         options.config_path.clone(),
         selected_control_socket(&options),
     )
     .await?;
+    #[cfg(not(unix))]
+    let preheld_lock = None;
+    #[cfg(not(unix))]
+    let existing_binding: Option<crate::runtime_threads::RuntimeStoreBinding> = None;
+    #[cfg(windows)]
+    let recovery = None;
     #[cfg(any(unix, windows))]
     if let Some(control) = published {
         let selected_store =
@@ -1727,6 +1871,8 @@ pub async fn run_http_server(
         manager_config,
         plugin_discovery.registry_for_workspace(&workspace),
         acp_selected,
+        preheld_lock,
+        existing_binding.as_ref(),
     )?;
     let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
     let task_manager =
@@ -1831,6 +1977,7 @@ pub async fn run_http_server(
         },
         options.workers,
         resolved_auth.generated,
+        recovery,
     )
     .await?;
     let listener_workspace = state.workspace.clone();
@@ -1969,7 +2116,16 @@ pub(crate) async fn validate_selected_owner(
     client: &codewhale_app_server::daemon_client::OwnerClient,
     selected_store: PathBuf,
 ) -> Result<()> {
-    let receipt = client.receipt().clone();
+    validate_selected_owner_receipt(client.receipt().clone(), selected_store)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(any(unix, windows))]
+async fn validate_selected_owner_receipt(
+    receipt: codewhale_protocol::RuntimeOwnerReceipt,
+    selected_store: PathBuf,
+) -> Result<crate::runtime_threads::RuntimeStoreBinding> {
     codewhale_app_server::daemon_socket::owner_work(move || {
         let selected = crate::runtime_threads::RuntimeStoreBinding::for_store_dir(&selected_store)?;
         selected.validate_existing_store()?;
@@ -1979,7 +2135,7 @@ pub(crate) async fn validate_selected_owner(
                 && selected.execution_scope == receipt.execution_scope,
             "authenticated Runtime owner belongs to another selected store; refusing attachment"
         );
-        Ok(())
+        Ok(selected)
     })
     .await
 }
@@ -1991,6 +2147,7 @@ async fn bind_captured_runtime_frontends(
     model: String,
     worker_setting: usize,
     generated_auth: bool,
+    recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
 ) -> Result<(
     codewhale_app_server::daemon_socket::DaemonSocket,
     codewhale_app_server::AppState,
@@ -2045,6 +2202,7 @@ async fn bind_captured_runtime_frontends(
             CapturedRuntimeFrontend::capture(state.clone(), model, worker_setting, generated_auth)
                 .await?,
         ),
+        recovery,
     )
     .await
 }
@@ -2326,6 +2484,22 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(thread_history::snapshot_thread_history),
         )
         .route(
+            "/v1/thread-history/operations/lookup",
+            post(thread_history::lookup_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/operations/recover",
+            post(thread_history::recover_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/mutate",
+            post(thread_history::mutate_thread_history),
+        )
+        .route(
+            "/v1/thread-history/import",
+            post(thread_history::import_thread_history),
+        )
+        .route(
             "/v1/threads/{id}/jobs",
             get(jobs::list_thread_jobs).post(jobs::create_thread_job),
         )
@@ -2408,6 +2582,13 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}",
             get(turn_artifacts::read_turn_artifact),
         )
+        // What one tool call changed, from the workspace restore points the
+        // engine recorded around it. A shell command's writes belong to the
+        // command here, not only to the turn (see `turn_artifacts`).
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/calls/{tool_call_id}/changes",
+            get(turn_artifacts::list_call_changes),
+        )
         .route(
             "/v1/threads/{id}/turns/{turn_id}/interrupt",
             post(interrupt_thread_turn),
@@ -2464,7 +2645,9 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/hooks", get(list_hooks))
         .route(
             "/v1/skills/{name}",
-            post(set_skill_enabled).delete(uninstall_skill_api),
+            post(set_skill_enabled)
+                .get(get_skill_detail)
+                .delete(uninstall_skill_api),
         )
         .route(
             "/v1/apps/mcp/imports",
@@ -2498,6 +2681,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/skills/{name}/audit", get(audit_skill_api))
         .route("/v1/apps/mcp/tools", get(list_mcp_tools))
         .route("/v1/apps/plugins", get(plugins::list_plugins))
+        .route("/v1/apps/avatars", get(avatars::list_avatars))
+        .route(
+            "/v1/apps/avatars/{handle}/atlases/{page}",
+            get(avatars::get_atlas),
+        )
         .route(
             "/v1/apps/plugins/install",
             post(plugins::install_plugin_api),
@@ -2597,6 +2785,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
+        .route("/v1/constitution", get(constitution::get_constitution))
+        .route(
+            "/v1/constitution/preview",
+            post(constitution::preview_constitution).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .route("/v1/settings/schema", get(get_settings_schema))
         .route(
             "/v1/threads/{id}/notifications/prepare",
@@ -2644,22 +2837,9 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/health", get(health))
         .route("/mobile", get(mobile_page))
         .route("/mobile/", get(mobile_page))
-        .route(
-            "/v1/thread-history/operations/lookup",
-            post(thread_history::lookup_thread_history_operation),
-        )
-        .route(
-            "/v1/thread-history/operations/recover",
-            post(thread_history::recover_thread_history_operation),
-        )
-        .route(
-            "/v1/thread-history/mutate",
-            post(thread_history::mutate_thread_history),
-        )
-        .route(
-            "/v1/thread-history/import",
-            post(thread_history::import_thread_history),
-        )
+        // Intentionally unauthenticated: loopback clients discover the
+        // listener here. The response already redacts account detail for
+        // unauthorized requests; it never mutates state.
         .route("/v1/runtime/info", get(runtime_info))
         // Authenticates per handler: the display WS also takes a single-use
         // ticket, and client-token minting is master-token only.
@@ -3025,16 +3205,41 @@ async fn list_threads_summary(
 ) -> Result<Json<Vec<ThreadSummary>>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let search = query.search.as_deref().map(str::to_ascii_lowercase);
+    let thread_ids = query
+        .thread_ids
+        .map(|ids| {
+            let ids = ids.split(',').map(str::to_owned).collect::<Vec<_>>();
+            if ids.is_empty()
+                || ids.len() > 200
+                || ids.iter().any(|id| {
+                    id.is_empty()
+                        || id.trim() != id
+                        || id.len() > 128
+                        || id.chars().any(char::is_control)
+                })
+            {
+                return Err(ApiError::bad_request(
+                    "thread_ids must be at most 200 comma-separated nonempty IDs of at most 128 bytes",
+                ));
+            }
+            Ok(ids.into_iter().collect::<BTreeSet<_>>())
+        })
+        .transpose()?;
     let filter = resolve_thread_filter(query.include_archived, query.archived_only);
     // `limit` bounds the rows this route returns, not how far a search looks.
     // Passing it to the store read as well matched only inside the newest
     // `limit` threads, so any older match — the row the caller typed the query
     // to find — was invisible. Unsearched listings keep the cheap bounded read;
-    // a search scans in newest-first order and stops at `limit` matches.
+    // a search or exact-ID filter scans in newest-first order and stops at
+    // `limit` matches.
     //
     // Match on the thread record *before* harvesting row facts. Preview is
     // filled only for rows that are returned; it is not a search key.
-    let scan_limit = if search.is_some() { None } else { Some(limit) };
+    let scan_limit = if search.is_some() || thread_ids.is_some() {
+        None
+    } else {
+        Some(limit)
+    };
     let threads = state
         .runtime_threads
         .list_threads(filter, scan_limit)
@@ -3045,6 +3250,11 @@ async fn list_threads_summary(
     for thread in threads {
         if rows.len() >= limit {
             break;
+        }
+        if let Some(thread_ids) = &thread_ids
+            && !thread_ids.contains(&thread.id)
+        {
+            continue;
         }
         if let Some(search) = &search
             && !state
@@ -4837,40 +5047,9 @@ async fn list_skills(
         .list()
         .iter()
         .map(|skill| {
-            let (path, source, plugin_id, plugin_generation, plugin_content_hash) =
-                match &skill.source {
-                    crate::skills::SkillSource::Native => (
-                        Some(skill.path.clone()),
-                        "native".to_string(),
-                        None,
-                        None,
-                        None,
-                    ),
-                    crate::skills::SkillSource::Plugin {
-                        plugin_id,
-                        plugin_name,
-                        authority,
-                        ..
-                    } => (
-                        None,
-                        format!("reviewed-plugin-snapshot:{plugin_name}"),
-                        Some(plugin_id.clone()),
-                        Some(authority.state_generation),
-                        Some(authority.content_hash.clone()),
-                    ),
-                };
-            SkillEntry {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                path,
-                source,
-                plugin_id,
-                plugin_generation,
-                plugin_content_hash,
-                enabled: skill_state
-                    .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref()),
-                is_bundled: skill_entry_is_bundled(skill, &skills_dir),
-            }
+            let enabled = skill_state
+                .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
+            skill_entry_for(skill, enabled, &skills_dir)
         })
         .collect();
     Ok(Json(SkillsResponse {
@@ -4917,6 +5096,100 @@ async fn set_skill_enabled(
         name,
         enabled: req.enabled,
     }))
+}
+
+/// `GET /v1/skills/{name}` — one skill's full routing metadata plus its body.
+///
+/// Clients that activate a skill client-side (TUI's `/skill`, the VS Code GUI)
+/// need the SKILL.md body to compose the next turn's instruction. `load_skill`
+/// serves the model inside a turn; this endpoint serves the *client* before
+/// one. The same discovery walk backs both, so a name the listing shows is a
+/// name this resolves. Plugin bodies are already content-bound in the
+/// in-memory registry snapshot; native bodies are re-checked against disk so
+/// a deleted SKILL.md fails loudly instead of serving a stale body.
+async fn get_skill_detail(
+    State(state): State<RuntimeApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<SkillDetailResponse>, ApiError> {
+    // Discovery, plugin tree hashing/state locks, and skill-state refresh
+    // all read disk; keep this new route's work off the async server worker.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let (skills_dir, mode) = {
+            let config = state.config.read();
+            let skills_dir = resolve_skills_dir(&config, &state.workspace);
+            let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
+            (skills_dir, mode)
+        };
+        let plugin_registry = state
+            .plugin_discovery
+            .registry_for_workspace(&state.workspace);
+        let (registry, directories) = discover_skills_for_runtime_api(
+            &state.workspace,
+            &skills_dir,
+            mode,
+            Some(plugin_registry.as_ref()),
+        );
+        let Some(skill) = registry.get(&name) else {
+            return Err(ApiError::not_found(format!(
+                "skill '{name}' not found in searched directories: {}",
+                format_skill_search_paths(&directories)
+            )));
+        };
+
+        // Only the checks the listing does not need: this route hands the body to
+        // a client, so a native skill whose file has gone must fail rather than
+        // serve the cached instructions, and a plugin must still hold the
+        // authority its snapshot was reviewed under. Field derivation itself is
+        // `skill_entry_for`'s, shared with the listing.
+        match &skill.source {
+            crate::skills::SkillSource::Native if !skill.path.is_file() => {
+                return Err(ApiError::not_found(format!(
+                    "skill '{}' is registered at {} but that file no longer exists on disk",
+                    skill.name,
+                    skill.path.display()
+                )));
+            }
+            crate::skills::SkillSource::Plugin { authority, .. } => {
+                // The same gate the TUI's own activation path runs: a plugin whose
+                // trust or enablement changed since discovery must not hand its
+                // body to a client.
+                crate::plugins::registry::verify_plugin_component_authority(
+                    authority,
+                    crate::plugins::activation::PluginActivationCapability::Skills,
+                )
+                .map_err(|reason| {
+                    ApiError::forbidden(format!(
+                        "plugin skill '{}' is no longer active: {reason}",
+                        skill.name
+                    ))
+                })?;
+                if authority.workspace != state.workspace {
+                    return Err(ApiError::forbidden(format!(
+                        "plugin skill '{}' belongs to a different workspace",
+                        skill.name
+                    )));
+                }
+            }
+            crate::skills::SkillSource::Native => {}
+        }
+
+        let mut skill_state = state.skill_state.blocking_lock();
+        skill_state
+            .refresh()
+            .map_err(|error| ApiError::internal(format!("refresh skill state: {error}")))?;
+        let enabled = skill_state
+            .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
+        Ok(Json(SkillDetailResponse {
+            skill: skill_entry_for(skill, enabled, &skills_dir),
+            body: skill.body.clone(),
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("skill detail read task failed: {error}")))?
 }
 
 // ─── Skill lifecycle helpers ────────────────────────────────────────────────
@@ -5571,7 +5844,7 @@ fn runtime_account_info_for_request(
     }
 }
 
-fn runtime_account_api_base() -> String {
+pub(crate) fn runtime_account_api_base() -> String {
     std::env::var(ACCOUNT_API_BASE_ENV)
         .ok()
         .and_then(|value| normalize_runtime_account_api_base(&value))
@@ -6500,9 +6773,19 @@ async fn list_automation_runs(
     Query(query): Query<AutomationRunsQuery>,
 ) -> Result<Json<Vec<AutomationRunRecord>>, ApiError> {
     let manager = state.automations.lock().await;
-    let runs = manager
-        .list_runs(&id, query.limit)
-        .map_err(map_automation_err)?;
+    let runs = if query.archived {
+        let mut runs = manager
+            .list_archived_runs(&id)
+            .map_err(map_automation_err)?;
+        if let Some(limit) = query.limit {
+            runs.truncate(limit);
+        }
+        runs
+    } else {
+        manager
+            .list_runs(&id, query.limit)
+            .map_err(map_automation_err)?
+    };
     Ok(Json(runs))
 }
 
@@ -7877,6 +8160,8 @@ async fn retry_thread_turn(
         .start_turn_from_stored_images(
             &forked_thread.id,
             StartTurnRequest {
+                account_model_owner: None,
+                profile_constitution: None,
                 expected_workspace: None,
                 max_output_tokens,
                 prompt: retry_prompt,
@@ -8808,6 +9093,8 @@ async fn stream_turn(
         .start_turn(
             &thread.id,
             StartTurnRequest {
+                account_model_owner: None,
+                profile_constitution: None,
                 max_output_tokens: req.max_output_tokens,
                 prompt,
                 images: req.images,
@@ -9181,6 +9468,11 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
                     "remember": payload.get("remember"),
                     "auto": payload.get("auto"),
                     "timeout": payload.get("timeout"),
+                    // Set when the decision was forced by a turn interrupt
+                    // or turn teardown: no user selection was made,
+                    // so clients must clear the pending prompt instead of
+                    // reporting a refusal.
+                    "cancelled": payload.get("cancelled"),
                 }),
             ))
         }
@@ -9373,6 +9665,61 @@ fn skill_entry_is_bundled(skill: &crate::skills::Skill, skills_dir: &FsPath) -> 
 
     let expected_path = skills_dir.join(&skill.name).join("SKILL.md");
     paths_refer_to_same_file(&skill.path, &expected_path)
+}
+
+/// One `/v1/skills` row, and the row half of `GET /v1/skills/{name}`. Both
+/// sites read the same fields from the same `Skill`, so a new routing field
+/// lands in the listing and the detail together or not at all.
+fn skill_entry_for(skill: &crate::skills::Skill, enabled: bool, skills_dir: &FsPath) -> SkillEntry {
+    let (path, source, plugin_id, plugin_generation, plugin_content_hash) = match &skill.source {
+        crate::skills::SkillSource::Native => (
+            Some(skill.path.clone()),
+            "native".to_string(),
+            None,
+            None,
+            None,
+        ),
+        crate::skills::SkillSource::Plugin {
+            plugin_id,
+            plugin_name,
+            authority,
+            ..
+        } => (
+            None,
+            format!("reviewed-plugin-snapshot:{plugin_name}"),
+            Some(plugin_id.clone()),
+            Some(authority.state_generation),
+            Some(authority.content_hash.clone()),
+        ),
+    };
+    let is_bundled = skill_entry_is_bundled(skill, skills_dir);
+    SkillEntry {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        path,
+        source,
+        plugin_id,
+        plugin_generation,
+        plugin_content_hash,
+        enabled,
+        is_bundled,
+        invocation: match skill.invocation {
+            crate::skills::SkillInvocation::ModelAndUser => "model+user",
+            crate::skills::SkillInvocation::ExplicitOnly => "explicit-only",
+            crate::skills::SkillInvocation::ModelOnly => "model-only",
+            crate::skills::SkillInvocation::Disabled => "disabled",
+        },
+        aliases: skill.aliases.clone(),
+        // Reported only when `is_bundled` is true, so the two fields cannot
+        // disagree: a row that is not the bundle-path copy of its name gets no
+        // curated tier, however its name reads. `is_bundled` itself is the
+        // pre-existing path test (`skills_dir/<name>/SKILL.md`), and this does
+        // not change what it means.
+        bundled_tier: is_bundled
+            .then(|| crate::skills::bundled_skill_tier(&skill.name))
+            .flatten()
+            .map(|tier| tier.label()),
+    }
 }
 
 fn paths_refer_to_same_file(left: &FsPath, right: &FsPath) -> bool {
@@ -10088,6 +10435,34 @@ pub(crate) fn runtime_chat_relay_catalog(
         return Err("Codewhale returned an invalid Runtime Chat relay challenge.".to_string());
     }
 
+    let mut account_config;
+    let ready = config
+        .active_provider_identity()
+        .ok()
+        .is_some_and(|identity| {
+            matches!(
+                crate::provider_readiness::credential_state_for_provider(config, &identity),
+                CredentialState::Saved
+                    | CredentialState::ImportedToken
+                    | CredentialState::Local
+                    | CredentialState::NoAuth
+            )
+        });
+    let config = if ready {
+        config
+    } else {
+        account_config = config.clone();
+        let identity = account_config
+            .resolve_persisted_provider_identity(Some("codewhale"), Some("codewhale"))?;
+        if account_config.account_model_api_key(&identity).is_none() {
+            return Err(
+                "Connect account model access before using the Codewhale agent.".to_string(),
+            );
+        }
+        account_config.scope_to_provider_identity(&identity)?;
+        &account_config
+    };
+
     let identity = config
         .active_provider_identity()
         .map_err(|_| "The active Runtime provider identity is invalid.".to_string())?;
@@ -10138,6 +10513,8 @@ pub(crate) fn runtime_chat_relay_catalog(
                 "turn_operation_idempotency": true,
                 "turn_image_inputs": true,
                 "turn_output_token_limit": true,
+                "profile_constitution": true,
+                "account_model_owner": true,
                 "tool_execution": false,
                 "stable_event_ids": true,
             },

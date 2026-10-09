@@ -3,6 +3,7 @@
 > 英文原文：[PROVIDERS.md](../PROVIDERS.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
 > ChatGPT 登录相关内容于 2026-10-02 按当前实现更新。
+> 2026-10-06 补齐已捕获身份、账号切换/限额及 OrcaRouter PKCE；媒体能力见 [MEDIA_MODELS.md](MEDIA_MODELS.md)。
 
 本注册表描述已接入当前 Codewhale 代码库的提供商行为。它刻意保持保守：随附条目仅限于代码已知的提供商 ID、配置键、认证路径、base URL、模型解析和能力元数据。
 
@@ -22,7 +23,7 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 | 阿里云百炼 Model Studio（DashScope） | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `qwen3.8-flash` | `DASHSCOPE_API_KEY` |
 | AICraft | `https://aicraftapi.com/v1` | `claude-4.6-sonnet`；DeepSeek / Claude / Gemini / Qwen / GLM / MiniMax / Doubao 系列 | `AICRAFT_API_KEY` |
 | Tsubasa | `https://api.tsubasa.sh/v1` | `tsubasa-pro`, `tsubasa-fast`（32,768 token 上下文） | `TSUBASA_API_KEY` |
-| Yolo-Auto | `https://yolo-auto.com/v1` | `qwen3.8-flash`（默认）、`claude-4.6-sonnet`、`gemini-3.5-pro` | `YOLO_AUTO_API_KEY` |
+| Yolo-Auto | `https://yolo-auto.com/v1` | `qwen3.8-flash`；`yolo` / `yolo-small` | `YOLO_AUTO_API_KEY` |
 | Cheaper Inference | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini`、`claude-sonnet-5`、`gemini-3.1-pro` | `CHEAPER_INFERENCE_API_KEY` |
 
 AICraft 的 OpenAI 兼容端点提供 DeepSeek、Anthropic Claude、Google Gemini、Qwen、GLM、MiniMax 和 Doubao 的模型 ID。权威来源是带上你的密钥请求 `GET https://aicraftapi.com/v1/models` 的结果：请从该列表中选择模型，而不是从上表中选。
@@ -36,9 +37,27 @@ OpenCode Zen 和 OpenCode Go 是一等提供商路由，配置方式与下文其
 - `crates/config/src/lib.rs` —— 共享的提供商 ID、默认值、环境变量优先级。
 - `crates/config/assets/provider_descriptors.json` —— 内置的 OpenAI 兼容主机描述符（即上文的已知可用主机表）。
 - `crates/tui/src/config.rs` —— TUI 提供商 ID、提供商能力元数据以及提供商特定的环境变量处理。
-- `crates/agent/src/lib.rs` —— `codewhale model list` 和 `codewhale model resolve` 使用的静态 `ModelRegistry`。
+- `crates/agent/src/lib.rs` —— `codewhale model resolve` 使用的静态 `ModelRegistry`（以及 `[model]` 配置面）。`codewhale model list` 则改为读取解析后的 provider lake，因此一次列表就能同时看到内置、实时与已配置的行。
 - `config.example.toml` 和 `docs/CONFIGURATION.md` —— 面向用户的配置示例和环境变量参考。
 - `scripts/check-provider-registry.py` —— 对规范提供商 ID、实时 TUI 提供商 ID、TOML 表名、静态注册表行和文档化默认值的漂移检查。
+
+## 已捕获的提供商身份
+
+名称、标签、别名及旧线协议标签来自 `provider_descriptors.json`。`ProviderKind`
+仍拥有 Rust 内部的凭据、协议与地区区别。配置路由同时捕获 kind 与精确表键；
+名为 `openai` 的自定义表仍是自定义路由，不会因名称而获得 OpenAI 凭据或协议规则。
+自定义键区分大小写。
+
+DeepSeek 中国路由保留三个表示：已发布 TUI serde 包装的 `deepseek_c_n`、捕获路由
+ID `deepseek-cn`、配置叶子 `deepseek_cn`。固有 kind 是 DeepSeek，表与端点仍独立。
+
+旧自定义路由缺少新增的 provider ID 时，只能凭经过验证的根 `base_url` 迁移回执
+恢复到活动 `providers.custom` 表。私有回执绑定解析后的表版本；仅表、仅 profile、
+冲突或后来替换的表不足以建立缺失身份，显式空 ID 会被拒绝。写入复用现有锁内配置
+变更与撤销比较，在同一锁内获得新迁移回执，核对捕获表后才改叶子。
+
+在途请求保留捕获身份、端点及凭据版本。健康查询不能仅因旧请求使用过同类认证，
+就把不透明凭据引用当作已就绪。
 
 ## 提供商选择
 
@@ -423,6 +442,30 @@ model = "qwen3:8b"        # 默认是 deepseek-v4-flash
 
 对于 Kimi，官方[快速入门](https://platform.kimi.ai/docs/overview)引导用户登录、打开 **API 密钥**、创建并复制密钥，并保守秘密。Codewhale 直接链接到该控制台并接受复制的密钥。它从不探测或冒充 `kimi_cli`/`kimi_code_cli`；一等 Kimi OAuth 仍然受阻于厂商注册的 Codewhale 身份。
 
+### 订阅账号与使用上限
+
+Codewhale 为每个订阅提供商保存一个自有登录，与浏览器、ChatGPT/Grok 应用及
+Codex/Grok CLI 分开。成功的新登录替换旧自有授权；不提供多个已保存 ChatGPT
+账号的选择器。
+
+- `codewhale auth status --provider openai-codex`（或 `xai`）及 `auth list`
+  只读取本地状态。有 ID token 邮箱声明时显示账号标签，有套餐/工作区声明时才显示
+  相应资料；标签不证明权益。有效授权也可能没有标签。访问令牌过期但有刷新令牌
+  仍可结构性使用；存储无效、缺失或过期且无刷新令牌则不可用。
+- `/auth chatgpt` 更新当前会话；从 shell 执行 `codewhale auth chatgpt` 后需重启
+  已打开会话。普通登录复用所选账号/工作区已签发的 client ID，并验证账号一致。
+  `CODEWHALE_CHATGPT_OAUTH_NO_PROMPT=1` 可在发行者拒绝 `prompt=login` 时省略它。
+- 从 shell 执行 `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt` 更换
+  账号/工作区，随后刷新模型目录并重启会话；只有完整验证的新授权替换活动授权。
+  xAI 使用 `/auth xai-device` 或 shell `codewhale auth xai-device`；设备页批准
+  浏览器当前账号，必要时先退出浏览器账号或使用隐私窗口。
+- `subscription_sharing_usage_limit_exceeded` / `subscription_sharing_usage_unavailable`
+  以及其他订阅配额错误给出当前请求账号（已知时）与恢复指引；不会自动重试终态
+  错误或悄悄换计费路由。xAI OAuth 配置若实际使用 API key，则不显示登录恢复指引。
+- 官方 ChatGPT 套餐路由只使用所选、已验证的 Codewhale 自有授权。
+  `OPENAI_CODEX_ACCESS_TOKEN`、`CODEX_ACCESS_TOKEN` 或获准读取的 Codex CLI
+  token 都不能覆盖或授权该路由。成功登录回执不会打印 token。
+
 ### 外部 CLI 凭据授权
 
 归另一 CLI 所有的凭据文件默认禁用。没有显式授权，提供商发现、设置、路由、`auth status` 和 doctor 不会 stat、读取、刷新、联系身份提供商或重写 Codex、Grok、Kimi 或未来的外部凭据文件。
@@ -589,13 +632,37 @@ Codewhale 在 OpenRouter 提供商范围内保留 `deepseek/` 线协议模型前
 
 OrcaRouter（`https://api.orcarouter.ai/v1`）是专用的具名路由（[OrcaRouter](https://www.orcarouter.ai)），它说同样的 OpenAI Chat Completions 线协议，并提供同样的命名空间化 `vendor/model` 目录。它不需要 OpenRouter 兼容的 `base_url` 覆盖：选择 `provider = "orcarouter"`，它的命名空间化线协议模型（例如 `deepseek/deepseek-v4-pro` 或它自己的 `orcarouter/auto` 路由器）会原样通过，就像它们在 OpenRouter 提供商范围上一样。
 
+#### OrcaRouter：API key 或 OAuth 2.0 + PKCE
+
+已有 key 可使用 `codewhale auth set --provider orcarouter`、`/provider` 或
+`ORCAROUTER_API_KEY`。`codewhale auth orcarouter` / `/auth orcarouter` 通过
+PKCE S256、回环回调与恒定时间 state 校验获得持久 `sk-orca-…` key；两条路径写入
+同一个 `orcarouter` 秘密槽位，`auth_mode = "api_key"`。
+
+浏览器授权为 `https://www.orcarouter.ai/auth`；交换为
+`POST https://www.orcarouter.ai/api/v1/auth/keys`，无需 client secret 或预注册
+回调 URI。推理和目录使用独立的 `https://api.orcarouter.ai/v1`，不能由另一个
+源站猜测路径。自托管可显式用 `ORCA_AUTH_BASE_URL` 与
+`ORCA_API_BASE_URL` / `ORCAROUTER_BASE_URL` 覆盖各自源站；远程必须 HTTPS，
+HTTP 只允许回环。
+
+所得 key 不是刷新令牌：重启后复用，不发送 refresh grant。请在 OrcaRouter
+控制台撤销；`/auth orcarouter-revoke` 只清除本地副本。Relay 401 将该凭据版本
+标为需重新认证，不静默重试。
+
+实时 `GET https://api.orcarouter.ai/v1/models` 用所配置 key 获取目录。
+聊天选择器仅保留 `supported_endpoint_types` 含 `openai`、`anthropic`、`gemini`
+或 `openai-response` 的行；图像生成、视频与 rerank 行被过滤，不按名称猜测。
+`architecture.input_modalities` 含 `image` 才确认图像输入；无 architecture 的行
+能力为未知。
+
 ### 近期 OpenRouter 大模型
 
 OpenRouter completions 和静态注册表行包括自 2026 年 4 月起通过 OpenRouter 模型元数据验证的大模型：`arcee-ai/trinity-large-thinking`、`qwen/qwen3.6-flash`、`qwen/qwen3.6-35b-a3b`、`qwen/qwen3.6-max-preview`、`qwen/qwen3.6-27b`、`qwen/qwen3.6-plus`、`minimax/minimax-m3`、`xiaomi/mimo-v2.5-pro`、`xiaomi/mimo-v2.5`、`moonshotai/kimi-k2.7-code`、`moonshotai/kimi-k2.6`、`z-ai/glm-5.1`、`z-ai/glm-5.2`、`z-ai/glm-5-turbo`、`tencent/hy3-preview`、`google/gemma-4-31b-it`、`google/gemma-4-26b-a4b-it` 和 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`。`minimax/minimax-m3` 是从 OpenRouter 2026 年 5 月 31 日的列表中新增的，作为 1M 上下文的多模态模型，用于编码、工具调用和长周期的智能体工作。`GLM-5.3` 现在是直接 Z.AI Coding 套餐的默认模型；`GLM-5.2` / `z-ai/glm-5.2` 仍然可用（显式选择保留自己的 id），`GLM-5.1` / `z-ai/glm-5.1` 作为更小的模型仍然可用，`GLM-5.3-Flash` / `z-ai/glm-5.3-flash` 是 `GLM-5.3` 的更快的探索型同系模型，`GLM-5-Turbo` / `z-ai/glm-5-turbo` 则仍是 `GLM-5.2` 的更快的同系模型。`GLM-5.3` / `z-ai/glm-5.3` 与 `GLM-5.3-Flash` / `z-ai/glm-5.3-flash` 是 Z.ai 和 OpenRouter 路由上的一等选择器 id（先执行 `/provider zai` 再用 `/model`，或设置 `model = "GLM-5.3-Flash"`）。在 Z.ai 发布不同的 5.3 元数据之前，5.3 的限制和推理选项继承自 `GLM-5.2`，而且 5.3 不带价格。Flash 采用已公布的 $0.15/$0.50 价目。在未开通 5.3 的账户上，实时调用仍可能以权限代码 1311 返回 429。
 
 ## 静态模型注册表
 
-`codewhale model list` 和 `codewhale model resolve` 使用 `crates/agent/src/lib.rs` 中的静态注册表。这与实时 `/models` 发现不同。当端点支持模型列表时，使用 `/models` 或 `codewhale models` 从活动的 API 端点获取模型 ID。
+下表描述的是静态注册表；`codewhale model resolve`（以及 `[model]` 配置面）仍用它解析选择器别名。这与实时 `/models` 发现不同。当端点支持模型列表时，使用 `/models` 或 `codewhale models` 从活动的 API 端点获取模型 ID。
 
 | 提供商 | 静态注册表条目 | 工具调用 | 注册表推理标志 |
 | --- | --- | --- | --- |

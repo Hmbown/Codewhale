@@ -377,8 +377,14 @@ SEED_RENDER_COMMAND = "python3 scripts/catalog_models_dev.py seed render"
 PROVIDER_MODEL_FIELDS = (
     "id",
     "base_model",
+    "canonical_model_id",
     "name",
+    "description",
+    "type",
     "family",
+    "knowledge",
+    "release_date",
+    "last_updated",
     "default",
     "attachment",
     "reasoning",
@@ -391,11 +397,19 @@ PROVIDER_MODEL_FIELDS = (
     "modalities",
     "limit",
     "cost",
+    "provider",
+    "status",
+    "experimental",
 )
 CANONICAL_MODEL_FIELDS = (
     "id",
     "name",
+    "description",
+    "type",
     "family",
+    "knowledge",
+    "release_date",
+    "last_updated",
     "attachment",
     "reasoning",
     "tool_call",
@@ -404,15 +418,20 @@ CANONICAL_MODEL_FIELDS = (
     "open_weights",
     "modalities",
     "limit",
+    "license",
+    "links",
+    "weights",
+    "benchmarks",
 )
 NESTED_FIELDS = {
     "limit": ("context", "input", "output"),
     "modalities": ("input", "output"),
-    "cost": ("input", "output", "cache_read", "cache_write"),
+    "cost": ("input", "output", "cache_read", "cache_write", "reasoning", "input_audio", "output_audio", "tiers", "context_over_200k"),
+    "provider": ("npm", "api", "shape", "body", "headers"),
 }
 # Mapping-only keys a spec model entry may carry. None of them restates an
-# upstream fact: `base_model` is Codewhale's canonical join, which upstream
-# provider rows do not carry.
+# upstream fact: `base_model` is the seed's compatibility join; generated
+# upstream provider rows may carry `canonical_model_id`.
 SPEC_MODEL_KEYS = {"id", "upstream_id", "from", "base_model", "curated"}
 SPEC_PROVIDER_KEYS = {"id", "upstream", "name", "api", "npm", "env", "doc", "default", "models"}
 SAFE_PUBLIC_TEXT = re.compile(r"^[A-Za-z0-9 ._:/()+\-]{0,64}$")
@@ -760,6 +779,10 @@ def render_seed(spec: dict[str, Any], lock: dict[str, Any], reviewed_source: dic
                 row = dict(locked[1])
             row["id"] = model["id"]
             if model.get("base_model"):
+                canonical = row.get("canonical_model_id")
+                if canonical is not None and canonical != model["base_model"]:
+                    errors.append(f"{key[0]}/{key[1]}: seed base_model conflicts with upstream canonical_model_id")
+                    continue
                 row["base_model"] = model["base_model"]
             row.pop("default", None)
             if model["id"] == provider["default"]:

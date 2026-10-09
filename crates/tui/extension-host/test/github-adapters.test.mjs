@@ -46,7 +46,7 @@ test('draft/read/operator review share one complete Markdown renderer and unavai
   assert.equal(draft.artifact,`artifacts/issue-reports/${report.id}.json`)
   assert.ok(review.startsWith(`# Lost tool result\n\nDraft: ${report.id}\nStatus: ready for review\nPublication: unavailable`))
   assert.ok(review.includes('## Inferences (not verified)\n\nNone recorded.\n'));assert.ok(review.includes('- Provider (agent reported): unknown\n'))
-  assert.ok(review.includes('- [#19](https://github.com/Hmbown/CodeWhale/issues/19)\n'));assert.ok(review.includes('Redacted categories: absolute_path, secret\n'))
+  assert.ok(review.includes('- [#19](https://github.com/codewhale-hq/CodeWhale/issues/19)\n'));assert.ok(review.includes('Redacted categories: absolute_path, secret\n'))
   assert.ok(review.endsWith(`\nReview: \`/feedback review ${report.id}\`\nRevise: \`/feedback edit ${report.id} <change>\`\n`))
 })
 test('revision and inference fields remain attributed and distinct',()=>{

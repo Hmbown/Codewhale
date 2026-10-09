@@ -1,4 +1,4 @@
-//! Codewhale's work dock: Tasks, Fleet, Jobs, Files, Notes, Context, Git, Cost.
+//! Codewhale's work dock: Tasks, Fleet, Jobs, Terminal, Files, Notes, Context, Git, Cost.
 //!
 //! Extracted from `CodeWhale/crates/tui/src/tui/work_surface/{model,input,
 //! render/{mod,layout,rows}}.rs` at `a79ce5c4d5ed1a5f7032185710c27343a900351c`.
@@ -23,6 +23,7 @@ pub enum WorkbarPanel {
     Tasks,
     Fleet,
     Jobs,
+    Terminal,
     Files,
     Notes,
     Context,
@@ -31,10 +32,11 @@ pub enum WorkbarPanel {
 }
 
 impl WorkbarPanel {
-    pub const ORDER: [Self; 8] = [
+    pub const ORDER: [Self; 9] = [
         Self::Tasks,
         Self::Fleet,
         Self::Jobs,
+        Self::Terminal,
         Self::Files,
         Self::Notes,
         Self::Context,
@@ -48,6 +50,7 @@ impl WorkbarPanel {
             Self::Tasks => "Tasks",
             Self::Fleet => "Fleet",
             Self::Jobs => "Jobs",
+            Self::Terminal => "Terminal",
             Self::Files => "Files",
             Self::Notes => "Notes",
             Self::Context => "Context",
@@ -62,6 +65,7 @@ impl WorkbarPanel {
             Self::Tasks => "no to-dos yet",
             Self::Fleet => "no agents have run this session",
             Self::Jobs => "nothing running in the background",
+            Self::Terminal => "",
             Self::Files => "no files touched this session",
             Self::Notes => "/note add <text> to keep a note",
             Self::Context => "context budget unknown",

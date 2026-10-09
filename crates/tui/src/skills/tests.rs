@@ -1960,19 +1960,40 @@ fn discovery_delta_since(earlier: super::SkillDiscoveryMetrics) -> super::SkillD
     super::discovery_metrics_snapshot().delta_since(earlier)
 }
 
+/// Run a cache-hit measurement on a cache no other test emptied meanwhile.
+///
+/// The discovery cache is process-wide. Under `cargo test` every test shares
+/// it, and other tests (and the app code they drive) empty it at any moment,
+/// which turns a genuine hit into a re-walk. Each attempt starts from an
+/// empty cache and is kept only if nothing else dropped the cache while it
+/// ran.
+fn measure_on_undisturbed_cache<T>(mut measure: impl FnMut() -> T) -> T {
+    for _ in 0..200 {
+        super::clear_skill_discovery_cache();
+        let drops = super::discovery_cache_drops();
+        let measured = measure();
+        if super::discovery_cache_drops() == drops {
+            return measured;
+        }
+    }
+    panic!("other tests emptied the shared skill discovery cache during every attempt");
+}
+
 #[test]
 fn cached_discovery_reuses_unchanged_registry_without_rewalking() {
-    super::clear_skill_discovery_cache();
     let tmpdir = TempDir::new().unwrap();
     let skills_root = tmpdir.path().join("skills");
     write_skill(&skills_root, "demo", "A demo skill", "Instructions");
     let dirs = vec![skills_root];
 
-    super::reset_discovery_metrics();
-    let first = super::discover_from_directories_with_plugins(dirs.clone(), None);
-    let walked = discovery_delta_since(super::SkillDiscoveryMetrics::default());
-    let second = super::discover_from_directories_with_plugins(dirs, None);
-    let rewalked = discovery_delta_since(walked);
+    let (first, walked, second, rewalked) = measure_on_undisturbed_cache(|| {
+        super::reset_discovery_metrics();
+        let first = super::discover_from_directories_with_plugins(dirs.clone(), None);
+        let walked = discovery_delta_since(super::SkillDiscoveryMetrics::default());
+        let second = super::discover_from_directories_with_plugins(dirs.clone(), None);
+        let rewalked = discovery_delta_since(walked);
+        (first, walked, second, rewalked)
+    });
 
     assert_eq!(walked.root_discovery_calls, 1);
     assert_eq!(rewalked, super::SkillDiscoveryMetrics::default());
@@ -2072,21 +2093,24 @@ fn workspace_and_dir_entry_point_shares_the_same_cache() {
     let _codewhale_home =
         crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale"));
 
-    super::reset_discovery_metrics();
-    let first = super::discover_for_workspace_and_dir_with_mode_and_plugins(
-        &workspace,
-        &skills_dir,
-        super::SkillDiscoveryMode::Compatible,
-        None,
-    );
-    let walked = discovery_delta_since(super::SkillDiscoveryMetrics::default());
-    let second = super::discover_for_workspace_and_dir_with_mode_and_plugins(
-        &workspace,
-        &skills_dir,
-        super::SkillDiscoveryMode::Compatible,
-        None,
-    );
-    let rewalked = discovery_delta_since(walked);
+    let (first, walked, second, rewalked) = measure_on_undisturbed_cache(|| {
+        super::reset_discovery_metrics();
+        let first = super::discover_for_workspace_and_dir_with_mode_and_plugins(
+            &workspace,
+            &skills_dir,
+            super::SkillDiscoveryMode::Compatible,
+            None,
+        );
+        let walked = discovery_delta_since(super::SkillDiscoveryMetrics::default());
+        let second = super::discover_for_workspace_and_dir_with_mode_and_plugins(
+            &workspace,
+            &skills_dir,
+            super::SkillDiscoveryMode::Compatible,
+            None,
+        );
+        let rewalked = discovery_delta_since(walked);
+        (first, walked, second, rewalked)
+    });
 
     assert!(walked.root_discovery_calls >= 1);
     assert_eq!(rewalked, super::SkillDiscoveryMetrics::default());

@@ -753,7 +753,7 @@ impl Engine {
             // turn's. Recheck the wall clock before it can authorize the
             // provider request that follows this phase.
             if let Some(error) = self.turn_wall_clock_exhausted_error() {
-                let _ = self.send_event(Event::status(error.clone())).await;
+                self.post_turn_budget_stop(&error).await;
                 return AutoCompactionStep::EndTurn(TurnOutcomeStatus::Failed, Some(error));
             }
         }

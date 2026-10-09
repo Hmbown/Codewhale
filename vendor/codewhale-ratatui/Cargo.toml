@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 description = "Reusable Ratatui components from Codewhale: native workbar, composer, views, themes, ocean and motion."
-repository = "https://github.com/Hmbown/codewhale-ratatui"
+repository = "https://github.com/codewhale-hq/codewhale-ratatui"
 keywords = ["ratatui", "tui", "terminal", "components", "codewhale"]
 categories = ["command-line-interface"]
 # Ship the library and runnable sources, not repository previews or local sessions.
@@ -14,6 +14,10 @@ include = [
     "/vendor/codewhale-design/tokens.rs",
     "/assets/whale-v2.scenes",
     "/assets/whale-motion/**",
+    "/assets/avatar-pack/**",
+    "/assets/whale-girl/avatar.json",
+    "/assets/whale-girl/player.rs",
+    "/assets/whale-girl/terminal.rgba",
     "/assets/tui-palettes.json",
     "/assets/tui-source.json",
     "/tests/fixtures/whale-motion/**",

@@ -25,7 +25,7 @@ use crate::compaction::{
 use crate::config::Config;
 #[cfg(test)]
 use crate::context_budget::PressureLevel;
-use crate::prompts::{CORE_EXECUTION_PROFILE_PROMPT, Personality};
+use crate::prompts::CORE_EXECUTION_PROFILE_PROMPT;
 use crate::route_budget::route_context_window_tokens;
 use crate::tui::app::App;
 use codewhale_config::AppMode;
@@ -464,7 +464,7 @@ fn base_source_entries(
 ) -> ReportBuilder {
     let mut builder = ReportBuilder::new();
 
-    let constitution = crate::prompts::compose_default_static_layers(Personality::Calm, model);
+    let constitution = crate::prompts::compose_default_static_layers(model);
     builder.push(SourceEntry::text(
         SourceKind::Constitution,
         "Bundled constitution, language policy, and output policy",
@@ -749,9 +749,7 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
 }
 
 fn add_handoff_entry(builder: &mut ReportBuilder, workspace: &Path) {
-    let primary = workspace.join(crate::prompts::HANDOFF_RELATIVE_PATH);
-    let legacy = workspace.join(".deepseek/handoff.md");
-    let path = if primary.exists() { primary } else { legacy };
+    let (path, _) = crate::prompts::resolve_handoff_path(workspace);
     let Some(raw) = std::fs::read_to_string(&path)
         .ok()
         .filter(|raw| !raw.trim().is_empty())
@@ -882,16 +880,22 @@ fn pressure_label(percent: Option<f64>) -> &'static str {
 
 #[cfg(test)]
 pub fn format_context_report(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::format_context_report(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::format_context_report(&project_source_map(
+        report.clone(),
+    ))
 }
 
 #[cfg(test)]
 pub fn format_context_summary(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::format_context_summary(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::format_context_summary(&project_source_map(
+        report.clone(),
+    ))
 }
 
 pub fn context_report_json(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::context_report_json(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::context_report_json(&project_source_map(
+        report.clone(),
+    ))
 }
 
 #[cfg(test)]

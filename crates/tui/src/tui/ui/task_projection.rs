@@ -244,9 +244,16 @@ pub(super) fn project_shell_jobs(
         files_touched: 0,
         exit_code: job.exit_code,
     };
+    // Only shells that really run in the background are jobs. A foreground
+    // Bash wait is already the live tool card in the transcript; listing it
+    // here too counted one command as a `1 shell` footer chip, a `Shells 1`
+    // row and the tool card at once. A wait that outlives its foreground
+    // budget (or Ctrl+B) flips `background`, and the shell then appears here.
     entries.extend(
         jobs.iter()
-            .filter(|job| matches!(job.status, crate::tools::shell::ShellStatus::Running))
+            .filter(|job| {
+                job.background && matches!(job.status, crate::tools::shell::ShellStatus::Running)
+            })
             .map(shell_entry),
     );
     // Finished shells in the order they finished, so the list is stable and

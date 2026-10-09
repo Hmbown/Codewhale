@@ -16,8 +16,8 @@ Packages:
   @deepseek-ai/dsh-tools@0.1.7-alpha.2 (MIT)
   @deepseek-ai/dsh-util-values@0.1.7-alpha.2 (MIT)
   @deepseek-ai/schemastery@3.18.4 (MIT)
-  @modelcontextprotocol/client@2.0.0 (MIT)
-  @modelcontextprotocol/core@2.0.0 (MIT)
+  @modelcontextprotocol/client@2.2.0 (MIT)
+  @modelcontextprotocol/core@2.2.0 (MIT)
   acorn@8.18.0 (MIT)
   eventsource@3.0.7 (MIT)
   eventsource-parser@3.1.1 (MIT)
@@ -411,7 +411,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ========================================================================
-@modelcontextprotocol/client@2.0.0 (MIT)
+@modelcontextprotocol/client@2.2.0 (MIT)
 ========================================================================
 
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.
@@ -632,7 +632,7 @@ CC-BY-4.0. See https://creativecommons.org/licenses/by/4.0/legalcode for
 the full license text.
 
 ========================================================================
-@modelcontextprotocol/core@2.0.0 (MIT)
+@modelcontextprotocol/core@2.2.0 (MIT)
 ========================================================================
 
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.

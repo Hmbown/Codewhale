@@ -459,7 +459,7 @@ pub(super) fn format_tool_error_with_schema(
             // #3020: Pass through self-explanatory messages that already name the
             // cause (mode switch, allow_shell, feature flag).  Avoids appending a
             // conflicting "Check mode, feature flags" suffix on top of
-            // "switch to Act mode" which already gives the recovery path.
+            // a message that already names the mode and who can change it.
             if lower.contains("current tool catalog")
                 || lower.contains("did you mean:")
                 || mentions_mode_word(&lower)

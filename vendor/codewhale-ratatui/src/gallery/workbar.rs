@@ -60,6 +60,10 @@ fn rows(panel: WorkbarPanel) -> Vec<WorkbarRow> {
                     .elapsed_seconds(183),
                 ),
         ],
+        WorkbarPanel::Terminal => vec![WorkbarRow::new(
+            "terminal:host",
+            "Terminal sessions are supplied by the host",
+        )],
         WorkbarPanel::Jobs => vec![
             WorkbarRow::new("shell:gallery", "Render the component gallery")
                 .mark("●")

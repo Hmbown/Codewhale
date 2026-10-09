@@ -1039,7 +1039,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             || config.subagent_heartbeat_timeout_secs(),
             |identity| config.subagent_heartbeat_timeout_secs_for_provider(identity),
         )),
-        prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
+        prefer_bwrap: config.prefers_bwrap(),
         bwrap_extensions: crate::sandbox::BwrapMountExtensions {
             read_only_roots: config.bwrap_ro_roots.clone(),
             device_roots: config.bwrap_dev_roots.clone(),
@@ -1498,6 +1498,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         return None;
     }
 
+    let pet_main = crate::tui::pet_watch::main_view(app);
+
     // Mini-window mode: when the host terminal window is pinned into its
     // small always-on-top form, hide the shell chrome and keep only what the
     // user opted to keep (`[mini_window]` in config.toml, or mutated live by
@@ -1517,7 +1519,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // `tui.metrics_line = "hidden"` gives the row to the transcript (#5950).
     // The empty shell keeps route identity visible; render_info_row omits
     // session readings until a conversation exists.
-    let info_height = if (mini && !mini_cfg.keep_header)
+    let info_height = if pet_main
+        || (mini && !mini_cfg.keep_header)
         || app.metrics_line == crate::config::ChromeRowPreset::Hidden
     {
         0
@@ -1529,7 +1532,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // left, depth·keys on the right. It hides with the rest of the footer
     // chrome in mini mode, never with the composer.
     // `tui.posture_bar = "hidden"` likewise (#5950).
-    let footer_height = if (mini && !mini_cfg.keep_footer)
+    let footer_height = if pet_main {
+        crate::tui::phase_strip::height()
+    } else if (mini && !mini_cfg.keep_footer)
         || app.posture_bar == crate::config::ChromeRowPreset::Hidden
     {
         0
@@ -1544,7 +1549,10 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         app.mention_menu_selected = mention_menu_entries.len().saturating_sub(1);
     }
     let rail_budget = rail_row_budget(app, shell_area.width, shell_area.height, idle_empty);
-    let top_work_strip_height = if mini && !mini_cfg.keep_todo {
+    let top_work_strip_height = if pet_main {
+        crate::tui::work_surface::collapse_strip(app);
+        0
+    } else if mini && !mini_cfg.keep_todo {
         // Mini mode hides the strip; when the side rail is also hidden (the
         // default), drop the work-surface interaction state so stale
         // hitboxes from the pre-pin layout cannot swallow transcript clicks
@@ -1573,7 +1581,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
                 .saturating_add(top_work_strip_height),
         )
         .max(MIN_COMPOSER_HEIGHT);
-    let composer_height = if mini && !mini_cfg.keep_input {
+    let composer_height = if !pet_main && mini && !mini_cfg.keep_input {
         0
     } else {
         let composer_widget = ComposerWidget::new(
@@ -1590,7 +1598,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // "messages typed during a running turn vanish" complaint by giving the
     // user immediate visible feedback above the composer.
     let pending_preview = build_pending_input_preview(app);
-    let desired_preview_height = if mini {
+    let desired_preview_height = if !pet_main && mini {
         0
     } else {
         pending_preview.desired_height(shell_area.width)
@@ -1605,12 +1613,12 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // posture bar, so live progress sits beside the controls that act on it
     // and never between the transcript and the composer. Zero rows when no
     // run is showing.
-    let desired_workbar_height = if mini {
+    let desired_workbar_height = if pet_main || mini {
         0
     } else {
         crate::tui::widgets::workbar::desired_rows(app.workflow_runs.len())
     };
-    let plugin_cta_height = if mini && !mini_cfg.keep_input {
+    let plugin_cta_height = if !pet_main && mini && !mini_cfg.keep_input {
         0
     } else {
         app.plugin_cta_row_height()
@@ -1692,7 +1700,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             .height
             .min(prompt.y.saturating_sub(visible_chat_area.y));
     }
-    let (work_chat_area, side_work_area) = if mini && !mini_cfg.keep_sidebar {
+    let (work_chat_area, side_work_area) = if pet_main || (mini && !mini_cfg.keep_sidebar) {
         // Mini mode without the side rail: the transcript takes the whole
         // chat row. split_chat is skipped so the rail never reserves columns.
         (visible_chat_area, None)
@@ -1749,7 +1757,16 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             };
         app.sidebar_hover_tooltip = None;
 
-        if app.agent_focus.is_some() && !app.launch.return_to_session {
+        if pet_main {
+            // Hidden shell surfaces must relinquish their pointer targets.
+            // The common composer below still publishes its exact native plan.
+            app.viewport.last_transcript_area = None;
+            app.viewport.pinned_prompt_area = None;
+            app.viewport.pinned_prompt_message = None;
+            app.launch.row_hitboxes.clear();
+            crate::tui::pet_watch::render_main(f, chat_area, app);
+            shell_ocean = None;
+        } else if app.agent_focus.is_some() && !app.launch.return_to_session {
             // A focused worker's full transcript owns the conversation area;
             // the ocean column and every other shell surface stay as they are.
             //
@@ -1799,10 +1816,12 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         // hitbox cannot describe a row the transcript did not draw — and a
         // fully dissolved card painted nothing this frame, so it owns no
         // rows either.
-        if app.launch.card_paintable(
-            app.ambient_clock_ms,
-            app.motion_policy().allows_decorative(),
-        ) {
+        if !pet_main
+            && app.launch.card_paintable(
+                app.ambient_clock_ms,
+                app.motion_policy().allows_decorative(),
+            )
+        {
             crate::tui::underwater::refresh_launch_row_hitboxes(app, chat_area);
         } else if !app.launch.row_hitboxes.is_empty() {
             app.launch.row_hitboxes.clear();
@@ -1844,7 +1863,17 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // the remote-control state or a live notice pinned right.
     if footer_height > 0 {
         let area = body_chunks[footer_slot];
-        let facts = crate::tui::phase_strip::tideline_footer_from_app(app, area.width);
+        let mut facts = crate::tui::phase_strip::tideline_footer_from_app(app, area.width);
+        if pet_main {
+            // The pet header owns phase and notices. This row retains the
+            // existing permission/mode controls, live counts and cap warning.
+            facts.turn_clock = None;
+            facts.session_clock = None;
+            facts.right = None;
+            if !app.is_loading {
+                facts.hint = None;
+            }
+        }
         let footer = facts
             .widget(
                 &app.ui_theme,
@@ -3084,3 +3113,242 @@ mod tests {
 
 #[cfg(test)]
 mod one_owner_tests;
+
+#[cfg(test)]
+mod pet_main_tests {
+    use super::*;
+    use crate::tui::{
+        approval::{ApprovalRequest, ApprovalView},
+        pet_watch,
+        shell_key_routing::Focus,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn app() -> App {
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.onboarding = OnboardingState::None;
+        app.redaction_gate = false;
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.pet_watch.detach_for_test();
+        pet_watch::set_enabled(&mut app, true);
+        app
+    }
+    fn paint(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, Option<(u16, u16)>) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut cursor = None;
+        terminal
+            .draw(|frame| cursor = render(frame, app, &Config::default()))
+            .unwrap();
+        (terminal.backend().buffer().clone(), cursor)
+    }
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content.iter().map(|cell| cell.symbol()).collect()
+    }
+    fn capture(app: &App, name: &str, buf: &ratatui::buffer::Buffer, light: bool) {
+        // Use the actual output backend's color projection, including light
+        // contrast and terminal depth, before exporting the terminal cells.
+        let mut buf = buf.clone();
+        for cell in &mut buf.content {
+            crate::tui::color_compat::adapt_cell_colors(
+                cell,
+                codewhale_palette::ColorDepth::detect(),
+                app.ui_theme.mode,
+                app.theme_id,
+                &app.ui_theme,
+                Some(app.ui_theme.surface_bg),
+            );
+        }
+        if let Some(dir) = std::env::var_os("CODEWHALE_PET_CAPTURE_DIR") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let profile = if light {
+                codewhale_ratatui::testing::Profile::LightTrue
+            } else {
+                codewhale_ratatui::testing::Profile::DarkTrue
+            };
+            std::fs::write(
+                dir.join(format!("{name}.svg")),
+                codewhale_ratatui::testing::svg(&buf, &profile.theme()),
+            )
+            .unwrap();
+        }
+    }
+    #[test]
+    fn pet_main_retains_native_composer_caret_pointer_and_paste_at_every_size() {
+        for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32), (140, 40)] {
+            let mut app = app();
+            app.composer_border = true;
+            app.input = "Help me build 中文".into();
+            app.cursor_position = app.input.chars().count();
+            let (buf, cursor) = paint(&mut app, width, height);
+            assert_eq!(app.focus(), Focus::Composer);
+            let cursor = cursor.expect("pet mode keeps the actual composer caret");
+            let composer = app.viewport.last_composer_area.unwrap();
+            assert!(composer.contains(cursor.into()), "{width}x{height}");
+            assert!(app.viewport.last_transcript_area.is_none());
+            assert!(app.work_surface.last_area.is_none());
+            assert!(app.viewport.last_infoline_hitboxes.is_empty());
+            assert!(text(&buf).contains("F5"));
+            capture(&app, &format!("main-{width}x{height}"), &buf, false);
+            assert!(handle_composer_mouse(
+                &mut app,
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left
+                    ),
+                    column: cursor.0,
+                    row: cursor.1,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ));
+            assert_eq!(app.cursor_position, app.input.chars().count());
+            handle_bracketed_paste(&mut app, " pasted");
+            assert!(app.input.ends_with(" pasted"));
+            assert!(app.view_stack.is_empty());
+        }
+    }
+    #[test]
+    fn pet_main_inspection_uses_the_same_key_and_pointer_route_and_returns_to_the_draft() {
+        let mut app = app();
+        app.input = "kept draft".into();
+        app.cursor_position = app.input.chars().count();
+        app.add_message(HistoryCell::Assistant {
+            content: "INSPECTION_RECEIPT".into(),
+            streaming: true,
+        });
+        let session = app.current_session_id.clone();
+        let (buf, _) = paint(&mut app, 100, 32);
+        assert!(!text(&buf).contains("INSPECTION_RECEIPT"));
+        assert!(!pet_watch::handle_inspect_key(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+        assert!(pet_watch::handle_inspect_key(
+            &mut app,
+            &KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)
+        ));
+        let (buf, cursor) = paint(&mut app, 100, 32);
+        assert!(text(&buf).contains("INSPECTION_RECEIPT"));
+        assert!(cursor.is_none());
+        app.view_stack
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.focus(), Focus::Composer);
+        assert!(pet_watch::main_view(&app));
+        paint(&mut app, 100, 32);
+        let hint = app.pet_watch.inspect_area.unwrap();
+        crate::tui::mouse_ui::handle_mouse_event(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: hint.x,
+                row: hint.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::PetHabitat));
+        app.view_stack
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.input, "kept draft");
+        assert_eq!(app.current_session_id, session);
+        pet_watch::set_enabled(&mut app, false);
+        let (buf, cursor) = paint(&mut app, 100, 32);
+        assert!(text(&buf).contains("INSPECTION_RECEIPT"));
+        assert!(cursor.is_some());
+    }
+    #[test]
+    fn pet_main_keeps_queue_feedback_and_cannot_take_approval_focus() {
+        let mut app = app();
+        app.is_loading = true;
+        app.queue_message(crate::tui::app::QueuedMessage::new(
+            "QUEUED_FIXTURE_MESSAGE".into(),
+            None,
+        ));
+        let (buf, _) = paint(&mut app, 80, 24);
+        assert!(text(&buf).contains("QUEUED_FIXTURE_MESSAGE"));
+        app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+            "pet-approval",
+            "exec_shell",
+            "Review command",
+            &serde_json::json!({"command":"git status"}),
+            "pet-approval-key",
+        )));
+        assert!(!pet_watch::handle_inspect_key(
+            &mut app,
+            &KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)
+        ));
+        let (_, cursor) = paint(&mut app, 80, 24);
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+        assert_eq!(app.focus(), Focus::Modal(ModalKind::Approval));
+        assert!(cursor.is_none());
+        assert_eq!(app.queued_messages.len(), 1);
+    }
+    #[test]
+    fn pet_main_light_render_keeps_the_same_live_composer() {
+        let mut app = app();
+        app.theme_id = codewhale_palette::ThemeId::ShorelineLight;
+        app.ui_theme = app.theme_id.ui_theme();
+        app.input = "What should we work on?".into();
+        app.cursor_position = app.input.chars().count();
+        let (buf, cursor) = paint(&mut app, 100, 32);
+        assert!(cursor.is_some());
+        assert_eq!(app.focus(), Focus::Composer);
+        capture(&app, "main-light-100x32", &buf, true);
+    }
+    #[test]
+    fn pet_inspector_keeps_the_copy_receipt_visible_and_returns_to_the_draft() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _state = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        for light in [false, true] {
+            let mut app = app();
+            if light {
+                app.theme_id = codewhale_palette::ThemeId::ShorelineLight;
+                app.ui_theme = app.theme_id.ui_theme();
+            }
+            app.clipboard = crate::tui::clipboard::ClipboardHandler::for_test(false, false);
+            app.input = "My next message".into();
+            let reply = "Pet mode\n\nYour view is remembered when Codewhale starts.\n\n- F5 opens replies and agents.\n- Escape returns to your draft.\n- c copies the last finished reply.";
+            let index = app.history.len();
+            app.add_message(HistoryCell::Assistant {
+                content: reply.into(),
+                streaming: false,
+            });
+            app.record_completed_assistant_output(index, reply);
+            assert!(pet_watch::handle_inspect_key(
+                &mut app,
+                &KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)
+            ));
+            let result =
+                crate::commands::execute_with_config("/copy", &mut app, &Config::default());
+            assert!(!result.is_error);
+            let (buf, cursor) = paint(&mut app, 100, 32);
+            let output = text(&buf);
+            assert!(
+                output.contains("Accepted the last completed assistant response"),
+                "copy feedback must be painted above the hidden transcript: {output}"
+            );
+            assert!(output.contains("c copy finished reply"));
+            assert!(cursor.is_none());
+            capture(
+                &app,
+                if light {
+                    "inspector-copy-light-100x32"
+                } else {
+                    "inspector-copy-dark-100x32"
+                },
+                &buf,
+                light,
+            );
+            app.view_stack
+                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.input, "My next message");
+            assert_eq!(app.focus(), Focus::Composer);
+        }
+    }
+}

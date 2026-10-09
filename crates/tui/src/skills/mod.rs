@@ -1392,6 +1392,25 @@ pub fn clear_skill_discovery_cache() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
+    #[cfg(test)]
+    record_discovery_cache_drop();
+}
+
+/// How often the process-wide cache has been emptied. Tests that assert a
+/// cache hit share that cache with every other test in the process, so they
+/// use this to tell "the cache missed" from "another test emptied it".
+#[cfg(test)]
+static DISCOVERY_CACHE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn record_discovery_cache_drop() {
+    DISCOVERY_CACHE_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) fn discovery_cache_drops() -> u64 {
+    DISCOVERY_CACHE_DROPS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Merged discovery for one resolved directory set, cached by that set.
@@ -1418,6 +1437,8 @@ fn cached_merged_discovery(dirs: Vec<PathBuf>, workspace: Option<PathBuf>) -> Sk
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if write.len() >= MAX_DISCOVERY_CACHE_ENTRIES {
         write.clear();
+        #[cfg(test)]
+        record_discovery_cache_drop();
     }
     write.insert(
         key,

@@ -196,6 +196,10 @@ impl ModalView for ElevationView {
         ModalKind::Elevation
     }
 
+    fn tool_decision_request_id(&self) -> Option<&str> {
+        Some(&self.request.tool_id)
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }

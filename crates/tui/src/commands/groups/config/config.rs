@@ -63,7 +63,7 @@ pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
     let first_word = raw_words.next();
     if first_word.is_some_and(is_ask_rules_config_token) {
         let rest = raw_words.next().unwrap_or("").trim();
-        return super::permissions::permissions_command(app, Some(rest));
+        return crate::commands::config_policy_host::permissions(app, Some(rest));
     }
     if first_word.is_some_and(|token| {
         token.eq_ignore_ascii_case("workflow") || token.eq_ignore_ascii_case("goal")
@@ -341,6 +341,7 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
             Some(if app.auto_compact { "true" } else { "false" }.to_string())
         }
         "calm_mode" | "calm" => Some(if app.calm_mode { "true" } else { "false" }.to_string()),
+        "pet_mode" => Some(app.pet_watch.enabled.to_string()),
         "low_motion" | "motion" => Some(if app.low_motion { "true" } else { "false" }.to_string()),
         "fancy_animations" | "fancy" | "animations" => Some(
             if app.fancy_animations {
@@ -626,7 +627,7 @@ pub fn screen(app: &mut App, target: ScreenMode, arg: Option<&str>) -> CommandRe
 /// claim about a surface that cannot render.
 pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     const USAGE: &str =
-        "Usage: /workbar [bottom|top|left|right|off|tasks|agents|context|pinned] [--save]";
+        "Usage: /workbar [bottom|top|left|right|off|tasks|agents|terminal|context|pinned] [--save]";
     let raw = arg.map(str::trim).unwrap_or("");
     let mut tokens = raw.split_whitespace().collect::<Vec<_>>();
     let persist = matches!(tokens.last(), Some(&"--save" | &"-s"));
@@ -663,6 +664,7 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
                     Some(crate::tui::work_surface::RailPanel::Background)
                 }
                 "files" | "changes" => Some(crate::tui::work_surface::RailPanel::Files),
+                "terminal" | "terminals" => Some(crate::tui::work_surface::RailPanel::Terminal),
                 "notepad" | "notes" => Some(crate::tui::work_surface::RailPanel::Notepad),
                 "context" | "session" => Some(crate::tui::work_surface::RailPanel::Context),
                 "git" | "branch" => Some(crate::tui::work_surface::RailPanel::Git),
@@ -704,17 +706,30 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     CommandResult::message(rail_status_message(app))
 }
 
-/// `/pet`: turn the terminal over to the Codewhale pet.
-///
-/// Bare `/pet` toggles. `on` enters the full habitat now and lets every
-/// accepted turn re-enter it until `off`. The habitat is a modal over the
-/// existing shell: composer draft, transcript, selection and the active
-/// Engine turn stay underneath, and Escape returns without cancelling
-/// anything. The remaining verbs address the shared companion: the browser
-/// appearance studio, the native window, source selection, replay export and
-/// the single audio lease. The pet has no workbar panel.
+fn select_pet_mode(app: &mut App, enabled: bool, persist: bool) -> CommandResult {
+    crate::tui::pet_watch::set_enabled(app, enabled);
+    if persist {
+        app.startup_defaults
+            .spawn(crate::tui::startup_defaults::StartupDefaults::pet_mode(
+                enabled,
+            ));
+    }
+    CommandResult::message(tr(
+        app.ui_locale,
+        if enabled {
+            MessageId::PetModeOn
+        } else {
+            MessageId::PetModeOff
+        },
+    ))
+}
+
+/// `/pet on` makes the pet the main shell surface, with the real composer
+/// always available. `/pet inspect` opens replies and agents on demand;
+/// Escape returns to the same backdrop and draft. Companion verbs keep the
+/// existing shared simulation, appearance, replay and single audio lease.
 pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
-    const USAGE: &str = "Usage: /pet [on|off|status|appearance|window|source|export|sound on|off]";
+    const USAGE: &str = "Usage: /pet [on|off|inspect|status|appearance|window|source|export|sound on|off|avatar [key]|action [name|live]|view [name|live]]";
     use crate::tui::pet_watch::{self, Control};
     let words = arg
         .map(str::trim)
@@ -723,22 +738,16 @@ pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
     let words = words.iter().map(String::as_str).collect::<Vec<_>>();
-    let mode = |app: &mut App, enabled: bool| {
-        pet_watch::set_enabled(app, enabled);
-        CommandResult::message(tr(
-            app.ui_locale,
-            if enabled {
-                MessageId::PetModeOn
-            } else {
-                MessageId::PetModeOff
-            },
-        ))
-    };
+    let mode = |app: &mut App, enabled: bool| select_pet_mode(app, enabled, true);
     let queued = |app: &mut App, control: Control| {
         pet_watch::command(app, control);
         CommandResult::message(tr(app.ui_locale, MessageId::PetHabitatQueued))
     };
     match words.as_slice() {
+        ["inspect"] => {
+            pet_watch::open_habitat(app);
+            CommandResult::ok()
+        }
         [] => {
             let enabled = !app.pet_watch.enabled;
             mode(app, enabled)
@@ -765,6 +774,21 @@ pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
             ),
             app.pet_watch.status()
         )),
+        ["avatar"] => CommandResult::message(app.pet_watch.avatar_choices()),
+        ["avatar", key] => {
+            if !app.pet_watch.select_avatar(key) {
+                return CommandResult::error(USAGE);
+            }
+            app.needs_redraw = true;
+            CommandResult::message(format!("/pet avatar {key}"))
+        }
+        [kind @ ("action" | "view"), name] => {
+            if !app.pet_watch.preview_avatar(name, *kind == "view") {
+                return CommandResult::error(USAGE);
+            }
+            app.needs_redraw = true;
+            CommandResult::message(format!("/pet {kind} {name}"))
+        }
         ["appearance"] => queued(app, Control::Browser),
         ["window"] => queued(app, Control::Window),
         ["source"] => queued(app, Control::Select),
@@ -1957,6 +1981,22 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
     }
 
     match key.as_str() {
+        "pet_mode" => {
+            let enabled = match parse_config_bool(value) {
+                Ok(enabled) => enabled,
+                Err(_) => {
+                    return CommandResult::error(
+                        tr(app.ui_locale, MessageId::ConfigCommandInvalidValue)
+                            .replace("{key}", &key)
+                            .replace("{value}", value)
+                            .replace("{choices}", "on/off"),
+                    );
+                }
+            };
+            // /pet and the settings editor share the ordered background writer.
+            // A failed save is reported by the existing warning mailbox.
+            return select_pet_mode(app, enabled, persist);
+        }
         "contextual_tips" => {
             let enabled = match parse_config_bool(value) {
                 Ok(enabled) => enabled,
@@ -3144,6 +3184,27 @@ pub(crate) async fn set_workspace_trust(app: &mut App, trusted: bool, save: bool
     Ok(())
 }
 
+/// What `/trust on|off [--save]` just did, for the transcript. The toast
+/// alone fades, and the footer does not show trust mode, so without this
+/// line the command appeared to do nothing.
+pub(crate) fn trust_change_note(trusted: bool, save: bool) -> String {
+    let session = if trusted {
+        "Trust mode is on for this session: file tools may now reach files outside this folder. `/trust off` turns it off."
+    } else {
+        "Trust mode is off for this session: it no longer lets file tools reach files outside this folder."
+    };
+    let saved = match (save, trusted) {
+        (false, _) => return session.to_string(),
+        (true, true) => {
+            "Saved for this folder: its project skills, commands, hooks, MCP servers and context are trusted in later sessions too."
+        }
+        (true, false) => {
+            "Saved for this folder: its project skills, commands, hooks, MCP servers and context are no longer trusted."
+        }
+    };
+    format!("{session}\n{saved}")
+}
+
 fn trust_status(workspace: &Path, app: &App, force_paths: bool) -> CommandResult {
     let trust = crate::workspace_trust::WorkspaceTrust::load_for(workspace);
     let mut lines = Vec::new();
@@ -3895,7 +3956,7 @@ mod tests {
     }
 
     #[test]
-    fn pet_command_toggles_the_habitat_and_automatic_entry() {
+    fn pet_command_selects_the_main_view_without_taking_composer_focus() {
         let mut app = create_test_app();
         app.onboarding = crate::tui::app::OnboardingState::None;
         app.redaction_gate = false;
@@ -3910,7 +3971,8 @@ mod tests {
             on.message.as_deref(),
             Some(&*tr(app.ui_locale, MessageId::PetModeOn))
         );
-        // Repeating `on` is harmless: still one habitat, still enabled.
+        assert!(app.view_stack.is_empty());
+        // Repeating `on` leaves the composer in the same shell focus.
         assert!(!pet(&mut app, Some(" ON ")).is_error);
         assert!(app.pet_watch.enabled);
         assert!(crate::tui::pet_watch::is_open(&app));
@@ -6355,6 +6417,34 @@ context_window = 262144
         assert!(!result.is_error, "{:?}", result.message);
         assert!(app.composer_multiline_mode);
         assert!(app.needs_redraw);
+    }
+
+    /// `/trust on` and `/trust off` printed nothing (0.10.1 tutorial, lesson
+    /// 3). Each change now has a line that says what it did and how to undo
+    /// it, and only `--save` claims anything was saved.
+    #[test]
+    fn trust_change_note_says_what_changed() {
+        let on = trust_change_note(true, false);
+        assert!(on.starts_with("Trust mode is on for this session"), "{on}");
+        assert!(on.contains("/trust off"), "{on}");
+        let off = trust_change_note(false, false);
+        assert!(
+            off.starts_with("Trust mode is off for this session"),
+            "{off}"
+        );
+        for note in [&on, &off] {
+            assert!(!note.contains("Saved"), "{note}");
+        }
+        let saved_on = trust_change_note(true, true);
+        assert!(
+            saved_on.starts_with(&on) && saved_on.contains("are trusted in later sessions"),
+            "{saved_on}"
+        );
+        let saved_off = trust_change_note(false, true);
+        assert!(
+            saved_off.starts_with(&off) && saved_off.contains("are no longer trusted"),
+            "{saved_off}"
+        );
     }
 
     #[tokio::test]

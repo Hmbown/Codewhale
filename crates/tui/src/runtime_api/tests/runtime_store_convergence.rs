@@ -1211,11 +1211,44 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
         ));
     }
     drop(selected_fleet);
+    // The selected thread's live Engine keeps its own sub-agent coordination
+    // lock open at `.codewhale/state/subagents.v1.lock` for its lifetime.
+    // NTFS refuses to rename a directory while any file beneath it is open
+    // (ERROR_ACCESS_DENIED), so a live session also prevents replacement.
+    #[cfg(windows)]
+    {
+        let error = fs::rename(&selected_workspace, &retired_workspace)
+            .expect_err("a live selected Engine must prevent workspace replacement");
+        assert_eq!(error.raw_os_error(), Some(5), "{error}");
+        assert!(!retired_workspace.exists());
+    }
+    // Draining the owner's Engines releases that lock. The workspace scopes,
+    // their caches and the attached frontends under test stay live.
+    manager.shutdown_and_wait().await?;
     // File identity, not a stable pathname, binds the cache. Replacing the
-    // selected directory after the Fleet pins close cannot borrow its admitted
-    // LSP/MCP authority. Keep this check on Windows as well as Unix.
-    fs::rename(&selected_workspace, &retired_workspace)
-        .context("replace selected workspace after releasing the test Fleet manager")?;
+    // selected directory after the Fleet pins and the Engine's lock close
+    // cannot borrow its admitted LSP/MCP authority. Keep this check on
+    // Windows as well as Unix. Engine shutdown completes asynchronously, so
+    // Windows waits a bounded time for the lock to close.
+    let replace_deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(30));
+    loop {
+        match fs::rename(&selected_workspace, &retired_workspace) {
+            Ok(()) => break,
+            Err(error)
+                if cfg!(windows)
+                    && error.raw_os_error() == Some(5)
+                    && std::time::Instant::now() < replace_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "replace selected workspace after releasing the test Fleet manager and \
+                     the selected Engine",
+                );
+            }
+        }
+    }
     fs::create_dir(&selected_workspace)?;
     assert!(scopes.admit(selected_workspace.clone()).await.is_err());
     assert_eq!(
@@ -1243,7 +1276,6 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
     assert!(scopes.admit(excess).await.is_err());
     assert_eq!(scopes.scopes.lock().len(), MAX_RUNTIME_WORKSPACE_SCOPES);
     drop(second);
-    manager.shutdown_and_wait().await?;
     drop((
         admitted_a,
         admitted_b,

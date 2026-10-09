@@ -8,12 +8,19 @@ use unicode_width::UnicodeWidthStr;
 
 use codewhale_palette as palette;
 
-use super::constants::{TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_TAIL_LINES, TOOL_TEXT_LIMIT};
+use super::constants::{
+    TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_TAIL_LINES, TOOL_TEXT_LIMIT, TRANSCRIPT_RAIL,
+};
 use super::{
     RenderMode, details_affordance_line, looks_like_file_path, render_card_detail_line,
     render_card_detail_line_single, render_card_detail_line_single_styled,
     render_card_detail_line_styled, tool_value_style, truncate_text,
 };
+
+/// Columns the first output row gives up to its label: `result: ` or
+/// `output: `. Both labels are the same width, which is what lets one cached
+/// set of rows serve either card.
+const FIRST_ROW_LABEL_COLUMNS: usize = "result: ".len();
 
 pub(super) fn render_tool_output_mode(
     output: &str,
@@ -363,6 +370,7 @@ fn render_preserved_output_mode(
     mode: RenderMode,
     first_label: &str,
 ) -> Vec<Line<'static>> {
+    debug_assert_eq!(first_label.len() + 2, FIRST_ROW_LABEL_COLUMNS);
     let mut lines = Vec::new();
     if output.trim().is_empty() {
         // #3031: In compact/Live mode, suppress "(no output)" — the tool
@@ -404,20 +412,24 @@ fn render_preserved_output_mode(
         line_limit,
         || selected_output_indices(&all_lines, line_limit),
     );
-    let mut previous: Option<usize> = None;
+    // Blank rows are dropped without a marker, so the count is of rows that
+    // carry text. Rows hidden after the last one shown are announced too: the
+    // tail can stop short of the end when it keeps a result row instead.
+    let omitted_line = |hidden: &[OutputRow]| {
+        let omitted = hidden.iter().filter(|row| !is_blank_row(row)).count();
+        (omitted > 0).then(|| {
+            details_affordance_line(
+                &format!(
+                    "{omitted} lines omitted; {}",
+                    crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output")
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
+            )
+        })
+    };
+    let mut next = 0usize;
     for (rendered_idx, idx) in selected.iter().copied().enumerate() {
-        if let Some(prev) = previous {
-            let omitted = idx.saturating_sub(prev + 1);
-            if omitted > 0 {
-                lines.push(details_affordance_line(
-                    &format!(
-                        "{omitted} lines omitted; {}",
-                        crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output")
-                    ),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ));
-            }
-        }
+        lines.extend(omitted_line(&all_lines[next..idx]));
 
         let row = &all_lines[idx];
         render_output_row(
@@ -430,14 +442,22 @@ fn render_preserved_output_mode(
             row,
             width,
         );
-        previous = Some(idx);
+        next = idx + 1;
     }
+    lines.extend(omitted_line(&all_lines[next..]));
 
     lines
 }
 
 fn output_rows(output: &str, width: u16) -> Vec<OutputRow> {
     let wrap_width = width.saturating_sub(4).max(1) as usize;
+    // The first row is painted after its label, so it has less room than the
+    // rows under it. Wrapped at the full width it was wrapped a second time
+    // when painted, which left the last word or two stranded on a row of
+    // their own.
+    let first_width = usize::from(width)
+        .saturating_sub(UnicodeWidthStr::width(TRANSCRIPT_RAIL) + FIRST_ROW_LABEL_COLUMNS)
+        .clamp(1, wrap_width);
     let mut rows = Vec::new();
     let mut sanitized = String::with_capacity(output.len());
     for line in output.lines() {
@@ -452,7 +472,11 @@ fn output_rows(output: &str, width: u16) -> Vec<OutputRow> {
                 styled,
             });
         } else {
-            let parts = wrap_text(&sanitized, wrap_width);
+            let parts = if rows.is_empty() {
+                wrap_first_row(&sanitized, first_width, wrap_width)
+            } else {
+                wrap_text(&sanitized, wrap_width)
+            };
             let mut styled_parts = styled.map(|segments| split_segments(&segments, &parts));
             for (idx, wrapped) in parts.into_iter().enumerate() {
                 rows.push(OutputRow {
@@ -557,32 +581,41 @@ pub(super) fn split_segments(
         .collect()
 }
 
+fn is_blank_row(row: &OutputRow) -> bool {
+    row.text.trim().is_empty()
+}
+
 fn selected_output_indices(rows: &[OutputRow], line_limit: usize) -> Vec<usize> {
-    let total = rows.len();
-    if total <= line_limit || line_limit == 0 {
-        return (0..total).collect();
+    if rows.len() <= line_limit || line_limit == 0 {
+        return (0..rows.len()).collect();
     }
 
-    // Small previews must retain the result/error at the tail as well as
-    // the opening context. The usual 20-row budget still keeps 10 + 6.
-    let head = TOOL_OUTPUT_HEAD_LINES
-        .min(line_limit.div_ceil(2))
-        .min(total);
-    let tail = TOOL_OUTPUT_TAIL_LINES
-        .min(line_limit.saturating_sub(head))
-        .min(total.saturating_sub(head));
+    // Once rows have to go, blank ones go first. Commands open and close
+    // with blank lines (`npm test` starts with one, `cargo test` ends with
+    // one), and a three-row preview that spends a row on one shows nothing.
+    let visible: Vec<usize> = (0..rows.len())
+        .filter(|&idx| !is_blank_row(&rows[idx]))
+        .collect();
+    if visible.len() <= line_limit {
+        return visible;
+    }
+
+    // A tight preview gives the larger share to the tail: one opening row
+    // says what ran, the end says how it went. The usual 20-row budget still
+    // keeps 10 + 6.
+    let head = TOOL_OUTPUT_HEAD_LINES.min(line_limit / 2).max(1);
+    let tail = TOOL_OUTPUT_TAIL_LINES.min(line_limit.saturating_sub(head));
     let mut selected = std::collections::BTreeSet::new();
-    selected.extend(0..head);
-    selected.extend(total.saturating_sub(tail)..total);
+    selected.extend(visible[..head].iter().copied());
+    selected.extend(tail_output_indices(rows, &visible[head..], tail));
 
     let budget = line_limit.saturating_sub(selected.len());
     if budget > 0 {
-        let mut important: Vec<(usize, usize)> = rows
+        let mut important: Vec<(usize, usize)> = visible[head..]
             .iter()
-            .enumerate()
-            .skip(head)
-            .take(total.saturating_sub(head + tail))
-            .filter_map(|(idx, row)| output_importance_rank(&row.text).map(|rank| (idx, rank)))
+            .copied()
+            .filter(|idx| !selected.contains(idx))
+            .filter_map(|idx| output_importance_rank(&rows[idx].text).map(|rank| (idx, rank)))
             .collect();
         important.sort_by_key(|(idx, rank)| (*rank, *idx));
         for (idx, _) in important.into_iter().take(budget) {
@@ -597,13 +630,57 @@ fn selected_output_indices(rows: &[OutputRow], line_limit: usize) -> Vec<usize> 
     // 20-line command then rendered 16 rows and claimed the other four were
     // "omitted". Spend whatever is left by growing the head downward, which
     // keeps the shown region contiguous and readable top-down.
-    let mut next = head;
-    while selected.len() < line_limit.min(total) && next < total {
-        selected.insert(next);
-        next += 1;
+    for &idx in &visible[head..] {
+        if selected.len() >= line_limit {
+            break;
+        }
+        selected.insert(idx);
     }
 
     selected.into_iter().collect()
+}
+
+/// Choose `tail` rows from the closing `TOOL_OUTPUT_TAIL_LINES` of
+/// `candidates` (non-blank row indices, in order).
+///
+/// With the full tail budget that is simply the closing rows. A tight preview
+/// has fewer slots than the closing block has rows, and a run's totals are
+/// often not its very last lines (a timing line follows them), so rows that
+/// state an outcome take the slots first and the last rows fill the rest.
+fn tail_output_indices(rows: &[OutputRow], candidates: &[usize], tail: usize) -> Vec<usize> {
+    let window_len = TOOL_OUTPUT_TAIL_LINES.max(tail).min(candidates.len());
+    let window = &candidates[candidates.len() - window_len..];
+    let mut picked: Vec<usize> = window
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&idx| states_outcome(&rows[idx].text))
+        .take(tail)
+        .collect();
+    for &idx in window.iter().rev() {
+        if picked.len() >= tail {
+            break;
+        }
+        if !picked.contains(&idx) {
+            picked.push(idx);
+        }
+    }
+    picked
+}
+
+/// Does the row say that something passed or failed? Plain words only, the
+/// same way `output_importance_rank` spots errors — no tool's format is parsed.
+fn states_outcome(line: &str) -> bool {
+    const OUTCOME_WORDS: [&str; 10] = [
+        "pass", "passed", "passes", "passing", "fail", "failed", "fails", "failing", "failure",
+        "failures",
+    ];
+    line.split(|ch: char| !ch.is_ascii_alphabetic())
+        .any(|word| {
+            OUTCOME_WORDS
+                .iter()
+                .any(|outcome| word.eq_ignore_ascii_case(outcome))
+        })
 }
 
 fn output_importance_rank(line: &str) -> Option<usize> {
@@ -743,6 +820,25 @@ pub(super) fn wrap_plain_line(line: &str, style: Style, width: u16) -> Vec<Line<
     lines
 }
 
+/// [`wrap_text`] with a narrower first row. The parts still concatenate to
+/// `text`, so the byte length of the first one is where the rest begins.
+fn wrap_first_row(text: &str, first_width: usize, width: usize) -> Vec<String> {
+    let mut parts = wrap_text(text, first_width);
+    if parts.len() > 1 {
+        let rest = wrap_text(&text[parts[0].len()..], width);
+        parts.truncate(1);
+        parts.extend(rest);
+    }
+    parts
+}
+
+/// Wrap `text` to `width` columns, ending each row between words when it
+/// can. A word longer than a row is still split between graphemes.
+///
+/// Nothing is dropped or added: the rows concatenate back to `text`, with
+/// the whitespace a row was broken at left on the end of that row. Tool
+/// output keeps its column alignment, and `split_segments` can lay the
+/// colours back over the rows by counting characters.
 pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -764,7 +860,10 @@ pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
         };
 
         if UnicodeWidthStr::width(tentative.as_str()) > width && !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
+            let carried = last_word_start(&current, grapheme, width)
+                .map(|start| current.split_off(start))
+                .unwrap_or_default();
+            lines.push(std::mem::replace(&mut current, carried));
         }
 
         current.push_str(grapheme);
@@ -777,6 +876,27 @@ pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     } else {
         lines
     }
+}
+
+/// Where the last word of a full `row` starts, when that word should move
+/// down to the next row together with `next`, the grapheme that did not fit.
+///
+/// `None` means break right where the row ends: it already ends between
+/// words, it is one unbroken word, everything before the word is
+/// indentation, or the word would not fit on the next row either.
+fn last_word_start(row: &str, next: &str, width: usize) -> Option<usize> {
+    let is_space = |text: &str| text.chars().all(char::is_whitespace);
+    let words = row.trim_end();
+    if words.len() < row.len() && !is_space(next) {
+        return None;
+    }
+    let (space, gap) = words
+        .grapheme_indices(true)
+        .rev()
+        .find(|(_, grapheme)| is_space(grapheme))?;
+    let start = space + gap.len();
+    let fits = UnicodeWidthStr::width(&row[start..]) + UnicodeWidthStr::width(next) <= width;
+    (fits && !row[..space].trim().is_empty()).then_some(start)
 }
 
 #[cfg(test)]
@@ -840,20 +960,21 @@ mod ansi_colour_tests {
 
     #[test]
     fn wrapped_rows_split_the_colour_along_wrap_boundaries() {
-        let line = format!("\x1b[33m{}\x1b[0m{}", "y".repeat(10), "p".repeat(10));
-        // width 12 → wrap width 8: rows of 8/8/4 characters.
+        let line = format!("\x1b[33m{}\x1b[0m{}", "y".repeat(12), "p".repeat(8));
+        // width 12 → the labelled first row holds 2 characters and the rows
+        // under it 8: rows of 2/8/8/2.
         let rows = output_rows(&line, 12);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(
             styled_text(&rows),
             rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
         );
-        let second = rows[1].styled.as_ref().unwrap();
+        let third = rows[2].styled.as_ref().unwrap();
         assert_eq!(
-            second[0],
+            third[0],
             ("yy".to_string(), Style::default().fg(Color::Yellow))
         );
-        assert_eq!(second[1], ("pppppp".to_string(), Style::default()));
+        assert_eq!(third[1], ("pppppp".to_string(), Style::default()));
     }
 
     #[test]
@@ -948,6 +1069,89 @@ mod ansi_colour_tests {
                 for line in &lines {
                     assert!(line.width() <= width, "line {line:?} exceeds width {width}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_text_ends_rows_between_words() {
+        assert_eq!(
+            wrap_text("Bring a refillable water bottle.", 22),
+            ["Bring a refillable ", "water bottle."]
+        );
+        // A row that is exactly full still ends on a whole word.
+        assert_eq!(wrap_text("aaa bbb ccc", 7), ["aaa ", "bbb ccc"]);
+        // Only a word longer than the row is split, and indentation is not
+        // mistaken for a place to break.
+        assert_eq!(
+            wrap_text("    averyverylongtoken tail", 10),
+            ["    averyv", "erylongtok", "en tail"]
+        );
+        assert_eq!(
+            wrap_text(&"y".repeat(20), 8),
+            ["y".repeat(8), "y".repeat(8), "y".repeat(4)]
+        );
+    }
+
+    #[test]
+    fn wrap_text_keeps_every_character_and_stays_within_the_width() {
+        for text in [
+            "name      size   modified",
+            "aaa   bbb",
+            "word          x",
+            "   ",
+            "日本語のテキスト と english mixed 語語語語語語",
+            "a \u{301}b c d e f",
+            "tab\tseparated\tvalues",
+        ] {
+            for width in 1..=14 {
+                let lines = wrap_text(text, width);
+                assert_eq!(lines.concat(), text, "width {width} changed the text");
+                for line in &lines {
+                    assert!(
+                        line.width() <= width || line.graphemes(true).count() == 1,
+                        "line {line:?} exceeds width {width}"
+                    );
+                    assert_eq!(
+                        wrap_text(line, width),
+                        std::slice::from_ref(line),
+                        "a wrapped row must not wrap again at width {width}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tutorial frame that showed `refillable wate / r bott / le.`: one
+    /// long MCP result line, wrapped once for the card and once more behind
+    /// the `result:` label.
+    #[test]
+    fn long_result_line_wraps_between_words_and_only_once() {
+        let output = "- text: Next shoreline cleanup: Saturday at 09:00, North Pier. \
+                      Bring gloves and a refillable water bottle. (Demo data.)";
+        for width in [60, 100, 110] {
+            let lines = render_tool_output_mode(output, width, 20, RenderMode::Live);
+            let rows: Vec<String> = lines
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            assert_eq!(
+                rows.len(),
+                output_rows(output, width).len(),
+                "painting wrapped a row a second time at width {width}: {rows:#?}"
+            );
+            let words: Vec<&str> = rows
+                .iter()
+                .flat_map(|row| row.split_whitespace())
+                .filter(|word| *word != TRANSCRIPT_RAIL.trim() && *word != "result:")
+                .collect();
+            assert_eq!(
+                words,
+                output.split_whitespace().collect::<Vec<_>>(),
+                "a word was split at width {width}: {rows:#?}"
+            );
+            for row in &rows {
+                assert!(row.width() <= usize::from(width), "{row:?} exceeds {width}");
             }
         }
     }

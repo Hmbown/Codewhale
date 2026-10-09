@@ -21,6 +21,7 @@ async fn interactive_thinking_only_drop_preserves_nothing_and_never_claims_it_di
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -255,6 +256,7 @@ async fn run_reasoning_only_turn_with_reprompts(
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),

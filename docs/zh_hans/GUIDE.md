@@ -51,7 +51,8 @@ Windows 用户请选择 [GitHub Releases](https://github.com/codewhale-hq/CodeWh
 [安装与迁移指南](INSTALL.md#recommended-official-github-releases)。Android/Termux 使用专用的
 [预览压缩包或源码构建路径](INSTALL.md#android--termux-arm64)。
 
-当你想要隔离的运行时，也可以用 Docker：
+当你想要隔离的运行时，也可以用 Docker。当前公开发行的镜像版本是 0.10.0；
+要测试当前 `main`，请[从源码构建](DOCKER.md#本地构建)。
 
 ```bash
 docker volume create codewhale-home
@@ -60,7 +61,7 @@ docker run --rm -it \
   -v codewhale-home:/home/codewhale/.codewhale \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/codewhale-hq/codewhale:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 把安装目录加入 PATH 后，从你希望它工作的仓库或目录启动 Codewhale：
@@ -219,8 +220,9 @@ Codewhale 有三种可见的 TUI 模式：
 /mode operate
 ```
 
-Plan 模式是在陌生仓库里开始的最安全位置。它用于检查和决策，不做文件编辑。对于非平凡的工作，Plan 模式的确认提示可以显示有依据的计划工件（PlanArtifact）：目标、上下文、使用的来源、关键文件、约束、方法、验证计划、风险和交接说明。
-当智能体（agent）使用富工件形态时，空章节也是可见的，所以你可以要求修订，而不是接受一份说明不足的计划。
+Plan 模式是在陌生仓库里开始的最安全位置。它用于检查和决策，不做文件编辑。当 Plan 回合成功完成非空回复时，Codewhale 会询问如何继续，即使计划只是普通文本。
+**Work（询问）** 和 **Work（自动审核）** 会以对应权限切换到 Work，并将获批回复的原文作为下一条消息发送。该回合已有的待办事项会保留；纯文本计划会添加一个待处理事项，不会替换其他工作。如果 Codewhale 无法准备工作状态，它会留在 Plan，不会开始执行任务。
+**继续规划** 或 `Esc` 留在 Plan。你也可以在那里输入反馈来修订计划。只有在输入框为空且没有打开其他视图时才会出现这个提问；`/mode work` 始终可用。
 
 Work 模式是大多数贡献工作的默认模式。它允许 Codewhale 读文件、跑检查、编辑文件，同时把有风险的动作留在审批门禁之后。
 
@@ -322,7 +324,7 @@ Codewhale 把这些记录保存在你的机器上，位于 `~/.codewhale/` 下�
 
 - **会话。** `sessions/<id>.json` 保存完整的对话，包括每一次工具调用及其结果文本。应用和 `codewhale serve` 的线程，则把每次调用作为一个回合条目（turn item）保存在 `tasks/runtime/` 下，含其输入、状态、开始和结束时间以及结构化结果。
 - **审批。** `sessions/<id>/approval_receipts.jsonl` 记录 Codewhale 请求过的每一次审批、决定，以及决定人：你、某条会话规则，或当前生效的权限级别。应用线程也会在其事件日志里记录每个决定。没有询问就运行的调用（Full Access、允许规则、已记住的授权）没有审批记录；每个回合所处的权限级别会随该回合一起保存。
-- **撤销点。** 工作区快照让 `/undo` 和 `/restore` 可以回滚文件。
+- **撤销点。** 工作区快照让你可以回退。`/undo` 一步撤销你的上一次请求：它改动的每个文件，以及这次请求和回复。它在任何权限级别下都可用，并列出恢复了哪些文件。如果其中某个文件在请求之后又被改动，`/undo` 不做任何更改，并指出是哪个文件。如果某次请求在 Codewhale 记录其改动终点之前被中断，`/undo` 会说明这一点；`/undo force` 仍会撤销它，包括此后对这些文件所做的编辑。`/restore` 把整个文件夹回滚到你选择的时间点，会覆盖之后的编辑，因此需要 `/trust on` 或 Full Access。Esc Esc 只回退对话；之后再运行 `/undo` 可以把文件恢复。
 - **安全事件。** `audit.log` 记录凭据变更、hook 环境变量的键名、压缩（compaction）过程、终端的审批路由，以及 Auto-Review 的裁决。它不是一份会话做过什么的清单。
 
 要查看一次会话做了什么，运行 `/receipts`，或在 shell 里运行：

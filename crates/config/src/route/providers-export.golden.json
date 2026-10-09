@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "0.10.1",
+  "runtimeVersion": "0.10.2",
   "routes": [
     {
       "id": "anthropic",
@@ -16,6 +16,10 @@
         {
           "kind": "api-key",
           "label": "API key"
+        },
+        {
+          "kind": "oauth",
+          "label": "OAuth"
         }
       ],
       "models": [
@@ -948,6 +952,10 @@
         {
           "kind": "api-key",
           "label": "API key"
+        },
+        {
+          "kind": "oauth",
+          "label": "OAuth"
         }
       ],
       "transport": "chat-completions"

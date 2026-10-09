@@ -15,12 +15,11 @@ use std::time::Duration;
 use crate::commands;
 #[cfg(test)]
 use crate::config::ProviderKind;
+use crate::core::authority::{RiskLevel, ToolCategory};
 #[cfg(test)]
 use crate::provider_lake::all_catalog_models_for_provider;
 use crate::tui::app::{App, ComposerDensity, ViewportState};
-use crate::tui::approval::{
-    ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel, ToolCategory,
-};
+use crate::tui::approval::{ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::menu_style;
 use crate::tui::scrolling::TranscriptLineMeta;
@@ -463,7 +462,7 @@ impl ChatWidget {
                 &cell_revisions,
                 transcript_width,
                 render_options,
-                &app.thinking_folds,
+                &app.cell_folds,
                 None,
                 provisional_action_owner,
             );
@@ -505,7 +504,7 @@ impl ChatWidget {
                 &filtered_revs,
                 transcript_width,
                 render_options,
-                &app.thinking_folds,
+                &app.cell_folds,
                 Some(&app.collapsed_cell_map),
                 provisional_action_owner,
             );
@@ -1861,7 +1860,7 @@ fn approval_control_facts(
     Line<'static>,
     Option<Span<'static>>,
 ) {
-    let question = Line::from(vec![
+    let mut question = Line::from(vec![
         Span::raw("  "),
         Span::styled(
             approval_proceed_question(locale),
@@ -1870,6 +1869,14 @@ fn approval_control_facts(
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
+    // On the question row, which is never cut, so the reason costs the
+    // change preview no rows.
+    if request.asks_without_git {
+        question.spans.push(Span::styled(
+            format!("  ·  {}", tr(locale, MessageId::ApprovalAsksWithoutGit)),
+            Style::default().fg(palette::TEXT_HINT),
+        ));
+    }
     let mut actions = Vec::new();
     let options = approval_options_for_request(request, risk, locale);
     for (i, opt) in options.iter().enumerate() {
@@ -1888,16 +1895,22 @@ fn approval_control_facts(
         } else {
             Span::raw("  ")
         };
+        let mut spans = vec![
+            lead,
+            Span::styled(
+                format!("[{}] ", opt.key_hint),
+                shortcut_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(opt.label.to_string(), option_style),
+        ];
+        // Deny is highlighted by default (#5293), so say on the row itself
+        // what Enter will do: a reflexive Enter is otherwise a silent refusal.
+        if is_selected {
+            spans.push(Span::styled(APPROVAL_ENTER_TAG, shortcut_style));
+        }
         actions.push(DecisionBandAction {
             persistent: opt.persistent,
-            line: Line::from(vec![
-                lead,
-                Span::styled(
-                    format!("[{}] ", opt.key_hint),
-                    shortcut_style.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(opt.label.to_string(), option_style),
-            ]),
+            line: Line::from(spans),
         });
     }
     let footer = Line::from(vec![
@@ -1916,6 +1929,9 @@ fn approval_control_facts(
         .then(|| Span::styled(save_ask_rule_hint(locale), Style::default().fg(shortcut)));
     (question, actions, footer, save_hint)
 }
+/// Key name appended to the highlighted option row, like `Esc` on its own row.
+const APPROVAL_ENTER_TAG: &str = " (Enter)";
+
 fn approval_proceed_question(locale: Locale) -> &'static str {
     match locale {
         Locale::ZhHans => "是否继续？",
@@ -8459,6 +8475,50 @@ diff --git a/src/b.rs b/src/b.rs\n\
         assert!(rendered.contains("change src/b.rs"), "{rendered}");
     }
 
+    /// Lesson 1, plain folder, 110x32: the card read "edit 1 / replace this
+    /// / … truncated" and never showed the change it asked about.
+    #[test]
+    fn approval_card_shows_a_one_line_edit_and_why_a_plain_folder_asks() {
+        let old = "export function formatDuration(totalMinutes) {\n  const hours = Math.floor(totalMinutes / 60);\n  return `${hours}h ${totalMinutes}m`;\n}";
+        let new = "export function formatDuration(totalMinutes) {\n  const hours = Math.floor(totalMinutes / 60);\n  return `${hours}h ${totalMinutes % 60}m`;\n}";
+        let mut request = crate::tui::approval::ApprovalRequest::new(
+            "approval-1",
+            "edit_file",
+            "Edit a file on disk",
+            &serde_json::json!({
+                "path": "duration.mjs",
+                "edits": [{ "oldText": old, "newText": new }]
+            }),
+            "tool:edit_file",
+        );
+
+        let in_repo = render_approval_request(&request, Rect::new(0, 0, 110, 32));
+        assert!(
+            in_repo.contains("-   return `${hours}h ${totalMinutes}m`;"),
+            "{in_repo}"
+        );
+        assert!(
+            in_repo.contains("+   return `${hours}h ${totalMinutes % 60}m`;"),
+            "{in_repo}"
+        );
+        assert!(!in_repo.contains("truncated"), "{in_repo}");
+        assert!(!in_repo.contains("replace this"), "{in_repo}");
+        assert!(!in_repo.contains("No Git repository"), "{in_repo}");
+
+        request.asks_without_git = true;
+        let plain = render_approval_request(&request, Rect::new(0, 0, 110, 32));
+        assert!(
+            plain.contains("proceed?  ·  No Git repository here, so edits ask first."),
+            "{plain}"
+        );
+        // The reason sits on the question row and takes nothing from the change.
+        assert!(
+            plain.contains("+   return `${hours}h ${totalMinutes % 60}m`;"),
+            "{plain}"
+        );
+        assert!(!plain.contains("truncated"), "{plain}");
+    }
+
     #[test]
     fn approval_card_truncates_apply_patch_ask_rule_save_preview() {
         let request = crate::tui::approval::ApprovalRequest::new(
@@ -9076,12 +9136,12 @@ diff --git a/src/b.rs b/src/b.rs\n\
                     }
                     13 if total > 0 => {
                         let index = below(&mut state, total);
-                        app.thinking_folds.insert(
+                        app.cell_folds.insert(
                             index,
                             if below(&mut state, 2) == 0 {
-                                crate::tui::history::ThinkingFold::Expanded
+                                crate::tui::history::TranscriptFold::Expanded
                             } else {
-                                crate::tui::history::ThinkingFold::Collapsed
+                                crate::tui::history::TranscriptFold::Collapsed
                             },
                         );
                         "fold"

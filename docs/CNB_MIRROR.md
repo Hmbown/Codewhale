@@ -8,6 +8,22 @@ GitHub repository for users on networks where GitHub is slow or blocked
 `fix/*`, `rebrand/*`, and `work/v*` branch used for first-party release work,
 and each `v*` release tag after its complete GitHub Release is published.
 
+## Source and downloads are separate checks (2026-10-06 audit)
+
+CNB `main` matched canonical GitHub `main` during this audit. GitHub, npm and
+npmmirror's latest published version was **0.10.0**; the two registry wrapper
+tarballs had identical bytes and verified integrity. CNB's latest binary
+release remained **0.9.9**. Its `v0.10.0` source tag exists, but that tag build
+failed the release-note check before compilation and upload. The CNB 0.10.0
+checksum manifest returned 404; do not recommend forcing the CNB-only installer
+for that version. 0.10.1 remains a Main source candidate until publication.
+
+Check source identity, then the actual versioned release, assets and manifest.
+A successful GitHub mirror workflow or a source tag is not binary availability.
+Re-pushing an existing tag does not create a fresh tag-push build. Maintainers
+must recover the build/publication separately and verify the result, preserving
+published tags. Refresh this dated status after publication.
+
 ## Provenance
 
 **GitHub is the sole canonical source.** All releases, tags, and source code
@@ -42,9 +58,9 @@ GitHub Actions workflow:
   push exactly that tag. Branch pushes mirror `main`, first-party
   `fix/*`/`rebrand/*` branches, or explicitly matched release branches. Other
   feature branches and dependabot refs are intentionally *not* mirrored.
-- **Concurrency:** runs are serialized via a `cnb-sync` concurrency
-  group so the back-to-back `main` push and tag push from
-  `auto-tag.yml` cannot race each other.
+- **Concurrency:** `cnb-sync-${{ github.ref }}` serializes each ref separately.
+  Distinct release tags cannot replace one another in a global pending slot;
+  only a newer push of the same branch supersedes its pending branch sync.
 - **Retry:** each push is retried up to three times with linear
   backoff (5s, 10s) before the workflow gives up.
 
@@ -251,7 +267,10 @@ https://cnb.cool/codewhale.net/codewhale.git
 The mirror receives `main`, release tags, and matched release branches. GitHub
 is the fallback when the CNB workflow or credentials are unhealthy.
 
-CNB deploy-button examples live in `deploy/tencent-lighthouse/cnb/`. They are
+The bilingual self-hosting guide is
+[`scripts/tencent-lighthouse/README.md`](../scripts/tencent-lighthouse/README.md).
+CNB deploy-button examples live in
+[`deploy/tencent-lighthouse/cnb/`](../deploy/tencent-lighthouse/cnb/README.md). They are
 not active until copied into `.cnb.yml` and `.cnb/tag_deploy.yml`, because live
 deploy jobs require a Lighthouse deploy key, target host, and explicit CNB
 quota/billing policy.

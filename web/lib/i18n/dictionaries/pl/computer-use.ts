@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Uruchom test w tle", body: "Pomocnik otwiera jednorazowe okno testowe, wpisuje w nim tekst i zapisuje jego zrzut. Sprawdza przy tym, czy w trakcie testu zmienił się wskaźnik lub aktywna aplikacja." },
     { title: "Połącz z Codewhale", body: "Przejrzyj, zatwierdź jako zaufaną i włącz wtyczkę Computer Use w sklepie z wtyczkami Codewhale. Używaj wtyczki w wersji 0.3.1 lub nowszej, aby lokalne działania przechodziły przez przyciski Pause i Stop pomocnika." },
   ],
-  controlsTitle: "Pracuj dalej. Zachowaj kontrolę.",
+  controlsTitle: "Wstrzymaj lub zatrzymaj sterowanie aplikacjami",
   controlsBody: "Obsługiwane działania są wykonywane w tle w wybranej aplikacji. Aplikacje i gesty wymagające przejęcia pierwszego planu potrzebują Twojej zgody. Menu pokazuje docelową aplikację i tryb wprowadzania danych; Pause (wstrzymaj) zawiesza wprowadzanie danych przez pomocnika, a Stop (zatrzymaj) kończy jego bieżące sesje.",
   updateTitle: "Aktualizacje wtedy, gdy chcesz",
   updateBody: "Wybierz w aplikacji Check for updates (sprawdź aktualizacje). Przed instalacją aktualizacji pomocnik sprawdza pobrany plik, podpis Codewhale i notaryzację Apple, a poprzednią wersję zachowuje na wypadek konieczności przywrócenia.",

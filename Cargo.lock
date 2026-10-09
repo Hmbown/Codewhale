@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-agent"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "codewhale-config",
  "serde",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-app-server"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -842,14 +842,14 @@ dependencies = [
 
 [[package]]
 name = "codewhale-build-support"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "codewhale-cli"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-cloud-facts"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "codewhale-config",
  "codewhale-release",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-command-contract"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chrono",
  "codewhale-protocol",
@@ -916,14 +916,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-commands"
+version = "0.10.2"
+dependencies = [
+ "codewhale-command-contract",
+ "serde_json",
+]
+
+[[package]]
 name = "codewhale-config"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
  "chrono",
  "codewhale-execpolicy",
  "codewhale-paths",
+ "codewhale-protocol",
  "codewhale-secrets",
  "fd-lock",
  "libc",
@@ -941,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -962,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-execpolicy"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "codewhale-protocol",
@@ -974,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-hooks"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -993,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-lane"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1008,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-localization"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "codewhale-build-support",
  "ratatui",
@@ -1021,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-mcp"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "serde_json",
  "tracing",
@@ -1029,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-memory"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "clap",
  "regex",
@@ -1044,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-models"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "codewhale-config",
  "codewhale-core",
@@ -1054,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-palette"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "codewhale-config",
  "libc",
@@ -1066,22 +1075,23 @@ dependencies = [
 
 [[package]]
 name = "codewhale-paths"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "dirs 7.0.0",
 ]
 
 [[package]]
-name = "codewhale-portable-debug-diagnostics"
-version = "0.10.1"
+name = "codewhale-portable-config-policy"
+version = "0.10.2"
 dependencies = [
  "codewhale-command-contract",
+ "codewhale-protocol",
  "serde_json",
 ]
 
 [[package]]
 name = "codewhale-portable-session"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chrono",
  "codewhale-command-contract",
@@ -1093,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-protocol"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chrono",
  "serde",
@@ -1117,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-release"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -1131,11 +1141,12 @@ dependencies = [
 
 [[package]]
 name = "codewhale-runtime"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "ahash",
  "anyhow",
  "chrono",
+ "codewhale-command-contract",
  "codewhale-config",
  "codewhale-core",
  "codewhale-memory",
@@ -1158,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-sanitize"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "regex",
  "serde_json",
@@ -1167,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-secrets"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chrono",
  "codewhale-paths",
@@ -1185,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-state"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1200,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-telemetry"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1220,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-tools"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1234,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-tui"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "ahash",
  "ansi-to-tui",
@@ -1251,6 +1262,7 @@ dependencies = [
  "codewhale-build-support",
  "codewhale-cloud-facts",
  "codewhale-command-contract",
+ "codewhale-commands",
  "codewhale-config",
  "codewhale-core",
  "codewhale-execpolicy",
@@ -1347,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-workflow"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1359,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-workflow-js"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "jsonschema",
@@ -1565,8 +1577,6 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",

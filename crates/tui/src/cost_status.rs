@@ -3200,6 +3200,7 @@ mod tests {
                     output: Some(output),
                     cache_read: Some(0.25),
                     cache_write: None,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }],
