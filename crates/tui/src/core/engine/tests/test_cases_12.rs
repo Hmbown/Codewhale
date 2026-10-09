@@ -1582,3 +1582,155 @@ fn turn_tool_context_uses_planned_authority_and_route_not_installed_session() {
         "planned-next-model"
     );
 }
+
+/// `/network allow <host>` edits `config.toml` and tells the operator to retry
+/// the command. The engine holds its policy by value, so that retry only works
+/// when the tool context re-reads the document — this is the regression guard
+/// for a session that kept refusing a host the file already allowed.
+#[test]
+fn tool_context_network_policy_follows_the_config_document_mid_session() {
+    use crate::network_policy::{Decision, DecisionToml, NetworkPolicy, NetworkPolicyDecider};
+
+    let dir = tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "[network]\ndefault = \"prompt\"\nallow = [\"api.github.com\"]\n",
+    )
+    .expect("write config");
+
+    let api_config = Config {
+        loaded_config_path: Some(config_path),
+        ..Config::default()
+    };
+
+    // The snapshot the engine was spawned with does not allow the host yet.
+    let engine_config = EngineConfig {
+        network_policy: Some(NetworkPolicyDecider::new(
+            NetworkPolicy {
+                default: DecisionToml::Prompt,
+                ..NetworkPolicy::default()
+            },
+            None,
+        )),
+        ..EngineConfig::default()
+    };
+    let (engine, _handle) = Engine::new(engine_config, &api_config);
+
+    let authority = crate::core::authority::TurnAuthority::from_effective_fields(
+        AppMode::Agent,
+        true,
+        true,
+        true,
+        ApprovalMode::Bypass,
+    );
+    let route = TurnRouteContext {
+        provider: ProviderKind::Deepseek,
+        model: "network-refresh-model".to_string(),
+        capabilities: codewhale_config::route::RouteCapabilities::default(),
+        limits: None,
+        client: None,
+        api_config: Box::new(Config::default()),
+        locale_tag: engine.config.locale_tag.clone(),
+        role_models: engine.subagent_role_models(),
+        auto_model: false,
+        reasoning_effort: None,
+        reasoning_effort_auto: false,
+    };
+
+    let context = engine.build_tool_context_for_turn(&authority, &route);
+    let decider = context
+        .network_policy
+        .as_ref()
+        .expect("the configured policy is injected");
+    assert_eq!(
+        decider.evaluate("api.github.com", "Bash"),
+        Decision::Allow,
+        "the document already allows the host; the retry must see it"
+    );
+    assert_eq!(
+        decider.evaluate("unlisted.example.com", "Bash"),
+        Decision::Prompt,
+        "a host the document does not name still prompts"
+    );
+}
+
+/// `/network deny <host>` writes the same `[network]` table `/network allow`
+/// does. A session that started without one has to adopt it — otherwise
+/// tightening the policy mid-session needs the restart this fix removes — and a
+/// session that started gated must not lose its policy because the table went
+/// away.
+#[test]
+fn tool_context_adopts_a_policy_written_mid_session_and_never_ungates_one() {
+    use crate::network_policy::{Decision, DecisionToml, NetworkPolicy, NetworkPolicyDecider};
+
+    let dir = tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "[network]\ndefault = \"prompt\"\ndeny = [\"evil.example.com\"]\n",
+    )
+    .expect("write config");
+
+    let api_config = Config {
+        loaded_config_path: Some(config_path.clone()),
+        ..Config::default()
+    };
+
+    // A session that started with no `[network]` table at all adopts the deny.
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &api_config);
+    let authority = crate::core::authority::TurnAuthority::from_effective_fields(
+        AppMode::Agent,
+        true,
+        true,
+        true,
+        ApprovalMode::Bypass,
+    );
+    let route = TurnRouteContext {
+        provider: ProviderKind::Deepseek,
+        model: "network-adopt-model".to_string(),
+        capabilities: codewhale_config::route::RouteCapabilities::default(),
+        limits: None,
+        client: None,
+        api_config: Box::new(Config::default()),
+        locale_tag: engine.config.locale_tag.clone(),
+        role_models: engine.subagent_role_models(),
+        auto_model: false,
+        reasoning_effort: None,
+        reasoning_effort_auto: false,
+    };
+    let context = engine.build_tool_context_for_turn(&authority, &route);
+    let decider = context
+        .network_policy
+        .as_ref()
+        .expect("a table written mid-session is adopted");
+    assert_eq!(
+        decider.evaluate("evil.example.com", "Bash"),
+        Decision::Deny,
+        "the deny direction must land mid-session too"
+    );
+
+    // Removing the table must not ungate a session that started gated.
+    fs::write(&config_path, "# `[network]` removed\n").expect("rewrite config");
+    let engine_config = EngineConfig {
+        network_policy: Some(NetworkPolicyDecider::new(
+            NetworkPolicy {
+                default: DecisionToml::Deny,
+                ..NetworkPolicy::default()
+            },
+            None,
+        )),
+        ..EngineConfig::default()
+    };
+    let (gated, _handle) = Engine::new(engine_config, &api_config);
+    let context = gated.build_tool_context_for_turn(&authority, &route);
+    let decider = context
+        .network_policy
+        .as_ref()
+        .expect("a gated session stays gated");
+    assert_eq!(
+        decider.evaluate("unlisted.example.com", "Bash"),
+        Decision::Deny,
+        "removing the table must not hand a gated session an open policy"
+    );
+}

@@ -7110,6 +7110,59 @@ impl Engine {
         )
     }
 
+    /// The network decider this turn runs under: the live policy, re-read from
+    /// the document the session was launched with.
+    ///
+    /// `self.config.network_policy` is the snapshot `Engine::new` took when the
+    /// session was spawned. `/network allow <host>` edits `config.toml` and
+    /// promises "Retry the command now.", but it cannot reach that snapshot —
+    /// so without this re-read the host stayed refused until the next engine
+    /// spawn. Same shape as the workspace trust list loaded below, which also
+    /// re-reads per tool-context build so `/trust add` lands mid-session; a
+    /// hand edit of `[network]` lands through it too.
+    ///
+    /// Both directions have to land. `/network deny <host>` writes the same
+    /// `[network]` table `/network allow` does, and a session that started
+    /// without one adopts it the moment it appears — otherwise tightening a
+    /// policy mid-session would need the restart this exists to remove.
+    ///
+    /// A session that started gated keeps the policy it holds when the document
+    /// stops carrying a `[network]` table, so removing the table cannot leave a
+    /// session ungated by accident.
+    ///
+    /// The session cache rides along on a refresh, so a host approved through
+    /// the approval prompt survives it. An adopted table has no cache to
+    /// inherit: the session had no decider, so nothing was ever approved under
+    /// one.
+    fn current_network_decider(&self) -> Option<crate::network_policy::NetworkPolicyDecider> {
+        let Some(path) = self.api_config.loaded_config_path.as_deref() else {
+            return self.config.network_policy.clone();
+        };
+        let Some(document) = crate::config::network_policy_from_document(path) else {
+            // The document carries no `[network]` table. Keep what the session
+            // resolved: removing a table must not ungate a gated run.
+            return self.config.network_policy.clone();
+        };
+        match self.config.network_policy.as_ref() {
+            // A managed overlay or a Fleet denial produced this policy, so the
+            // document is a lower layer: it may add hosts, but it may not widen
+            // the fallback or lift a denial.
+            Some(decider)
+                if decider.is_authoritative() || self.api_config.network_layer_is_managed =>
+            {
+                Some(
+                    decider
+                        .with_policy_refreshed(decider.policy().folded_with_lower_layer(document)),
+                )
+            }
+            Some(decider) => Some(decider.with_policy_refreshed(document)),
+            // Nothing resolved a policy for this session, so there is no higher
+            // layer to protect. Adopt the table the moment it exists — that is
+            // how `/network deny <host>` lands where there was no policy yet.
+            None => Some(crate::network_policy::NetworkPolicyDecider::with_default_audit(document)),
+        }
+    }
+
     /// Build one tool context from the already-resolved turn authority and
     /// route. A preview owns values that are deliberately not installed on the
     /// session; rebuilding either from `self.session` would give it the prior
@@ -7216,8 +7269,8 @@ impl Engine {
             ctx.memory_path = Some(self.config.memory_path.clone());
         }
 
-        if let Some(decider) = self.config.network_policy.as_ref() {
-            ctx = ctx.with_network_policy(decider.clone());
+        if let Some(decider) = self.current_network_decider() {
+            ctx = ctx.with_network_policy(decider);
         }
 
         // Adaptive evidence routing is engine-native and opt-in
@@ -7426,8 +7479,8 @@ impl Engine {
         }
         pool = pool.with_backend(crate::mcp::McpBackend::from_config(&self.api_config));
         pool = pool.with_disallowed_tools(self.config.disallowed_tools.clone().unwrap_or_default());
-        if let Some(decider) = self.config.network_policy.as_ref() {
-            pool = pool.with_network_policy(decider.clone());
+        if let Some(decider) = self.current_network_decider() {
+            pool = pool.with_network_policy(decider);
         }
         // The self-serve login tool honors the same pre-registered redirect
         // overrides `/mcp login` uses, or providers with pinned callback

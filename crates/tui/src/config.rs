@@ -2593,6 +2593,13 @@ pub struct Config {
     #[serde(skip)]
     pub loaded_config_path: Option<PathBuf>,
 
+    /// Runtime-only receipt that a higher-precedence layer supplied `[network]`
+    /// — a managed overlay. The resolved policy is then not the user
+    /// document's to replace: a mid-session re-read of that document must not
+    /// widen what the higher layer set.
+    #[serde(skip)]
+    pub(crate) network_layer_is_managed: bool,
+
     /// A resolved startup snapshot never reads remembered route choices again.
     /// False means an explicit config/profile owns the route instead.
     #[serde(skip)]
@@ -3055,6 +3062,33 @@ impl NetworkPolicyToml {
             audit: self.audit,
         }
     }
+}
+
+/// Re-read the `[network]` table from a configuration document.
+///
+/// Deliberately narrower than [`Config::load`]: this runs on the tool-context
+/// build path, where re-applying the environment, managed, and credential
+/// layers would be both wasteful and wrong. Only the document's own table comes
+/// back — the same table `/network allow <host>` edits.
+///
+/// `None` means there is nothing usable to adopt: the document is missing,
+/// unreadable, unparseable, or carries no `[network]` table. Callers keep the
+/// policy they already hold, which is the conservative direction for an
+/// allow/deny gate.
+///
+/// Known limitation: `[profiles.<name>.network]` is not consulted. `/network`
+/// does not write it either, so a live session and the command agree on this
+/// base table.
+#[must_use]
+pub fn network_policy_from_document(path: &Path) -> Option<crate::network_policy::NetworkPolicy> {
+    #[derive(Deserialize)]
+    struct NetworkTable {
+        network: Option<NetworkPolicyToml>,
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    let parsed: NetworkTable = toml::from_str(&contents).ok()?;
+    parsed.network.map(NetworkPolicyToml::into_runtime)
 }
 
 /// `[lsp]` table — mirrors [`crate::lsp::LspConfig`]. Documented in
@@ -10443,6 +10477,8 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         notifications: override_cfg.notifications.or(base.notifications),
         approval: override_cfg.approval.or(base.approval),
         network: override_cfg.network.or(base.network),
+        network_layer_is_managed: override_cfg.network_layer_is_managed
+            || base.network_layer_is_managed,
         verifier: override_cfg.verifier.or(base.verifier),
         advisor: override_cfg.advisor.or(base.advisor),
         skills: merge_skills_config(base.skills, override_cfg.skills),
@@ -10967,6 +11003,12 @@ fn apply_managed_overrides(config: &mut Config) -> Result<()> {
             merged.provider_config_for_mut(&owner)?.base_url = None;
         }
         merged.base_url_env_receipt = BaseUrlEnvReceipt::NoOwner;
+    }
+    // A managed `[network]` table outranks the user document. Record that the
+    // resolved policy is not the document's to replace, so a mid-session
+    // re-read of that document folds onto it instead of widening it.
+    if managed.network.is_some() {
+        merged.network_layer_is_managed = true;
     }
     *config = merged;
     Ok(())

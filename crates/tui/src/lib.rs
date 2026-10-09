@@ -14924,13 +14924,19 @@ fn exec_network_policy(
     // Fleet caps are an outer authority boundary: user configuration may
     // narrow them further, but it may never widen an explicit network denial.
     if outer_network_access == Some(false) {
-        return Some(crate::network_policy::NetworkPolicyDecider::new(
-            crate::network_policy::NetworkPolicy {
-                default: crate::network_policy::DecisionToml::Deny,
-                ..crate::network_policy::NetworkPolicy::default()
-            },
-            None,
-        ));
+        // A Fleet denial is an outer authority the user's document may never
+        // widen, so mark the decider authoritative: a mid-session re-read of
+        // that document folds onto it instead of replacing it.
+        return Some(
+            crate::network_policy::NetworkPolicyDecider::new(
+                crate::network_policy::NetworkPolicy {
+                    default: crate::network_policy::DecisionToml::Deny,
+                    ..crate::network_policy::NetworkPolicy::default()
+                },
+                None,
+            )
+            .with_authoritative(),
+        );
     }
     config.network.clone().map(|toml_cfg| {
         crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
