@@ -20824,9 +20824,7 @@ fn transition_blockers_summarize_past_the_fifth_task_and_bound_each_summary() {
     );
     assert_eq!(blockers[5], "…and 1 more");
     assert!(
-        blockers[..5]
-            .iter()
-            .all(|row| row.as_str().width() <= 74),
+        blockers[..5].iter().all(|row| row.as_str().width() <= 74),
         "rows must fit the 74-column Note body: {blockers:?}"
     );
     assert!(
