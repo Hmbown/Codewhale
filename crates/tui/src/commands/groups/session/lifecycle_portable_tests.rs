@@ -59,7 +59,7 @@ fn branch_composes_exact_baseline_messages() {
     assert_eq!(
         result.message.as_deref(),
         Some(
-            "Error: Cannot branch while runtime work is active:\n  • shell_a3f2  running  5h 18m  cw-leftovers.ps1\n\nWait for them to finish, or cancel them with /jobs cancel-all."
+            "Error: Cannot branch while runtime work is active:\n  • shell_a3f2  running  5h 18m  cw-leftovers.ps1\n\nWait for them to finish, or cancel what is still cancelable: Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs."
         )
     );
     assert_eq!(canned.transition_checks.get(), 1);

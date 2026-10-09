@@ -113,7 +113,7 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(
             message(&result),
-            "Cannot resume while runtime work is active:\n  • a turn is still running\n\nWait for them to finish, or cancel them with /jobs cancel-all."
+            "Cannot resume while runtime work is active:\n  • a turn is still running\n\nWait for them to finish, or cancel what is still cancelable: Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs."
         );
         assert_eq!(
             fake.calls.borrow().as_slice(),

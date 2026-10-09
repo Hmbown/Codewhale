@@ -29,7 +29,7 @@ mod session;
 pub(in crate::commands) const MAX_TITLE_LEN: usize = 100;
 
 /// The one way the lifecycle commands report a closed transition gate: the
-/// verb, the named blockers, and the supported way out.
+/// verb, the named blockers, and the exits that actually clear them.
 pub(in crate::commands) fn transition_blocked_message(verb: &str, blockers: &[String]) -> String {
     let mut message = format!("Cannot {verb} while runtime work is active");
     if blockers.is_empty() {
@@ -41,7 +41,13 @@ pub(in crate::commands) fn transition_blocked_message(verb: &str, blockers: &[St
             message.push_str(blocker);
         }
     }
-    message.push_str("\n\nWait for them to finish, or cancel them with /jobs cancel-all.");
+    // `/jobs cancel-all` only kills shell processes and answers "No running
+    // commands to cancel." for everything else, so it must not read as the
+    // exit for a turn, dispatch, compaction, or cleanup blocker.
+    message.push_str(
+        "\n\nWait for them to finish, or cancel what is still cancelable: \
+         Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs.",
+    );
     message
 }
 
