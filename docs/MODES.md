@@ -77,8 +77,9 @@ or make mode the approval authority. Durable tasks and automation keep
 conservative omitted-field defaults and receive shell authority only when their
 settings explicitly grant it. Stateful terminal/background controls are
 specialized deferred tools rather than fields on the small foreground `bash`
-schema. Full Access changes the permission posture while hard safety and
-repository-policy holds remain authoritative.
+schema. Full Access changes the permission posture: the deterministic
+Auto-Review floor applies in the reviewing postures and is skipped under Full
+Access, while repository-policy holds remain authoritative.
 
 Action-capable modes can discover the deferred `rlm` family through
 `tool_search`; its `open`, `eval`, `configure`, and `close` actions own persistent
@@ -246,11 +247,14 @@ tells the model to retry a denied command exactly once with the narrowest wider
 mode plus a justification. DeepSeek Harness does not add an LLM reviewer to
 that path. Codewhale's autonomous posture adds only the single stateless
 guardian request described above; deterministic hard blocks remain
-non-bypassable.
+non-bypassable in the reviewing postures.
 - `bypass` (**Full Access**): ordinary tool calls do not show approval prompts,
-  while deliberate user questions remain available. Non-bypassable registered
-  holds auto-approve instead of opening a contradictory modal. Repository-law
-  and managed-policy holds fail closed as hard blocks instead of contradicting
+  while deliberate user questions remain available. The deterministic
+  Auto-Review floor is skipped — publish-like commands, destructive
+  background/headless work, and the Windows npm-launcher platform hold do not
+  strand a call the person already granted. Non-bypassable registered holds
+  auto-approve instead of opening a contradictory modal. Repository-law and
+  managed-policy holds fail closed as hard blocks instead of contradicting
   Full Access with an approval modal.
 - `never`: blocks any tool that is not considered safe/read-only; deliberate
   user questions remain available.
@@ -278,8 +282,9 @@ auto-approve bit:
   and the person's answer is routed back to it, whether the parent turn is
   idle or itself awaiting an approval. Hosts that cannot prompt deny with the
   reason.
-- **Full Access**: ordinary calls run; destructive detached work still fails
-  closed, because children are background workers.
+- **Full Access**: calls run, including destructive detached work — the
+  Auto-Review floor is skipped exactly as it is for the parent turn. The
+  execution envelope still applies and never widens.
 
 Role posture and the execution envelope are checked before and after this
 gate and never widen. Every decision a person did not make at a prompt is

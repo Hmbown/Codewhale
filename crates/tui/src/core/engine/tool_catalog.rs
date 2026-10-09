@@ -51,7 +51,7 @@ pub(crate) fn is_tool_search_tool(name: &str) -> bool {
 #[rustfmt::skip]
 pub(crate) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     // Core work controls are eager; specialized tools stay searchable.
-    "read", "write", "edit", "bash", "agent", "workflow", "todo_write",
+    "read", "write", "edit", "file_search", "bash", "agent", "workflow", "todo_write",
     // Continuation instructions require these controls. Hiding them behind
     // discovery leaves a model unable to stop the work it was asked to run.
     "create_goal", "get_goal", "update_goal",

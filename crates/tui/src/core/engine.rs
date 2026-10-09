@@ -1879,7 +1879,7 @@ impl Engine {
         }
 
         let (tx_op, rx_op) = mpsc::channel(ENGINE_OP_CHANNEL_CAPACITY);
-        let (tx_event, rx_event) = mpsc::channel(256);
+        let (tx_event, rx_event) = mpsc::channel(4 * streaming::MAX_TOOL_CALLS_PER_RESPONSE);
         let (tx_approval, rx_approval) = mpsc::channel(64);
         let (tx_user_input, rx_user_input) = mpsc::channel(32);
         let (tx_steer, rx_steer) = mpsc::channel(64);
@@ -8973,11 +8973,11 @@ pub(crate) fn auto_review_plan_decision_for_context(
                 );
                 if matches!(
                     context.approval_mode,
-                    ApprovalMode::Auto | ApprovalMode::Never | ApprovalMode::Bypass
+                    ApprovalMode::Auto | ApprovalMode::Never
                 ) {
-                    // Auto-Review, Never, and Full Access are non-interactive for
-                    // approval holds. Full Access auto-runs ordinary calls, but a
-                    // non-bypassable safety floor always fails closed.
+                    // Auto-Review and Never are non-interactive for approval
+                    // holds, so the floor fails closed instead of stranding
+                    // the call on a modal neither posture opens.
                     AutoReviewPlanDecision::Block(reason)
                 } else {
                     AutoReviewPlanDecision::ForcePrompt(reason)
@@ -9385,7 +9385,7 @@ impl MockEngineHandle {
 #[cfg(test)]
 pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_op, rx_op) = mpsc::channel(32);
-    let (tx_event, rx_event) = mpsc::channel(256);
+    let (tx_event, rx_event) = mpsc::channel(4 * streaming::MAX_TOOL_CALLS_PER_RESPONSE);
     let (tx_approval, rx_approval) = mpsc::channel(64);
     let (tx_user_input, rx_user_input) = mpsc::channel(32);
     let (tx_steer, rx_steer) = mpsc::channel(64);
@@ -9841,7 +9841,7 @@ pub(crate) mod reviewer;
 mod streaming;
 mod token_estimate_cache;
 pub(crate) mod tool_catalog;
-mod tool_execution;
+pub(crate) mod tool_execution;
 #[cfg(all(test, unix))]
 pub(crate) use tool_execution::pin_replay_span_sequence;
 mod tool_media;

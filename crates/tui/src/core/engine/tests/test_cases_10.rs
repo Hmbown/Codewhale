@@ -1,11 +1,10 @@
-
-
 #[test]
 fn default_active_contract_keeps_discovery_and_core_tools_eager() {
-    const EXPECTED_NATIVE: [&str; 11] = [
+    const EXPECTED_NATIVE: [&str; 12] = [
         "read",
         "write",
         "edit",
+        "file_search",
         "bash",
         "agent",
         "workflow",
@@ -607,9 +606,13 @@ async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
 
     for mode in ["act", "operate"] {
         let full = metric_tool_names(&payload, mode, "full");
-        for required in ["Run", "verify", "fim_edit"] {
+        for required in ["Run", "verify"] {
             assert!(full.contains(required), "{mode} must include {required}");
         }
+        assert!(
+            !full.contains("fim_edit"),
+            "{mode} must exclude FIM on its unsupported route"
+        );
     }
 }
 
