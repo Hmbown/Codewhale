@@ -202,3 +202,30 @@ test("Windows PowerShell refuses substring-only and ambiguous exact names", WIND
   const ambiguous = nativeFixture((script) => stateFixture(script, ["Fixture", "FIXTURE"]));
   await assert.rejects(ambiguous.get_app_state({ app_ref: { name: "Fixture" } }), /More than one application window/u);
 });
+
+test("Windows UIA geometry retains negative screen coordinates and omits absent or nonfinite rectangles", WINDOWS, async () => {
+  const cases = [
+    ["[System.Windows.Rect]::Empty", null, null],
+    ["[System.Windows.Rect]::new(-40, 20, 300, 40)", { x: -40, y: 20 }, { w: 300, h: 40 }],
+    ["[System.Windows.Rect]::new(0, 0, 0, 40)", null, null],
+    ...["[double]::NaN", "[double]::PositiveInfinity", "2147483648"].map(x => [
+      `[pscustomobject]@{ IsEmpty = $false; X = ${x}; Y = 0; Width = 20; Height = 20 }`, null, null,
+    ]),
+  ];
+  for (const [rect, position, size] of cases) {
+    const backend = nativeFixture(original => {
+      const start = "    $position = $null; $size = $null;";
+      const end = "    $acts = @();";
+      assert.equal(original.split(start).length, 2);
+      assert.equal(original.split(end).length, 2);
+      const geometry = original.slice(original.indexOf(start), original.indexOf(end));
+      return `Add-Type -AssemblyName WindowsBase;
+$rect = ${rect};
+${geometry}
+Write-Output (@{ found = $true; name = 'Fixture'; elements = @(@{ position = $position; size = $size }) } | ConvertTo-Json -Depth 6 -Compress);`;
+    });
+    const state = await backend.get_app_state({ app_ref: { name: "Fixture" } });
+    assert.deepEqual(state.elements[0].position, position, rect);
+    assert.deepEqual(state.elements[0].size, size, rect);
+  }
+});

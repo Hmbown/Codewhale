@@ -452,14 +452,18 @@ fn materialization_preserves_legacy_tree_receipts_and_missing_home() {
         .unwrap()
         .modified()
         .unwrap();
+    let stamp_bytes = fs::read(published.join(STAMP_NAME)).unwrap();
     assert_eq!(materialize_at_home(&home).unwrap().unwrap(), published);
-    assert_eq!(
+    // Reuse re-stamps the snapshot's mtime (plugin-state GC reads it as "last
+    // started") and nothing else: the stamp's bytes are the digest, untouched.
+    assert!(
         fs::metadata(published.join(STAMP_NAME))
             .unwrap()
             .modified()
-            .unwrap(),
-        stamp_time
+            .unwrap()
+            >= stamp_time
     );
+    assert_eq!(fs::read(published.join(STAMP_NAME)).unwrap(), stamp_bytes);
     assert!(published.join(COMPUTER_USE).join("plugin.json").is_file());
     assert_eq!(fs::read(legacy.join("legacy")).unwrap(), b"old live bundle");
     assert_eq!(fs::read(state).unwrap(), b"existing receipts");

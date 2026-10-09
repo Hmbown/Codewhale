@@ -21,7 +21,7 @@ Checks:
 
 Set GH_BIN=/path/to/gh to choose a GitHub CLI binary. Set
 CODEWHALE_GITHUB_REPO=owner/repo or CODEWHALE_RELEASE_REMOTE=remote to override
-the default Hmbown/CodeWhale origin check.
+the default codewhale-hq/CodeWhale origin check.
 EOF
 }
 
@@ -61,7 +61,7 @@ if [[ -z "${version}" ]]; then
   exit 1
 fi
 
-repo="${CODEWHALE_GITHUB_REPO:-Hmbown/CodeWhale}"
+repo="${CODEWHALE_GITHUB_REPO:-codewhale-hq/CodeWhale}"
 remote="${CODEWHALE_RELEASE_REMOTE:-origin}"
 gh_bin="${GH_BIN:-gh}"
 

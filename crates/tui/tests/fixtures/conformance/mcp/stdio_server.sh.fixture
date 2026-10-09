@@ -1,0 +1,45 @@
+#!/bin/sh
+# Deterministic stdio MCP server for the `mcp` conformance family.
+#
+#   sh stdio_server.sh.fixture DIR   (any copy of this file; the harness copies it
+#                                     to stdio_server.sh in a temp dir)
+#
+# It answers from files in DIR, which the harness writes from the case's
+# `server` object (same shape the HTTP transcript server uses):
+#
+#   initialize.reply, tools_list.reply   the JSON-RPC reply minus its id,
+#                                        e.g.  "result":{"tools":[...]}
+#   call.<tool>.reply                    the same, for tools/call of <tool>
+#   call.<tool>.exit                     present: exit without replying
+#                                        (a server that dies mid-call)
+#
+# Every tools/call request line is appended to DIR/calls.log before it is
+# answered, so the harness can report what the server was actually asked to
+# run. One JSON-RPC message per line on stdin and stdout; notifications get
+# no reply. Plain POSIX sh: no Node, no JSON parser.
+dir=$1
+reply() {
+    printf '{"jsonrpc":"2.0","id":"%s",%s}\n' "$1" "$2"
+}
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    method=$(printf '%s\n' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+    case "$method" in
+        notifications/*) ;;
+        initialize) reply "$id" "$(cat "$dir/initialize.reply")" ;;
+        tools/list) reply "$id" "$(cat "$dir/tools_list.reply")" ;;
+        tools/call)
+            printf '%s\n' "$line" >> "$dir/calls.log"
+            tool=$(printf '%s\n' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+            [ -f "$dir/call.$tool.exit" ] && exit 0
+            if [ -f "$dir/call.$tool.reply" ]; then
+                reply "$id" "$(cat "$dir/call.$tool.reply")"
+            else
+                reply "$id" '"error":{"code":-32602,"message":"no scripted tools/call answer"}'
+            fi
+            ;;
+        *)
+            [ -n "$id" ] && reply "$id" '"error":{"code":-32601,"message":"method not found"}'
+            ;;
+    esac
+done

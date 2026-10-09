@@ -7,7 +7,6 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -358,7 +357,11 @@ impl FleetManager {
 
     fn manager_lock_path(&self, run_id: &FleetRunId) -> PathBuf {
         self.workspace
-            .join(".codewhale")
+            .join(Self::manager_lock_relative_path(run_id))
+    }
+
+    fn manager_lock_relative_path(run_id: &FleetRunId) -> PathBuf {
+        PathBuf::from(".codewhale")
             .join("fleet")
             .join(format!("manager-{}.lock", safe_path_segment(&run_id.0)))
     }
@@ -667,7 +670,10 @@ impl FleetManager {
             return Ok(());
         };
         let state = self.ledger.rebuild_state()?;
-        for record in guard.list_worker_records() {
+        for record in guard
+            .fleet_worker_records_for_workspace(&self.workspace)
+            .map_err(anyhow::Error::msg)?
+        {
             let current = state
                 .tasks
                 .values()
@@ -805,18 +811,13 @@ impl FleetManager {
         // blocking pool (blocking-call convention, #6149).
         let lock_file = {
             let path = manager_lock_path.clone();
+            let workspace = self.workspace.clone();
+            let relative = Self::manager_lock_relative_path(run_id);
             tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("creating Fleet manager lock dir {}", parent.display())
-                    })?;
-                }
-                OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&path)
+                // Created and opened through the pinned no-follow handle, so a
+                // linked `.codewhale` or lock name is refused, not followed.
+                super::files::WorkspaceFile::open(&workspace, &relative, true)
+                    .and_then(|file| file.open_update(true, false))
                     .with_context(|| format!("opening Fleet manager lock {}", path.display()))
             })
             .await
@@ -1077,28 +1078,35 @@ impl FleetManager {
 
         // Enrich only a live lease with its in-memory worker projection. A
         // terminal durable task always wins over a lagging runtime record.
-        let runtime_state = current
-            .as_ref()
-            .filter(|task| task.status == FleetTaskLedgerStatus::Leased)
-            .and(self.sub_agent_manager.as_ref())
-            .and_then(|mgr| {
-                mgr.try_read()
-                    .ok()
-                    .and_then(|guard| guard.get_worker_record(worker_id))
-                    .map(|record| FleetWorkerRuntimeProjection {
-                        agent_status: format!("{:?}", record.status).to_lowercase(),
-                        steps_taken: record.steps_taken,
-                        latest_message: record.latest_message,
-                        error: record.error,
-                        result_summary: record.result_summary,
-                        has_session: !matches!(
-                            record.status,
-                            crate::tools::subagent::AgentWorkerStatus::Completed
-                                | crate::tools::subagent::AgentWorkerStatus::Failed
-                                | crate::tools::subagent::AgentWorkerStatus::Cancelled
-                        ),
-                    })
-            });
+        let runtime_record = match (current.as_ref(), self.sub_agent_manager.as_ref()) {
+            (Some(task), Some(manager)) if task.status == FleetTaskLedgerStatus::Leased => {
+                match manager.try_read() {
+                    Ok(guard) => guard
+                        .fleet_worker_records_for_workspace(&self.workspace)
+                        .map_err(anyhow::Error::msg)?
+                        .into_iter()
+                        .find(|record| {
+                            record.spec.worker_id == worker_id
+                                && record.spec.run_id == task.entry.run_id.0
+                        }),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let runtime_state = runtime_record.map(|record| FleetWorkerRuntimeProjection {
+            agent_status: format!("{:?}", record.status).to_lowercase(),
+            steps_taken: record.steps_taken,
+            latest_message: record.latest_message,
+            error: record.error,
+            result_summary: record.result_summary,
+            has_session: !matches!(
+                record.status,
+                crate::tools::subagent::AgentWorkerStatus::Completed
+                    | crate::tools::subagent::AgentWorkerStatus::Failed
+                    | crate::tools::subagent::AgentWorkerStatus::Cancelled
+            ),
+        });
 
         Ok(FleetWorkerInspection {
             worker_id: worker_id.to_string(),
@@ -1261,8 +1269,15 @@ impl FleetManager {
             task.entry.attempts,
         );
         let record = coordination
-            .get_worker_record(worker_id)
-            .ok_or_else(|| anyhow!("Fleet worker {worker_id} has no registered launch spec"))?;
+            .fleet_worker_records_for_workspace(&self.workspace)
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .find(|record| {
+                record.spec.worker_id == worker_id && record.spec.run_id == task.entry.run_id.0
+            })
+            .ok_or_else(|| {
+                anyhow!("Fleet worker {worker_id} has no registered launch spec in its origin")
+            })?;
         let current_generation = task.entry.attempts.max(1);
         let next_generation = current_generation
             .checked_add(1)
@@ -1392,6 +1407,9 @@ impl FleetManager {
             .find(|worker| worker.id == worker_id)
             .cloned()
             .unwrap_or_else(|| default_local_worker(worker_id));
+        // Capture selected owner scope before cwd/worktree resolution. The
+        // execution target cannot manufacture a different worker origin.
+        let origin_workspace = self.workspace.clone();
         let worker_workspace = resolve_task_cwd(&self.workspace, task_spec)?;
         validate_task_cwd_for_host(&self.workspace, &worker_spec.host, &worker_workspace)?;
         let roster = self.agent_roster();
@@ -1424,7 +1442,12 @@ impl FleetManager {
                 let Ok(mut guard) = manager.try_write() else {
                     return Ok(false);
                 };
-                if let Err(error) = guard.preflight_worker_coordination(&sub_agent_worker) {
+                let origin = guard
+                    .capture_fleet_worker_origin(&origin_workspace)
+                    .map_err(anyhow::Error::msg)?;
+                if let Err(error) =
+                    guard.preflight_worker_coordination_in_origin(&sub_agent_worker, &origin)
+                {
                     tracing::debug!(
                         worker_id,
                         run_id = %entry.run_id.0,
@@ -1441,6 +1464,11 @@ impl FleetManager {
         let registration_snapshot = coordination_guard
             .as_ref()
             .map(|guard| guard.coordination_registration_snapshot());
+        let worker_origin = coordination_guard
+            .as_ref()
+            .map(|guard| guard.capture_fleet_worker_origin(&origin_workspace))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
         let mut registration_succeeded = false;
         let now = timestamp();
         let start_result = self.ledger.start_task_if_enqueued(
@@ -1463,7 +1491,12 @@ impl FleetManager {
                 // cancellation cannot win between claim and projection setup.
                 if let Some(guard) = coordination_guard.as_mut() {
                     guard
-                        .register_worker_with_coordination(sub_agent_worker)
+                        .register_worker_with_coordination_in_origin(
+                            sub_agent_worker,
+                            worker_origin
+                                .clone()
+                                .expect("coordination guard captured worker origin"),
+                        )
                         .map_err(anyhow::Error::msg)?;
                     registration_succeeded = true;
                 }
@@ -1531,7 +1564,16 @@ impl FleetManager {
                 let Ok(guard) = manager.try_read() else {
                     continue;
                 };
-                Some(guard.get_worker_record(worker_id))
+                Some(
+                    guard
+                        .fleet_worker_records_for_workspace(&self.workspace)
+                        .map_err(anyhow::Error::msg)?
+                        .into_iter()
+                        .find(|record| {
+                            record.spec.worker_id == worker_id
+                                && record.spec.run_id == task.entry.run_id.0
+                        }),
+                )
             } else {
                 None
             };
@@ -2084,18 +2126,15 @@ impl FleetManager {
             .join(safe_path_segment(&run_id.0))
             .join(safe_path_segment(&task_spec.id))
             .join(format!("{}.log", safe_path_segment(worker_id)));
-        let abs_path = self.workspace.join(&rel_path);
-        if let Some(parent) = abs_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating Fleet artifact dir {}", parent.display()))?;
-        }
         let contents = format!(
             "run_id={}\ntask_id={}\ntask_name={}\nworker_id={}\nstatus=started\n",
             run_id.0, task_spec.id, task_spec.name, worker_id
         );
-        std::fs::write(&abs_path, contents)
-            .with_context(|| format!("writing Fleet worker log {}", abs_path.display()))?;
-        let size_bytes = std::fs::metadata(&abs_path).ok().map(|m| m.len());
+        // The same pinned, no-follow writer as every other Fleet artifact: a
+        // link in `.codewhale` cannot send the log outside the workspace.
+        super::artifacts::write(&self.workspace, &rel_path, contents.as_bytes())
+            .with_context(|| format!("writing Fleet worker log {}", rel_path.display()))?;
+        let size_bytes = Some(contents.len() as u64);
         Ok(FleetArtifactRef {
             kind: FleetArtifactKind::Log,
             path: rel_path,
@@ -2750,6 +2789,94 @@ mod tests {
             alert_policy: None,
             timeout_seconds: None,
             metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn selected_owner_origin_survives_task_cwd_and_requires_actual_fleet_lease() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let original = root.join("original");
+        let selected = root.join("selected");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(selected.join("nested")).unwrap();
+        let coordination = crate::tools::subagent::new_shared_subagent_manager(original.clone(), 2);
+        {
+            let mut owner = coordination.try_write().unwrap();
+            for workspace in [&original, &selected] {
+                let (canonical, held) =
+                    crate::runtime_api::open_workspace_directory(workspace).unwrap();
+                owner
+                    .admit_coordination_workspace(
+                        workspace.clone(),
+                        canonical,
+                        std::sync::Arc::new(held),
+                    )
+                    .unwrap();
+            }
+        }
+        let manager = test_manager(&selected)
+            .unwrap()
+            .with_sub_agent_manager(coordination.clone());
+        let mut nested = task("nested");
+        nested.workspace = Some(FleetWorkspaceRequirements {
+            root: Some(PathBuf::from("nested")),
+            ..FleetWorkspaceRequirements::default()
+        });
+        let report = manager
+            .create_run(
+                FleetTaskSpecDocument {
+                    name: Some("captured origin".into()),
+                    labels: BTreeMap::new(),
+                    security_policy: None,
+                    workers: Vec::new(),
+                    tasks: vec![nested],
+                    usage_ceiling: None,
+                },
+                1,
+            )
+            .unwrap();
+        let ledger = manager.rebuild_state().unwrap();
+        let owner = coordination.try_read().unwrap();
+        assert!(
+            owner
+                .fleet_worker_records_for_workspace(&original)
+                .unwrap()
+                .is_empty()
+        );
+        let rows = owner.fleet_worker_records_for_workspace(&selected).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].spec.workspace, selected.join("nested"));
+        let lease = ledger.tasks.values().next().unwrap();
+        assert_eq!(rows[0].spec.run_id, report.run_id.0);
+        assert_eq!(
+            lease.leased_to.as_deref(),
+            Some(rows[0].spec.worker_id.as_str())
+        );
+        assert_eq!(lease.entry.run_id.0, rows[0].spec.run_id);
+        drop(owner);
+        #[cfg(windows)]
+        {
+            // The retained directory handles prevent replacement on Windows.
+            let error = std::fs::rename(&selected, root.join("retired-selected")).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32), "{error}");
+            let owner = coordination.try_read().unwrap();
+            let rows = owner.fleet_worker_records_for_workspace(&selected).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].spec.run_id, report.run_id.0);
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix permits rename of a held directory; a replacement must refuse.
+            std::fs::rename(&selected, root.join("retired-selected")).unwrap();
+            std::fs::create_dir(&selected).unwrap();
+            assert!(
+                coordination
+                    .try_read()
+                    .unwrap()
+                    .fleet_worker_records_for_workspace(&selected)
+                    .is_err()
+            );
         }
     }
 

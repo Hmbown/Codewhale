@@ -9,7 +9,7 @@ const script = fileURLToPath(new URL("../scripts/sync-latest-release.mjs", impor
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-const OLD = { tag: "v0.10.0", version: "0.10.0", publishedAt: "2026-09-01T00:00:00Z", url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.10.0" };
+const OLD = { tag: "v0.10.0", version: "0.10.0", publishedAt: "2026-09-01T00:00:00Z", url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.0" };
 
 /** The script in a throwaway web/ + docs/ tree, with GitHub stubbed. */
 function run(args: string[], { status = 200, cloud = { release: { latest: "0.10.0" } } }: { status?: number; cloud?: unknown } = {}) {

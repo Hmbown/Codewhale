@@ -18,11 +18,18 @@ cat >"$FAKE" <<'FAKE_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "app-server" ]]; then
+    [[ "$HOME" == "$CODEWHALE_HOME" && -d "$HOME" && -z "${OPENAI_API_KEY:-}" ]] || exit 4
+    if [[ -f "$(dirname "$0")/stall" ]]; then
+        sleep 30
+    fi
     cat >/dev/null   # drain the JSON-RPC requests
     printf '%s\n' \
         '{"jsonrpc":"2.0","id":1,"result":{"status":"ok","service":"deepseek-app-server","transport":"stdio"}}' \
         '{"jsonrpc":"2.0","id":2,"result":{"methods":["thread/request","prompt/run","prompt/request","thread/goal/set"]}}' \
-        '{"jsonrpc":"2.0","id":3,"result":{"ok":true,"data":{"transport":"stdio+http"}}}'
+        '{"jsonrpc":"2.0","id":3,"result":{"ok":true,"data":{"transport":"stdio+http"}}}' \
+        '{"jsonrpc":"2.0","id":4,"result":{}}' \
+        '{"jsonrpc":"2.0","id":5,"result":{}}' \
+        '{"jsonrpc":"2.0","id":6,"result":{"ok":true}}'
     exit 0
 fi
 if [[ "${1:-}" == "auth" && "${2:-}" == "list" ]]; then
@@ -98,6 +105,16 @@ want "arcee has no cheap-model mapping"
 TESTS=$((TESTS + 1))
 LAST_OUT="$(SMOKE_MODEL_ARCEE=arcee-cheap bash "$SMOKE" --bin "$FAKE" --matrix 2>&1)" || { FAILED=$((FAILED + 1)); printf 'FAIL override run errored\n'; }
 want "arcee -> arcee-cheap"
+
+# A non-answering binary must fail within a deadline instead of hanging release.
+touch "$WORK/stall"
+SMOKE_STDIO_TIMEOUT=1 run_smoke 1 -- || true
+want "did not shut down within the probe deadline"
+rm "$WORK/stall"
+
+# Ambient provider credentials must never reach the stdio probe.
+OPENAI_API_KEY=non-secret-test-sentinel run_smoke 0 -- || true
+want "healthz reports ok"
 
 echo ""
 if [[ "$FAILED" -eq 0 ]]; then

@@ -1,103 +1,180 @@
-<!-- source: README.md sha256:925619135f77 -->
-# Codewhale
+<!-- source: README.md sha256:c28f2ad5a8ed -->
+<div align="center">
 
-Codewhale ist ein Open-Source-Agent, der dein Projekt liest, Dateien bearbeitet, Befehle ausführt und seine Arbeit mit einem gehosteten oder lokalen Modell deiner Wahl prüft. Starte mit einer Aufgabe im Terminal. Teile eine größere Aufgabe auf Agenten mit verschiedenen Modellen und Rollen auf.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/wordmark-inverted.svg">
+  <img src="brand/wordmark.svg" alt="Codewhale" width="320">
+</picture>
 
-![Codewhale in einem Terminal](web/public/codewhale-tui-5765d80.png)
+**Der Open-Source-Coding-Agent, der mit jedem Modell arbeitet.**
 
-*Terminalvorschau aus einem Entwicklungsbuild von v0.10.0.*
+Codewhale liest dein Projekt, bearbeitet Dateien, führt Befehle aus und prüft seine eigene
+Arbeit — in deinem Terminal, mit einem gehosteten oder lokalen Modell deiner Wahl.
+
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
+[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+
+[Website](https://codewhale.net) · [Dokumentation](docs/README.md) · [Changelog](CHANGELOG.md) · [Mitwirken](CONTRIBUTING.md)
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
-[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Eine Codewhale-Terminalsitzung" width="760">
+
+<sub>Echte Codewhale-Terminalaufnahme einer eingerichteten lokalen Demositzung.</sub>
+
+</div>
 
 ## Installation
 
-Für eine neue Installation unter macOS oder Linux verwende die offizielle GitHub-Version:
+macOS und Linux:
 
 ```bash
 curl -fsSL https://codewhale.net/install.sh | sh
-"$HOME/.local/bin/codewhale"
 ```
 
-Meldet ein einfaches `codewhale` "command not found", ist `~/.local/bin` noch nicht in deinem PATH: Führe die eine Zeile aus, die das Installationsprogramm für deine Shell ausgibt, oder siehe [In den PATH aufnehmen](docs/INSTALL.md#put-it-on-your-path).
+Das Installationsskript lädt Binärdateien mit geprüfter Prüfsumme nach `~/.local/bin`. Meldet
+`codewhale` danach „command not found“, führe die eine PATH-Zeile aus, die das Skript ausgibt,
+oder siehe [Zum PATH hinzufügen](docs/INSTALL.md#put-it-on-your-path).
+Aktualisieren kannst du jederzeit mit `codewhale update`.
 
-Das Installationsprogramm wählt die neueste veröffentlichte Version aus. Das [Änderungsprotokoll](CHANGELOG.md) beschreibt auch den noch unveröffentlichten Kandidaten für die nächste Version; diese Änderungen sind erst in den veröffentlichten Downloads enthalten, wenn die Version verfügbar ist.
+<details>
+<summary><b>Windows, npm, Cargo und weitere Wege</b></summary>
 
-Unter Windows lade das passende Installationsprogramm oder Archiv von [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) herunter. Bestehende direkte Installationen aktualisierst du mit `codewhale update`; `codewhale update --check` prüft nur. Der Updater zeigt den Pfad der ausführbaren Datei und behält neuere Builds bei. npm und Cargo sind nachrangige Paketoptionen. Hinweise zur Migration aus einer Paketverwaltung und zu PATH stehen in der [Installationsanleitung](docs/INSTALL.md).
+```bash
+winget install HunterBown.CodeWhale  # Windows x64 (or Scoop, or the installer from GitHub Releases)
+npm install -g codewhale            # wraps the same release binaries
+cargo install codewhale-cli --locked  # build from crates.io
+```
 
-Der erste Start öffnet direkt den Editor für Nachrichten; es gibt keinen Einrichtungsassistenten. Antworten erfordern ein verbundenes gehostetes oder lokales Modell: Solange keines verbunden ist, zeigt der Startbildschirm "no model connected". Führe `/provider` aus (oder drücke F3), um einen Schlüssel für einen gehosteten Anbieter hinzuzufügen oder eine lokale Laufzeit zu wählen. Läuft Ollama bereits mit einem Chat-Modell, wechselt Codewhale von selbst dorthin. Codewhale unterstützt außerdem npm und Cargo als nachrangige Paketoptionen sowie Docker, Nix, Scoop, Android/Termux und einen optionalen CNB-Spiegel. Bestehende Installationen über Paketverwaltungen erhalten Migrationshinweise. Siehe die [Hilfe zu Installation und PATH](docs/INSTALL.md).
+Docker, Nix, Homebrew unter Linux, Android/Termux, manuelle Downloads mit Prüfsummenkontrolle
+und der optionale CNB-Mirror sind in der
+[Installationsanleitung](docs/INSTALL.md) beschrieben. Wähle einen Weg: Mehrere Installationen
+auf einem Rechner streiten sich am Ende um den `PATH`.
 
-Die Tab-Vervollständigung lässt sich für jede Shell mit einem einzigen Befehl aktivieren — `codewhale completion bash|zsh|fish|powershell|elvish`. Siehe [Shell-Vervollständigung](docs/INSTALL.md#8-shell-completions).
+</details>
 
-## Verwendung
+## Schnellstart
 
-Öffne ein Terminal im Ordner deines Projekts und starte `codewhale` (sobald es [in deinem PATH](docs/INSTALL.md#put-it-on-your-path) ist). Wähle deinen Anbieter mit `/provider` und dein Modell mit `/model`. Beschreibe dann eine konkrete Aufgabe:
+**Die API-Schlüssel deiner Anbieter an einem Ort verwalten.** [Erstelle ein Codewhale-Konto](https://app.codewhale.net/register)
+oder führe `codewhale login` aus, um dich anzumelden. Speichere und aktualisiere deine API-Schlüssel im Konto
+und nutze sie über die Codewhale-Modellroute auf deinen angemeldeten Geräten.
+[Kontoschlüssel einrichten](docs/CONFIGURATION.md#account-provider-keys).
+Beim Anmelden werden vorhandene lokale Schlüssel nicht hochgeladen; die lokale Nutzung ist weiterhin ohne Konto möglich.
+
+1. **Öffne dein Projekt.** Starte `codewhale` in dem Ordner, an dem du arbeiten willst.
+2. **Verbinde ein Modell.** Starte `/provider` (oder drücke `F3`), um einen gehosteten Schlüssel
+   hinzuzufügen oder eine lokale Runtime zu wählen. Läuft Ollama bereits mit einem Chat-Modell,
+   wechselt Codewhale von selbst dorthin. Mit `/model` wechselst du das Modell.
+3. **Gib ihm eine konkrete Aufgabe.**
 
 ```text
 Fix the failing tests and explain what changed.
 ```
 
-Du kannst eine Aufgabe auch ausführen, ohne die TUI zu öffnen:
+Dieselbe Aufgabe läuft ohne Oberfläche aus einem Skript oder CI-Job:
 
 ```bash
 codewhale exec "fix the failing tests and explain what changed"
 ```
 
-Codewhale kann dein Repository lesen, Dateien bearbeiten, Befehle ausführen, Ergebnisse prüfen und auf ein Ziel hinarbeiten. Nutze `/mode plan`, um ohne Dateiänderungen oder Shell-Ausführung zu erkunden, und `/mode work`, wenn der Agent Änderungen vornehmen soll. Drücke `Shift+Tab`, um Ask, Auto-Review oder Full Access auszuwählen; die [Anleitung zu Modi und Berechtigungen](docs/MODES.md) erklärt, was jeweils erlaubt ist.
+Mit `/help` siehst du Befehle und Tastenkürzel.
 
-## Terminal, Apps und Computer Use
+## Wege, es auszuführen
 
-Das Terminal und die grafischen Clients verbinden sich mit der Codewhale Runtime, die den Agenten und seine Werkzeuge ausführt:
+Jeder Client steuert dieselbe lokale Codewhale Runtime, daher verhalten sich Sitzungen, Tools
+und Berechtigungen überall gleich.
 
-- **Terminal:** `codewhale` öffnet die interaktive Oberfläche; `codewhale exec` führt eine Aufgabe aus einem Skript oder CI-Job aus.
-- **Lokaler Browser:** `codewhale web` öffnet den mitgelieferten [lokalen Webclient](docs/WEB.md) für dieselbe Runtime.
-- **Codewhale-Desktop-App (GPUI):** Eine native Desktop-App, die in einem separaten Repository entwickelt wird, ist die Richtung für den angemeldeten Produkt-Client. Die gehostete Web-App unter app.codewhale.net wird nach ihrem Vorbild neu gebaut; Marketing-Website, Anmeldung, Abrechnung, Rechts- und Download-Seiten bleiben im Web. Die Verfügbarkeit ist auf der [Produktseite](https://codewhale.net/en/product) angegeben.
+| Befehl | Was er tut |
+| --- | --- |
+| `codewhale` | Die interaktive Terminaloberfläche |
+| `codewhale exec "…"` | Ein Durchlauf ohne Oberfläche aus einem Skript oder der CI, mit JSON-Streaming |
+| `codewhale web` | Der mitgelieferte [lokale Browser-Client](docs/WEB.md) auf `127.0.0.1` |
+| `codewhale review --pr N` | Ein beratendes [Pull-Request-Review](docs/GITHUB_ACTION.md); das Veröffentlichen ist optional |
+| Runtime API | Eine [lokale HTTP-API](docs/RUNTIME_API.md) für Threads, Ereignisse und Freigaben |
 
-**Computer Use ergänzt Werkzeuge zum Beobachten anderer Anwendungen und zur Interaktion mit ihnen.** Das Plugin ist im aktuellen Quellcode enthalten. Prüfe die angeforderten Zugriffsrechte und aktiviere es vor der Verwendung; Betriebssystemberechtigungen und Plattformanforderungen gelten weiterhin. Siehe die mitgelieferte [Anleitung zu Computer Use](crates/tui/plugins/computer-use/README.md) und die [Plugin-Einrichtung](docs/PLUGINS.md).
+Eine native Desktop-App (GPUI) wird als Produkt-Client für angemeldete Nutzer entwickelt;
+Informationen zur Verfügbarkeit findest du auf der
+[Produktseite](https://codewhale.net/en/product). Die von der Community gepflegte
+[VS Code-Erweiterung](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode)
+verbindet sich aus einer Seitenleiste mit derselben Runtime ([Quellcode](https://github.com/HengQuWorld/CodeWhale-VSCode)).
 
-Für VS Code verbindet sich die von der Community gepflegte CodeWhale-Erweiterung über eine Seitenleiste mit der lokalen Runtime. Installiere sie aus dem [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode); der Quellcode liegt auf [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode).
+## Was es kann
 
-## Warum Codewhale
+- **Jedes Modell, ohne Lock-in.** Über 40 eingebaute Anbieter-Routen — Anthropic, DeepSeek,
+  Google, Mistral, Moonshot, OpenAI, OpenRouter, xAI und weitere — dazu jeder
+  OpenAI-kompatible Endpunkt und lokale Modelle über Ollama, vLLM oder SGLang.
+  [Anbieter](docs/PROVIDERS.md)
+- **Du behältst die Kontrolle.** Der Plan-Modus erkundet, ohne etwas zu ändern; Work und Operate
+  nehmen Änderungen vor. Freigabe-Haltungen entscheiden, wann ein Tool-Aufruf deine Zustimmung
+  braucht, `/undo` und `/restore` stellen Änderungen im Arbeitsbereich wieder her, und
+  `/receipts` listet jede Datei, jeden Befehl und jede Freigabe einer Sitzung auf.
+  [Modi](docs/MODES.md) · [Belege](docs/RECEIPTS.md)
+- **Gebaut für lange Aufgaben.** Setze ein dauerhaftes `/goal`, delegiere abgegrenzte Arbeit an
+  [Sub-Agenten](docs/SUBAGENTS.md), betreibe beaufsichtigte [Agententeams](docs/FLEET.md) mit
+  einer Prüfung vor dem Ausgeben, oder skripte sie als eingecheckte
+  [Workflows](docs/WORKFLOW_AUTHORING.md).
+- **Erweitere, was du schon nutzt.** Verbinde [MCP-Server](docs/MCP.md), installiere
+  [Skills](docs/SKILLS.md) und [Plugins](docs/PLUGINS.md), führe
+  [Hooks](docs/HOOKS.md) bei Sitzungs- und Tool-Ereignissen aus und lade vorhandene
+  [Claude-Code-Plugins](docs/CLAUDE_PLUGIN_COMPAT.md).
+- **Computer Use.** Ein mitgeliefertes Plugin fügt Tools zum Beobachten und Bedienen anderer
+  Anwendungen hinzu. Prüfe seine Zugriffsrechte und aktiviere es vor der Nutzung.
+  [Anleitung](crates/tui/plugins/computer-use/README.md)
 
-- **Wähle deine Modelle.** Verbinde gehostete Anbieter oder lokale Modelle über Ollama, vLLM oder SGLang. Mit `/provider` wechselst du den Anbieter, mit `/model` wählst du ein Modell.
-- **Behalte die Kontrolle.** Prüfe vorgeschlagene Aktionen und die daraus entstehenden Dateiänderungen. Die Genehmigungseinstellungen bestimmen, wann eine Prüfung nötig ist; Full Access beachtet weiterhin die verbindlichen Grenzen der Richtlinien. `/undo` und `/restore` helfen bei der Wiederherstellung von Änderungen im Arbeitsbereich.
-- **Halte lange Arbeiten übersichtlich.** Speichere Sitzungen, setze ein dauerhaftes `/goal`, prüfe Workflows vor der Ausführung und koordiniere Agenten, ohne dass ihre internen Anweisungen in deinem Gesprächsverlauf erscheinen.
-- **Erweitere deinen vorhandenen Agenten.** Verbinde MCP-Server und Skills, konfiguriere Hooks und verwalte Agentenrollen als lesbare Dateien in deinem Projekt oder in deinen persönlichen Einstellungen.
+## Modi und Berechtigungen
 
-Führe `/help` in der TUI aus, um Befehle und Tastenkürzel anzuzeigen.
+| | Auswahl mit | Optionen |
+| --- | --- | --- |
+| **Modus** — was der Agent gerade tut | `Tab` oder `/mode` | Plan (erkunden, keine Änderungen) · Work (bearbeiten und ausführen) · Operate (ein Ziel über geplante, geprüfte Schritte verfolgen) |
+| **Haltung** — wann er vorher fragt | `Shift+Tab` | Ask · Auto-Review · Full Access |
+
+Full Access respektiert weiterhin die harten Richtliniengrenzen. Die
+[Anleitung zu Modi und Berechtigungen](docs/MODES.md) erklärt jede Option.
 
 ## Sicherheit
 
-Codewhale läuft auf deinem Rechner mit den von dir gewährten Zugriffsrechten. Genehmigungsmodi und Repository-Regeln begrenzen, was der Agent tun darf; optionales OS-Sandboxing schafft auf unterstützten Systemen eine stärkere Ausführungsgrenze. Unbekannte Modellpreise bleiben als unbekannt gekennzeichnet, statt als kostenlos gemeldet zu werden.
+Codewhale läuft auf deinem Rechner mit den Zugriffsrechten, die du ihm gibst. Freigabe-Haltungen
+und Repository-Regeln begrenzen, was der Agent tun darf, und Befehle laufen, wo unterstützt, in
+einer Betriebssystem-Sandbox (Seatbelt unter macOS; bubblewrap unter Linux ist optional).
+`/preview-request` zeigt die exakte, geschwärzte Anfrage, bevor etwas gesendet wird.
+Unbekannte Modellpreise bleiben unbekannt, statt als kostenlos ausgewiesen zu werden.
 
-Lies die [Autorisierungsreihenfolge](docs/AUTHORIZATION_ORDER.md) für die genaue Richtlinienhierarchie und die [Konfiguration](docs/CONFIGURATION.md) für lokale Einstellungen.
+Siehe [Autorisierungsreihenfolge](docs/AUTHORIZATION_ORDER.md),
+[Sandboxing](docs/SANDBOX.md) und [Telemetrie](docs/TELEMETRY.md) — Nutzungszähler sind
+standardmäßig aktiv, und `codewhale config set telemetry false` schaltet sie ab.
 
 ## Dokumentation
 
-- [GitHub-PR-Reviews einrichten](docs/GITHUB_ACTION.md)
-- [Anbieter und lokale Modelle](docs/PROVIDERS.md)
-- [Agententeams](docs/FLEET.md)
-- [MCP](docs/MCP.md), [Hooks](docs/HOOKS.md) und [Konfiguration](docs/CONFIGURATION.md)
-- [Lokaler Webclient](docs/WEB.md)
-- [Gesamte Dokumentation](docs/README.md)
-- [Aufbau des Repositorys und Anleitung zum Mitwirken](CONTRIBUTING.md#project-structure)
+| Zum Einstieg | Zum Vertiefen |
+| --- | --- |
+| [Installation](docs/INSTALL.md) | [Konfiguration](docs/CONFIGURATION.md) |
+| [Anbieter und lokale Modelle](docs/PROVIDERS.md) | [Architektur](docs/ARCHITECTURE.md) |
+| [Modi und Berechtigungen](docs/MODES.md) | [Runtime API](docs/RUNTIME_API.md) |
+| [Tastenbelegung](docs/KEYBINDINGS.md) | [Plugins entwickeln](docs/PLUGIN_AUTHORING.md) |
+| [GitHub-PR-Review](docs/GITHUB_ACTION.md) | [Gesamte Dokumentation](docs/README.md) |
 
-## Der Community beitreten
+## Community
 
-**Fehlerberichte, Funktionsideen und Pull Requests sind willkommen**, egal ob du Codewhale seit Monaten nutzt oder zum ersten Mal ausprobierst. Wenn ein Anbieter fehlt, ein Workflow umständlich ist oder dir die Terminaloberfläche im Weg steht, [eröffne ein Issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) oder [sende einen Pull Request](CONTRIBUTING.md), damit wir es gemeinsam verbessern können. Erste Beiträge sind willkommen, und Mitwirkende behalten die Anerkennung für ihre übernommenen Arbeiten.
+Fehlerberichte, Funktionsideen und Pull Requests sind willkommen — ob du Codewhale seit Monaten
+nutzt oder es zum ersten Mal ausprobierst. Fehlt ein Anbieter oder ist ein Workflow
+umständlich, [eröffne ein Issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) oder
+[sende einen Pull Request](CONTRIBUTING.md). Erste Beiträge sind willkommen, und wer beiträgt,
+behält die Anerkennung für die übernommene Arbeit. Die
+[Repository-Struktur](CONTRIBUTING.md#project-structure) ist ein guter Einstieg.
 
-Tritt unserem [Discord](https://discord.gg/37gfS3ksug) bei oder füge Hunter auf WeChat (`hunterbown`) hinzu und bitte um Aufnahme in die Whale-Brothers-Gruppe.
+Tritt dem [Discord](https://discord.gg/37gfS3ksug) bei, oder füge Hunter auf WeChat
+(`hunterbown`) hinzu und bitte darum, in die Gruppe Whale Brothers aufgenommen zu werden.
 
-## Projektgeschichte
+## Geschichte und Lizenz
 
-Codewhale begann als `deepseek-tui` und bewahrt weiterhin die Kompatibilität mit dessen Konfiguration und Sitzungen. Heute ist es anbieterneutral, wird unabhängig gepflegt und ist mit keinem Modellanbieter verbunden.
+Codewhale begann als `deepseek-tui` und liest weiterhin die Konfiguration und die Sitzungen
+dieses Projekts. Es ist inzwischen anbieterneutral, wird unabhängig gepflegt und ist mit keinem
+Modellanbieter verbunden. Danke an
+[alle Mitwirkenden](docs/CONTRIBUTORS.md) und an die Open-Source-Communities, die zu seinem
+Wachstum beigetragen haben.
 
-Vielen Dank an alle Mitwirkenden und die Open-Source-Communitys, die das Projekt beim Wachsen unterstützt haben. Siehe [Liste der Mitwirkenden](docs/CONTRIBUTORS.md).
-
-## Lizenz
-
-[MIT](LICENSE). Aus anderen Open-Source-Projekten übernommene Teile sind in den [Hinweisen zu Drittanbieterkomponenten](docs/THIRD_PARTY_NOTICES.md) aufgeführt.
+[MIT](LICENSE). Aus anderen Open-Source-Projekten übernommene Teile sind in den
+[Hinweisen zu Drittanbietern](docs/THIRD_PARTY_NOTICES.md) verzeichnet.

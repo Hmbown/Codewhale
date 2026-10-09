@@ -885,20 +885,23 @@ fn osc52_sequence(text: &str) -> Result<String> {
     Ok(format!("\x1b]52;c;{encoded}\x07"))
 }
 
-/// Resolve the directory pasted images should land in. Prefers
-/// `~/.codewhale/clipboard-images/` so the path is stable across worktrees and
-/// matches the location described in user-facing docs; falls back to
-/// `<workspace>/clipboard-images/` if the home dir is unavailable.
-pub(crate) fn clipboard_images_dir(workspace: &Path) -> PathBuf {
-    let home = crate::config::effective_home_dir();
-    clipboard_images_dir_for_home(workspace, home.as_deref())
-}
-
-fn clipboard_images_dir_for_home(workspace: &Path, home: Option<&Path>) -> PathBuf {
-    if let Some(home) = home {
-        return home.join(".codewhale").join("clipboard-images");
-    }
-    workspace.join("clipboard-images")
+/// Pinned, no-follow writer for `dir`, which is `<root>/<name>`: `root` may be a
+/// user-selected link (a relocated `~/.codewhale`), but nothing below it may be.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+fn clipboard_image_target(
+    dir: &Path,
+    file_name: &str,
+) -> Result<crate::fleet::files::WorkspaceFile> {
+    let root = dir.parent().context("clipboard-images dir has no parent")?;
+    let name = dir
+        .file_name()
+        .context("clipboard-images dir has no name")?;
+    crate::fleet::files::WorkspaceFile::open(root, &Path::new(name).join(file_name), true)
+        .context("open clipboard-images destination (links are not followed)")
 }
 
 /// Encode an RGBA `ImageData` from arboard as PNG and persist it. Returns
@@ -909,7 +912,7 @@ fn clipboard_images_dir_for_home(workspace: &Path, home: Option<&Path>) -> PathB
     all(target_os = "linux", not(target_env = "ohos"))
 ))]
 fn save_image_as_png(workspace: &Path, image: &ImageData) -> Result<PastedImage> {
-    save_image_as_png_in(&clipboard_images_dir(workspace), image)
+    save_image_as_png_in(&crate::config::clipboard_images_dir(workspace), image)
 }
 
 /// Lower-level variant that writes into an explicit directory. Exposed so the
@@ -920,14 +923,10 @@ fn save_image_as_png(workspace: &Path, image: &ImageData) -> Result<PastedImage>
     all(target_os = "linux", not(target_env = "ohos"))
 ))]
 fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
-    std::fs::create_dir_all(dir).context("create clipboard-images dir")?;
-
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = dir.join(format!("clipboard-{timestamp}.png"));
-
     let width = u32::try_from(image.width).context("clipboard image width too large")?;
     let height = u32::try_from(image.height).context("clipboard image height too large")?;
 
@@ -945,13 +944,23 @@ fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
 
     let buffer: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, rgba)
         .context("clipboard image dimensions did not match buffer length")?;
+    // Encode in memory and publish through the pinned no-follow writer: the
+    // destination is created exclusively and owner-only, and a linked
+    // directory or file name is refused rather than written through.
+    let mut encoded = Vec::new();
     buffer
-        .save_with_format(&path, image::ImageFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut encoded),
+            image::ImageFormat::Png,
+        )
+        .context("encode clipboard PNG")?;
+    let file_name = format!("clipboard-{timestamp}.png");
+    clipboard_image_target(dir, &file_name)?
+        .publish(&encoded)
         .context("write clipboard PNG")?;
+    let path = dir.join(file_name);
 
-    let byte_len = std::fs::metadata(&path)
-        .map(|m| m.len() as usize)
-        .unwrap_or(0);
+    let byte_len = encoded.len();
     Ok(PastedImage {
         path,
         width,
@@ -1171,12 +1180,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
+    fn pasted_images_are_private_and_never_written_through_a_link() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let img = solid_rgba(2, 2, [0, 255, 0, 255]);
+
+        let real = root.path().join("clipboard-images");
+        let pasted = save_image_as_png_in(&real, &img).expect("a plain directory works");
+        let mode = std::fs::metadata(&pasted.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "pasted images are owner-only");
+
+        // A linked destination directory is refused and nothing lands behind it.
+        let linked = root.path().join("linked-images");
+        symlink(outside.path(), &linked).unwrap();
+        assert!(save_image_as_png_in(&linked, &img).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn clipboard_images_dir_uses_codewhale_home_directory() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            clipboard_images_dir_for_home(workspace.path(), Some(home.path())),
+            crate::config::clipboard_images_dir_for_home(workspace.path(), Some(home.path())),
             home.path().join(".codewhale").join("clipboard-images")
         );
     }
@@ -1186,7 +1224,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            clipboard_images_dir_for_home(workspace.path(), None),
+            crate::config::clipboard_images_dir_for_home(workspace.path(), None),
             workspace.path().join("clipboard-images")
         );
     }

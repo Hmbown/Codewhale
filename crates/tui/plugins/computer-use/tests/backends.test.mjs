@@ -220,3 +220,48 @@ test("remote agent answers the platform probe", async () => {
   assert.equal(reply.ok, true);
   assert.equal(reply.platform, process.platform);
 });
+
+
+test("linux: nested zooms crop only the latest backend-owned raster", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-linux-crop-"));
+  const saved = Object.fromEntries(["CODEWHALE_CU_RECORDINGS_DIR", "DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"].map(k => [k, process.env[k]]));
+  process.env.CODEWHALE_CU_RECORDINGS_DIR = dir;
+  process.env.DISPLAY = "fixture";
+  delete process.env.WAYLAND_DISPLAY;
+  process.env.XDG_SESSION_TYPE = "x11";
+  t.after(() => {
+    for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const png = Buffer.alloc(24);
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(png);
+  png.write("IHDR", 12); png.writeUInt32BE(100, 16); png.writeUInt32BE(80, 20);
+  const commands = [];
+  let cropFailure = null;
+  const run = async (cmd, args) => {
+    commands.push({ cmd, args });
+    if (cmd === "ffmpeg" && cropFailure) return { code: 0, stdout: "", stderr: "", ...cropFailure };
+    const output = args.at(-1);
+    if (typeof output === "string" && output.startsWith(dir) && output.endsWith(".png")) fs.writeFileSync(output, png);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const { create } = await import("../src/backends/linux.mjs");
+  const backend = create({ exec: { run, have: async () => true } });
+  const shot = await backend.screenshot();
+  for (const [failure, reason] of [
+    [{ aborted: true }, /cancelled/],
+    [{ timedOut: true }, /timeout/],
+    [{ code: 1, stderr: "fixture crop failure" }, /fixture crop failure/],
+  ]) {
+    cropFailure = failure;
+    await assert.rejects(backend.zoom({ region: [0, 0, 10, 10] }), reason);
+  }
+  cropFailure = null;
+  const first = await backend.zoom({ region: [10, 20, 40, 30], source: "/untrusted/caller.png" });
+  const child = await backend.zoom({ region: [2, 3, 10, 8], source: "/untrusted/caller.png" });
+  const crops = commands.filter(call => call.cmd === "ffmpeg").slice(-2);
+  assert.equal(crops[0].args[crops[0].args.indexOf("-i") + 1], shot.file);
+  assert.equal(crops[1].args[crops[1].args.indexOf("-i") + 1], first.file);
+  assert.deepEqual(child.points, { x: 12, y: 23, w: 10, h: 8 });
+  assert.deepEqual(child.pixels, { w: 10, h: 8 });
+});

@@ -1,0 +1,270 @@
+{
+  "version": 1,
+  "id": "whale-girl",
+  "name": "Whale girl",
+  "columns": 2,
+  "rows": 2,
+  "tileWidth": 672,
+  "tileHeight": 672,
+  "actions": {
+    "rest": {
+      "frames": [
+        0,
+        1
+      ],
+      "durationsMs": [
+        3800,
+        180
+      ],
+      "poster": 0,
+      "repeat": true
+    },
+    "listen": {
+      "frames": [
+        2,
+        3
+      ],
+      "durationsMs": [
+        3800,
+        180
+      ],
+      "poster": 2,
+      "repeat": true
+    },
+    "think": {
+      "frames": [
+        4,
+        5
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 4,
+      "repeat": true
+    },
+    "busy": {
+      "frames": [
+        6,
+        7
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 6,
+      "repeat": true
+    },
+    "read": {
+      "frames": [
+        8,
+        9
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 8,
+      "repeat": true
+    },
+    "search": {
+      "frames": [
+        10,
+        11
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 10,
+      "repeat": true
+    },
+    "write": {
+      "frames": [
+        12,
+        13
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 12,
+      "repeat": true
+    },
+    "run": {
+      "frames": [
+        14,
+        15
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 14,
+      "repeat": true
+    },
+    "browse": {
+      "frames": [
+        16,
+        17
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 16,
+      "repeat": true
+    },
+    "talk": {
+      "frames": [
+        18,
+        19
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 18,
+      "repeat": true
+    },
+    "pod": {
+      "frames": [
+        20,
+        21
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 20,
+      "repeat": true
+    },
+    "needs": {
+      "frames": [
+        22,
+        23
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 22,
+      "repeat": true
+    },
+    "done": {
+      "frames": [
+        24,
+        25
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 24,
+      "repeat": true
+    },
+    "hmm": {
+      "frames": [
+        26,
+        27
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 26,
+      "repeat": true
+    },
+    "computer": {
+      "frames": [
+        28,
+        29
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 28,
+      "repeat": true
+    },
+    "connect": {
+      "frames": [
+        30,
+        31
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 30,
+      "repeat": true
+    },
+    "sleep": {
+      "frames": [
+        32,
+        33
+      ],
+      "durationsMs": [
+        1300,
+        500
+      ],
+      "poster": 32,
+      "repeat": true
+    },
+    "side": {
+      "frames": [
+        34
+      ],
+      "durationsMs": [
+        1000
+      ],
+      "poster": 34,
+      "repeat": true
+    },
+    "back": {
+      "frames": [
+        35
+      ],
+      "durationsMs": [
+        1000
+      ],
+      "poster": 35,
+      "repeat": true
+    }
+  },
+  "states": {
+    "rest": "rest",
+    "listen": "listen",
+    "think": "think",
+    "busy": "busy",
+    "read": "read",
+    "search": "search",
+    "write": "write",
+    "run": "run",
+    "browse": "browse",
+    "talk": "talk",
+    "pod": "pod",
+    "needs": "needs",
+    "done": "done",
+    "hmm": "hmm",
+    "computer": "computer",
+    "connect": "connect",
+    "sleep": "sleep"
+  },
+  "views": {
+    "front": "rest",
+    "side": "side",
+    "back": "back"
+  },
+  "atlases": [
+    "page-00.png",
+    "page-01.png",
+    "page-02.png",
+    "page-03.png",
+    "page-04.png",
+    "page-05.png",
+    "page-06.png",
+    "page-07.png",
+    "page-08.png"
+  ]
+}

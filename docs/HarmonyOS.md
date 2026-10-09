@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale" --version
 ```
 
-The [published v0.9.11 release](https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.11)
+The [published v0.9.11 release](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
 includes `codewhale-linux-arm64` and `codew-linux-arm64`; asset availability does
 not establish compatibility with every HarmonyOS device. See
 [Linux ARM64 portability](INSTALL.md#linux-arm64-portability) for release-specific

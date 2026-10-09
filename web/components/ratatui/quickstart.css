@@ -1,0 +1,23 @@
+.rat-quickstart { width: var(--container); margin: 0 auto 2rem; padding: 1.5rem; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.25rem 2rem; border-radius: var(--radius-surface); background: var(--surface); color: var(--text); scroll-margin-top: 6rem; }
+.rat-start-intro h2 { font-size: 1.15rem; font-weight: 600; margin: 0 0 .5rem; }
+.rat-quickstart p { font-size: .875rem; line-height: 1.6; color: var(--muted); max-width: 70ch; margin: 0; }
+.rat-start-links { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; margin-top: 1rem; font-size: .8rem; }
+.rat-quickstart a { color: var(--accent); text-underline-offset: .2em; }
+.rat-quickstart a:hover { text-decoration: underline; }
+.rat-start-command .rat-copy { display: flex; justify-content: flex-end; margin-bottom: .5rem; }
+.rat-start-command > p { font-size: .75rem; margin-top: .75rem; }
+.rat-quickstart pre { min-width: 0; max-width: 100%; overflow: auto; padding: 1rem; border-radius: var(--radius-control); background: var(--bg); font-size: .8rem; line-height: 1.6; margin: 0; scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--bg); }
+.rat-quickstart pre::selection, .rat-quickstart code::selection { background: var(--accent); color: var(--on-brand); }
+.rat-quickstart :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.rat-existing-app { grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 1rem; min-width: 0; }
+.rat-existing-app summary { font-weight: 600; font-size: .875rem; cursor: pointer; min-height: 2.75rem; display: list-item; align-content: center; }
+.rat-existing-body { padding-top: 1rem; display: grid; gap: 1rem; min-width: 0; }
+.rat-existing-body .rat-copy { justify-self: end; }
+.rat-host-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.5rem; border-top: 1px solid var(--line); padding-top: 1.25rem; margin-top: .5rem; }
+.rat-host-flow dt { font-weight: 600; font-size: .875rem; margin-bottom: .35rem; }
+.rat-host-flow dd { margin: 0; color: var(--muted); font-size: .85rem; line-height: 1.6; }
+@media (max-width: 760px) {
+  .rat-quickstart { grid-template-columns: minmax(0, 1fr); padding: 1.1rem; gap: 1rem; }
+  .rat-host-flow { grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+  .rat-start-command .rat-copy { justify-content: flex-start; }
+}

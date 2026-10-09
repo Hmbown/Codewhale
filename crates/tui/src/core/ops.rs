@@ -4,7 +4,7 @@
 //! allowing the UI to remain responsive while the engine processes requests.
 
 use crate::compaction::CompactionConfig;
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::route_runtime::ResolvedRuntimeRoute;
 use crate::tools::goal::GoalStatus;
 use codewhale_config::AppMode;
@@ -80,7 +80,7 @@ pub struct SessionContextBudget {
 /// Returned by `Op::GetProviderRuntimeStatus` via a oneshot channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRuntimeStatus {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     pub request_concurrency_limit: Option<usize>,
     pub active_provider_requests: usize,
 }
@@ -170,6 +170,8 @@ impl UserInputProvenance {
 /// variant; the serializable twin is `codewhale_protocol::op::TurnSpec`.
 #[derive(Debug)]
 pub struct TurnSpec {
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
     /// Admitted allowance for this turn only; never changes session settings.
     pub max_output_tokens: Option<std::num::NonZeroU32>,
     pub content: String,

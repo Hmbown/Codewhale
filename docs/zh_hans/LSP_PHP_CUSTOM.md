@@ -104,10 +104,10 @@ edit_file / write_file / apply_patch 成功
 ## 验证
 
 ```
-cargo test -p codewhale-tui --bin codewhale-tui lsp::
+cargo test -p codewhale-tui --lib lsp::
 # 32 个测试通过（新增 3 个：detects_php_extension、language_ids_for_php、
 # server_for_php_is_intelephense）
-cargo clippy -p codewhale-tui --bin codewhale-tui
+cargo clippy -p codewhale-tui --lib
 # lsp 模块：零新增警告
 ```
 

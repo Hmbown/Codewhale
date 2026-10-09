@@ -478,7 +478,7 @@ fn rlm_is_the_only_registered_session_surface() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
     let registry = ToolRegistryBuilder::new()
-        .with_rlm_tool(None, "test-model".to_string())
+        .with_rlm_tool()
         .with_harness_tool()
         .build(ctx);
 
@@ -1399,7 +1399,10 @@ async fn fleet_authority_rejects_fim_edit_outside_its_write_scope() {
     std::fs::create_dir(tmp.path().join("docs")).expect("docs");
     std::fs::write(tmp.path().join("docs/outside.txt"), "before\nafter\n").expect("fixture");
     let registry = ToolRegistryBuilder::new()
-        .with_fim_tool(None, "fixture-model".to_string())
+        .with_tool(Arc::new(crate::tools::fim::FimEditTool::new(
+            None,
+            "fixture-model".to_string(),
+        )))
         .build(scoped_context(tmp.path()));
 
     let error = registry
@@ -2175,9 +2178,7 @@ fn read_only_task_surface_contains_no_per_action_aliases() {
 fn rlm_family_removes_legacy_aliases() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
-    let registry = ToolRegistryBuilder::new()
-        .with_rlm_tool(None, "deepseek-v4-pro".to_string())
-        .build(ctx);
+    let registry = ToolRegistryBuilder::new().with_rlm_tool().build(ctx);
 
     for alias in [
         "rlm_session_objects",

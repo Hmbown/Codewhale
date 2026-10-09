@@ -485,6 +485,7 @@ mod tests {
             git_branch: None,
             agent_type: crate::tools::subagent::FleetRole::Worker,
             assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
                 objective: "task".to_string(),
                 role: Some("worker".to_string()),
             },

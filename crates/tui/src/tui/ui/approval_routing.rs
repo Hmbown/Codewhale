@@ -137,6 +137,7 @@ pub(super) fn auto_approval_decider(
         false,
         false,
         approval_force_prompt,
+        false,
     ) {
         ApprovalRequestDisposition::AutoApprove => crate::approval_log::ApprovalDecider::Posture,
         _ => crate::approval_log::ApprovalDecider::SessionRule,
@@ -155,6 +156,8 @@ pub(super) fn resolve_ui_approval_disposition(
         is_session_approved_for_tool(app, tool_name, grouping_key),
         is_session_denied_for_key(app, approval_key),
         approval_force_prompt,
+        // This namespace is minted by the Engine, not by plugin card text.
+        approval_key.starts_with("extcall:ext:"),
     )
 }
 

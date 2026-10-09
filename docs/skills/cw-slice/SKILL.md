@@ -39,7 +39,7 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
    grep -rln 'model_\|_config\|provider_' crates/*/src --include='*.rs' | head -30
    ```
    Search behavior and symbols, not just filenames. If you find an owner, edit
-   it. If you are still adding a new layer, its module doc must name the
+   it. If you are still adding a new layer, its commit message must name the
    predecessor it replaces — otherwise you are editing the wrong file.
 
 3. **Check the contracts you are about to walk into.** One of these is
@@ -66,7 +66,7 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
 4. **Read the scoped guidance for the files you will touch.** `crates/tui/AGENTS.md`
    owns the UI contracts (one owner per fact, `codewhale_palette::grammar` semantics, typed
    state enums, toast routing, `tr(locale, MessageId::...)` for user prose).
-   `crates/tui/locales/AGENTS.md` owns string changes. `web/AGENTS.md` owns the
+   `crates/localization/locales/AGENTS.md` owns string changes. `web/AGENTS.md` owns the
    site. `docs/MOTION_CONTRACT.md` owns motion. Design law lives in
    `docs/design/`, not in a prototype file someone left in a sibling directory.
 
@@ -83,21 +83,20 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
    - whether it is cross-cutting enough to need the full sweep in
      [cw-gates](../cw-gates/SKILL.md).
 
-7. **Write the implementation first.** Code first, then tests (see `AGENTS.md`
-   — this repo does not practice TDD). Build it, prove it runs, then add or
-   adjust tests to cover what you actually built.
+7. **Write the implementation, then prove it runs.** No new tests or code
+   comments unless explicitly asked (`AGENTS.md`); update or delete existing
+   tests the change makes wrong.
 
 ## Red flags / don't
 
 - Don't add a module that "bridges", "mirrors", "stages", or "wraps" something
-  that already exists without naming that thing in the module doc.
+  that already exists without naming that thing in the commit message.
 - Don't fork a singleton (turn loop, base prompt, delegation axis,
   lifecycle system) without moving its guard test and consumers with it.
   The repo has one of each on purpose; a silent second one is the failure
   mode, not the refactor.
-- Don't write tests first. Don't add tests by default either — add one when it
-  cheaply protects safety, data integrity, protocol compatibility, or a
-  reproduced regression.
+- Don't write new tests unless explicitly asked, and never first. Don't add
+  new code comments.
 - Don't contort production code to keep a brittle assertion green. A test that
   only encodes old behavior is evidence, not a veto: change it with the code.
 - Don't cut trust-boundary validation, data-loss handling, security, or

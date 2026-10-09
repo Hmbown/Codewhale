@@ -8,12 +8,10 @@
 //!   `SessionId`. Many sessions can attach to one thread over time, but only
 //!   one `Session` drives a turn for a given `ThreadId` at a time.
 //!
-//! The thread manager (`ThreadManager` in `crate::lib`) already can start a
-//! session with no TUI attached (`spawn_thread_with_history`); this file
-//! formalizes the types that make that first-class and moves the former
-//! `crates/tui/src/core/session.rs` state (model, reasoning_effort,
-//! `AppendLog`, `PrefixStabilityManager`, `frozen_prefix`,
-//! `messages_revision`) into `crates/core` so both TUI and headless share it.
+//! The canonical RuntimeThreadManager creates sessions without a TUI and drives
+//! the same Engine turn loop used by mounted clients. These types preserve the
+//! shared model, append log, prefix stability and message revision state; the
+//! compatibility Core Runtime owns only configuration, hooks and job bookkeeping.
 
 use std::path::PathBuf;
 

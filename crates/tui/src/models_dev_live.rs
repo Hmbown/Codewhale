@@ -175,7 +175,8 @@ pub fn status() -> ModelsDevStatus {
     let current = STATUS.read().map(|guard| guard.clone()).unwrap_or_default();
     honor_bundled_staleness(
         current,
-        codewhale_models::model_catalog::bundled_catalog_is_stale(),
+        codewhale_config::catalog::reviewed::bundled_source_fetched_at()
+            .is_none_or(|fetched_at| !within_ttl(fetched_at, now_unix())),
     )
 }
 
@@ -586,7 +587,7 @@ pub(crate) fn offerings_from_json_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use crate::provider_lake::{
         all_catalog_models_for_provider, clear_live_snapshot, lock_live_snapshot,
     };
@@ -716,12 +717,12 @@ mod tests {
         let count = rt.block_on(refresh(true)).expect("refresh from path");
         assert!(count >= 2);
 
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(
             together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"),
             "Together lake missing live Models.dev row: {together:?}"
         );
-        let moonshot = all_catalog_models_for_provider(ApiProvider::Moonshot);
+        let moonshot = all_catalog_models_for_provider(ProviderKind::Moonshot);
         assert!(
             moonshot.iter().any(|m| m == "kimi-k2.5"),
             "Moonshot lake missing live Models.dev row: {moonshot:?}"
@@ -781,7 +782,7 @@ mod tests {
         let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path().join("home"));
         let _path = EnvVarGuard::set(ENV_MODELS_DEV_PATH, &path);
 
-        let before = all_catalog_models_for_provider(ApiProvider::Together);
+        let before = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(!before.is_empty(), "bundled Together rows required");
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -791,7 +792,7 @@ mod tests {
         let err = rt.block_on(refresh(true)).expect_err("bad json");
         assert!(matches!(err, ModelsDevRefreshError::InvalidResponse(_)));
 
-        let after = all_catalog_models_for_provider(ApiProvider::Together);
+        let after = all_catalog_models_for_provider(ProviderKind::Together);
         assert_eq!(after, before, "bundled rows must survive parse failure");
         let st = status();
         assert_eq!(st.freshness, ModelsDevFreshness::Failed);
@@ -824,7 +825,7 @@ mod tests {
         let st = status();
         assert_eq!(st.freshness, ModelsDevFreshness::Stale);
         assert!(st.offering_count >= 2);
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"));
         clear_live_snapshot();
     }
@@ -930,7 +931,7 @@ mod tests {
         let err = rt.block_on(refresh(true)).expect_err("dead URL");
         assert!(matches!(err, ModelsDevRefreshError::Network(_)));
 
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(
             together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"),
             "prior live rows must survive network failure"

@@ -121,7 +121,7 @@ test("start failures print the install hint for download errors", () => {
   assert.match(output, /codewhale install hint:/);
   assert.match(
     output,
-    /https:\/\/github\.com\/Hmbown\/CodeWhale\/blob\/main\/docs\/INSTALL\.md#npm-binary-download-times-out/,
+    /https:\/\/github\.com\/codewhale-hq\/CodeWhale\/blob\/main\/docs\/INSTALL\.md#npm-binary-download-times-out/,
   );
 
   logged.length = 0;

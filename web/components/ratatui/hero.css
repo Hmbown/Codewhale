@@ -1,0 +1,20 @@
+.rat-hero { width: var(--container); margin: 0 auto 2.5rem; }
+.rat-hero-frame { margin: 0; }
+.rat-hero-terminal { overflow-x: auto; border-radius: var(--radius-surface); background: var(--surface); scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--surface); }
+.rat-hero-terminal:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+/* The buffer keeps its 1:2 cell grid at every size; never letterbox it. */
+.rat-hero-terminal svg { display: block; width: 100%; min-width: 46rem; height: auto; }
+/* Small screens get the real 40-column redraw, not a shrunken wide render. */
+.rat-hero-narrow { display: none; }
+@media (max-width: 760px) {
+  .rat-hero-wide { display: none; }
+  .rat-hero-narrow { display: block; }
+  .rat-hero-narrow svg { min-width: 0; }
+}
+.rat-hero-caption { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; align-items: baseline; justify-content: space-between; padding-top: .75rem; color: var(--muted); font-size: .8rem; line-height: 1.5; }
+.rat-hero-links { display: flex; flex-wrap: wrap; gap: .5rem 1.25rem; }
+.rat-hero-links a { color: var(--accent); text-underline-offset: .2em; white-space: nowrap; }
+.rat-hero-links a:hover { text-decoration: underline; }
+@media (max-width: 760px) {
+  .rat-hero { margin-bottom: 2rem; }
+}

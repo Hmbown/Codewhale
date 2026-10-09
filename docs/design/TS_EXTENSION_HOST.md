@@ -8,6 +8,537 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: authored prompt sections, owner-local storage and invocation identity (2026-10-02)
+
+`prompt` and `storage` are host-provided shim services whose replacement is
+refused. `ctx.prompt.registerSection({id, text})` uses the existing owned
+registration lifecycle and Rust's reviewed owner registry. Live snapshots are
+scoped to one Engine attachment, validated against its desired plugin hashes
+and current Native authority before and after collection, and sorted by
+owner/id. Rust bounds raw text, section counts and the final attributed block;
+the existing user-role runtime-message path delivers the complete bounded
+snapshot at turn boundaries, including explicit withdrawal, without changing
+the pinned system header or truncating it into workspace context deltas.
+An author cannot replace the system prompt or choose another session. See
+`docs/EXTENSIONS.md` for the exact byte/count limits and grammar.
+
+`ctx.storage.get`, `set` and `delete` expose bounded plain JSON in the directory
+Rust assigned to that owner. Atomic per-key replacement, corrupt-data refusal, symlink
+refusal, serialized owner writes and live-owner checks preserve local state.
+Storage has no session-history or credential access and introduces no protocol
+method. It remains plugin-local state in the existing directory, rather than
+another Codewhale session store.
+
+`tool/call` and `command/run` add optional `session_id`, `agent_id` and
+`origin_turn_id` wire strings. The host exposes only supplied fields as frozen
+per-call `sessionId`, `agentId` and `originTurnId`; no identity is cached during
+activation. A user slash command supplies its known session only. These are
+labels, not handles or new authority. Older callers can omit every field.
+
+## As built: programmable pre-execute mods (2026-10-02)
+
+`ctx.on('tools/pre-execute', (exec, next) => ...)` now registers an owned `hook` handle through Cordis's `internal/listener` extension point. `hook/evaluate` is core-to-host only, carries a Rust-composed frozen call projection with DSH's `name`, `arguments`, `callId`, and cancellation `signal` spelling, and accepts monotonic `abstain`, `deny`, `ask`, `annotate`, and `revise` proposals. DSH `allow` maps to abstention; unsupported answers fail closed. No runtime, session, agent, invocation ticket, or approval handle is given to a listener.
+
+`HostAttachment::tool_before_hooks` scopes dispatch to this engine's desired reviewed owners, validates Native authority and owner generation before and after dispatch, and uses the existing owner cancellation and host supervision. Native hook results followed by TypeScript proposals enter `fold_tool_call_before_results`; the existing `reprepare_tool_call_after_hook` and all later policy/approval gates consume the revised arguments. Strict no-verdict semantics cover malformed replies, errors, the bounded five-second listener batch, and revocation. Multiple listeners share the existing deny/ask/last-input/context fold. The real-host acceptance drives native reads and a read-to-write revision through a real Engine, alongside owner withdrawal and workspace isolation.
+
+This is the bounded pre-execute part of phase 4. It does not implement DSH's around-execution waterfalls or replace its agent/token runtime; `next()` is an abstention rather than tool execution. `prepend`/`global`, post-result transformations, and lifecycle events remain absent. Standalone ACP has no TypeScript attachment; its native hook contract is preserved.
+
+## As built: `core/call`, capability tickets and the gate for extension tools (2026-10-02)
+
+Slice B of the tier plan, and the first thing the host can ask the core to do.
+Still protocol v1 (a new method and an optional field); corpus `22`, `58`-`66`.
+User-facing rules: `docs/EXTENSIONS.md`, "Asking the core to run a tool".
+Nested shell and network calls force a fresh user prompt under the accepted
+Slice B contract, including semantic action aliases. The separate routing hook
+remains outstanding; programmable pre-execute proposals do not implement it.
+
+- **Protocol.** `core/call` (host to core, request, both tiers)
+  `{owner, ticket, name, input}`, answered with the existing `ToolResultWire`;
+  `core_call::` below. New error codes `Refused` (-32002: policy, a limit, an
+  invalid ticket) and `Denied` (-32003: the user declined the card).
+  `tool/call` gains an optional `ticket`. `host_protocol_never_gains_core_authority`
+  has its reviewed row for `core/call` and was not weakened (the method name
+  mentions none of the core-only words); corpus `22` flipped from invalid to
+  valid and was renamed.
+- **Tickets** (`extension_host/ticket.rs`). A Rust-minted opaque id (244 random
+  bits) indexing a Rust-side row `{kind, tier, host_generation, owner, method,
+  target, expires, uses_left}`. `TicketKind` has one variant, `Invocation`
+  (multi-use, budgeted); a process launch, fetch or MCP grant join with their
+  redeemers. `redeem` checks every field under one mutex (kind, tier, host
+  generation, the whole `OwnerRef`, method, a stated target as parsed JSON,
+  expiry, uses) and refuses an unknown, expired, replayed (exhausted), wrong-owner,
+  wrong-tier, wrong-generation or wrong-method ticket. Which field mismatched is
+  not told to the host. Eight invalid presentations within a minute from one
+  host process are a protocol violation (`HostRequestContext::violation` ends
+  the host through the reader's kill path); a valid ticket merely out of uses
+  does not count. Tickets are never persisted or logged (`Ticket`'s `Debug` is
+  redacted; nothing quotes one) and are revoked when the invocation ends (the
+  guard's `Drop`, so also when the tool call's future is dropped), when the
+  owner is revoked (reconcile, `ext/faulted`) and when the host exits.
+  Backstop expiry is 24 h: an invocation's life is bounded by its own deadline,
+  which pauses while a person decides, so a short ttl would be wrong.
+- **Where one exists.** `HostToolSpec::execute` mints an `Invocation` ticket only
+  when the tool's context carries a `NestedCallGate` that the turn loop built
+  *for this tool* (`NestedCallGate::for_extension(caller, specs)`; the tool
+  checks the caller matches its own). The turn loop attaches one when a
+  registry spec says `extension_caller()` (a `ToolSpec` method, default
+  `None`), in `execute_tools_with_nested_gate`, the same function that serves an
+  `execute_tools` program's gate. A sub-agent, a test, and a tool nested in
+  `execute_tools` (whose invoker takes the gate from the nested context) have
+  none, nor does any command, timer or activation: the tool gets no `exec.core`
+  and a forged request finds no ticket.
+- **One gate, one executor.** The turn loop serves the request with
+  `gate_nested_call`, now parameterised by who is asking
+  (`ToolCallSource::Extension`), so planning is `plan_tool_calls` unchanged
+  (budget, allow/deny lists, preparation, hooks, ask-rules, Auto-Review, repo
+  law, the authority envelope, the fleet guard). The caller side is the same
+  `CodemodeInvoker` code mode uses (`for_extension`; `invoke` is now `call` plus
+  a mapping): the concurrency cap, the exclusive/shared order lock, the
+  `PauseClock`, the receipts, the result bounding and spill. What this removed
+  rather than copied: nothing about the executor was duplicated; the only new
+  code in `codemode.rs` is the withdraw plumbing and the `NestedFailure` type
+  that lets a caller see the decision (code mode maps it back to
+  `DriverError`).
+- **Refused outright** (`core_call::refusal`), before planning on the host's
+  name and again by the turn loop on the name planning resolved and the final
+  input (after a hook rewrite): everything `refusal_before_gate` refuses; any
+  extension tool (`ToolSpec::extension_caller`, found by case-insensitive name
+  and by canonical alias), the caller's own tool included; `mcp_*` and the MCP
+  resource tools, Computer Use included (founder's default: not in v1); tool
+  search and `retrieve_tool_result`; `remember`; and a name table for what
+  changes or schedules beyond the session (`request_plugin_install`, goals,
+  `automation*`, `send_later`, starting MCP servers). Names compare ASCII
+  case-insensitively and by canonical alias.
+- **Approval** (`core_call::origin_approval`, applied at the end of
+  `plan_tool_calls` for `Extension` and only ever raising). `Required` unless the
+  tool is in `EXT_AUTO_ELIGIBLE` (`read`, `read_file`, `list_dir`, `file_search`,
+  `grep_files`; a test pins each as a registered, read-only, auto-approved tool;
+  the action-based `Git` tool is left out until its read-only actions can be
+  told apart by name) *and* planning found nothing
+  that asks. Shell and network (the registered tool's capabilities and concrete
+  execution-envelope classification, plus the authority categories and `web.run`,
+  `git_fetch`, `finance`, `run_tests`, `verify`, `run_verifiers`, `harness`)
+  set `approval_force_prompt`. The card text is composed in Rust ("Requested by
+  `extension:<plugin>` from inside its tool `<tool>` (core/call): ...") and the
+  audit events say `caller: extension` with the extension and tool. Keys are
+  origin-scoped (`extension_origin_approval_keys`: `extcall:<ext:plugin@hash>:`
+  plus the usual key), so a grant for the model's call never covers an
+  extension's and the reverse.
+  *How "forced" meets the existing postures* (a documented choice, tested in
+  `extension_calls_resolve_against_every_posture_as_documented`): the engine
+  always raises the card with `approval_force_prompt`; what answers it is
+  `resolve_approval_request_disposition`. Ask and Full Access: a modal every
+  time, no session grant consulted. The Engine-minted `extcall:ext:` approval
+  namespace identifies extension-origin calls; host labels cannot select this
+  policy. Explicit session denials still win. Other forced policy holds retain
+  their Full Access refusal. Auto-Review and Never refuse these extension calls
+  as for any hold. Every other call an
+  extension makes (Required, not forced) is, in Full Access, auto-approved as the
+  model's would be, and in Ask promptable and groupable under the extension's
+  own keys.
+- **Two fixes the plan named.** (1) `await_tool_approval` takes an optional
+  withdraw token (`request_tool_approval_until`; the old name is a wrapper):
+  when it fires the wait ends with a `Cancelled` outcome in the approval log, a
+  status line and a cancelled error, and the call is never decided for the
+  person. The token fires on the host's `$/cancel` of the request, the owner's
+  revocation, the host's exit and the invocation's end (which includes the
+  tool call's deadline and the turn being cancelled); a request withdrawn
+  before the server starts it is dropped unplanned (`NestedCallRequest::is_stale`).
+  (2) `HostProcess::call_with_clock` measures the `tool/call` deadline on the
+  invocation's `PauseClock`, paused while any `core/call` waits on the gate
+  (`call` is the same with a clock nothing pauses), so a person taking a minute
+  on a card does not time the tool out; the deadline is otherwise as before.
+- **Caps.** Per invocation 50 core calls in all (the ticket's uses), 4 at once
+  (code mode's `MAX_CONCURRENT_CALLS`; a fifth waits for a slot), and one
+  approval card at a time (the turn loop serves one gate request at a time; a
+  second call needing approval waits behind the first); per host 256 requests in
+  flight (A2's table). The call's result metadata gets `core_calls`: at most 50
+  receipts (decision, status, bytes, a note cut at 256 bytes).
+- **Host.** `exec.core.call(name, input?, {signal?})` (`src/shims/core.ts`),
+  present on a tool's `exec` only when the call carried a ticket (so the frozen
+  `exec`'s keys are unchanged otherwise); it answers `{content, isError,
+  structured?}` or rejects with `CoreCallError` whose `code` is `refused`,
+  `denied`, `cancelled`, `unavailable` or `failed`. The host refuses locally
+  what it must not send (a bad name, input that is not plain JSON). The tool's
+  `exec.signal` and an optional per-call signal send `$/cancel` for the pending
+  `core/call`. The ticket is never exposed to plugin code. No DSH equivalent was
+  found in the vendored DSH surface (DSH reaches tools through its own
+  `ToolRuntime` service, which the host deliberately does not provide), so there
+  is only the Codewhale-native API.
+- **Tests.** Rust: the ticket table (every field, expiry, exhaustion, burst
+  window, revocation, redaction); spoofing against `serve` (wrong owner, other
+  token, other tier, generation bump, unknown, after revoke/exit/end); the real
+  host through a stand-in gate (read plus receipts, every refusal in many
+  spellings before the gate is asked, no ticket without this tool's extension
+  gate, a command has no `core`, a held approval outliving a 1 s deadline,
+  withdrawal on drop, owner revoke and host kill, 50 total and 4 concurrent);
+  the real turn loop with a fake extension tool (forced prompt in Ask and Full
+  Access with Rust-composed card and extension-scoped keys, read unprompted and
+  write carded, refused calls raise no card, a withdrawn card recorded
+  cancelled, one card at a time) and `await_tool_approval`'s withdraw token on
+  its own; the refusal list and the approval table; the posture matrix; the key
+  scoping in both directions; the corpus and the lint. JS: `exec.core` against a
+  fake core (payload, absence without a ticket, every error code, local refusals,
+  cancel, concurrency).
+
+Withdrawn calls emit the typed `ApprovalWithdrawn` identity after committing the
+cancelled outcome. Terminal and runtime clients retire the matching card and
+continue draining events; a queued allow cannot win over a ready cancellation.
+Headless Full Access also refuses these forced holds.
+
+Not done: no per-plugin process (a
+ticket narrows a frame, it does not isolate plugins sharing the host, section
+4.4); images and rich content from a core tool are dropped; the refusal table
+names tools (a new mode/permission tool must be added); no `core/call` from a
+command, a timer or activation (by design: they return a proposal); `mcp_*`
+stays out until the MCP move.
+
+## As built: the tier in the handshake, method tiers and host requests (2026-10-02)
+
+Slice A2 of the tier plan. It adds the three things A1 listed as not done that
+need no new method. Still protocol v1; the TypeScript shapes are regenerated and
+corpus fixtures `51`-`57` cover the new hello fields.
+
+- **`host/hello` says what the host is.** It now carries `tier`
+  (`plugin`|`builtin`, the `--tier=` the host was started with) and
+  `builtin_modules`, one `{id, sha256}` row per built-in module source the host
+  *build* embeds, in id order. `build.mjs` builds the built-in modules first and
+  substitutes their digests into the host bundle, so the bundle states them
+  itself and stays deterministic. The core checks both the way it checks the
+  runtime name and version, in `supervisor::check_hello_identity`, and refuses
+  a mismatch before `host/initialize`: a tier other than the one in the launch
+  plan, or a module list that is not exactly the one the Rust table
+  (`tier::BUILTIN_MODULES`, carried on the launch as `builtin_modules`) pins.
+  Both fields are required (a host that omits one is a protocol violation, not
+  a legacy host: the bundle is embedded and always the same build). Today the
+  table and the list are empty. This is drift protection between the two halves
+  of one build, not authentication: a substituted host reports whatever it
+  likes, as `bundle_sha256` already allowed (§4.4, threat 1).
+- **A tier allow-list per method.** `protocol::MethodSpec` has `tiers`, the
+  trust tiers whose host may send (host to core) or be sent (core to host) the
+  method; `row()` gives both and a reserved method is written
+  `MethodSpec { tiers: &[HostTier::Builtin], ..row(..) }`. It is enforced in both
+  directions on both sides: `admit_in` refuses a frame from a host of the wrong
+  tier like an unknown method (a protocol violation), `HostProcess::start_request`
+  refuses to send a method the host's tier may not receive (`MethodNotFound`,
+  nothing is written), and the host's `validateMessage(.., tier)` refuses both
+  what it would send and what it is sent. The generated `METHODS` table carries
+  `tiers`. No method is reserved yet (the first are the process broker, the
+  fetch proxy and the MCP client: `proc/*`, `net/*`, `mcp/*`; a test pins that
+  any method with those prefixes can never allow the plugin tier); the mechanism
+  is tested with test-only reserved rows in Rust and in the host's tests.
+- **Host requests are tasks.** The reader no longer answers `registry/*`
+  inline. Each host request is admitted into an id table
+  (`supervisor::InboundRequests`, at most 256 in flight and no id reused in
+  flight, the same bound the host holds itself to; either is a protocol
+  violation that ends the host), runs as its own task through
+  `HostEvents::host_request` (an async trait method whose default answers the
+  registry requests exactly as before) and is answered when it finishes. It is
+  cancelled by the host's `$/cancel {id}` (the answer, if the handler still
+  produces one, is dropped; a cancel for an id not in flight is ignored), by
+  its owner's revocation (`revoke_calls_of`: the host is answered `Cancelled`)
+  and by the host's exit (nobody is answered). A handler gets a
+  `CancellationToken` it should wait on; one that ignores it is abandoned
+  500 ms (`CANCEL_GRACE`) after the cancel, so a cancelled request never holds
+  its slot. The host half: `RpcPeer.request(method, params, signal)` sends
+  `$/cancel` for its id and rejects as cancelled when the signal aborts.
+- **Tests.** Rust: the hello identity rules (tier, missing, extra, changed and
+  repeated modules), a real host refused for a launched/reported tier mismatch
+  and for a pinned module its bundle lacks, the id table (cancel, late answer,
+  abandoned handler, revoke, exit, cap, id reuse, default registry answers), the
+  tier rule over a reserved test table, the corpus under both tiers, and the
+  generated-TypeScript drift test. JS: the corpus under both tiers, a reserved
+  test row refused to a plugin host in both directions, the hello fields, and
+  `RpcPeer` cancellation.
+
+Not done: any reserved method (nothing needs the builtin-only tier before the
+MCP move). The first host request that can be cancelled, `core/call`, is the
+next section.
+
+## As built: trust tiers (2026-10-02)
+
+Slice A1 of the tier plan (CURRENT_DECISIONS §26 D3, §1.5 above): the host is
+now two processes' worth of machinery, one per trust tier, and nothing else
+about it changed. No wire change, no new behaviour for a plugin author. What
+exists:
+
+- **Two tiers** (`extension_host/tier.rs`, `HostTier { Plugin, Builtin }`).
+  *Plugin* hosts reviewed third-party plugins; its owner ids are the plugin ids
+  discovery builds (`<scope>/<12 hex>/<name>`). *Builtin* (tier 0) is for
+  Codewhale's own host code and its owner ids are `host:<module>`. The id
+  spaces cannot meet: `OwnerRegistry::begin_owner` takes the tier and refuses a
+  `host:` id on the plugin tier and any other id on the builtin tier, and an
+  authority that does not fit (a plugin owner needs its reviewed plugin
+  authority, a module has none); every owner entry, tool and command
+  registration records its tier. Discovery cannot produce a `host:` id (a
+  manifest name cannot hold `:`, and an id starts with a scope name), a test
+  shows such a plugin failing validation, and `desired_owners` checks the id
+  once more before it reaches the host.
+- **An empty production table.** `BUILTIN_MODULES` (`BuiltinModule { id,
+  source_sha256, tools: &[Tier0Tool { name, approval }] }`) is empty, so
+  nothing asks for the builtin tier and **it never spawns**; plugins behave
+  exactly as before. "Needed" currently means "has a row". A tier-0 tool's
+  approval comes only from this Rust table (`Auto` or `Required`); an unlisted
+  tool or module is `Required`, and the module's own say changes nothing. It is
+  still never read-only for plan mode. The manager holds the table
+  (`ManagerShared::builtin_modules`, the production const unless a test builds
+  the manager with `with_builtin_modules`), so a test exercises tier 0 without
+  a production row. A module's source is
+  expected at `<bundle dir>/builtin/<module>.mjs` and is activated only if its
+  SHA-256 is the pinned one (otherwise a failed owner with the reason, no host
+  started); nothing materializes such a file yet because there is no module.
+- **Per-tier supervision.** `ManagerShared` holds two `TierRuntime`s (host
+  slot, generation, spawn count, crash and restart state), lazily spawned. The
+  owner registry, the runtime pin, the attachments and plugin settings stay
+  shared, so both hosts run on the same pinned runtime and one registry says
+  which tier an owner is in. A host's exit, restart, heartbeat and dirty
+  teardown touch only its own tier (`OwnerRegistry::host_exited(tier, ..)`).
+  A host answers `registry/*`, `log` and the like only for owners of its own
+  tier. Lock order, restated at `ManagerShared` and kept: `sync_lock`, then one
+  tier's host slot, then that tier's supervision state, then the registry; no
+  path holds both tiers' slots, and the other locks are leaves.
+- **Supervisor.** `plan_launch` and the sandbox plan take a tier. The argv ends
+  `<bundle> --tier=plugin|builtin`. The plugin tier's data directory, working
+  directory and writable root are what they always were,
+  `extension-host/data`, so the per-plugin directories under it
+  (`data/plugins/<name>-<hex>`, unchanged and pinned by a test) keep their
+  data. The builtin tier's is **`extension-host/data-builtin`**, a sibling and
+  not `data/builtin`: a child would lie inside the plugin tier's writable root,
+  and the host sandbox has no per-subpath write deny, so plugin code could
+  then write tier-0 state. The plugin tier's read deny list names the builtin
+  directory explicitly (unit test on the path function). A built-in module's
+  own directory is `data-builtin/modules/<module>`. Under bubblewrap a builtin
+  directory that did not exist when the plugin host started cannot be masked;
+  Seatbelt denies it by name before it exists.
+- **Host.** `--tier=` is parsed before anything else; an unknown value, a bare
+  `--tier` or a tier named twice exits with 64 before `host/hello` (no
+  `--tier` means `plugin`, the least-privileged). `ext/activate` for an owner
+  of the other tier (decided by the `host:` prefix) is refused with
+  `InvalidParams`, before anything is read or loaded. `dist/` was rebuilt.
+- **Drift check.** `build.mjs` builds each `src/builtin/<id>.ts` to
+  `dist/builtin/<id>.mjs` and writes the SHA-256 of each to
+  `dist/builtin-modules.json` (`{"modules": {}}` today); a Rust test
+  (`tier::tests::table_matches_the_host_build`) fails when `BUILTIN_MODULES` and
+  that file disagree in either direction. A module that would bundle a
+  `node_modules` package fails the build until its licence notice is handled.
+- **Activation policy** is untouched: v4 and its pinned digest test pass
+  without change, because tier-0 modules are not plugins and no installed
+  plugin is re-reviewed.
+- **Tests.** Rust: owner/tier refusals and per-tier crash isolation in the
+  registry, a host answering only for its own tier, a `host:`-named manifest
+  failing validation, launch plans (argv, data directories, deny list, the
+  unchanged per-plugin path), the drift test, the table's approval lookup, a
+  tampered or missing module refused with no host started, production never
+  spawning the builtin tier, and (test table) a tier-0 host spawning apart from
+  the plugin host, activating `host:tier0-module`, its tools' approval
+  following the table, a call through it, and a plugin-host crash leaving it
+  alone. JS: refusal of bad `--tier` values, each tier refusing the other's
+  owners, `host:` activation on the builtin tier, and the dist digest file
+  matching `dist/builtin/`.
+
+Not done, and not claimed: any real tier-0 module (the MCP move, §5, is the
+first consumer); `host/hello` reporting a tier or module digests and a
+per-method tier allow-list (done in slice A2, above); capability
+tickets (landed with their first redeemer, `core/call`, in the section above); embedding or
+materializing a module's source; a bundled tier-0 executable (D1); a demand
+predicate that defers the builtin spawn until something needs it; the builtin
+tier's sandbox denying the plugin tier's data directory (it can read it today);
+`/plugin` listing the builtin host's modules and tools beyond one status line;
+tier-0 commands or tools being offered to the model (an engine installs plugin
+owners' tools only).
+
+## As built: plugin context, several entries, input validation, notices (2026-10-01)
+
+A review of the commands slice found four defects and one gap in what an author
+can do. This section is what changed; where it disagrees with the older "As
+built" sections below, this one is current.
+
+- **Licence notices.** The embedded bundle contains MIT code (cordis,
+  schemastery, cosmokit, dsh-util-values, and verbatim `dsh-tools` excerpts),
+  and its banner promised `LICENSES.txt` beside it, which nothing wrote.
+  `build.mjs` now generates `dist/LICENSES.txt` from the bundler's metafile
+  (every package that contributed an input file, each with its own LICENSE
+  file; a bundled package with none fails the build; the `dsh-tools` excerpt is
+  listed from a named table that the build checks against the source file). The
+  list was hand-kept before and named `@standard-schema/spec`, which is not
+  bundled. The existing `git diff --exit-code -- dist` check covers it. Rust
+  embeds it (`NOTICES`) and `materialize_bundle` writes it beside the bundle in
+  the same digest-named directory, by the same staging, `0400`, rename and
+  read-back as the bundle (so a symlink at its name is replaced, never written
+  through). `THIRD_PARTY_NOTICES.md` lists the packages. Tests: the directory
+  holds exactly the two files with the embedded bytes; and every
+  `node_modules/<pkg>` marker in the *embedded bundle* has a section in
+  `LICENSES.txt` and an entry in `THIRD_PARTY_NOTICES.md`, so the check does not
+  trust the generator.
+- **Several `native` entries.** The manifest has always accepted
+  `native.paths` (up to 64), and the core sent one `ext/activate` per entry
+  under one owner token, which the host answered with "owner token already
+  active" for the second. No protocol change was needed: the host now accepts a
+  further `ext/activate` for a live owner token if the previous entry finished
+  activating, the plugin matches, and the path is new; each entry is a fiber of
+  the same owner, so deactivation, revocation and crash handling are unchanged.
+  Any failing entry fails the owner and the host disposes the earlier entries'
+  fibers (rolling back their registrations) before answering; the core already
+  drops the owner's registrations. The core merges the cumulative tool and
+  command names of the answers and skips a path the manifest lists twice. Tests
+  (JS and Rust, with `two-entries` and `two-entries-failing` fixtures): both
+  entries live under one owner, one tool callable from each, a repeated or
+  foreign entry refused, one `ext/deactivate` tearing both down, a throwing
+  second entry leaving nothing of the first.
+- **Input is validated by the core.** `HostToolSpec` checked nothing against
+  the schema a plugin registered, so `additionalProperties: false` in the
+  example was advice (DSH's `defineTool` validates inside the plugin; a raw
+  registration did not). `registry::InputValidator` compiles the schema at
+  registration with the `jsonschema` crate (already linked for Workflow
+  `responseSchema`; it moved from `[dev-dependencies]` to `[dependencies]` of
+  `codewhale-tui`, no new crate and no lockfile change). No `$ref` resolver is
+  enabled, so a reference outside the schema fails to compile and is refused
+  at registration with the reason, as is any invalid schema. `prepare` (before
+  an approval card exists) and `execute` check each call and return
+  `ToolError::InvalidInput` naming the violations (at most five, bounded), so
+  the model can correct itself and the host sees nothing. The deferred-tool
+  first-call check (`deferred_first_call_matches_schema`) is a separate,
+  hand-written shape check of required and known field names; it leaves types
+  to the tool, so it was not the path to reuse. Known limit: the validator
+  runs on the channel's callback thread under the registry lock at
+  registration (a schema is at most 64 KiB); schema `format` assertions follow
+  the draft's own default.
+- **Plugin context.** Core to host, three optional fields (protocol still v1;
+  an older host ignores them, the generated TypeScript was regenerated):
+  `ext/activate.data_dir`, `tool/call.workspace`, `command/run.workspace`
+  (corpus `46`-`50`). The workspace is `ToolContext::workspace` of the calling
+  session, or the workspace whose user registry loaded the command
+  (`ExtensionCommandRef::workspace`); a path that is not UTF-8 is omitted. A
+  plugin's `exec` is now frozen `{signal, callId, args, workspace?, dataDir?}`
+  and a command invocation gains the same two. `dataDir` is
+  `<home>/extension-host/data/plugins/<name>-<12 hex of sha256(plugin id)>`,
+  created by Rust (0700) before activation: inside the host's single writable
+  root, stable across generations, never deleted. It is not isolation between
+  plugins that share the process (§4.4). No home, credential or other
+  workspace path is passed, though `dataDir` and the entry path do reveal the
+  Codewhale home's location.
+- **Plugin configuration.** There was no per-plugin config (`config` was always
+  `{}`). `[plugins."<name>".config]` in the *user's* `config.toml`
+  (`config::PluginSettings`, a new field on `Config`; project scope reads an
+  explicit key list that excludes it) becomes the second argument of `apply`.
+  Cordis already validates it against an exported `Config` schema (a
+  schemastery `Schema`) and applies defaults, so a mismatch fails activation
+  with the field named; no host code was needed for that. Rust bounds it
+  (`plugin_config.rs`: objects of plain TOML values, 16 KiB, 16 levels, no
+  date-times) and refuses an over-limit table by failing that plugin's
+  activation with the reason, before the host is asked. Each owner records the
+  digest of the config it was activated with; reconcile treats a changed
+  digest like a changed plugin (revoke, new generation), so settings re-read
+  at `/plugin reload` re-activate exactly the plugins whose table changed. A
+  refused config is hashed from its reason, so it is neither retried every turn
+  nor stuck once fixed. `/plugin show` lists the configured keys (never the
+  values) or the refusal. The example plugin reads one setting through its own
+  `Config` schema.
+- **Tests.** Rust: settings parse, size/depth/date-time refusal and digest
+  behaviour; the real host with `plugin-context` (settings with the plugin's
+  default filled in, per-call workspace, frozen context, a write into `dataDir`
+  inside the sandbox, a command's workspace, no churn on unchanged settings, a
+  new generation on a change, a schema-refused config, an oversize config, and
+  recovery); `/plugin show` rendering and escaping. JS: the same against the
+  fake core, and the typed example with and without its setting.
+
+Not done: a running session does not watch `config.toml` (only `/plugin reload`
+re-reads it); `[plugins]` is not profile-scoped; the review screen shows the
+config keys through `/plugin show`, not the trust review itself; the `Config`
+schema is not exported into the plugin's registered tool schema; there is still
+no storage service beyond the directory; the Linux and Windows runs of the new
+Rust tests did not happen on this machine.
+
+## As built: extension commands (2026-10-01)
+
+Phase 2's `command/run` landed in `crates/tui/src/extension_host/command.rs`,
+the registry, the protocol and the host's `src/shims/commands.ts`, mirroring
+how a tool flows: `registry/register` → owned entry (plugin id + generation,
+never-reused handle) → adapter → call → teardown.
+
+- **Protocol (still v1).** `registry/register` takes `kind: "command"`.
+  `RegisterSpecWire` (was `ToolSpecWire`) has `name`, `description`,
+  `input_schema?` and `argument_hint?`; the generator cannot express a
+  per-kind union, so `RegisterParams::check_spec` (a tool needs `input_schema`
+  and takes no hint; a command takes no schema) runs in `parse_host_message`
+  and is mirrored in the host's `validateMessage`, and the corpus holds both
+  (`20`, `37`–`40`). New core→host request `command/run`
+  `{handle, command_id, raw_input, deadline_ms}`; `raw_input` is the argument
+  text after the name, trimmed (the core's slash parser trims; the design's
+  `agent: AgentRef` was not built, the host has no agent or session). Its
+  answer, `CommandResultWire`, is `{kind: "success", text?}`,
+  `{kind: "error", text}` or `{kind: "submit", prompt, text?}` (corpus `41`–`45`).
+  `ext/activate`'s `ok` also reports `commands` (defaulted). The protocol lint
+  (`host_protocol_never_gains_core_authority`) passes unchanged by
+  construction: `command/run` names no event, store, approval, secret,
+  credential, token, auth, turn, loop, session or prompt authority, and has a
+  reviewed row saying why. `protocol.generated.ts` is regenerated by the
+  drift test.
+- **What a command can return.** What the user-command machinery already does:
+  text shown as a `System` transcript cell (labelled with `/name` and
+  `extension:<plugin>`; escapes stripped, cut at 64 KiB) and/or a prompt sent
+  as the user's next message through the same `SendMessage` path a markdown
+  command's template takes (visible; refused over 128 KiB, never truncated;
+  empty refused). Nothing the host returns makes the core call a tool or the
+  model itself: after a `submit` the turn and tool approval are the ordinary
+  ones.
+- **Rust.** `OwnerRegistry` holds commands beside tools with the same owner
+  rules; one never-reused handle counter; `remove_registrations_of`,
+  `mark_failed`, `revoke_owner`, `forget_owner`, `host_exited` and
+  `revoke_all` remove an owner's commands with its tools; a stale
+  `unregister` is a no-op. Admission (`register_command`): DSH's grammar
+  (`^[a-z][a-z0-9_-]*$`, ≤ 64), refused if a built-in command or alias (or the
+  fixed `jihua`/`zidong`) answers to the name, or another plugin holds it;
+  descriptions ≤ 1 KiB and hints ≤ 256 bytes, single-line; 64 per owner, 256
+  per host. Commands and tools are separate namespaces. The commands of the
+  owners an engine's workspace snapshot desires, bound to the reviewed hash,
+  are loaded by `UserCommandRegistry::load_extension_commands` into the
+  existing user registry, last, so a user, workspace or manifest markdown
+  command (or a built-in) always wins the spelling, with a load error; a
+  global `command::epoch()` bumped on every registry or attachment change
+  makes the registry reload. Entries carry the owner's reviewed authority, so
+  disabling or untrusting the plugin hides them at once, before reconcile.
+  Dispatch (`try_dispatch`) returns the new `AppAction::RunExtensionCommand`;
+  the UI loop awaits `extension_host::run_command` (like `/balance`).
+  `run` re-checks, immediately before sending, the policy flag, a running
+  host (so a dead host answers `extension host is down: <why>` at once), the
+  exact registration (handle and generation), the reviewed receipt and the
+  `Native` capability, through the same `live_host` the tool path now uses.
+  The call is bounded by `SupervisionOptions::command_run_deadline` (30 s),
+  sent as `deadline_ms`, then `$/cancel`, like every method. Capability: the
+  existing `Native`; no new one and no policy bump (§4.6).
+- **Host.** `ctx.commands.register(definition)` returns an idempotent
+  disposer and is an effect of the calling fiber. It accepts the Codewhale
+  shape (`argumentHint`, handler may return a string, `{kind: 'submit'}`) and
+  DSH's (`input: {hint}`, `{kind: 'success' | 'error'}`, `rawInput` with its
+  leading separator; `@deepseek-ai/dsh-commands/brand`, the one value import
+  such plugins make, resolves to two identity functions in
+  `src/dsh/resolve-hooks.ts`, and the rest of that package still fails
+  loudly). `commands` moved from "not provided" to provided;
+  plugins still cannot provide it (the root provides its own shim once, frozen
+  like `tools`). `src/shims/owned.ts` holds the register/undo bookkeeping
+  both shims now share; the tool path was moved onto it. `dist/` was rebuilt.
+- **Tests.** Host: register, each answer kind, cancel, refusal, dispose of
+  one handle versus deactivation, invalid definitions, no provide/rewrite.
+  Rust: registry rules (shadowing, caps, exact undo, revocation, crash),
+  wire shapes, end-to-end through the real host and `commands::execute`
+  (hints, per-workspace visibility, trimmed arguments, DSH `rawInput`,
+  escapes, disable), clash refusal (built-in, other plugin, markdown wins),
+  host-down, deadline cancel, and a killed host with a stale reference after
+  replay.
+
+Not done: Esc or a keypress cancelling a running command before its deadline
+(the UI loop awaits it); the Runtime API and GPUI cannot list or run
+extension commands (`GET /v1/commands` omits them); a clash with a
+markdown command is resolved at registry load, not refused at registration;
+`/plugin show`'s localized owner line does not list commands (the `/plugin`
+host section does); no `agent`/session handle, attachments, `list`/`find`
+on the DSH surface or `command/run`/`command/done` session events; an
+extension command does not reset the goal, todos or plan as a markdown command
+does; a command's `submit` prompt is not marked as plugin-authored beyond the
+transcript line printed before it; the Bun runtime and Windows/Linux were not
+run for the Rust tests of this slice.
+
 ## As built: script tools lose self-approval and shadowing (2026-09-30)
 
 CURRENT_DECISIONS §26 D4 landed in Rust ahead of phase 4, so R1 below and
@@ -141,20 +672,23 @@ the diagnosed fallback. The same embedded bundle runs on either runtime.
   cap: CI runs it with Node on Linux, macOS and Windows; the Bun case has run
   on macOS only.
 
-Not done: the bundled single-executable host (`bun build --compile`, D1) is
-not built, signed or shipped; the host still runs on a user-installed Bun or
-Node. DSH's own loader, HMR and inspector bridge stay Node-only (spike §2); the
-Codewhale host does not use them. Bun on Linux runs under the same bwrap
-wrapper as Node, and on Windows is unsandboxed exactly as Node is. The Windows Job Object limit and the Linux `RLIMIT_DATA`
-path were not run on this machine; CI runs the memory-cap tests there. The
-Rust CI job still runs the Rust integration tests on Node only; the Bun ones
-skip there unless `CODEWHALE_EXT_HOST_BUN_TESTS` is set. So the Bun default
-cutover is not done: Node stays the default until the four gates hold on
-Linux and Windows too. Under Bun, a `tsconfig.json` next to or above a
-plugin's files (including one above the reviewed bundle) steers its imports
-through `paths`/`baseUrl`; Node ignores it. The Linux `RLIMIT_DATA` path
-clamps to a lower inherited hard limit and still reports the configured cap.
-The native-code lockdown covers the entry points found so far.
+2026-10-02 source checkpoint: `compile-host.mjs` builds the same canonical host
+with an explicitly supplied local Bun and no runtime download. An adjacent
+compiled image is optional for Bun/Auto and must report this Engine's exact
+source digest; Node remains the default. Six local compiled-image/fake-Core
+cases pass, including both tiers, same-PID macOS jetsam, FFI/Worker refusal,
+embedded no-install flags and zero registry traffic. This is separate from
+Rust execution, code signing, release packaging and installed-binary proof.
+
+Native launch now refuses an absent or failed verified OS wrapper. The pinned
+Builtin exception remains diagnosed and ticket-bound; it does not close D9.
+The CI source requires Node and Bun in the Rust three-OS matrix and adds
+source/compiled-host suites, but these jobs have not run on this source. Linux
+and Windows isolation/memory receipts, release assets and the four D2 gates
+remain required before a Bun default cutover. The Linux `RLIMIT_DATA` path
+clamps to a lower inherited hard limit and reports the configured cap.
+Reviewed import closures diagnose Bun query/fragment and dynamic CommonJS
+identity limitations explicitly rather than choosing a different module.
 
 ## As built: phase 2a supervision (2026-09-29)
 
@@ -197,8 +731,8 @@ discovery rules as `.mjs`/`.js`; Node strips erasable types. The executable
 [author guide](../EXTENSIONS.md) describe the actual services and trust loop.
 
 `exec.cwd` remains deferred: the current execution context does not expose the
-caller's workspace path. Commands, hooks, MCP, `core/call`, and sandbox parity
-also remain subsequent work. The following phase-1 section is its historical
+caller's workspace path. Hooks, MCP, `core/call`, and sandbox parity
+also remain subsequent work (commands landed: see the 2026-10-01 section). The following phase-1 section is its historical
 receipt, including the earlier lack of heartbeat/restart and `.mts` support.
 
 ## As built: phase 1 (2026-09-25)
@@ -227,9 +761,10 @@ differences from the text below:
   when a launch-time probe shows bwrap works; each Codewhale home is masked
   whole and its readable entries bound again, since bwrap cannot deny a path
   that does not exist yet (`extension_host::supervisor` lists what that does
-  not cover). Where bwrap is missing or cannot start, and on Windows, the host
-  runs unsandboxed, and `/plugin` and doctor say why. §4.5 remains the plan
-  for real containment.
+  not cover). Current Native admission refuses missing or failed verified
+  wrappers, including Windows while filesystem/network isolation is absent.
+  Only the pinned Builtin exception can run unsandboxed with its diagnostic;
+  §4.5's full containment and mandatory-host cutover remain open.
 - **Extension tool names that the approval path keys by name are refused.**
   Approval keys (`approval_cache`), approval-card summaries and the approval /
   auto-review category are derived from the tool name. A plugin tool named
@@ -544,7 +1079,7 @@ Rust then respawns the host and replays activations from its own record of which
 
   ```
   host → core  host/hello      {protocol: {min: 1, max: 1}, host_version, bundle_sha256, runtime: {name, version},
-                                required_caps: [...], optional_caps: [...]}
+                                tier, builtin_modules: [{id, sha256}], (memory_limit_mib)}
   core → host  host/initialize {protocol: 1, session_runtime_id, workspace_roots, caps_granted: [...],
                                 limits: {max_frame, max_inflight, hook_deadline_ms, dispose_deadline_ms}}
   host → core  host/ready      {}
@@ -876,7 +1411,7 @@ There is no `CompositeDispatch` and no `HostExtensionDispatch` (removed). Only o
 | pnpm install with build-script approval | **Tier C** | v1 accepts path and tarball only, with no scripts |
 | Rebuilding a retired preset revision after restart | Out (DSH does not do it either) | |
 
-**Sizing** (from the DSH memo's approximate grep): about 13–21 of the ~90 parsed `inject`-declaring packages are headless and within reach by phase 5. About 69 need DSH UI or internal services and stay skipped. The honest headline: **DSH's headless host-code plugins and all of its config bundles run natively. Its UI and loop-replacing plugins do not.**
+**Sizing** (from the DSH memo's approximate grep): about 13–21 of the ~90 parsed `inject`-declaring packages are headless and within reach by phase 5. About 69 need DSH UI or internal services and stay skipped. This is a planning estimate. Accepted Native source now reviews closed compositions and exact preset entries; unsupported service or prompt-replacement rows remain visibly broken. Complete stock-bundle acceptance must be established from actual installed Engine fixtures before claiming that every config bundle runs. UI and loop-replacing plugins remain outside the shared Engine boundary.
 
 ### 6.2 Module resolution: what "natively" requires
 
@@ -904,7 +1439,7 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
 |---|---|---|---|
 | **0** | `crates/mcp` client pool, `InMemoryMcpClient`, `ChildProcessMcpClient` and legacy CLI aggregation proxy | Removed in the 0.10.1 completion source | The earlier "no production caller" premise was false: the CLI proxy spawned registered child clients. Under the recorded founder D5 decision, that proxy is removed and `mcp-server` delegates to existing native `serve --mcp`. The unused Core/App-server pool and `/mcp/startup` route/docs were removed together. The small shared bounded instruction sanitizer remains; saved legacy definitions are preserved without a new reader/writer. Hosted and package acceptance are separate pending receipts. |
 | **1** (no deletion) | Nothing. Phase 1 adds the host behind the flag and deletes nothing, because no consumer has moved yet. The `ExternalToolDispatch` seam is the lane's option or phase 3's work (§5.2) | 0 | — |
-| **3** (MCP move) | `McpConnection`, transport trait, discovery, pool connect / supervise / backoff / reconnect / stale retry / route (`mcp.rs` ~1466–2660 and most of 2709–5240); `mcp/{sse, streamable_http, http, http_client, wire, headers}.rs`; stdio framing (spawn moves to the broker); about half of `mcp/tests.rs` | ~4,700 | `core/engine.rs`, `turn_loop.rs`, `tool_execution.rs`, `tool_preparation.rs`, `dispatch.rs`, `runtime_api.rs`, `hooks/executor.rs`, `tools/subagent/mod.rs`, `tools/runtime_mcp.rs`, `tools/registry.rs`, `codemode.rs`, `lib.rs`, `tui/views/extensions.rs`, `tui/command_palette.rs`, `tui/setup/tools_mcp.rs`. All of them go through `HostMcpClient`'s snapshot API or `ExternalToolDispatch` |
+| **3** (MCP move) | `McpConnection`, transport trait, discovery, pool connect / supervise / backoff / reconnect / stale retry / route (`mcp.rs` ~1466–2660 and most of 2709–5240); `mcp/{sse, streamable_http, http, http_client, wire, headers}.rs`; stdio framing (spawn moves to the broker); about half of `mcp/tests.rs` | ~4,700 | `core/engine.rs`, `turn_loop.rs`, `tool_execution.rs`, `tool_preparation.rs`, `dispatch.rs`, `runtime_api.rs`, `hooks/executor.rs`, `tools/subagent/mod.rs`, `tools/runtime_mcp.rs`, `tools/registry.rs`, `codemode.rs`, `lib.rs`, `tui/views/extensions.rs`, `tui/command_palette.rs`, `tui/setup/tools_mcp.rs`. Current adoption supersedes this estimate: callers retain `McpPool`/`McpConnection` as the sole Rust authority and use the selected SDK transport. Only native protocol/client orchestration is deleted after the one-release default window; shared ProcessBroker, guarded HTTP/OAuth, framing bounds and catalogue/session policy remain |
 | **0** | Legacy `run_stdio_server` aggregating proxy | Removed with its last CLI consumer | Founder D5 drops the proxy. The CLI spelling remains an alias of the native server and introduces no SDK proxy or second client pool. |
 | **4** (hooks) | `hooks/executor.rs` orchestration: matching, env building, sync and background runs, observers, message-submit transform; part of `hooks/config.rs` validation | ~2,450 | Turn-loop fire points (kept), `tui/ui/observer_hooks.rs`, `exec_agent`. **Kept in Rust:** the verdict fold, `authority.rs` project-hook receipts, output sanitizers, and the process tree (moved into the broker) |
 | **4** (script tools, new row, R1) | `tools/plugin.rs` (`ScriptPluginTool`, `CommandPluginTool`, frontmatter parser; 893 lines incl. tests), `ToolRegistry::load_plugins`, the non-`Disabled` arms of `apply_overrides`, `configure_plugin_tools` (`core/engine.rs:7360-7400`) | ~700 | Users' `~/.codewhale/tools/*` scripts and `[tools.overrides]` `Script` / `Command` entries. They become one `builtin:script-tools` host plugin: each script is registered as an extension tool, spawned through the broker (the same executor as shell hooks, which is why this lands with phase 4). **Two user-visible changes are decision D9:** `# approval: auto` is no longer honoured (Required, rememberable), and a script can no longer replace a built-in. `[tools.overrides] X = "disabled"` stays in Rust: it is configuration, not extensibility |
@@ -916,7 +1451,7 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
 - The +2,800: supervisor and client (~600), protocol (~500), OwnerRegistry (~500), tool adapter and MCP dispatch (~300), broker glue (~300), FetchProxy (~400), catalog admission and cache (~200).
 - That leaves **about −7,050 net**, plus about 5–8k lines of TypeScript. These remain reading-based estimates, not measured diffs.
 
-**Stop rule.** If phase 3 has not landed within six weeks of phase 1, delete the host rather than leave a second extension runtime in the tree behind a flag. The flag is for trying it out, not for keeping two systems.
+**Stop rule.** The accepted anchor is the Phase 1 exit gate, not the September 26 host merge. If Phase 3 has not landed within six weeks of that gate, delete the host rather than retain another extension runtime behind a flag. Phase 1 exit is not yet achieved, so that clock has not started. The October 1 plan proposes a later anchor; no founder adoption of that change is recorded. `CURRENT_DECISIONS.md` §26 is the accepted decision.
 
 ---
 
@@ -1006,24 +1541,35 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
 - The trust-tier split: host #0 builtin, host #1 third-party. This is **required before phase 3**.
 - (Removed: running Computer Use's `agent.mjs` as a host plugin. It is a remote SSH agent, not host code, R7.)
 
-### Phase 3: MCP moves to the host (deletes the pool)
+### Phase 3: MCP protocol orchestration moves to the host
 
 **Entry gates:**
 - the phase-2 tier split exists, so `builtin:mcp` runs in host #0 only;
-- decision D1 is made;
+- decision D1 is ratified in Ops CURRENT_DECISIONS §26: system Node with a doctor diagnostic;
 - the `ExternalToolDispatch` seam exists, landed by the lane or at the start of this phase.
 
 **Work:**
 - ProcessBroker (merged spawn path) and FetchProxy with auth injection.
 - `builtin:mcp`, the SDK client adapted from DSH `mcp-client`.
-- `HostMcpClient` snapshot and the Rust catalog cache.
+- The actual pinned SDK transport under the existing `McpConnection`/`McpPool`
+  Rust authority facade: catalogue/session/permission/provenance and credential
+  state stay in Rust. `mcp_backend = "host"` demand starts the Builtin tier
+  independently of optional Native activation; harness/third-party activation
+  continues to require the actual Native policy, including after restart.
 - Grant enforcement at the broker and proxy with the default-deny method policy (§4.4, threat 5).
 
 **Exit gates:**
 - Every existing `mcp/tests.rs` behaviour test, not the transport internals, passes against the host through a Rust↔host conformance harness that reuses the MCP fixture servers.
 - The CU screenshot latency gate (§5.1).
 - Code mode's nested MCP calls pass the lane's MCP tests unchanged through `HostMcpDispatch`.
-- **Deletion row 3 lands in the same PR series.** The flag then graduates to Beta, because MCP now depends on it: an MCP user without Node gets a diagnostic, per decision D1.
+- The unchanged recorded corpus and real HTTP/OAuth/Computer Use/broker tests
+  pass; platform isolation and the measured Phase 3 gates pass before a mandatory
+  default. D9 forbids making tier 0 mandatory before Linux/Windows host sandboxes.
+- Ops CURRENT_DECISIONS §26 orders the default flip for one release, then
+  deletion of the native protocol/client adapters after their last selected
+  consumers migrate. The Rust pool's authority/cache stays. Optional Native
+  activation is not made mandatory by MCP. An MCP user without supported Node
+  gets the existing doctor diagnostic, per ratified D1; no Rust fallback.
 
 ### Phase 4: hooks and script tools move to the host
 
@@ -1087,7 +1633,7 @@ This follows the evidence rules in AGENTS.md: match the evidence to the surface.
 - **TS unit tests** (`node --test` against `dist/`, run by root `npm test` through `npm --prefix`, and by an explicit Node-22 CI step): framing, shims, refusal list, the `dsh-tools` compat module, fiber teardown and leak detection.
 - **Protocol conformance corpus.** JSON fixtures that Rust `serde` and TS both parse and round-trip. Generated types plus the drift check arrive in phase 2.
 - **Rust integration tests** that spawn the **real bundle** under a real Node. **CI installs Node 22 for this job, so they run there.** Locally they skip with a visible reason when no Node ≥22.19 is found. They cover admission, gating (direct, and code mode as refused on main or suspended once the lane lands), revocation, crash, and anti-spoofing: a stale token, a cross-owner handle, a name collision against natives and against scripts, and a refused `provide`. Restart and replay join in phase 2.
-- **MCP parity harness** (phase 3): the existing MCP fixture servers are driven through both `McpPoolDispatch` and `HostMcpDispatch` with the same assertions, until the pool is deleted. Transport-internal Rust tests are deleted with the code they test. Behaviour tests are re-targeted.
+- **MCP parity harness** (phase 3): the existing MCP fixture servers are driven through both `McpPoolDispatch` and `HostMcpDispatch` with the same assertions, until the native protocol adapters retire after the one-release default window. The Rust pool's authority/cache remains. Transport-internal Rust tests are deleted with the code they test; security guards and behaviour tests are re-targeted to the actual SDK/broker consumers.
 - **The DSH corpus** reuses the 41 `test_convert_plugin.py` cases as *install and review* cases (phase 5), plus the pinned real packages:
   - `tool-workspace-dependencies` in phase 1;
   - `dsh-mcp-client` rows in phase 3;
@@ -1095,12 +1641,16 @@ This follows the evidence rules in AGENTS.md: match the evidence to the surface.
 - **Performance:** `hyperfine` on startup with the flag on and off, and the CU screenshot latency gate in phase 3.
 - **Not claimed by any of the above:** hosted CI, a real provider call, or a customer run. Each is a separate level of evidence.
 
-### 9.4 Open decisions for the founder
+### 9.4 Decisions and remaining choices
 
-- **D1. Node for MCP users.**
-  - (a) Diagnostic only. **Recommended through phase 3.**
-  - (b) Ship a pinned Node runtime in non-npm channels: +30–45 MB per platform, and a security-update duty.
-  - (c) Keep a Rust MCP fallback. **This reintroduces two stacks; I advise against it.**
+Ops CURRENT_DECISIONS §26 is the current decision authority; older alternatives
+below are historical proposals unless that table leaves the choice open.
+
+- **D1. Node for MCP users — ratified.** System Node ≥22.19 with the existing
+  doctor diagnostic for the initial 0.10.1 host. The September 29 founder
+  follow-up makes Bun the target runtime and bundled executable after the four
+  measured D2 gates; Node remains a diagnosed fallback while that work lands.
+  Selected Host failures never silently fall back to the Rust adapter.
 - **D2. Node floor.** `^22.19 || >=24` for the host, matching DSH. I recommend it: Node 20 is end-of-life, and `module.registerHooks` needs ≥22.15. Computer Use is a separate MCP server process (R7) and keeps its own `>=20` floor. Several CI jobs still pin Node 20 (`ci.yml` version-drift and conversion jobs, release workflows), and none of them run host code.
 - **D3. Stdio secrets.** Relayed broker, which I recommend; or a `direct_stdio` ticket for builtin servers only if the phase-3 latency gate fails.
 - **D4. Legacy stdio proxy:** resolved by Ops CURRENT_DECISIONS §26 D5: drop it. The native `serve --mcp` server remains.

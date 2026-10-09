@@ -170,6 +170,15 @@ fn provider_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     heading(&mut lines, app, MessageId::OnboardProviderTitle, width);
     lines.push(Line::from(""));
+    if let Some(notice) = app.onboarding_key_rejected.as_deref() {
+        for segment in wrap_words(notice, width) {
+            lines.push(Line::from(Span::styled(
+                segment,
+                Style::default().fg(palette::STATUS_ERROR),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
     wrap_body(&mut lines, app, MessageId::OnboardProviderBlurb, width);
     lines
 }

@@ -587,6 +587,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
                 objective: "objective".into(),
                 role: None,
             },

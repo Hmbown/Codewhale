@@ -540,6 +540,34 @@ static void axPrepare(AXUIElementRef app) {
   AXUIElementSetAttributeValue(app,(__bridge CFStringRef)@"AXEnhancedUserInterface",kCFBooleanTrue);
   AXUIElementSetAttributeValue(app,(__bridge CFStringRef)@"AXManualAccessibility",kCFBooleanTrue);
 }
+static void axSetEnhancedUI(AXUIElementRef app, BOOL on) {
+#ifdef CU_TEST
+  if([(__bridge id)app isKindOfClass:NSMutableDictionary.class]) {
+    NSMutableDictionary *fake=(__bridge NSMutableDictionary *)app;
+    fake[@"AXEnhancedUserInterface"]=@(on);
+    [fake[@"writes"] addObject:on?@"AXEnhancedUserInterface=1":@"AXEnhancedUserInterface=0"];
+    return;
+  }
+#endif
+  AXUIElementSetAttributeValue(app,(__bridge CFStringRef)@"AXEnhancedUserInterface",on?kCFBooleanTrue:kCFBooleanFalse);
+}
+/**
+ * Run window geometry writes with AXEnhancedUserInterface off. While it is on
+ * (axPrepare turns it on for every app we observe, and it stays on for the life
+ * of that process) AppKit animates each AXPosition/AXSize write over ~200 ms,
+ * and a later write cancels the running animation where it stands: a 50 ms
+ * position re-assert froze a 1100x800 -> 1600x900 resize at 1232x827. Window
+ * managers (Rectangle, yabai) clear the attribute around frame writes for the
+ * same reason. It is restored afterwards, even if the writes throw, so content
+ * observation of Chromium/WebKit apps keeps working.
+ */
+static void cuWithoutEnhancedUI(AXUIElementRef app, void (^work)(void)) {
+  id eui=attr(app,@"AXEnhancedUserInterface");
+  BOOL wasOn=[eui isKindOfClass:NSNumber.class] && [eui boolValue];
+  if(wasOn) axSetEnhancedUI(app,NO);
+  @try { work(); }
+  @finally { if(wasOn) axSetEnhancedUI(app,YES); }
+}
 static NSDictionary *geometry(id v, BOOL size) {
   if (!v || CFGetTypeID((__bridge CFTypeRef)v) != AXValueGetTypeID()) return nil;
   if (size) { CGSize s; if (AXValueGetValue((__bridge AXValueRef)v,kAXValueCGSizeType,&s)) return @{ @"w":@(s.width), @"h":@(s.height) }; }
@@ -651,6 +679,64 @@ static BOOL cuFrame(AXUIElementRef el, CGRect *out) {
   if(!p || !z) return NO;
   *out=CGRectMake([p[@"x"] doubleValue],[p[@"y"] doubleValue],[z[@"w"] doubleValue],[z[@"h"] doubleValue]);
   return YES;
+}
+static AXError cuSetWindowGeometry(AXUIElementRef win, NSString *name, AXValueRef value) {
+#ifdef CU_TEST
+  // A fake window records each write with the app's enhanced-UI state at that
+  // moment, then stores the value so cuFrame reads it back.
+  if([(__bridge id)win isKindOfClass:NSMutableDictionary.class]) {
+    NSMutableDictionary *fake=(__bridge NSMutableDictionary *)win, *app=fake[@"app"];
+    [app[@"writes"] addObject:[NSString stringWithFormat:@"%@(AXEnhancedUserInterface=%d)",name,[app[@"AXEnhancedUserInterface"] boolValue]]];
+    if([fake[@"refuse"] boolValue]) return kAXErrorCannotComplete;
+    fake[name]=(__bridge id)value;
+    return kAXErrorSuccess;
+  }
+#endif
+  return AXUIElementSetAttributeValue(win,(__bridge CFStringRef)name,value);
+}
+/**
+ * Write a window's frame and read back what the app actually applied. The
+ * writes and the readback run with AXEnhancedUserInterface off (see
+ * cuWithoutEnhancedUI); pe/se report the position and size write errors.
+ * Throws when the app refuses both.
+ */
+static CGRect cuWriteWindowFrame(AXUIElementRef app, AXUIElementRef win, CGRect target, CGRect before, AXError *outPe, AXError *outSe) {
+  double fx=target.origin.x, fy=target.origin.y, fw=target.size.width, fh=target.size.height;
+  CGPoint p=target.origin; CGSize z=target.size;
+  __block AXError pe=kAXErrorFailure, se=kAXErrorFailure;
+  __block CGRect after=before;
+  @try {
+    cuWithoutEnhancedUI(app,^{
+      AXValueRef pos=AXValueCreate(kAXValueCGPointType,&p), size=AXValueCreate(kAXValueCGSizeType,&z);
+      @try {
+        pe=cuSetWindowGeometry(win,@"AXPosition",pos);
+        se=cuSetWindowGeometry(win,@"AXSize",size);
+        // Some apps re-anchor a window's origin when its size changes; re-assert
+        // the position once after the size has had a run-loop turn to settle.
+        if(pe==kAXErrorSuccess) {
+          [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+          AXError pe2=cuSetWindowGeometry(win,@"AXPosition",pos);
+          if(pe2!=kAXErrorSuccess) pe=pe2;
+        }
+      } @finally { if(pos) CFRelease(pos); if(size) CFRelease(size); }
+      if(pe!=kAXErrorSuccess && se!=kAXErrorSuccess)
+        @throw [NSException exceptionWithName:@"window" reason:@"the app refused the window frame change (it may be fullscreen, tiled or non-resizable)" userInfo:nil];
+      // Apps apply frame changes over a few run-loop turns; verify by reading the
+      // window's own geometry back, not by trusting the set call. The readback
+      // stays inside the enhanced-UI-off window so no animation is in flight
+      // when the attribute is restored.
+      for(int i=0;i<40;i++) {
+        cuCheckCancelled();
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        cuFrame(win,&after);
+        if(fabs(after.origin.x-fx)<1 && fabs(after.origin.y-fy)<1 && fabs(after.size.width-fw)<1 && fabs(after.size.height-fh)<1) break;
+      }
+    });
+  } @finally {
+    if(outPe) *outPe=pe;
+    if(outSe) *outSe=se;
+  }
+  return after;
 }
 /**
  * The CGWindow that should receive input for an element. An AXSheet ancestor
@@ -1116,6 +1202,21 @@ static id execute(NSDictionary *p) {
     if([args[@"cancelled"] boolValue]) cuCancelled=1;
     return @{@"yield_ms":@(cuYieldToUser(args))};
   }
+  if([tool isEqual:@"inspect_enhanced_ui_frame"]) {
+    // Drives the same cuWriteWindowFrame that set_window_frame uses, against a
+    // fake app and window that log every write with the enhanced-UI state.
+    NSMutableDictionary *app=[@{@"writes":[NSMutableArray array]} mutableCopy];
+    if(args[@"enhanced"]) app[@"AXEnhancedUserInterface"]=args[@"enhanced"];
+    NSMutableDictionary *win=[@{@"app":app} mutableCopy];
+    if([args[@"refuse"] boolValue]) win[@"refuse"]=@YES;
+    CGRect before=CGRectMake(0,0,1100,800), after=before;
+    NSString *error=nil;
+    @try {
+      after=cuWriteWindowFrame((__bridge AXUIElementRef)app,(__bridge AXUIElementRef)win,CGRectMake(200,120,1600,900),before,NULL,NULL);
+    } @catch(NSException *e) { error=e.reason; }
+    return @{@"writes":app[@"writes"],@"enhanced":app[@"AXEnhancedUserInterface"]?:NSNull.null,@"error":error?:NSNull.null,
+             @"after":@{@"x":@(after.origin.x),@"y":@(after.origin.y),@"w":@(after.size.width),@"h":@(after.size.height)}};
+  }
   if([tool isEqual:@"inspect_click_action"]) return @{@"action":cuClickAction((__bridge AXUIElementRef)args[@"element"],[args[@"context"] boolValue])?:NSNull.null};
   if([tool isEqual:@"inspect_element_identity"]) {
     cuValidateElementIdentity((__bridge AXUIElementRef)args[@"element"],args[@"target"]);
@@ -1327,32 +1428,10 @@ static id execute(NSDictionary *p) {
     AXUIElementRef win=(__bridge AXUIElementRef)windows[idx];
     CGRect before=CGRectNull; cuFrame(win,&before);
     cuCheckCancelled();
-    CGPoint p=CGPointMake(fx,fy); CGSize z=CGSizeMake(fw,fh);
-    AXValueRef pos=AXValueCreate(kAXValueCGPointType,&p), size=AXValueCreate(kAXValueCGSizeType,&z);
-    AXError pe=AXUIElementSetAttributeValue(win,(__bridge CFStringRef)@"AXPosition",pos);
-    AXError se=AXUIElementSetAttributeValue(win,(__bridge CFStringRef)@"AXSize",size);
-    // Some apps re-anchor a window's origin when its size changes; re-assert
-    // the position once after the size has had a run-loop turn to settle.
-    if(pe==kAXErrorSuccess) {
-      [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-      AXError pe2=AXUIElementSetAttributeValue(win,(__bridge CFStringRef)@"AXPosition",pos);
-      if(pe2!=kAXErrorSuccess) pe=pe2;
-    }
-    if(pos) CFRelease(pos); if(size) CFRelease(size);
-    if(pe!=kAXErrorSuccess && se!=kAXErrorSuccess) {
-      CFRelease(app);
-      @throw [NSException exceptionWithName:@"window" reason:@"the app refused the window frame change (it may be fullscreen, tiled or non-resizable)" userInfo:nil];
-    }
-    // Apps apply frame changes over a few run-loop turns; verify by reading the
-    // window's own geometry back, not by trusting the set call.
+    AXError pe=kAXErrorFailure, se=kAXErrorFailure;
     CGRect after=before;
-    for(int i=0;i<40;i++) {
-      cuCheckCancelled();
-      [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-      cuFrame(win,&after);
-      if(fabs(after.origin.x-fx)<1 && fabs(after.origin.y-fy)<1 && fabs(after.size.width-fw)<1 && fabs(after.size.height-fh)<1) break;
-    }
-    CFRelease(app);
+    @try { after=cuWriteWindowFrame(app,win,CGRectMake(fx,fy,fw,fh),before,&pe,&se); }
+    @finally { CFRelease(app); }
     BOOL verified = fabs(after.origin.x-fx)<1 && fabs(after.origin.y-fy)<1 && fabs(after.size.width-fw)<1 && fabs(after.size.height-fh)<1;
     NSMutableDictionary *done=[@{@"action_sent":@YES,@"window_id":@(idx),
              @"before":@{@"x":@(before.origin.x),@"y":@(before.origin.y),@"w":@(before.size.width),@"h":@(before.size.height)},

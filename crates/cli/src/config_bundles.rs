@@ -1172,7 +1172,9 @@ fn rollback_import_target(
     if let Some(backup_path) = backup_path {
         let bytes = std::fs::read(backup_path)
             .with_context(|| format!("reading pre-import backup {}", backup_path.display()))?;
-        std::fs::write(target, bytes)
+        // Replace the name by rename (owner-only), never write through a link
+        // that has appeared at it since the import wrote the file.
+        codewhale_config::persistence::atomic_write(target, &bytes)
             .with_context(|| format!("restoring pre-import config {}", target.display()))?;
         return Ok(());
     }

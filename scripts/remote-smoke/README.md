@@ -108,7 +108,7 @@ docs/REMOTE_VM_US.md default spec).
 ## Autonomous agent loop (#3022)
 
 Once the droplet is provisioned and `gh` is authenticated with a
-fine-grained PAT (scoped to Hmbown/CodeWhale: Contents RW, Issues RW,
+fine-grained PAT (scoped to codewhale-hq/CodeWhale: Contents RW, Issues RW,
 PRs RW, Metadata R), an agent can work the full pick→PR loop headless.
 
 One-time git wiring after `gh auth login` so pushes use the PAT and
@@ -122,7 +122,7 @@ git config --global user.email "whalebro-agent@users.noreply.github.com"
 
 ```bash
 # 1. Pick an agent-ready issue
-gh issue list --repo Hmbown/CodeWhale --label agent-ready --state open --json number,title,url
+gh issue list --repo codewhale-hq/CodeWhale --label agent-ready --state open --json number,title,url
 
 # 2. Claim it
 gh issue edit <N> --add-label agent-in-progress --remove-label agent-ready
@@ -140,7 +140,7 @@ gh issue view <N> --json body -q .body | \
 
 # 5. Verify (run the issue's Verification block verbatim)
 # 6. Deliver
-gh pr create --repo Hmbown/CodeWhale --base main \
+gh pr create --repo codewhale-hq/CodeWhale --base main \
   --title "<title>" --body "Closes #<N>"
 
 # 7. On blockage: swap label to needs-human + comment

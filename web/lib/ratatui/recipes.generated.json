@@ -1,0 +1,26 @@
+{
+  "sourceRevision": "4d5b05ba0709eb850e7415929b51c4db083d1241",
+  "sourceSha256": "4e8b679ac8ad746adf984bd94d18e21336b4310a9fb948c27da1e7a7eadf667f",
+  "recipes": {
+    "composer": {
+      "code": "pub fn draw_composer(\n    area: ratatui::layout::Rect,\n    buffer: &mut ratatui::buffer::Buffer,\n    theme: &codewhale_ratatui::Theme,\n    draft: &codewhale_ratatui::TextInputState,\n) -> Option<ratatui::layout::Position> {\n    use codewhale_ratatui::{NativeComposer, Paint};\n    let area = area.intersection(buffer.area);\n    if area.is_empty() {\n        return None;\n    }\n    let composer = NativeComposer::new(draft.text())\n        .focused(true)\n        .cursor(draft.cursor())\n        .can_submit(!draft.is_empty())\n        .placeholder(\"Type a line, then press Enter\");\n    let height = composer.desired_height(area.width, area.height);\n    let slot = ratatui::layout::Rect::new(area.x, area.bottom() - height, area.width, height);\n    composer.paint(slot, buffer, theme);\n    composer.cursor_position(slot)\n}\n",
+      "line": 10
+    },
+    "workbar": {
+      "code": "pub fn draw_workbar(\n    area: ratatui::layout::Rect,\n    buffer: &mut ratatui::buffer::Buffer,\n    theme: &codewhale_ratatui::Theme,\n) {\n    use codewhale_ratatui::{Paint, Workbar, WorkbarPanel, WorkbarRow};\n    // Replace these example rows with your application's current tasks.\n    Workbar::new(\n        WorkbarPanel::Tasks,\n        vec![\n            WorkbarRow::new(\"read\", \"Read the starter example\").mark(\"✓\"),\n            WorkbarRow::new(\"build\", \"Add a component to your app\").mark(\"●\"),\n        ],\n    )\n    .goal(\"Your first Codewhale component\")\n    .paint(area, buffer, theme);\n}\n",
+      "line": 34
+    },
+    "ocean": {
+      "code": "pub fn draw_ocean(\n    area: ratatui::layout::Rect,\n    buffer: &mut ratatui::buffer::Buffer,\n    theme: &codewhale_ratatui::Theme,\n) {\n    use codewhale_ratatui::{\n        Message, MotionMode, NativeComposer, OceanColumn, Paint, PostureBar, TerminalShell,\n        TuiGround,\n    };\n    use std::time::Duration;\n    let area = area.intersection(buffer.area);\n    if area.is_empty() {\n        return;\n    }\n    let composer = NativeComposer::new(\"\").placeholder(\"One continuous water column\");\n    let shell = TerminalShell::new(composer.desired_height(area.width, area.height));\n    let slots = shell.areas(area);\n    shell.paint(area, buffer, theme);\n    Message::native(\"Paint content first; finish ordinary grounds with the water.\").paint(\n        slots.conversation,\n        buffer,\n        theme,\n    );\n    composer.paint(slots.composer, buffer, theme);\n    PostureBar::new(\"ask\").paint(slots.posture, buffer, theme);\n    let water = OceanColumn::new(Duration::ZERO, MotionMode::Still).viewport(area);\n    water.apply(area, buffer, theme);\n    if let Some(ground) = theme.tui_ground(TuiGround::Composer).bg {\n        water.apply_matching(slots.composer, buffer, theme, ground);\n    }\n}\n",
+      "line": 54
+    },
+    "whale": {
+      "code": "pub fn draw_whale(\n    area: ratatui::layout::Rect,\n    buffer: &mut ratatui::buffer::Buffer,\n    theme: &codewhale_ratatui::Theme,\n) {\n    use codewhale_ratatui::{Paint, Whale, WhaleState};\n    // A still pose needs no clock. Narrow and ASCII viewports retain the words.\n    Whale::new(WhaleState::Rest)\n        .words(\"Ready when you are\")\n        .paint(area, buffer, theme);\n}\n",
+      "line": 88
+    },
+    "animated-whale": {
+      "code": "pub fn draw_animated_whale(\n    area: ratatui::layout::Rect,\n    buffer: &mut ratatui::buffer::Buffer,\n    theme: &codewhale_ratatui::Theme,\n    stage: &mut codewhale_ratatui::whale_motion::Stage,\n    now: std::time::Instant,\n) {\n    use codewhale_ratatui::whale_motion::colored_braille;\n    use codewhale_ratatui::{Whale, WhaleState, detect::Appearance};\n    // Keep this Stage in the host. Observe its inputs before drawing this frame.\n    let area = area.intersection(buffer.area);\n    stage.set_visible(area.width >= 16 && area.height >= 9 && !theme.ascii());\n    stage.advance(now);\n    let grid = colored_braille(\n        stage.director(),\n        usize::from(area.width.min(32)),\n        usize::from(area.height.saturating_sub(1).min(16)),\n        theme.caps().appearance != Appearance::Light,\n    );\n    // The host reports Working; this example has no agent or provider connection.\n    grid.paint(&Whale::new(WhaleState::Busy), area, buffer, theme);\n}\n",
+      "line": 102
+    }
+  }
+}

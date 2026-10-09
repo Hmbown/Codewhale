@@ -31,7 +31,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # ---- pins (release v0.9.11, tag commit 96d13a0bc3f40280ea3865280ad5ccf0e2845e6f)
 ENV CODEWHALE_VERSION=0.9.11 \
     CODEWHALE_COMMIT=96d13a0bc3f40280ea3865280ad5ccf0e2845e6f \
-    CODEWHALE_ASSET_URL=https://github.com/Hmbown/CodeWhale/releases/download/v0.9.11/codewhale-linux-x64 \
+    CODEWHALE_ASSET_URL=https://github.com/codewhale-hq/CodeWhale/releases/download/v0.9.11/codewhale-linux-x64 \
     CODEWHALE_ASSET_SHA256=c02969556e51e138afa3fe9c97a1359878cd3d1986b1ce1f5fa96c93c6909416 \
     NODE_MAJOR=22
 
@@ -83,12 +83,12 @@ LABEL org.opencontainers.image.title="codewhale-cloud-agent" \
       org.opencontainers.image.description="Codewhale cloud agent Computer: released codewhale CLI preinstalled for dispatched turns" \
       org.opencontainers.image.version="0.9.11" \
       org.opencontainers.image.revision="96d13a0bc3f40280ea3865280ad5ccf0e2845e6f" \
-      org.opencontainers.image.source="https://github.com/Hmbown/CodeWhale" \
+      org.opencontainers.image.source="https://github.com/codewhale-hq/CodeWhale" \
       net.codewhale.binary.asset="codewhale-linux-x64" \
       net.codewhale.binary.sha256="c02969556e51e138afa3fe9c97a1359878cd3d1986b1ce1f5fa96c93c6909416" \
       net.codewhale.binary.commit="96d13a0bc3f40280ea3865280ad5ccf0e2845e6f" \
       net.codewhale.binary.version="0.9.11" \
-      net.codewhale.release.image="ghcr.io/hmbown/codewhale:0.9.11@sha256:6de13fe5e62fb3cb815c423bcb17455bef4d9f7db2107888beb88fe4b7c9ac14"
+      net.codewhale.release.image="ghcr.io/codewhale-hq/codewhale:0.9.11@sha256:6de13fe5e62fb3cb815c423bcb17455bef4d9f7db2107888beb88fe4b7c9ac14"
 
 USER agent
 WORKDIR /work

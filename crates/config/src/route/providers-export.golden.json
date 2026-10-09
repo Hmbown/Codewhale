@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "0.10.1",
+  "runtimeVersion": "0.10.2",
   "routes": [
     {
       "id": "anthropic",
@@ -16,6 +16,10 @@
         {
           "kind": "api-key",
           "label": "API key"
+        },
+        {
+          "kind": "oauth",
+          "label": "OAuth"
         }
       ],
       "models": [
@@ -805,7 +809,7 @@
       "id": "openai-codex",
       "family": "openai-codex",
       "label": "OpenAI Codex (ChatGPT)",
-      "endpoint": "https://chatgpt.com/backend-api",
+      "endpoint": "https://api.openai.com/v1",
       "wire": "responses",
       "defaultModel": "gpt-5.6",
       "envVars": [
@@ -948,6 +952,10 @@
         {
           "kind": "api-key",
           "label": "API key"
+        },
+        {
+          "kind": "oauth",
+          "label": "OAuth"
         }
       ],
       "transport": "chat-completions"

@@ -1,0 +1,27 @@
+{
+  "description": "A URL server that answers 401 to initialize and no credential is configured. Pins Rust McpPool::note_connect_failure / error_needs_oauth_login / to_api_tools: boot reports the rejection with the /mcp login recovery, the server lands in the needs-auth state, the catalog offers exactly the synthetic mcp_<server>_authenticate tool, and a call to one of the server's real tool names fails with the auth-required hint instead of a bare unknown-tool error. Only unauthenticated initialize POSTs reach the server (the summary does not pin how many connect attempts the call makes).",
+  "server_name": "conformance",
+  "expect_boot": "error",
+  "record_requests": "summary",
+  "server": {
+    "initialize": {
+      "http": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Bearer realm=\"conformance\""
+        },
+        "body": "{\"error\":\"unauthorized\"}"
+      }
+    }
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {}
+    }
+  ]
+}

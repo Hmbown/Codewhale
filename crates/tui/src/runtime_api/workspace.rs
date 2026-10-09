@@ -706,6 +706,10 @@ fn write_workspace_file(
     bytes: &[u8],
     expected_revision: Option<&str>,
 ) -> Result<(StatusCode, Json<WorkspaceFileWriteResponse>), ApiError> {
+    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _write_guard = WRITES
+        .lock()
+        .map_err(|_| ApiError::internal("workspace file write lock is unavailable"))?;
     let root = canonical_workspace(workspace)?;
     let created = precheck_file_target(&root, relative)?.is_none();
     match (created, expected_revision) {
@@ -736,8 +740,7 @@ fn write_workspace_file(
             )));
         }
     }
-    file.replace(bytes)
-        .map_err(|error| map_fs_error(error, "file"))?;
+    publish_workspace_file(&file, bytes, created)?;
     Ok((
         if created {
             StatusCode::CREATED
@@ -752,6 +755,27 @@ fn write_workspace_file(
             written_at: chrono::Utc::now().to_rfc3339(),
         }),
     ))
+}
+
+pub(super) fn publish_workspace_file(
+    file: &crate::fleet::files::WorkspaceFile,
+    bytes: &[u8],
+    created: bool,
+) -> Result<(), ApiError> {
+    // Absence was observed before opening the confined parent. Another
+    // creator can publish meanwhile; never replace that creator's file.
+    let publication = if created {
+        file.publish(bytes)
+    } else {
+        file.replace(bytes)
+    };
+    publication.map_err(|error| {
+        if created && error.kind() == std::io::ErrorKind::AlreadyExists {
+            ApiError::conflict("file was created by another writer; read it before overwriting")
+        } else {
+            map_fs_error(error, "file")
+        }
+    })
 }
 
 // ── Effective instruction sources (#6168) ────────────────────────────────

@@ -2,12 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod model_catalog;
-
 /// Context window used only for legacy DeepSeek model IDs that do not name a
 /// newer V4 alias and do not carry an explicit `*k` suffix.
 pub const LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
-pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: u32 = 1_000_000;
+pub use codewhale_config::catalog::reviewed::constants::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS;
 /// Conservative Kimi Code K3 context baseline. The membership route's real
 /// context is plan-tier dependent (verified 2026-07-20 from
 /// <https://www.kimi.com/code/docs/en/kimi-code/models>): Moderato gets 256K,
@@ -20,12 +18,12 @@ pub const KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS: u32 = 262_144;
 /// Verified 2026-07-20 from <https://platform.kimi.ai/docs/guide/kimi-k3-quickstart>
 /// (1,048,576 tokens). Max output is a separate fact below and must never be
 /// conflated with this window.
-pub const KIMI_K3_CONTEXT_WINDOW_TOKENS: u32 = 1_048_576;
+pub use codewhale_config::catalog::reviewed::constants::KIMI_K3_CONTEXT_WINDOW_TOKENS;
 /// Conservative K3 default generation ceiling. The direct Kimi API defaults
 /// `max_completion_tokens` to 131,072, while its documented route maximum is
 /// a separate exact-route fact below. Membership and neighboring routes do
 /// not inherit that direct-platform maximum.
-pub const KIMI_K3_DEFAULT_MAX_COMPLETION_TOKENS: u32 = 131_072;
+pub use codewhale_config::catalog::reviewed::constants::KIMI_K3_DEFAULT_MAX_COMPLETION_TOKENS;
 /// Documented maximum output for the exact direct Kimi K3 API route.
 ///
 /// Source: <https://platform.kimi.ai/docs/guide/kimi-k3-quickstart> (verified 2026-07-20).
@@ -39,21 +37,7 @@ pub const DIRECT_KIMI_K3_MAX_OUTPUT_TOKENS: u32 = 1_048_576;
 /// `compaction_threshold_for_model` (#664).
 pub const DEFAULT_COMPACTION_TOKEN_THRESHOLD: usize = 102_400;
 pub fn canonical_official_deepseek_model_id(model: &str) -> Option<&'static str> {
-    match model.trim().to_ascii_lowercase().as_str() {
-        "deepseek-v4-pro"
-        | "deepseek-v4pro"
-        | "deepseek-ai/deepseek-v4-pro"
-        | "deepseek-ai/deepseek-v4pro"
-        | "deepseek/deepseek-v4-pro"
-        | "deepseek/deepseek-v4pro" => Some("deepseek-v4-pro"),
-        "deepseek-v4-flash"
-        | "deepseek-v4flash"
-        | "deepseek-ai/deepseek-v4-flash"
-        | "deepseek-ai/deepseek-v4flash"
-        | "deepseek/deepseek-v4-flash"
-        | "deepseek/deepseek-v4flash" => Some("deepseek-v4-flash"),
-        _ => None,
-    }
+    codewhale_config::catalog::reviewed::official_deepseek_model_id(model)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -124,6 +108,34 @@ pub fn is_output_limit_stop_reason(reason: Option<&str>) -> bool {
     })
 }
 
+/// Stop reason recorded for a response that reported `stop` while its own usage
+/// shows it ran to the requested output ceiling (#6889). The Chat Completions
+/// spelling, so every existing output-limit path treats it as a `length` stop.
+pub const OUTPUT_CEILING_STOP_REASON: &str = "length";
+
+/// True when a Chat Completions `stop` is contradicted by the provider's own
+/// usage: the completion tokens it reported equal the output ceiling the
+/// request asked for (#6889). A finished answer leaves the allowance unfilled,
+/// so this response was cut at the ceiling, typically by reasoning that used
+/// the allowance before or during the answer.
+///
+/// `reported_output_tokens` is `None` when the provider reported no usage; no
+/// inference is made then. The match is exact: a provider that does not count
+/// reasoning against the cap can report more than the ceiling on a finished
+/// answer. Only `stop` is second-guessed. The Anthropic and Responses wires
+/// report a limit stop through typed fields of their own, and one Responses
+/// route sends no ceiling at all.
+#[must_use]
+pub fn stop_contradicts_output_ceiling(
+    reason: Option<&str>,
+    reported_output_tokens: Option<u32>,
+    requested_max_tokens: u32,
+) -> bool {
+    requested_max_tokens > 0
+        && reported_output_tokens == Some(requested_max_tokens)
+        && reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("stop"))
+}
+
 /// True when the provider explicitly reported that it did not complete the
 /// response. Responses API reasons carry an `incomplete:` prefix so unknown
 /// future reasons cannot accidentally be accepted as a finished answer.
@@ -181,275 +193,27 @@ pub struct Usage {
 /// Unrecognized DeepSeek family names remain unknown.
 #[must_use]
 pub fn context_window_for_model(model: &str) -> Option<u32> {
-    if let Some(window) = crate::model_catalog::resolved_context_window(model) {
-        return Some(window);
-    }
-    let lower = model.to_lowercase();
-    // Concrete model facts take precedence over vendor-agnostic suffix
-    // inference (`k3-256k` means 262,144 tokens, not 256,000).
-    if let Some(window) = known_context_window_for_model(&lower) {
-        return Some(window);
-    }
-    if canonical_official_deepseek_model_id(&lower).is_some() {
-        return Some(DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS);
-    }
-    if let Some(explicit_window) = explicit_context_window_hint(&lower) {
-        return Some(explicit_window);
-    }
-    if is_openai_gpt_55_api_model(&lower) || is_openai_gpt_56_api_model(&lower) {
-        return Some(1_050_000);
-    }
-    if is_openai_codex_model(&lower) {
-        return Some(400_000);
-    }
-    if lower.contains("claude") {
-        return Some(200_000);
-    }
-    None
-}
-
-fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
-    match model_lower {
-        // OpenAI API model docs, verified 2026-06-12:
-        // https://developers.openai.com/api/docs/models/gpt-5.5
-        // Family aliases and snapshots are handled by
-        // `is_openai_gpt_55_api_model` before this table.
-        // OpenAI Codex model docs, verified 2026-06-12:
-        // https://developers.openai.com/api/docs/models/gpt-5-codex
-        // https://developers.openai.com/api/docs/models/gpt-5.3-codex
-        "gpt-5-codex" | "gpt-5.3-codex" => Some(400_000),
-        // Anthropic 4.6+ models carry a 1M window; Haiku stays at 200K (#3014).
-        // Opus 5 (GA 2026-07-24) is 1M / 128K per
-        // https://platform.claude.com/docs/en/about-claude/models/overview.
-        "claude-opus-4-8" | "claude-opus-5" | "claude-sonnet-4-6" | "claude-sonnet-5"
-        | "claude-fable-5" => Some(1_000_000),
-        "claude-haiku-4-5" => Some(200_000),
-        // DeepSeek V4.1 Flash, id verified live on api.deepseek.com /v1/models
-        // 2026-09-10. The V4 family ships 1M context / 384K output, and the
-        // vendor's own notice puts V4.1 Flash above V4 Pro on every metric.
-        // Listed here as an exact-id context fact; its price is time-varying
-        // and lives in `pricing.rs`, which is why this does not route through
-        // `canonical_official_deepseek_model_id`.
-        "deepseek-flash" | "deepseek/deepseek-flash" | "deepseek-ai/deepseek-flash" => {
-            Some(DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS)
-        }
-        "trinity-mini" => Some(128_000),
-        "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" | "trinity-large-preview" => {
-            Some(262_144)
-        }
-        "google/gemma-4-31b-it"
-        | "google/gemma-4-31b-it:free"
-        | "google/gemma-4-26b-a4b-it"
-        | "google/gemma-4-26b-a4b-it:free"
-        | "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-        | "qwen/qwen3.6-35b-a3b"
-        | "qwen/qwen3.6-max-preview"
-        | "qwen/qwen3.6-27b"
-        | "tencent/hy3-preview" => Some(262_144),
-        // Official Kimi K3 platform pricing (2026-07-20):
-        // https://platform.kimi.ai/docs/guide/kimi-k3-quickstart — 1,048,576 context
-        // for the open platform.
-        "moonshotai/kimi-k3" | "kimi-k3" | "opencode-go/kimi-k3" => {
-            Some(KIMI_K3_CONTEXT_WINDOW_TOKENS)
-        }
-        // Bare `k3` is plan-tier dependent; `k3-256k` is fixed at 256 KiTok.
-        // Neither may fall through to the generic suffix heuristic.
-        "k3" | "k3-256k" => Some(KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS),
-        // `kimi-k2.7-code-highspeed` is the same model on the direct
-        // platform's high-speed tier (262,144 context), per
-        // https://platform.kimi.ai/docs/pricing/chat-k27-code (2026-08-17).
-        "moonshotai/kimi-k2.7-code"
-        | "moonshotai/kimi-k2.7-code-highspeed"
-        | "moonshotai/kimi-k2.6"
-        | "moonshotai/kimi-k2.6:free"
-        | "kimi-k2.7-code"
-        | "kimi-k2.7-code-highspeed"
-        | "kimi-k2.6"
-        | "kimi-for-coding"
-        | "kimi-for-coding-highspeed" => Some(262_144),
-        "minimax-m2.7"
-        | "minimax/minimax-m2.7"
-        | "minimax-m2.7-highspeed"
-        | "minimax-m2.5"
-        | "minimax-m2.5-highspeed"
-        | "minimax-m2.1"
-        | "minimax-m2.1-highspeed"
-        | "minimax-m2" => Some(204_800),
-        "z-ai/glm-5.1" | "z-ai/glm-5v-turbo" | "glm-5.1" | "glm-5v-turbo" => Some(202_752),
-        "z-ai/glm-5-turbo" | "glm-5-turbo" => Some(202_752),
-        // GLM-5.3 limits are inherited from GLM-5.2 pending official Z.ai
-        // release metadata (see `INHERITED FROM glm-5.2` in config/models.rs).
-        // GLM-5.3-Flash is the published 1M multimodal sibling (2026-08-26).
-        "z-ai/glm-5.2" | "glm-5.2" | "z-ai/glm-5.3" | "glm-5.3" | "z-ai/glm-5.3-flash"
-        | "glm-5.3-flash" => Some(1_000_000),
-        "minimax/minimax-m3" | "minimax-m3" | "qwen/qwen3.8-flash" | "qwen/qwen3.6-flash"
-        | "qwen/qwen3.6-plus" => Some(1_000_000),
-        // Alibaba Cloud Model Studio (Token Plan console + curated catalog,
-        // verified 2026-08-03): ~1M context. Never fall through to the 128K
-        // legacy default — that number is the generation ceiling, not the window.
-        // Bare `qwen3.8-flash` is the OpenRouter short id (verified 2026-08-26
-        // against models.dev: 1M context / 131K output); Alibaba first-party
-        // does not list a flash row, so this is not a Model Studio default.
-        "qwen3.8-max"
-        | "qwen3.8-max-preview"
-        | "qwen3.8-flash"
-        | "qwen3.7-plus"
-        | "qwen3.7-max"
-        | "qwen3.6-flash" => Some(1_000_000),
-        "nvidia/nemotron-3-ultra-550b-a55b" | "nvidia/nemotron-3-ultra-550b-a55b:free" => {
-            Some(1_000_000)
-        }
-        "xiaomi/mimo-v2.5-pro"
-        | "xiaomi/mimo-v2.5"
-        | "mimo-v2.5-pro"
-        | "mimo-v2.5-pro-ultraspeed"
-        | "mimo-v2.5" => Some(1_000_000),
-        "mimo-v2.5-asr"
-        | "mimo-v2.5-tts"
-        | "mimo-v2.5-tts-voicedesign"
-        | "mimo-v2.5-tts-voiceclone"
-        | "mimo-v2-tts" => Some(8_000),
-        "grok-4.7" | "grok-4.6" | "grok-4.5" => Some(500_000),
-        "grok-4.3" => Some(1_000_000),
-        "grok-build" => Some(512_000),
-        "grok-composer-2.5-fast" => Some(200_000),
-        "grok-4.20-0309-reasoning" | "grok-4.20-0309-non-reasoning" => Some(2_000_000),
-        "muse-spark-1.1" | "muse-spark-1.2" | "muse-spark-1.2-contributor" => Some(1_000_000),
-        // Mistral la Plateforme text/reasoning models: all report 262144
-        // (256K) tokens on /v1/models as of 2026-08-08. Codestral coding
-        // model (mistral-code-latest) reports 256000 tokens on the same
-        // endpoint. IDs and windows verified live against
-        // https://api.mistral.ai/v1/models rather than model-card slugs.
-        "mistral-medium-latest"
-        | "mistral-medium-3-5"
-        | "mistral-medium-2604"
-        | "mistral-medium-3.5"
-        | "mistral-medium-3"
-        | "mistral-small-latest"
-        | "mistral-small-2603"
-        | "magistral-small-latest"
-        | "mistral-large-latest"
-        | "mistral-large-2512" => Some(262_144),
-        "mistral-code-latest" | "codestral-latest" | "codestral" | "mistral-code" => Some(256_000),
-        // Google Gemini API model pages (verified 2026-08-17): every current
-        // Gemini 3.x / 2.5 text model lists a 1,048,576-token input limit and
-        // a 65,536-token output limit.
-        // https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
-        // https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash
-        // https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash
-        // https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite
-        // https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview
-        // https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro
-        // https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash
-        // (gemini-3-pro-preview's page carries the same limits but is marked
-        // shut down since 2026-03-09 on the Gemini API; it stays here only
-        // because other routes still name it.)
-        "gemini-3.7-flash"
-        | "gemini-3.6-flash"
-        | "gemini-3.5-flash"
-        | "gemini-3.5-flash-lite"
-        | "gemini-3.1-pro-preview"
-        | "gemini-3-pro-preview"
-        | "gemini-2.5-pro"
-        | "gemini-2.5-flash" => Some(1_048_576),
-        // OpenRouter-hosted Dots Studio (RedNote) Dots3-Note preview: the only
-        // hosted route (single AtlasCloud endpoint) reports 512,000 context /
-        // 512,000 max completion tokens, https://openrouter.ai/api/v1/models/
-        // dots-studio/dots-3-note-preview:free/endpoints (2026-08-17).
-        "dots-studio/dots-3-note-preview:free" => Some(512_000),
-        _ => None,
-    }
+    codewhale_config::catalog::reviewed::intrinsic_model(model)
+        .and_then(|row| row.context_window)
+        .or_else(|| {
+            reviewed_snapshot_model(model).and_then(|id| {
+                codewhale_config::catalog::reviewed::intrinsic_model(id)
+                    .and_then(|row| row.context_window)
+            })
+        })
+        .or_else(|| explicit_context_window_hint(&model.to_ascii_lowercase()))
 }
 
 #[must_use]
 pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
-    if let Some(max_output) = crate::model_catalog::resolved_max_output(model) {
-        return Some(max_output);
-    }
-    let lower = model.to_lowercase();
-    if is_openai_gpt_55_api_model(&lower)
-        || is_openai_gpt_56_api_model(&lower)
-        || is_openai_codex_model(&lower)
-    {
-        return Some(128_000);
-    }
-    match lower.as_str() {
-        "gpt-5-codex" | "gpt-5.3-codex" => Some(128_000),
-        // claude-sonnet-4-6 max output raised 64K -> 128K per
-        // https://platform.claude.com/docs/en/about-claude/models/overview
-        // (2026-07-09 audit).
-        "claude-opus-4-8" | "claude-opus-5" | "claude-sonnet-4-6" | "claude-sonnet-5"
-        | "claude-fable-5" => Some(128_000),
-        "claude-haiku-4-5" => Some(64_000),
-        "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" => Some(262_144),
-        // Keep the generic/model-id lookup at K3's conservative documented
-        // default generation ceiling. The exact direct route's 1M maximum is
-        // applied later with endpoint-aware provenance; membership and
-        // neighboring routes must not inherit it.
-        "moonshotai/kimi-k3" | "kimi-k3" | "k3" | "k3-256k" | "opencode-go/kimi-k3" => {
-            Some(KIMI_K3_DEFAULT_MAX_COMPLETION_TOKENS)
-        }
-        // Kimi K2.7 Code has a 256K context window but its documented default
-        // maximum generation is 32K. Keeping those separate prevents the
-        // input budget from collapsing to the 1K emergency floor (#4368). The
-        // direct-platform value matches the provider-reported bundled
-        // catalog. The Kimi Code membership ids (`kimi-for-coding` family)
-        // are deliberately absent here: the membership catalog is the source
-        // of truth for their limits and no client-side output ceiling is
-        // claimed, so they fall back to the generic default.
-        "moonshotai/kimi-k2.7-code"
-        | "moonshotai/kimi-k2.7-code-highspeed"
-        | "moonshotai/kimi-k2.6"
-        | "kimi-k2.7-code"
-        | "kimi-k2.7-code-highspeed"
-        | "kimi-k2.6" => Some(32_768),
-        "minimax/minimax-m3" | "minimax-m3" => Some(524_288),
-        // Alibaba's published limit is 65,536 output tokens; the earlier
-        // 262,140 mirrored the context window (data-entry smell flagged by
-        // MODEL_PROVIDER_AUDIT A2/D-7, vendor-verified 2026-07-12).
-        "qwen/qwen3.6-35b-a3b"
-        | "qwen/qwen3.6-27b"
-        | "qwen/qwen3.6-flash"
-        | "qwen/qwen3.6-max-preview"
-        | "qwen/qwen3.6-plus" => Some(65_536),
-        // Model Studio: 128K is the generation ceiling, not the context window.
-        // OpenRouter qwen3.8-flash shares the 131,072 output cap (models.dev
-        // 2026-08-26); do not inherit qwen3.6-flash's 65,536 ceiling.
-        "qwen3.8-max" | "qwen3.8-max-preview" | "qwen/qwen3.8-flash" | "qwen3.8-flash" => {
-            Some(131_072)
-        }
-        "qwen3.7-plus" | "qwen3.7-max" | "qwen3.6-flash" => Some(65_536),
-        "z-ai/glm-5.1" | "z-ai/glm-5.2" | "z-ai/glm-5.3" | "z-ai/glm-5.3-flash"
-        | "z-ai/glm-5-turbo" | "glm-5.1" | "glm-5.2" | "glm-5.3" | "glm-5.3-flash"
-        | "glm-5-turbo" => Some(131_072),
-        "xiaomi/mimo-v2.5-pro"
-        | "xiaomi/mimo-v2.5"
-        | "mimo-v2.5-pro"
-        | "mimo-v2.5-pro-ultraspeed"
-        | "mimo-v2.5" => Some(131_072),
-        "mimo-v2.5-asr" => Some(2_048),
-        "mimo-v2.5-tts"
-        | "mimo-v2.5-tts-voicedesign"
-        | "mimo-v2.5-tts-voiceclone"
-        | "mimo-v2-tts" => Some(8_192),
-        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free" => Some(65_536),
-        "nvidia/nemotron-3-ultra-550b-a55b" => Some(16_384),
-        "nvidia/nemotron-3-ultra-550b-a55b:free" => Some(65_536),
-        "google/gemma-4-31b-it" => Some(16_384),
-        "google/gemma-4-31b-it:free" | "google/gemma-4-26b-a4b-it:free" => Some(32_768),
-        "muse-spark-1.1" | "muse-spark-1.2" | "muse-spark-1.2-contributor" => Some(32_000),
-        // Gemini API output token limit (see `known_context_window_for_model`).
-        "gemini-3.7-flash"
-        | "gemini-3.6-flash"
-        | "gemini-3.5-flash"
-        | "gemini-3.5-flash-lite"
-        | "gemini-3.1-pro-preview"
-        | "gemini-3-pro-preview"
-        | "gemini-2.5-pro"
-        | "gemini-2.5-flash" => Some(65_536),
-        "dots-studio/dots-3-note-preview:free" => Some(512_000),
-        _ => None,
-    }
+    codewhale_config::catalog::reviewed::intrinsic_model(model)
+        .and_then(|row| row.generation_default.or(row.max_output))
+        .or_else(|| {
+            reviewed_snapshot_model(model).and_then(|id| {
+                codewhale_config::catalog::reviewed::intrinsic_model(id)
+                    .and_then(|row| row.generation_default.or(row.max_output))
+            })
+        })
 }
 
 /// Catalog-first reasoning capability. `None` means no catalog row and no
@@ -460,67 +224,14 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
 /// unknown to `false` for existing stream/UI gates.
 #[must_use]
 pub fn model_reasoning_capability(model: &str) -> Option<bool> {
-    if let Some(supports_reasoning) = crate::model_catalog::resolved_supports_reasoning(model) {
-        return Some(supports_reasoning);
-    }
-    let lower = model.to_lowercase();
-    if canonical_official_deepseek_model_id(&lower).is_some() {
-        return Some(true);
-    }
-    // Bundled Models.dev snapshot (#6032): sourced `reasoning` booleans for
-    // ids the offline catalog does not carry. Exact-id rows only — the
-    // resolver never guesses from a prefix.
-    if let Some(reasoning) =
-        codewhale_config::catalog::bundled_models_dev_catalog().reasoning_support(&lower)
-    {
-        return Some(reasoning);
-    }
-    // Remaining prefix/list arms have no bundled-catalog row yet. They stay
-    // until each family is fully sourced (#6032 part 2). Do not invent rows.
-    if lower.starts_with("kimi-") {
-        return Some(true);
-    }
-    if lower.starts_with("mistral-medium")
-        || lower.starts_with("mistral-small")
-        || lower.starts_with("magistral")
-    {
-        return Some(true);
-    }
-    let listed = matches!(
-        lower.as_str(),
-        "arcee-ai/trinity-large-thinking"
-            | "thinkingmachines/inkling"
-            | "google/gemma-4-31b-it"
-            | "google/gemma-4-31b-it:free"
-            | "google/gemma-4-26b-a4b-it"
-            | "google/gemma-4-26b-a4b-it:free"
-            | "moonshotai/kimi-k2.7-code-highspeed"
-            | "moonshotai/kimi-k2.6"
-            | "moonshotai/kimi-k2.6:free"
-            | "minimax-m3"
-            | "minimax-m2.7-highspeed"
-            | "minimax-m2.5"
-            | "minimax-m2.5-highspeed"
-            | "minimax-m2.1"
-            | "minimax-m2.1-highspeed"
-            | "minimax-m2"
-            | "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-            | "nvidia/nemotron-3-ultra-550b-a55b"
-            | "nvidia/nemotron-3-ultra-550b-a55b:free"
-            | "qwen/qwen3.6-max-preview"
-            | "qwen/qwen3.6-27b"
-            | "tencent/hy3-preview"
-            | "xiaomi/mimo-v2.5-pro"
-            | "xiaomi/mimo-v2.5"
-            | "z-ai/glm-5.1"
-            | "z-ai/glm-5-turbo"
-            | "glm-5-turbo"
-            | "grok-build"
-            | "grok-4.20-0309-reasoning"
-    ) || is_openai_gpt_55_api_model(&lower)
-        || is_openai_gpt_56_api_model(&lower)
-        || is_openai_codex_model(&lower);
-    listed.then_some(true)
+    codewhale_config::catalog::reviewed::intrinsic_model(model)
+        .and_then(|row| row.reasoning)
+        .or_else(|| {
+            reviewed_snapshot_model(model).and_then(|id| {
+                codewhale_config::catalog::reviewed::intrinsic_model(id)
+                    .and_then(|row| row.reasoning)
+            })
+        })
 }
 
 #[must_use]
@@ -538,41 +249,21 @@ pub fn effective_muse_wire_id(model: &str) -> &str {
 
 #[must_use]
 pub fn model_is_openai_reasoning_family(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    is_openai_gpt_55_api_model(&lower)
-        || is_openai_gpt_56_api_model(&lower)
-        || is_openai_codex_model(&lower)
-}
-
-fn is_openai_gpt_55_api_model(model_lower: &str) -> bool {
-    matches!(model_lower, "gpt-5.5" | "gpt-5.5-pro")
-        || has_date_snapshot_suffix(model_lower, "gpt-5.5-")
-        || has_date_snapshot_suffix(model_lower, "gpt-5.5-pro-")
+    let lower = model.to_ascii_lowercase();
+    let reviewed = codewhale_config::catalog::reviewed::bundled_reviewed();
+    reviewed.openai_reasoning_ids.contains_key(&lower)
+        // Snapshot resolution spans every reviewed family; the resolved
+        // target must itself be an OpenAI reasoning row, or a DeepSeek
+        // snapshot would be relabelled as one.
+        || reviewed_snapshot_model(&lower)
+            .is_some_and(|target| reviewed.openai_reasoning_ids.contains_key(target))
 }
 
 pub fn is_openai_gpt_56_api_model(model_lower: &str) -> bool {
-    matches!(
-        model_lower,
-        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
-    )
-}
-
-fn is_openai_codex_model(model_lower: &str) -> bool {
-    matches!(
-        model_lower,
-        "gpt-5-codex"
-            | "gpt-5.1-codex"
-            | "gpt-5.1-codex-mini"
-            | "gpt-5.1-codex-max"
-            | "gpt-5.2-codex"
-            | "gpt-5.3-codex"
-            | "codex-gpt-5.5"
-            | "chatgpt-gpt-5.5"
-            | "gpt-5.5-codex"
-            | "gpt-5.5-codex-preview"
-            | "codex-gpt-5.5-preview"
-            | "chatgpt-gpt-5.5-preview"
-    )
+    codewhale_config::catalog::reviewed::bundled_reviewed()
+        .openai_reasoning_ids
+        .get(model_lower)
+        .is_some_and(|kind| kind == "gpt_56")
 }
 
 pub fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
@@ -589,6 +280,102 @@ pub fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
             .all(|(idx, byte)| idx == 4 || idx == 7 || byte.is_ascii_digit())
 }
 
+/// Resolve a snapshot or variant model id to the reviewed intrinsic row it
+/// denotes, without inventing facts for names the catalog does not own.
+///
+/// Two documented contracts, applied in order:
+/// - the authored `snapshot_prefixes` rows (`gpt-5.5-<YYYY-MM-DD>`);
+/// - a trailing date stamp (`-YYYY-MM-DD` or `-MMDD`) or an explicit variant
+///   marker (`-vision-exp`, `-vision`, `-exp`), accepted only when stripping
+///   it leaves the exact id of a reviewed intrinsic row
+///   (`deepseek-v4-pro-0813` denotes `deepseek-v4-pro`;
+///   `deepseek-v4-flash-vision` denotes `deepseek-v4-flash`).
+///   The compact `-YYYYMMDD` shape is deliberately not inferred: the
+///   sibling-metadata contract rejects it.
+///
+/// Every layer is resolved against the bundled reviewed catalog only. An
+/// unrecognized name still returns `None`: the unknown stays observable.
+fn reviewed_snapshot_model(model: &str) -> Option<&'static str> {
+    let reviewed = codewhale_config::catalog::reviewed::bundled_reviewed();
+    let via_authored_contract = |candidate: &str| {
+        reviewed
+            .snapshot_prefixes
+            .iter()
+            .find_map(|(prefix, target)| {
+                has_date_snapshot_suffix(candidate, prefix).then_some(target.as_str())
+            })
+    };
+    let mut candidate = model.to_ascii_lowercase();
+    for _ in 0..3 {
+        if let Some(target) = via_authored_contract(&candidate) {
+            return Some(target);
+        }
+        let stripped = strip_snapshot_or_variant_suffix(&candidate)?;
+        if let Some((key, _)) = reviewed.intrinsic.get_key_value(&stripped) {
+            return Some(key.as_str());
+        }
+        candidate = stripped;
+    }
+    None
+}
+
+/// One snapshot/variant normalization layer, longest marker first. The
+/// caller re-resolves the shortened id against the reviewed catalog and
+/// never accepts a shortening on its own.
+fn strip_snapshot_or_variant_suffix(id: &str) -> Option<String> {
+    for marker in ["-vision-exp", "-vision", "-exp"] {
+        if let Some(base) = id.strip_suffix(marker)
+            && !base.is_empty()
+        {
+            return Some(base.to_string());
+        }
+    }
+    strip_date_stamp(id)
+}
+
+/// Strip one trailing date stamp: `-YYYY-MM-DD` or `-MMDD` (the reviewed
+/// snapshot conventions). The compact `-YYYYMMDD` form is deliberately not
+/// inferred: the sibling-metadata contract rejects that shape (see
+/// `unrecognized_deepseek_models_do_not_inherit_sibling_metadata`).
+fn strip_date_stamp(id: &str) -> Option<String> {
+    // `-YYYY-MM-DD`: a ten-character tail preceded by its own dash. The split
+    // index is a byte offset, so it must land on a char boundary: a multi-byte
+    // model id would panic in `split_at` otherwise.
+    if id.len() > 11 && id.is_char_boundary(id.len() - 10) {
+        let (head, tail) = id.split_at(id.len() - 10);
+        if let Some(head) = head.strip_suffix('-')
+            && !head.is_empty()
+            && has_date_snapshot_suffix(tail, "")
+        {
+            return Some(head.to_string());
+        }
+    }
+    let (head, tail) = id.rsplit_once('-')?;
+    if head.is_empty() || tail.is_empty() {
+        return None;
+    }
+    let digits = tail.as_bytes();
+    if digits.len() == 4
+        && digits.iter().all(u8::is_ascii_digit)
+        && valid_month_day(&digits[0..2], &digits[2..4])
+    {
+        return Some(head.to_string());
+    }
+    None
+}
+
+/// Validate a two-digit month/day pair (ranges only, no calendar math).
+fn valid_month_day(month_digits: &[u8], day_digits: &[u8]) -> bool {
+    let two = |bytes: &[u8]| -> Option<u32> {
+        (bytes.len() == 2 && bytes.iter().all(u8::is_ascii_digit))
+            .then(|| u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0'))
+    };
+    match (two(month_digits), two(day_digits)) {
+        (Some(month), Some(day)) => (1..=12).contains(&month) && (1..=31).contains(&day),
+        _ => false,
+    }
+}
+
 /// The context window a model name's `_Nk` suffix advertises, when the
 /// catalog does not already describe the model (#5441).
 ///
@@ -599,10 +386,14 @@ pub fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
 /// mark it unverified.
 #[must_use]
 pub fn name_suffix_context_window_hint(model: &str) -> Option<u32> {
-    if crate::model_catalog::resolved_context_window(model).is_some() {
+    if codewhale_config::catalog::reviewed::intrinsic_model(model)
+        .and_then(|row| row.context_window)
+        .is_some()
+        || reviewed_snapshot_model(model).is_some()
+    {
         return None;
     }
-    explicit_context_window_hint(&model.to_lowercase())
+    explicit_context_window_hint(&model.to_ascii_lowercase())
 }
 
 /// Parse an explicit `_Nk` context-window hint from a model name (vendor
@@ -769,7 +560,6 @@ pub struct MessageDelta {
 mod tests {
     use super::*;
     use std::any::TypeId;
-    use std::collections::BTreeMap;
 
     /// #6032: `model_supports_reasoning` consults the catalog before its
     /// hand-maintained pile, so a literal arm that duplicates a catalog row is
@@ -841,7 +631,8 @@ mod tests {
         ];
         for model in removed {
             assert_eq!(
-                crate::model_catalog::resolved_supports_reasoning(model),
+                codewhale_config::catalog::reviewed::intrinsic_model(model)
+                    .and_then(|row| row.reasoning),
                 Some(true),
                 "{model} no longer has a catalog row, but its heuristic arm was \
                  deleted in #6032 — restore the row, or put the arm back"
@@ -875,8 +666,8 @@ mod tests {
             assert_eq!(
                 catalog.reasoning_support(model),
                 Some(true),
-                "{model} lost its bundled Models.dev row — restore the row or put \
-                 its heuristic arm back (#6032)"
+                "{model} lost its bundled Models.dev row — restore its reviewed \
+                 source row (#6032)"
             );
             assert!(
                 model_supports_reasoning(model),
@@ -885,109 +676,31 @@ mod tests {
         }
     }
 
-    /// #6032 part 3 coverage guard: every literal arm remaining in the
-    /// heuristic pile must be an id the bundled Models.dev snapshot does NOT
-    /// source, so the pile can only shrink as sourcing grows. If this fails,
-    /// the named arm is now redundant (or disagrees with the asset) — delete
-    /// it, do not widen it.
-    ///
-    /// Still unsourced/unknown as of 2026-09-15:
-    /// - the literal list below (OpenRouter-style vendor ids for Gemma,
-    ///   Kimi, MiniMax, Nemotron, Qwen, Hunyuan, MiMo, GLM, Grok families);
-    /// - the `kimi-` / `mistral-medium` / `mistral-small` / `magistral`
-    ///   prefix arms (no asset row states any Mistral-family fact at all);
-    /// - `is_openai_gpt_55_api_model` / `is_openai_gpt_56_api_model` /
-    ///   `is_openai_codex_model`, which must stay for their date-snapshot
-    ///   and chatgpt/codex variants (`gpt-5.5-2026-06-01`,
-    ///   `codex-gpt-5.5-preview`, …) that the asset does not enumerate.
+    /// #6032 coverage guard: exact reviewed facts and documented snapshot
+    /// contracts classify known models. Mistral's documented latest IDs now
+    /// have explicit reviewed reasoning facts; their family names and private
+    /// model names do not inherit those facts through a prefix heuristic.
     #[test]
     fn remaining_reasoning_heuristic_arms_are_unsourced_in_models_dev_bundled_asset() {
-        let catalog = codewhale_config::catalog::bundled_models_dev_catalog();
-        let remaining = [
-            "arcee-ai/trinity-large-thinking",
-            "thinkingmachines/inkling",
-            "google/gemma-4-31b-it",
-            "google/gemma-4-31b-it:free",
-            "google/gemma-4-26b-a4b-it",
-            "google/gemma-4-26b-a4b-it:free",
-            "moonshotai/kimi-k2.7-code-highspeed",
-            "moonshotai/kimi-k2.6",
-            "moonshotai/kimi-k2.6:free",
-            "minimax-m3",
-            "minimax-m2.7-highspeed",
-            "minimax-m2.5",
-            "minimax-m2.5-highspeed",
-            "minimax-m2.1",
-            "minimax-m2.1-highspeed",
-            "minimax-m2",
-            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-            "nvidia/nemotron-3-ultra-550b-a55b",
-            "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "qwen/qwen3.6-max-preview",
-            "qwen/qwen3.6-27b",
-            "tencent/hy3-preview",
-            "xiaomi/mimo-v2.5-pro",
-            "xiaomi/mimo-v2.5",
-            "z-ai/glm-5.1",
-            "z-ai/glm-5-turbo",
-            "glm-5-turbo",
-            "grok-build",
-            "grok-4.20-0309-reasoning",
-        ];
-        for model in remaining {
-            assert_eq!(
-                catalog.reasoning_support(model),
-                None,
-                "{model} is now sourced by the bundled Models.dev asset — delete \
-                 its heuristic arm instead of keeping both (#6032)"
-            );
-            assert_eq!(
-                model_reasoning_capability(model),
-                Some(true),
-                "{model} must still classify as reasoning-capable via the pile"
-            );
-        }
-        // The prefix/function arms are not enumerable literals, so the guard
-        // samples both directions: asset rows they overlap must agree with
-        // the arm's claim (`true`), and unsourced variants that still need
-        // the arm must stay unknown in the asset.
-        for sourced_and_agreeing in [
-            "kimi-k2.6",
-            "kimi-k2.7-code",
-            "kimi-k2.7-code-highspeed",
-            "kimi-k3",
-            "gpt-5.5",
-            "gpt-5.5-pro",
-            "gpt-5.6",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.3-codex",
-        ] {
-            assert_eq!(
-                catalog.reasoning_support(sourced_and_agreeing),
-                Some(true),
-                "{sourced_and_agreeing} now disagrees with its heuristic arm — \
-                 resolve the source before shipping (#6032)"
-            );
-        }
-        for still_arm_only in [
+        // Known facts are explicit data. Family resemblance is not a sourced
+        // capability, while the documented date-snapshot contract remains exact.
+        for model in [
             "kimi-k2.9",
+            "magistral-medium",
+            "claude-private-server",
+            "gpt-5.6-private",
+        ] {
+            assert_eq!(model_reasoning_capability(model), None, "{model}");
+        }
+        for model in [
             "mistral-medium-latest",
             "mistral-small-latest",
-            "magistral-medium",
             "gpt-5.5-2026-06-01",
             "gpt-5.1-codex-max",
             "codex-gpt-5.5-preview",
             "chatgpt-gpt-5.5",
         ] {
-            assert_eq!(
-                catalog.reasoning_support(still_arm_only),
-                None,
-                "{still_arm_only} is now sourced — its heuristic arm family may \
-                 be shrinkable (#6032)"
-            );
-            assert!(model_supports_reasoning(still_arm_only));
+            assert_eq!(model_reasoning_capability(model), Some(true), "{model}");
         }
     }
 
@@ -1004,6 +717,49 @@ mod tests {
         }
         for reason in [None, Some("end_turn"), Some("tool_use"), Some("")] {
             assert!(!is_output_limit_stop_reason(reason), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn stop_at_the_requested_ceiling_is_an_output_limit_stop() {
+        // #6889: 16000 requested, 16000 reported, `finish_reason: stop`.
+        assert!(stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(16_000),
+            16_000
+        ));
+        assert!(stop_contradicts_output_ceiling(
+            Some(" STOP "),
+            Some(50),
+            50
+        ));
+        assert!(is_output_limit_stop_reason(Some(
+            OUTPUT_CEILING_STOP_REASON
+        )));
+        assert!(is_incomplete_stop_reason(Some(OUTPUT_CEILING_STOP_REASON)));
+
+        // A finished answer leaves the allowance unfilled.
+        assert!(!stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(15_999),
+            16_000
+        ));
+        // Reasoning the provider does not count against the cap.
+        assert!(!stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(20_000),
+            16_000
+        ));
+        // No usage reported: nothing to compare.
+        assert!(!stop_contradicts_output_ceiling(Some("stop"), None, 16_000));
+        // No ceiling requested.
+        assert!(!stop_contradicts_output_ceiling(Some("stop"), Some(0), 0));
+        // Other wires and other stops keep their own reporting.
+        for reason in [None, Some("end_turn"), Some("tool_calls"), Some("length")] {
+            assert!(
+                !stop_contradicts_output_ceiling(reason, Some(16_000), 16_000),
+                "{reason:?}"
+            );
         }
     }
 
@@ -1099,15 +855,6 @@ mod tests {
 
     #[test]
     fn deepseek_v4_output_caps_require_exact_catalog_metadata() {
-        let _lock = crate::model_catalog::test_catalog_lock();
-        let catalog = crate::model_catalog::MergedCatalog::from_sources(
-            BTreeMap::new(),
-            None,
-            crate::model_catalog::bundled_catalog(),
-            chrono::Utc::now(),
-        );
-        let _guard = crate::model_catalog::replace_active_catalog_for_test(catalog);
-
         for model in [
             "deepseek-v4.1-flash-expires-on-0910",
             "deepseek-v4.1-flash",
@@ -1116,7 +863,7 @@ mod tests {
             "deepseek-v4-flash-vendor",
         ] {
             assert!(
-                crate::model_catalog::resolved_entry(model).is_none(),
+                codewhale_config::catalog::reviewed::intrinsic_model(model).is_none(),
                 "{model}"
             );
             assert_eq!(max_output_tokens_for_model(model), None, "{model}");
@@ -1380,40 +1127,14 @@ mod tests {
 
     #[test]
     fn model_metadata_catalog_override_flows_through_models_chokepoint() {
-        let _lock = crate::model_catalog::test_catalog_lock();
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "catalog-only-model".to_string(),
-            crate::model_catalog::CatalogEntry {
-                id: "catalog-only-model".to_string(),
-                context_window: Some(777_000),
-                max_output: Some(55_000),
-                supports_reasoning: Some(true),
-                input_usd_per_million: None,
-                output_usd_per_million: None,
-                modalities: Vec::new(),
-                supported_parameters: Vec::new(),
-                provider_model_id: None,
-                provenance: crate::model_catalog::MetadataProvenance::UserOverride,
-            },
+        let private=codewhale_config::models_dev::ModelsDevCatalog::parse_json(r#"{"providers":{"private":{"models":{"catalog-only-model":{"limit":{"context":777000,"output":55000},"reasoning":true}}}}}"#).unwrap();
+        assert!(
+            codewhale_config::catalog::reviewed::intrinsic_model_in(&private, "catalog-only-model")
+                .is_none()
         );
-        let catalog = crate::model_catalog::MergedCatalog::from_sources(
-            overrides,
-            None,
-            crate::model_catalog::bundled_catalog(),
-            chrono::Utc::now(),
-        );
-        let _guard = crate::model_catalog::replace_active_catalog_for_test(catalog);
-
-        assert_eq!(
-            context_window_for_model("catalog-only-model"),
-            Some(777_000)
-        );
-        assert_eq!(
-            max_output_tokens_for_model("catalog-only-model"),
-            Some(55_000)
-        );
-        assert!(model_supports_reasoning("catalog-only-model"));
+        assert_eq!(context_window_for_model("catalog-only-model"), None);
+        assert_eq!(max_output_tokens_for_model("catalog-only-model"), None);
+        assert_eq!(model_reasoning_capability("catalog-only-model"), None);
     }
 
     #[test]
@@ -1593,7 +1314,8 @@ mod tests {
         assert_eq!(context_window_for_model("z-ai/glm-5-turbo"), Some(202_752));
         assert!(model_supports_reasoning("z-ai/glm-5-turbo"));
         assert_eq!(
-            crate::model_catalog::resolved_max_output("kimi-k2.7-code"),
+            codewhale_config::catalog::reviewed::intrinsic_model("kimi-k2.7-code")
+                .and_then(|row| row.generation_default.or(row.max_output)),
             Some(32_768)
         );
         assert_eq!(max_output_tokens_for_model("kimi-k2.7-code"), Some(32_768));
@@ -1615,6 +1337,54 @@ mod tests {
             Some(256_000)
         );
         assert_eq!(context_window_for_model("deepseek-v3.2-2k-preview"), None);
+    }
+
+    /// 2026-10-05: custom gateways serve V4 under snapshot and variant ids
+    /// the reviewed catalog does not enumerate (`deepseek-v4-pro-0813`,
+    /// `deepseek-v4-flash-vision`). They denote the same rows as their base
+    /// ids and must inherit the base facts instead of falling back to the
+    /// 128K unknown shape.
+    #[test]
+    fn deepseek_v4_snapshot_and_variant_ids_inherit_reviewed_facts() {
+        for model in [
+            "deepseek-v4-pro-0813",
+            "DeepSeek-V4-Pro-0813",
+            "deepseek-v4-pro-2025-08-13",
+            "deepseek-v4-flash-vision",
+            "deepseek-v4-flash-vision-0813",
+        ] {
+            assert_eq!(context_window_for_model(model), Some(1_000_000), "{model}");
+            assert_eq!(max_output_tokens_for_model(model), Some(384_000), "{model}");
+            assert!(model_supports_reasoning(model), "{model}");
+        }
+        // A trailing number that is not a recognized date stamp, an
+        // eight-digit compact stamp, or an unknown base, stays unknown: the
+        // resolver never invents a row.
+        for model in [
+            "not-a-model-0813",
+            "deepseek-v4-pro-9913",
+            "deepseek-v4-pro-08130",
+            "deepseek-v4-pro-x0813",
+            "deepseek-v4-pro-20250813",
+        ] {
+            assert_eq!(context_window_for_model(model), None, "{model}");
+            assert_eq!(model_reasoning_capability(model), None, "{model}");
+        }
+        // Snapshot resolution must not relabel a DeepSeek row as an OpenAI
+        // reasoning model, while the OpenAI snapshot contract keeps working.
+        assert!(!model_is_openai_reasoning_family("deepseek-v4-pro-0813"));
+        assert!(model_is_openai_reasoning_family("gpt-5.5-2026-06-01"));
+    }
+
+    /// Multi-byte model ids must not panic the byte-indexed date scan: the
+    /// `-YYYY-MM-DD` layer splits at `len - 10`, which need not be a UTF-8
+    /// char boundary (review finding from the PR #6 review).
+    #[test]
+    fn non_ascii_ids_do_not_panic_the_snapshot_scan() {
+        for model in ["模型模型模型模型", "ローカルモデル-2026", "モデル-0813"] {
+            assert_eq!(context_window_for_model(model), None, "{model}");
+            assert_eq!(model_reasoning_capability(model), None, "{model}");
+        }
     }
 
     #[test]

@@ -15,13 +15,6 @@ function selectorBlock(selector: string): string {
 
 const PINNED_DARK = ':root[data-theme="dark"]';
 
-/** Every custom property declared in the OS-dark block (inside the media query). */
-function osDarkVars(): Record<string, string> {
-  const media = CSS.match(/@media \(prefers-color-scheme: dark\)\s*\{\s*:root:not\(\[data-theme="light"\]\)\s*\{([^}]*)\}/);
-  if (!media) throw new Error("Missing OS-dark block");
-  return Object.fromEntries([...media[1].matchAll(/--([\w-]+):\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]));
-}
-
 function allVars(selector: string): Record<string, string> {
   return Object.fromEntries(
     [...selectorBlock(selector).matchAll(/--([\w-]+):\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]),
@@ -29,11 +22,12 @@ function allVars(selector: string): Record<string, string> {
 }
 
 describe("site-wide theme contract", () => {
-  it("follows the OS by default and repeats the pinned dark scheme exactly", () => {
+  it("is paper by default; dark is a reader's pin, never the OS", () => {
     // No region-scoped dark sheet: the docs portal follows the root theme.
     expect(CSS).not.toMatch(/html\[data-theme="dark"\] \.docs-(portal|theme)/);
     expect(CSS).toMatch(/(?:^|\n):root \{[^}]*color-scheme:\s*light;/);
-    expect(osDarkVars()).toEqual(allVars(PINNED_DARK));
+    expect(CSS).not.toMatch(/@media \(prefers-color-scheme: dark\)/);
+    expect(Object.keys(allVars(PINNED_DARK))).toContain("bg");
     expect(selectorBlock(PINNED_DARK)).toMatch(/color-scheme:\s*dark/);
   });
 
@@ -43,14 +37,14 @@ describe("site-wide theme contract", () => {
     expect(CSS).toMatch(/\.paper-wordmark-logo,\s*\.wordmark\s*\{[^}]*background: var\(--mark-ink\);/);
   });
 
-  it("shows the toggle on every page with one system|light|dark storage contract", () => {
+  it("shows the toggle on every page with one light|dark storage contract", () => {
     const toggle = readFileSync(new URL("../components/theme-toggle.tsx", import.meta.url), "utf8");
     expect(toggle).not.toMatch(/isDocsPath|return null/);
-    expect(toggle).toMatch(/"system" \| "light" \| "dark"/);
+    expect(toggle).toMatch(/type Mode = "light" \| "dark"/);
     expect(toggle).toContain('const KEY = "cw-theme"');
     const layout = readFileSync(new URL("../app/[locale]/layout.tsx", import.meta.url), "utf8");
-    // The boot script pins only an explicit light/dark; anything else (system,
-    // a legacy "auto", nothing) is left to prefers-color-scheme.
+    // The boot script pins only an explicit light/dark; anything else (a
+    // legacy "system" or "auto", nothing) stays on paper.
     expect(layout).toContain("localStorage.getItem('cw-theme');if(t==='light'||t==='dark')");
   });
 });

@@ -284,7 +284,7 @@ fn run_exec(workspace: &Path, home: &Path, server: &MockServer) -> std::process:
         "allow_shell = true\n\n[retry]\nenabled = false\n",
     )
     .expect("headless test config");
-    let mut command = Command::new(binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace)
@@ -465,14 +465,6 @@ fn sse_response(body: String) -> ResponseTemplate {
 
 fn json_response(value: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(value)
-}
-
-fn binary() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_codewhale-tui")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/codewhale-tui")
-        })
 }
 
 fn preserve_host_env(command: &mut Command) {

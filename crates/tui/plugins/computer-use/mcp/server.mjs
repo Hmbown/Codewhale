@@ -16,7 +16,7 @@ import { tryJson, withSignal, throwIfAborted, wait, currentSignal } from "../src
 import { inputRefusal, watchLease, HUMAN_DRIVING } from "../src/lease.mjs";
 import { APP_VERSION, helperStaleness } from "../src/app-socket.mjs";
 import { checkAppScript } from "../src/app-script-policy.mjs";
-import { createRecorder, readTrajectory, listTrajectories, resolveTrajectory, isTrajectoryTool } from "../src/trajectory.mjs";
+import { createRecorder, readTrajectory, listTrajectories, resolveTrajectory, isTrajectoryTool, containsRasterPin } from "../src/trajectory.mjs";
 
 const SERVER_NAME = "codewhale-cu";
 
@@ -277,10 +277,24 @@ class ServerError extends Error {
   constructor(code, message, extra = null) { super(message); this.code = code; if (extra) this.extra = extra; }
 }
 
-/** Map raster-pixel coordinates to screen points using the bound raster. */
-function rasterToPoints(computerId, x, y) {
+/** A supplied capture identity must still be the current raster on this route. */
+function currentRaster(computerId, rasterId) {
   const r = lastRasters.get(computerId);
   if (!r) throw new ServerError("no_raster", "no screenshot bound on this computer yet — call screenshot first so pixel targets have a frame");
+  if (rasterId !== undefined) {
+    if (typeof rasterId !== "string" || !rasterId || rasterId.length > 128) {
+      throw new ServerError("bad_target", "raster_id must be the string returned by screenshot, zoom or OCR");
+    }
+    if (rasterId !== r.raster_id) {
+      throw new ServerError("raster_stale", "raster_id is not the current capture on this computer — observe again before choosing coordinates");
+    }
+  }
+  return r;
+}
+
+/** Map raster-pixel coordinates to screen points using the bound raster. */
+function rasterToPoints(computerId, x, y, rasterId) {
+  const r = currentRaster(computerId, rasterId);
   if (r.pixels?.w != null && r.pixels?.h != null && (x < 0 || y < 0 || x >= r.pixels.w || y >= r.pixels.h)) {
     throw new ServerError("target_outside_raster", `target (${x},${y}) is outside the bound raster (${r.pixels.w}x${r.pixels.h} pixels) — take a fresh screenshot`);
   }
@@ -298,13 +312,15 @@ function rasterToPoints(computerId, x, y) {
 async function normalizeTarget(computer, target, kind, resolve, sink) {
   if (target?.type === "coordinate") {
     if (target.space === "screen") {
+      if (target.raster_id !== undefined) throw new ServerError("bad_target", "raster_id pins raster pixels, not absolute screen points");
       if (!Number.isFinite(target.x) || !Number.isFinite(target.y)) {
         throw new ServerError("bad_target", "screen coordinates must be finite numbers");
       }
       return { x: Math.round(target.x), y: Math.round(target.y), strategy: "event", coordinate_space: "screen" };
     }
     if (target.x < 0 || target.y < 0) throw new ServerError("bad_target", "raster coordinates must be non-negative");
-    const pt = rasterToPoints(computer.id, target.x, target.y);
+    const pt = rasterToPoints(computer.id, target.x, target.y, target.raster_id);
+    if (sink) sink.rasterId = lastRasters.get(computer.id).raster_id;
     return { x: Math.round(pt.x), y: Math.round(pt.y), strategy: "event", coordinate_space: "raster" };
   }
   if (target?.type === "element") {
@@ -355,30 +371,33 @@ async function normalizeTarget(computer, target, kind, resolve, sink) {
   throw new ServerError("bad_target", "target must be {type:'coordinate',x,y} or {type:'element',index} (state_id optional to pin a specific observation)");
 }
 
-function bindRaster(computer, shot) {
-  lastRasters.set(computer.id, {
+function bindRaster(computer, shot, sourceFile = shot.file ?? shot.path) {
+  const raster = {
+    raster_id: crypto.randomUUID(),
     file: shot.file ?? shot.path,
+    sourceFile,
     scale: shot.scale ?? 1,
     origin: shot.points ?? { x: 0, y: 0 },
     pixels: shot.pixels ?? null,
     capturedAt: shot.capturedAt ?? new Date().toISOString(),
-  });
+  };
+  lastRasters.set(computer.id, raster);
+  return raster;
 }
 
 /** A zoom produces a child raster: origin shifted by the crop, parent scale. */
-function bindZoomRaster(computer, parent, region, file) {
+function bindZoomRaster(computer, parent, region, file, sourceFile = file) {
   const scale = parent.scale && parent.scale > 0 ? parent.scale : 1;
-  lastRasters.set(computer.id, {
+  return bindRaster(computer, {
     file,
     scale,
-    origin: {
+    points: {
       x: (parent.origin?.x ?? 0) + region[0] / scale,
       y: (parent.origin?.y ?? 0) + region[1] / scale,
     },
     pixels: { w: region[2], h: region[3] },
-    parent: parent.file,
     capturedAt: new Date().toISOString(),
-  });
+  }, sourceFile);
 }
 
 function rememberState(computer, app_ref, result) {
@@ -467,24 +486,24 @@ async function invokeType(invoke, prepared) {
   return { ...last, newlines_as_return: true, typed_parts: steps.length };
 }
 
-function observeState(computer, app_ref, result, args = {}) {
+function observeState(computer, app_ref, result, args = {}, bindWhen = null) {
   // Cache the complete backend records before making the model-facing view.
   // Public indices still address those records, including their private AX
   // paths; a compact response must never weaken live target revalidation.
   // Ephemeral polls (wait_for) share the filter math without churning the
   // state cache: only the observation a caller can act on earns a state_id.
-  const ephemeral = args.ephemeral === true;
+  const filtered = filterElements(result.elements, {
+    detail: args.detail === "full" ? "full" : "summary", query: args.query,
+    role: args.role, limit: args.limit, offset: args.offset,
+    compact: args.detail === "compact" || args.compact === true,
+  });
+  const ephemeral = args.ephemeral === true || (bindWhen && (result.found === false || !bindWhen({ matched: filtered.matched, tree_truncated: result.truncated === true })));
+  const baseId = args.since === "latest" ? latestStateByComputer.get(computer.id) : args.since;
+  const baseline = baseId ? appStates.get(baseId) : null;
+  if (baseline && baseline.computerId !== computer.id) throw new ServerError("state_wrong_computer", "since belongs to another computer — observe this computer first");
   const state_id = ephemeral ? null : rememberState(computer, app_ref, result);
   const compact = args.detail === "compact" || args.compact === true;
   const detail = args.detail === "full" ? "full" : compact ? "compact" : "summary";
-  const filtered = filterElements(result.elements, {
-    detail: args.detail === "full" ? "full" : "summary",
-    query: args.query,
-    role: args.role,
-    limit: args.limit,
-    offset: args.offset,
-    compact,
-  });
   const data = {
     ...result,
     state_id,
@@ -494,12 +513,120 @@ function observeState(computer, app_ref, result, args = {}) {
     offset: filtered.offset,
     returned: filtered.returned,
     truncated: filtered.truncated,
+    tree_truncated: result.truncated === true,
     note: ephemeral
       ? "Ephemeral poll: elements are not bound to a state_id."
       : "Indices target this observation's cached tree (including rows not shown); pin it with state_id, or re-observe after the app changes.",
   };
   if (compact && data.ocr && args.include_ocr !== true) delete data.ocr;
-  return fitStatePayload(data, STATE_CHAR_BUDGET);
+  // Diffs compare the same bounded view, never replace the complete records
+  // used for target revalidation, and never carry raster/OCR coordinates.
+  const view = fitStatePayload(data, STATE_CHAR_BUDGET);
+  const options = { detail, window_id: args.window_id ?? null, query: args.query ?? null, role: args.role ?? null,
+    limit: args.limit ?? null, offset: args.offset ?? 0, include_ocr: args.include_ocr === true };
+  const identity = { name: result.name, pid: result.pid, bundle_id: result.bundle_id, found: result.found };
+  if (!ephemeral) Object.assign(appStates.get(state_id), { view: { elements: view.elements, options, identity, truncated: view.truncated, treeTruncated: result.truncated === true } });
+  if (!args.since || ephemeral) return view;
+  const previous = baseline?.view;
+  if (!previous || !isDeepStrictEqual(previous.options, options) || !isDeepStrictEqual(previous.identity, identity) ||
+      previous.truncated || view.truncated || previous.treeTruncated || result.truncated === true || args.include_ocr) {
+    return { ...view, delta: false, resync_required: true, note: "Full observation: the baseline expired, changed scope, or was incomplete. Use this state_id for the next since read." };
+  }
+  const old = new Map(previous.elements.map((el) => [el.index, el]));
+  const current = new Set(view.elements.map((el) => el.index));
+  const changed = view.elements.filter((el) => !isDeepStrictEqual(old.get(el.index), el));
+  return { ...view, elements: changed, returned: changed.length, delta: true, base_state_id: baseId,
+    removed_indices: previous.elements.filter((el) => !current.has(el.index)).map((el) => el.index),
+    unchanged: view.elements.length - changed.length,
+    note: "Changed rows for the same view; removed_indices left that view. All element indices target the new state_id. Re-observe after UI changes." };
+}
+
+function batchSteps(args, computer) {
+  if (!Array.isArray(args.steps) || args.steps.length < 1 || args.steps.length > 8) throw new ServerError("bad_args", "run_actions needs 1..8 steps");
+  // Validate plan shape before input. Runtime argument, consent, route,
+  // target and human-control checks still run per call; batches are not atomic.
+  return args.steps.map((step, i) => {
+    if (!step || typeof step.tool !== "string") throw new ServerError("bad_args", `step ${i} needs a tool name`);
+    if (Object.keys(step).some((key) => !["tool", "arguments", "args", "find"].includes(key))) throw new ServerError("bad_args", `step ${i} accepts tool, arguments (or args), and find`);
+    if (step.arguments !== undefined && step.args !== undefined) throw new ServerError("bad_args", `step ${i} cannot use both arguments and args`);
+    const input = step.arguments !== undefined ? step.arguments : step.args !== undefined ? step.args : {};
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new ServerError("bad_args", `step ${i} arguments must be an object`);
+    if (input.computer !== undefined && input.computer !== computer.id) throw new ServerError("bad_args", `step ${i} cannot switch computers inside a batch`);
+    if (!TOOL_NAMES.has(step.tool)) throw new ServerError("unknown_tool", `unknown tool "${step.tool}"`);
+    const resolved = resolveTool(step.tool, input);
+    if (resolved.args.computer !== undefined && resolved.args.computer !== computer.id) throw new ServerError("bad_args", `step ${i} cannot select another computer through an alias`);
+    validateToolArgs(computer, resolved.name, resolved.args);
+    if (["run_actions", "trajectory_replay"].includes(resolved.name)) throw new ServerError("bad_args", "run_actions cannot nest or replay another batch");
+    if (isConsentDecision(step.tool, input)) throw new ServerError("bad_args", "consent decisions cannot be a run_actions step — record each one as its own consent call after the user answers");
+    if (needsUserDecision(step.tool, input)) throw new ServerError("consent_needs_user", `${step.tool} needs the user's own approval as its own call, not a run_actions step`);
+    if (GRANT && !GRANT.has(step.tool) && !GRANT.has(resolved.name)) throw new ServerError("not_granted", `step ${i} is outside this session's capability grant`);
+    if (step.find !== undefined) {
+      const find = step.find;
+      if (!find || typeof find !== "object" || Array.isArray(find) || Object.keys(find).some((key) => !["query", "role", "app_ref", "window_id"].includes(key)) ||
+          (find.query !== undefined && (typeof find.query !== "string" || !find.query.trim())) ||
+          (find.role !== undefined && (typeof find.role !== "string" || !find.role.trim())) || (!find.query && !find.role)) {
+        throw new ServerError("bad_args", `step ${i} find needs a nonempty query and/or exact role, with optional app_ref/window_id`);
+      }
+      if (resolved.args.target !== undefined || !TOOLS.find((tool) => tool.name === resolved.name)?.inputSchema.properties.target) throw new ServerError("bad_args", `step ${i} find needs a tool accepting target and cannot replace an explicit target`);
+      validateToolArgs(computer, "get_app_state", find);
+    }
+    for (const field of REQUIRED_ARGS.get(resolved.name) ?? []) {
+      if (resolved.args[field] == null && !(field === "target" && step.find)) throw new ServerError("bad_args", `step ${i} ${step.tool} requires "${field}"`);
+    }
+    return { tool: step.tool, arguments: input, find: step.find };
+  });
+}
+
+const batchInputSent = (body) => body?.action_sent === true || body?.steps?.some((step) => batchInputSent(step.receipt ?? step)) === true;
+
+async function runActions(computer, args, switched) {
+  const steps = batchSteps(args, computer);
+  let observe = null;
+  if (args.observe !== undefined && args.observe !== false) {
+    if (args.observe !== true && (!args.observe || typeof args.observe !== "object" || Array.isArray(args.observe))) throw new ServerError("bad_args", "observe must be true, false or get_app_state arguments");
+    if (args.observe.computer !== undefined && args.observe.computer !== computer.id) throw new ServerError("bad_args", "final observation cannot switch computers inside a batch");
+    observe = { detail: "compact", limit: 20, ...(args.observe === true ? {} : args.observe), computer: computer.id };
+    if (Object.keys(observe).some((key) => !Object.hasOwn(TOOLS.find((tool) => tool.name === "get_app_state").inputSchema.properties, key))) throw new ServerError("bad_args", "observe accepts get_app_state arguments only");
+    await prepareArgs(computer, "get_app_state", observe, null, {});
+  }
+  const results = [];
+  const summary = () => ({ tool: "run_actions", switched, steps: results, completed_steps: results.filter((step) => step.ok).length,
+    attempted_steps: results.length, action_sent: results.some((step) => batchInputSent(step.receipt)) ? true : results.some((step) => step.receipt.outcome_unknown) ? null : false,
+    outcome_unknown: results.some((step) => step.receipt.outcome_unknown === true) });
+  for (const [i, step] of steps.entries()) {
+    const input = { ...step.arguments, computer: computer.id };
+    let body;
+    let isError = false;
+    try {
+      throwIfAborted();
+      if (step.find) {
+        const found = await callTool({ name: "get_app_state", arguments: { ...step.find, detail: "compact", limit: 2, computer: computer.id } });
+        const state = JSON.parse(found.content[0].text);
+        if (found.isError || state.ok === false) body = state;
+        else if (state.matched <= 1 && (state.tree_truncated || state.truncated)) body = fail(computer, "observation_incomplete", "Named lookup cannot prove uniqueness in an incomplete observation. Narrow the app/window or observe and select a target explicitly.", { candidates: state.elements, matched: state.matched });
+        else if (state.matched !== 1 || state.returned !== 1) body = fail(computer, state.matched > 1 ? "element_ambiguous" : "element_not_found", "Named batch target must match exactly one element. Narrow query/role or observe the app before acting.", { candidates: state.elements, matched: state.matched });
+        else input.target = { type: "element", state_id: state.state_id, index: state.elements[0].index };
+      }
+      if (!body) {
+        const result = await callTool({ name: step.tool, arguments: input });
+        body = JSON.parse(result.content[0].text);
+        isError = result.isError;
+      }
+    } catch (err) {
+      body = fail(computer, err.code === "cancelled" ? cancelledCode() : err.code ?? "step_failed", err.message);
+      isError = true;
+    }
+    const failed = isError || body.ok === false || (step.tool === "wait_for" && body.matched !== true);
+    results.push({ tool: step.tool, ok: !failed, receipt: body });
+    if (failed) return { content: [{ type: "text", text: JSON.stringify(fail(computer, body.error?.code ?? "condition_not_met", body.error?.message ?? "Batch wait condition was not met", { ...summary(), stopped_at: i })) }], isError: true };
+  }
+  let observation;
+  if (observe) {
+    const result = await callTool({ name: "get_app_state", arguments: observe });
+    observation = JSON.parse(result.content[0].text);
+    if (result.isError || observation.ok === false) return { content: [{ type: "text", text: JSON.stringify(fail(computer, observation.error?.code ?? "observe_failed", observation.error?.message ?? "Final observation failed; completed steps must not be replayed", { ...summary(), observation })) }], isError: true };
+  }
+  return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, ...summary(), ...(observation ? { observation } : {}) })) }] };
 }
 
 /**
@@ -510,7 +637,7 @@ function observeState(computer, app_ref, result, args = {}) {
  * Errors that can resolve themselves (app not launched yet) count as "no
  * match yet"; errors that cannot (stopped, route changed) abort the wait.
  */
-async function waitFor(computer, args, switched) {
+function validateWaitArgs(args) {
   const { query, role } = args;
   if (query == null && role == null) throw new ServerError("bad_args", "wait_for needs a query and/or role to watch for");
   if (query != null && typeof query !== "string") throw new ServerError("bad_args", "query must be a string");
@@ -523,12 +650,18 @@ async function waitFor(computer, args, switched) {
   if (!Number.isInteger(intervalMs) || intervalMs < 100 || intervalMs > 5000) throw new ServerError("bad_args", "interval must be an integer 100..5000 ms");
   const limit = args.limit ?? 20;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new ServerError("bad_args", "limit must be an integer 1..100");
+  return { query, role, state, timeoutSec, intervalMs, limit };
+}
 
+async function waitFor(computer, args, switched) {
+  const { query, role, state, timeoutSec, intervalMs, limit } = validateWaitArgs(args);
   const FATAL = new Set(["cancelled", "control_stopped", "computer_route_changed", "app_upgrade_required"]);
-  const observe = (ephemeral) => callTool({ name: "get_app_state", arguments: {
+  const missingApp = (body) => body?.found === false || /application not found/.test(body?.error?.message ?? "");
+  const satisfies = (body) => state === "absent" ? body.matched === 0 && !body.tree_truncated : body.matched > 0;
+  const observe = (ephemeral, bindWhen = null) => callTool({ name: "get_app_state", arguments: {
     app_ref: args.app_ref, window_id: args.window_id, query, role,
     limit, detail: "compact", ephemeral, computer: computer.id,
-  }});
+  }}, bindWhen);
   const started = Date.now();
   const deadline = started + timeoutSec * 1000;
   let polls = 0, lastError = null, everObserved = false;
@@ -537,23 +670,32 @@ async function waitFor(computer, args, switched) {
     polls++;
     const body = JSON.parse(res.content[0].text);
     let usable = false, matchedCount = 0;
-    if (!res.isError && body.ok !== false) { usable = true; matchedCount = body.matched ?? 0; }
+    if (!res.isError && body.ok !== false) {
+      matchedCount = body.matched ?? 0;
+      usable = state !== "absent" || matchedCount > 0 || !body.tree_truncated;
+      if (!usable) lastError = { code: "observation_incomplete", message: "An incomplete walk cannot prove absence" };
+    }
     else if (FATAL.has(body?.error?.code)) {
       return { content: [{ type: "text", text: JSON.stringify(fail(computer, body.error.code, body.error.message, { tool: "wait_for", switched, polls })) }], isError: true };
-    } else if (body?.found === false || /application not found/.test(body?.error?.message ?? "")) {
+    } else if (missingApp(body)) {
       usable = true; // not running yet, or gone: zero matches either way
     } else {
       lastError = body?.error ?? { code: "observe_failed", message: "observation failed" };
     }
     if (usable) { everObserved = true; lastError = null; }
     if (usable && (state === "absent" ? matchedCount === 0 : matchedCount > 0)) {
-      const bound = await observe(false);
+      const bound = await observe(false, satisfies);
       polls++;
       const b = JSON.parse(bound.content[0].text);
-      if (bound.isError || b.ok === false) {
-        return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, note: "Condition held but the follow-up observation failed — call get_app_state before targeting." })) }] };
+      if (state === "absent" && !FATAL.has(b.error?.code) && missingApp(b)) {
+        return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, matched_count: 0, elements: [], note: "The application is absent; no targetable app state exists. Observe again before acting." })) }] };
       }
-      return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, state_id: b.state_id, matched_count: b.matched ?? 0, elements: b.elements, app: { name: b.name ?? null, pid: b.pid ?? null, bundle_id: b.bundle_id ?? null }, note: "Elements are bound to this observation — target them with {type:'element', index}; add state_id only to pin this snapshot after later observes. Re-observe if the UI changes again." })) }] };
+      if (bound.isError || b.ok === false) {
+        return { content: [{ type: "text", text: JSON.stringify(fail(computer, b.error?.code ?? "observe_failed", b.error?.message ?? "Follow-up observation failed", { tool: "wait_for", switched, matched: false, state, polls, elapsed_ms: Date.now() - started })) }], isError: true };
+      }
+      if (satisfies(b)) {
+        return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, state_id: b.state_id, matched_count: b.matched ?? 0, elements: b.elements, app: { name: b.name ?? null, pid: b.pid ?? null, bundle_id: b.bundle_id ?? null }, note: "Elements are bound to this observation — target them with {type:'element', index}; add state_id only to pin this snapshot after later observes. Re-observe if the UI changes again." })) }] };
+      }
     }
     if (Date.now() >= deadline) break;
     await wait(Math.min(intervalMs, Math.max(1, deadline - Date.now())));
@@ -717,6 +859,51 @@ async function consentCheck(computer, name, args) {
   return grant ? { grant } : null;
 }
 
+// ---------- input ownership ----------
+// Keystrokes and pointer events go to whichever window the OS routes them to,
+// which is not necessarily the app the agent last observed. A backend that
+// implements input_owner reports the app behind that window (keyboard: the
+// active window; pointer: the topmost window under the point), and the
+// consent ledger decides on that identity. Backends without input_owner keep
+// the bound-app and element checks above.
+const KEYBOARD_INPUT_TOOLS = new Set(["type", "key", "hold_key"]);
+const POINTER_INPUT_TOOLS = new Set(["left_click", "double_click", "triple_click", "right_click", "middle_click", "mouse_move", "scroll", "left_mouse_down"]);
+
+/** Every ledger key that identifies this owner: its window class, its process name and its pid. */
+function ownerKeys(owner) {
+  const keys = new Set();
+  for (const name of [owner.name, owner.comm]) for (const key of consent.appKeys({ name })) keys.add(key);
+  for (const key of consent.appKeys({ pid: owner.pid })) keys.add(key);
+  return [...keys];
+}
+
+async function inputOwnerCheck(computer, name, prepared, backend) {
+  if (computer.transport !== "local" || computer.owned === true || typeof backend.input_owner !== "function") return;
+  const checks = [];
+  if (KEYBOARD_INPUT_TOOLS.has(name)) checks.push({ kind: "keyboard" });
+  else if (name === "left_click_drag") checks.push({ kind: "pointer", at: prepared.from_target }, { kind: "pointer", at: prepared.to });
+  else if (POINTER_INPUT_TOOLS.has(name)) checks.push({ kind: "pointer", at: prepared.target });
+  else return;
+  for (const check of checks) {
+    const at = check.at && Number.isFinite(check.at.x) && Number.isFinite(check.at.y) ? { x: check.at.x, y: check.at.y } : undefined;
+    const owner = await backend.input_owner({ kind: check.kind, ...(at ? { point: at } : {}) });
+    if (!owner) continue; // the desktop itself: no application receives this input
+    const verdict = consent.decisionFor(computer.id, ownerKeys(owner));
+    const desc = owner.name ?? (owner.pid ? `pid ${owner.pid}` : "the application");
+    const arg = owner.name ?? `pid:${owner.pid}`;
+    if (verdict.state === "denied") {
+      throw new ServerError("app_denied",
+        `the user denied access to ${desc} on this computer — do not work around it; only they can change it (consent {action:"revoke"}).`,
+        { app: owner });
+    }
+    if (verdict.state === "undecided") {
+      throw new ServerError("consent_required",
+        `Codewhale needs the user's permission to use ${desc} on this computer — ask them, then record their answer with consent {action:"allow"|"deny", app:"${arg}"}. This ${check.kind} input would reach ${desc}, the app that owns the window receiving it.`,
+        { app: owner });
+    }
+  }
+}
+
 // ---------- irreversible-action confirmation ----------
 // A click or press on a control labelled pay, buy, send, transfer, delete (and
 // their close relatives) moves money or destroys something, and the text that
@@ -824,7 +1011,7 @@ function assertNotOwnedElsewhere(id) {
 }
 
 // ---------- tool dispatch ----------
-async function callTool(params) {
+async function callTool(params, bindWhen = null) {
   const requested = params.name;
   if (!TOOL_NAMES.has(requested)) {
     return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: { code: "unknown_tool", message: `unknown tool "${requested}"` } }) }], isError: true };
@@ -911,6 +1098,9 @@ async function callTool(params) {
       return { content: [{ type: "text", text: JSON.stringify(fail(null, "replay_too_large", `this trajectory has ${calls.length} calls; replay is limited to 200 at a time`)) }], isError: true };
     }
     const dryRun = args.dry_run === true;
+    // Old files may lack replayable:false; never strip or remap a saved pin.
+    const cannotReplay = call => call.replayable === false || call.redacted === true
+      || isConsentDecision(call.tool, call.args) || needsUserDecision(call.tool, call.args) || containsRasterPin(call.args);
     const results = [];
     if (!dryRun) {
       replaying = true;
@@ -919,7 +1109,7 @@ async function callTool(params) {
           if (controlStopped && !READ_ONLY_TOOLS.has(call.tool)) { results.push({ tool: call.tool, ok: false, code: "control_stopped" }); break; }
           // A redacted step carries a placeholder, not what was entered —
           // replaying it would type "[redacted]" into the app.
-          if (call.replayable === false || call.redacted === true || isConsentDecision(call.tool, call.args) || needsUserDecision(call.tool, call.args)) { results.push({ tool: call.tool, ok: false, code: "not_replayable" }); break; }
+          if (cannotReplay(call)) { results.push({ tool: call.tool, ok: false, code: "not_replayable" }); break; }
           let body = null;
           try {
             const r = await callTool({ name: call.tool, arguments: call.args ?? {} });
@@ -935,7 +1125,7 @@ async function callTool(params) {
       } finally { replaying = false; }
     }
     const failed = results.filter((r) => r.ok === false).length;
-    return { content: [{ type: "text", text: JSON.stringify(receipt(null, { ok: true, tool: "trajectory_replay", trajectory: path.basename(file), dry_run: dryRun, turns_in_file: calls.length, replayed: results.length, failed, ...(dryRun ? { plan: calls.map((c) => c.tool), not_replayable: calls.flatMap((c, i) => (c.replayable === false || c.redacted === true || isConsentDecision(c.tool, c.args) || needsUserDecision(c.tool, c.args)) ? [i] : []) } : { results }), note: dryRun ? "Nothing was executed. Run again without dry_run:true to replay through the normal gates." : "Replay re-entered the normal pipeline; grants, permissions and the kill switch still apply." })) }] };
+    return { content: [{ type: "text", text: JSON.stringify(receipt(null, { ok: true, tool: "trajectory_replay", trajectory: path.basename(file), dry_run: dryRun, turns_in_file: calls.length, replayed: results.length, failed, ...(dryRun ? { plan: calls.map((c) => c.tool), not_replayable: calls.flatMap((c, i) => cannotReplay(c) ? [i] : []) } : { results }), note: dryRun ? "Nothing was executed. Review not_replayable: saved capture pins, entered text and consent decisions cannot replay. Other steps re-enter the normal gates." : "Replay re-entered the normal pipeline; grants, permissions and the kill switch still apply." })) }] };
   }
 
   if (name === "computer_list") {
@@ -951,7 +1141,8 @@ async function callTool(params) {
   if (name === "computer_register") {
     try {
       assertNotOwnedElsewhere(args.computer);
-      const entry = registry.register({ id: args.computer, transport: args.transport, label: args.label, host: args.host, port: args.port, user: args.user, knownHosts: args.knownHosts, target: args.target });      await bindComputer(entry);
+      const entry = registry.register({ id: args.computer, transport: args.transport, label: args.label, host: args.host, port: args.port, user: args.user, knownHosts: args.knownHosts, target: args.target });
+      await bindComputer(entry);
       let installed = null;
       if (entry.transport === "ssh" && args.installAgent !== false) {
         installed = await installRemoteAgent(entry);
@@ -1020,9 +1211,15 @@ async function callTool(params) {
   }
 
   if (name === "computer_switch") {
-    const c = registry.get(args.computer);
-    activeComputerId = c.id;
-    return { content: [{ type: "text", text: JSON.stringify(receipt(c, { ok: true, active: c.id })) }] };
+    // An unknown id is the caller's mistake: report it as a tool failure with
+    // the registry's code, not as a protocol error.
+    try {
+      const c = registry.get(args.computer);
+      activeComputerId = c.id;
+      return { content: [{ type: "text", text: JSON.stringify(receipt(c, { ok: true, active: c.id })) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: JSON.stringify(fail(null, err.code ?? "computer_error", err.message ?? String(err), { tool: name })) }], isError: true };
+    }
   }
 
   // Everything below acts on a computer.
@@ -1102,23 +1299,7 @@ async function callTool(params) {
     const gateResult = await consentCheck(computer, name, args);
     confirmationCheck(computer, name, args);
     if (name === "run_actions") {
-      const steps = args.steps;
-      if (!Array.isArray(steps) || steps.length < 1 || steps.length > 8) throw new ServerError("bad_args", "run_actions needs 1..8 steps");
-      const results = [];
-      for (const [i, step] of steps.entries()) {
-        if (!step || typeof step.tool !== "string") throw new ServerError("bad_args", `step ${i} needs a tool name`);
-        if (step.tool === "run_actions") throw new ServerError("bad_args", "run_actions cannot nest");
-        if (isConsentDecision(step.tool, step.arguments)) throw new ServerError("bad_args", "consent decisions cannot be a run_actions step — record each one as its own consent call after the user answers");
-        if (needsUserDecision(step.tool, step.arguments)) throw new ServerError("consent_needs_user", `${step.tool} needs the user's own approval as its own call, not a run_actions step`);
-        if (!TOOL_NAMES.has(step.tool)) throw new ServerError("unknown_tool", `unknown tool "${step.tool}"`);
-        const result = await callTool({ name: step.tool, arguments: { ...(step.arguments ?? {}), computer: computer.id } });
-        const body = JSON.parse(result.content[0].text);
-        results.push({ tool: step.tool, ok: body.ok !== false, receipt: body });
-        if (body.ok === false || result.isError) {
-          return { content: [{ type: "text", text: JSON.stringify(fail(computer, body.error?.code ?? "step_failed", body.error?.message ?? "step failed", { tool: "run_actions", switched, stopped_at: i, steps: results })) }], isError: true };
-        }
-      }
-      return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "run_actions", switched, steps: results })) }] };
+      return await runActions(computer, args, switched);
     }
     if (name === "find_elements") {
       const st = args.state_id ? appStates.get(args.state_id) : null;
@@ -1175,8 +1356,7 @@ async function callTool(params) {
     // only the backend) so it can bind the child raster after success.
     let zoomParent = null;
     if (name === "zoom") {
-      zoomParent = lastRasters.get(computer.id);
-      if (!zoomParent) throw new ServerError("no_raster", "no screenshot bound on this computer yet — call screenshot first so zoom has a source raster");
+      zoomParent = currentRaster(computer.id, args.raster_id);
       if (!Array.isArray(args.region) || args.region.length !== 4) throw new ServerError("bad_args", "zoom needs region [x, y, w, h] in last-raster pixels");
     }
     const sink = { reacquired: false };
@@ -1233,17 +1413,17 @@ async function callTool(params) {
       }
       await assertCurrentRoute(computer, binding, true);
       if (Array.isArray(data)) data = { items: data };
-      if ((backendMethod === "screenshot" || backendMethod === "zoom") && data?.file) {
+      if (backendMethod === "screenshot" && data?.file) {
         if (ex.filesLocal) bindRaster(computer, data);
         else {
           // Raster lives on the remote machine; bind geometry for coordinate mapping.
-          bindRaster(computer, { ...data, file: null });
+          bindRaster(computer, { ...data, file: null, path: null }, data.file ?? data.path);
           data.note = "file lives on the remote computer; pull it with scp if you need the bytes locally";
         }
       }
-      if (backendMethod === "zoom") bindZoomRaster(computer, zoomParent, args.region, ex.filesLocal ? data?.file ?? data?.path : null);
+      if (backendMethod === "zoom") bindZoomRaster(computer, zoomParent, args.region, ex.filesLocal ? data?.file ?? data?.path : null, data?.file ?? data?.path);
       if (name === "get_app_state") {
-        data = observeState(computer, wireArgs.app_ref, data, args);
+        data = observeState(computer, wireArgs.app_ref, data, args, bindWhen);
       }
       if (backendMethod === "probe") Object.assign(data, { via: ex.kind, app: ex.app ?? null });
       if (backendMethod === "probe" && data?.app?.version && data.app.version !== APP_VERSION) {
@@ -1264,6 +1444,7 @@ async function callTool(params) {
       }
       const resolve = typeof backend.resolve_element === "function" ? (req) => backend.resolve_element(req) : null;
       const prepared = await prepareArgs(computer, name, args, resolve, sink);
+      await inputOwnerCheck(computer, name, prepared, backend);
       throwIfAborted();
       await assertCurrentRoute(computer, binding);
       if (controlStopped && !READ_ONLY_TOOLS.has(name)) throw new ServerError("control_stopped", "stop_computer_control is active; no further actions are permitted this session");
@@ -1282,13 +1463,22 @@ async function callTool(params) {
       if (name === "screenshot") bindRaster(computer, data);
       if (backendMethod === "zoom") bindZoomRaster(computer, zoomParent, args.region, data?.file ?? data?.path);
       if (name === "get_app_state") {
-        data = observeState(computer, prepared.app_ref, data, args);
+        data = observeState(computer, prepared.app_ref, data, args, bindWhen);
       }
       if (backendMethod === "probe" && computer.transport === "local") {
         // Direct mode: permissions belong to whatever hosts this server. Say so.
         Object.assign(data, { via: "direct", app: null, appHint: ex?.appReason ?? null });
       }
     }
+
+    if (name === "screenshot" || name === "zoom") {
+      data.raster_id = lastRasters.get(computer.id)?.raster_id;
+      if (name === "zoom") data.parent_raster_id = zoomParent.raster_id;
+    }
+
+    // Every successful launch retires captured pixels, including backends
+    // that report only launch status rather than a resolved app identity.
+    if (name === "open_application") lastRasters.delete(computer.id);
 
     // Binding a different app retires this computer's element cache: a bare
     // index must never silently address the previous app's observation —
@@ -1320,7 +1510,11 @@ async function callTool(params) {
       data.ocr ??= { status: "unavailable", reason: "Text recognition is not available on this backend", blocks: [] };
       if (data.ocr.raster) {
         const localFile = typeof ex?.remote !== "function" || ex.filesLocal;
-        bindRaster(computer, localFile ? data.ocr.raster : { ...data.ocr.raster, file: null, path: null });
+        const raster = bindRaster(computer, localFile ? data.ocr.raster : { ...data.ocr.raster, file: null, path: null }, data.ocr.raster.file ?? data.ocr.raster.path);
+        data.ocr.raster.raster_id = raster.raster_id;
+        for (const block of data.ocr.blocks ?? []) {
+          if (block.target?.type === "coordinate" && block.target.space !== "screen") block.target.raster_id = raster.raster_id;
+        }
       }
       data.ocr.note = "Recognized text may be imperfect. These coordinate targets belong to this captured image, not to accessibility elements; observe again after the UI changes. Prefer ocr_region or query over a second full-window OCR.";
     }
@@ -1351,7 +1545,7 @@ async function callTool(params) {
       const grant = grantReport();
       if (grant) data.grant = grant;
     }
-    const content = [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, ...(sink.reacquired ? { target_reacquired: true } : {}), ...data })) }];
+    const content = [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, ...(sink.reacquired ? { target_reacquired: true } : {}), ...data, ...(sink.rasterId ? { target_raster_id: sink.rasterId } : {}) })) }];
     if (imageBlock) content.push(imageBlock);
     if ((name === "screenshot" && (data?.file || data?.path) && data?.pixels?.w > 0 && data?.pixels?.h > 0) ||
         (name === "browser_screenshot" && !!data?.file) ||
@@ -1362,9 +1556,11 @@ async function callTool(params) {
   } catch (err) {
     // A failed open_application cleared the backend's input binding before it
     // attempted anything — the tracked bound app must not claim otherwise.
-    if (name === "open_application") boundApps.delete(computer.id);
-    // A local backend that timed out or was cancelled after posting input
-    // (inputMayHaveBeenSent) is as unknown as a transport that lost the reply.
+    if (name === "open_application") {
+      boundApps.delete(computer.id);
+      lastRasters.delete(computer.id);
+    }
+    // Local input may have landed before cancellation or timeout too.
     let outcomeUnknown = !!(err.requestDispatched || err.inputMayHaveBeenSent);
     if (dispatched && !outcomeUnknown) {
       // A transport/backend can fail after delivering input. Reconcile its
@@ -1388,6 +1584,30 @@ async function callTool(params) {
   }
 }
 
+// Shared side-effect-free argument checks. Live targets and backend constraints
+// remain dispatch-time checks, so a batch may retain earlier completed effects.
+function validateToolArgs(computer, name, out) {
+  if (name === "wait_for") validateWaitArgs(out);
+  if (name === "get_app_state" || name === "find_elements") {
+    if (out.since !== undefined && (typeof out.since !== "string" || !out.since.trim() || out.since.length > 128)) throw new ServerError("bad_args", "since must be latest or an observation state_id");
+    const baseline = appStates.get(out.since === "latest" ? latestStateByComputer.get(computer.id) : out.since);
+    if (baseline && baseline.computerId !== computer.id) throw new ServerError("state_wrong_computer", "since belongs to another computer — observe this computer first");
+    if (out.detail != null && !["summary", "compact", "full"].includes(out.detail)) throw new ServerError("bad_args", "detail must be summary, compact or full");
+    if (out.include_ocr != null && typeof out.include_ocr !== "boolean") throw new ServerError("bad_args", "include_ocr must be true or false");
+    if (out.window_id != null && (!Number.isSafeInteger(out.window_id) || out.window_id < 0)) throw new ServerError("bad_args", "window_id must be a non-negative window index from list_windows");
+    if (out.limit != null && (!Number.isSafeInteger(out.limit) || out.limit < 1 || out.limit > 200)) throw new ServerError("bad_args", "limit must be an integer 1..200");
+    if (out.offset != null && (!Number.isSafeInteger(out.offset) || out.offset < 0)) throw new ServerError("bad_args", "offset must be a non-negative integer");
+    if (out.query != null && typeof out.query !== "string") throw new ServerError("bad_args", "query must be a string");
+    if (out.role != null && typeof out.role !== "string") throw new ServerError("bad_args", "role must be a string");
+    if (out.ocr_region != null && (!Array.isArray(out.ocr_region) || out.ocr_region.length !== 4)) throw new ServerError("bad_args", "ocr_region must be [x, y, w, h] in screen points");
+  }
+  if (name === "app_script") {
+    if (typeof out.script !== "string" || !out.script.trim()) throw new ServerError("bad_args", "app_script needs a non-empty script string");
+    if (out.language != null && !["applescript", "javascript"].includes(out.language)) throw new ServerError("bad_args", 'app_script language must be "applescript" or "javascript"');
+    if (out.timeout != null && (!Number.isFinite(out.timeout) || out.timeout <= 0 || out.timeout > 120)) throw new ServerError("bad_args", "app_script timeout must be 1..120 seconds");
+  }
+}
+
 /**
  * Convert public tool args into backend args, identically for every route.
  * Element targets carry their revalidated AX path and fresh center; coordinate
@@ -1402,9 +1622,16 @@ async function prepareArgs(computer, name, args, resolve, sink) {
   const out = { ...args };
   delete out.computer;
   delete out.ephemeral; // server-internal: never reaches a backend
-  // Captures and crops read only rasters the backend itself produced; a
-  // caller-named source file is never forwarded.
+  // Ignore caller-named source files. Zoom forwards only the parent file
+  // selected from this computer's server-bound capture below.
   if (name === "screenshot" || name === "zoom") delete out.source;
+  delete out.raster_id; // capture identity is checked here, not by older helpers
+  if (name === "zoom") {
+    // Every backend accepts a source, but some retain only the original shot.
+    // Crop our bound parent, never an arbitrary caller-supplied file.
+    out.source = currentRaster(computer.id, args.raster_id).sourceFile;
+    if (typeof out.source !== "string" || !out.source) throw new ServerError("no_raster", "the bound capture has no source file — take a fresh screenshot before zooming");
+  }
   // type/key join the semantic set: their element target addresses a window
   // for input routing (hosted panels), not a point for pointer delivery.
   const semantic = new Set(["set_value", "select_text", "perform_action", "focus", "get_value", "type", "key"]);
@@ -1421,25 +1648,12 @@ async function prepareArgs(computer, name, args, resolve, sink) {
     }
     const kind = key === "target" && semantic.has(name) ? "semantic" : "pointer";
     out[key] = { ...given, ...(await normalizeTarget(computer, given, kind, resolve, sink)) };
+    delete out[key].raster_id;
   }
-  if (name === "get_app_state" || name === "find_elements") {
-    if (out.detail != null && !["summary", "compact", "full"].includes(out.detail)) throw new ServerError("bad_args", "detail must be summary, compact or full");
-    if (name === "get_app_state") {
-      out.compact = out.detail === "compact";
-      out.detail = out.detail === "full" ? "full" : "summary";
-    }
-    if (out.include_ocr != null && typeof out.include_ocr !== "boolean") throw new ServerError("bad_args", "include_ocr must be true or false");
-    if (out.window_id != null && (!Number.isSafeInteger(out.window_id) || out.window_id < 0)) throw new ServerError("bad_args", "window_id must be a non-negative window index from list_windows");
-    if (out.limit != null && (!Number.isSafeInteger(out.limit) || out.limit < 1 || out.limit > 200)) throw new ServerError("bad_args", "limit must be an integer 1..200");
-    if (out.offset != null && (!Number.isSafeInteger(out.offset) || out.offset < 0)) throw new ServerError("bad_args", "offset must be a non-negative integer");
-    if (out.query != null && typeof out.query !== "string") throw new ServerError("bad_args", "query must be a string");
-    if (out.role != null && typeof out.role !== "string") throw new ServerError("bad_args", "role must be a string");
-    if (out.ocr_region != null && (!Array.isArray(out.ocr_region) || out.ocr_region.length !== 4)) throw new ServerError("bad_args", "ocr_region must be [x, y, w, h] in screen points");
-  }
-  if (name === "app_script") {
-    if (typeof out.script !== "string" || !out.script.trim()) throw new ServerError("bad_args", "app_script needs a non-empty script string");
-    if (out.language != null && !["applescript", "javascript"].includes(out.language)) throw new ServerError("bad_args", 'app_script language must be "applescript" or "javascript"');
-    if (out.timeout != null && (!Number.isFinite(out.timeout) || out.timeout <= 0 || out.timeout > 120)) throw new ServerError("bad_args", "app_script timeout must be 1..120 seconds");
+  validateToolArgs(computer, name, out);
+  if (name === "get_app_state") {
+    out.compact = out.detail === "compact";
+    out.detail = out.detail === "full" ? "full" : "summary";
   }
   return out;
 }
@@ -1461,7 +1675,8 @@ function paramError(message) {
 // The operating guide travels with the server and is served as MCP resources
 // (skill://codewhale-cu/…) so any host can read the loop, the failure codes and
 // the safety rules without paying for them in every receipt. The pack is loaded
-// once at startup; a trimmed install without skills/ simply serves none.
+// once at startup. An incomplete pack is an installation error, never a
+// silently instruction-free computer-control server.
 const SKILL_NAME = "computer-use";
 const SKILL_ROOT_URI = `skill://codewhale-cu/SKILL.md`;
 
@@ -1486,18 +1701,20 @@ const skillPack = (() => {
     ["SKILL.md", "text/markdown"],
     ["references/quick-reference.md", "text/markdown"],
     ["references/refusal-codes.md", "text/markdown"],
+    ["references/operating-details.md", "text/markdown"],
+    ["recording/SKILL.md", "text/markdown"],
   ];
   const pack = [];
   for (const [rel, mime] of files) {
     try {
-      const bytes = fs.readFileSync(new URL(rel, root));
+      const bytes = fs.readFileSync(new URL(rel === "recording/SKILL.md" ? "../recording/SKILL.md" : rel, root));
       const text = bytes.toString("utf8");
       pack.push({
         rel, uri: `skill://codewhale-cu/${rel}`, mime, size: bytes.length, text,
-        frontmatter: rel === "SKILL.md" ? parseFrontmatter(text) : null,
+        frontmatter: rel.endsWith("SKILL.md") ? parseFrontmatter(text) : null,
         sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
       });
-    } catch { /* no pack on disk — serve nothing */ }
+    } catch (error) { throw new Error(`Computer Use skill pack is incomplete (${rel}): ${error.message}`); }
   }
   return pack;
 })();
@@ -1528,6 +1745,7 @@ const HANDLERS = {
         resources: { listChanged: false, subscribe: false },
         experimental: { "io.modelcontextprotocol/skills": {} },
       },
+      instructions: skillPack.find((file) => file.uri === SKILL_ROOT_URI).text,
       serverInfo: { name: SERVER_NAME, version: APP_VERSION, platforms: ["darwin", "win32", "linux", "harmonyos"], transports: ["local", "ssh", "hdc"] },
     };
   },
@@ -1566,7 +1784,7 @@ const HANDLERS = {
     const entry = skillPack.find((f) => f.uri === (params?.uri ?? SKILL_ROOT_URI));
     if (!entry) throw paramError(`skill "${params?.uri ?? ""}" is unknown — skills/list names the catalog`);
     return {
-      skill: { uri: entry.uri, name: SKILL_NAME, description: SKILL_DESCRIPTION, frontmatter: entry.frontmatter, content: entry.text },
+      skill: { uri: entry.uri, name: entry.frontmatter?.name ?? SKILL_NAME, description: SKILL_DESCRIPTION, frontmatter: entry.frontmatter, content: entry.text },
       manifest: skillPack.map(({ uri, sha256, size }) => ({ uri, sha256, bytes: size })),
     };
   },

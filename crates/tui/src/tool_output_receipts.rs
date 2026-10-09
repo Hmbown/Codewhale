@@ -2,6 +2,7 @@
 
 use crate::artifacts::ArtifactRecord;
 
+#[cfg(test)]
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_models::{ContentBlock, Message};
 
@@ -10,14 +11,7 @@ use codewhale_models::{ContentBlock, Message};
 /// route's inline budget (`route_budget::route_inline_char_budget`).
 pub const RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS: usize = 12_000;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ToolOutputStatus {
-    pub raw_large_count: usize,
-    pub raw_large_chars: usize,
-    pub receipt_count: usize,
-    pub artifact_count: usize,
-    pub artifact_bytes: u64,
-}
+pub use codewhale_command_contract::config_policy::StatusToolOutputs as ToolOutputStatus;
 
 pub fn tool_output_status(messages: &[Message], artifacts: &[ArtifactRecord]) -> ToolOutputStatus {
     let mut status = ToolOutputStatus {
@@ -49,36 +43,18 @@ pub fn tool_output_status(messages: &[Message], artifacts: &[ArtifactRecord]) ->
     status
 }
 
-pub fn format_tool_output_status(status: &ToolOutputStatus, locale: Locale) -> String {
-    let mut parts = Vec::new();
-    if status.raw_large_count > 0 {
-        parts.push(
-            tr(locale, MessageId::StatusToolRawPressure)
-                .replace("{count}", &status.raw_large_count.to_string())
-                .replace("{chars}", &format_count(status.raw_large_chars)),
-        );
-    }
-    if status.receipt_count > 0 {
-        parts.push(
-            tr(locale, MessageId::StatusToolCompactReceipts)
-                .replace("{count}", &status.receipt_count.to_string()),
-        );
-    }
-    if status.artifact_count > 0 {
-        parts.push(
-            tr(locale, MessageId::StatusToolArtifacts)
-                .replace("{count}", &status.artifact_count.to_string())
-                .replace(
-                    "{bytes}",
-                    &crate::artifacts::format_byte_size(status.artifact_bytes),
-                ),
-        );
-    }
-    if parts.is_empty() {
-        tr(locale, MessageId::StatusToolNone).into_owned()
-    } else {
-        parts.join("; ")
-    }
+// Locale adapter retained solely for existing host integration assertions.
+#[cfg(test)]
+fn format_tool_output_status(status: &ToolOutputStatus, locale: Locale) -> String {
+    codewhale_command_contract::tool_outputs::format_tool_output_status(
+        status,
+        &codewhale_command_contract::tool_outputs::ToolOutputLabels {
+            raw_pressure: tr(locale, MessageId::StatusToolRawPressure).into_owned(),
+            compact_receipts: tr(locale, MessageId::StatusToolCompactReceipts).into_owned(),
+            artifacts: tr(locale, MessageId::StatusToolArtifacts).into_owned(),
+            none: tr(locale, MessageId::StatusToolNone).into_owned(),
+        },
+    )
 }
 
 fn looks_like_receipt(content: &str) -> bool {
@@ -87,10 +63,6 @@ fn looks_like_receipt(content: &str) -> bool {
         || trimmed.starts_with("[artifact:")
         || trimmed.starts_with("[TOOL_RESULT_TRUNCATED]")
         || trimmed.starts_with("<TOOL_RESULT_REF")
-}
-
-fn format_count(value: usize) -> String {
-    value.to_string()
 }
 
 #[cfg(test)]

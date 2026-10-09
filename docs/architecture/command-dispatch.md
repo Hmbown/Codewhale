@@ -1,8 +1,8 @@
 # Command Dispatch Architecture
 
 **Target branch:** `main`
-**Related EPIC:** [#2870](https://github.com/Hmbown/CodeWhale/issues/2870)
-**Related issue:** [#2791](https://github.com/Hmbown/CodeWhale/issues/2791)
+**Related EPIC:** [#2870](https://github.com/codewhale-hq/CodeWhale/issues/2870)
+**Related issue:** [#2791](https://github.com/codewhale-hq/CodeWhale/issues/2791)
 **EPIC-002 (Command Single Responsibility Extraction):** Layer 4.x (FEAT-006 through FEAT-008)
 
 This document records the command-dispatch ownership model after the

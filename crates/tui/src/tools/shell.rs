@@ -17,7 +17,8 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
@@ -1933,7 +1934,9 @@ pub struct ShellManager {
     default_workspace: PathBuf,
     sandbox_manager: SandboxManager,
     sandbox_policy: ExecutionSandboxPolicy,
-    foreground_background_requested: bool,
+    /// Only live wait futures hold strong references. A request cannot survive
+    /// completion/cancellation and release a later wait or another session.
+    active_waits: Vec<(String, Weak<AtomicBool>)>,
     /// Directory for lowercase-`bash` complete-output spill files
     /// (`None` = process temp dir). Overridable so tests can fault-inject a
     /// missing/unwritable spill location.
@@ -1948,8 +1951,12 @@ impl std::fmt::Debug for ShellManager {
             .field("default_workspace", &self.default_workspace)
             .field("sandbox_policy", &self.sandbox_policy)
             .field(
-                "foreground_background_requested",
-                &self.foreground_background_requested,
+                "active_waits",
+                &self
+                    .active_waits
+                    .iter()
+                    .filter(|(_, wait)| wait.strong_count() > 0)
+                    .count(),
             )
             .finish()
     }
@@ -1978,7 +1985,7 @@ impl ShellManager {
             default_workspace: workspace,
             sandbox_manager: SandboxManager::new(),
             sandbox_policy: ExecutionSandboxPolicy::default(),
-            foreground_background_requested: false,
+            active_waits: Vec::new(),
             output_spill_dir: None,
         }
     }
@@ -2103,28 +2110,42 @@ impl ShellManager {
         self.sandbox_manager.prepare(&spec)
     }
 
-    /// Request that the active foreground shell wait detach and leave its
-    /// process running in the background job table.
-    pub fn request_foreground_background(&mut self) {
-        self.foreground_background_requested = true;
+    fn register_shell_wait(&mut self, session_id: &str) -> Arc<AtomicBool> {
+        self.active_waits
+            .retain(|(_, wait)| wait.strong_count() > 0);
+        let detach = Arc::new(AtomicBool::new(false));
+        self.active_waits
+            .push((session_id.to_string(), Arc::downgrade(&detach)));
+        detach
+    }
+
+    /// Release the owning session's currently active shell waits without
+    /// stopping their processes. This never queues a request for future work.
+    pub(crate) fn request_shell_wait_detach(&mut self, session_id: &str) -> bool {
+        let mut requested = false;
+        self.active_waits.retain(|(owner, wait)| {
+            let Some(wait) = wait.upgrade() else {
+                return false;
+            };
+            if !session_id.is_empty() && owner == session_id {
+                wait.store(true, Ordering::Release);
+                requested = true;
+            }
+            true
+        });
+        requested
     }
 
     #[cfg(test)]
-    pub(crate) fn foreground_background_requested_for_test(&self) -> bool {
-        self.foreground_background_requested
+    pub(crate) fn shell_wait_active_for_test(&self, session_id: &str) -> bool {
+        self.active_waits
+            .iter()
+            .any(|(owner, wait)| owner == session_id && wait.strong_count() > 0)
     }
 
-    fn clear_foreground_background_request(&mut self) {
-        self.foreground_background_requested = false;
-    }
-
-    fn take_foreground_background_request(&mut self, task_id: &str) -> bool {
-        let requested = self.foreground_background_requested;
-        self.foreground_background_requested = false;
-        if requested && let Some(shell) = self.processes.get_mut(task_id) {
-            shell.background = true;
-        }
-        requested
+    #[cfg(test)]
+    pub(crate) fn register_shell_wait_for_test(&mut self, session_id: &str) -> Arc<AtomicBool> {
+        self.register_shell_wait(session_id)
     }
 
     /// Execute a shell command with stdin/TTY options plus an extra env-var map
@@ -3834,9 +3855,18 @@ fn load_default_policy() -> anyhow::Result<Option<ExecPolicyConfig>> {
     Ok(Some(config))
 }
 
-const FOREGROUND_TIMEOUT_RECOVERY_HINT: &str = "Foreground Bash is for bounded commands. \
-The timed-out process was killed; rerun long work as Bash action=\"run\" background=true, \
-then poll with Bash action=\"wait\" task_id=\"<id>\".";
+/// The last `n` lines of `text`, marking how many were left out.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= n {
+        return text.to_string();
+    }
+    format!(
+        "[{} earlier lines]\n{}",
+        lines.len() - n,
+        lines[lines.len() - n..].join("\n")
+    )
+}
 
 const MACOS_PROVENANCE_HINT: &str = "Docker buildx failed to update its activity file due to a macOS \
 com.apple.provenance restriction. Files created by Docker Desktop's signed process carry a \
@@ -4891,12 +4921,11 @@ async fn execute_foreground_via_background(
         None
     };
     let working_dir = receipt_cwd.clone().or(working_dir);
-    let task_id = {
+    let (task_id, detach) = {
         let mut manager = context
             .shell_manager
             .lock()
             .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-        manager.clear_foreground_background_request();
         let owner = shell_job_owner_from_context(context);
         let lifecycle = shell_work_lifecycle_from_context(context);
         let spawned = manager.execute_with_options_env_for_owner_and_work(
@@ -4950,7 +4979,8 @@ async fn execute_foreground_via_background(
                 cwd: process.working_dir.clone(),
             });
         }
-        task_id
+        let detach = manager.register_shell_wait(&context.state_namespace);
+        (task_id, detach)
     };
     let mut foreground = ForegroundShellGuard {
         manager: context.shell_manager.clone(),
@@ -5011,7 +5041,10 @@ async fn execute_foreground_via_background(
                 .shell_manager
                 .lock()
                 .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-            if manager.take_foreground_background_request(&task_id) {
+            if detach.load(Ordering::Acquire) {
+                if let Some(shell) = manager.processes.get_mut(&task_id) {
+                    shell.background = true;
+                }
                 let snapshot = manager.get_output(&task_id, false, 0)?;
                 foreground.armed = false;
                 return Ok(snapshot);
@@ -5042,16 +5075,23 @@ async fn execute_foreground_via_background(
             return Ok(snapshot);
         }
 
+        // The foreground budget is how long the turn waits, never how long
+        // the command may live. Past it the process keeps running as a
+        // background job — exactly as Ctrl+B would move it — and the model
+        // gets the output so far plus the job id to wait on, read, or cancel.
+        // Killing here threw away minutes of a build or test run and made the
+        // model start it over.
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let mut manager = context
                 .shell_manager
                 .lock()
                 .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-            let mut result = manager.kill(&task_id)?;
-            manager.acknowledge_foreground_completion(&task_id);
-            result.status = ShellStatus::TimedOut;
+            if let Some(process) = manager.processes.get_mut(&task_id) {
+                process.background = true;
+            }
+            let snapshot = manager.get_output(&task_id, false, 0)?;
             foreground.armed = false;
-            return Ok(result);
+            return Ok(snapshot);
         }
 
         tokio::time::sleep(Duration::from_millis(poll_tick_ms)).await;
@@ -5222,11 +5262,10 @@ const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// `BASH_MAX_TIMEOUT_MS` (~24.8 days), so a command that blocked on an
 /// interactive prompt or a hung network call pinned the turn indefinitely —
 /// the tool row just counted seconds while the model waited. The tool's own
-/// schema already promises `action=run 120000`, and its description already
-/// says foreground is for bounded commands, so honor that: an omitted
-/// timeout takes the advertised default, which lets
-/// `FOREGROUND_TIMEOUT_RECOVERY_HINT` kill the process and tell the model to
-/// rerun with `background=true`.
+/// schema already promises `action=run 120000`, so an omitted timeout takes
+/// that default as the foreground wait. Past it the command moves to the
+/// background (it is never killed for running long) and the model gets its
+/// output so far and task id.
 ///
 /// An explicit `timeout_ms` is still honored up to the full contract ceiling,
 /// and background and interactive runs keep their own lifetimes: their
@@ -5290,10 +5329,14 @@ fn finish_contract_bash_result(
     }
     if result.status == ShellStatus::Running {
         let task_id = result.task_id.as_deref().unwrap_or("unknown");
-        let partial = (!output.is_empty()).then(|| format!("\n\nOutput so far:\n{output}"));
+        let so_far = if output.trim().is_empty() {
+            "(no output yet)".to_string()
+        } else {
+            tail_lines(output.trim(), 20)
+        };
         return Ok(ToolResult::success(format!(
-            "Foreground shell wait moved to /jobs: {task_id}{}\n\nThe command is still running; completion will appear as a runtime event.",
-            partial.as_deref().unwrap_or_default()
+            "Still running after {}s; moved to the background as {task_id} (not killed).\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". To stop it, send the same call with cancel=true. It also stops when the session ends.",
+            result.duration_ms / 1_000
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
@@ -5338,7 +5381,7 @@ impl ToolSpec for LowercaseBashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": guidance::runtime_command_guidance() },
-                "timeout": { "type": "number", "description": "Optional timeout in seconds; when omitted the command is killed after 120 seconds." },
+                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 120 seconds). A command still running then is not killed: it moves to the background and you get its output so far and a task_id. Find task_shell_wait with tool_search to read more or wait for it." },
                 "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
                 "sandbox_permissions": {
                     "type": "string",
@@ -5460,7 +5503,7 @@ pub(crate) fn readonly_bash_input_schema() -> serde_json::Value {
             "command": { "type": "string", "description": "A classifier-approved read command, or analysis code with read_only=true" },
             "read_only": { "type": "boolean", "description": "Require native filesystem read-only and no-network enforcement for analysis code; unavailable sandboxes fail closed." },
             "cwd": { "type": "string", "description": "Workspace-relative working directory" },
-            "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (1000-600000)" }
+            "timeout_ms": { "type": "integer", "description": "Foreground wait in milliseconds (1000-600000). A command still running then moves to the background; it is not killed." }
         },
         "required": ["command"],
         "additionalProperties": false
@@ -5542,7 +5585,7 @@ impl ToolSpec for BashTool {
                 "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only and no-network execution. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Timeout in milliseconds. The default depends on the action: action=run 120000 (the standalone Bash tool caps it at 600000), action=wait 30000, action=interact 1000. A foreground action=run that omits this is bounded by that default and killed with a background-rerun hint; pass an explicit value for longer foreground work, or background=true. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
+                    "description": "How long to wait, in milliseconds. action=run: how long the turn waits in the foreground (default 120000, max 600000); a command still running then is NOT killed — it moves to the background and you get its output so far and task_id. action=wait 30000, action=interact 1000. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
                 },
                 "background": {
                     "type": "boolean",
@@ -5772,14 +5815,15 @@ impl ToolSpec for BashTool {
                     // A typed denial, so a Fleet worker's no-progress guard
                     // counts it. #6298: an agent has no mode to switch to,
                     // so it gets the same next steps as the other read-only
-                    // gates; only a parent session is pointed at Work mode.
+                    // gates; only a parent session is told the user can
+                    // change modes.
                     let message = if context.owner_agent_id.is_some()
                         || context.tool_authority.is_some()
                     {
                         readonly_refusal(&rejection, readonly_enforced_lane_available(context))
                     } else {
                         format!(
-                            "{rejection}. Use a read-only inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
+                            "{rejection}. This shell admits read-only inspection commands only. The user can change modes with /mode."
                         )
                     };
                     return Err(ToolError::permission_denied(message));
@@ -5970,9 +6014,21 @@ impl ToolSpec for BashTool {
             HashMap::new()
         } else if let Some(hook_executor) = &context.runtime.hook_executor {
             let hook_ctx = crate::hooks::HookContext::new()
+                .with_tool_context(context)
                 .with_tool_name("exec_shell")
                 .with_tool_args(&input);
-            hook_executor.collect_shell_env(&hook_ctx)
+            let executor = Arc::clone(hook_executor);
+            let policy = crate::plugins::activation::extension_host_policy_enabled();
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
+            tokio::task::spawn_blocking(move || {
+                let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
+                executor.collect_shell_env(&hook_ctx)
+            })
+            .await
+            .unwrap_or_default()
         } else {
             std::collections::HashMap::new()
         };
@@ -6375,12 +6431,23 @@ impl ToolSpec for BashTool {
                         "completion is delivered to the model as an internal runtime event and shown in task/status state."
                     };
                     if backgrounded_foreground {
+                        let seconds = result.duration_ms / 1_000;
+                        let so_far = match (result.stdout.trim(), result.stderr.trim()) {
+                            ("", "") => "(no output yet)".to_string(),
+                            (out, "") => tail_lines(out, 20),
+                            ("", err) => format!("STDERR:\n{}", tail_lines(err, 20)),
+                            (out, err) => format!(
+                                "{}\n\nSTDERR:\n{}",
+                                tail_lines(out, 20),
+                                tail_lines(err, 20)
+                            ),
+                        };
                         format!(
-                            "Foreground shell wait moved to /jobs: {task_id_str}\n\nReturns immediately; {completion_contract} Keep working; call Bash action=\"wait\" task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "Still running after {seconds}s; moved to the background as {task_id_str} (not killed).\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends."
                         )
                     } else {
                         format!(
-                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call Bash action=\"wait\" task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
                         )
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {
@@ -6390,7 +6457,7 @@ impl ToolSpec for BashTool {
                     )
                 } else if result.status == ShellStatus::TimedOut {
                     format!(
-                        "Command timed out after {timeout_value_ms}ms; process killed.\n\n{FOREGROUND_TIMEOUT_RECOVERY_HINT}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
+                        "Command timed out after {timeout_value_ms}ms; process killed.\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
                         result.stdout, result.stderr
                     )
                 } else {
@@ -6483,18 +6550,6 @@ impl ToolSpec for BashTool {
                     };
                     metadata["background_policy"] = json!("nonblocking");
                 }
-                if result.status == ShellStatus::TimedOut && !background && !interactive {
-                    metadata["foreground_timeout_recovery"] = json!({
-                        "process_killed": true,
-                        "hint": FOREGROUND_TIMEOUT_RECOVERY_HINT,
-                        "recommended_tools": ["Bash", "task_shell_start", "task_shell_wait"],
-                        "rerun_as": {"tool": "Bash", "action": "run", "background": true},
-                        "poll_with": [
-                            {"tool": "Bash", "action": "wait"},
-                            {"tool": "task_shell_wait"}
-                        ]
-                    });
-                }
                 if let Some(hint) = network_restricted_hint {
                     metadata["sandbox_network_restricted"] = json!(true);
                     metadata["sandbox_network_denied_hint"] = json!(hint);
@@ -6574,7 +6629,7 @@ impl BashTool {
         };
         let timeout_ms = wait_timeout_ms(input)?;
 
-        let (delta, wait_canceled) = if wait {
+        let (delta, interruption) = if wait {
             wait_for_shell_delta_cancellable(context, task_id, timeout_ms).await?
         } else {
             let mut manager = context
@@ -6584,7 +6639,7 @@ impl BashTool {
             let delta = manager
                 .get_output_delta_for_session(&context.state_namespace, task_id, false, timeout_ms)
                 .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-            (delta, false)
+            (delta, None)
         };
 
         let status = delta.result.status.clone();
@@ -6594,17 +6649,21 @@ impl BashTool {
         {
             object.insert("wait_timeout_ms".to_string(), json!(timeout_ms));
         }
-        if wait_canceled {
+        if let Some(interruption) = interruption {
+            let (action, key) = match interruption {
+                ShellWaitInterruption::Canceled => ("canceled", "wait_canceled"),
+                ShellWaitInterruption::Detached => ("detached", "wait_detached"),
+            };
             if matches!(status, ShellStatus::Running) {
                 result.content = format!(
-                    "Wait canceled; background shell task {task_id} is still running.\n\n{}",
+                    "Wait {action}; background shell task {task_id} is still running.\n\n{}",
                     result.content
                 );
             }
             if let Some(metadata) = result.metadata.as_mut()
                 && let Some(object) = metadata.as_object_mut()
             {
-                object.insert("wait_canceled".to_string(), json!(true));
+                object.insert(key.to_string(), json!(true));
             }
         }
 
@@ -6642,6 +6701,7 @@ impl BashTool {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         let mut timed_out = false;
         let mut wait_canceled = false;
+        let mut wait_detached = false;
 
         let snapshot =
             |manager: &mut ShellManager| -> Result<Vec<(String, ShellStatus)>, ToolError> {
@@ -6649,13 +6709,24 @@ impl BashTool {
                     .iter()
                     .map(|id| {
                         let detail = manager
-                            .inspect_job(id)
+                            .inspect_job_for_session(&context.state_namespace, id)
                             .map_err(|err| ToolError::execution_failed(err.to_string()))?;
                         Ok((id.clone(), detail.snapshot.status))
                     })
                     .collect()
             };
 
+        let detach = if wait {
+            let mut manager = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+            // Validate every owner before registering or consuming any output.
+            snapshot(&mut manager)?;
+            Some(manager.register_shell_wait(&context.state_namespace))
+        } else {
+            None
+        };
         let mut poll_tick_ms: u64 = FOREGROUND_POLL_INITIAL_MS;
         let statuses = loop {
             let current = {
@@ -6684,6 +6755,13 @@ impl BashTool {
                 running == 0
             };
             if !wait || satisfied {
+                break current;
+            }
+            if detach
+                .as_ref()
+                .is_some_and(|detach| detach.load(Ordering::Acquire))
+            {
+                wait_detached = true;
                 break current;
             }
             if std::time::Instant::now() >= deadline {
@@ -6718,9 +6796,14 @@ impl BashTool {
                     still_running.join(", ")
                 }
             )
-        } else if wait_canceled {
+        } else if wait_canceled || wait_detached {
+            let action = if wait_canceled {
+                "canceled"
+            } else {
+                "detached"
+            };
             format!(
-                "wait canceled; still running: {}",
+                "wait {action}; still running: {}",
                 if still_running.is_empty() {
                     "none".to_string()
                 } else {
@@ -6755,6 +6838,9 @@ impl BashTool {
         metadata.insert("timed_out".to_string(), json!(timed_out));
         if wait_canceled {
             metadata.insert("wait_canceled".to_string(), json!(true));
+        }
+        if wait_detached {
+            metadata.insert("wait_detached".to_string(), json!(true));
         }
         Ok(ToolResult {
             content: content.trim().to_string(),
@@ -7094,11 +7180,26 @@ fn wait_timing_line(result: &ShellResult) -> String {
     }
 }
 
+enum ShellWaitInterruption {
+    Canceled,
+    Detached,
+}
+
 async fn wait_for_shell_delta_cancellable(
     context: &ToolContext,
     task_id: &str,
     timeout_ms: u64,
-) -> Result<(ShellDeltaResult, bool), ToolError> {
+) -> Result<(ShellDeltaResult, Option<ShellWaitInterruption>), ToolError> {
+    let detach = {
+        let mut manager = context
+            .shell_manager
+            .lock()
+            .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+        manager
+            .require_session_owner(task_id, &context.state_namespace)
+            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+        manager.register_shell_wait(&context.state_namespace)
+    };
     let timeout_ms = timeout_ms.clamp(1000, EXEC_SHELL_WAIT_MAX_TIMEOUT_MS);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut stdout_accum = String::new();
@@ -7106,11 +7207,11 @@ async fn wait_for_shell_delta_cancellable(
 
     let mut poll_tick_ms: u64 = FOREGROUND_POLL_INITIAL_MS;
     let (command, result, stdout_total_len, stderr_total_len) = loop {
-        if context
+        let canceled = context
             .cancel_token
             .as_ref()
-            .is_some_and(|token| token.is_cancelled())
-        {
+            .is_some_and(|token| token.is_cancelled());
+        if canceled || detach.load(Ordering::Acquire) {
             let mut manager = context
                 .shell_manager
                 .lock()
@@ -7128,7 +7229,11 @@ async fn wait_for_shell_delta_cancellable(
                     delta.stdout_total_len,
                     delta.stderr_total_len,
                 ),
-                true,
+                Some(if canceled {
+                    ShellWaitInterruption::Canceled
+                } else {
+                    ShellWaitInterruption::Detached
+                }),
             ));
         }
 
@@ -7165,7 +7270,7 @@ async fn wait_for_shell_delta_cancellable(
             stdout_total_len,
             stderr_total_len,
         ),
-        false,
+        None,
     ))
 }
 
@@ -7333,3 +7438,49 @@ impl ToolSpec for NoteTool {
 mod enforced_readonly_tests;
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn foreground_command_requests_detach(command: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let chars = command.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !single_quoted {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if ch == '"' && !single_quoted {
+            double_quoted = !double_quoted;
+            continue;
+        }
+        if ch != '&' || single_quoted || double_quoted {
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(index + 1).copied();
+        // `&&`, `&>`/`&>>`, and `>&` are chaining/redirection rather than a
+        // detached child. Any other unquoted ampersand is a background
+        // control operator and is unavailable in ACP.
+        if previous != Some('&') && next != Some('&') && next != Some('>') && previous != Some('>')
+        {
+            return true;
+        }
+    }
+
+    shell_words::split(command).is_ok_and(|words| {
+        words.iter().any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "nohup" | "disown" | "setsid" | "daemonize"
+            )
+        })
+    })
+}

@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::tools::todo::TodoListSnapshot;
 use codewhale_models::Usage;
 
@@ -126,6 +126,7 @@ impl MailboxMessage {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn work_state(agent_id: impl Into<String>, todo: TodoListSnapshot) -> Self {
         Self::WorkState {
             agent_id: agent_id.into(),
@@ -351,7 +352,7 @@ mod tests {
     }
 
     fn test_route(
-        provider: ApiProvider,
+        provider: ProviderKind,
         model: &str,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
         crate::cost_status::EffectiveRouteEnvelope::capture(
@@ -359,7 +360,7 @@ mod tests {
             provider,
             provider.as_str(),
             model,
-            Some(provider.default_base_url()),
+            Some(provider.provider().default_base_url()),
             chrono::Utc::now(),
         )
     }
@@ -619,7 +620,7 @@ mod tests {
                 MailboxMessage::TokenUsage {
                     agent_id: "a9".into(),
                     source_id: "response-a9".into(),
-                    route: Box::new(test_route(ApiProvider::Deepseek, "deepseek-v4-flash")),
+                    route: Box::new(test_route(ProviderKind::Deepseek, "deepseek-v4-flash")),
                     usage: Usage {
                         input_tokens: 100,
                         output_tokens: 50,
@@ -638,8 +639,8 @@ mod tests {
     fn token_usage_serde_round_trip_preserves_immutable_route_evidence() {
         let route = crate::cost_status::EffectiveRouteEnvelope {
             openrouter_vendor: None,
-            provider: ApiProvider::Moonshot,
-            provider_identity: "kimi-membership".to_string(),
+            provider: ProviderKind::Moonshot,
+            provider_identity: ProviderKind::Moonshot.as_str().to_string(),
             model: "k3".to_string(),
             billing_surface: Some(crate::pricing::MOONSHOT_KIMI_CODE_BILLING_SURFACE.to_string()),
             endpoint_fingerprint: Some("a".repeat(64)),

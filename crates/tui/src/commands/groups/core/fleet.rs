@@ -108,7 +108,7 @@ fn fleet_models_text(app: &App) -> String {
             .replace("{count}", &models.len().to_string()),
     ];
     for member in &models {
-        let provider = crate::config::ApiProvider::parse(&member.provider);
+        let provider = crate::config::ProviderKind::parse(&member.provider);
         let facts = provider
             .and_then(|p| crate::provider_lake::catalog_offering_for_model(p, &member.model))
             .map(|row| {
@@ -154,32 +154,17 @@ fn fleet_models_text(app: &App) -> String {
 /// **live** `config`, the same source the `/provider` and `/model` pickers
 /// consult. A startup snapshot goes stale after an in-session provider change.
 fn provider_id_is_configured(app: &App, config: &Config, provider_id: &str) -> bool {
-    let provider_id = provider_id.trim();
-    if provider_id.is_empty() {
+    let Some(active) = app
+        .provider_identity
+        .as_ref()
+        .filter(|identity| config.verify_provider_identity(identity).is_ok())
+    else {
         return false;
-    }
-    if let Some(provider) = crate::config::ApiProvider::parse(provider_id) {
-        return crate::config::provider_is_configured_for_active(
-            config,
-            provider,
-            app.api_provider,
-        );
-    }
-    // Named custom provider: allow the active custom route, or any explicit
-    // `[providers.<name>]` table.
-    if app.api_provider == crate::config::ApiProvider::Custom
-        && app
-            .provider_identity_for_persistence()
-            .eq_ignore_ascii_case(provider_id)
-    {
-        return true;
-    }
-    config.providers.as_ref().is_some_and(|providers| {
-        providers
-            .custom
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case(provider_id))
-    })
+    };
+    let Ok(identity) = config.resolve_provider_selection_identity(provider_id) else {
+        return false;
+    };
+    crate::config::provider_is_configured_for_active(config, &identity, active)
 }
 
 /// The localized reason `provider` may not enter the team, or `None` when
@@ -205,7 +190,7 @@ pub(crate) fn fleet_catalog_rejection(
     provider: &str,
     model: &str,
 ) -> Option<String> {
-    let known = crate::config::ApiProvider::parse(provider)?;
+    let known = crate::config::ProviderKind::parse(provider)?;
     let served = crate::provider_lake::all_catalog_models_for_provider(known);
     (!served.is_empty() && !served.iter().any(|id| id.eq_ignore_ascii_case(model))).then(|| {
         tr(locale, MessageId::FleetAddModelNotServed)
@@ -438,8 +423,11 @@ mod tests {
         );
         assert!(fleet_provider_rejection(&app, &live, "openrouter").is_some());
         // An in-session credential change is visible without restarting.
-        live.provider_config_for_mut(crate::config::ApiProvider::Openrouter)
-            .api_key = Some("test-key".to_string());
+        live.provider_config_for_mut(
+            &live.test_identity_for_kind(crate::config::ProviderKind::Openrouter),
+        )
+        .unwrap()
+        .api_key = Some("test-key".to_string());
         assert_eq!(fleet_provider_rejection(&app, &live, "openrouter"), None);
 
         assert!(

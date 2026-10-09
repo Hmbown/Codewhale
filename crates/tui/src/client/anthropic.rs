@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{ApiProvider, wire_model_for_provider_route};
+use crate::config::{ProviderKind, wire_model_for_provider_route};
 use crate::llm_client::StreamEventBox;
 use crate::logging;
 use crate::tools::schema_sanitize;
@@ -131,13 +131,13 @@ impl CodewhaleClient {
         // enabled/disabled/auto thinking types, so non-native routes get the
         // portable `{"type":"enabled","budget_tokens":N}` shape instead.
         let thinking_capable = codewhale_models::model_supports_reasoning(&model);
-        let is_minimax_provider = self.api_provider == ApiProvider::MinimaxAnthropic;
+        let is_minimax_provider = self.api_provider == ProviderKind::MinimaxAnthropic;
         let is_minimax = crate::config::is_exact_minimax_anthropic_m3_route(
             self.api_provider,
             &self.base_url,
             &model,
         );
-        let is_deepseek = self.api_provider == ApiProvider::DeepseekAnthropic;
+        let is_deepseek = self.api_provider == ProviderKind::DeepseekAnthropic;
         // Model Studio's Anthropic-compatible endpoint documents the portable
         // `{"type":"enabled","budget_tokens":N}` shape AND `{"type":"disabled"}`
         // (alibabacloud.com/help/en/model-studio/anthropic-api-messages), so
@@ -146,10 +146,10 @@ impl CodewhaleClient {
         // qwen3.x families).
         let is_modelstudio = matches!(
             self.api_provider,
-            ApiProvider::ModelstudioTokenPlan
-                | ApiProvider::ModelstudioTokenPlanAnthropic
-                | ApiProvider::ModelstudioCodingPlan
-                | ApiProvider::ModelstudioCodingPlanAnthropic
+            ProviderKind::ModelstudioTokenPlan
+                | ProviderKind::ModelstudioTokenPlanAnthropic
+                | ProviderKind::ModelstudioCodingPlan
+                | ProviderKind::ModelstudioCodingPlanAnthropic
         );
         // MiniMax's exact M3 route and DeepSeek's Messages dialect both
         // document adaptive support; everything else needs the native host.
@@ -236,11 +236,12 @@ impl CodewhaleClient {
     /// Open the streaming Messages request through the shared stream-entry
     /// transport policy: bounded header wait, dual-client selection, and at
     /// most one HTTP/1.1 fallback retry on a classified H2 header stall.
-    /// Inside each open attempt the provider retry loop (`send_with_retry`)
-    /// handles rate limits and transient upstream failures before any stream
-    /// body exists, as the Chat and Responses adapters do. Wire-specific
-    /// request construction (headers, endpoint, body) stays here at the
-    /// adapter edge.
+    /// Inside each open attempt the provider retry loop
+    /// (`send_stream_open_with_retry`) handles rate limits and transient
+    /// upstream failures before any stream body exists — with no total
+    /// deadline, which would ride on the returned body — as the Chat and
+    /// Responses adapters do. Wire-specific request construction (headers,
+    /// endpoint, body) stays here at the adapter edge.
     async fn open_anthropic_stream_response(
         &self,
         url: &str,
@@ -259,7 +260,7 @@ impl CodewhaleClient {
                     self.http1_fallback_client(),
                     policy,
                 );
-                self.send_with_retry(|| {
+                self.send_stream_open_with_retry(|| {
                     client
                         .post(&url)
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -287,7 +288,8 @@ impl CodewhaleClient {
 
         let stream_idle_timeout = self.stream_idle_timeout;
         let first_byte = super::stream_entry::first_byte_timeout(stream_idle_timeout);
-        let provider_label = self.api_provider.display_name();
+        let provider_label = self.api_provider.provider().display_name();
+        let suppress_error_details = self.claude_oauth_config.is_some();
         let byte_stream = response.bytes_stream();
 
         let stream = async_stream::stream! {
@@ -370,6 +372,10 @@ impl CodewhaleClient {
 
                     match convert_anthropic_sse_data(&data) {
                         Some(Ok(StreamEvent::Error { error })) => {
+                            if suppress_error_details {
+                                yield Err(anyhow::anyhow!("Claude subscription stream failed"));
+                                return;
+                            }
                             let (error_type, message) = anthropic_error_fields(&error);
                             yield Err(anyhow::anyhow!(
                                 "Anthropic stream error ({error_type}): {message}"
@@ -384,7 +390,11 @@ impl CodewhaleClient {
                             }
                         }
                         Some(Err(e)) => {
-                            logging::warn(format!("Failed to parse Anthropic SSE event: {e}"));
+                            if suppress_error_details {
+                                logging::warn("Failed to parse Claude subscription stream event");
+                            } else {
+                                logging::warn(format!("Failed to parse Anthropic SSE event: {e}"));
+                            }
                         }
                         None => {}
                     }

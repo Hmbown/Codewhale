@@ -5,14 +5,14 @@
 # real HTTP requests.
 #
 # Usage:  ./scripts/mobile-smoke.sh
-# Requires: curl, a built binary at target/release/codewhale-tui
+# Requires: curl, a built binary at target/release/codewhale
 #           (the script will build it if cargo is available).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="${BINARY:-${REPO_ROOT}/target/release/codewhale-tui}"
+BINARY="${BINARY:-${REPO_ROOT}/target/release/codewhale}"
 PASS=0
 FAIL=0
 SERVER_PID=""
@@ -132,7 +132,7 @@ assert_body_not_contains() {
 
 if [[ ! -x "$BINARY" ]]; then
     log "Binary not found; building codewhale-tui in release mode..."
-    cargo build -p codewhale-tui --release --locked
+    cargo build -p codewhale-cli --bin codewhale --release --locked
 fi
 
 log "Using binary: $BINARY"

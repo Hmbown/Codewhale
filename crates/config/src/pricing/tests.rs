@@ -18,6 +18,7 @@ fn priced(source: CatalogSource) -> CatalogOffering {
             output: Some(0.42),
             cache_read: Some(0.028),
             cache_write: None,
+            ..Default::default()
         }),
         source,
         ..Default::default()
@@ -433,6 +434,7 @@ fn cache_only_offering_is_unknown_at_the_route_layer() {
         output: None,
         cache_read: Some(0.028),
         cache_write: None,
+        ..Default::default()
     });
 
     assert!(matches!(

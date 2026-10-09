@@ -1,0 +1,5 @@
+import { mountReviewedComposition } from '@codewhale/dsh-composition'
+import spec from './composition.json' with { type: 'json' }
+export async function apply(ctx) {
+  await mountReviewedComposition(ctx, new URL('../source/', import.meta.url).href, spec)
+}

@@ -1,0 +1,30 @@
+{
+  "description": "A server that answers initialize with a protocol revision the client does not implement. Pins Rust McpConnection::initialize against MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS: the handshake ends with the supported list in the error, nothing is advertised, only initialize reaches the server, and a later call to one of the server's tools gets the same refusal (the pool reconnects lazily at call time) instead of an unknown-tool error.",
+  "server_name": "conformance",
+  "expect_boot": "error",
+  "record_requests": "summary",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "1999-12-31",
+        "serverInfo": {
+          "name": "from-the-future",
+          "version": "9.9.9"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    }
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {}
+    }
+  ]
+}

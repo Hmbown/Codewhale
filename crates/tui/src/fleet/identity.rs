@@ -110,6 +110,7 @@ pub fn roster_from_fleet(fleet: &FleetFile, scope: FleetScope, source: &Path) ->
                     .clone()
                     .or_else(|| operator.and_then(|operator| operator.reasoning.clone()));
                 AgentProfile {
+                    native_preset: None,
                     id: member.id.trim().to_string(),
                     display_name: member.display_name.clone(),
                     description: None,
@@ -475,6 +476,7 @@ mod tests {
         model: Option<&str>,
     ) -> AgentProfile {
         AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: display_name.map(str::to_string),
             description: None,

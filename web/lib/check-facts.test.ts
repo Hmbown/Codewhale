@@ -111,7 +111,7 @@ function freshFacts(overrides: Partial<RepoFacts> = {}): RepoFacts {
       tag: "v0.8.63",
       version: "0.8.63",
       publishedAt: "2026-06-01T00:00:00Z",
-      url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.63",
+      url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.63",
     },
     ...overrides,
   };
@@ -200,7 +200,7 @@ describe("diffFacts (check-facts parity)", () => {
         tag: "v0.8.64",
         version: "0.8.64",
         publishedAt: "2026-06-02T00:00:00Z",
-        url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.64",
+        url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.64",
       },
     });
     const diffs = diffFacts(committed, fresh);

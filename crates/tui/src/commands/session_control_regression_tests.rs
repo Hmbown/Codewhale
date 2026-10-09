@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use crate::commands::groups::session::MAX_TITLE_LEN;
 use crate::commands::{CommandResult, execute};
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::session_manager::{SessionManager, create_saved_session_with_mode};
 use crate::test_support::{EnvVarGuard, TestEnvLock};
 use crate::tui::app::{App, AppAction, TuiOptions};
@@ -130,7 +130,7 @@ fn rename_persists_all_live_metadata_through_public_dispatch() {
         .set_model_selection("local-code-model".to_string());
     harness
         .app
-        .set_provider_identity(ApiProvider::Custom, "lm-studio");
+        .set_provider_identity(ProviderKind::Custom, "lm-studio");
     harness.app.mode = AppMode::Operate;
     harness.app.system_prompt = None;
     harness.app.todos.try_lock().expect("todos lock").add(
@@ -438,7 +438,7 @@ fn remote_env_open_encodes_branch_and_never_echoes_credentials() {
     let secret = "top-secret-token";
     init_repo(
         harness.temp.path(),
-        &format!("https://hunter:{secret}@github.com/Hmbown/CodeWhale.git"),
+        &format!("https://hunter:{secret}@github.com/codewhale-hq/CodeWhale.git"),
         "feature/mobile&cloud-{url}",
     );
 
@@ -447,7 +447,7 @@ fn remote_env_open_encodes_branch_and_never_echoes_credentials() {
     assert!(!result.is_error, "{result:?}");
     assert_eq!(
         external_url(&result),
-        "https://app.codewhale.net/work?repo=Hmbown%2FCodeWhale&branch=feature%2Fmobile%26cloud-%7Burl%7D"
+        "https://app.codewhale.net/work?repo=codewhale-hq%2FCodeWhale&branch=feature%2Fmobile%26cloud-%7Burl%7D"
     );
     assert!(result_text(&result).contains("feature/mobile&cloud-{url}"));
     assert!(!external_url(&result).contains(secret));
@@ -458,18 +458,21 @@ fn remote_env_open_encodes_branch_and_never_echoes_credentials() {
 fn remote_env_supported_https_ssh_and_cnb_origins_remain_accepted() {
     for (origin, expected) in [
         (
-            "https://github.com/Hmbown/CodeWhale.git",
-            "Hmbown%2FCodeWhale",
+            "https://github.com/codewhale-hq/CodeWhale.git",
+            "codewhale-hq%2FCodeWhale",
         ),
         (
-            "https://user:token@github.com/Hmbown/CodeWhale",
-            "Hmbown%2FCodeWhale",
+            "https://user:token@github.com/codewhale-hq/CodeWhale",
+            "codewhale-hq%2FCodeWhale",
         ),
         (
-            "ssh://git@github.com/Hmbown/CodeWhale.git",
-            "Hmbown%2FCodeWhale",
+            "ssh://git@github.com/codewhale-hq/CodeWhale.git",
+            "codewhale-hq%2FCodeWhale",
         ),
-        ("git@github.com:Hmbown/CodeWhale.git", "Hmbown%2FCodeWhale"),
+        (
+            "git@github.com:codewhale-hq/CodeWhale.git",
+            "codewhale-hq%2FCodeWhale",
+        ),
         ("https://cnb.cool/whale/codewhale.git", "whale%2Fcodewhale"),
         (
             "ssh://git@cnb.cool:2222/whale/codewhale.git",

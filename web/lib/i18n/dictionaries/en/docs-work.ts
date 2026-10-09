@@ -63,7 +63,7 @@ export const docsWork: DocsWorkDict = {
       title: "Continue in a fresh session",
       blocks: [
         {
-          p: "When a session gets long, `/relay` writes a handoff for a new thread, including the current To-do list exactly as it stands, so the next session starts from where you really are rather than a summary of it. Add a focus to steer the handoff:",
+          p: "When a session gets long, `/relay` writes a handoff for a new thread, including the current To-do list exactly as it stands, so the next session starts from the actual state of the work rather than a summary of it. Add a focus to steer the handoff:",
         },
         { code: "/relay finish the Windows test fixes", lang: "Codewhale" },
         {

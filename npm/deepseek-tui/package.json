@@ -15,13 +15,13 @@
       "url": "https://www.buymeacoffee.com/hmbown"
     }
   ],
-  "homepage": "https://github.com/Hmbown/CodeWhale/blob/main/docs/REBRAND.md",
+  "homepage": "https://github.com/codewhale-hq/CodeWhale/blob/main/docs/REBRAND.md",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Hmbown/CodeWhale.git"
+    "url": "git+https://github.com/codewhale-hq/CodeWhale.git"
   },
   "bugs": {
-    "url": "https://github.com/Hmbown/CodeWhale/issues"
+    "url": "https://github.com/codewhale-hq/CodeWhale/issues"
   },
   "keywords": [
     "compatibility",

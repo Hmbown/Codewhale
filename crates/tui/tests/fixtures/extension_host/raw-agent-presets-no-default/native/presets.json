@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "mode_selection_enabled": true,
+  "presets": [
+    {
+      "id": "a",
+      "trust": "user",
+      "is_default": false,
+      "name": "Preset Alpha",
+      "description": "First caller only",
+      "order": 1,
+      "entry": {
+        "path": "native/presets/a.mjs",
+        "sha256": "bd5cb0ecb616db7df173e69d01ce68168432adf3541bfad4927bf93bdff46f6d"
+      }
+    },
+    {
+      "id": "b",
+      "trust": "user",
+      "is_default": false,
+      "name": "Preset Beta",
+      "description": "Second caller only",
+      "order": 2,
+      "entry": {
+        "path": "native/presets/b.mjs",
+        "sha256": "3d5fa7f503184098d473990f1f0336059b67a46c2e9a482d4549c2e3281ba894"
+      }
+    }
+  ],
+  "inventory": {
+    "a": {
+      "path": "presets/a/agent.cordis.yml",
+      "rows": [
+        {
+          "entryId": null,
+          "moduleName": "../../common.mjs",
+          "enabled": true
+        }
+      ]
+    },
+    "b": {
+      "path": "presets/b/agent.cordis.yml",
+      "rows": [
+        {
+          "entryId": null,
+          "moduleName": "@demo/preset-row",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

@@ -15,7 +15,7 @@ use codewhale_localization::{Locale, MessageId};
 
 use crate::commands::debug_diagnostics_test_support::{DiagnosticsHarness, assert_fixture};
 use crate::commands::{CommandResult, execute};
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::tui::app::AppAction;
 
 /// The eight declared diagnostics commands in registry order, with their exact
@@ -251,7 +251,10 @@ fn diagnostics_registrations_expose_exact_facets_and_preview_is_pure() {
                         debug_diff,
                         debug_undo,
                         debug_diagnostics,
+                        permissions,
+                        config_status,
                     } = parts;
+                    assert!(permissions.is_none() && config_status.is_none());
                     assert!(debug_diagnostics.is_some(), "/{spelling} needs diagnostics");
                     assert_eq!(
                         presentation.is_some(),
@@ -427,7 +430,7 @@ fn preview_request_remains_the_pure_registration() {
     // Phase 6 wires the portable registrations. Even here preview creates no
     // facet bundle and parses the action without provider/session state.
     let mut harness = DiagnosticsHarness::new();
-    harness.app.api_provider = ApiProvider::Ollama;
+    harness.app.api_provider = ProviderKind::Ollama;
     let result = execute("/preview-request", &mut harness.app);
     assert!(matches!(
         result.action,

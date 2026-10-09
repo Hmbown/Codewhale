@@ -54,18 +54,22 @@ async fn lifecycle_bulk_followup_preserves_mappings_and_retries_without_duplicat
             agent.agent_type = FleetRole::Scout;
             agent.model = "deepseek-v4-flash".into();
             agent.allowed_tools = Some(Vec::new());
-            let spec = &mut guard.worker_records.get_mut(&id).unwrap().spec;
+            let record = guard.worker_records.get_mut(&id).unwrap();
+            record.parent_run_id = None;
+            record.spec.parent_run_id = None;
+            let spec = &mut record.spec;
             spec.model = "deepseek-v4-flash".into();
             spec.agent_type = FleetRole::Scout;
             spec.runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
             sources.push(id);
         }
     }
-    let (client, _, _) =
+    let (client, _, _, fixture_config) =
         super::tests::delayed_chat_client(Duration::from_secs(30), "fixture result").await;
     let mut runtime = super::tests::stub_runtime();
     runtime.manager = Arc::clone(&manager);
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.context = ToolContext::new(dir.path());
     let tool = coord::AgentsFollowupTool::new(Arc::clone(&manager)).with_runtime(runtime);
     let input = json!({"agent_ids": sources, "message": "Continue the assignment."});
@@ -576,16 +580,20 @@ async fn lifecycle_continuation_link_is_durable_before_the_child_can_run() {
     let manager = Arc::new(RwLock::new(
         SubAgentManager::new(base.clone(), 4).with_state_path(path.clone()),
     ));
-    let (client, calls, _) =
+    let (client, calls, _, fixture_config) =
         super::tests::delayed_chat_client(Duration::from_secs(30), "fixture").await;
     let mut runtime = super::tests::stub_runtime();
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(&base);
     let mut guard = manager.write().await;
     let (source, _) =
         guard.insert_test_interrupted_continuable_agent("durable-source", &base, prior_messages());
     guard.agents.get_mut(&source).unwrap().model = "deepseek-v4-flash".into();
+    let record = guard.worker_records.get_mut(&source).unwrap();
+    record.parent_run_id = None;
+    record.spec.parent_run_id = None;
     guard
         .worker_records
         .get_mut(&source)

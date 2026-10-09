@@ -11,7 +11,7 @@ use super::qa_harness::{
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn launch(workspace: &SealedWorkspace) -> Harness {
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())

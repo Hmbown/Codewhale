@@ -51,7 +51,7 @@ use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
 use image::imageops::FilterType;
 use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder, ImageReader, Limits};
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -296,6 +296,26 @@ pub struct PreparedToolImage {
 #[must_use]
 pub fn prepare_tool_image_bytes(bytes: &[u8], mime_type: &str) -> PreparedToolImage {
     let mime_type = mime_type.split(';').next().unwrap_or(mime_type).trim();
+    // A Retina screenshot is routinely over the inline limit as PNG. Fit it
+    // on the attach-time ladder instead of omitting it, so `read` on a
+    // screenshot behaves like dropping the same file into the composer.
+    if bytes.len() > MAX_IMAGE_BYTES
+        && sniff_media_type(bytes) == Some(mime_type)
+        && let Ok(fitted) = fit_image_bytes(bytes, Path::new("image"))
+        && let Some((fitted_mime, payload)) = parse_data_url(&fitted.data_url)
+    {
+        return PreparedToolImage {
+            block: Some(codewhale_tools::ToolResultContentBlock::Image {
+                mime_type: fitted_mime.to_string(),
+                data: payload.to_string(),
+            }),
+            note: format!(
+                "Read image file [{mime_type}] (downscaled from {} to a {} {fitted_mime} to fit the inline image limit)",
+                human_bytes(bytes.len()),
+                human_bytes(fitted.source_bytes),
+            ),
+        };
+    }
     let valid = bytes.len() <= MAX_IMAGE_BYTES
         && sniff_media_type(bytes) == Some(mime_type)
         && decode_and_guard_image(bytes).is_ok();
@@ -573,27 +593,241 @@ pub fn attach_image_from_path(path: &Path) -> Result<AttachedImage, ImageAttachE
             limit: source_limit,
         });
     }
-    let oversized_edge = ImageReader::new(Cursor::new(&bytes))
+    fit_image_bytes(&bytes, path)
+}
+
+/// The size/edge policy of [`attach_image_from_path`] over bytes already in
+/// memory, shared with the `read` tool so both deliver the same image.
+fn fit_image_bytes(bytes: &[u8], path: &Path) -> Result<AttachedImage, ImageAttachError> {
+    let display = path.display().to_string();
+    let oversized_edge = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()
         .and_then(|reader| reader.into_dimensions().ok())
         .is_some_and(|(width, height)| width.max(height) > ATTACH_MAX_EDGE_PX);
     if bytes.len() <= MAX_IMAGE_BYTES && !oversized_edge {
-        return encode_image_bytes(&bytes, &display);
+        return encode_image_bytes(bytes, &display);
     }
-    if sniff_media_type(&bytes).is_none() {
-        return Err(format_error(&bytes, &display));
+    if sniff_media_type(bytes).is_none() {
+        return Err(format_error(bytes, &display));
     }
     let unreadable = |reason: String| ImageAttachError::Unreadable {
         path: display.clone(),
         reason,
     };
     let (image, _, _) =
-        decode_and_guard_image(&bytes).map_err(|error| unreadable(error.to_string()))?;
+        decode_and_guard_image(bytes).map_err(|error| unreadable(error.to_string()))?;
     let (encoded, _) =
         crate::tools::read_media::fit_and_encode(&image, ATTACH_MAX_EDGE_PX, MAX_IMAGE_BYTES, path)
             .map_err(|error| unreadable(error.to_string()))?;
     encode_image_bytes(&encoded, &display)
+}
+
+/// Upper bound on a paste considered as a list of dropped file paths.
+const MAX_PASTED_PATHS_BYTES: usize = 16 * 1024;
+
+/// The local image files a pasted string names, or `None` when the paste is
+/// anything else and belongs in the composer as text.
+///
+/// Terminals deliver a drag-and-drop as a paste of the file's path, in
+/// whatever spelling the terminal prefers: Terminal.app and iTerm2
+/// shell-escape (`/var/folders/…/Screenshot\ 2026-10-04\ at\ 22.25.47.png`),
+/// others quote, some hand over a `file://` URL, and several files arrive as
+/// one space-separated line. Without this, that path reached the model as
+/// prose and the model had no way to look at the picture.
+///
+/// The paste converts only when *every* path in it is absolute and names an
+/// existing file whose bytes are PNG, JPEG, GIF or WebP, so a sentence that
+/// merely mentions a path, a relative name, or a pasted non-image stays text.
+///
+/// Known limits: a path typed or pasted inside prose is not converted (the
+/// drop is the gesture, not the mention); on Windows a paste is read as one
+/// path verbatim, without shell unescaping.
+#[must_use]
+pub fn pasted_image_paths(text: &str) -> Option<Vec<PathBuf>> {
+    pasted_paths_matching(text, |path| sniff_image_file(path).is_some())
+}
+
+/// A local image path leading a submitted message, and the text after it.
+///
+/// The paste-time check ([`pasted_image_paths`]) only sees a paste that is
+/// nothing but paths. A drop can still reach the composer as typed keys, or
+/// be followed by the question on the same line before Enter. So at submit a
+/// message that *starts* with an existing image path (escaped, quoted, a
+/// `file://` URL, or unescaped with spaces) attaches it and keeps the rest as
+/// the prompt — the same rule Hermes Agent's `_detect_file_drop` applies.
+#[must_use]
+pub fn leading_dropped_image(text: &str) -> Option<(PathBuf, String)> {
+    leading_path_matching(text, |path| sniff_image_file(path).is_some())
+}
+
+fn leading_path_matching(
+    text: &str,
+    is_image: impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, String)> {
+    let text = text.trim_start();
+    let (line, after) = text.split_once('\n').unwrap_or((text, ""));
+    let line = line.trim_end();
+    if line.is_empty() || line.len() > MAX_PASTED_PATHS_BYTES {
+        return None;
+    }
+    let bare = line.trim_start_matches(['"', '\'']);
+    if !(bare.starts_with('/') || bare.starts_with("file://") || Path::new(bare).is_absolute()) {
+        return None;
+    }
+    let accept = |raw: &str, unescape: bool| {
+        let path = pasted_path(raw, unescape);
+        (path.is_absolute() && is_image(&path)).then_some(path)
+    };
+    let found = (|| {
+        // A quoted path ends at its closing quote.
+        if let Some(quote) = line.chars().next().filter(|c| *c == '"' || *c == '\'')
+            && let Some(end) = line[1..].find(quote)
+        {
+            let end = end + 2;
+            return accept(&line[..end], false).map(|path| (path, end));
+        }
+        // A shell-escaped path ends at its first unescaped space.
+        let mut escaped = false;
+        let token_end = line
+            .char_indices()
+            .find(|&(_, ch)| {
+                let stop = ch == ' ' && !escaped;
+                escaped = ch == '\\' && !escaped;
+                stop
+            })
+            .map_or(line.len(), |(index, _)| index);
+        if let Some(path) = accept(&line[..token_end], true) {
+            return Some((path, token_end));
+        }
+        // An unescaped path with spaces: the longest prefix that is a file.
+        let mut cuts: Vec<usize> = line.match_indices(' ').map(|(index, _)| index).collect();
+        cuts.push(line.len());
+        cuts.into_iter()
+            .rev()
+            .filter(|&cut| cut > token_end)
+            .find_map(|cut| accept(&line[..cut], false).map(|path| (path, cut)))
+    })()?;
+    let (path, end) = found;
+    let rest = format!("{}\n{after}", &line[end..]);
+    Some((path, rest.trim().to_string()))
+}
+
+fn pasted_paths_matching(text: &str, is_image: impl Fn(&Path) -> bool) -> Option<Vec<PathBuf>> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_PASTED_PATHS_BYTES {
+        return None;
+    }
+    let accept = |path: PathBuf| (path.is_absolute() && is_image(&path)).then_some(path);
+    // The whole paste as one path first: a dropped file whose name has
+    // spaces is one path even when the terminal did not escape it.
+    if let Some(path) = accept(pasted_path(text, true)) {
+        return Some(vec![path]);
+    }
+    if cfg!(windows) {
+        return None;
+    }
+    // Several dropped files: shlex has already removed quotes and escapes.
+    let paths = shlex::split(text)?
+        .iter()
+        .map(|token| accept(pasted_path(token, false)))
+        .collect::<Option<Vec<_>>>()?;
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// One pasted path spelling (quoted, shell-escaped, or a `file://` URL) as
+/// a filesystem path. `unescape` is false for a token shlex already split.
+fn pasted_path(raw: &str, unescape: bool) -> PathBuf {
+    let unquoted = ['"', '\'']
+        .iter()
+        .find_map(|quote| {
+            raw.strip_prefix(*quote)
+                .and_then(|rest| rest.strip_suffix(*quote))
+        })
+        .unwrap_or(raw);
+    if let Ok(url) = url::Url::parse(unquoted)
+        && url.scheme() == "file"
+        && let Ok(path) = url.to_file_path()
+    {
+        return path;
+    }
+    if cfg!(windows) || !unescape {
+        return PathBuf::from(unquoted);
+    }
+    let mut unescaped = String::with_capacity(unquoted.len());
+    let mut chars = unquoted.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(next) = chars.next()
+        {
+            unescaped.push(next);
+        } else {
+            unescaped.push(ch);
+        }
+    }
+    PathBuf::from(unescaped)
+}
+
+/// The accepted image format of a regular file, judged by its leading bytes.
+fn sniff_image_file(path: &Path) -> Option<&'static str> {
+    use std::io::Read as _;
+    // stat before open: opening a FIFO (or other special file) a paste named
+    // blocks until a writer appears, which would freeze the composer.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut head = Vec::with_capacity(16);
+    file.take(16).read_to_end(&mut head).ok()?;
+    sniff_media_type(&head)
+}
+
+/// Paths of the images the user attached in this session's own prompts.
+///
+/// Reads only `[Attached image: …]` lines in user-role text — the logged
+/// record of what the user put in the composer — and never tool output or
+/// model text, so a tool result cannot widen what a read may open. Pure
+/// string work; [`resolve_user_attached_image`] does the filesystem half.
+#[must_use]
+pub fn user_attached_image_references(messages: &[codewhale_models::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == codewhale_models::Role::User)
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .flat_map(codewhale_core::media_attachment_references)
+        .filter(|reference| reference.kind == "image")
+        .map(|reference| reference.path)
+        .collect()
+}
+
+/// Admit `raw` for a read-only image tool when it is exactly a file the user
+/// attached (see [`user_attached_image_references`]).
+///
+/// The workspace boundary keeps the model from wandering the disk; a
+/// screenshot the user dropped into the composer from a temp directory is not
+/// wandering, and refusing it is what sent a model to OCR and computer-use
+/// screenshots instead of looking. Admission stays narrow: the exact file
+/// (compared after canonicalization, so `/var` and `/private/var` agree), not
+/// its directory, and only while its bytes are an accepted image format.
+/// Callers still apply the credential and read deny-list checks.
+#[must_use]
+pub fn resolve_user_attached_image(references: &[String], raw: &str) -> Option<PathBuf> {
+    let requested = Path::new(raw);
+    if !requested.is_absolute() {
+        return None;
+    }
+    let requested = std::fs::canonicalize(requested).ok()?;
+    let attached = references
+        .iter()
+        .any(|reference| std::fs::canonicalize(reference).is_ok_and(|path| path == requested));
+    (attached && sniff_image_file(&requested).is_some()).then_some(requested)
 }
 
 /// Image blocks sent from the latest user prompt onward: this turn's

@@ -82,13 +82,30 @@ fn shipped_default_routes_have_reviewed_pricing_coverage() {
                 ..Default::default()
             })
             .unwrap_or_else(|error| panic!("{} default cannot resolve: {error}", entry.id()));
-        let provider = ApiProvider::from_kind(entry.kind());
+        let provider = entry.kind();
         let mut config = Config {
             provider: Some(entry.id().to_string()),
             ..Default::default()
         };
-        config.provider_config_for_mut(provider).base_url =
-            Some(candidate.endpoint().base_url.clone());
+        if provider == ProviderKind::Custom {
+            config
+                .providers
+                .get_or_insert_with(Default::default)
+                .custom
+                .insert(
+                    "custom".into(),
+                    ProviderConfig {
+                        kind: Some("openai-compatible".into()),
+                        base_url: Some(candidate.endpoint().base_url.clone()),
+                        model: Some(candidate.wire_model_id().as_str().into()),
+                        ..Default::default()
+                    },
+                );
+        }
+        config
+            .provider_config_for_mut(&config.test_identity_for_kind(provider))
+            .unwrap()
+            .base_url = Some(candidate.endpoint().base_url.clone());
         defaults.push((config, provider, candidate));
     }
     let built_in_count = defaults.len();
@@ -98,12 +115,19 @@ fn shipped_default_routes_have_reviewed_pricing_coverage() {
             provider: Some(descriptor.id.clone()),
             ..Default::default()
         };
-        *config.provider_config_for_mut(ApiProvider::Custom) = ProviderConfig {
-            kind: Some("openai-compatible".to_string()),
-            base_url: Some(descriptor.base_url.clone()),
-            model: Some(descriptor.default_model.clone()),
-            ..Default::default()
-        };
+        config
+            .providers
+            .get_or_insert_with(Default::default)
+            .custom
+            .insert(
+                descriptor.id.clone(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some(descriptor.base_url.clone()),
+                    model: Some(descriptor.default_model.clone()),
+                    ..Default::default()
+                },
+            );
         config
             .resolve_provider_identity(&descriptor.id)
             .expect("named compatible default must retain a valid identity");
@@ -111,11 +135,13 @@ fn shipped_default_routes_have_reviewed_pricing_coverage() {
             .resolve(&RouteRequest {
                 explicit_provider: Some(ProviderKind::Custom),
                 model_selector: Some(LogicalModelRef::from(descriptor.default_model.clone())),
-                base_url_override: Some(config.base_url_for_route(ApiProvider::Custom)),
+                base_url_override: Some(
+                    config.base_url_for_route(&config.test_identity_for_kind(ProviderKind::Custom)),
+                ),
                 ..Default::default()
             })
             .expect("named compatible bootstrap route must resolve");
-        defaults.push((config, ApiProvider::Custom, candidate));
+        defaults.push((config, ProviderKind::Custom, candidate));
     }
 
     // A deliberate breadth receipt, including the generic Custom placeholder.
@@ -137,7 +163,7 @@ fn shipped_default_routes_have_reviewed_pricing_coverage() {
     let mut seen = BTreeSet::new();
     let mut unpriced = BTreeMap::new();
     for (config, provider, candidate) in defaults {
-        let base_url = config.base_url_for_route(provider);
+        let base_url = config.base_url_for_route(&config.test_identity_for_kind(provider));
         // Config normalizes the optional trailing separator before dispatch.
         // Retain the exact host/path comparison and audit that runtime form.
         assert_eq!(
@@ -147,7 +173,7 @@ fn shipped_default_routes_have_reviewed_pricing_coverage() {
         let route = EffectiveRouteEnvelope::capture(
             Some(&config),
             provider,
-            config.provider_identity_for(provider),
+            config.active_provider_identity().unwrap().key.as_str(),
             candidate.wire_model_id().as_str(),
             Some(&base_url),
             recorded_at,

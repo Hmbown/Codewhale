@@ -95,6 +95,16 @@ impl ToolSpec for ValidateDataTool {
         let requested_format = DataFormat::from_input(optional_str(&input, "format")?)?;
 
         let (source_name, raw_content, extension) = load_input_source(path, content, context)?;
+        if context.features.enabled(crate::features::Feature::DataHost) {
+            return validate_host(
+                &raw_content,
+                &source_name,
+                requested_format,
+                extension.as_deref(),
+                context,
+            )
+            .await;
+        }
         match requested_format {
             DataFormat::Json => validate_json(&raw_content, &source_name),
             DataFormat::Toml => validate_toml(&raw_content, &source_name),
@@ -115,9 +125,29 @@ fn load_input_source(
         (None, None) => Err(ToolError::missing_field("path or content")),
         (Some(path), None) => {
             let resolved = context.resolve_path(path)?;
-            let raw_content = fs::read_to_string(&resolved).map_err(|e| {
-                ToolError::execution_failed(format!("Failed to read {}: {e}", resolved.display()))
-            })?;
+            let raw_content = if context.features.enabled(crate::features::Feature::DataHost) {
+                use std::io::Read;
+                let mut content = String::new();
+                fs::File::open(&resolved)
+                    .and_then(|file| file.take(1024 * 1024 + 1).read_to_string(&mut content))
+                    .map_err(|e| {
+                        ToolError::execution_failed(format!(
+                            "Failed to read {}: {e}",
+                            resolved.display()
+                        ))
+                    })?;
+                if content.len() > 1024 * 1024 {
+                    return Err(ToolError::invalid_input("Host data input exceeds 1 MiB"));
+                }
+                content
+            } else {
+                fs::read_to_string(&resolved).map_err(|e| {
+                    ToolError::execution_failed(format!(
+                        "Failed to read {}: {e}",
+                        resolved.display()
+                    ))
+                })?
+            };
             let extension = resolved
                 .extension()
                 .and_then(|ext| ext.to_str())
@@ -125,6 +155,78 @@ fn load_input_source(
             Ok((path.to_string(), raw_content, extension))
         }
         (None, Some(content)) => Ok(("inline".to_string(), content.to_string(), None)),
+    }
+}
+
+/// Preserve the existing Rust parsers and their exact diagnostics. The host
+/// selects the format and owns summary/result presentation from minimal facts.
+async fn validate_host(
+    raw: &str,
+    source: &str,
+    format: DataFormat,
+    extension: Option<&str>,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if raw.len() > 1024 * 1024 {
+        return Err(ToolError::invalid_input("Host data input exceeds 1 MiB"));
+    }
+    let json = match serde_json::from_str::<Value>(raw) {
+        Ok(parsed) => json!({"ok":true,"value":json_descriptor(&parsed)}),
+        Err(error) => json!({"ok":false,"error":error.to_string()}),
+    };
+    let toml = match toml::from_str::<toml::Value>(raw) {
+        Ok(parsed) => json!({"ok":true,"value":toml_descriptor(&parsed)}),
+        Err(error) => json!({"ok":false,"error":error.to_string()}),
+    };
+    let result = crate::extension_host::manager().execute_stock(
+        crate::extension_host::StockOperation::ValidateData,
+        json!({"format":format.as_str(),"source":source,"extension":extension,"json":json,"toml":toml}),
+        context,
+        std::time::Duration::from_secs(120),
+    ).await?;
+    let metadata = result
+        .metadata
+        .as_ref()
+        .ok_or_else(|| ToolError::execution_failed("Host data result omitted metadata"))?;
+    if metadata.get("valid").and_then(Value::as_bool) != Some(result.success)
+        || metadata.get("source").and_then(Value::as_str) != Some(source)
+    {
+        return Err(ToolError::execution_failed(
+            "Host data result changed its captured source",
+        ));
+    }
+    if result.success {
+        if metadata.get("summary").is_none() {
+            return Err(ToolError::execution_failed(
+                "Host data result changed its captured source",
+            ));
+        }
+        ToolResult::json(metadata).map_err(|error| ToolError::execution_failed(error.to_string()))
+    } else {
+        Ok(result)
+    }
+}
+fn json_descriptor(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => json!({"kind":"object","keys":map.keys().collect::<Vec<_>>()}),
+        Value::Array(array) => json!({"kind":"array","entries":array.len()}),
+        Value::String(_) => json!({"kind":"string"}),
+        Value::Number(_) => json!({"kind":"number"}),
+        Value::Bool(_) => json!({"kind":"boolean"}),
+        Value::Null => json!({"kind":"null"}),
+    }
+}
+fn toml_descriptor(value: &toml::Value) -> Value {
+    match value {
+        toml::Value::Table(table) => {
+            json!({"kind":"table","keys":table.keys().collect::<Vec<_>>()})
+        }
+        toml::Value::Array(array) => json!({"kind":"array","entries":array.len()}),
+        toml::Value::String(_) => json!({"kind":"string"}),
+        toml::Value::Integer(_) => json!({"kind":"integer"}),
+        toml::Value::Float(_) => json!({"kind":"float"}),
+        toml::Value::Boolean(_) => json!({"kind":"boolean"}),
+        toml::Value::Datetime(_) => json!({"kind":"datetime"}),
     }
 }
 

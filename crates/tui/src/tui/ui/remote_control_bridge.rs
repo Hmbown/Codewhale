@@ -271,6 +271,7 @@ pub(crate) async fn drain_remote_control_events(
                         };
                         match result {
                             Ok(()) => {
+                                note_human_decision_delivered(app, &tool_id);
                                 let _ = app.remote_control.take_pending_approval(&gate);
                                 app.retire_action_notices(Some(&tool_id));
                                 // First decision wins: the web answered this
@@ -418,7 +419,7 @@ pub(crate) fn start_remote_control_session(app: &mut App, config: &Config) {
         .filter(|value| !value.is_empty())
         .unwrap_or("Codewhale session")
         .to_string();
-    let git_remote = crate::remote_control::observed_git_repo(&app.workspace);
+    let git_remote = crate::git_status::observed_git_repo(&app.workspace);
     let runtime_commit = option_env!("CODEWHALE_BUILD_COMMIT")
         .unwrap_or("")
         .to_string();

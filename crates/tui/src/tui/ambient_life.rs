@@ -1211,12 +1211,6 @@ pub fn apply_caustic_shimmer(
     if !animated || area.width < AMBIENT_MIN_WIDTH || area.height < AMBIENT_MIN_HEIGHT {
         return;
     }
-    // Sparse sampling: every 3rd column on every other row near the surface.
-    //
-    // The light stops where the composition starts. Sunlight raking across
-    // the rows a wordmark is sitting in is the same failure as a fish
-    // swimming through them, just quieter, and it costs nothing to measure:
-    // the surface band is clipped to the first row that carries text.
     let ceiling = (0..area.height)
         .find(|row| {
             lines
@@ -1226,61 +1220,44 @@ pub fn apply_caustic_shimmer(
         })
         .unwrap_or(area.height);
     let band = (area.height / 3).max(2).min(ceiling);
-    for local_y in 0..band {
-        let protected = lines
-            .get(usize::from(local_y))
-            .and_then(occupied_text_bounds);
-        let ramp = frame_ocean_ramp(
-            column,
-            area.height,
-            area.y,
-            elapsed_ms,
-            column.phase_tag(),
-            column.ramp_fingerprint(),
-        );
-        let row_bg = ramp
-            .get(usize::from(local_y))
+    let ramp = frame_ocean_ramp(
+        column,
+        area.height,
+        area.y,
+        elapsed_ms,
+        column.phase_tag(),
+        column.ramp_fingerprint(),
+    );
+    let protected = codewhale_ratatui::ocean::ocean_semantic_surfaces(
+        lines,
+        area,
+        crate::tui::ui_text::grapheme_display_width,
+    );
+    let paint = codewhale_ratatui::ocean::OceanPaintFacts {
+        ground: ramp
+            .first()
             .copied()
-            .unwrap_or_else(|| column.color_at_y(area.y.saturating_add(local_y)));
-        for local_x in (0..area.width).step_by(3) {
-            if protected.is_some_and(|(start, end)| {
-                usize::from(local_x) >= start && usize::from(local_x) < end
-            }) {
-                continue;
-            }
-            let cell = &mut buf[(area.x + local_x, area.y + local_y)];
-            // Soften toward ambient ink without replacing semantic glyphs.
-            if cell.symbol() == " " || cell.symbol().is_empty() {
-                // Sunlight dissolves with depth instead of stopping: full
-                // amplitude at the surface easing to zero at the band's
-                // floor. The former hard cutoff at `band` drew a visible
-                // horizontal line across tall windows.
-                let depth_fade = 1.0 - f32::from(local_y) / f32::from(band.max(1));
-                let shimmer = ocean::scale_color(
-                    row_bg,
-                    caustic_brightness(elapsed_ms, local_x, local_y, depth_fade * depth_fade),
-                );
-                cell.set_bg(shimmer);
-            }
-        }
-    }
+            .unwrap_or_else(|| column.color_at_y(area.y)),
+        sample_top: area.y,
+        samples: &ramp,
+        protected: &protected,
+    };
+    let facts = codewhale_ratatui::ocean::OceanCausticFacts {
+        paint,
+        elapsed: std::time::Duration::from_millis((elapsed_ms % 960) as u64),
+        band_rows: band,
+    };
+    column.paint_caustics(area, buf, &facts);
 }
 
-/// Continuous travelling caustic. The former `(elapsed / 80) % 12` mask
-/// toggled cells fully on/off at 12.5 Hz; truecolor made that quantization look
-/// like dropped frames. A narrow cosine crest preserves the same sparse light
-/// band while cross-fading every sampled cell between frames.
+#[cfg(test)]
 fn caustic_brightness(elapsed_ms: u128, local_x: u16, local_y: u16, depth_fade: f32) -> f32 {
-    const CYCLE_MS: f64 = 960.0;
-    const SPATIAL_SLOTS: f64 = 4.0;
-    let time = (elapsed_ms % CYCLE_MS as u128) as f64 / CYCLE_MS;
-    // The sampled grid advances by three terminal columns. Four grid phases
-    // therefore preserve the old 12-column repeat instead of stretching the
-    // caustic topology while changing only its temporal interpolation.
-    let slot = (u32::from(local_x / 3) + u32::from(local_y)) % 4;
-    let phase = (time + f64::from(slot) / SPATIAL_SLOTS) * std::f64::consts::TAU;
-    let crest = ((phase.cos() + 1.0) * 0.5).powi(8);
-    1.0 + 0.08 * (crest as f32) * depth_fade.clamp(0.0, 1.0)
+    codewhale_ratatui::ocean::ocean_caustic_brightness(
+        std::time::Duration::from_millis((elapsed_ms % 960) as u64),
+        local_x,
+        local_y,
+        depth_fade,
+    )
 }
 
 /// Cached ocean row colors invalidated only when phase/dimensions/palette/breath tick.

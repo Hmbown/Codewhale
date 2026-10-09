@@ -30,7 +30,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Executa la comprovació en segon pla", body: "L’ajudant obre una finestra de pràctica d’un sol ús, hi escriu text i la captura. Comprova si el punter o l’aplicació activa han canviat durant l’execució." },
     { title: "Connecta’l amb Codewhale", body: "Revisa, marca com a fiable i activa Computer Use al mercat de connectors de Codewhale. Fes servir el connector 0.3.1 o posterior perquè les accions locals passin pels controls Pause i Stop de l’ajudant." },
   ],
-  controlsTitle: "Continua treballant. Mantén el control.",
+  controlsTitle: "Posa en pausa o atura el control de les aplicacions",
   controlsBody: "Les accions compatibles operen en segon pla sobre l’aplicació seleccionada. Les aplicacions i els gestos que necessiten el control en primer pla requereixen la teva autorització. El menú mostra l’aplicació de destinació i el mode d’entrada; Pause (pausa) suspèn l’entrada de l’ajudant i Stop (atura) tanca les seves sessions actives.",
   updateTitle: "Actualitzacions quan tu vulguis",
   updateBody: "Tria Check for updates (Cerca actualitzacions) a l’aplicació. Abans d’instal·lar una actualització, comprova la baixada, la signatura de Codewhale i la notarització d’Apple, i conserva l’aplicació anterior per si cal recuperar-la.",

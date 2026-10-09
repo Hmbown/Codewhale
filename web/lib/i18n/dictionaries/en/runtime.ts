@@ -8,12 +8,12 @@ import type { RuntimeDict } from "../types";
 export const runtime: RuntimeDict = {
   metaTitle: "Runtime & Integrations · Codewhale",
   metaDescription:
-    "Codewhale's local Runtime API, HTTP/SSE, baseline ACP stdio adapter, MCP servers, an early VS Code companion, and messaging bridges.",
+    "Connect editors, scripts, and chat apps to Codewhale through the local Runtime API over HTTP/SSE, a baseline ACP stdio adapter, MCP servers, an early VS Code companion, and messaging bridges.",
   kicker: "Runtime & Integrations",
-  title: "Runtime and integrations",
+  title: "Drive Codewhale from your own tools",
   titleAside: "运行时与集成",
   titleAsideLang: "zh",
-  lede: "Embed Codewhale in the tools you already use. Beyond the terminal, it runs a local control plane that editors, scripts and chat apps can talk to.",
+  lede: "Codewhale runs a local control plane alongside the terminal. Editors, scripts, and chat apps use it to read threads, stream events, and answer approvals.",
   integrationsTitle: "Integration surfaces",
   experimental: "Experimental",
   trustTitle: "Trust boundary",

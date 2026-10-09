@@ -11,7 +11,7 @@ use super::qa_harness::{
 #[test]
 fn search_text_stays_in_modal_and_out_of_composer() {
     let workspace = make_sealed_workspace().expect("sealed workspace");
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())

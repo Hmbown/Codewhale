@@ -19,7 +19,7 @@ is missing — fall back to printing the issue text for manual filing.
    command, expected vs actual, minimal steps.
 2. Draft the issue (title, repro, expected, actual, version) and read it back.
 3. File only with explicit approval:
-   `gh issue create -R Hmbown/Codewhale --title "..." --body "..."`.
+   `gh issue create -R codewhale-hq/Codewhale --title "..." --body "..."`.
 4. Report the issue URL back.
 
 ## Non-goals

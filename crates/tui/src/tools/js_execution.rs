@@ -6,7 +6,12 @@
 //! what it printed." The split into a dedicated module (rather than
 //! living inline in `core::engine::tool_catalog` next to
 //! `execute_code_execution_tool`) keeps the dependency-probe and
-//! tempfile-spawn logic isolated for the test pin.
+//! code-delivery logic isolated.
+//!
+//! Both interpreter tools reuse the shell's permission-aware launcher. Native
+//! isolation depends on its available backend; unsupported read-only execution
+//! and local execution with an external backend are refused. This is not a
+//! persistent REPL; source is read from stdin rather than a host temporary file.
 //!
 //! Registration is gated by [`crate::dependencies::resolve_node`]:
 //! when Node is missing the tool is simply not advertised, so the
@@ -21,7 +26,7 @@ use std::time::Duration;
 use crate::dependencies::ExternalTool;
 use serde_json::{Value, json};
 
-use crate::tools::spec::{ToolError, ToolResult, required_str};
+use crate::tools::spec::{ToolContext, ToolError, ToolResult, required_str};
 use codewhale_models::Tool;
 
 /// Tool name surfaced to the model. Held alongside `code_execution`
@@ -81,7 +86,9 @@ fn node_proxy_env_overrides() -> Vec<(&'static str, OsString)> {
 }
 
 fn apply_node_execution_env(cmd: &mut tokio::process::Command) {
-    crate::child_env::apply_to_tokio_command(cmd, node_proxy_env_overrides());
+    // The shared launcher already scrubbed the environment and supplied
+    // sandbox markers. Append Node overrides without clearing that environment.
+    cmd.envs(node_proxy_env_overrides());
 }
 
 /// Build the `Tool` definition the catalog should advertise when
@@ -94,12 +101,21 @@ pub fn js_execution_tool_definition() -> Tool {
         tool_type: Some(JS_EXECUTION_TOOL_TYPE.to_string()),
         name: JS_EXECUTION_TOOL_NAME.to_string(),
         description:
-            "Execute JavaScript code with the local Node.js runtime in the workspace and return stdout/stderr/return_code as JSON."
+            "Execute JavaScript code with the local Node.js runtime using this call's execution policy and return stdout/stderr/return_code as JSON."
                 .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "JavaScript source code to execute." }
+                "code": { "type": "string", "description": "JavaScript source code to execute." },
+                "sandbox_permissions": {
+                    "type": "string",
+                    "enum": ["workspace-write", "danger-full-access"],
+                    "description": "Request a wider policy for this exact execution after a sandbox denial; requires justification and explicit user approval."
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "Required with sandbox_permissions: why this exact code needs wider access."
+                }
             },
             "required": ["code"]
         }),
@@ -125,61 +141,39 @@ fn js_execution_timeout() -> Duration {
     }
 }
 
-/// Run the model-provided JavaScript and return the captured
-/// stdout / stderr / return_code payload. Mirrors
-/// `execute_code_execution_tool` — same tempfile pattern, same error
-/// shape — so the surfaces stay interchangeable from the model's point of
-/// view. The wall-clock budget is 600 seconds, and on timeout the contained
-/// process tree is killed instead of being left running orphaned.
-///
-/// Tempfile lives only for the duration of this execution; `Drop`
-/// removes it. We use the `.js` extension so any source-map /
-/// shebang / encoding-sniffer logic in the interpreter behaves
-/// normally.
+/// Run JavaScript under the effective per-call policy, with the existing
+/// 600-second budget and process-tree cleanup. Stdin avoids host temporary-file
+/// visibility problems in a sandbox; CommonJS matches the former .js script.
 pub async fn execute_js_execution_tool(
     input: &Value,
     workspace: &Path,
+    context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     let code = required_str(input, "code")?;
-
-    // Resolve the Node runtime via ExternalTool. If it's absent now
-    // tokio_command() returns None and we fail fast with a clear message.
-
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| ToolError::execution_failed(format!("tempdir failed: {e}")))?;
-    let script_path = temp_dir.path().join("js_execution.js");
-    tokio::fs::write(&script_path, code)
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
-
-    let mut cmd = crate::dependencies::Node::tokio_command().ok_or_else(|| {
-        ToolError::execution_failed("js_execution: Node.js runtime became unavailable".to_string())
+    let node = crate::dependencies::Node::resolve().ok_or_else(|| {
+        ToolError::execution_failed("js_execution: Node.js runtime became unavailable")
     })?;
-    // Recent Node releases use this startup env to make fetch/http(s) honor
-    // standard proxy variables; older runtimes ignore it and keep prior behavior.
+    let budget = js_execution_timeout();
+    let mut cmd = crate::tools::shell::sandboxed_runner_command(
+        context,
+        &node,
+        vec!["--input-type=commonjs".to_string(), "-".to_string()],
+        workspace,
+        budget,
+    )?;
     apply_node_execution_env(&mut cmd);
-    cmd.arg(&script_path).current_dir(workspace);
-
-    // #3273: Node's built-in `fetch` (undici) ignores HTTP(S)_PROXY env vars
-    // unless `NODE_USE_ENV_PROXY` is set (Node >= 24). This child already
-    // inherits CodeWhale's proxy environment, so enabling the flag lets
-    // `js_execution`'s `fetch()` reach the network through the same proxy/VPN
-    // as the rest of the app and honor `NO_PROXY`. Only default it on when the
-    // user hasn't chosen a value, so an explicit opt-out (`NODE_USE_ENV_PROXY=0`)
-    // still wins. No-op on Node < 24, which ignores the unknown variable.
     if std::env::var_os("NODE_USE_ENV_PROXY").is_none() {
         cmd.env("NODE_USE_ENV_PROXY", "1");
     }
-
-    // Contained: a timeout or a cancelled call ends the interpreter and
-    // anything it started (`setInterval`, a server), not only this future.
-    let budget = js_execution_timeout();
-    let output = tokio::time::timeout(budget, crate::process_tree::contained_output(&mut cmd))
-        .await
-        .map_err(|_| ToolError::Timeout {
-            seconds: budget.as_secs(),
-        })
-        .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
+    let output = tokio::time::timeout(
+        budget,
+        crate::process_tree::contained_output_with_input(&mut cmd, code.as_bytes().to_vec()),
+    )
+    .await
+    .map_err(|_| ToolError::Timeout {
+        seconds: budget.as_secs(),
+    })
+    .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -281,6 +275,7 @@ mod tests {
         let result = execute_js_execution_tool(
             &json!({ "code": "process.stdout.write('hello from node')" }),
             tmp.path(),
+            &ToolContext::new(tmp.path()),
         )
         .await
         .expect("execute");
@@ -307,7 +302,7 @@ mod tests {
                     setInterval(() => {}, 1000);";
         let input = json!({ "code": code });
         let grandchild = crate::process_tree::drop_once_pid_written(
-            execute_js_execution_tool(&input, tmp.path()),
+            execute_js_execution_tool(&input, tmp.path(), &ToolContext::new(tmp.path())),
             &tmp.path().join("grandchild.pid"),
         )
         .await;
@@ -326,6 +321,7 @@ mod tests {
         let result = execute_js_execution_tool(
             &json!({ "code": "throw new Error('intentional fail')" }),
             tmp.path(),
+            &ToolContext::new(tmp.path()),
         )
         .await
         .expect("execute should not Err — runtime errors land in stderr/exit code");
@@ -356,6 +352,7 @@ mod tests {
                 "code": "process.stdout.write(process.env.CODEWHALE_JS_SECRET_LEAK_TEST || 'missing')"
             }),
             tmp.path(),
+            &ToolContext::new(tmp.path()),
         )
         .await
         .expect("execute");
@@ -389,6 +386,7 @@ mod tests {
         let result = execute_js_execution_tool(
             &json!({ "code": "process.stdout.write(String(process.env.NODE_USE_ENV_PROXY))" }),
             tmp.path(),
+            &ToolContext::new(tmp.path()),
         )
         .await
         .expect("execute");
@@ -403,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn execute_js_rejects_input_without_code_field() {
         let tmp = tempdir().expect("tempdir");
-        let err = execute_js_execution_tool(&json!({}), tmp.path())
+        let err = execute_js_execution_tool(&json!({}), tmp.path(), &ToolContext::new(tmp.path()))
             .await
             .expect_err("missing `code` must reject before any node spawn");
         let msg = err.to_string();
@@ -428,9 +426,13 @@ mod tests {
             serde_json::json!(pid_file.to_string_lossy())
         );
 
-        let err = execute_js_execution_tool(&serde_json::json!({ "code": code }), workspace.path())
-            .await
-            .expect_err("a 60s sleep must hit the execution timeout");
+        let err = execute_js_execution_tool(
+            &serde_json::json!({ "code": code }),
+            workspace.path(),
+            &ToolContext::new(workspace.path()),
+        )
+        .await
+        .expect_err("a 60s sleep must hit the execution timeout");
         assert!(
             matches!(err, ToolError::Timeout { .. }),
             "expected a timeout error; got {err:?}"
@@ -475,9 +477,13 @@ mod tests {
                     setTimeout(() => {}, 60000);";
 
         let started = std::time::Instant::now();
-        let err = execute_js_execution_tool(&serde_json::json!({ "code": code }), workspace.path())
-            .await
-            .expect_err("a 60s sleep must hit the execution timeout");
+        let err = execute_js_execution_tool(
+            &serde_json::json!({ "code": code }),
+            workspace.path(),
+            &ToolContext::new(workspace.path()),
+        )
+        .await
+        .expect_err("a 60s sleep must hit the execution timeout");
         let elapsed = started.elapsed();
         assert!(
             matches!(err, ToolError::Timeout { .. }),

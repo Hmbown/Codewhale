@@ -83,6 +83,7 @@ pub(crate) fn onboarding_key_route(
 }
 
 pub(crate) fn back_from_provider_onboarding(app: &mut App) {
+    app.onboarding_key_rejected = None;
     if app.onboarding_missing_key_recovery {
         // A returning user declined missing-key recovery: leave onboarding
         // for the offline composer without mutating the saved route.
@@ -101,7 +102,7 @@ pub(crate) fn back_from_provider_onboarding(app: &mut App) {
     app.status_message = None;
 }
 
-pub(crate) fn complete_provider_picker_onboarding(app: &mut App, provider: ApiProvider) {
+pub(crate) fn complete_provider_picker_onboarding(app: &mut App, provider: ProviderKind) {
     // Ordinary `/provider` changes stay session-local until the operator
     // answers the route-save prompt. Onboarding is different: choosing a
     // provider is the explicit decision that establishes the startup route.
@@ -132,6 +133,7 @@ pub(crate) fn complete_provider_picker_onboarding(app: &mut App, provider: ApiPr
     };
     app.onboarding_provider = provider;
     app.onboarding_needs_api_key = false;
+    app.onboarding_key_rejected = None;
     // The route now has its key, so a later local-Ollama probe must not treat
     // this session as still recovering from a missing one.
     app.onboarding_missing_key_recovery = false;
@@ -151,7 +153,7 @@ pub(crate) fn complete_provider_picker_onboarding(app: &mut App, provider: ApiPr
 
 pub(crate) fn complete_provider_picker_onboarding_if_switched(
     app: &mut App,
-    provider: ApiProvider,
+    provider: ProviderKind,
     switched: bool,
 ) {
     if switched && app.onboarding == OnboardingState::Provider {
@@ -169,11 +171,11 @@ enum BalanceApi {
     SiliconFlowUserInfo,
 }
 
-fn balance_api_for(provider: ApiProvider) -> Option<BalanceApi> {
+fn balance_api_for(provider: ProviderKind) -> Option<BalanceApi> {
     match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => Some(BalanceApi::DeepSeekUserBalance),
-        ApiProvider::Openrouter => Some(BalanceApi::OpenRouterCredits),
-        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => {
+        ProviderKind::Deepseek => Some(BalanceApi::DeepSeekUserBalance),
+        ProviderKind::Openrouter => Some(BalanceApi::OpenRouterCredits),
+        ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => {
             Some(BalanceApi::SiliconFlowUserInfo)
         }
         _ => None,
@@ -185,7 +187,7 @@ fn balance_api_for(provider: ApiProvider) -> Option<BalanceApi> {
 /// Returns `None` on any error (network, auth, parse) — callers treat that
 /// as "balance unknown" and keep the previous value.
 pub(crate) async fn fetch_provider_balance(
-    provider: ApiProvider,
+    provider: ProviderKind,
     api_key: &str,
     base_url: &str,
 ) -> Option<crate::pricing::BalanceInfo> {
@@ -259,7 +261,7 @@ struct SiliconFlowUserData {
 async fn fetch_siliconflow_user_info(
     api_key: &str,
     base_url: &str,
-    provider: ApiProvider,
+    provider: ProviderKind,
 ) -> Option<crate::pricing::BalanceInfo> {
     let url = format!("{}/user/info", base_url.trim_end_matches('/'));
     let body: SiliconFlowUserInfo = balance_get_json(api_key, &url).await?;
@@ -270,7 +272,7 @@ async fn fetch_siliconflow_user_info(
         .or(data.balance.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let currency = if provider == ApiProvider::SiliconflowCn {
+    let currency = if provider == ProviderKind::SiliconflowCN {
         "CNY"
     } else {
         "USD"
@@ -314,7 +316,7 @@ pub(crate) fn should_fetch_provider_balance(app: &App) -> bool {
 /// the previous route's fetch cooldown.
 pub(crate) fn balance_cell_for_route(
     app: &mut App,
-    provider: ApiProvider,
+    provider: ProviderKind,
     api_key: &str,
     base_url: &str,
 ) -> std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>> {
@@ -437,7 +439,7 @@ pub(crate) fn resolve_cache_replay_route(
             target.provider_id.as_deref(),
         )
         .map_err(anyhow::Error::msg)?;
-    if identity.provider != target.provider || identity.key != target.provider_identity {
+    if identity.provider != target.provider || identity.key.as_str() != target.provider_identity {
         anyhow::bail!(
             "saved cache route identity `{}` now resolves as {}/{} instead of {}/{}; send a new turn before warming",
             target.provider_identity,
@@ -462,20 +464,10 @@ pub(crate) fn resolve_cache_replay_route(
     Ok(route)
 }
 
-pub(crate) fn error_health_route(
-    app: &App,
-    fallback_provider: ApiProvider,
-) -> (ApiProvider, String) {
-    app.active_turn
-        .as_ref()
-        .and_then(|turn| turn.route.as_ref())
-        .map(|route| (route.provider, route.model.clone()))
-        .or_else(|| {
-            app.pending_turn_route
-                .as_ref()
-                .map(|(provider, model, _)| (*provider, model.clone()))
-        })
-        .unwrap_or_else(|| (fallback_provider, app.model.clone()))
+pub(crate) fn error_health_route(app: &App) -> Option<(ProviderIdentity, String)> {
+    let route = app.active_turn.as_ref()?.route.as_ref()?;
+    let receipt = route.receipt.as_ref()?;
+    Some((receipt.admitted_identity().clone(), route.model.clone()))
 }
 
 pub(crate) fn rollback_provider_after_auth_failure(
@@ -500,15 +492,16 @@ pub(crate) fn rollback_provider_after_auth_failure(
     *config = previous_config;
 
     app.refresh_notification_settings(config);
-    if let Ok(identity) = config.active_provider_identity(previous_provider) {
-        app.set_provider_identity_record(identity);
-    } else {
-        app.set_provider_identity(
-            previous_provider,
-            config.provider_identity_for(previous_provider),
-        );
-    }
-    app.billing_presentation = crate::route_billing::for_route(config, previous_provider);
+    app.provider_identity = config
+        .active_provider_identity()
+        .ok()
+        .filter(|identity| identity.provider == previous_provider);
+    app.api_provider = previous_provider;
+    app.billing_presentation = app.provider_identity.as_ref().map_or(
+        crate::route_billing::BillingPresentation::Unknown,
+        |identity| crate::route_billing::for_route(config, identity),
+    );
+
     app.set_model_selection(previous_model.clone());
     app.provider_models.insert(
         app.provider_identity_for_persistence().to_string(),
@@ -563,7 +556,7 @@ pub(crate) fn validated_app_runtime_route(
     app: &App,
     config: &Config,
 ) -> Result<crate::route_runtime::ValidatedRuntimeRoute, String> {
-    let (identity, scoped) = app_scoped_runtime_config(app, config);
+    let (identity, scoped) = app_scoped_runtime_config(app, config)?;
     resolve_runtime_route_for_identity(&scoped, &identity, Some(&app.model))?.validate()
 }
 
@@ -583,16 +576,18 @@ pub(crate) fn compaction_for_validated_route(
 pub(crate) fn validated_profile_default_route(
     config: &Config,
 ) -> Result<crate::route_runtime::ValidatedRuntimeRoute> {
-    let provider = config.api_provider();
+    let identity = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
     let model = config.default_model();
-    resolve_runtime_route(config, provider, Some(&model))
+    resolve_runtime_route_for_identity(config, &identity, Some(&model))
         .and_then(crate::route_runtime::ResolvedRuntimeRoute::validate)
         .map_err(anyhow::Error::msg)
 }
 
 pub(crate) fn reasoning_effort_receipt_for_route(
     tier: ReasoningEffort,
-    provider: ApiProvider,
+    provider: ProviderKind,
     endpoint_identity: &str,
     model: &str,
 ) -> EffectiveReasoningEffort {
@@ -628,16 +623,20 @@ pub(crate) async fn switch_provider(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    target: ApiProvider,
+    identity: crate::config::ProviderIdentity,
     model_override: Option<String>,
 ) -> bool {
+    if let Err(reason) = config.verify_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return false;
+    }
+    let target = identity.provider;
     let previous_provider = app.api_provider;
     let previous_identity = app.provider_identity_for_persistence().to_string();
-    let requested_identity = config.provider_identity_for(target);
+    let requested_identity = identity.key.to_string();
     let previous_model = app.model.clone();
     let previous_model_ids_passthrough = app.model_ids_passthrough;
-    let mut previous_config = config.clone();
-    previous_config.provider = Some(previous_identity.clone());
+    let previous_config = config.clone();
     app.pending_provider_switch = Some(PendingProviderSwitch {
         previous_provider,
         previous_model: previous_model.clone(),
@@ -657,66 +656,70 @@ pub(crate) async fn switch_provider(
     // outgoing route was using moves onto that route's own leaf, so coming
     // back lands on it instead of the catalog default. Every failure path
     // below restores `previous_config`.
-    if let Some((outgoing, value)) = config
-        .active_provider_identity(target)
-        .ok()
-        .and_then(|incoming| config.root_model_alias_owned_by_outgoing(&incoming))
-    {
-        config.set_provider_model_override(outgoing.provider, Some(value));
+    if let Some((outgoing, value)) = config.root_model_alias_owned_by_outgoing(&identity) {
+        if let Err(reason) = config.set_provider_model_override(&outgoing, Some(value)) {
+            app.pending_provider_switch = None;
+            app.push_status_toast(reason.to_string(), StatusToastLevel::Error, Some(8_000));
+            return false;
+        }
         config.default_text_model = None;
     }
 
-    let resolved_route = match resolve_runtime_route(config, target, model_override.as_deref()) {
-        Ok(route) => route,
-        Err(reason) => {
-            app.pending_provider_switch = None;
-            // #3830: if the switch failed only because the target provider has
-            // no key or local runtime, hand off to /provider already focused
-            // on that provider's key prompt instead of dead-ending with an
-            // error the user has to translate into an action.
-            if !crate::config::has_api_key_for(config, target)
-                && app.view_stack.top_kind() != Some(ModalKind::ProviderPicker)
-            {
-                let runtime_status = query_provider_runtime_status(engine_handle).await;
-                if let Some(picker) =
-                    crate::tui::provider_picker::ProviderPickerView::new_for_missing_auth(
-                        previous_provider,
-                        target,
-                        config,
-                        runtime_status,
-                    )
-                    .map(|picker| {
-                        picker
-                            .with_locale(app.ui_locale)
-                            .with_provider_health(&app.provider_health)
-                    })
+    let resolved_route =
+        match resolve_runtime_route_for_identity(config, &identity, model_override.as_deref()) {
+            Ok(route) => route,
+            Err(reason) => {
+                app.pending_provider_switch = None;
+                // #3830: if the switch failed only because the target provider has
+                // no key or local runtime, hand off to /provider already focused
+                // on that provider's key prompt instead of dead-ending with an
+                // error the user has to translate into an action.
+                if !crate::config::has_api_key_for(config, &identity)
+                    && app.view_stack.top_kind() != Some(ModalKind::ProviderPicker)
                 {
-                    *config = previous_config;
-                    app.refresh_notification_settings(config);
-                    app.view_stack.push(picker);
-                    app.status_message = Some(format!(
-                        "{} needs a key or local runtime — enter one to switch.",
-                        target.display_name()
-                    ));
-                    app.needs_redraw = true;
-                    return false;
+                    let runtime_status = query_provider_runtime_status(engine_handle).await;
+                    if let Some(picker) =
+                        crate::tui::provider_picker::ProviderPickerView::new_for_missing_auth(
+                            previous_provider,
+                            &identity,
+                            config,
+                            runtime_status,
+                        )
+                        .map(|picker| {
+                            picker
+                                .with_locale(app.ui_locale)
+                                .with_provider_health(&app.provider_health)
+                        })
+                    {
+                        *config = previous_config;
+                        app.refresh_notification_settings(config);
+                        app.view_stack.push(picker);
+                        app.status_message = Some(format!(
+                            "{} needs a key or local runtime — enter one to switch.",
+                            identity
+                                .compatibility()
+                                .map(|row| row.label)
+                                .unwrap_or(identity.key.as_str())
+                        ));
+                        app.needs_redraw = true;
+                        return false;
+                    }
                 }
+                *config = previous_config;
+                app.refresh_notification_settings(config);
+                app.add_message(HistoryCell::System {
+                    content: format!(
+                        "Cannot switch to {}: {reason}\nProvider unchanged ({}).",
+                        requested_identity, previous_identity
+                    ),
+                });
+                app.status_message = Some(format!(
+                    "Route rejected before provider switch: {}.",
+                    target.as_str()
+                ));
+                return false;
             }
-            *config = previous_config;
-            app.refresh_notification_settings(config);
-            app.add_message(HistoryCell::System {
-                content: format!(
-                    "Cannot switch to {}: {reason}\nProvider unchanged ({}).",
-                    requested_identity, previous_identity
-                ),
-            });
-            app.status_message = Some(format!(
-                "Route rejected before provider switch: {}.",
-                target.as_str()
-            ));
-            return false;
-        }
-    };
+        };
     let validated_route = match resolved_route.validate() {
         Ok(route) => route,
         Err(err) => {
@@ -733,7 +736,7 @@ pub(crate) async fn switch_provider(
         }
     };
     let target_identity_record = validated_route.identity.clone();
-    let target_identity = target_identity_record.key.clone();
+    let target_identity = target_identity_record.key.to_string();
     let resolved_endpoint = validated_route.candidate.endpoint().base_url.clone();
     let route_limits = validated_route.candidate.limits();
     let context_window_source = validated_route.context_window.source;
@@ -746,7 +749,7 @@ pub(crate) async fn switch_provider(
     let cache_scope_changed = previous_provider != target
         || previous_identity != target_identity
         || previous_model != new_model;
-    app.set_provider_identity_record(target_identity_record);
+    app.set_provider_identity_record(target_identity_record.clone());
     // Launch computed "needs a key" for the launch provider. A switch to a
     // route that has its credential answers that, even when the user left the
     // picker with Esc first; otherwise the stale flag keeps the info line on
@@ -756,19 +759,19 @@ pub(crate) async fn switch_provider(
     if !app.onboarding_needs_api_key {
         app.onboarding_missing_key_recovery = false;
     }
-    app.billing_presentation = crate::route_billing::for_route(config, target);
+    app.billing_presentation = crate::route_billing::for_route(config, &target_identity_record);
     app.max_subagents = config
-        .max_subagents_for_provider(target)
+        .max_subagents_for_provider(&target_identity_record)
         .clamp(1, crate::config::MAX_SUBAGENTS);
-    app.provider_chain = target
-        .kind()
-        .map(|kind| codewhale_config::ProviderChain::new(kind, &config.fallback_providers))
+    app.provider_chain = (target_identity_record.key.as_str() == target.as_str()
+        && target != ProviderKind::Antigravity)
+        .then(|| codewhale_config::ProviderChain::new(target, &config.fallback_providers))
         .filter(|chain| chain.providers().len() > 1);
     app.last_fallback_reason = None;
     app.model_ids_passthrough = config.model_ids_pass_through();
     app.set_model_selection(new_model.clone());
     app.apply_provider_switch_reasoning_effort(target, &new_base_url, model_override.as_deref());
-    app.set_active_context_window_override(config, target);
+    app.set_active_context_window_override(config, &target_identity_record);
     app.set_active_route_resolution(new_base_url.clone(), route_limits, context_window_source);
     if model_override.is_some() {
         app.provider_models
@@ -874,11 +877,10 @@ pub(crate) fn sync_config_provider_from_app(config: &mut Config, app: &App) {
 pub(crate) fn provider_picker_model_override(
     app: &App,
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) -> Option<String> {
-    (app.api_provider == provider
-        && app.provider_identity_for_persistence() == config.provider_identity_for(provider))
-    .then(|| app.model.clone())
+    config.verify_provider_identity(identity).ok()?;
+    (app.admitted_provider_identity().ok() == Some(identity)).then(|| app.model.clone())
 }
 
 pub(crate) async fn query_provider_runtime_status(
@@ -1076,19 +1078,31 @@ pub(crate) fn mcp_import_apply(
     Ok(message)
 }
 
-pub(crate) fn clear_active_provider_api_key_from_memory(app: &App, config: &mut Config) {
-    config.set_provider_api_key_override(app.api_provider, None);
-    // DeepSeek-CN reads DeepSeek's key (they used to share the top-level key,
-    // #6394), so clearing it clears that shared key too, as on disk.
-    if app.api_provider == ApiProvider::DeepseekCN {
-        config.set_provider_api_key_override(ApiProvider::Deepseek, None);
+pub(crate) fn clear_active_provider_api_key_from_memory(
+    app: &App,
+    config: &mut Config,
+) -> Result<(), String> {
+    let identity = app.admitted_provider_identity()?;
+    config.verify_provider_identity(identity)?;
+    config
+        .set_provider_api_key_override(identity, None)
+        .map_err(|error| error.to_string())?;
+    // Region presentation shares the intrinsic secret owner through D6.
+    if identity.key.as_str() == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id {
+        let primary = config.builtin_provider_identity(ProviderKind::Deepseek)?;
+        config
+            .set_provider_api_key_override(&primary, None)
+            .map_err(|error| error.to_string())?;
     }
-    if app.api_provider == ApiProvider::Xai {
-        let entry = config.provider_config_for_mut(ApiProvider::Xai);
+    if identity.provider == ProviderKind::Xai {
+        let entry = config
+            .provider_config_for_mut(identity)
+            .map_err(|error| error.to_string())?;
         entry.auth_mode = None;
         entry.oauth_credential_generation = None;
         entry.external_credentials = None;
     }
+    Ok(())
 }
 
 pub(crate) fn record_provider_model_setup_progress(app: &mut App, config: &Config) {
@@ -1104,31 +1118,16 @@ pub(crate) fn record_provider_model_setup_progress(app: &mut App, config: &Confi
     }
 }
 
-/// Persist the typed API key to `~/.codewhale/config.toml`, refresh the
-/// in-memory config so the engine can see it, then switch to the provider.
-pub(crate) fn set_active_custom_provider_in_memory(config: &mut Config, provider_id: &str) {
-    let provider_id = provider_id.trim();
-    if provider_id.is_empty() {
-        return;
-    }
-    config.provider = Some(provider_id.to_string());
-    config
-        .providers
-        .get_or_insert_with(ProvidersConfig::default)
-        .custom
-        .entry(provider_id.to_string())
-        .or_default();
-}
-
+#[cfg(test)]
 pub(crate) fn picker_provider_identity(
     config: &Config,
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_id: Option<&str>,
 ) -> Result<crate::config::ProviderIdentity, String> {
     let identity = match provider_id {
         Some(provider_id) => config
             .resolve_persisted_provider_identity(Some(provider.as_str()), Some(provider_id))?,
-        None if provider == ApiProvider::Custom => config.active_provider_identity(provider)?,
+        None if provider == ProviderKind::Custom => config.active_provider_identity()?,
         None => config.resolve_persisted_provider_identity(
             Some(provider.as_str()),
             Some(provider.as_str()),

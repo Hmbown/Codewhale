@@ -99,7 +99,7 @@ async fn scenario(tool: &'static str, deny: bool) {
         "allow_shell = true\ntelemetry = false\n[retry]\nenabled = false\n",
     )
     .unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codewhale-tui"));
+    let mut command = Command::new(crate::binary::codewhale());
     command.env_clear();
     for key in ["PATH", "LANG", "TMPDIR"] {
         if let Some(value) = std::env::var_os(key) {

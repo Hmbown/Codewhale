@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "raw-dsh-mcp",
+  "version": "1.0.0",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "paths": [
+          "native/a.mjs",
+          "native/b.mjs"
+        ]
+      }
+    }
+  }
+}

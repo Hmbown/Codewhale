@@ -63,3 +63,4 @@ claim that none is required.
 | `crates/tui/src/tui/frame_rate_limiter.rs` | `codex-rs/tui/src/tui/frame_rate_limiter.rs`, [openai/codex](https://github.com/openai/codex) |
 | `crates/tui/src/tui/display_refresh.rs` | Grok CLI's host display-refresh probe |
 | `patches/unicode-width-0.2.2/` | vendored patch; upstream `LICENSE-MIT` retained in-tree |
+| `patches/crossterm-0.29.0/` | vendored patch (surrogate key-up handling in `src/event/sys/windows/parse.rs`, the change proposed upstream as crossterm-rs/crossterm#1073); upstream MIT `LICENSE` retained in-tree |

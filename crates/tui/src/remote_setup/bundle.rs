@@ -86,7 +86,7 @@ impl BundleInputs {
             provider_slug: self.provider.slug.to_string(),
             region: self.cloud.default_region.to_string(),
             instance_name: "codewhale-remote".to_string(),
-            image: "ghcr.io/hmbown/codewhale:latest".to_string(),
+            image: "ghcr.io/codewhale-hq/codewhale:latest".to_string(),
         }
     }
 }

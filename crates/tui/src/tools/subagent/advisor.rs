@@ -497,32 +497,30 @@ fn exact_advisor_client(
         );
     }
 
+    let active = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
     let selection =
         crate::model_routing::resolve_explicit_route_with_inventory(config, requested_model);
-    let (provider, model) = if let Some(selection) = selection {
-        if selection.provider == crate::config::ApiProvider::Custom {
-            anyhow::bail!(
-                "advisor model `{}` resolved only to a custom provider kind without an exact provider identity",
-                requested_model.trim()
-            );
-        }
+    let (identity, model) = if let Some(selection) = selection {
         (selection.provider, selection.model)
     } else {
         let candidates =
             crate::model_routing::explicit_route_candidate_providers(config, requested_model);
-        if !candidates.is_empty() && !candidates.contains(&config.api_provider()) {
+        if !candidates.is_empty() && !candidates.contains(&active) {
             anyhow::bail!(
                 "advisor model `{}` is not owned by the originating provider and has no unique exact route",
                 requested_model.trim()
             );
         }
-        (config.api_provider(), requested_model.trim().to_string())
+        (active, requested_model.trim().to_string())
     };
-    let client = crate::route_runtime::resolve_runtime_route(config, provider, Some(&model))
-        .map_err(anyhow::Error::msg)?
-        .validate()
-        .map(|route| route.client)
-        .map_err(anyhow::Error::msg)?;
+    let client =
+        crate::route_runtime::resolve_runtime_route_for_identity(config, &identity, Some(&model))
+            .map_err(anyhow::Error::msg)?
+            .validate()
+            .map(|route| route.client)
+            .map_err(anyhow::Error::msg)?;
     Ok((client, model))
 }
 
@@ -905,7 +903,7 @@ mod tests {
         .expect("cross-provider advisor route");
         let route = advisor.effective_route_envelope(&resolved_model, chrono::Utc::now());
 
-        assert_eq!(route.provider, crate::config::ApiProvider::Zai);
+        assert_eq!(route.provider, crate::config::ProviderKind::Zai);
         assert_eq!(route.provider_identity, "zai");
         assert_eq!(route.model, crate::config::DEFAULT_ZAI_MODEL);
     }

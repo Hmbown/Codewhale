@@ -392,6 +392,10 @@ impl ModalView for UserInputView {
         ModalKind::UserInput
     }
 
+    fn user_input_request_id(&self) -> Option<&str> {
+        Some(&self.tool_id)
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }

@@ -15,7 +15,7 @@ Both names run the same compiled runtime. The application state and credentials
 still live in Codewhale's normal config files, not inside `node_modules`.
 
 > Previously published as `deepseek-tui`. See
-> [docs/REBRAND.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/REBRAND.md)
+> [docs/REBRAND.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/REBRAND.md)
 > for the migration notes; the legacy `deepseek-tui` npm package is deprecated
 > and receives no further releases.
 
@@ -26,6 +26,12 @@ npm install -g codewhale
 # or
 pnpm add -g codewhale
 ```
+
+On Windows, the Node launcher stays alive while the native program runs.
+Killing Node by process name can also interrupt other Codewhale npm sessions
+and prevent normal terminal cleanup. Stop dev servers by their owned PID or
+port, or use Codewhale's task cancellation. The Windows native archive or
+installer avoids this launcher dependency. See the [Windows npm note](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md#4-npm).
 
 For project-local usage:
 
@@ -53,7 +59,7 @@ codewhale
 Every provider is the same one-line shape — `--provider openrouter`,
 `--provider huggingface`, `--provider ollama`, or `--provider anthropic` for a
 Claude key; the full registry lives in
-[docs/PROVIDERS.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/PROVIDERS.md).
+[docs/PROVIDERS.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/PROVIDERS.md).
 
 The single runtime reads `~/.codewhale/config.toml` for auth and default model
 settings. Legacy `~/.deepseek/config.toml` installs are still read as a
@@ -76,7 +82,7 @@ The wrapper recognizes Android arm64 and resolves the
 Termux-native `codewhale` and `codew` assets. That path works only for package
 versions whose matching GitHub Release publishes both assets, and remains
 preview support pending real-device QA. See the support table in
-[docs/INSTALL.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md).
+[docs/INSTALL.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md).
 
 HarmonyOS PC (`openharmony`) is treated as `linux`, so it gets the Linux
 binaries matching your CPU architecture (x64 or arm64). Linux riscv64 prebuilts
@@ -85,7 +91,7 @@ are temporarily paused while the locked `rquickjs-sys` dependency lacks
 (FreeBSD, Linux riscv64, …) aren't shipped as prebuilts. Unsupported platforms,
 checksum failures, and glibc compatibility problems still fail with a clear
 error pointing you at the full
-[docs/INSTALL.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md)
+[docs/INSTALL.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md)
 guide.
 
 ## Wrapper configuration
@@ -96,7 +102,7 @@ guide.
 | `CODEWHALE_RELEASE_BASE_URL` | Canonical override: use an internal or mirrored release-asset directory and skip the Linux x64 GitHub/CNB race. The directory must contain `codewhale-artifacts-sha256.txt` and the platform binaries. `DEEPSEEK_TUI_RELEASE_BASE_URL` and `DEEPSEEK_RELEASE_BASE_URL` are the implemented legacy fallbacks. |
 | `CODEWHALE_USE_CNB_MIRROR=1` | Force the CNB (China-friendly) first-party mirror on Linux x64 and OpenHarmony x64, skipping the automatic race. Other targets fail with a clear unsupported-mirror error; use GitHub or a complete `CODEWHALE_RELEASE_BASE_URL` mirror there. Without this variable, Linux x64 still probes CNB and GitHub together and uses the first valid checksum manifest. |
 | `CODEWHALE_VERSION` | Override the release version to download. |
-| `CODEWHALE_GITHUB_REPO` | Override the source repo. Defaults to `Hmbown/CodeWhale`. |
+| `CODEWHALE_GITHUB_REPO` | Override the source repo. Defaults to `codewhale-hq/CodeWhale`. |
 | `CODEWHALE_FORCE_DOWNLOAD=1` | Force download even when the cached binary is already present. |
 | `CODEWHALE_DISABLE_INSTALL=1` | Skip install-time download. |
 | `CODEWHALE_OPTIONAL_INSTALL=1` | Make install-time retryable download failures warn and exit `0` instead of failing `npm install`. |
@@ -129,7 +135,7 @@ offline installs, set `CODEWHALE_DISABLE_INSTALL=1` or point
 
 ## Links
 
-- Repository: <https://github.com/Hmbown/CodeWhale>
+- Repository: <https://github.com/codewhale-hq/CodeWhale>
 - Website: <https://codewhale.net/>
-- Provider registry: [docs/PROVIDERS.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/PROVIDERS.md)
-- Changelog: [CHANGELOG.md](https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md)
+- Provider registry: [docs/PROVIDERS.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/PROVIDERS.md)
+- Changelog: [CHANGELOG.md](https://github.com/codewhale-hq/CodeWhale/blob/main/CHANGELOG.md)

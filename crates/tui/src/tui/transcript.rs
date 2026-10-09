@@ -19,7 +19,7 @@ use ratatui::{
 
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::history::{
-    HistoryCell, ReasoningAction, ReasoningActionTarget, ThinkingFold, TranscriptActionOwner,
+    CellFoldAction, CellFoldActionTarget, HistoryCell, TranscriptActionOwner, TranscriptFold,
     TranscriptRenderOptions,
 };
 use crate::tui::scrolling::TranscriptLineMeta;
@@ -49,7 +49,7 @@ struct CachedCell {
     /// spacing never depends on strings, palette, terminal depth, or motion.
     kind: TranscriptBlockKind,
     is_tool_groupable: bool,
-    reasoning_action: Option<ReasoningAction>,
+    fold_action: Option<CellFoldAction>,
     /// Only the changing Assistant cell carries incremental parser state;
     /// stable lines stay above its replaceable-tail index.
     incremental_markdown: Option<Box<crate::tui::markdown_render::IncrementalMarkdownRenderCache>>,
@@ -119,7 +119,7 @@ pub struct TranscriptViewCache {
     options: TranscriptRenderOptions,
     /// Explicit per-cell fold intent affects rendering without changing cell
     /// revisions. Keyed by original virtual cell index.
-    thinking_folds: HashMap<usize, ThinkingFold>,
+    cell_folds: HashMap<usize, TranscriptFold>,
     /// Index of the newest durable Work receipt (checklist / plan snapshot)
     /// in the last pass. When a new one lands the previous newest must
     /// re-render collapsed, and its revision alone would not say so.
@@ -129,14 +129,18 @@ pub struct TranscriptViewCache {
     /// newest must re-render on the bare ground, and its revision alone
     /// would not say so.
     newest_user_turn: Option<usize>,
-    reasoning_action_target: Option<ReasoningActionTarget>,
+    fold_action_target: Option<CellFoldActionTarget>,
     transcript_action_owner: Option<TranscriptActionOwner>,
     identity_epoch: Option<u64>,
-    reasoning_action_rendered_cell: Option<usize>,
+    fold_action_rendered_cell: Option<usize>,
     /// Per-cell renders plus flattened lines and index-aligned link/selection
     /// metadata. Rail prefix widths strip decoration without glyph guessing
     /// (#1163); deterministic counters measure the production cache path.
     per_cell: Vec<CachedCell>,
+    /// `per_cell[i].revision`, kept contiguous. The steady-state check and the
+    /// first-changed-cell search compare this against the caller's revisions
+    /// without touching a single cached render (#6652).
+    seen_revisions: Vec<u64>,
     lines: Vec<Line<'static>>,
     line_links: Vec<Vec<crate::tui::osc8::LineLink>>,
     line_meta: Vec<TranscriptLineMeta>,
@@ -149,6 +153,10 @@ pub struct TranscriptViewCache {
     streaming_source_receipt: Option<StreamingSourceReceipt>,
     streaming_lines_reflattened: u64,
     streaming_meta_rows_scanned: u64,
+    /// Cells (re)rendered over the cache's lifetime; proves a settled frame
+    /// renders nothing.
+    #[cfg(test)]
+    cells_rendered: u64,
 }
 
 impl TranscriptViewCache {
@@ -157,14 +165,15 @@ impl TranscriptViewCache {
         Self {
             width: 0,
             options: TranscriptRenderOptions::default(),
-            thinking_folds: HashMap::new(),
+            cell_folds: HashMap::new(),
             newest_work_receipt: None,
             newest_user_turn: None,
-            reasoning_action_target: None,
+            fold_action_target: None,
             transcript_action_owner: None,
             identity_epoch: None,
-            reasoning_action_rendered_cell: None,
+            fold_action_rendered_cell: None,
             per_cell: Vec::new(),
+            seen_revisions: Vec::new(),
             lines: Vec::new(),
             line_links: Vec::new(),
             line_meta: Vec::new(),
@@ -173,6 +182,8 @@ impl TranscriptViewCache {
             streaming_source_receipt: None,
             streaming_lines_reflattened: 0,
             streaming_meta_rows_scanned: 0,
+            #[cfg(test)]
+            cells_rendered: 0,
         }
     }
 
@@ -180,12 +191,24 @@ impl TranscriptViewCache {
         self.streaming_source_receipt = receipt;
     }
 
+    #[cfg(test)]
+    pub(crate) fn streaming_render_work(
+        &self,
+        cell_index: usize,
+    ) -> Option<crate::tui::markdown_render::MarkdownRenderWork> {
+        self.per_cell
+            .get(cell_index)?
+            .incremental_markdown
+            .as_ref()
+            .map(|cache| cache.work())
+    }
+
     pub(crate) fn take_transcript_action(
         &mut self,
-    ) -> Option<(TranscriptActionOwner, Option<ReasoningActionTarget>)> {
+    ) -> Option<(TranscriptActionOwner, Option<CellFoldActionTarget>)> {
         Some((
             self.transcript_action_owner.take()?,
-            self.reasoning_action_target.take(),
+            self.fold_action_target.take(),
         ))
     }
 
@@ -238,18 +261,27 @@ impl TranscriptViewCache {
         cell_revisions: &[u64],
         width: u16,
         options: TranscriptRenderOptions,
-        thinking_folds: &HashMap<usize, ThinkingFold>,
+        cell_folds: &HashMap<usize, TranscriptFold>,
         original_index_map: Option<&[usize]>,
         action_owner: Option<TranscriptActionOwner>,
     ) {
         let total_cells: usize = cell_shards.iter().map(|s| s.len()).sum();
         self.ensure_iter(
             total_cells,
-            cell_shards.iter().flat_map(|shard| shard.iter()),
+            |index| {
+                let mut remaining = index;
+                for shard in cell_shards {
+                    if let Some(cell) = shard.get(remaining) {
+                        return cell;
+                    }
+                    remaining -= shard.len();
+                }
+                unreachable!("cell index {index} is below total_cells")
+            },
             cell_revisions,
             width,
             options,
-            thinking_folds,
+            cell_folds,
             original_index_map,
             action_owner,
         );
@@ -266,17 +298,17 @@ impl TranscriptViewCache {
         cell_revisions: &[u64],
         width: u16,
         options: TranscriptRenderOptions,
-        thinking_folds: &HashMap<usize, ThinkingFold>,
+        cell_folds: &HashMap<usize, TranscriptFold>,
         original_index_map: Option<&[usize]>,
         action_owner: Option<TranscriptActionOwner>,
     ) {
         self.ensure_iter(
             cells.len(),
-            cells.iter().copied(),
+            |index| cells[index],
             cell_revisions,
             width,
             options,
-            thinking_folds,
+            cell_folds,
             original_index_map,
             action_owner,
         );
@@ -286,11 +318,11 @@ impl TranscriptViewCache {
     fn ensure_iter<'a>(
         &mut self,
         total_cells: usize,
-        cells: impl Iterator<Item = &'a HistoryCell>,
+        cell_at: impl Fn(usize) -> &'a HistoryCell,
         cell_revisions: &[u64],
         width: u16,
         options: TranscriptRenderOptions,
-        thinking_folds: &HashMap<usize, ThinkingFold>,
+        cell_folds: &HashMap<usize, TranscriptFold>,
         original_index_map: Option<&[usize]>,
         action_owner: Option<TranscriptActionOwner>,
     ) {
@@ -305,42 +337,61 @@ impl TranscriptViewCache {
         // Collapsed reasoning has a fixed preview budget; viewport height
         // does not participate in wrapping or cached cell identity.
         let layout_changed = self.width != width || self.options != options || identity_changed;
-        let folded_changed = self.thinking_folds != *thinking_folds;
+        let folded_changed = self.cell_folds != *cell_folds;
+        let revisions_match = cell_revisions.len() == total_cells;
+        // Cells `0..unchanged` were rendered at exactly these revisions, so
+        // their cached output (and what they are: kind, supersession) is
+        // current. Layout, fold, or a mismatched revision vector (never
+        // trusted) leaves no such prefix. In steady state this is all of
+        // them, and the frame ends below without rendering, moving, or even
+        // looking at a cell (#6652).
+        let mut unchanged = if layout_changed || folded_changed || !revisions_match {
+            0
+        } else {
+            self.seen_revisions
+                .iter()
+                .zip(cell_revisions)
+                .position(|(seen, current)| seen != current)
+                .unwrap_or_else(|| self.seen_revisions.len().min(total_cells))
+        };
         // `todo_write` replaces the whole list on every call, so only the
         // newest snapshot is worth a full card (#5871). When a new one lands
         // the previous newest must re-render collapsed; its own revision has
         // not changed, so supersession has to invalidate the cache itself.
-        let cells: Vec<&'a HistoryCell> = cells.collect();
-        let newest_work_receipt = cells
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, cell)| {
-                matches!(cell, HistoryCell::Tool(tool) if tool.is_durable_work_receipt())
-            })
-            .map(|(idx, _)| idx)
-            .next_back();
+        let newest_work_receipt = newest_matching_cell(
+            total_cells,
+            unchanged,
+            self.newest_work_receipt,
+            &cell_at,
+            |cell| matches!(cell, HistoryCell::Tool(tool) if tool.is_durable_work_receipt()),
+        );
         let work_receipt_changed = self.newest_work_receipt != newest_work_receipt;
         self.newest_work_receipt = newest_work_receipt;
         // Same supersession shape as the work receipt: the highlight lives on
         // the newest user turn only, so a newly sent prompt must un-highlight
         // its predecessor even though that cell's own revision never moved.
-        let newest_user_turn = cells
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, cell)| matches!(cell, HistoryCell::User { .. }))
-            .map(|(idx, _)| idx)
-            .next_back();
+        let newest_user_turn = newest_matching_cell(
+            total_cells,
+            unchanged,
+            self.newest_user_turn,
+            &cell_at,
+            |cell| matches!(cell, HistoryCell::User { .. }),
+        );
         let user_turn_changed = self.newest_user_turn != newest_user_turn;
         self.newest_user_turn = newest_user_turn;
         if layout_changed || folded_changed || work_receipt_changed || user_turn_changed {
             self.per_cell.clear();
+            self.seen_revisions.clear();
+            unchanged = 0;
         }
         self.width = width;
         self.options = options;
-        self.thinking_folds = thinking_folds.clone();
-        let previous_rendered_target = self.reasoning_action_rendered_cell;
+        // Cloning the map every frame is wasted work for the usual unchanged
+        // case (#6652); `folded_changed` already compared the two.
+        if folded_changed {
+            self.cell_folds.clone_from(cell_folds);
+        }
+        let previous_rendered_target = self.fold_action_rendered_cell;
 
         // Same-index revision reuse is intentional: insert/remove shifts must
         // cold-render rather than attach cached lines to another cell. The
@@ -358,23 +409,25 @@ impl TranscriptViewCache {
             None
         };
 
-        let mut old_per_cell: Vec<Option<CachedCell>> = std::mem::take(&mut self.per_cell)
-            .into_iter()
-            .map(Some)
-            .collect();
-        let mut new_per_cell: Vec<CachedCell> = Vec::with_capacity(total_cells);
-        let revisions_match = cell_revisions.len() == total_cells;
+        // Update the cache where it stands: a frame that changes only the tail
+        // renders only the tail instead of moving every cached cell out and
+        // back (#6652).
+        self.per_cell.truncate(total_cells);
+        self.seen_revisions.truncate(total_cells);
         let mut dirty_cells = 0usize;
         let mut streaming_tail_update = None;
 
-        let mut idx: usize = 0;
-        for cell in cells {
-            let current_rev = if revisions_match {
-                cell_revisions[idx]
-            } else {
-                // A mismatched revision vector is never trusted.
-                u64::MAX
-            };
+        for idx in unchanged..total_cells {
+            // A mismatched revision vector is never trusted.
+            let current_rev = cell_revisions
+                .get(idx)
+                .copied()
+                .filter(|_| revisions_match)
+                .unwrap_or(u64::MAX);
+            if revisions_match && self.seen_revisions.get(idx) == Some(&current_rev) {
+                continue;
+            }
+            let cell = cell_at(idx);
             let original_idx = original_index_map
                 .map(|m| *m.get(idx).unwrap_or(&idx))
                 .unwrap_or(idx);
@@ -384,38 +437,27 @@ impl TranscriptViewCache {
             } else {
                 width
             };
-            let fold = thinking_folds.get(&original_idx).copied();
-            if !layout_changed
-                && revisions_match
-                && old_per_cell
-                    .get(idx)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|prev| prev.revision == current_rev)
-            {
-                new_per_cell.push(
-                    old_per_cell[idx]
-                        .take()
-                        .expect("cached cell checked as present"),
-                );
-                idx += 1;
-                continue;
-            }
+            let fold = cell_folds.get(&original_idx).copied();
 
             any_dirty = true;
             dirty_cells = dirty_cells.saturating_add(1);
+            #[cfg(test)]
+            {
+                self.cells_rendered += 1;
+            }
             first_dirty = Some(first_dirty.map_or(idx, |current| current.min(idx)));
 
-            if matches!(
-                cell,
-                HistoryCell::Assistant {
-                    streaming: true,
-                    ..
-                }
-            ) {
-                let mut cached = old_per_cell
-                    .get_mut(idx)
-                    .and_then(Option::take)
-                    .unwrap_or_else(|| CachedCell {
+            if fold != Some(TranscriptFold::Collapsed)
+                && matches!(
+                    cell,
+                    HistoryCell::Assistant {
+                        streaming: true,
+                        ..
+                    }
+                )
+            {
+                if idx >= self.per_cell.len() {
+                    self.per_cell.push(CachedCell {
                         revision: current_rev,
                         lines: Arc::new(Vec::new()),
                         links: Arc::new(Vec::new()),
@@ -425,10 +467,15 @@ impl TranscriptViewCache {
                         ends_blank: false,
                         kind: TranscriptBlockKind::Answer,
                         is_tool_groupable: false,
-                        reasoning_action: None,
+                        fold_action: None,
                         incremental_markdown: Some(Box::default()),
                         hot_tail_original: None,
                     });
+                    self.seen_revisions.push(current_rev);
+                }
+                let receipt = self.streaming_source_receipt;
+                let cached = &mut self.per_cell[idx];
+                let shape_before = (cached.kind, cached.is_tool_groupable, cached.is_empty);
                 if let Some((line_index, original)) = cached.hot_tail_original.take()
                     && let Some(line) = Arc::make_mut(&mut cached.lines).get_mut(line_index)
                 {
@@ -438,7 +485,7 @@ impl TranscriptViewCache {
                     HistoryCell::Assistant { content, .. } => content.len(),
                     _ => 0,
                 };
-                let verified_append = self.streaming_source_receipt.is_some_and(|receipt| {
+                let verified_append = receipt.is_some_and(|receipt| {
                     receipt.cell_index == original_idx
                         && receipt.from_revision == cached.revision
                         && receipt.to_revision == current_rev
@@ -470,11 +517,17 @@ impl TranscriptViewCache {
                 cached.ends_blank = last_line_is_blank(&cached.lines);
                 cached.kind = TranscriptBlockKind::Answer;
                 cached.is_tool_groupable = false;
-                cached.reasoning_action = None;
+                cached.fold_action = None;
+                // The spacer and group rail between this cell and its
+                // predecessor depend on what this cell is. A tool, hidden, or
+                // other cell becoming a streaming answer in place (a filter
+                // shifting rows under it) changes them, so only an answer that
+                // stays an answer may take the tail-only shortcut.
+                let same_shape =
+                    shape_before == (cached.kind, cached.is_tool_groupable, cached.is_empty);
+                self.seen_revisions[idx] = current_rev;
                 // Hot-tail styling can affect the preceding settled line.
-                streaming_tail_update = Some((idx, replace_from.saturating_sub(1)));
-                new_per_cell.push(cached);
-                idx += 1;
+                streaming_tail_update = same_shape.then_some((idx, replace_from.saturating_sub(1)));
                 continue;
             }
 
@@ -486,17 +539,17 @@ impl TranscriptViewCache {
                 .is_some_and(|newest| newest != idx);
             cell_options.newest_user_turn = matches!(cell, HistoryCell::User { .. })
                 && newest_user_turn.is_some_and(|newest| newest == idx);
-            new_per_cell.push(render_cached_cell(
-                cell,
-                current_rev,
-                width,
-                cell_options,
-                fold,
-            ));
-            idx += 1;
+            let rendered = render_cached_cell(cell, current_rev, width, cell_options, fold);
+            if let Some(slot) = self.per_cell.get_mut(idx) {
+                *slot = rendered;
+                self.seen_revisions[idx] = current_rev;
+            } else {
+                self.per_cell.push(rendered);
+                self.seen_revisions.push(current_rev);
+            }
         }
-
-        self.per_cell = new_per_cell;
+        debug_assert_eq!(self.per_cell.len(), total_cells);
+        debug_assert_eq!(self.seen_revisions.len(), total_cells);
         // Rows from here down are rebuilt this frame; rows above it are
         // untouched and still sit at their recorded `cell_line_starts`.
         let mut rebuild_from = if !any_dirty {
@@ -534,7 +587,7 @@ impl TranscriptViewCache {
 
         if !layout_changed
             && !folded_changed
-            && (hint_settled || previous_rendered_target == self.reasoning_action_rendered_cell)
+            && (hint_settled || previous_rendered_target == self.fold_action_rendered_cell)
             && old_len == total_cells
             && dirty_cells == 1
             && let Some((cell_index, line_from)) = streaming_tail_update
@@ -568,18 +621,18 @@ impl TranscriptViewCache {
             Some(map) => map.iter().position(|&index| index == owner.cell_index),
             None => (owner.cell_index < self.per_cell.len()).then_some(owner.cell_index),
         });
-        self.reasoning_action_target = owner.and_then(|owner| {
-            Some(ReasoningActionTarget {
+        self.fold_action_target = owner.and_then(|owner| {
+            Some(CellFoldActionTarget {
                 owner,
-                action: self.per_cell.get(rendered?)?.reasoning_action?,
+                action: self.per_cell.get(rendered?)?.fold_action?,
             })
         });
         let next = self
-            .reasoning_action_target
-            .filter(|target| target.action == ReasoningAction::Expand)
+            .fold_action_target
+            .filter(|target| target.action == CellFoldAction::Expand)
             .and(rendered);
-        let previous = self.reasoning_action_rendered_cell;
-        self.reasoning_action_rendered_cell = next;
+        let previous = self.fold_action_rendered_cell;
+        self.fold_action_rendered_cell = next;
         (previous != next).then_some(HintChange { previous, next })
     }
 
@@ -651,7 +704,7 @@ impl TranscriptViewCache {
         let rendered_line_count = cached.lines.len();
         let line = &cached.lines[line_in_cell];
         let hint = hint.filter(|hint| {
-            self.reasoning_action_rendered_cell == Some(cell_index)
+            self.fold_action_rendered_cell == Some(cell_index)
                 && line_in_cell == 0
                 && line
                     .width()
@@ -887,6 +940,41 @@ impl TranscriptViewCache {
     }
 }
 
+/// Index of the last cell satisfying `is_match`.
+///
+/// The previous pass already classified cells `0..unchanged` (they are
+/// rendered at the same revisions), so only the changed suffix is searched
+/// and a settled transcript costs nothing. A prefix answer is reused only
+/// while it still names a cell inside the prefix; otherwise the prefix is
+/// searched too (#6652).
+fn newest_matching_cell<'a>(
+    total_cells: usize,
+    unchanged: usize,
+    previous: Option<usize>,
+    cell_at: &impl Fn(usize) -> &'a HistoryCell,
+    is_match: impl Fn(&HistoryCell) -> bool,
+) -> Option<usize> {
+    let found = (unchanged..total_cells)
+        .rev()
+        .find(|&index| is_match(cell_at(index)))
+        .or_else(|| match previous {
+            None => None,
+            Some(index) if index < unchanged => Some(index),
+            Some(_) => (0..unchanged).rev().find(|&index| is_match(cell_at(index))),
+        });
+    // The shortcut above is only as good as the revision contract. Tests
+    // prove it against the full scan; production never pays for it.
+    #[cfg(test)]
+    assert_eq!(
+        found,
+        (0..total_cells)
+            .rev()
+            .find(|&index| is_match(cell_at(index))),
+        "a cell changed without its revision changing"
+    );
+    found
+}
+
 /// Previous and next cells carrying the Space affordance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HintChange {
@@ -908,7 +996,7 @@ fn render_cached_cell(
     revision: u64,
     width: u16,
     options: TranscriptRenderOptions,
-    fold: Option<ThinkingFold>,
+    fold: Option<TranscriptFold>,
 ) -> CachedCell {
     let is_tool_groupable = matches!(cell, HistoryCell::Tool(_));
     let render_width = if is_tool_groupable {
@@ -916,8 +1004,7 @@ fn render_cached_cell(
     } else {
         width
     };
-    let (rendered, reasoning_action) =
-        cell.lines_with_copy_metadata_folded(render_width, options, fold);
+    let (rendered, fold_action) = cell.lines_with_copy_metadata_folded(render_width, options, fold);
     let mut lines = Vec::with_capacity(rendered.len());
     let mut links = Vec::with_capacity(rendered.len());
     let mut copy_separators = Vec::with_capacity(rendered.len());
@@ -932,17 +1019,14 @@ fn render_cached_cell(
         copy_prefix_widths.push(rendered_line.copy_prefix_width);
         copy_separators.push(rendered_line.copy_separator_after);
     }
-    if reasoning_action == Some(ReasoningAction::Expand)
+    if fold_action == Some(CellFoldAction::Expand)
         && let Some(line) = lines.first()
     {
         let prefix = line.width().saturating_sub(compute_rail_prefix_width(line));
         *copy_prefix_widths
             .first_mut()
-            .expect("reasoning affordance header") = prefix;
-        links
-            .first_mut()
-            .expect("reasoning affordance header")
-            .clear();
+            .expect("fold affordance header") = prefix;
+        links.first_mut().expect("fold affordance header").clear();
     }
     let is_empty = lines.is_empty();
     let ends_blank = last_line_is_blank(&lines);
@@ -956,7 +1040,7 @@ fn render_cached_cell(
         ends_blank,
         kind: TranscriptBlockKind::for_cell(cell),
         is_tool_groupable,
-        reasoning_action,
+        fold_action,
         incremental_markdown: None,
         hot_tail_original: None,
     }

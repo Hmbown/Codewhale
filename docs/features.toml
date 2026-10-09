@@ -48,6 +48,15 @@ docs = "docs/TOOL_SURFACE.md"
 owner = "crates/tui/src/tools/shell.rs"
 
 [[feature]]
+id = "local-code-execution"
+name = "Local code execution"
+summary = "Runs Python and Node with the shared execution policy and explicitly approved per-call elevation."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/TOOL_SURFACE.md#local-code-execution"
+owner = "crates/tui/src/core/engine/tool_catalog.rs"
+
+[[feature]]
 id = "subagents"
 name = "Sub-agents"
 summary = "Delegates bounded work to background child agents with their own budgets."
@@ -138,7 +147,7 @@ owner = "crates/tui/src/tools/codemode.rs"
 [[feature]]
 id = "extension-host"
 name = "Extension host"
-summary = "Runs reviewed plugins' native TypeScript/JavaScript tool code in a Bun or Node sidecar."
+summary = "Runs reviewed plugins' native TypeScript/JavaScript tool and slash-command code in a Bun or Node sidecar."
 status = "flagged"
 surfaces = { tui = "preview", web = "none", api = "none" }
 since = "0.10.1"
@@ -146,12 +155,111 @@ flag = "extension_host"
 docs = "docs/EXTENSIONS.md"
 owner = "crates/tui/src/extension_host"
 
+[[feature]]
+id = "finance-host"
+name = "Finance host"
+summary = "Routes opted-in finance tools through the bundled Native host under the existing permission and sandbox gates."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "finance_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/finance.rs"
+
+[[feature]]
+id = "data-host"
+name = "Data host"
+summary = "Routes opted-in data validation through the bundled Native host with owned input and output bounds."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "data_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/validate_data.rs"
+
+[[feature]]
+id = "speech-host"
+name = "Speech host"
+summary = "Routes opted-in speech tools through the bundled Native host while Rust retains credentials and permissions."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "speech_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/speech.rs"
+
+[[feature]]
+id = "pdf-host"
+name = "PDF host"
+summary = "Routes opted-in PDF extraction through the bundled Native host with the same Rust path and size guards."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "pdf_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/pdf.rs"
+
+[[feature]]
+id = "ocr-host"
+name = "OCR host"
+summary = "Routes opted-in image OCR through the bundled Native host under existing media and permission guards."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "ocr_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/image_ocr.rs"
+
+[[feature]]
+id = "github-host"
+name = "GitHub host"
+summary = "Routes opted-in GitHub operations through the bundled Native host while Rust retains credentials and approvals."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "github_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/github"
+
+[[feature]]
+id = "web-search-host"
+name = "Web search host"
+summary = "Routes opted-in web search through the bundled Native host with the existing Rust credential and network gates."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "web_search_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/web/adapter.rs"
+
+[[feature]]
+id = "web-extract-host"
+name = "Web extract host"
+summary = "Routes opted-in web extraction through the bundled Native host with owned URL and response bounds."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "web_extract_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/web/extract.rs"
+
+[[feature]]
+id = "review-host"
+name = "Review host"
+summary = "Routes opted-in review tools through the bundled Native host while Rust retains route and permission authority."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "review_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/review_host.rs"
+
 # --- Working with the agent ---
 
 [[feature]]
 id = "modes"
 name = "Modes"
-summary = "Plan, Work and Operate modes set what the agent may do in a session."
+summary = "Plan, Work and Operate modes set what the agent may do in a session; a finished plan offers to start the work."
 status = "stable"
 surfaces = { tui = "stable", api = "stable" }
 docs = "docs/MODES.md"
@@ -169,7 +277,7 @@ owner = "crates/execpolicy/src/approval_mode.rs"
 [[feature]]
 id = "sandbox"
 name = "Command sandbox"
-summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is opt-in."
+summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is on by default once installed and verified."
 status = "stable"
 surfaces = { tui = "stable" }
 docs = "docs/SANDBOX.md"
@@ -314,6 +422,15 @@ docs = "docs/PLUGINS.md"
 owner = "crates/tui/src/plugins"
 
 [[feature]]
+id = "computer-use"
+name = "Computer Use"
+summary = "Reviewed app control with consent, fresh element targets, observation diffs and bounded named action batches."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+docs = "docs/PLUGIN_BUNDLES.md"
+owner = "crates/tui/plugins/computer-use"
+
+[[feature]]
 id = "script-tools"
 name = "Script tools"
 summary = "Scripts in ~/.codewhale/tools become approval-gated tools; [tools.overrides] disables built-ins, never replaces them."
@@ -360,7 +477,7 @@ owner = "crates/tui/src/lsp"
 [[feature]]
 id = "runtime-api"
 name = "Runtime API"
-summary = "Local HTTP API for threads, events, approvals and the rest of the session."
+summary = "Local HTTP API for threads, events and approvals, with scoped watch/drive device tokens and account-bound model turns."
 status = "stable"
 surfaces = { api = "stable" }
 docs = "docs/RUNTIME_API.md"
@@ -442,7 +559,7 @@ owner = "crates/tui/src/voice.rs"
 [[feature]]
 id = "pet"
 name = "Pet"
-summary = "/pet turns the screen over to the Codewhale pet while it works."
+summary = "/pet on saves the animated main view; /pet inspect shows replies and agents and lets you copy finished replies."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/tui/pet_watch"
@@ -463,6 +580,15 @@ summary = "/login signs in to Codewhale or stores provider keys."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/commands/groups/config/config.rs"
+
+[[feature]]
+id = "account-computer-files"
+name = "Account computer files"
+summary = "Save computer files as account versions, restore with revision checks, and download verified bytes."
+status = "experimental"
+surfaces = { tui = "preview" }
+since = "unreleased"
+owner = "crates/cli/src/cloud.rs"
 
 [[feature]]
 id = "context-anchors"
@@ -504,6 +630,14 @@ status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/tui/sidebar.rs"
 
+[[feature]]
+id = "terminal-dock"
+name = "Terminal dock"
+summary = "/workbar terminal shows workspace PTYs with live output, human input, session selection and a fresh shell; macOS/Linux."
+status = "stable"
+surfaces = { tui = "stable" }
+owner = "crates/tui/src/tui/work_surface/terminal.rs"
+
 # --- Operations and platforms ---
 
 [[feature]]
@@ -532,3 +666,64 @@ status = "experimental"
 surfaces = { tui = "preview" }
 docs = "docs/TERMUX.md"
 owner = ".github/workflows/release-artifacts.yml"
+
+[[feature]]
+id = "chatgpt-plan-sign-in"
+name = "Sign in with ChatGPT"
+summary = "Uses official OAuth and the selected account catalog for eligible ChatGPT plan requests in the local OSS app."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
+owner = "crates/tui/src/oauth.rs"
+
+[[feature]]
+id = "claude-plan-sign-in"
+name = "Sign in with Claude"
+summary = "Adds Claude subscription sign-in and native Messages routing. Live provider acceptance remains unverified."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md#sign-in-with-claude"
+owner = "crates/tui/src/oauth.rs"
+
+[[feature]]
+id = "plugin-oauth-providers"
+name = "Reviewed plugin OAuth providers"
+summary = "Reviewed plugins add OpenAI-compatible routes; the host owns PKCE grants and rechecks approval at each request."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PLUGIN_PROVIDERS.md"
+owner = "crates/tui/src/plugins/providers.rs"
+
+[[feature]]
+id = "orcarouter-sign-in"
+name = "Sign in with OrcaRouter"
+summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
+status = "experimental"
+surfaces = { tui = "preview", api = "none", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md"
+owner = "crates/tui/src/oauth.rs"
+
+# Community marketing website, separate from the Runtime's local web client.
+[[feature]]
+id = "merch-interest"
+name = "Merch interest list"
+summary = "The community website collects private merch opt-ins, material preferences and optional item-price feedback."
+status = "experimental"
+surfaces = { tui = "none", web = "none", api = "none" }
+since = "unreleased"
+docs = "web/lib/merch/README.md"
+owner = "web/components/merch-interest.tsx"
+
+[[feature]]
+id = "profile-constitution"
+name = "Profile constitution"
+summary = "Account preferences are captured per turn and previewed by the Engine."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+since = "unreleased"
+docs = "docs/RUNTIME_API.md#profile-constitution"
+owner = "crates/tui/src/profile_constitution.rs"

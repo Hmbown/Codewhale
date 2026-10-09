@@ -62,7 +62,7 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
     std::fs::create_dir_all(&trust_dir).expect("workspace trust dir");
     std::fs::write(trust_dir.join("trusted"), "").expect("workspace trust marker");
 
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())

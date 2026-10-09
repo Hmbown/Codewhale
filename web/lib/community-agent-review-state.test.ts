@@ -145,7 +145,7 @@ function stubAdminEnv(kv: FakeKv, lock?: FakeDraftClaimLock) {
     ...(lock ? { DRAFT_CLAIM_LOCK: lock } : {}),
     MAINTAINER_TOKEN: "configured",
     MAINTAINER_GITHUB_PAT: "ghp_test",
-    GITHUB_REPO: "Hmbown/CodeWhale",
+    GITHUB_REPO: "codewhale-hq/CodeWhale",
   });
 }
 
@@ -160,7 +160,7 @@ function stubGitHub(status = 201, existing: unknown[] = []) {
     if ((init?.method ?? "GET") === "GET") return jsonResponse(existing);
     posts.push(url);
     if (url.endsWith("/issues")) {
-      return jsonResponse({ number: 900, html_url: "https://github.com/Hmbown/CodeWhale/issues/900" }, status);
+      return jsonResponse({ number: 900, html_url: "https://github.com/codewhale-hq/CodeWhale/issues/900" }, status);
     }
     return jsonResponse({ id: 1 }, status);
   });
@@ -329,7 +329,7 @@ describe("weekly digest publication requires maintainer approval", () => {
 
     const body = JSON.parse(kv.values.get(draftKey)!).bodyEn as string;
     const title = body.split("\n")[0].replace(/^#+\s*/, "").trim();
-    const posts = stubGitHub(201, [{ number: 901, html_url: "https://github.com/Hmbown/CodeWhale/issues/901", title, body }]);
+    const posts = stubGitHub(201, [{ number: 901, html_url: "https://github.com/codewhale-hq/CodeWhale/issues/901", title, body }]);
     const retry = await act(kv, { action: "post", draftKey, lang: "en" });
     await expect(retry.json()).resolves.toMatchObject({ ok: true, number: 901, published: true });
     expect(posts).toEqual([]);
@@ -359,7 +359,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     const bodies: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       bodies.push(String(init?.body));
-      return jsonResponse({ number: 900, html_url: "https://github.com/Hmbown/CodeWhale/issues/900" }, 201);
+      return jsonResponse({ number: 900, html_url: "https://github.com/codewhale-hq/CodeWhale/issues/900" }, 201);
     }));
     const res = await act(kv, { action: "post", draftKey, lang: "en" });
     await expect(res.json()).resolves.toMatchObject({
@@ -414,7 +414,7 @@ describe("resolved drafts are not resurrected by the cron", () => {
         title: "Issue",
         body: "body",
         updated_at: updatedAt,
-        html_url: "https://github.com/Hmbown/CodeWhale/issues/42",
+        html_url: "https://github.com/codewhale-hq/CodeWhale/issues/42",
         labels: [],
       }]);
     }));
@@ -1064,7 +1064,7 @@ describe("post retry durability and generation admission", () => {
   it("admits one overlapping generation batch and holds completed KV propagation", async () => {
     const kv = new FakeKv(), lock = new FakeDraftClaimLock();
     const env = { CURATED_KV: kv, DRAFT_CLAIM_LOCK: lock, DEEPSEEK_API_KEY: "k" };
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse([{ number: 42, title: "issue", body: "body", updated_at: "2020-01-01T00:00:00.000Z", html_url: "https://github.com/Hmbown/CodeWhale/issues/42", labels: [] }])));
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse([{ number: 42, title: "issue", body: "body", updated_at: "2020-01-01T00:00:00.000Z", html_url: "https://github.com/codewhale-hq/CodeWhale/issues/42", labels: [] }])));
     let finish!: (value: unknown) => void;
     mocks.agentChat.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue({ content: JSON.stringify({ bodyEn: "other", bodyZh: "另一个" }), usage: { input: 1, output: 1 } });
     const first = runTriage(env);

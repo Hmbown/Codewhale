@@ -5,7 +5,7 @@
 //! keeps the v0.6.6 CLI form for muscle-memory + scripted use.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::config::{ApiProvider, canonical_model_id_for_provider, provider_passes_model_through};
+use crate::config::{ProviderKind, canonical_model_id_for_provider, provider_passes_model_through};
 use crate::tui::app::{App, AppAction};
 use codewhale_localization::MessageId;
 
@@ -65,12 +65,15 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
         );
     }
 
-    let Some(target) = ApiProvider::parse(name) else {
+    let Some(row) = codewhale_config::descriptors::compatibility_for_selector(name) else {
         return CommandResult::error(format!(
             "Unknown provider '{name}'. Expected: {}.",
-            ApiProvider::names_hint()
+            ProviderKind::names_hint()
         ));
     };
+
+    let target = row.kind;
+    let selected_key: codewhale_config::ProviderId = row.id.into();
 
     let model = match model_arg {
         None => None,
@@ -103,12 +106,17 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
         }
     };
 
-    if target == app.api_provider && model.is_none() {
-        return CommandResult::message(format!("Already on provider: {}", target.as_str()));
+    if app
+        .provider_identity
+        .as_ref()
+        .is_some_and(|identity| identity.key == selected_key)
+        && model.is_none()
+    {
+        return CommandResult::message(format!("Already on provider: {}", selected_key));
     }
 
     CommandResult::action(AppAction::SwitchProvider {
-        provider: target,
+        provider: selected_key,
         model,
     })
 }
@@ -123,21 +131,21 @@ pub(in crate::commands) fn provider_setup_action_for_name(raw: &str) -> Result<A
     // First-class aliases (zen, opencode-zen, …) resolve through the provider
     // registry. There are no setup templates anymore: named custom hosts are
     // configured with `/provider setup` and the blank custom form (#6289).
-    match ApiProvider::parse(raw) {
+    match codewhale_config::descriptors::compatibility_for_selector(raw) {
         Some(provider) => Ok(AppAction::OpenProviderSetup {
-            provider: Some(provider),
+            provider: Some(provider.id.into()),
         }),
         None => Err(format!(
             "Unknown provider '{raw}'. Expected: {}.",
-            ApiProvider::names_hint()
+            ProviderKind::names_hint()
         )),
     }
 }
 
-fn is_route_ambiguous_deepseek_alias(provider: ApiProvider, model: &str) -> bool {
+fn is_route_ambiguous_deepseek_alias(provider: ProviderKind, model: &str) -> bool {
     matches!(
         provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
     ) && (model.eq_ignore_ascii_case("deepseek-chat")
         || model.eq_ignore_ascii_case("deepseek-reasoner"))
 }
@@ -156,7 +164,7 @@ fn provider_fallback(app: &mut App, subcommand: Option<&str>) -> CommandResult {
                     primary.as_str()
                 ),
                 AppAction::SwitchProvider {
-                    provider: primary,
+                    provider: primary.as_str().into(),
                     model: None,
                 },
             )
@@ -196,10 +204,10 @@ fn provider_fallback(app: &mut App, subcommand: Option<&str>) -> CommandResult {
     }
 }
 
-fn expand_model_alias_for_provider(provider: ApiProvider, name: &str) -> String {
+fn expand_model_alias_for_provider(provider: ProviderKind, name: &str) -> String {
     let trimmed = name.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if matches!(provider, ApiProvider::XiaomiMimo) {
+    if matches!(provider, ProviderKind::XiaomiMimo) {
         return match lower.as_str() {
             "pro" | "mimo" => "mimo-v2.5-pro".to_string(),
             "ultraspeed" | "pro-ultraspeed" => "mimo-v2.5-pro-ultraspeed".to_string(),
@@ -240,7 +248,7 @@ mod tests {
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = codewhale_localization::Locale::En;
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app
     }
 
@@ -263,7 +271,7 @@ mod tests {
             let message = result.message.expect("tombstone message");
             assert!(message.contains("non-runnable"), "{identity}: {message}");
             assert!(message.contains("GEMINI_API_KEY"), "{identity}: {message}");
-            assert_eq!(app.api_provider, crate::config::ApiProvider::Deepseek);
+            assert_eq!(app.api_provider, crate::config::ProviderKind::Deepseek);
 
             let setup = provider_setup_action_for_name(identity)
                 .expect_err("setup must not open for the tombstone");
@@ -289,7 +297,7 @@ mod tests {
         assert_eq!(
             result.action,
             Some(AppAction::OpenProviderSetup {
-                provider: Some(ApiProvider::Anthropic),
+                provider: Some(ProviderKind::Anthropic.as_str().into()),
             })
         );
     }
@@ -320,7 +328,7 @@ mod tests {
             assert_eq!(
                 result.action,
                 Some(AppAction::OpenProviderSetup {
-                    provider: Some(ApiProvider::OpencodeZen),
+                    provider: Some(ProviderKind::OpencodeZen.as_str().into()),
                 }),
                 "{name} must resolve through the provider registry"
             );
@@ -357,7 +365,7 @@ mod tests {
         let result = provider(&mut app, Some("openrouter"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Openrouter);
+                assert_eq!(provider.as_str(), ProviderKind::Openrouter.as_str());
                 assert_eq!(model, None);
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -370,7 +378,7 @@ mod tests {
         let result = provider(&mut app, Some("xiaomi-mimo"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::XiaomiMimo);
+                assert_eq!(provider.as_str(), ProviderKind::XiaomiMimo.as_str());
                 assert_eq!(model, None);
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -383,7 +391,7 @@ mod tests {
         let result = provider(&mut app, Some("xiaomi-mimo tts"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::XiaomiMimo);
+                assert_eq!(provider.as_str(), ProviderKind::XiaomiMimo.as_str());
                 assert_eq!(model.as_deref(), Some("mimo-v2.5-tts"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -392,7 +400,7 @@ mod tests {
         let result = provider(&mut app, Some("xiaomi-mimo voiceclone"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::XiaomiMimo);
+                assert_eq!(provider.as_str(), ProviderKind::XiaomiMimo.as_str());
                 assert_eq!(model.as_deref(), Some("mimo-v2.5-tts-voiceclone"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -411,7 +419,7 @@ mod tests {
             let result = provider(&mut app, Some(input));
             match result.action {
                 Some(AppAction::SwitchProvider { provider, model }) => {
-                    assert_eq!(provider, ApiProvider::XiaomiMimo);
+                    assert_eq!(provider.as_str(), ProviderKind::XiaomiMimo.as_str());
                     assert_eq!(model.as_deref(), Some(expected));
                 }
                 other => panic!("expected SwitchProvider for {input}, got {other:?}"),
@@ -425,7 +433,7 @@ mod tests {
         let result = provider(&mut app, Some("atlascloud"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Atlascloud);
+                assert_eq!(provider.as_str(), ProviderKind::Atlascloud.as_str());
                 assert_eq!(model, None);
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -438,7 +446,7 @@ mod tests {
         let result = provider(&mut app, Some("ark-wanjie account-model-id"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::WanjieArk);
+                assert_eq!(provider.as_str(), ProviderKind::WanjieArk.as_str());
                 assert_eq!(model.as_deref(), Some("account-model-id"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -451,7 +459,7 @@ mod tests {
         let result = provider(&mut app, Some("openai qwen-plus"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Openai);
+                assert_eq!(provider.as_str(), ProviderKind::Openai.as_str());
                 assert_eq!(model.as_deref(), Some("qwen-plus"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -464,7 +472,7 @@ mod tests {
         let result = provider(&mut app, Some("qianfan custom-qianfan-service-id"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Qianfan);
+                assert_eq!(provider.as_str(), ProviderKind::Qianfan.as_str());
                 assert_eq!(model.as_deref(), Some("custom-qianfan-service-id"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -480,7 +488,7 @@ mod tests {
         let result = provider(&mut app, Some("zhipu glm-5.2"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Zai);
+                assert_eq!(provider.as_str(), ProviderKind::Zai.as_str());
                 assert_eq!(model.as_deref(), Some("GLM-5.2"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -489,7 +497,7 @@ mod tests {
         let result = provider(&mut app, Some("zhipuai glm-5-1"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Zai);
+                assert_eq!(provider.as_str(), ProviderKind::Zai.as_str());
                 assert_eq!(model.as_deref(), Some("GLM-5.1"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -502,7 +510,7 @@ mod tests {
         let result = provider(&mut app, Some("novita"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Novita);
+                assert_eq!(provider.as_str(), ProviderKind::Novita.as_str());
                 assert_eq!(model, None);
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -515,7 +523,7 @@ mod tests {
         let result = provider(&mut app, Some("fireworks pro"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Fireworks);
+                assert_eq!(provider.as_str(), ProviderKind::Fireworks.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-pro"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -528,7 +536,7 @@ mod tests {
         let result = provider(&mut app, Some("siliconflow flash"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Siliconflow);
+                assert_eq!(provider.as_str(), ProviderKind::Siliconflow.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -541,7 +549,7 @@ mod tests {
         let result = provider(&mut app, Some("siliconflow-CN flash"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::SiliconflowCn);
+                assert_eq!(provider.as_str(), ProviderKind::SiliconflowCN.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -558,7 +566,7 @@ mod tests {
         let result = provider(&mut app, Some("together deepseek-v4-pro"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Together);
+                assert_eq!(provider.as_str(), ProviderKind::Together.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-pro"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -567,7 +575,7 @@ mod tests {
         let result = provider(&mut app, Some("together flash"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Together);
+                assert_eq!(provider.as_str(), ProviderKind::Together.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -580,7 +588,7 @@ mod tests {
         let result = provider(&mut app, Some("sglang flash"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Sglang);
+                assert_eq!(provider.as_str(), ProviderKind::Sglang.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -593,7 +601,7 @@ mod tests {
         let result = provider(&mut app, Some("vllm flash"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Vllm);
+                assert_eq!(provider.as_str(), ProviderKind::Vllm.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -606,7 +614,7 @@ mod tests {
         let result = provider(&mut app, Some("ollama qwen2.5-coder:7b"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Ollama);
+                assert_eq!(provider.as_str(), ProviderKind::Ollama.as_str());
                 assert_eq!(model.as_deref(), Some("qwen2.5-coder:7b"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
@@ -629,7 +637,7 @@ mod tests {
         assert!(result.message.is_none());
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::NvidiaNim);
+                assert_eq!(provider.as_str(), ProviderKind::NvidiaNim.as_str());
                 assert_eq!(model, None);
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
@@ -642,7 +650,7 @@ mod tests {
         let result = provider(&mut app, Some("nim flash"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::NvidiaNim);
+                assert_eq!(provider.as_str(), ProviderKind::NvidiaNim.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
@@ -655,7 +663,7 @@ mod tests {
         let result = provider(&mut app, Some("nim pro"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::NvidiaNim);
+                assert_eq!(provider.as_str(), ProviderKind::NvidiaNim.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-pro"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
@@ -668,7 +676,7 @@ mod tests {
         let result = provider(&mut app, Some("deepseek flash"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Deepseek);
+                assert_eq!(provider.as_str(), ProviderKind::Deepseek.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
@@ -678,13 +686,13 @@ mod tests {
     #[test]
     fn switch_to_deepseek_canonicalizes_provider_prefixed_model_override() {
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::Openrouter;
+        app.api_provider = ProviderKind::Openrouter;
 
         let result = provider(&mut app, Some("deepseek deepseek/deepseek-v4-pro"));
 
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::Deepseek);
+                assert_eq!(provider.as_str(), ProviderKind::Deepseek.as_str());
                 assert_eq!(model.as_deref(), Some("deepseek-v4-pro"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
@@ -694,31 +702,23 @@ mod tests {
     #[test]
     fn direct_deepseek_provider_commands_retire_aliases_at_official_wire_boundary() {
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::Openrouter;
+        app.api_provider = ProviderKind::Openrouter;
 
         for provider_name in ["deepseek", "deepseek-cn", "deepseek-anthropic"] {
             for alias in ["deepseek-chat", "deepseek-reasoner"] {
                 let result = provider(&mut app, Some(&format!("{provider_name} {alias}")));
                 match result.action {
                     Some(AppAction::SwitchProvider { provider, model }) => {
-                        assert!(matches!(
-                            provider,
-                            ApiProvider::Deepseek
-                                | ApiProvider::DeepseekCN
-                                | ApiProvider::DeepseekAnthropic
-                        ));
+                        assert_eq!(provider.as_str(), provider_name);
                         assert_eq!(model.as_deref(), Some(alias));
-                        let official_base_url = match provider {
-                            ApiProvider::Deepseek => crate::config::DEFAULT_DEEPSEEK_BASE_URL,
-                            ApiProvider::DeepseekCN => crate::config::DEFAULT_DEEPSEEKCN_BASE_URL,
-                            ApiProvider::DeepseekAnthropic => {
-                                crate::config::DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
-                            }
-                            _ => unreachable!("asserted direct DeepSeek provider"),
-                        };
+                        let row =
+                            codewhale_config::descriptors::compatibility_for_id(provider.as_str())
+                                .expect("command descriptor");
+                        let official_base_url = row.base_url;
+                        let intrinsic = row.kind;
                         assert_eq!(
                             crate::config::wire_model_for_provider_route(
-                                provider,
+                                intrinsic,
                                 official_base_url,
                                 model.as_deref().expect("command model"),
                             ),
@@ -727,7 +727,7 @@ mod tests {
                         app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::Max;
                         app.reasoning_effort_preference = None;
                         app.apply_provider_switch_reasoning_effort(
-                            provider,
+                            intrinsic,
                             official_base_url,
                             model.as_deref(),
                         );
@@ -750,9 +750,9 @@ mod tests {
         assert!(matches!(
             wanjie.action,
             Some(AppAction::SwitchProvider {
-                provider: ApiProvider::WanjieArk,
+                provider: ref selected,
                 model: Some(ref model),
-            }) if model == "deepseek-reasoner"
+            }) if selected.as_str() == "wanjie-ark" && model == "deepseek-reasoner"
         ));
     }
 
@@ -767,11 +767,11 @@ mod tests {
         };
         let model = model.expect("command model");
 
-        assert_eq!(provider, ApiProvider::Deepseek);
+        assert_eq!(provider.as_str(), ProviderKind::Deepseek.as_str());
         assert_eq!(model, "deepseek-reasoner");
         assert_eq!(
             crate::config::wire_model_for_provider_route(
-                provider,
+                ProviderKind::Deepseek,
                 "https://models.example/v1",
                 &model,
             ),
@@ -780,7 +780,7 @@ mod tests {
         app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::Max;
         app.reasoning_effort_preference = None;
         app.apply_provider_switch_reasoning_effort(
-            provider,
+            ProviderKind::Deepseek,
             "https://models.example/v1",
             Some(&model),
         );
@@ -792,7 +792,7 @@ mod tests {
 
         app.reasoning_effort_preference = Some(crate::reasoning_preference::ReasoningEffort::Max);
         app.apply_provider_switch_reasoning_effort(
-            provider,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
             Some(&model),
         );
@@ -822,9 +822,9 @@ mod tests {
         assert!(matches!(
             reset.action,
             Some(AppAction::SwitchProvider {
-                provider: ApiProvider::Deepseek,
+                provider: ref selected,
                 model: None
-            })
+            }) if selected.as_str() == "deepseek"
         ));
     }
 
@@ -836,17 +836,28 @@ mod tests {
     #[test]
     fn provider_fallback_reset_targets_primary_even_when_on_fallback() {
         let _lock = lock_test_env();
-        let mut app = create_test_app();
-        app.api_provider = ApiProvider::Deepseek;
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openrouter.api_key = Some("fixture-fallback-key".to_string());
+        let config = crate::config::Config {
+            provider: Some("deepseek".to_string()),
+            fallback_providers: vec![ProviderKind::Openrouter],
+            providers: Some(providers),
+            ..Default::default()
+        };
+        let mut app = App::new(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            &config,
+        );
+        app.api_provider = ProviderKind::Deepseek;
         app.provider_chain = Some(codewhale_config::ProviderChain::new(
             codewhale_config::ProviderKind::Deepseek,
             &[codewhale_config::ProviderKind::Openrouter],
         ));
         // Simulate having already fallen back to the secondary provider.
-        // (Openrouter is treated as ready by default — no readiness snapshot.)
+        // The secondary route is admitted from the captured fixture config.
         let advanced = app.advance_fallback("recoverable error");
-        assert_eq!(advanced, Some(ApiProvider::Openrouter));
-        assert_eq!(app.api_provider, ApiProvider::Openrouter);
+        assert_eq!(advanced, Some(ProviderKind::Openrouter));
+        assert_eq!(app.api_provider, ProviderKind::Openrouter);
 
         let reset = provider(&mut app, Some("fallback reset"));
         assert!(
@@ -859,9 +870,9 @@ mod tests {
         assert!(matches!(
             reset.action,
             Some(AppAction::SwitchProvider {
-                provider: ApiProvider::Deepseek,
+                provider: ref selected,
                 model: None
-            })
+            }) if selected.as_str() == "deepseek"
         ));
     }
 
@@ -875,7 +886,7 @@ mod tests {
         assert!(result.message.is_none());
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, ApiProvider::NvidiaNim);
+                assert_eq!(provider.as_str(), ProviderKind::NvidiaNim.as_str());
                 assert_eq!(model.as_deref(), Some("gpt-4"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),

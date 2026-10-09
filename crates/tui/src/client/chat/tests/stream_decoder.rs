@@ -296,7 +296,7 @@ fn decoder_streams_moonshot_multi_chunk_reasoning_as_thinking() {
     ];
 
     let is_reasoning =
-        is_reasoning_model_for_stream(crate::config::ApiProvider::Moonshot, "kimi-k2.6");
+        is_reasoning_model_for_stream(crate::config::ProviderKind::Moonshot, "kimi-k2.6");
     let mut content_index = 0u32;
     let mut text_started = false;
     let mut thinking_started = false;
@@ -384,7 +384,7 @@ fn decoder_streams_minimax_reasoning_details_as_incremental_thinking() {
         r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"content":"Done."}}]}"#,
     ];
 
-    let is_reasoning = is_reasoning_model_for_stream(ApiProvider::Minimax, "MiniMax-M3");
+    let is_reasoning = is_reasoning_model_for_stream(ProviderKind::Minimax, "MiniMax-M3");
     let mut content_index = 0u32;
     let mut text_started = false;
     let mut thinking_started = false;
@@ -443,12 +443,12 @@ fn modelstudio_streams_reasoning_content_as_thinking() {
     // Both OpenAI-dialect plans classify their reasoning catalog.
     for (provider, base_url, model) in [
         (
-            ApiProvider::ModelstudioTokenPlan,
+            ProviderKind::ModelstudioTokenPlan,
             crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
             "qwen3.8-max",
         ),
         (
-            ApiProvider::ModelstudioCodingPlan,
+            ProviderKind::ModelstudioCodingPlan,
             crate::config::DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
             "qwen3.7-plus",
         ),
@@ -515,7 +515,7 @@ fn modelstudio_streams_reasoning_content_as_thinking() {
     // A model id the catalog does not know still routes the reasoning field
     // to Thinking (#6501); a model that sends no reasoning field gets none.
     let style = reasoning_stream_style_for_route(
-        ApiProvider::ModelstudioTokenPlan,
+        ProviderKind::ModelstudioTokenPlan,
         crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
         "qwen3.8-max-lite-unknown",
         None,
@@ -531,7 +531,7 @@ fn decoder_does_not_render_reasoning_as_text_for_known_provider_models() {
     let mut tool_indices = std::collections::HashMap::new();
     let mut reasoning_detail_buffers = std::collections::HashMap::new();
     let is_reasoning_model =
-        is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro");
+        is_reasoning_model_for_stream(ProviderKind::XiaomiMimo, "mimo-v2.5-pro");
     let events = parse_sse_chunk(
         &serde_json::json!({
             "choices": [{
@@ -620,7 +620,7 @@ fn reasoning_style_separate_field_routes_reasoning_to_thinking() {
 #[test]
 fn exact_kimi_code_k3_streams_reasoning_content_as_thinking() {
     let style = reasoning_stream_style_for_route(
-        ApiProvider::Moonshot,
+        ProviderKind::Moonshot,
         crate::config::DEFAULT_KIMI_CODE_BASE_URL,
         crate::config::KIMI_CODE_K3_MODEL,
         None,
@@ -635,7 +635,7 @@ fn exact_kimi_code_k3_streams_reasoning_content_as_thinking() {
     assert_eq!(text_delta_text(&events), "");
 
     let generic_style = reasoning_stream_style_for_route(
-        ApiProvider::Moonshot,
+        ProviderKind::Moonshot,
         crate::config::DEFAULT_MOONSHOT_BASE_URL,
         crate::config::KIMI_CODE_K3_MODEL,
         None,
@@ -651,17 +651,17 @@ fn exact_kimi_code_k3_streams_reasoning_content_as_thinking() {
 fn issue_6501_reasoning_field_never_leaks_into_answer_text_on_unlisted_routes() {
     for (provider, base_url, model) in [
         (
-            ApiProvider::Xai,
+            ProviderKind::Xai,
             crate::config::DEFAULT_XAI_BASE_URL,
             "grok-4.7",
         ),
         (
-            ApiProvider::XiaomiMimo,
+            ProviderKind::XiaomiMimo,
             "https://token-plan-sgp.xiaomimimo.com/v1",
             "mimo-v2.7-pro-unreleased",
         ),
         (
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://gateway.example.test/v1",
             "some-new-reasoner",
         ),
@@ -706,7 +706,7 @@ fn issue_6501_reasoning_field_never_leaks_into_answer_text_on_unlisted_routes() 
     let passthrough = decode_chunks_with_style(
         &[r#"{"choices":[{"delta":{"reasoning_content":"answer via reasoning field"}}]}"#],
         reasoning_stream_style_for_route(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "https://gateway.example.test/v1",
             "some-new-reasoner",
             Some("none"),
@@ -776,23 +776,23 @@ fn reasoning_style_none_keeps_inline_tags_visible_text() {
 #[test]
 fn configured_reasoning_style_overrides_route_default() {
     assert_eq!(
-        reasoning_stream_style_for_stream(ApiProvider::Openai, "custom-minimax", None),
+        reasoning_stream_style_for_stream(ProviderKind::Openai, "custom-minimax", None),
         ReasoningStreamStyle::SeparateField
     );
     assert_eq!(
         reasoning_stream_style_for_stream(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "custom-minimax",
             Some("inline-tags")
         ),
         ReasoningStreamStyle::InlineTags
     );
     assert_eq!(
-        reasoning_stream_style_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro", None),
+        reasoning_stream_style_for_stream(ProviderKind::XiaomiMimo, "mimo-v2.5-pro", None),
         ReasoningStreamStyle::SeparateField
     );
     assert_eq!(
-        reasoning_stream_style_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro", Some("none")),
+        reasoning_stream_style_for_stream(ProviderKind::XiaomiMimo, "mimo-v2.5-pro", Some("none")),
         ReasoningStreamStyle::None
     );
 }
@@ -1316,7 +1316,7 @@ fn restored_tool_results_obey_the_active_route_budget() {
         for stream in [false, true] {
             let wire = build_chat_wire_body(
                 &request,
-                ApiProvider::Arcee,
+                ProviderKind::Arcee,
                 "https://api.arcee.ai/api/v1",
                 stream,
                 limits,
@@ -1660,14 +1660,14 @@ fn deepseek_flash_v41_classifies_reasoning_through_the_catalog() {
         "prompt inspection must agree with the wire request"
     );
     assert!(should_replay_reasoning_content_for_provider_on_route(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         base_url,
         "deepseek-flash",
         None,
     ));
 
     let style =
-        reasoning_stream_style_for_route(ApiProvider::Deepseek, base_url, "deepseek-flash", None);
+        reasoning_stream_style_for_route(ProviderKind::Deepseek, base_url, "deepseek-flash", None);
     assert_eq!(style, ReasoningStreamStyle::SeparateField);
     let events = decode_chunks_with_style(
         &[r#"{"choices":[{"delta":{"reasoning_content":"private flash plan"}}]}"#],

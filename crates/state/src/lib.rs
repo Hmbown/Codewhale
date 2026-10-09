@@ -1,13 +1,13 @@
-//! Persistent state management for conversation threads, messages, and jobs.
+//! Historical thread recovery, canonical owner receipts, metadata and jobs.
 //!
-//! The [`StateStore`] is the primary entry point, backed by a SQLite database and an
-//! append-only JSONL session index file. It provides CRUD operations for:
-//!
-//! - **Threads** — conversation metadata, archival, and session indexing.
-//! - **Messages** — append-only message storage with tree-structured branching.
-//! - **Checkpoints** — named state snapshots for restoring conversation progress.
-//! - **Jobs** — background task tracking with status and progress.
-//! - **Dynamic tools** — per-thread tool registrations.
+//! [`StateStore`] retains legacy conversation graphs as read-only archives.
+//! A bounded absent-only restore can admit a complete historical graph in one
+//! SQLite transaction; live transcript writes belong to Runtime's Engine and
+//! SessionManager. Canonical aliases and durable operations use this same
+//! SQLite connection. Thread metadata, jobs, dynamic tools and the session
+//! index retain their existing ownership.
+
+mod runtime_aliases;
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -101,6 +101,21 @@ pub struct ThreadMetadata {
     pub current_leaf_id: Option<i64>,
 }
 
+/// A complete historical SQLite thread, restored once into an absent target.
+///
+/// This is recovery/import data, never a live transcript writer. Entry IDs,
+/// timestamps, all branches and the exact selected leaf are retained.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyThreadArchive {
+    pub thread: ThreadMetadata,
+    pub messages: Vec<MessageRecord>,
+    #[serde(default)]
+    pub goal: Option<ThreadGoalRecord>,
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointRecord>,
+}
+
 /// A dynamically registered tool associated with a thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicToolRecord {
@@ -114,31 +129,12 @@ pub struct DynamicToolRecord {
     pub input_schema: Value,
 }
 
-/// A single message entry in a conversation thread.
-///
-/// Messages form a tree structure via [`parent_entry_id`](Self::parent_entry_id),
-/// enabling conversation branching and forking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageRecord {
-    /// Auto-incremented unique identifier for this message.
-    pub id: i64,
-    /// ID of the thread this message belongs to.
-    pub thread_id: String,
-    /// Role of the message sender (e.g. `"user"`, `"assistant"`, `"system"`).
-    pub role: String,
-    /// Text content of the message.
-    pub content: String,
-    /// Optional structured item payload (tool calls, tool results, etc.).
-    pub item: Option<Value>,
-    /// Unix timestamp (seconds) when the message was created.
-    pub created_at: i64,
-    /// ID of the parent message, forming a tree structure. `None` for root messages.
-    pub parent_entry_id: Option<i64>,
-}
+pub use codewhale_protocol::MessageRecord;
 
-/// One message for [`StateStore::append_messages`].
+/// Private historical database fixture for State unit tests.
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct NewMessage {
+struct NewMessage {
     /// Role of the message sender (e.g. `"user"`, `"history"`).
     pub role: String,
     /// Text content of the message.
@@ -284,7 +280,7 @@ fn session_index_compact_line_threshold() -> usize {
 }
 
 /// The `user_version` the last step of `StateStore::migrate_schema` writes.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// Persistent storage for conversation threads, messages, checkpoints, and jobs.
 ///
@@ -710,6 +706,16 @@ impl StateStore {
                 "#,
             )
             .context("failed to initialize thread runtime link schema")?;
+            user_version = 6;
+        }
+        if user_version < 7 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS state_store_identity (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), identity TEXT NOT NULL);
+                 INSERT OR IGNORE INTO state_store_identity VALUES(1, lower(hex(randomblob(32))));
+                 CREATE TABLE IF NOT EXISTS thread_runtime_receipts (thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE, receipt_json TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS thread_runtime_operations (operation_key TEXT PRIMARY KEY, request_digest TEXT NOT NULL, receipt_json TEXT NOT NULL);
+                 PRAGMA user_version = 7;",
+            ).context("failed to initialize bound canonical Runtime receipts")?;
         }
         Ok(())
     }
@@ -730,9 +736,20 @@ impl StateStore {
 
     /// Record the runtime thread for `thread_id`. The thread must exist; the
     /// link is removed with it.
-    pub fn set_runtime_thread_link(&self, thread_id: &str, runtime_thread_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
+    #[cfg(test)]
+    fn set_runtime_thread_link(&self, thread_id: &str, runtime_thread_id: &str) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thread_runtime_receipts WHERE thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !bound,
+            "bound canonical aliases cannot be changed by the legacy link writer"
+        );
+        tx.execute(
             r#"
             INSERT INTO thread_runtime_links(thread_id, runtime_thread_id, created_at)
             VALUES (?1, ?2, ?3)
@@ -743,73 +760,17 @@ impl StateStore {
             params![thread_id, runtime_thread_id, Utc::now().timestamp()],
         )
         .with_context(|| format!("failed to save runtime link for thread {thread_id}"))?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Insert or update thread metadata.
     ///
-    /// This does **not** update `current_leaf_id`; use [`append_message`](Self::append_message)
-    /// or [`set_current_leaf_id`](Self::set_current_leaf_id) for that.
+    /// This does **not** update legacy history or its selected leaf. Restoring an
+    /// old transcript requires an absent target and a complete immutable archive.
     pub fn upsert_thread(&self, thread: &ThreadMetadata) -> Result<()> {
         let conn = self.conn()?;
-        conn.execute(
-            r#"
-            INSERT INTO threads (
-                id, rollout_path, preview, ephemeral, model_provider, created_at, updated_at, status, path, cwd,
-                cli_version, source, title, sandbox_policy, approval_mode, archived, archived_at,
-                git_sha, git_branch, git_origin_url, memory_mode
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                ?18, ?19, ?20, ?21
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                rollout_path=excluded.rollout_path,
-                preview=excluded.preview,
-                ephemeral=excluded.ephemeral,
-                model_provider=excluded.model_provider,
-                created_at=excluded.created_at,
-                updated_at=excluded.updated_at,
-                status=excluded.status,
-                path=excluded.path,
-                cwd=excluded.cwd,
-                cli_version=excluded.cli_version,
-                source=excluded.source,
-                title=excluded.title,
-                sandbox_policy=excluded.sandbox_policy,
-                approval_mode=excluded.approval_mode,
-                archived=excluded.archived,
-                archived_at=excluded.archived_at,
-                git_sha=excluded.git_sha,
-                git_branch=excluded.git_branch,
-                git_origin_url=excluded.git_origin_url,
-                memory_mode=excluded.memory_mode
-            "#,
-            params![
-                thread.id,
-                path_to_opt_string(thread.rollout_path.as_deref()),
-                thread.preview,
-                bool_to_i64(thread.ephemeral),
-                thread.model_provider,
-                thread.created_at,
-                thread.updated_at,
-                thread_status_to_str(&thread.status),
-                path_to_opt_string(thread.path.as_deref()),
-                thread.cwd.display().to_string(),
-                thread.cli_version,
-                session_source_to_str(&thread.source),
-                thread.name,
-                thread.sandbox_policy,
-                thread.approval_mode,
-                bool_to_i64(thread.archived),
-                thread.archived_at,
-                thread.git_sha,
-                thread.git_branch,
-                thread.git_origin_url,
-                thread.memory_mode,
-            ],
-        )
-        .context("failed to upsert thread metadata")?;
+        write_thread_metadata_on(&conn, thread)?;
 
         self.append_thread_name(
             &thread.id,
@@ -919,72 +880,10 @@ impl StateStore {
     }
 
     /// Insert or replace the persisted goal for a thread.
-    pub fn upsert_thread_goal(&self, goal: &ThreadGoalRecord) -> Result<()> {
-        codewhale_protocol::validate_goal_stall_state(
-            goal.last_gap_fingerprint.as_deref(),
-            goal.repeated_gap_count,
-            goal.last_gap_pass,
-            u32::try_from(goal.continuation_count.max(0)).unwrap_or(u32::MAX),
-        )
-        .map_err(anyhow::Error::msg)?;
-        let pause_reason = goal
-            .pause_reason
-            .map(|reason| serde_json::to_string(&reason))
-            .transpose()?;
+    #[cfg(test)]
+    fn upsert_thread_goal(&self, goal: &ThreadGoalRecord) -> Result<()> {
         let conn = self.conn()?;
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM threads WHERE id = ?1",
-                params![goal.thread_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("failed to verify thread before saving goal")?;
-        if exists.is_none() {
-            anyhow::bail!("thread {} not found", goal.thread_id);
-        }
-
-        conn.execute(
-            r#"
-            INSERT INTO thread_goals (
-                thread_id, goal_id, objective, status, token_budget, tokens_used,
-                time_used_seconds, continuation_count, created_at, updated_at,
-                last_gap_fingerprint, repeated_gap_count, last_gap_pass, pause_reason
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-            ON CONFLICT(thread_id) DO UPDATE SET
-                goal_id=excluded.goal_id,
-                objective=excluded.objective,
-                status=excluded.status,
-                token_budget=excluded.token_budget,
-                tokens_used=excluded.tokens_used,
-                time_used_seconds=excluded.time_used_seconds,
-                continuation_count=excluded.continuation_count,
-                created_at=excluded.created_at,
-                updated_at=excluded.updated_at,
-                last_gap_fingerprint=excluded.last_gap_fingerprint,
-                repeated_gap_count=excluded.repeated_gap_count,
-                last_gap_pass=excluded.last_gap_pass,
-                pause_reason=excluded.pause_reason
-            "#,
-            params![
-                goal.thread_id,
-                goal.goal_id,
-                goal.objective,
-                thread_goal_status_to_str(&goal.status),
-                goal.token_budget,
-                goal.tokens_used,
-                goal.time_used_seconds,
-                goal.continuation_count,
-                goal.created_at,
-                goal.updated_at,
-                goal.last_gap_fingerprint,
-                goal.repeated_gap_count,
-                goal.last_gap_pass,
-                pause_reason,
-            ],
-        )
-        .context("failed to upsert thread goal")?;
-        Ok(())
+        write_thread_goal_on(&conn, goal)
     }
 
     /// Accrue additional token and wall-clock usage onto a thread's persisted goal.
@@ -1000,9 +899,10 @@ impl StateStore {
     /// which is intentionally left to the caller's discretion).
     ///
     /// Returns the updated [`ThreadGoalRecord`], or `Ok(None)` if the thread has no
-    /// persisted goal. Unlike [`upsert_thread_goal`](Self::upsert_thread_goal) this never
+    /// persisted goal. Unlike the historical fixture upsert this never
     /// creates a goal row; it only accumulates onto an existing one.
-    pub fn record_thread_goal_usage(
+    #[cfg(test)]
+    fn record_thread_goal_usage(
         &self,
         thread_id: &str,
         token_delta: i64,
@@ -1033,7 +933,8 @@ impl StateStore {
     /// The older TUI continuation guard is scoped to one engine turn. This
     /// counter is intentionally persisted so a resumed goal loop can feed
     /// `goal_loop::decide_continuation` with the true cross-turn count.
-    pub fn record_thread_goal_continuation(
+    #[cfg(test)]
+    fn record_thread_goal_continuation(
         &self,
         thread_id: &str,
         now: i64,
@@ -1063,9 +964,22 @@ impl StateStore {
     }
 
     /// Read a goal on an already-held connection. The `record_*` mutators call
-    /// this instead of [`Self::get_thread_goal`], which would re-lock the
+    /// this instead of the public goal reader, which would re-lock the
     /// connection mutex and self-deadlock.
     fn read_thread_goal(conn: &Connection, thread_id: &str) -> Result<Option<ThreadGoalRecord>> {
+        let mut goal = Self::read_thread_goal_snapshot(conn, thread_id)?;
+        if let Some(goal) = goal.as_mut() {
+            goal.normalize_restored_stall_state();
+        }
+        Ok(goal)
+    }
+
+    /// Immutable migration/CAS snapshot keeps the original persisted status.
+    /// Restore normalization belongs to the reader/target, never source CAS.
+    fn read_thread_goal_snapshot(
+        conn: &Connection,
+        thread_id: &str,
+    ) -> Result<Option<ThreadGoalRecord>> {
         conn.query_row(
             r#"
             SELECT thread_id, goal_id, objective, status, token_budget, tokens_used,
@@ -1082,7 +996,8 @@ impl StateStore {
     }
 
     /// Delete the persisted goal for a thread.
-    pub fn delete_thread_goal(&self, thread_id: &str) -> Result<bool> {
+    #[cfg(test)]
+    fn delete_thread_goal(&self, thread_id: &str) -> Result<bool> {
         let conn = self.conn()?;
         let changed = conn
             .execute(
@@ -1133,20 +1048,6 @@ impl StateStore {
             });
         }
         Ok(out)
-    }
-
-    /// Update the current leaf message pointer for a thread.
-    ///
-    /// This controls which branch of the conversation tree is considered active
-    /// when listing messages via [`list_messages`](Self::list_messages).
-    pub fn set_current_leaf_id(&self, thread_id: &str, current_leaf_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE threads SET current_leaf_id = ?1 WHERE id = ?2",
-            params![current_leaf_id, thread_id],
-        )
-        .context("failed to update thread current leaf id")?;
-        Ok(())
     }
 
     /// Replace the dynamic tools for a thread.
@@ -1218,7 +1119,8 @@ impl StateStore {
     /// The message is linked to the thread's current leaf as its parent, and the
     /// thread's `current_leaf_id` is updated to the new message. Returns the ID
     /// of the newly created message.
-    pub fn append_message(
+    #[cfg(test)]
+    fn append_message(
         &self,
         thread_id: &str,
         role: &str,
@@ -1244,7 +1146,8 @@ impl StateStore {
     /// current leaf), and the leaf ends on the last. All or nothing: a failure
     /// part-way leaves the thread exactly as it was, never a partial history.
     /// Returns the new message ids in order.
-    pub fn append_messages(&self, thread_id: &str, messages: &[NewMessage]) -> Result<Vec<i64>> {
+    #[cfg(test)]
+    fn append_messages(&self, thread_id: &str, messages: &[NewMessage]) -> Result<Vec<i64>> {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
@@ -1369,68 +1272,11 @@ impl StateStore {
         Ok(out)
     }
 
-    /// Fork the conversation at a specific message.
-    ///
-    /// Creates a new message whose parent is `message_id` and updates the thread's
-    /// `current_leaf_id` to the new message. Returns the ID of the new message.
-    /// This enables branching conversations from any point in the history.
-    pub fn fork_at_message(
-        &self,
-        message_id: &str,
-        role: &str,
-        content: &str,
-        item: Option<Value>,
-    ) -> Result<i64> {
-        let mut conn = self.conn()?;
-        let created_at = Utc::now().timestamp();
-        let item_json = item
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("failed to serialize message item payload")?;
-
-        let tx = conn
-            .transaction()
-            .context("failed to begin fork message transaction")?;
-
-        let thread_id: String = tx
-            .query_row(
-                "SELECT thread_id FROM messages WHERE id = ?1",
-                params![message_id],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("failed to query thread id for message {message_id}"))?;
-
-        let next_leaf_id: i64 = tx.query_row(
-            r#"
-                INSERT INTO messages(thread_id, role, content, item_json, created_at, parent_entry_id)
-                SELECT ?1, ?2, ?3, ?4, ?5, ?6
-                RETURNING id
-            "#, params![thread_id, role, content, item_json, created_at, message_id], |row| row.get(0)
-        ).with_context(|| format!("failed to fork at message for thread {thread_id:?}"))?;
-
-        tx.execute(
-            r#"
-            UPDATE threads
-            SET current_leaf_id = ?1
-            WHERE id = ?2;
-            "#,
-            params![next_leaf_id, thread_id],
-        )
-        .with_context(|| {
-            format!("failed to update thread current leaf id for thread {thread_id:?}")
-        })?;
-
-        tx.commit()
-            .context("failed to commit fork message transaction")?;
-
-        Ok(next_leaf_id)
-    }
-
     /// Delete all messages belonging to a thread and reset its `current_leaf_id`.
     ///
     /// Returns the number of messages deleted.
-    pub fn clear_messages(&self, thread_id: &str) -> Result<usize> {
+    #[cfg(test)]
+    fn clear_messages(&self, thread_id: &str) -> Result<usize> {
         let mut conn = self.conn()?;
         let tx = conn
             .transaction()
@@ -1463,12 +1309,8 @@ impl StateStore {
     ///
     /// If a checkpoint with the same `thread_id` and `checkpoint_id` already exists,
     /// its state and timestamp are overwritten.
-    pub fn save_checkpoint(
-        &self,
-        thread_id: &str,
-        checkpoint_id: &str,
-        state: &Value,
-    ) -> Result<()> {
+    #[cfg(test)]
+    fn save_checkpoint(&self, thread_id: &str, checkpoint_id: &str, state: &Value) -> Result<()> {
         let conn = self.conn()?;
         let state_json =
             serde_json::to_string(state).context("failed to encode checkpoint state")?;
@@ -1587,19 +1429,6 @@ impl StateStore {
             });
         }
         Ok(out)
-    }
-
-    /// Delete a specific checkpoint from a thread.
-    pub fn delete_checkpoint(&self, thread_id: &str, checkpoint_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM checkpoints WHERE thread_id = ?1 AND checkpoint_id = ?2",
-            params![thread_id, checkpoint_id],
-        )
-        .with_context(|| {
-            format!("failed to delete checkpoint {checkpoint_id} for thread {thread_id}")
-        })?;
-        Ok(())
     }
 
     /// Insert or update a background job record.
@@ -1989,6 +1818,135 @@ pub fn default_state_db_path() -> PathBuf {
     }
 }
 
+fn write_thread_metadata_on(conn: &Connection, thread: &ThreadMetadata) -> Result<()> {
+    conn.execute(
+            r#"
+            INSERT INTO threads (
+                id, rollout_path, preview, ephemeral, model_provider, created_at, updated_at, status, path, cwd,
+                cli_version, source, title, sandbox_policy, approval_mode, archived, archived_at,
+                git_sha, git_branch, git_origin_url, memory_mode
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                ?18, ?19, ?20, ?21
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                rollout_path=excluded.rollout_path,
+                preview=excluded.preview,
+                ephemeral=excluded.ephemeral,
+                model_provider=excluded.model_provider,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                status=excluded.status,
+                path=excluded.path,
+                cwd=excluded.cwd,
+                cli_version=excluded.cli_version,
+                source=excluded.source,
+                title=excluded.title,
+                sandbox_policy=excluded.sandbox_policy,
+                approval_mode=excluded.approval_mode,
+                archived=excluded.archived,
+                archived_at=excluded.archived_at,
+                git_sha=excluded.git_sha,
+                git_branch=excluded.git_branch,
+                git_origin_url=excluded.git_origin_url,
+                memory_mode=excluded.memory_mode
+            "#,
+            params![
+                thread.id,
+                path_to_opt_string(thread.rollout_path.as_deref()),
+                thread.preview,
+                bool_to_i64(thread.ephemeral),
+                thread.model_provider,
+                thread.created_at,
+                thread.updated_at,
+                thread_status_to_str(&thread.status),
+                path_to_opt_string(thread.path.as_deref()),
+                thread.cwd.display().to_string(),
+                thread.cli_version,
+                session_source_to_str(&thread.source),
+                thread.name,
+                thread.sandbox_policy,
+                thread.approval_mode,
+                bool_to_i64(thread.archived),
+                thread.archived_at,
+                thread.git_sha,
+                thread.git_branch,
+                thread.git_origin_url,
+                thread.memory_mode,
+            ],
+        )
+        .context("failed to upsert thread metadata")?;
+    Ok(())
+}
+
+fn write_thread_goal_on(conn: &Connection, goal: &ThreadGoalRecord) -> Result<()> {
+    codewhale_protocol::validate_goal_stall_state(
+        goal.last_gap_fingerprint.as_deref(),
+        goal.repeated_gap_count,
+        goal.last_gap_pass,
+        u32::try_from(goal.continuation_count.max(0)).unwrap_or(u32::MAX),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let pause_reason = goal
+        .pause_reason
+        .map(|reason| serde_json::to_string(&reason))
+        .transpose()?;
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM threads WHERE id = ?1",
+            params![goal.thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to verify thread before saving goal")?;
+    if exists.is_none() {
+        anyhow::bail!("thread {} not found", goal.thread_id);
+    }
+
+    conn.execute(
+        r#"
+            INSERT INTO thread_goals (
+                thread_id, goal_id, objective, status, token_budget, tokens_used,
+                time_used_seconds, continuation_count, created_at, updated_at,
+                last_gap_fingerprint, repeated_gap_count, last_gap_pass, pause_reason
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                goal_id=excluded.goal_id,
+                objective=excluded.objective,
+                status=excluded.status,
+                token_budget=excluded.token_budget,
+                tokens_used=excluded.tokens_used,
+                time_used_seconds=excluded.time_used_seconds,
+                continuation_count=excluded.continuation_count,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                last_gap_fingerprint=excluded.last_gap_fingerprint,
+                repeated_gap_count=excluded.repeated_gap_count,
+                last_gap_pass=excluded.last_gap_pass,
+                pause_reason=excluded.pause_reason
+            "#,
+        params![
+            goal.thread_id,
+            goal.goal_id,
+            goal.objective,
+            thread_goal_status_to_str(&goal.status),
+            goal.token_budget,
+            goal.tokens_used,
+            goal.time_used_seconds,
+            goal.continuation_count,
+            goal.created_at,
+            goal.updated_at,
+            goal.last_gap_fingerprint,
+            goal.repeated_gap_count,
+            goal.last_gap_pass,
+            pause_reason,
+        ],
+    )
+    .context("failed to upsert thread goal")?;
+    Ok(())
+}
+
 fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
@@ -2148,7 +2106,7 @@ fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadMetadata> {
 fn row_to_thread_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadGoalRecord> {
     let status_raw: String = row.get(3)?;
     let pause_reason: Option<String> = row.get(13)?;
-    let mut goal = ThreadGoalRecord {
+    let goal = ThreadGoalRecord {
         thread_id: row.get(0)?,
         goal_id: row.get(1)?,
         objective: row.get(2)?,
@@ -2186,7 +2144,6 @@ fn row_to_thread_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadGoalRec
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
         )
     })?;
-    goal.normalize_restored_stall_state();
     Ok(goal)
 }
 
@@ -3132,5 +3089,135 @@ mod tests {
                 .as_deref(),
             Some("trigger-name"),
         );
+    }
+    fn legacy_archive_fixture(id: &str) -> LegacyThreadArchive {
+        let mut thread = test_thread(id);
+        thread.current_leaf_id = Some(3);
+        LegacyThreadArchive {
+            thread,
+            messages: [
+                (1, None, "root"),
+                (2, Some(1), "inactive"),
+                (3, Some(1), "active"),
+            ]
+            .into_iter()
+            .map(|(entry_id, parent_entry_id, content)| MessageRecord {
+                id: entry_id,
+                thread_id: id.into(),
+                role: "user".into(),
+                content: content.into(),
+                item: Some(serde_json::json!({"content":content})),
+                created_at: 100 + entry_id,
+                parent_entry_id,
+            })
+            .collect(),
+            goal: Some(test_goal(id, "historical goal")),
+            checkpoints: vec![CheckpointRecord {
+                thread_id: id.into(),
+                checkpoint_id: "retained".into(),
+                state: serde_json::json!({"receipt":"historical"}),
+                created_at: 123,
+            }],
+        }
+    }
+
+    #[test]
+    fn legacy_archive_restore_keeps_full_graph_goal_checkpoint_and_refuses_replacement() {
+        let store = temp_state_store("archive-once");
+        let archive = legacy_archive_fixture("legacy");
+        store.restore_legacy_thread_archive(&archive).unwrap();
+        let snapshot = store.snapshot_legacy_thread_history("legacy").unwrap();
+        assert_eq!(
+            serde_json::to_value(&snapshot.messages).unwrap(),
+            serde_json::to_value(&archive.messages).unwrap()
+        );
+        assert_eq!(snapshot.current_leaf_id, Some(3));
+        assert_eq!(store.list_messages("legacy", None).unwrap().len(), 2);
+        let goal = snapshot.goal.unwrap();
+        assert_eq!(goal.status, codewhale_protocol::ThreadGoalStatus::Active);
+        assert_eq!(goal.tokens_used, archive.goal.as_ref().unwrap().tokens_used);
+        assert_eq!(goal.updated_at, archive.goal.as_ref().unwrap().updated_at);
+        let checkpoint = store
+            .load_checkpoint("legacy", Some("retained"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.created_at, 123);
+        assert_eq!(checkpoint.state, archive.checkpoints[0].state);
+        let mut replacement = archive.clone();
+        replacement.messages[1].content = "changed inactive history".into();
+        assert!(store.restore_legacy_thread_archive(&replacement).is_err());
+        assert_eq!(
+            store
+                .snapshot_legacy_thread_history("legacy")
+                .unwrap()
+                .messages[1]
+                .content,
+            "inactive"
+        );
+    }
+
+    #[test]
+    fn legacy_archive_restore_refuses_cycles_duplicates_foreign_rows_and_bounds_without_publication()
+     {
+        let store = temp_state_store("archive-refusals");
+        let valid = legacy_archive_fixture("legacy");
+        let mut invalid = Vec::new();
+        let mut archive = valid.clone();
+        archive.messages[0].parent_entry_id = Some(2);
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.messages[1].id = 1;
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.messages[1].parent_entry_id = Some(99);
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.messages[1].thread_id = "foreign".into();
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.thread.current_leaf_id = Some(99);
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.goal.as_mut().unwrap().thread_id = "foreign".into();
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.checkpoints[0].thread_id = "foreign".into();
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.checkpoints.push(archive.checkpoints[0].clone());
+        invalid.push(archive);
+        let mut archive = valid.clone();
+        archive.messages[0].content =
+            "x".repeat(codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES + 1);
+        invalid.push(archive);
+        for archive in invalid {
+            assert!(store.restore_legacy_thread_archive(&archive).is_err());
+            assert!(store.get_thread("legacy").unwrap().is_none());
+        }
+        store.restore_legacy_thread_archive(&valid).unwrap();
+    }
+
+    #[test]
+    fn legacy_archive_restore_rolls_back_metadata_messages_goal_on_late_checkpoint_failure() {
+        let store = temp_state_store("archive-transaction");
+        store.conn().unwrap().execute_batch("CREATE TRIGGER refuse_archive_checkpoint BEFORE INSERT ON checkpoints BEGIN SELECT RAISE(ABORT, 'fixture checkpoint failure'); END;").unwrap();
+        let archive = legacy_archive_fixture("legacy");
+        assert!(store.restore_legacy_thread_archive(&archive).is_err());
+        let conn = store.conn().unwrap();
+        for table in ["threads", "messages", "thread_goals", "checkpoints"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "{table} must roll back with the immutable archive"
+            );
+        }
+        conn.execute_batch("DROP TRIGGER refuse_archive_checkpoint")
+            .unwrap();
+        drop(conn);
+        store.restore_legacy_thread_archive(&archive).unwrap();
     }
 }

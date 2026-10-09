@@ -27,12 +27,11 @@ use codewhale_config::pricing::OfferingPricing;
 use crate::codex_model_cache::{
     self, CodexModelCacheFreshness, CodexModelMetadata, CodexModelRoster,
 };
-use crate::config::{ApiProvider, Config, DEEPSEEK_ALIAS_REPLACEMENT};
+use crate::config::{Config, DEEPSEEK_ALIAS_REPLACEMENT, ProviderKind};
 use crate::model_profile::{
     CapabilityOverride, SupportState, resolved_capability_profile_for_route_with_overrides,
     resolved_capability_profile_with_overrides,
 };
-use crate::model_registry;
 use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::provider_lake::{
     catalog_offering_for_model, catalog_offering_for_model_identity, configured_providers,
@@ -215,8 +214,9 @@ pub struct ModelPickerView {
     /// the canonical replacement for a retired alias performs a real migration
     /// instead of being misclassified as "unchanged".
     previous_model: String,
-    initial_provider: ApiProvider,
+    initial_provider: ProviderKind,
     initial_provider_identity: String,
+    initial_identity: Option<crate::config::ProviderIdentity>,
     /// Raw preference before the picker opened. An absent explicit preference
     /// is represented by Auto so applying a visible fixed-route tier is still
     /// recognized as an intentional picker choice.
@@ -250,7 +250,7 @@ pub struct ModelPickerView {
     /// `[providers.<name>]` entry. Self-hosted providers (Ollama/Sglang/
     /// Vllm) don't qualify just because routing to them doesn't require a
     /// key.
-    configured_providers: Vec<ApiProvider>,
+    configured_providers: Vec<crate::config::ProviderIdentity>,
     row_hitboxes: RefCell<Vec<(Rect, Pane, usize)>>,
     last_mouse_selected: Option<(Pane, usize)>,
     hovered_row: Option<(Pane, usize)>,
@@ -294,7 +294,7 @@ struct ModelPickerProjection {
     sort: Option<ModelSort>,
     indices: Vec<usize>,
     rows: Vec<PaneRow>,
-    custom: Option<(String, ApiProvider)>,
+    custom: Option<(String, crate::config::ProviderIdentity)>,
 }
 
 struct VisibleModelRows<'a> {
@@ -324,10 +324,11 @@ impl std::ops::Index<usize> for VisibleModelRows<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelPickerRow {
     id: String,
-    provider: Option<ApiProvider>,
+    provider: Option<ProviderKind>,
     /// Concrete persistence identity. `Custom` alone cannot identify a named
     /// custom route, so pins must carry this exact key when present.
     provider_identity: Option<String>,
+    admitted_identity: Option<crate::config::ProviderIdentity>,
     hint: String,
     metadata: EffectivePickerMetadata,
     selectable: bool,
@@ -464,8 +465,13 @@ impl ModelPickerView {
         picker.initial_provider_identity = selection
             .provider
             .unwrap_or_else(|| app.provider_identity_for_persistence().to_string());
-        picker.initial_provider =
-            ApiProvider::parse(&picker.initial_provider_identity).unwrap_or(ApiProvider::Custom);
+        picker.initial_identity = config
+            .legacy_selection_identity(&picker.initial_provider_identity)
+            .ok();
+        picker.initial_provider = picker
+            .initial_identity
+            .as_ref()
+            .map_or(ProviderKind::Custom, |identity| identity.provider);
         picker.initial_model = selection.model.unwrap_or_else(|| "auto".to_string());
         picker.previous_model = picker.initial_model.clone();
         picker.initial_effort = selection.reasoning.unwrap_or(ReasoningEffort::Auto);
@@ -498,23 +504,32 @@ impl ModelPickerView {
             ModelPickerPurpose::FleetRoute { allow_inherit, .. } => allow_inherit,
             ModelPickerPurpose::FleetProfileRoute { .. } => true,
         };
-        self.route_config.provider = Some(self.initial_provider_identity.clone());
-        self.configured_providers = configured_providers(config, self.initial_provider)
+        if let Some(identity) = self.initial_identity.as_ref()
+            && self
+                .route_config
+                .scope_to_provider_identity(identity)
+                .is_err()
+        {
+            self.initial_identity = None;
+        }
+        self.configured_providers = configured_providers(config)
             .into_iter()
-            .filter(|provider| *provider != self.initial_provider)
+            .filter(|identity| Some(identity) != self.initial_identity.as_ref())
             .collect();
-        self.active_accepts_custom_model_ids =
-            config.model_ids_pass_through_for_provider(self.initial_provider);
-        if self.initial_model != "auto" {
+        self.active_accepts_custom_model_ids = self
+            .initial_identity
+            .as_ref()
+            .is_some_and(|identity| config.model_ids_pass_through_for_provider(identity));
+        if self.initial_model != "auto"
+            && let Some(identity) = self.initial_identity.as_ref()
+        {
             push_provider_model_rows(
                 &mut self.model_rows,
-                self.initial_provider,
-                (self.initial_provider == ApiProvider::Custom)
-                    .then_some(self.initial_provider_identity.as_str()),
+                identity,
                 vec![self.initial_model.clone()],
                 self.initial_provider,
                 config,
-                &codex_model_cache::model_roster(),
+                &codex_model_cache::model_roster_for(config),
                 &app.provider_health,
             );
         }
@@ -555,9 +570,9 @@ impl ModelPickerView {
             app.model.clone()
         };
         let model_rows = picker_model_rows_for_app(app, config);
-        let configured_providers: Vec<_> = configured_providers(config, app.api_provider)
+        let configured_providers: Vec<_> = configured_providers(config)
             .into_iter()
-            .filter(|provider| *provider != app.api_provider)
+            .filter(|identity| app.admitted_provider_identity().ok() != Some(identity))
             .collect();
         let mut default_visible_rows: Vec<_> = model_rows
             .iter()
@@ -625,6 +640,7 @@ impl ModelPickerView {
             previous_model,
             initial_provider: app.api_provider,
             initial_provider_identity: app.provider_identity_for_persistence().to_string(),
+            initial_identity: app.admitted_provider_identity().ok().cloned(),
             initial_effort,
             selected_effort_request,
             active_accepts_custom_model_ids: app.accepts_custom_model_ids(),
@@ -744,8 +760,7 @@ impl ModelPickerView {
                         .as_str()
                         .to_ascii_lowercase()
                         .contains(&query_lower)
-                        || provider
-                            .display_name()
+                        || row_provider_label(row)
                             .to_ascii_lowercase()
                             .contains(&query_lower)
                 });
@@ -798,7 +813,7 @@ impl ModelPickerView {
                         route_labels
                             .get(row_provider_identity(row).unwrap_or(provider.as_str()))
                             .cloned()
-                            .unwrap_or_else(|| provider.display_name().to_string())
+                            .unwrap_or_else(|| row_provider_label(row).to_string())
                     })
                     .unwrap_or_default(),
                 meta: if row.provider.is_none() {
@@ -855,7 +870,11 @@ impl ModelPickerView {
         if let Some((model, provider)) = custom.as_ref() {
             rows.push(PaneRow {
                 primary: model.clone(),
-                route: provider.display_name().to_string(),
+                route: provider
+                    .compatibility()
+                    .map(|row| row.label)
+                    .unwrap_or(provider.key.as_str())
+                    .to_string(),
                 meta: vec![
                     if query.is_empty() {
                         "current (custom)"
@@ -916,12 +935,15 @@ impl ModelPickerView {
         }
         let rows = self.visible_model_rows();
         if let Some(row) = rows.get(self.selected_model_idx) {
-            return row.selectable;
+            return row.selectable
+                && row.admitted_identity.as_ref().is_some_and(|identity| {
+                    self.route_config.verify_provider_identity(identity).is_ok()
+                });
         }
         self.custom_model_row().is_some_and(|(model, provider)| {
             crate::provider_readiness::resolve_for_model(
                 &self.route_config,
-                provider,
+                &provider,
                 &model,
                 &self.provider_health,
             )
@@ -942,19 +964,13 @@ impl ModelPickerView {
         } else {
             row.hint.clone()
         };
-        // The provider auth event identifies only an enum. Sending Custom
-        // would open the first custom route's key editor, not this row's.
-        if row.provider == Some(ApiProvider::Custom) {
-            let identity = row_provider_identity(row).unwrap_or("custom");
-            return ViewAction::Emit(ViewEvent::StatusMessage {
-                message: format!(
-                    "! {identity}/{} is locked — {reason}. Open /provider and select {identity} to repair or authenticate this route.",
-                    row.id
-                ),
-            });
-        }
+        let route = row.provider_identity.as_deref().unwrap_or(
+            row.provider
+                .map(ProviderKind::as_str)
+                .unwrap_or("unknown route"),
+        );
         let message = format!(
-            "! {} is locked — {reason}. Open /provider to authenticate, then refresh.",
+            "! {route}/{} is locked — {reason}. Open /provider and select {route} to authenticate, then refresh.",
             row.id
         );
         // The ordinary setup wizard switches the session after auth. A
@@ -963,9 +979,13 @@ impl ModelPickerView {
             return ViewAction::Emit(ViewEvent::StatusMessage { message });
         }
         // Prefer opening provider setup so the user can remediate in one step.
-        if let Some(provider) = row.provider {
+        if let Some(identity) = row
+            .admitted_identity
+            .as_ref()
+            .filter(|identity| self.route_config.verify_provider_identity(identity).is_ok())
+        {
             return ViewAction::Emit(ViewEvent::ModelPickerNeedsAuth {
-                provider,
+                identity: identity.clone(),
                 model: row.id.clone(),
                 reason: message,
             });
@@ -974,18 +994,30 @@ impl ModelPickerView {
     }
 
     /// Exact route identity of the highlighted row, when it names one.
+    #[cfg(test)]
     fn resolved_provider_identity(&self) -> Option<String> {
-        let rows = self.visible_model_rows();
-        rows.get(self.selected_model_idx)?.provider_identity.clone()
+        self.resolved_admitted_identity()
+            .map(|identity| identity.key.to_string())
     }
 
-    fn resolved_provider(&self) -> Option<ApiProvider> {
+    fn resolved_admitted_identity(&self) -> Option<crate::config::ProviderIdentity> {
+        let rows = self.visible_model_rows();
+        let identity = if let Some(row) = rows.get(self.selected_model_idx) {
+            row.admitted_identity.clone()
+        } else {
+            self.custom_model_row().map(|(_, identity)| identity)
+        }?;
+        self.route_config.verify_provider_identity(&identity).ok()?;
+        Some(identity)
+    }
+
+    fn resolved_provider(&self) -> Option<ProviderKind> {
         let rows = self.visible_model_rows();
         if self.selected_model_idx < rows.len() {
             return rows[self.selected_model_idx].provider;
         }
         self.custom_model_row()
-            .map(|(_, provider)| provider)
+            .map(|(_, identity)| identity.provider)
             .or(Some(self.initial_provider))
     }
 
@@ -1027,20 +1059,20 @@ impl ModelPickerView {
         )
     }
 
-    fn resolved_base_url_for_provider(&self, provider: ApiProvider, model: &str) -> String {
-        if provider == ApiProvider::Custom
-            && let Some(identity) = self.resolved_provider_identity()
-        {
-            return self
-                .route_config
-                .base_url_for_route_identity(provider, &identity);
-        }
-        crate::route_runtime::resolve_runtime_route(&self.route_config, provider, Some(model))
-            .map(|route| route.candidate.endpoint().base_url.clone())
-            .unwrap_or_else(|_| provider.default_base_url().to_string())
+    fn resolved_base_url_for_provider(&self, _provider: ProviderKind, model: &str) -> String {
+        let Some(identity) = self.resolved_admitted_identity() else {
+            return String::new();
+        };
+        crate::route_runtime::resolve_runtime_route_for_identity(
+            &self.route_config,
+            &identity,
+            Some(model),
+        )
+        .map(|route| route.candidate.endpoint().base_url.clone())
+        .unwrap_or_else(|_| self.route_config.base_url_for_route(&identity))
     }
 
-    fn custom_model_row(&self) -> Option<(String, ApiProvider)> {
+    fn custom_model_row(&self) -> Option<(String, crate::config::ProviderIdentity)> {
         self.ensure_projection();
         self.projection.borrow().as_ref().unwrap().custom.clone()
     }
@@ -1048,20 +1080,23 @@ impl ModelPickerView {
     fn custom_model_row_for_visible(
         &self,
         visible_rows: &[&ModelPickerRow],
-    ) -> Option<(String, ApiProvider)> {
+    ) -> Option<(String, crate::config::ProviderIdentity)> {
         let query = self.query.trim();
         if query.is_empty() {
             return self
                 .show_custom_model_row
-                .then(|| (self.initial_model.clone(), self.initial_provider));
+                .then(|| self.initial_identity.clone())
+                .flatten()
+                .map(|identity| (self.initial_model.clone(), identity));
         }
         if let Some((provider, model)) = self.provider_qualified_custom_query(query) {
             if visible_rows.iter().any(|row| {
-                row.provider == Some(provider) && row.id.eq_ignore_ascii_case(model.trim())
+                row.admitted_identity.as_ref() == Some(&provider)
+                    && row.id.eq_ignore_ascii_case(model.trim())
             }) {
                 return None;
             }
-            if self.provider_accepts_custom_model(provider, &model) {
+            if self.provider_accepts_custom_model(&provider, &model) {
                 return Some((model, provider));
             }
             return None;
@@ -1070,19 +1105,25 @@ impl ModelPickerView {
             return None;
         }
         if visible_rows.iter().any(|row| {
-            row.provider == Some(self.initial_provider) && row.id.eq_ignore_ascii_case(query)
+            row.admitted_identity.as_ref() == self.initial_identity.as_ref()
+                && row.id.eq_ignore_ascii_case(query)
         }) {
             return None;
         }
-        Some((query.to_string(), self.initial_provider))
+        self.initial_identity
+            .clone()
+            .map(|identity| (query.to_string(), identity))
     }
 
-    fn provider_qualified_custom_query(&self, query: &str) -> Option<(ApiProvider, String)> {
+    fn provider_qualified_custom_query(
+        &self,
+        query: &str,
+    ) -> Option<(crate::config::ProviderIdentity, String)> {
         for (provider_key, model) in provider_query_splits(query) {
-            let Some(provider) = ApiProvider::parse(provider_key) else {
+            let Ok(provider) = self.route_config.legacy_selection_identity(provider_key) else {
                 continue;
             };
-            if provider != self.initial_provider
+            if Some(&provider) != self.initial_identity.as_ref()
                 && !self.view.browses_all_providers()
                 && !self.configured_providers.contains(&provider)
             {
@@ -1097,13 +1138,17 @@ impl ModelPickerView {
         None
     }
 
-    fn provider_accepts_custom_model(&self, provider: ApiProvider, model: &str) -> bool {
-        (provider == self.initial_provider && self.active_accepts_custom_model_ids)
-            || (provider != self.initial_provider
+    fn provider_accepts_custom_model(
+        &self,
+        identity: &crate::config::ProviderIdentity,
+        model: &str,
+    ) -> bool {
+        (Some(identity) == self.initial_identity.as_ref() && self.active_accepts_custom_model_ids)
+            || (Some(identity) != self.initial_identity.as_ref()
                 && self
                     .route_config
-                    .model_ids_pass_through_for_provider(provider))
-            || crate::config::normalize_model_name_for_provider(provider, model).is_some()
+                    .model_ids_pass_through_for_provider(identity))
+            || crate::config::normalize_model_name_for_provider(identity.provider, model).is_some()
     }
 
     fn clamp_model_selection(&mut self) {
@@ -1241,20 +1286,9 @@ impl ModelPickerView {
     }
 
     fn build_event_with_startup_default(&self, save_as_startup_default: bool) -> ViewEvent {
-        let resolved_provider = self.resolved_provider().unwrap_or(self.initial_provider);
-        let provider = (resolved_provider != self.initial_provider).then_some(resolved_provider);
-        // The selected row's own identity, never the config's currently
-        // selected custom route: applying a row must switch to the route that
-        // row describes (#6016). Only the typed custom-model row, which names
-        // no route, falls back to the configured identity.
-        let provider_id = (resolved_provider == ApiProvider::Custom).then(|| {
-            self.resolved_provider_identity()
-                .unwrap_or_else(|| self.route_config.provider_identity_for(resolved_provider))
-        });
         ViewEvent::ModelPickerApplied {
             model: self.resolved_model(),
-            provider,
-            provider_id,
+            identity: self.resolved_admitted_identity(),
             effort: self.selected_effort_request,
             previous_model: self.previous_model.clone(),
             previous_effort: self.initial_effort,
@@ -1279,11 +1313,11 @@ impl ModelPickerView {
                 initial_reasoning, ..
             } => (initial_reasoning, true),
         };
-        let provider = self.resolved_provider().unwrap_or(self.initial_provider);
-        let provider_id = (provider == ApiProvider::Custom).then(|| {
-            self.resolved_provider_identity()
-                .unwrap_or_else(|| self.route_config.provider_identity_for(provider))
-        });
+        let captured = self.resolved_admitted_identity();
+        let provider = captured
+            .as_ref()
+            .map_or(self.initial_provider, |identity| identity.provider);
+        let provider_id = captured.as_ref().map(|identity| identity.key.to_string());
         let model = self.resolved_model();
         let reasoning = if !allow_inherit {
             None
@@ -2054,7 +2088,7 @@ fn pin_for_row<'a>(pins: &'a [PinnedModel], row: &ModelPickerRow) -> Option<&'a 
 /// identity is its exact config key, so `TeamA` and `teama` stay two routes.
 /// Model ids are exact.
 fn pin_names_row(pin: &PinnedModel, row: &ModelPickerRow) -> bool {
-    let named_custom = row.provider == Some(ApiProvider::Custom);
+    let named_custom = row.provider == Some(ProviderKind::Custom);
     row_provider_identity(row).is_some_and(|provider| {
         if named_custom {
             provider == pin.provider
@@ -2088,8 +2122,8 @@ fn picker_model_rows_for_app(app: &App, config: &Config) -> Vec<ModelPickerRow> 
     push_auto_model_row(&mut rows, app, config, &auto_hint);
     // One snapshot supplies both IDs, capabilities, and freshness so a cache
     // replacement cannot produce mixed-generation picker rows.
-    let codex_roster = codex_model_cache::model_roster();
-    let mut active_model_ids = if app.api_provider == ApiProvider::OpenaiCodex {
+    let codex_roster = codex_model_cache::model_roster_for(config);
+    let mut active_model_ids = if app.api_provider == ProviderKind::OpenaiCodex {
         let mut models = vec!["auto".to_string()];
         for id in codex_roster.model_ids() {
             push_model_id(&mut models, &id);
@@ -2120,47 +2154,23 @@ fn picker_model_rows_for_app(app: &App, config: &Config) -> Vec<ModelPickerRow> 
         app.api_provider,
         app.provider_identity_for_persistence(),
     );
-    push_provider_model_rows(
-        &mut rows,
-        app.api_provider,
-        (app.api_provider == ApiProvider::Custom).then(|| app.provider_identity_for_persistence()),
-        active_model_ids,
-        app.api_provider,
-        config,
-        &codex_roster,
-        &app.provider_health,
-    );
-
-    for provider in ApiProvider::sorted_for_display() {
-        // Every named custom route shares `ApiProvider::Custom`, so the enum
-        // alone can neither name a route nor say which ones are already
-        // listed. Enumerate the configured tables by exact identity (#6016):
-        // a session resumed on another provider still sees every custom route
-        // it has configured, and one custom route never stands in for another.
-        if provider == ApiProvider::Custom {
-            for identity in inactive_custom_route_identities(app, config) {
-                push_inactive_route_rows(
-                    &mut rows,
-                    app,
-                    config,
-                    provider,
-                    &identity,
-                    &codex_roster,
-                );
-            }
-            continue;
-        }
-        if provider == app.api_provider {
-            continue;
-        }
-        push_inactive_route_rows(
+    if let Ok(identity) = app.admitted_provider_identity() {
+        push_provider_model_rows(
             &mut rows,
-            app,
+            identity,
+            active_model_ids,
+            app.api_provider,
             config,
-            provider,
-            provider.as_str(),
             &codex_roster,
+            &app.provider_health,
         );
+    }
+
+    for identity in config.provider_identities() {
+        if app.admitted_provider_identity().ok() == Some(&identity) {
+            continue;
+        }
+        push_inactive_route_rows(&mut rows, app, config, &identity, &codex_roster);
     }
 
     // The fleet comes first (design §10 F1): every model the person added
@@ -2180,7 +2190,7 @@ fn picker_model_rows_for_app(app: &App, config: &Config) -> Vec<ModelPickerRow> 
     }
 
     for pin in &pins {
-        let provider = ApiProvider::parse(&pin.provider).unwrap_or(ApiProvider::Custom);
+        let provider = ProviderKind::parse(&pin.provider).unwrap_or(ProviderKind::Custom);
         if rows.iter().any(|row| {
             row_provider_identity(row).is_some_and(|identity| identity == pin.provider)
                 && row.id == pin.model
@@ -2199,6 +2209,7 @@ fn picker_model_rows_for_app(app: &App, config: &Config) -> Vec<ModelPickerRow> 
             id: pin.model.clone(),
             provider: Some(provider),
             provider_identity: Some(pin.provider.clone()),
+            admitted_identity: None,
             hint: format!(
                 "stale pinned · exact {} / {} · unavailable; repair or remove",
                 pin.provider, pin.model
@@ -2283,7 +2294,7 @@ fn assign_default_sections(
             recent += 1;
         }
     }
-    let mut routes: Vec<(String, ApiProvider)> = Vec::new();
+    let mut routes: Vec<(String, ProviderKind)> = Vec::new();
     for row in rows.iter() {
         if let (Some(provider), Some(identity)) = (row.provider, row_provider_identity(row))
             && !routes.iter().any(|(seen, _)| seen == identity)
@@ -2292,6 +2303,12 @@ fn assign_default_sections(
         }
     }
     for (order, (identity, provider)) in routes.iter().enumerate() {
+        let Ok(admitted) = config.legacy_selection_identity(identity) else {
+            continue;
+        };
+        if admitted.provider != *provider {
+            continue;
+        }
         let in_use = current.is_some_and(|(current, _)| current == identity)
             || usage.identity_used(identity, now);
         let configured = || {
@@ -2304,12 +2321,12 @@ fn assign_default_sections(
                 })
                 .map(str::to_string)
         };
-        let default = if in_use || *provider == ApiProvider::Custom {
+        let default = if in_use || *provider == ProviderKind::Custom {
             configured()
         } else {
-            provider
-                .kind()
-                .map(|kind| kind.provider().default_model().to_string())
+            codewhale_config::descriptors::compatibility_for_id(identity)
+                .filter(|row| row.kind == *provider)
+                .map(|row| row.default_model.to_string())
         };
         let Some(default) = default
             .as_deref()
@@ -2319,7 +2336,7 @@ fn assign_default_sections(
                 picker_visible_model_id(
                     *provider,
                     model,
-                    config.model_ids_pass_through_for_provider(*provider),
+                    config.model_ids_pass_through_for_provider(&admitted),
                 )
                 .to_string()
             })
@@ -2352,31 +2369,6 @@ fn push_recent_model_ids(models: &mut Vec<String>, app: &App, identity: &str) {
     }
 }
 
-/// Every configured custom route except the one this session is actually on.
-///
-/// Ordered by identity so the picker's row order is stable across rebuilds;
-/// case-distinct tables stay distinct routes, exactly as the catalog and
-/// credential stores treat them.
-fn inactive_custom_route_identities(app: &App, config: &Config) -> Vec<String> {
-    let active =
-        (app.api_provider == ApiProvider::Custom).then(|| app.provider_identity_for_persistence());
-    let mut identities: Vec<String> = config
-        .providers
-        .as_ref()
-        .map(|providers| {
-            providers
-                .custom
-                .iter()
-                .filter(|(_, entry)| entry.is_openai_compatible_custom())
-                .map(|(identity, _)| identity.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    identities.sort();
-    identities.retain(|identity| active != Some(identity.as_str()));
-    identities
-}
-
 /// Rows for one route that is not the session's active route.
 ///
 /// `identity` is the exact persistence key — the `[providers.<name>]` table
@@ -2387,18 +2379,18 @@ fn push_inactive_route_rows(
     rows: &mut Vec<ModelPickerRow>,
     app: &App,
     config: &Config,
-    provider: ApiProvider,
-    identity: &str,
+    admitted: &crate::config::ProviderIdentity,
     codex_roster: &CodexModelRoster,
 ) {
-    let mut model_ids = if provider == ApiProvider::OpenaiCodex {
+    if config.verify_provider_identity(admitted).is_err() {
+        return;
+    }
+    let provider = admitted.provider;
+    let identity = admitted.key.as_str();
+    let mut model_ids = if provider == ProviderKind::OpenaiCodex {
         codex_roster.model_ids()
     } else {
-        provider_catalog_model_ids(
-            provider,
-            identity,
-            &config.base_url_for_route_identity(provider, identity),
-        )
+        provider_catalog_model_ids(provider, identity, &config.base_url_for_route(admitted))
     };
     if let Some(model) = app
         .provider_models
@@ -2411,7 +2403,7 @@ fn push_inactive_route_rows(
             picker_visible_model_id(
                 provider,
                 model,
-                config.model_ids_pass_through_for_provider(provider),
+                config.model_ids_pass_through_for_provider(admitted),
             ),
         );
     }
@@ -2419,8 +2411,7 @@ fn push_inactive_route_rows(
     push_configured_provider_model(&mut model_ids, config, provider, identity);
     push_provider_model_rows(
         rows,
-        provider,
-        (provider == ApiProvider::Custom).then_some(identity),
+        admitted,
         model_ids,
         app.api_provider,
         config,
@@ -2436,50 +2427,29 @@ fn push_inactive_route_rows(
 /// not on — and must never answer for one (#6016).
 fn route_provider_config<'a>(
     config: &'a Config,
-    provider: ApiProvider,
-    identity: &str,
+    provider: ProviderKind,
+    key: &str,
 ) -> Option<&'a crate::config::ProviderConfig> {
-    if provider == ApiProvider::Custom {
-        return config
-            .providers
-            .as_ref()?
-            .custom_provider_config(identity.trim());
-    }
-    config.provider_config_for(provider)
+    let identity = config.legacy_selection_identity(key).ok()?;
+    (identity.provider == provider).then_some(())?;
+    config.provider_config_for(&identity)
 }
 
 fn push_provider_model_rows(
     rows: &mut Vec<ModelPickerRow>,
-    provider: ApiProvider,
-    provider_identity: Option<&str>,
+    admitted: &crate::config::ProviderIdentity,
     mut model_ids: Vec<String>,
-    active_provider: ApiProvider,
+    active_provider: ProviderKind,
     config: &Config,
     codex_roster: &CodexModelRoster,
     provider_health: &crate::provider_readiness::ProviderReadinessSnapshot,
 ) {
-    let identity = provider_identity
-        .map(str::to_string)
-        .unwrap_or_else(|| config.provider_identity_for(provider));
-    // Readiness resolves a custom route's endpoint, auth class and credentials
-    // through the selected `provider = "<name>"`, so an inactive named route
-    // would otherwise be judged by the active route's credentials. Scope one
-    // copy to this exact identity — the same re-pointing the provider
-    // dashboard uses for its per-route rows.
-    let scoped_config;
-    let config = if provider == ApiProvider::Custom
-        && config.provider.as_deref().map(str::trim) != Some(identity.as_str())
-    {
-        scoped_config = {
-            let mut scoped = config.clone();
-            scoped.provider = Some(identity.clone());
-            scoped
-        };
-        &scoped_config
-    } else {
-        config
-    };
-    let base_url = config.base_url_for_route_identity(provider, &identity);
+    if config.verify_provider_identity(admitted).is_err() {
+        return;
+    }
+    let provider = admitted.provider;
+    let identity = admitted.key.to_string();
+    let base_url = config.base_url_for_route(admitted);
     let fresh_roster = fresh_roster_listing(provider, &identity, &base_url);
     for declaration in config.custom_models.as_deref().unwrap_or_default() {
         if crate::provider_lake::configured_model_for_route(
@@ -2500,10 +2470,10 @@ fn push_provider_model_rows(
             continue;
         }
         let readiness =
-            crate::provider_readiness::resolve_for_model(config, provider, &id, provider_health);
+            crate::provider_readiness::resolve_for_model(config, admitted, &id, provider_health);
         let selectable = readiness.can_attempt();
         let readiness_label = readiness.label();
-        let roster_entry = if provider == ApiProvider::OpenaiCodex {
+        let roster_entry = if provider == ProviderKind::OpenaiCodex {
             codex_roster.metadata_for(&id)
         } else {
             None
@@ -2517,13 +2487,13 @@ fn push_provider_model_rows(
         let metadata = effective_picker_metadata_with_codex(
             config,
             Some(provider),
-            provider_identity,
+            Some(identity.as_str()),
             &id,
             codex_metadata,
         );
         let provider_catalog_receipt = provider_catalog_receipt_for_route(
             provider,
-            provider_identity,
+            Some(identity.as_str()),
             config,
             metadata.source.as_ref(),
         );
@@ -2552,10 +2522,10 @@ fn push_provider_model_rows(
         );
         let not_listed = fresh_roster.as_ref().and_then(|(listed, checked)| {
             (!listed.iter().any(|listed| listed.eq_ignore_ascii_case(&id))).then(|| NotListed {
-                provider: if provider == ApiProvider::Custom {
+                provider: if provider == ProviderKind::Custom {
                     identity.clone()
                 } else {
-                    provider.display_name().to_string()
+                    provider.provider().display_name().to_string()
                 },
                 checked: checked.clone(),
             })
@@ -2565,7 +2535,7 @@ fn push_provider_model_rows(
             rows,
             id.clone(),
             Some(provider),
-            provider_identity.map(str::to_string),
+            Some(identity.clone()),
             hint,
             metadata,
             selectable,
@@ -2574,6 +2544,7 @@ fn push_provider_model_rows(
         if rows.len() > before
             && let Some(row) = rows.last_mut()
         {
+            row.admitted_identity = Some(admitted.clone());
             row.credentialed = credentialed;
             row.not_listed = not_listed;
         }
@@ -2586,11 +2557,11 @@ fn push_provider_model_rows(
 /// `provider_catalog_live::pin_missing_from_fresh_roster`, #6035). Attested
 /// unlisted ids count as listed.
 fn fresh_roster_listing(
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
 ) -> Option<(Vec<String>, String)> {
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ProviderKind::OpenaiCodex {
         return None;
     }
     // Reading the entry first loads a roster an earlier process persisted.
@@ -2616,29 +2587,26 @@ fn fresh_roster_listing(
 }
 
 fn provider_catalog_receipt_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     config: &Config,
     source: Option<&CatalogSource>,
 ) -> Option<(CatalogStatus, bool)> {
-    let identity = provider_identity.unwrap_or_else(|| provider.as_str());
-    // A custom route owns its catalog only on Baseten's endpoint, whose
-    // account-scoped roster no snapshot can serve (#6289).
-    let owns_provider_catalog = matches!(
-        provider,
-        ApiProvider::Openrouter
-            | ApiProvider::Telecomjs
-            | ApiProvider::Edenai
-            | ApiProvider::Zenmux
-    ) || (provider == ApiProvider::Custom
-        && codewhale_config::catalog::endpoint_is_baseten(
-            &config.base_url_for_route_identity(provider, identity),
-        ));
-    if !owns_provider_catalog {
+    let admitted = match provider_identity {
+        Some(key) => config.legacy_selection_identity(key),
+        None => config.builtin_provider_identity(provider),
+    }
+    .ok()?;
+    (admitted.provider == provider).then_some(())?;
+    let identity = admitted.key.as_str();
+    // One predicate with the active-provider refresh: any route whose roster
+    // is probed (named live gateways and custom hosts) reports its freshness
+    // here, so a widened probe cannot leave this receipt behind.
+    if !crate::provider_catalog_live::provider_owns_live_catalog(provider) {
         return None;
     }
 
-    let base_url = config.base_url_for_route_identity(provider, identity);
+    let base_url = config.base_url_for_route(&admitted);
     let endpoint_matches = match source {
         Some(CatalogSource::Live {
             base_url_fingerprint,
@@ -2656,14 +2624,20 @@ fn provider_catalog_receipt_for_route(
 }
 
 fn push_auto_model_row(rows: &mut Vec<ModelPickerRow>, app: &App, config: &Config, hint: &str) {
-    let readiness = crate::provider_readiness::resolve_for_model(
-        config,
-        app.api_provider,
-        "auto",
-        &app.provider_health,
+    let captured = app.admitted_provider_identity().ok();
+    let readiness = captured.map_or(
+        crate::provider_readiness::ResolvedProviderReadiness::Legacy,
+        |identity| {
+            crate::provider_readiness::resolve_for_model(
+                config,
+                identity,
+                "auto",
+                &app.provider_health,
+            )
+        },
     );
     let metadata = effective_picker_metadata(config, None, "auto");
-    let selectable = readiness.can_attempt();
+    let selectable = captured.is_some() && readiness.can_attempt();
     let blocked_reason = (!selectable).then(|| readiness.label().to_string());
     push_model_row(
         rows,
@@ -2675,10 +2649,18 @@ fn push_auto_model_row(rows: &mut Vec<ModelPickerRow>, app: &App, config: &Confi
         selectable,
         blocked_reason,
     );
+    if let Some(row) = rows.last_mut() {
+        row.admitted_identity = captured.cloned();
+    }
 }
 
 fn auto_picker_hint(app: &App, config: &Config) -> String {
-    let inventory = crate::model_inventory::ModelInventory::from_config(config);
+    let inventory = match crate::model_inventory::ModelInventory::from_config(config) {
+        Ok(inventory) => inventory,
+        Err(reason) => {
+            return format!("{} · {reason}", app.tr(MessageId::ModelPickerAutoLocalHint));
+        }
+    };
     // #4411: the classifier only sees other providers under the persisted
     // `[auto] cross_provider` opt-in, so the default hint says active provider
     // only and names the classifier route it will actually call.
@@ -2690,18 +2672,21 @@ fn auto_picker_hint(app: &App, config: &Config) -> String {
     let mut hint = app
         .tr(hint_id)
         .into_owned()
-        .replace("{provider}", inventory.router_provider.display_name())
+        .replace(
+            "{provider}",
+            inventory.router_provider.provider().display_name(),
+        )
         .replace("{model}", &inventory.router_model);
     if let (Some(provider), Some(model)) = (
         app.last_effective_provider,
         app.last_effective_model.as_deref(),
     ) {
-        let provider_label = if provider == ApiProvider::Custom {
+        let provider_label = if provider == ProviderKind::Custom {
             app.last_effective_provider_identity
                 .as_deref()
                 .unwrap_or_else(|| app.provider_identity_for_persistence())
         } else {
-            provider.display_name()
+            provider.provider().display_name()
         };
         let last = app
             .tr(MessageId::ModelPickerAutoLastRoute)
@@ -2716,9 +2701,15 @@ fn auto_picker_hint(app: &App, config: &Config) -> String {
 fn push_configured_provider_model(
     models: &mut Vec<String>,
     config: &Config,
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
 ) {
+    let Ok(admitted) = config.legacy_selection_identity(identity) else {
+        return;
+    };
+    if admitted.provider != provider {
+        return;
+    }
     if let Some(model) = route_provider_config(config, provider, identity)
         .and_then(|entry| entry.model.as_deref())
         .map(str::trim)
@@ -2729,14 +2720,14 @@ fn push_configured_provider_model(
             picker_visible_model_id(
                 provider,
                 model,
-                config.model_ids_pass_through_for_provider(provider),
+                config.model_ids_pass_through_for_provider(&admitted),
             ),
         );
     }
 }
 
 fn provider_catalog_model_ids(
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
 ) -> Vec<String> {
@@ -2762,7 +2753,7 @@ fn provider_scoped_model_ids_for_app(app: &App, include_current_model: bool) -> 
         push_model_id(&mut models, &id);
     }
 
-    if app.api_provider != ApiProvider::OpenaiCodex
+    if app.api_provider != ProviderKind::OpenaiCodex
         && codewhale_config::catalog::configured::validate_configured_models(&app.configured_models)
             .is_ok()
     {
@@ -2821,14 +2812,14 @@ fn push_model_id(models: &mut Vec<String>, model: &str) {
 /// endpoints and aggregators own their namespaces, where `deepseek-reasoner`
 /// can remain a native wire id.
 fn picker_visible_model_id(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     preserve_endpoint_model_ids: bool,
 ) -> &str {
     if !preserve_endpoint_model_ids
         && matches!(
             provider,
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+            ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
         )
         && (model.eq_ignore_ascii_case("deepseek-chat")
             || model.eq_ignore_ascii_case("deepseek-reasoner"))
@@ -2855,7 +2846,7 @@ fn provider_query_splits(query: &str) -> Vec<(&str, &str)> {
 fn push_model_row(
     rows: &mut Vec<ModelPickerRow>,
     id: String,
-    provider: Option<ApiProvider>,
+    provider: Option<ProviderKind>,
     provider_identity: Option<String>,
     hint: String,
     metadata: EffectivePickerMetadata,
@@ -2880,6 +2871,7 @@ fn push_model_row(
         id,
         provider,
         provider_identity,
+        admitted_identity: None,
         hint,
         metadata,
         selectable,
@@ -2916,7 +2908,7 @@ fn catalog_freshness_title_suffix_for(freshness: ModelsDevFreshness) -> &'static
 fn model_row_matches_query(
     row: &ModelPickerRow,
     query: &str,
-    initial_provider: ApiProvider,
+    initial_provider: ProviderKind,
 ) -> bool {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -2931,7 +2923,7 @@ fn model_row_matches_query(
     let provider_matches = row.provider.is_some_and(|provider| {
         row.provider_identity.as_deref().is_some_and(matches)
             || matches(provider.as_str())
-            || matches(provider.display_name())
+            || matches(row_provider_label(row))
     });
     provider_matches
         || row.metadata.display_name.as_deref().is_some_and(matches)
@@ -2965,13 +2957,15 @@ fn normalize_picker_search_text(text: &str) -> String {
 /// edit — supplies the discriminator, with the leading run it already shares
 /// with the display name removed so the suffix is the part that differs.
 fn route_labels_for_rows(rows: &[&ModelPickerRow]) -> BTreeMap<String, String> {
-    let mut by_display: BTreeMap<&'static str, Vec<ApiProvider>> = BTreeMap::new();
+    let mut by_display: BTreeMap<&'static str, Vec<ProviderKind>> = BTreeMap::new();
     for provider in rows
         .iter()
         .filter_map(|row| row.provider)
-        .filter(|provider| *provider != ApiProvider::Custom)
+        .filter(|provider| *provider != ProviderKind::Custom)
     {
-        let bucket = by_display.entry(provider.display_name()).or_default();
+        let bucket = by_display
+            .entry(provider.provider().display_name())
+            .or_default();
         if !bucket.contains(&provider) {
             bucket.push(provider);
         }
@@ -2993,7 +2987,7 @@ fn route_labels_for_rows(rows: &[&ModelPickerRow]) -> BTreeMap<String, String> {
     }
     for row in rows
         .iter()
-        .filter(|row| row.provider == Some(ApiProvider::Custom))
+        .filter(|row| row.provider == Some(ProviderKind::Custom))
     {
         let Some(identity) = row_provider_identity(row) else {
             continue;
@@ -3057,12 +3051,12 @@ fn route_discriminator(display: &str, provider_id: &str) -> Option<String> {
 /// values for its current V4 models, so keep its picker heading stable and
 /// provider-facing rather than exposing either implementation detail.
 fn catalog_family_for_identity(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     model_id: &str,
 ) -> Option<String> {
-    if provider == ApiProvider::Deepseek {
-        return Some(provider.display_name().to_string());
+    if provider == ProviderKind::Deepseek {
+        return Some(provider.provider().display_name().to_string());
     }
     catalog_offering_for_model_identity(provider, provider_identity, model_id)
         .and_then(|offering| offering.family)
@@ -3207,7 +3201,7 @@ fn model_row_visible_by_default(row: &ModelPickerRow) -> bool {
     row.provider.is_none() || row.default_rank.is_some()
 }
 
-fn model_row_matches_route(row: &ModelPickerRow, provider: ApiProvider, identity: &str) -> bool {
+fn model_row_matches_route(row: &ModelPickerRow, provider: ProviderKind, identity: &str) -> bool {
     row.provider.is_none()
         || (row.provider == Some(provider) && row_provider_identity(row) == Some(identity))
 }
@@ -3397,11 +3391,23 @@ fn model_version_key(id: &str) -> Vec<u32> {
     parts
 }
 
+fn row_provider_label(row: &ModelPickerRow) -> &str {
+    let Some(key) = row_provider_identity(row) else {
+        return "unavailable";
+    };
+    if row.provider == Some(ProviderKind::Custom) {
+        return key;
+    }
+    codewhale_config::descriptors::compatibility_for_id(key)
+        .filter(|metadata| Some(metadata.kind) == row.provider)
+        .map_or(key, |metadata| metadata.label)
+}
+
 fn row_provider_identity(row: &ModelPickerRow) -> Option<&str> {
     row.provider_identity.as_deref().or_else(|| {
         row.provider
-            .filter(|provider| *provider != ApiProvider::Custom)
-            .map(ApiProvider::as_str)
+            .filter(|provider| *provider != ProviderKind::Custom)
+            .map(ProviderKind::as_str)
     })
 }
 
@@ -3467,7 +3473,7 @@ fn coding_score(row: &ModelPickerRow) -> u32 {
 
 fn effective_picker_metadata(
     config: &Config,
-    provider: Option<ApiProvider>,
+    provider: Option<ProviderKind>,
     id: &str,
 ) -> EffectivePickerMetadata {
     effective_picker_metadata_for_identity(config, provider, None, id)
@@ -3475,7 +3481,7 @@ fn effective_picker_metadata(
 
 fn effective_picker_metadata_for_identity(
     config: &Config,
-    provider: Option<ApiProvider>,
+    provider: Option<ProviderKind>,
     provider_identity: Option<&str>,
     id: &str,
 ) -> EffectivePickerMetadata {
@@ -3484,33 +3490,47 @@ fn effective_picker_metadata_for_identity(
 
 fn effective_picker_metadata_with_codex(
     config: &Config,
-    provider: Option<ApiProvider>,
+    provider: Option<ProviderKind>,
     provider_identity: Option<&str>,
     id: &str,
     codex_metadata: Option<&CodexModelMetadata>,
 ) -> EffectivePickerMetadata {
-    let offering = provider.and_then(|provider| {
-        let identity = provider_identity
-            .map(str::to_string)
-            .unwrap_or_else(|| config.provider_identity_for(provider));
-        let base_url = config.base_url_for_route_identity(provider, &identity);
+    let captured = provider.and_then(|kind| {
+        let identity = match provider_identity {
+            Some(key) => config.legacy_selection_identity(key),
+            None => config.builtin_provider_identity(kind),
+        }
+        .ok()?;
+        (identity.provider == kind).then_some(identity)
+    });
+    if provider.is_some() && captured.is_none() {
+        return EffectivePickerMetadata::default();
+    }
+    let offering = captured.as_ref().and_then(|identity| {
+        let base_url = config.base_url_for_route(identity);
         crate::provider_lake::configured_catalog_offering_for_route(
-            config, provider, &identity, &base_url, id,
+            config,
+            identity.provider,
+            identity.key.as_str(),
+            &base_url,
+            id,
         )
     });
     let card = offering.as_ref().map(ModelReferenceCard::from_offering);
-    let registry = model_registry::lookup(id);
+    let registry = codewhale_config::catalog::reviewed::intrinsic_model(id);
 
     let Some(provider) = provider else {
         return EffectivePickerMetadata {
             context_window: registry.as_ref().and_then(|meta| meta.context_window),
             context_window_unverified: false,
-            max_output: registry.as_ref().and_then(|meta| meta.max_output),
+            max_output: registry
+                .as_ref()
+                .and_then(|meta| meta.generation_default.or(meta.max_output)),
             max_output_unverified: false,
             tool_calls: None,
             reasoning: registry
                 .as_ref()
-                .is_some_and(|meta| meta.supports_reasoning),
+                .is_some_and(|meta| meta.reasoning == Some(true)),
             vision: SupportState::Unknown,
             pricing: if crate::pricing::has_pricing_for_model(id) {
                 PickerPricing::Known("priced".to_string())
@@ -3524,22 +3544,14 @@ fn effective_picker_metadata_with_codex(
         };
     };
 
-    let identity = provider_identity
-        .map(str::to_string)
-        .unwrap_or_else(|| config.provider_identity_for(provider));
-    let context_override = if provider == ApiProvider::Custom {
-        config
-            .providers
-            .as_ref()
-            .and_then(|providers| providers.custom_provider_config(&identity))
-            .and_then(|entry| entry.context_window)
-            .filter(|window| *window > 0)
-    } else {
-        config.context_window_for_provider_config(provider)
-    };
-    let base_url = config.base_url_for_route_identity(provider, &identity);
+    let admitted = captured
+        .as_ref()
+        .expect("provider metadata admission checked");
+    let identity = admitted.key.as_str();
+    let context_override = config.context_window_for_provider_config(admitted);
+    let base_url = config.base_url_for_route(admitted);
     if let Some(declared) =
-        crate::provider_lake::configured_model_for_route(config, provider, &identity, &base_url, id)
+        crate::provider_lake::configured_model_for_route(config, provider, identity, &base_url, id)
     {
         return EffectivePickerMetadata {
             display_name: declared.display_name.clone(),
@@ -3575,10 +3587,8 @@ fn effective_picker_metadata_with_codex(
         };
     }
     if offering.is_none()
-        && provider != ApiProvider::OpenaiCodex
-        && provider.kind().is_none_or(|kind| {
-            codewhale_config::provider_preserves_custom_base_url_model(kind, &base_url)
-        })
+        && provider != ProviderKind::OpenaiCodex
+        && codewhale_config::provider_preserves_custom_base_url_model(provider, &base_url)
     {
         return EffectivePickerMetadata {
             context_window: context_override,
@@ -3607,11 +3617,11 @@ fn effective_picker_metadata_with_codex(
         .and_then(|card| card.context_window)
         .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
     let preserves_unknown_limits = offering.is_some()
-        || (provider == ApiProvider::Together
+        || (provider == ProviderKind::Together
             && id.eq_ignore_ascii_case(crate::config::TOGETHER_INKLING_MODEL));
     let context_window = if context_override.is_some() {
         profile.context_window
-    } else if provider == ApiProvider::OpenaiCodex {
+    } else if provider == ProviderKind::OpenaiCodex {
         codex_metadata.and_then(|metadata| metadata.context_window)
     } else if preserves_unknown_limits {
         card_context
@@ -3625,7 +3635,7 @@ fn effective_picker_metadata_with_codex(
     // The Codex cache does not publish a route-owned output ceiling. The
     // profile's current value is inherited from the same-id OpenAI API model,
     // so omitting it is more truthful than claiming that API limit for OAuth.
-    let max_output = if provider == ApiProvider::OpenaiCodex {
+    let max_output = if provider == ProviderKind::OpenaiCodex {
         None
     } else if preserves_unknown_limits {
         card_output
@@ -3637,7 +3647,7 @@ fn effective_picker_metadata_with_codex(
         SupportState::Unsupported => Some(false),
         SupportState::Unknown => None,
     };
-    let tool_calls = if provider == ApiProvider::OpenaiCodex {
+    let tool_calls = if provider == ProviderKind::OpenaiCodex {
         codex_metadata.and(profile_tool_calls)
     } else {
         offering
@@ -3645,7 +3655,7 @@ fn effective_picker_metadata_with_codex(
             .and_then(|offering| offering.tool_call)
             .or(profile_tool_calls)
     };
-    let reasoning = if provider == ApiProvider::OpenaiCodex {
+    let reasoning = if provider == ProviderKind::OpenaiCodex {
         codex_metadata
             .map(|metadata| {
                 metadata
@@ -3664,7 +3674,7 @@ fn effective_picker_metadata_with_codex(
         let label = card.price_label();
         (label != "unknown").then_some(label)
     });
-    let pricing = if provider == ApiProvider::OpenaiCodex {
+    let pricing = if provider == ProviderKind::OpenaiCodex {
         PickerPricing::Unavailable
     } else if let Some(label) = card_price {
         PickerPricing::Known(label)
@@ -3682,13 +3692,15 @@ fn effective_picker_metadata_with_codex(
     // must say what they are instead of borrowing a verified label.
     let context_window_unverified = context_window.is_some()
         && context_override.is_none()
-        && provider != ApiProvider::OpenaiCodex
+        && provider != ProviderKind::OpenaiCodex
         && !preserves_unknown_limits
-        && codewhale_models::model_catalog::resolved_context_window(id).is_none();
+        && codewhale_config::catalog::reviewed::intrinsic_model(id)
+            .and_then(|row| row.context_window)
+            .is_none();
     let max_output_unverified = max_output.is_some()
         && matches!(
             provider,
-            ApiProvider::Anthropic | ApiProvider::MinimaxAnthropic | ApiProvider::Openmodel
+            ProviderKind::Anthropic | ProviderKind::MinimaxAnthropic | ProviderKind::Openmodel
         )
         && !preserves_unknown_limits
         && codewhale_models::max_output_tokens_for_model(id).is_none();
@@ -3702,7 +3714,7 @@ fn effective_picker_metadata_with_codex(
         reasoning,
         vision,
         pricing,
-        display_name: None,
+        display_name: codex_metadata.and_then(|model| model.display_name.clone()),
         reasoning_unknown: false,
         declared_input_price: None,
         source: card.map(|card| card.source),
@@ -3711,7 +3723,7 @@ fn effective_picker_metadata_with_codex(
 
 fn render_picker_model_hint(
     id: &str,
-    provider: Option<ApiProvider>,
+    provider: Option<ProviderKind>,
     metadata: &EffectivePickerMetadata,
     codex_freshness: Option<CodexModelCacheFreshness>,
     provider_catalog_receipt: Option<&(CatalogStatus, bool)>,
@@ -3724,7 +3736,7 @@ fn render_picker_model_hint(
     // products, so bare ids read as a confusing duplicate. Name the route:
     // bare `k3` is the Kimi Code membership route (validated pairing with
     // the coding endpoint, #4687), `kimi-k3` is the direct open platform.
-    if provider == Some(ApiProvider::Moonshot) {
+    if provider == Some(ProviderKind::Moonshot) {
         match id.trim().to_ascii_lowercase().as_str() {
             "k3" => parts.push("Kimi Code plan route".to_string()),
             "kimi-k3" | "moonshotai/kimi-k3" => parts.push("Moonshot direct route".to_string()),
@@ -3737,12 +3749,12 @@ fn render_picker_model_hint(
         // 272K for gpt-5.x) that differ from the API route's limits by
         // deliberate policy. Label the value as route-scoped so it reads as a
         // route fact, not a wrong generic model limit (TUI-DOG-016).
-        if provider == Some(ApiProvider::OpenaiCodex) {
+        if provider == Some(ProviderKind::OpenaiCodex) {
             parts.push(format!(
                 "{} ctx · ChatGPT route",
                 format_context_window(u64::from(context_window))
             ));
-        } else if provider == Some(ApiProvider::Moonshot)
+        } else if provider == Some(ProviderKind::Moonshot)
             && id.trim().eq_ignore_ascii_case("k3")
             && context_window == codewhale_models::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS
         {
@@ -3825,7 +3837,7 @@ fn render_picker_model_hint(
             catalog_refresh_error_label(*reason)
         ));
     }
-    if provider == Some(ApiProvider::OpenaiCodex) {
+    if provider == Some(ProviderKind::OpenaiCodex) {
         parts.push(match codex_freshness {
             Some(freshness) => freshness.picker_label().to_string(),
             None => "custom · OAuth roster unconfirmed".to_string(),
@@ -3891,9 +3903,9 @@ impl ModelPickerView {
         self.apply_fleet_route_rows(app, config);
         *self.projection.get_mut() = None;
         self.last_mouse_selected = None;
-        self.configured_providers = configured_providers(config, self.initial_provider)
+        self.configured_providers = configured_providers(config)
             .into_iter()
-            .filter(|provider| *provider != self.initial_provider)
+            .filter(|identity| Some(identity) != self.initial_identity.as_ref())
             .collect();
         // Re-anchor to the same exact provider/model after pin sorting changes;
         // preserving only the numeric index can select a different model.
@@ -3917,7 +3929,7 @@ impl ModelPickerView {
 impl ModelPickerView {
     /// Exact route of the highlighted catalog row: the target of ⇧P, ⇧F and
     /// Alt+↑↓. `None` on provider-less rows (`auto`) and the custom row.
-    fn highlighted_route(&self) -> Option<(ApiProvider, Option<String>, String)> {
+    fn highlighted_route(&self) -> Option<(ProviderKind, Option<String>, String)> {
         let rows = self.visible_model_rows();
         let row = rows.get(self.selected_model_idx)?;
         Some((row.provider?, row.provider_identity.clone(), row.id.clone()))
@@ -4343,9 +4355,15 @@ impl ModelPickerView {
                 Style::default().fg(palette::TEXT_MUTED),
             ),
             Span::styled(
-                self.resolved_provider()
-                    .unwrap_or(self.initial_provider)
-                    .display_name(),
+                self.resolved_admitted_identity()
+                    .as_ref()
+                    .or(self.initial_identity.as_ref())
+                    .map_or("unavailable", |identity| {
+                        identity
+                            .compatibility()
+                            .map_or(identity.key.as_str(), |row| row.label)
+                    })
+                    .to_string(),
                 Style::default().fg(palette::TEXT_PRIMARY),
             ),
             Span::styled(
@@ -4478,7 +4496,7 @@ fn wrapping_next(index: usize, count: usize) -> usize {
 }
 
 pub(crate) fn picker_efforts_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
     model_is_auto: bool,
@@ -4502,7 +4520,7 @@ pub(crate) fn picker_efforts_for_route(
 /// dedupe against the same value the operator sees.
 pub(crate) fn effective_tier_for_route(
     effort: ReasoningEffort,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
 ) -> ReasoningEffort {
@@ -4533,7 +4551,7 @@ pub(crate) fn effective_tier_for_route(
 /// an enabled-but-untiered toggle) keep their rows.
 fn distinct_effective_efforts(
     efforts: Vec<ReasoningEffort>,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
 ) -> Vec<ReasoningEffort> {
@@ -4557,7 +4575,7 @@ fn distinct_effective_efforts(
 }
 
 fn route_picker_efforts(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
 ) -> Vec<ReasoningEffort> {
@@ -4567,43 +4585,18 @@ fn route_picker_efforts(
     if crate::config::is_exact_kimi_code_k3_route(provider, base_url, wire_model) {
         return KIMI_CODE_K3_PICKER_EFFORTS.to_vec();
     }
-    if provider == ApiProvider::OpenaiCodex {
-        // The OAuth roster publishes a per-model ladder, and the models differ:
-        // gpt-5.6-sol/terra go up to `ultra`, gpt-5.6-luna stops at `max`, and
-        // gpt-5.5 and older stop at `xhigh`. Returning one static list for the
-        // whole provider offered tiers a model does not have and hid tiers it
-        // does. Fall back to the static ladder only when the roster is missing
-        // or published no levels for this model.
-        return codex_picker_efforts(wire_model).unwrap_or_else(|| CODEX_PICKER_EFFORTS.to_vec());
+    if provider == ProviderKind::OpenaiCodex {
+        // The official account list publishes IDs and display labels, not
+        // effort tiers. Keep the existing wire-compatible route ladder.
+        return CODEX_PICKER_EFFORTS.to_vec();
     }
     if let Some(catalog_efforts) = catalog_picker_efforts(provider, wire_model) {
         return catalog_efforts;
     }
-    if matches!(
-        provider,
-        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN
-    ) {
+    if matches!(provider, crate::config::ProviderKind::Deepseek) {
         return DEEPSEEK_PICKER_EFFORTS.to_vec();
     }
     DEFAULT_PICKER_EFFORTS.to_vec()
-}
-
-/// Thinking tiers for one Codex model, taken from the OAuth roster's
-/// `supported_reasoning_levels`. `None` when the roster does not describe the
-/// model, so the caller keeps the static Codex ladder rather than inventing
-/// tiers.
-fn codex_picker_efforts(wire_model: &str) -> Option<Vec<ReasoningEffort>> {
-    let roster = crate::codex_model_cache::model_roster();
-    let metadata = roster.metadata_for(wire_model)?;
-    let mut efforts = Vec::new();
-    for raw in &metadata.efforts {
-        if let Some(effort) = catalog_effort_value(raw)
-            && !efforts.contains(&effort)
-        {
-            efforts.push(effort);
-        }
-    }
-    (!efforts.is_empty()).then_some(efforts)
 }
 
 /// Build thinking-tier rows from Models.dev `reasoning_options` when present.
@@ -4614,7 +4607,10 @@ fn codex_picker_efforts(wire_model: &str) -> Option<Vec<ReasoningEffort>> {
 /// values collapse cleanly onto our tier vocabulary; unknown values are
 /// skipped. Returns `None` when the catalog has no usable effort list so the
 /// caller can keep the provider default rather than inventing tiers.
-fn catalog_picker_efforts(provider: ApiProvider, wire_model: &str) -> Option<Vec<ReasoningEffort>> {
+fn catalog_picker_efforts(
+    provider: ProviderKind,
+    wire_model: &str,
+) -> Option<Vec<ReasoningEffort>> {
     let offering = catalog_offering_for_model(provider, wire_model)?;
     let mut efforts = Vec::new();
     let mut saw_effort_list = false;
@@ -4685,7 +4681,7 @@ fn catalog_effort_value(raw: &str) -> Option<ReasoningEffort> {
 
 fn normalize_picker_effort(
     effort: ReasoningEffort,
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
     model_is_auto: bool,
@@ -4708,8 +4704,8 @@ fn normalize_picker_effort(
     default_picker_effort(provider, &efforts)
 }
 
-fn default_picker_effort(provider: ApiProvider, efforts: &[ReasoningEffort]) -> ReasoningEffort {
-    let preferred = if provider == ApiProvider::OpenaiCodex {
+fn default_picker_effort(provider: ProviderKind, efforts: &[ReasoningEffort]) -> ReasoningEffort {
+    let preferred = if provider == ProviderKind::OpenaiCodex {
         ReasoningEffort::Medium
     } else {
         ReasoningEffort::High
@@ -4727,7 +4723,7 @@ fn default_picker_effort(provider: ApiProvider, efforts: &[ReasoningEffort]) -> 
 }
 
 fn default_picker_effort_idx(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
     model_is_auto: bool,
@@ -4753,7 +4749,7 @@ mod tests {
         assert_eq!(
             distinct_effective_efforts(
                 vec![Auto, Off, Minimal, Low, Medium, High, XHigh, Ultra, Max],
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 crate::config::DEFAULT_DEEPSEEK_BASE_URL,
                 "deepseek-v4.1-flash",
             ),
@@ -4763,7 +4759,7 @@ mod tests {
         assert_eq!(
             distinct_effective_efforts(
                 vec![Auto, Medium, High, Max],
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 crate::config::DEFAULT_DEEPSEEK_BASE_URL,
                 "deepseek-v4.1-flash",
             ),
@@ -4781,13 +4777,13 @@ mod tests {
         .unwrap();
         let id = "deepseek-v4.1-flash-expires-on-0910";
         let base = "https://models.example.test/v1";
-        let metadata = effective_picker_metadata(&config, Some(ApiProvider::Deepseek), id);
+        let metadata = effective_picker_metadata(&config, Some(ProviderKind::Deepseek), id);
         assert_eq!(metadata.display_name.as_deref(), Some("Temporary preview"));
         assert_eq!(metadata.context_window, Some(96000));
         assert_eq!(metadata.max_output, Some(8000));
         assert_eq!(metadata.tool_calls, Some(true));
         assert_eq!(metadata.source, Some(CatalogSource::ConfigOverride));
-        let mut row = model_row(ApiProvider::Deepseek, true);
+        let mut row = model_row(ProviderKind::Deepseek, true);
         row.id = id.into();
         row.metadata = metadata.clone();
         let chips = model_row_meta_chips(&row);
@@ -4795,13 +4791,13 @@ mod tests {
         assert!(chips.iter().any(|chip| chip.starts_with("estimate ")));
         assert!(fit_meta_chips(&chips, 30).starts_with("user declared"));
         assert!(
-            render_picker_model_hint(id, Some(ApiProvider::Deepseek), &metadata, None, None)
+            render_picker_model_hint(id, Some(ProviderKind::Deepseek), &metadata, None, None)
                 .contains("user declared")
         );
         assert!(
             crate::provider_lake::configured_catalog_models_for_route(
                 &config,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek",
                 base
             )
@@ -4809,7 +4805,7 @@ mod tests {
             .any(|model| model == id)
         );
         let route =
-            crate::route_runtime::resolve_runtime_route(&config, ApiProvider::Deepseek, Some(id))
+            crate::route_runtime::resolve_runtime_route(&config, ProviderKind::Deepseek, Some(id))
                 .unwrap();
         assert_eq!(route.model, id);
         assert_eq!(Some(route.context_window.tokens), metadata.context_window);
@@ -4838,7 +4834,7 @@ mod tests {
         reloaded.custom_models.as_mut().unwrap()[0].tool_call = None;
         reloaded.custom_models.as_mut().unwrap()[0].modalities = None;
         config.refresh_provider_routes_from(&reloaded);
-        let unknown = effective_picker_metadata(&config, Some(ApiProvider::Deepseek), id);
+        let unknown = effective_picker_metadata(&config, Some(ProviderKind::Deepseek), id);
         // An automatic request allowance is policy, not discovered metadata.
         // Its limits are covered by route_budget; the picker must stay unknown.
         assert_eq!(unknown.context_window, None);
@@ -4850,11 +4846,13 @@ mod tests {
         assert!(model_row_meta_chips(&row).contains(&"reasoning unknown".to_string()));
     }
 
-    fn model_row(provider: ApiProvider, in_default_view: bool) -> ModelPickerRow {
+    fn model_row(provider: ProviderKind, in_default_view: bool) -> ModelPickerRow {
         ModelPickerRow {
             id: "model".to_string(),
             provider: Some(provider),
             provider_identity: None,
+            admitted_identity: (provider != ProviderKind::Custom)
+                .then(|| Config::default().test_identity_for_kind(provider)),
             hint: String::new(),
             metadata: EffectivePickerMetadata::default(),
             selectable: true,
@@ -4877,13 +4875,13 @@ mod tests {
         };
         let custom = |identity: &str| ModelPickerRow {
             provider_identity: Some(identity.to_string()),
-            ..model_row(ApiProvider::Custom, true)
+            ..model_row(ProviderKind::Custom, true)
         };
         assert!(pin_names_row(&pin("TeamA"), &custom("TeamA")));
         assert!(!pin_names_row(&pin("TeamA"), &custom("teama")));
         assert!(!pin_names_row(&pin("teama"), &custom("TeamA")));
 
-        let builtin = model_row(ApiProvider::Deepseek, true);
+        let builtin = model_row(ProviderKind::Deepseek, true);
         assert!(pin_names_row(&pin("deepseek"), &builtin));
         assert!(pin_names_row(&pin("DeepSeek"), &builtin));
     }
@@ -4900,10 +4898,10 @@ mod tests {
         }];
         let custom = |identity: &str| ModelPickerRow {
             provider_identity: Some(identity.to_string()),
-            ..model_row(ApiProvider::Custom, true)
+            ..model_row(ProviderKind::Custom, true)
         };
         let owned = [
-            model_row(ApiProvider::Deepseek, true),
+            model_row(ProviderKind::Deepseek, true),
             custom("teama"),
             custom("TeamA"),
         ];
@@ -4945,7 +4943,7 @@ mod tests {
         let mut picker = test_picker();
         picker
             .model_rows
-            .push(model_row(ApiProvider::Deepseek, true));
+            .push(model_row(ProviderKind::Deepseek, true));
         let area = Rect::new(0, 0, 100, 32);
         let mut buf = Buffer::empty(area);
         picker.render(area, &mut buf);
@@ -4974,8 +4972,13 @@ mod tests {
         ModelPickerView {
             initial_model: "model".to_string(),
             previous_model: "model".to_string(),
-            initial_provider: ApiProvider::Openai,
-            initial_provider_identity: ApiProvider::Openai.as_str().to_string(),
+            initial_provider: ProviderKind::Openai,
+            initial_provider_identity: ProviderKind::Openai.as_str().to_string(),
+            initial_identity: Some(
+                Config::default()
+                    .builtin_provider_identity(ProviderKind::Openai)
+                    .unwrap(),
+            ),
             initial_effort: ReasoningEffort::Auto,
             selected_effort_request: ReasoningEffort::Auto,
             active_accepts_custom_model_ids: false,
@@ -4984,7 +4987,7 @@ mod tests {
             selected_effort_idx: 0,
             focus: Pane::Model,
             show_custom_model_row: false,
-            model_rows: vec![model_row(ApiProvider::Openai, true)],
+            model_rows: vec![model_row(ProviderKind::Openai, true)],
             route_config: Config::default(),
             provider_health: Default::default(),
             view: ModelListView::Configured,
@@ -5059,12 +5062,12 @@ mod tests {
                 &action,
                 ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked {
                     target: FleetRouteTarget::Member(1),
-                    provider: ApiProvider::Openai,
-                    provider_id: None,
+                    provider: ProviderKind::Openai,
+                    provider_id: Some(provider_id),
                     model,
                     editor_id,
                     reasoning: None,
-                }) if model == "model" && editor_id.is_nil()
+                }) if provider_id == "openai" && model == "model" && editor_id.is_nil()
             ),
             "{action:?}"
         );
@@ -5090,7 +5093,7 @@ mod tests {
         };
         assert!(
             matches!(picker.build_apply_event(false), ViewEvent::FleetProfileRoutePicked {
-            editor_id: owner, provider: ApiProvider::Openai, model, ..
+            editor_id: owner, provider: ProviderKind::Openai, model, ..
         } if owner == editor_id && model == "model")
         );
         for (width, height) in [(40, 12), (80, 24), (140, 40)] {
@@ -5183,7 +5186,7 @@ mod tests {
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked {
-                provider: ApiProvider::Custom, provider_id: Some(identity), model,
+                provider: ProviderKind::Custom, provider_id: Some(identity), model,
                 reasoning: Some(ReasoningEffort::Low), ..
             }) if identity == "command_code" && model == "deepseek/deepseek-v4-flash"
         ));
@@ -5197,13 +5200,13 @@ mod tests {
             "openrouter new-fixture-model",
         ] {
             picker.update_query(query.to_string());
-            assert_eq!(picker.resolved_provider(), Some(ApiProvider::Openrouter));
+            assert_eq!(picker.resolved_provider(), Some(ProviderKind::Openrouter));
             assert_eq!(picker.resolved_model(), "new-fixture-model");
         }
         // A slash is part of a model id, not a provider switch: compatible
         // routes routinely serve names such as openai/gpt-5.
         picker.update_query("openrouter/new-fixture-model".to_string());
-        assert_eq!(picker.resolved_provider(), Some(ApiProvider::Custom));
+        assert_eq!(picker.resolved_provider(), Some(ProviderKind::Custom));
         assert_eq!(picker.resolved_model(), "openrouter/new-fixture-model");
     }
 
@@ -5305,20 +5308,20 @@ mod tests {
     #[test]
     fn deepseek_picker_heading_hides_legacy_family_metadata() {
         assert_eq!(
-            catalog_family_for_identity(ApiProvider::Deepseek, None, "deepseek-v4-pro").as_deref(),
+            catalog_family_for_identity(ProviderKind::Deepseek, None, "deepseek-v4-pro").as_deref(),
             Some("DeepSeek")
         );
     }
 
     #[test]
     fn default_view_shows_only_sectioned_rows_and_auto() {
-        let row = model_row(ApiProvider::Deepseek, false);
+        let row = model_row(ProviderKind::Deepseek, false);
         assert!(!model_row_visible_by_default(&row));
         assert!(model_row_visible_by_default(&model_row(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             true
         )));
-        let mut auto = model_row(ApiProvider::Deepseek, false);
+        let mut auto = model_row(ProviderKind::Deepseek, false);
         auto.provider = None;
         assert!(model_row_visible_by_default(&auto));
     }
@@ -5350,7 +5353,7 @@ mod tests {
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)),
             ViewAction::Emit(ViewEvent::ModelPickerTogglePin {
-                provider: ApiProvider::Openai,
+                provider: ProviderKind::Openai,
                 provider_id: None,
                 model,
             }) if model == "model"
@@ -5360,7 +5363,7 @@ mod tests {
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
             ViewAction::Emit(ViewEvent::ModelPickerToggleFleet {
-                provider: ApiProvider::Openai,
+                provider: ProviderKind::Openai,
                 provider_id: None,
                 model,
             }) if model == "model"
@@ -5428,11 +5431,18 @@ mod tests {
                 ))
                 .unwrap();
                 config.default_text_model = Some(lower.into());
-                config.set_provider_model_override(ApiProvider::Deepseek, Some(lower.into()));
-                config.set_provider_api_key_override(
-                    ApiProvider::Deepseek,
-                    Some("fixture-key".into()),
-                );
+                config
+                    .set_provider_model_override(
+                        &config.test_identity_for_kind(ProviderKind::Deepseek),
+                        Some(lower.into()),
+                    )
+                    .unwrap();
+                config
+                    .set_provider_api_key_override(
+                        &config.test_identity_for_kind(ProviderKind::Deepseek),
+                        Some("fixture-key".into()),
+                    )
+                    .unwrap();
                 config.custom_models.as_mut().unwrap()[0].id = lower.into();
                 let mut second = config.custom_models.as_ref().unwrap()[0].clone();
                 second.id = upper.into();
@@ -5460,7 +5470,7 @@ mod tests {
                     let row = rows
                         .iter()
                         .find(|row| {
-                            row.provider == Some(ApiProvider::Deepseek) && row.id == pin.model
+                            row.provider == Some(ProviderKind::Deepseek) && row.id == pin.model
                         })
                         .unwrap();
                     assert!(row.hint.starts_with(pin.label.as_deref().unwrap()));
@@ -5504,13 +5514,13 @@ mod tests {
                 let rows = picker_model_rows_for_app(&reloaded, &config);
                 let stale = rows
                     .iter()
-                    .filter(|row| row.provider == Some(ApiProvider::Deepseek) && row.id == upper)
+                    .filter(|row| row.provider == Some(ProviderKind::Deepseek) && row.id == upper)
                     .collect::<Vec<_>>();
                 assert_eq!(stale.len(), 1);
                 assert_eq!(stale[0].blocked_reason.as_deref(), Some("stale pin"));
                 assert!(
                     rows.iter()
-                        .any(|row| row.provider == Some(ApiProvider::Deepseek)
+                        .any(|row| row.provider == Some(ProviderKind::Deepseek)
                             && row.id == lower
                             && row.blocked_reason.as_deref() != Some("stale pin"))
                 );
@@ -5722,7 +5732,7 @@ mod tests {
             picker
                 .visible_model_rows()
                 .iter()
-                .all(|row| row.provider == Some(ApiProvider::Openrouter))
+                .all(|row| row.provider == Some(ProviderKind::Openrouter))
         );
         assert_eq!(
             picker.projection.borrow().as_ref().unwrap().query,
@@ -5745,7 +5755,7 @@ mod tests {
 
         // A real catalog/readiness refresh replaces cached presentation facts.
         let mut offering =
-            catalog_offering_for_model(ApiProvider::Deepseek, "deepseek-v4-pro").unwrap();
+            catalog_offering_for_model(ProviderKind::Deepseek, "deepseek-v4-pro").unwrap();
         offering.limit.as_mut().unwrap().context = Some(777_000);
         crate::provider_lake::set_live_snapshot(
             codewhale_config::catalog::CatalogSnapshot {
@@ -5757,13 +5767,13 @@ mod tests {
         let visible = picker.visible_model_rows();
         let row = visible
             .iter()
-            .find(|row| row.provider == Some(ApiProvider::Deepseek) && row.id == "deepseek-v4-pro")
+            .find(|row| row.provider == Some(ProviderKind::Deepseek) && row.id == "deepseek-v4-pro")
             .unwrap();
         assert_eq!(row.metadata.context_window, Some(777_000));
         let index = visible
             .iter()
             .position(|row| {
-                row.provider == Some(ApiProvider::Deepseek) && row.id == "deepseek-v4-pro"
+                row.provider == Some(ProviderKind::Deepseek) && row.id == "deepseek-v4-pro"
             })
             .unwrap();
         assert!(
@@ -5811,7 +5821,7 @@ mod tests {
         // listing lands for its exact endpoint (#6289).
         assert!(
             provider_catalog_model_ids(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 codewhale_config::catalog::BASETEN_BASE_URL,
             )
@@ -5840,7 +5850,7 @@ mod tests {
         );
 
         let models = provider_catalog_model_ids(
-            ApiProvider::Custom,
+            ProviderKind::Custom,
             codewhale_config::catalog::BASETEN_PROVIDER_ID,
             codewhale_config::catalog::BASETEN_BASE_URL,
         );
@@ -5851,8 +5861,9 @@ mod tests {
 
         let row = ModelPickerRow {
             id: codewhale_config::catalog::BASETEN_DEFAULT_MODEL.to_string(),
-            provider: Some(ApiProvider::Custom),
+            provider: Some(ProviderKind::Custom),
             provider_identity: Some(codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string()),
+            admitted_identity: None,
             hint: String::new(),
             metadata: EffectivePickerMetadata::default(),
             selectable: true,
@@ -5904,7 +5915,11 @@ mod tests {
             provider: Some("openrouter".to_string()),
             ..Config::default()
         };
-        let base_url = config.base_url_for_route_identity(ApiProvider::Openrouter, "openrouter");
+        let base_url = config.base_url_for_route(
+            &config
+                .resolve_provider_selection_identity("openrouter")
+                .unwrap(),
+        );
         let fingerprint = codewhale_config::catalog::base_url_fingerprint(&base_url);
         crate::provider_catalog_live::record_failure(
             "openrouter",
@@ -5913,8 +5928,8 @@ mod tests {
         );
 
         let model = provider_catalog_model_ids(
-            ApiProvider::Openrouter,
-            ApiProvider::Openrouter.as_str(),
+            ProviderKind::Openrouter,
+            ProviderKind::Openrouter.as_str(),
             crate::config::DEFAULT_OPENROUTER_BASE_URL,
         )
         .into_iter()
@@ -5931,10 +5946,9 @@ mod tests {
         };
         push_provider_model_rows(
             &mut rows,
-            ApiProvider::Openrouter,
-            None,
+            &config.test_identity_for_kind(ProviderKind::Openrouter),
             vec![model],
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             &config,
             &codex_roster,
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
@@ -5969,7 +5983,7 @@ mod tests {
             .visible_model_rows()
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.provider == Some(ApiProvider::Custom) && row.id == MODEL)
+            .filter(|(_, row)| row.provider == Some(ProviderKind::Custom) && row.id == MODEL)
             .map(|(index, row)| (index, row.provider_identity.clone(), row.selectable))
             .collect();
         assert_eq!(
@@ -5991,14 +6005,14 @@ mod tests {
             match picker.build_apply_event(false) {
                 ViewEvent::ModelPickerApplied {
                     model,
-                    provider,
-                    provider_id,
+                    identity: admitted,
                     ..
                 } => {
                     assert_eq!(model, MODEL);
-                    assert_eq!(provider, Some(ApiProvider::Custom));
+                    let admitted = admitted.expect("selected row carries its exact admitted route");
+                    assert_eq!(admitted.provider, ProviderKind::Custom);
                     assert_eq!(
-                        provider_id.as_deref(),
+                        admitted.persisted_id(),
                         Some(identity.as_str()),
                         "applying a row must switch to the route that row describes"
                     );
@@ -6018,7 +6032,7 @@ mod tests {
             push_model_row(
                 &mut rows,
                 "shared-model".to_string(),
-                Some(ApiProvider::Custom),
+                Some(ProviderKind::Custom),
                 Some(identity.to_string()),
                 String::new(),
                 EffectivePickerMetadata::default(),
@@ -6061,9 +6075,12 @@ model = "deepseek/deepseek-v4-flash"
         let options = crate::test_support::test_tui_options(workspace.path());
         let mut app = App::new(options, &config);
         // The resumed session stays on the provider it was created with.
-        app.api_provider = ApiProvider::Openrouter;
-        app.provider_identity = ApiProvider::Openrouter.as_str().to_string();
-        app.provider_exact_id = None;
+        app.api_provider = ProviderKind::Openrouter;
+        app.provider_identity = Some(
+            config
+                .builtin_provider_identity(ProviderKind::Openrouter)
+                .unwrap(),
+        );
         app.model = "z-ai/glm-5.3".to_string();
         app.active_route_base_url = crate::config::DEFAULT_OPENROUTER_BASE_URL.to_string();
         (config, app, home, workspace)
@@ -6081,7 +6098,7 @@ model = "deepseek/deepseek-v4-flash"
         let rows = picker_model_rows_for_app(&app, &config);
         let custom: Vec<_> = rows
             .iter()
-            .filter(|row| row.provider == Some(ApiProvider::Custom))
+            .filter(|row| row.provider == Some(ProviderKind::Custom))
             .collect();
         let identities: Vec<_> = custom
             .iter()
@@ -6136,7 +6153,7 @@ model = "deepseek/deepseek-v4-flash"
             .get_mut("other_code")
             .unwrap()
             .api_key = Some("fixture-other-key".to_string());
-        app.set_provider_identity(ApiProvider::Custom, "other_code");
+        app.set_provider_identity(ProviderKind::Custom, "other_code");
         app.set_model_selection(MODEL.to_string());
         app.active_route_base_url = "https://other.example.test/v1".to_string();
         app.pinned_models = vec![PinnedModel {
@@ -6176,21 +6193,19 @@ model = "deepseek/deepseek-v4-flash"
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ViewAction::EmitAndClose(ViewEvent::ModelPickerApplied {
-                provider: None,
-                provider_id: Some(identity),
+                identity: Some(identity),
                 model,
                 save_as_startup_default: false,
                 ..
-            }) if identity == "other_code" && model == MODEL
+            }) if identity.persisted_id() == Some("other_code") && model == MODEL
         ));
         assert!(matches!(
             picker.build_event_with_startup_default(true),
             ViewEvent::ModelPickerApplied {
-                provider: None,
-                provider_id: Some(identity),
+                identity: Some(identity),
                 save_as_startup_default: true,
                 ..
-            } if identity == "other_code"
+            } if identity.persisted_id() == Some("other_code")
         ));
         crate::provider_catalog_live::reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
@@ -6199,7 +6214,7 @@ model = "deepseek/deepseek-v4-flash"
     #[test]
     fn locked_custom_model_names_exact_auth_route_without_opening_another_key_editor() {
         let mut picker = test_picker();
-        let mut row = model_row(ApiProvider::Custom, true);
+        let mut row = model_row(ProviderKind::Custom, true);
         row.provider_identity = Some("other_code".to_string());
         row.selectable = false;
         picker.model_rows = vec![row];
@@ -6216,9 +6231,9 @@ model = "deepseek/deepseek-v4-flash"
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ViewAction::Emit(ViewEvent::ModelPickerNeedsAuth {
-                provider: ApiProvider::Openai,
+                identity,
                 ..
-            })
+            }) if identity.provider == ProviderKind::Openai
         ));
     }
 
@@ -6265,9 +6280,12 @@ api_key = "fixture-xai-key"
         .expect("founder fixture");
         let mut app = App::new(crate::test_support::test_tui_options(workspace), &config);
         app.workspace = workspace.to_path_buf();
-        app.api_provider = ApiProvider::Deepseek;
-        app.provider_identity = ApiProvider::Deepseek.as_str().to_string();
-        app.provider_exact_id = None;
+        app.api_provider = ProviderKind::Deepseek;
+        app.provider_identity = Some(
+            config
+                .builtin_provider_identity(ProviderKind::Deepseek)
+                .unwrap(),
+        );
         app.auto_model = false;
         app.model = "deepseek-flash".to_string();
         app.provider_models
@@ -6388,7 +6406,7 @@ api_key = "fixture-xai-key"
                     picker
                         .visible_model_rows()
                         .iter()
-                        .any(|row| row.provider == Some(ApiProvider::Zai)
+                        .any(|row| row.provider == Some(ProviderKind::Zai)
                             && row.id.eq_ignore_ascii_case("GLM-5.2")),
                     "search still finds an unused model"
                 );
@@ -6472,8 +6490,12 @@ api_key = "fixture-xai-key"
                 // default row and reaches the default view.
                 app.note_route_used("openrouter", "stealth/ox-alpha");
 
-                let roster = |provider: ApiProvider, ids: &[&str], fetched_at: u64| {
-                    let base_url = config.base_url_for_route_identity(provider, provider.as_str());
+                let roster = |provider: ProviderKind, ids: &[&str], fetched_at: u64| {
+                    let base_url = config.base_url_for_route(
+                        &config
+                            .resolve_provider_selection_identity(provider.as_str())
+                            .unwrap(),
+                    );
                     let fingerprint = codewhale_config::catalog::base_url_fingerprint(&base_url);
                     let _ = crate::provider_catalog_live::record_success(
                         codewhale_config::catalog::ProviderCatalogDelta {
@@ -6505,7 +6527,7 @@ api_key = "fixture-xai-key"
                 // DeepSeek's roster is 15 days old and lacks the current model.
                 assert!(matches!(
                     roster(
-                        ApiProvider::Deepseek,
+                        ProviderKind::Deepseek,
                         &["deepseek-v4-flash", "deepseek-v4-pro"],
                         now - 15 * 86_400
                     ),
@@ -6523,7 +6545,7 @@ api_key = "fixture-xai-key"
                 drop(rows);
 
                 assert_eq!(
-                    roster(ApiProvider::Openrouter, &["openai/gpt-5"], now),
+                    roster(ProviderKind::Openrouter, &["openai/gpt-5"], now),
                     CatalogStatus::Fresh
                 );
                 let picker = ModelPickerView::new(&app, &config);
@@ -6536,7 +6558,10 @@ api_key = "fixture-xai-key"
                 assert_eq!(
                     ox.not_listed,
                     Some(NotListed {
-                        provider: ApiProvider::Openrouter.display_name().to_string(),
+                        provider: ProviderKind::Openrouter
+                            .provider()
+                            .display_name()
+                            .to_string(),
                         checked: checked.clone(),
                     })
                 );
@@ -6549,7 +6574,9 @@ api_key = "fixture-xai-key"
                 );
                 assert_eq!(
                     config
-                        .provider_config_for(ApiProvider::Openrouter)
+                        .provider_config_for(
+                            &config.test_identity_for_kind(ProviderKind::Openrouter)
+                        )
                         .and_then(|entry| entry.model.as_deref()),
                     Some("stealth/ox-alpha"),
                     "config is never rewritten"

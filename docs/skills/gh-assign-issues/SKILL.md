@@ -28,7 +28,7 @@ merge, or release. Those stay with the maintainer.
    note the starting open-count:
 
    ```bash
-   gh api repos/Hmbown/CodeWhale/milestones \
+   gh api repos/codewhale-hq/CodeWhale/milestones \
      --jq '.[] | "\(.number)\t\(.title)\topen=\(.open_issues)\tstate=\(.state)"'
    ```
 
@@ -41,7 +41,7 @@ merge, or release. Those stay with the maintainer.
 
    ```bash
    for N in <N1> <N2> <N3>; do   # substitute the real issue numbers
-     gh issue view "$N" --repo Hmbown/CodeWhale \
+     gh issue view "$N" --repo codewhale-hq/CodeWhale \
        --json number,state,url,milestone \
        --jq '"\(.number)\t\(.state)\t\(.url)\tmilestone=\(.milestone.title // "none")"'
    done
@@ -55,7 +55,7 @@ merge, or release. Those stay with the maintainer.
 
    ```bash
    for N in <N1> <N2> <N3>; do   # substitute the real issue numbers
-     if gh issue edit "$N" --repo Hmbown/CodeWhale \
+     if gh issue edit "$N" --repo codewhale-hq/CodeWhale \
           --milestone "<milestone>" >/dev/null 2>&1; then
        echo "ok   #$N -> <milestone>"
      else

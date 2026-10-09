@@ -59,6 +59,6 @@ if (process.env.NODE_ENV === "development") {
   // Initialize Cloudflare bindings (KV, etc.) when running `next dev`.
   // No-op in production builds.
   void import("@opennextjs/cloudflare").then(({ initOpenNextCloudflareForDev }) => {
-    initOpenNextCloudflareForDev();
+    initOpenNextCloudflareForDev({ configPath: ".cloudflare/opennext.json" });
   }).catch(() => { /* dev-only convenience */ });
 }

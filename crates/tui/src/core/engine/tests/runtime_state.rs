@@ -234,6 +234,158 @@ async fn an_open_user_input_question_is_not_charged_to_the_turn() {
 }
 
 #[tokio::test]
+async fn user_input_acknowledges_only_live_answer_or_cancellation() {
+    for timeout in [None, Some(Duration::ZERO)] {
+        for cancel in [false, true] {
+            let workspace = tempdir().unwrap();
+            let (mut engine, handle) = quiet_engine(EngineConfig {
+                user_input_timeout: timeout,
+                ..deterministic_engine_config(workspace.path())
+            });
+            let waiter = tokio::spawn(async move {
+                engine
+                    .await_user_input("live-question", empty_user_input_request())
+                    .await
+            });
+            assert!(matches!(handle.rx_event.write().await.recv().await,
+                Some(Event::UserInputRequired { id, .. }) if id == "live-question"));
+            if cancel {
+                handle
+                    .cancel_user_input("live-question")
+                    .await
+                    .expect("live cancel accepted");
+                assert!(matches!(
+                    waiter.await.unwrap(),
+                    Err(ToolError::Cancelled { .. })
+                ));
+            } else {
+                handle
+                    .submit_user_input(
+                        "live-question",
+                        UserInputResponse {
+                            answers: Vec::new(),
+                        },
+                    )
+                    .await
+                    .expect("live answer accepted");
+                assert!(waiter.await.unwrap().is_ok());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn user_input_expired_deadline_or_cancellation_rejects_ready_reply() {
+    for canceled in [false, true] {
+        let workspace = tempdir().unwrap();
+        let (mut engine, handle) = quiet_engine(EngineConfig {
+            user_input_timeout: (!canceled).then_some(Duration::from_millis(200)),
+            ..deterministic_engine_config(workspace.path())
+        });
+        let cancel = engine.cancel_token.clone();
+        let wait = engine.await_user_input("expired-question", empty_user_input_request());
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut wait)
+                .await
+                .is_err()
+        );
+        if canceled {
+            cancel.cancel();
+        } else {
+            // Stop polling the wait until its actual absolute deadline has
+            // elapsed, then make both the mailbox and terminal bound ready.
+            tokio::time::sleep(Duration::from_millis(230)).await;
+        }
+        let submission = handle.submit_user_input(
+            "expired-question",
+            UserInputResponse {
+                answers: Vec::new(),
+            },
+        );
+        tokio::pin!(submission);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut submission)
+                .await
+                .is_err()
+        );
+        let outcome = wait.await;
+        if canceled {
+            assert!(matches!(outcome, Err(ToolError::Cancelled { .. })));
+        } else {
+            assert!(matches!(outcome, Err(ToolError::Timeout { .. })));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), submission)
+                .await
+                .expect("wait exit must reject the queued verdict")
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn user_input_mismatched_and_abandoned_replies_do_not_end_live_wait() {
+    let workspace = tempdir().unwrap();
+    let (mut engine, handle) = quiet_engine(deterministic_engine_config(workspace.path()));
+    let waiter = tokio::spawn(async move {
+        engine
+            .await_user_input("current-question", empty_user_input_request())
+            .await
+    });
+    assert!(matches!(
+        handle.rx_event.write().await.recv().await,
+        Some(Event::UserInputRequired { .. })
+    ));
+    assert!(
+        handle
+            .submit_user_input(
+                "old-question",
+                UserInputResponse {
+                    answers: Vec::new()
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert!(handle.cancel_user_input("old-question").await.is_err());
+    for cancel in [false, true] {
+        let (accepted, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        let decision = if cancel {
+            UserInputDecision::Cancelled {
+                id: "current-question".into(),
+                accepted,
+            }
+        } else {
+            UserInputDecision::Submitted {
+                id: "current-question".into(),
+                response: UserInputResponse {
+                    answers: Vec::new(),
+                },
+                accepted,
+            }
+        };
+        handle.tx_user_input.send(decision).await.unwrap();
+    }
+    handle
+        .submit_user_input(
+            "current-question",
+            UserInputResponse {
+                answers: vec![crate::tools::user_input::UserInputAnswer {
+                    id: "choice".into(),
+                    label: "Live".into(),
+                    value: "accepted-live-reply".into(),
+                }],
+            },
+        )
+        .await
+        .expect("current response accepted after rejected decisions");
+    let response = waiter.await.unwrap().expect("live waiter completed");
+    assert_eq!(response.answers[0].value, "accepted-live-reply");
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn edit_last_turn_restores_the_exchange_when_the_replacement_never_starts() {
     // C02-02: `/edit` cuts the last exchange, then dispatches the new text.

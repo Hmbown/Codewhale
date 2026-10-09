@@ -134,6 +134,29 @@ pub(crate) fn project_instructions_source_label(source_path: Option<&Path>) -> S
         .unwrap_or_else(|| "project".to_string())
 }
 
+/// The `source` label for prompt blocks that must keep sibling scopes
+/// distinguishable (ancestor instruction-chain segments, `<project_rule>`
+/// blocks): the file's path relative to `root` — the containing checkout —
+/// rendered with forward slashes. When `root` is `None` or `path` is not
+/// inside it, falls back to the absolute spelling rather than guessing.
+///
+/// Like [`project_instructions_source_label`], the label sits inside the
+/// pinned system prompt, so keeping it stable across directory moves and
+/// recasings means an unchanged file does not emit a spurious
+/// `<context_update>` history append after a move, and absolute project
+/// paths stay out of provider-bound prompt labels. Root-relative spelling
+/// (rather than the bare file name) is deliberate: chain segments and rule
+/// files legitimately share basenames across scopes, and the label exists
+/// precisely to disambiguate them.
+pub(crate) fn repo_relative_source_label(path: &Path, root: Option<&Path>) -> String {
+    if let Some(root) = root
+        && let Ok(relative) = path.strip_prefix(root)
+    {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    path.display().to_string()
+}
+
 /// Merge multiple project contexts (e.g., from nested directories)
 #[allow(dead_code)] // Public API for monorepo context merging
 pub fn merge_contexts(contexts: &[ProjectContext]) -> Option<String> {

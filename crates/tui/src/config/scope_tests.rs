@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::provider_readiness::{ResolvedProviderReadiness, resolve_for_model};
 
 struct HomeGuard {
@@ -81,7 +81,7 @@ fn sealed_env(config_path: Option<&Path>) -> HomeGuard {
 fn deepseek_readiness(config: &Config) -> ResolvedProviderReadiness {
     resolve_for_model(
         config,
-        ApiProvider::Deepseek,
+        &(config).test_identity_for_kind(ProviderKind::Deepseek),
         "deepseek-v4-pro",
         &crate::provider_readiness::ProviderReadinessSnapshot::default(),
     )
@@ -155,8 +155,8 @@ fn explicit_workspace_config_selects_its_route_without_locking_user_global() {
     let config = Config::load(Some(config_path.clone()), None).expect("load workspace config");
     // The workspace selection IS honored for the session route.
     assert_eq!(
-        config.api_provider(),
-        ApiProvider::Zai,
+        config.active_provider_identity().unwrap().provider,
+        ProviderKind::Zai,
         "the explicit workspace config selects zai"
     );
 
@@ -174,7 +174,7 @@ fn explicit_workspace_config_selects_its_route_without_locking_user_global() {
     // never a lie, never a silent substitution.
     let zai = resolve_for_model(
         &config,
-        ApiProvider::Zai,
+        &(config).test_identity_for_kind(ProviderKind::Zai),
         "GLM-5.2",
         &crate::provider_readiness::ProviderReadinessSnapshot::default(),
     );
@@ -244,7 +244,7 @@ fn unavailable_truly_means_unavailable_with_a_reason() {
     // Moonshot has no key anywhere in the sealed fixtures.
     let moonshot = resolve_for_model(
         &config,
-        ApiProvider::Moonshot,
+        &(config).test_identity_for_kind(ProviderKind::Moonshot),
         "kimi-k2.6",
         &crate::provider_readiness::ProviderReadinessSnapshot::default(),
     );

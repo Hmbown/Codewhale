@@ -1,0 +1,43 @@
+{
+  "server_received": [],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": []
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to locate tool: Unknown MCP tool name: mcp_conformance_echo",
+          "kind": "not_available"
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to locate tool: Failed to find MCP server: conformance",
+          "kind": "not_available"
+        }
+      },
+      "tool": "mcp_read_resource"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to locate tool: Failed to find MCP server: conformance",
+          "kind": "not_available"
+        }
+      },
+      "tool": "mcp_get_prompt"
+    }
+  ]
+}

@@ -110,14 +110,28 @@ test("Wayland child cancellation is reported as cancelled instead of success", a
   await assert.rejects(withSignal(controller.signal, () => backend.hold_key({ text: "shift", duration: 30 })), (err) => err.code === "cancelled");
 });
 
+test("Windows refuses recording before spawning an unowned recorder", async () => {
+  const calls = [];
+  const backend = windows.create({ exec: { persistentInputOwner: true, run: async (...args) => { calls.push(args); return success; } } });
+  await assert.rejects(backend.recordingStart({ fps: 15 }), (err) => err.code === "owned_recording_unavailable");
+  assert.deepEqual(calls, []);
+  assert.deepEqual(await backend.recordingStatus({ id: "not-started" }), { id: "not-started", running: false });
+});
+
+test("Linux recording without an X11 session refuses before spawning ffmpeg", async (t) => {
+  // Clear every display variable so this test never starts a real recorder,
+  // even on a developer machine that runs inside X.
+  const saved = Object.fromEntries(["DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"].map((key) => [key, process.env[key]]));
+  for (const key of Object.keys(saved)) delete process.env[key];
+  t.after(() => { for (const [key, value] of Object.entries(saved)) { if (value !== undefined) process.env[key] = value; } });
+  const calls = [];
+  const backend = linux.create({ exec: { persistentInputOwner: true, have: async () => true, run: async (...args) => { calls.push(args); return success; } } });
+  await assert.rejects(backend.recordingStart({ fps: 15 }), (err) => err.code === "no_session");
+  assert.deepEqual(calls, []);
+  assert.deepEqual(await backend.recordingStatus({ id: "not-started" }), { id: "not-started", running: false });
+});
+
 for (const [name, platform] of [["Windows", windows], ["Linux", linux]]) {
-  test(`${name} refuses recording before spawning an unowned recorder`, async () => {
-    const calls = [];
-    const backend = platform.create({ exec: { persistentInputOwner: true, run: async (...args) => { calls.push(args); return success; } } });
-    await assert.rejects(backend.recordingStart({ fps: 15 }), (err) => err.code === "owned_recording_unavailable");
-    assert.deepEqual(calls, []);
-    assert.deepEqual(await backend.recordingStatus({ id: "not-started" }), { id: "not-started", running: false });
-  });
 
   test(`${name} direct mode refuses held gestures before moving or pressing`, async () => {
     const calls = [];

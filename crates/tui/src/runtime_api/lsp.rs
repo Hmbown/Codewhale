@@ -47,14 +47,12 @@ const LANGUAGES: &[Language] = &[
 
 /// The shared workspace manager: built once, from the live config's `[lsp]`
 /// table and the canonical workspace root.
-fn lsp_manager(state: &RuntimeApiState) -> Result<Arc<LspManager>, ApiError> {
-    if let Some(manager) = state.lsp_manager.get() {
-        return Ok(manager.clone());
-    }
-    let workspace = state
-        .workspace
-        .canonicalize()
-        .map_err(|_| ApiError::internal("workspace is unavailable"))?;
+async fn lsp_manager(state: &RuntimeApiState) -> Result<Arc<LspManager>, ApiError> {
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     let config = state
         .config
         .read()
@@ -63,8 +61,14 @@ fn lsp_manager(state: &RuntimeApiState) -> Result<Arc<LspManager>, ApiError> {
         .map(|toml| toml.into_runtime())
         .unwrap_or_default();
     Ok(state
-        .lsp_manager
-        .get_or_init(|| Arc::new(LspManager::new(config, workspace)))
+        .workspace_scope
+        .lsp
+        .get_or_init(|| {
+            Arc::new(LspManager::new(
+                config,
+                state.workspace_scope.canonical.clone(),
+            ))
+        })
         .clone())
 }
 
@@ -117,7 +121,7 @@ async fn run_intelligence(
     query: Option<String>,
     expected_revision: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = lsp_manager(state)?;
+    let manager = lsp_manager(state).await?;
     if !manager.config().enabled {
         return Ok(Json(
             json!({ "ok": false, "reason": "lsp_disabled", "enabled": false }),
@@ -175,7 +179,7 @@ pub(super) struct LspSymbolsQuery {
 pub(super) async fn lsp_status(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = lsp_manager(&state)?;
+    let manager = lsp_manager(&state).await?;
     let config = manager.config();
     let languages: Vec<Value> = LANGUAGES
         .iter()

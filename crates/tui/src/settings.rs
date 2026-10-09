@@ -254,6 +254,8 @@ pub struct Settings {
     pub(crate) auto_compact_explicit: bool,
     /// Reduce status noise and collapse details more aggressively
     pub calm_mode: bool,
+    /// Use the pet as the main view on the next launch.
+    pub pet_mode: bool,
     /// Dense tool-run collapse mode: compact, expanded, or calm.
     pub tool_collapse_mode: String,
     /// Reduce decorative motion. This must never synthesize model text speed;
@@ -541,6 +543,7 @@ impl Default for Settings {
             auto_compact_explicit: false,
             // #4095: default presentation is compact/calm; verbose detail is opt-in.
             calm_mode: true,
+            pet_mode: false,
             tool_collapse_mode: "compact".to_string(),
             low_motion: false,
             load_error: None,
@@ -650,6 +653,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
     match value.trim().to_ascii_lowercase().as_str() {
         "agents" => "agents",
         "background" => "background",
+        "terminal" => "terminal",
         "files" => "files",
         "notepad" => "notepad",
         "context" => "context",
@@ -1435,6 +1439,7 @@ impl Settings {
                 "auto_compact_threshold_percent"
             }
             "calm_mode" | "calm" => "calm_mode",
+            "pet_mode" => "pet_mode",
             "tool_collapse" | "tool_collapse_mode" | "collapse" => "tool_collapse",
             "low_motion" | "motion" => "low_motion",
             "fancy_animations" | "fancy" | "animations" => "fancy_animations",
@@ -1504,6 +1509,9 @@ impl Settings {
             "calm_mode" | "calm" => {
                 self.calm_mode = parse_bool(value)?;
             }
+            "pet_mode" => {
+                self.pet_mode = parse_bool(value)?;
+            }
             "tool_collapse" | "tool_collapse_mode" | "collapse" => {
                 let normalized = normalize_tool_collapse_mode(value);
                 if !matches!(normalized, "compact" | "expanded" | "calm") {
@@ -1549,6 +1557,7 @@ impl Settings {
                     "tasks"
                         | "agents"
                         | "background"
+                        | "terminal"
                         | "files"
                         | "notepad"
                         | "context"
@@ -1558,7 +1567,7 @@ impl Settings {
                         | "pinned"
                 ) {
                     anyhow::bail!(
-                        "Failed to update setting: invalid workbar panel '{value}'. Expected: tasks, agents, background, files, notepad, context, git, or price."
+                        "Failed to update setting: invalid workbar panel '{value}'. Expected: tasks, agents, background, terminal, files, notepad, context, git, or price."
                     );
                 }
                 self.rail_panel = normalize_rail_panel(&normalized).to_string();
@@ -1806,6 +1815,7 @@ impl Settings {
             self.auto_compact_threshold_percent
         ));
         lines.push(format!("  calm_mode:          {}", self.calm_mode));
+        lines.push(format!("  pet_mode:           {}", self.pet_mode));
         lines.push(format!("  tool_collapse:      {}", self.tool_collapse_mode));
         lines.push(format!("  low_motion:         {}", self.low_motion));
         lines.push(format!("  fancy_animations:   {}", self.fancy_animations));
@@ -3242,11 +3252,12 @@ mod tests {
         assert_eq!(settings.rail_panel, "tasks");
 
         // Every panel the dock cycles through must survive `set` and a
-        // settings.toml round trip — the dock persists all eight.
+        // settings.toml round trip — including an empty Terminal view.
         for panel in [
             "tasks",
             "agents",
             "background",
+            "terminal",
             "files",
             "notepad",
             "context",
@@ -3269,10 +3280,9 @@ mod tests {
         let err = settings
             .set("rail_panel", "auto")
             .expect_err("auto-collapse was dropped with the legacy sidebar");
-        assert!(
-            err.to_string()
-                .contains("tasks, agents, background, files, notepad, context, git, or price")
-        );
+        assert!(err.to_string().contains(
+            "tasks, agents, background, terminal, files, notepad, context, git, or price"
+        ));
         assert_eq!(settings.rail_panel, "tasks");
     }
 

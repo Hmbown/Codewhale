@@ -2,6 +2,7 @@
 
 > 英文原文：[CATALOG_REFRESH.md](../CATALOG_REFRESH.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐 reviewed 元数据的唯一 owner 与退役缓存边界。
 
 Codewhale 如何让模型元数据保持最新：哪些部分已经自动更新，哪些要人工维护，
 以及定时目录任务该做什么、不该做什么。
@@ -132,10 +133,9 @@ TUI/运行时启动时（且未被禁用）：
 | 表面 | 为什么会漂移 |
 |---|---|
 | `models_dev.bundled.json` | 离线种子，由经过审阅的 spec 和固定的 lock 生成（见下文）；通过 PR 刷新，而不是在运行时刷新 |
-| `model_catalog.bundled.json` | 紧凑的 TUI 种子 |
-| `provider_defaults.rs` / 默认模型 ID | 属于产品选择，不是纯粹的目录导出 |
-| `models.rs` 里的静态表 | 目录缺行时的兜底启发式 |
-| 人工整理的 `pricing.rs` 行 | 厂商计费的怪癖；Models.dev 里不一定有 |
+| `provider_descriptors.json` 默认模型 ID | 产品选择，不是纯目录导出；常量投影由生成器维护 |
+| `catalog_corrections.json` 的 `reviewed` | 带精确来源回执的固有/选择器/传输兼容事实；生成到同一种子 |
+| Rust 价格策略 | 厂商计费窗口、人民币换算及扣留/分级行为；纯参考观察保存在 reviewed 补充资料 |
 | 新的 `ProviderKind` / 线协议方言 | 需要代码，光有 JSON 不够 |
 
 运行时的实时刷新**不会**改写这些文件。最近安装、网络正常的用户仍能看到
@@ -178,7 +178,8 @@ CI 会运行 `seed render --check`，出现任何差异都会失败。
 | `scripts/catalog/models_dev_seed.toml` | 要携带哪些上游行，以及它们的 Codewhale 提供商 id、线协议 id、默认值、规范关联，还有少数上游没有列出的人工整理行 | 人工，经审阅 |
 | `scripts/catalog/models_dev_seed.lock.json` | 被引用的上游行（已按允许列表过滤），以及来源 URL、抓取时间和 sha256 | 只由 `seed lock` 写入 |
 | `crates/config/assets/catalog_corrections.json` | 有意的压制：扣留的价格、收紧的上限、推理控制 | 人工，经审阅；在线时同样生效 |
-| `crates/config/assets/models_dev.bundled.json` | 渲染出的种子 | 只由 `seed render` 写入 |
+| `crates/config/assets/catalog_corrections.json` 的 `reviewed` | 保留来源的固有事实、限定范围别名、补全引用、公开标签/源码支持日期、纯路由事实与参考价格 | 人工审查；保留来源回执 |
+| `crates/config/assets/models_dev.bundled.json` | 包含 reviewed 补充资料的渲染种子 | 只由 `seed render` 写入 |
 
 spec 只负责选择和映射；它不能写出与上游不一致的值（未知的键会被拒绝）。
 如果某个上游值对某条 Codewhale 路由不对，就加一条修正。修正对种子和实时行都生效；
@@ -289,3 +290,16 @@ Codewhale 的 Anthropic 路由在推理时仍**基于 API 密钥**（`ANTHROPIC_
 - 目录自动化脚本（校验 / 试运行）：#4117
 - 生成的离线种子与运行时修正：#6396
 - 更细的元数据清单与漂移列表：`codewhale-ops` 仓库
+
+### 已退役的无范围元数据读取器
+
+旧 models crate 缓存读取器及其独立内置资产、TUI 专用模型注册表已经退役。
+已有旧缓存文件保留，但不作为提供商或公开标签权威导入。`config::catalog` 拥有
+不可变的编译固有事实投影；现有 Engine provider lake 与限定范围目录缓存继续拥有
+实时、账号及配置事实。不同端点上相同的线协议名称不构成规范关联、公开标签或
+无范围价格。内置新鲜度使用真实种子 lock 的抓取时间，每次查询重新读取当前时钟。
+
+兼容补全列表引用提供商描述符默认值与目录组，不再复制它们。Kimi 生成默认值与
+直连/会员路由限制保持不同。未知能力及名称后缀推断的预算明确未验证。
+网站模型日期表示源码支持日期，旧已证实日期保留在同一 reviewed owner 中；
+它们不声明厂商发布日期或当前 API 可用性。

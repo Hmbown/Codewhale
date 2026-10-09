@@ -20,8 +20,8 @@
 # Uses prebuilt release binaries instead of a Rust build.
 set -euo pipefail
 
-RELEASE_TAG="${RELEASE_TAG:-v0.10.1}"
-REPO_URL="${REPO_URL:-https://github.com/Hmbown/CodeWhale.git}"
+RELEASE_TAG="${RELEASE_TAG:-v0.10.2}"
+REPO_URL="${REPO_URL:-https://github.com/codewhale-hq/CodeWhale.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 SECRETS_FILE="${SECRETS_FILE:-/tmp/cw-secrets.env}"
 
@@ -52,7 +52,7 @@ echo "== [3/8] install prebuilt ${RELEASE_TAG} binaries (no Rust build) =="
 # the release binaries exactly there.
 BIN_DIR=/home/codewhale/.cargo/bin
 install -d -o codewhale -g codewhale "$BIN_DIR"
-BASE="https://github.com/Hmbown/CodeWhale/releases/download/${RELEASE_TAG}"
+BASE="https://github.com/codewhale-hq/CodeWhale/releases/download/${RELEASE_TAG}"
 TMP=$(mktemp -d)
 curl -fsSL -o "$TMP/codewhale" "$BASE/codewhale-linux-x64"
 curl -fsSL -o "$TMP/codew" "$BASE/codew-linux-x64"

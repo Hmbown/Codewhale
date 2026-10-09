@@ -73,6 +73,18 @@ fn review(plugin: &dyn CommandPluginContext, path: &str) -> CommandResult {
         "Network hosts it will request",
         &preview.network_hosts,
     );
+    if !preview.native_rows.is_empty() {
+        list_line(
+            &mut output,
+            "Native host code (JavaScript; runs in the experimental extension host)",
+            &preview.native_rows,
+        );
+        if !crate::plugins::activation::extension_host_policy_enabled() {
+            output.push_str(
+                "  Requires: [features] extension_host = true (off now, so this bundle cannot be enabled)\n",
+            );
+        }
+    }
     if preview.requires_node {
         output.push_str("  Requires: node on PATH\n");
     }

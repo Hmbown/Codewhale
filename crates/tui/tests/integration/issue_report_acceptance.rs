@@ -257,7 +257,7 @@ fn run_exec(
         "allow_shell = false\ntelemetry = false\n\n[retry]\nenabled = false\n",
     )
     .unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codewhale-tui"));
+    let mut command = Command::new(crate::binary::codewhale());
     command.env_clear();
     for key in [
         "PATH",

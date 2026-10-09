@@ -69,7 +69,7 @@ first, in this order, and let the contributor choose:
 ### 3. Build
 
 ```
-cargo build --release -p codewhale-cli -p codewhale-tui
+cargo build --release -p codewhale-cli --bin codewhale
 ```
 
 Report the exit status and the first error if it fails. A build failure ends

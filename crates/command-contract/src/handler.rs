@@ -5,13 +5,14 @@
 //! `CommandHandler<crate::commands::CommandResult>`.
 
 use crate::facets::{
-    CommandCostContext, CommandDebugChangeContext, CommandDebugDiagnosticsContext,
-    CommandDebugDiffContext, CommandDebugHistoryContext, CommandDebugReceiptsContext,
-    CommandDebugUndoContext, CommandMediaContext, CommandMemoryContext, CommandModePolicyContext,
-    CommandModelContext, CommandPluginContext, CommandPresentationContext, CommandProjectContext,
-    CommandSessionContext, CommandSessionControlContext, CommandSessionExportContext,
-    CommandSessionLifecycleContext, CommandSessionStructcopyContext, CommandSkillGroupContext,
-    CommandSkillsContext, CommandSystemPromptContext, CommandWorkspaceContext,
+    CommandConfigStatusContext, CommandCostContext, CommandDebugChangeContext,
+    CommandDebugDiagnosticsContext, CommandDebugDiffContext, CommandDebugHistoryContext,
+    CommandDebugReceiptsContext, CommandDebugUndoContext, CommandMediaContext,
+    CommandMemoryContext, CommandModePolicyContext, CommandModelContext, CommandPermissionsContext,
+    CommandPluginContext, CommandPresentationContext, CommandProjectContext, CommandSessionContext,
+    CommandSessionControlContext, CommandSessionExportContext, CommandSessionLifecycleContext,
+    CommandSessionStructcopyContext, CommandSkillGroupContext, CommandSkillsContext,
+    CommandSystemPromptContext, CommandWorkspaceContext,
 };
 
 /// Exact host capabilities exposed to one contextual command handler.
@@ -81,6 +82,10 @@ impl CommandCapabilities {
 
     /// One human-selected structural copy; independent from export/recovery.
     pub const SESSION_STRUCTCOPY: Self = Self(1 << 22);
+    /// Permission observations and token-checked removal, independent of status.
+    pub const PERMISSIONS: Self = Self(1 << 23);
+    /// Read-only status observations, with no permission mutation authority.
+    pub const CONFIG_STATUS: Self = Self(1 << 24);
 
     /// Raw bit pattern, for tests that pin the capability-space capacity.
     ///
@@ -147,6 +152,8 @@ pub struct CommandContexts<'a> {
     debug_diff: Option<&'a mut dyn CommandDebugDiffContext>,
     debug_undo: Option<&'a mut dyn CommandDebugUndoContext>,
     debug_diagnostics: Option<&'a mut dyn CommandDebugDiagnosticsContext>,
+    permissions: Option<&'a mut dyn CommandPermissionsContext>,
+    config_status: Option<&'a mut dyn CommandConfigStatusContext>,
 }
 
 /// Consumed envelope used when one handler needs several independent facets.
@@ -174,6 +181,8 @@ pub struct ContextParts<'a> {
     pub debug_diff: Option<&'a mut dyn CommandDebugDiffContext>,
     pub debug_undo: Option<&'a mut dyn CommandDebugUndoContext>,
     pub debug_diagnostics: Option<&'a mut dyn CommandDebugDiagnosticsContext>,
+    pub permissions: Option<&'a mut dyn CommandPermissionsContext>,
+    pub config_status: Option<&'a mut dyn CommandConfigStatusContext>,
 }
 
 impl<'a> CommandContexts<'a> {
@@ -202,6 +211,8 @@ impl<'a> CommandContexts<'a> {
             debug_diff: None,
             debug_undo: None,
             debug_diagnostics: None,
+            permissions: None,
+            config_status: None,
         }
     }
 
@@ -230,7 +241,24 @@ impl<'a> CommandContexts<'a> {
             debug_diff: self.debug_diff,
             debug_undo: self.debug_undo,
             debug_diagnostics: self.debug_diagnostics,
+            permissions: self.permissions,
+            config_status: self.config_status,
         }
+    }
+
+    pub fn with_permissions(mut self, value: &'a mut dyn CommandPermissionsContext) -> Self {
+        assert!(
+            self.permissions.replace(value).is_none(),
+            "permissions facet already set"
+        );
+        self
+    }
+    pub fn with_config_status(mut self, value: &'a mut dyn CommandConfigStatusContext) -> Self {
+        assert!(
+            self.config_status.replace(value).is_none(),
+            "config status facet already set"
+        );
+        self
     }
 
     pub fn with_session(mut self, value: &'a mut dyn CommandSessionContext) -> Self {

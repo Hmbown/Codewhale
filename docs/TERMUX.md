@@ -11,7 +11,7 @@ should know about.
 ## Installation
 
 Use the Android-specific GitHub release archive. The
-[v0.9.11 release](https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.11)
+[v0.9.11 release](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
 includes `codewhale-android-arm64.tar.gz`; device support remains **preview**.
 Follow [the Android / Termux installation steps](INSTALL.md#android--termux-arm64-preview)
 to verify the archive against the matching `codewhale-bundles-sha256.txt`, then

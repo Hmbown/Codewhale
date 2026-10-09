@@ -10,7 +10,7 @@ Codewhale 为 [Termux](https://termux.dev) 提供 Android arm64 的构建与发�
 ## 安装
 
 请使用 Android 专用的 GitHub 发布归档。
-[v0.9.11 发行版](https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.11)
+[v0.9.11 发行版](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
 包含 `codewhale-android-arm64.tar.gz`；设备支持仍为**预览**。
 按 [Android / Termux 安装步骤](./INSTALL.md#android--termux-arm64) 用配套的
 `codewhale-bundles-sha256.txt` 校验归档包，再用 `PREFIX="$PREFIX"` 运行包内安装器，

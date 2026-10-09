@@ -2,26 +2,26 @@
    Settings  ────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         
    Appearance   Models & providers   Work   Tools & MCP   Trust   Motion   Advanced                                     
-   Search: type to filter  (17/71)                                                                                      
+   Search: type to filter  (18/72)                                                                                      
   ❯ Display         │  Display                                                │Theme                                    
                     │❯Theme                              terminal       ‹ ›   │theme                                    
                     │ Language                           auto           ‹ ›   │                                         
                     │ Background                         (default)      ✎     │current   terminal                       
-                    │ Quiet transcript                   On             [x]   │saved     terminal                       
-                    │ Model reasoning in chat            Off            [ ]   │startup   terminal                       
-                    │ Thinking Default Expanded          Off            [ ]   │source    settings.toml                  
-                    │ Thinking Preview Lines             2              ✎     │scope     SAVED                          
-                    │ Thinking background highlight      On             [x]   │apply     applies on save                
-                    │ Help Expand Groups                 Off            [ ]   │kind      choice                         
-                    │ Contextual tips                    On             [x]   │available not observed this session      
-                    │ Pin Last Prompt                    On             [x]   │                                         
-                    │ Tool detail level                  Off            [ ]   │system | terminal | shoreline |          
-                    │ Inline file changes                Full diff      ‹ ›   │shoreline-light | underwater |           
-                    │ Output pacing                      auto           ‹ ›   │underwater-retro | dark | light |        
-                    │ Cost currency                      usd            ‹ ›   │grayscale | catppuccin-mocha |           
-                    │ Transcript spacing                 comfortable    ‹ ›   │tokyo-night | dracula | gruvbox-dark |   
-                    │ Tool cards                         compact        ‹ ›   │claude | matrix | solarized-light | uwu  
-                    │                                                         │Enter or click again: Enter opens        
+                    │ Pet mode                           Off            [ ]   │saved     terminal                       
+                    │ Quiet transcript                   On             [x]   │startup   terminal                       
+                    │ Model reasoning in chat            Off            [ ]   │source    settings.toml                  
+                    │ Thinking Default Expanded          Off            [ ]   │scope     SAVED                          
+                    │ Thinking Preview Lines             2              ✎     │apply     applies on save                
+                    │ Thinking background highlight      On             [x]   │kind      choice                         
+                    │ Help Expand Groups                 Off            [ ]   │available not observed this session      
+                    │ Contextual tips                    On             [x]   │                                         
+                    │ Pin Last Prompt                    On             [x]   │system | terminal | shoreline |          
+                    │ Tool detail level                  Off            [ ]   │shoreline-light | underwater |           
+                    │ Inline file changes                Full diff      ‹ ›   │underwater-retro | dark | light |        
+                    │ Output pacing                      auto           ‹ ›   │grayscale | catppuccin-mocha |           
+                    │ Cost currency                      usd            ‹ ›   │tokyo-night | dracula | gruvbox-dark |   
+                    │ Transcript spacing                 comfortable    ‹ ›   │claude | matrix | solarized-light | uwu  
+                    │ Tool cards                         compact        ‹ ›   │Enter or click again: Enter opens        
                     │                                                         │choices                                  
                     │                                                         │                                         
                     │                                                         │                                         

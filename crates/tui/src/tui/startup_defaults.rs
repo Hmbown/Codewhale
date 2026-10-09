@@ -1,4 +1,4 @@
-//! The single owner for mode and reasoning defaults written back by interactive
+//! The single owner for mode, reasoning and pet-view defaults written back by interactive
 //! TUI selectors. Provider/model choices persist through `config_persistence`.
 //!
 //! Before this module there were three unrelated writers for the same
@@ -128,6 +128,8 @@ pub struct StartupDefaults {
     /// `settings.reasoning_effort` — normalized for the active route by the
     /// caller, because only the caller knows the route.
     reasoning_effort: Option<String>,
+    /// `settings.pet_mode` — the main view a fresh session starts in.
+    pet_mode: Option<bool>,
 }
 
 impl StartupDefaults {
@@ -154,6 +156,15 @@ impl StartupDefaults {
         }
     }
 
+    /// Persist the selected main view without delaying the event loop.
+    #[must_use]
+    pub fn pet_mode(enabled: bool) -> Self {
+        Self {
+            pet_mode: Some(enabled),
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
@@ -163,7 +174,7 @@ impl StartupDefaults {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.mode.is_none() && self.reasoning_effort.is_none()
+        self.mode.is_none() && self.reasoning_effort.is_none() && self.pet_mode.is_none()
     }
 
     /// Which user-facing settings this update touches, as typed subjects.
@@ -181,6 +192,9 @@ impl StartupDefaults {
         }
         if self.reasoning_effort.is_some() {
             subjects.push(StartupDefaultSubject::Thinking);
+        }
+        if self.pet_mode.is_some() {
+            subjects.push(StartupDefaultSubject::PetMode);
         }
         subjects
     }
@@ -204,6 +218,9 @@ impl StartupDefaults {
             }
             if let Some(effort) = self.reasoning_effort.as_deref() {
                 settings.set("reasoning_effort", effort)?;
+            }
+            if let Some(enabled) = self.pet_mode {
+                settings.set("pet_mode", if enabled { "true" } else { "false" })?;
             }
             Ok(())
         })
@@ -239,6 +256,8 @@ pub enum StartupDefaultSubject {
     Mode,
     /// `settings.reasoning_effort`.
     Thinking,
+    /// `settings.pet_mode`.
+    PetMode,
 }
 
 /// One startup-default write that did not land.

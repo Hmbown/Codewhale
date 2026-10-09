@@ -119,6 +119,26 @@ impl<W: Write> ColorCompatBackend<W> {
         }
     }
 
+    /// Immutable frame input from this backend's already negotiated facts.
+    /// Unknown terminal background stays unknown; an explicitly painted pane
+    /// may separately establish its own known ground at the finishing boundary.
+    pub(crate) fn native_ocean_caps(&self) -> codewhale_ratatui::Caps {
+        use codewhale_ratatui::{Caps, color::ColorDepth as NativeDepth, detect::Appearance};
+        Caps {
+            depth: match self.depth {
+                ColorDepth::Monochrome => NativeDepth::Monochrome,
+                ColorDepth::Ansi16 => NativeDepth::Ansi16,
+                ColorDepth::Ansi256 => NativeDepth::Ansi256,
+                ColorDepth::TrueColor => NativeDepth::TrueColor,
+            },
+            ascii: self.ascii_safe,
+            appearance: self
+                .detected_background
+                .and_then(codewhale_ratatui::detect::appearance_for_background)
+                .unwrap_or(Appearance::Unknown),
+        }
+    }
+
     /// Record the measured terminal background. See the field docs.
     pub(crate) fn set_detected_background(&mut self, color: Option<ratatui::style::Color>) {
         self.detected_background = color;
@@ -464,6 +484,33 @@ pub(crate) fn adapt_cell_colors(
     if depth == ColorDepth::Monochrome {
         cell.underline_color = ratatui::style::Color::Reset;
     }
+}
+
+/// Exact backend-visible proposed ink, reused by native Ocean's guard.
+pub(crate) fn project_ocean_ink(
+    cell: &Cell,
+    water: ratatui::style::Color,
+    depth: codewhale_ratatui::color::ColorDepth,
+    theme: &UiTheme,
+) -> ratatui::style::Color {
+    use codewhale_ratatui::color::ColorDepth as NativeDepth;
+    let depth = match depth {
+        NativeDepth::Monochrome => ColorDepth::Monochrome,
+        NativeDepth::Ansi16 => ColorDepth::Ansi16,
+        NativeDepth::Ansi256 => ColorDepth::Ansi256,
+        NativeDepth::TrueColor => ColorDepth::TrueColor,
+    };
+    let mut proposed = cell.clone();
+    proposed.set_bg(water);
+    adapt_cell_colors(
+        &mut proposed,
+        depth,
+        theme.mode,
+        ThemeId::Underwater,
+        theme,
+        None,
+    );
+    proposed.fg
 }
 
 #[cfg(test)]

@@ -364,14 +364,14 @@ fn scanner_should_report_missing_path(world: &mut PluginE2EWorld) {
 /// Prove the binary still loads after the plugin module extraction.
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_module_does_not_break_binary_load() {
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .arg("--version")
         .output()
-        .expect("codewhale-tui --version should start");
+        .expect("codewhale --version should start");
 
     assert!(
         output.status.success(),
-        "codewhale-tui --version failed\nstderr:\n{}",
+        "codewhale --version failed\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -870,7 +870,7 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     ));
     std::fs::write(config_path, config).expect("configure sealed lifecycle receipt");
     let (base_url, shutdown_tx, model_thread) = spawn_hermetic_model_server();
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -1104,19 +1104,77 @@ async fn run_scenario(name: &'static str, expected_steps: usize) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
+/// A continued session must stay resumable: resume it, run a turn, quit, and
+/// resume again, twice. The second resume used to fail for good with "saved
+/// holder checkpoint does not cover the full source" (0.10.1 QA), because the
+/// runtime holder mounted by the first resume stayed behind the document the
+/// resumed turn was saved to.
+#[cfg(all(unix, feature = "long-running-tests"))]
+#[test]
+fn a_continued_session_resumes_again_after_each_turn() {
+    let workspace = make_sealed_workspace().expect("sealed workspace");
+    let (base_url, shutdown_tx, model_thread) = spawn_hermetic_model_server();
+    let launch = |args: &[&str]| {
+        Harness::builder(Harness::codewhale_binary())
+            .cwd(workspace.workspace())
+            .clear_env()
+            .seal_home(workspace.home())
+            .env("DEEPSEEK_API_KEY", "sealed-resume-acceptance-key")
+            .env("DEEPSEEK_BASE_URL", &base_url)
+            .env("DEEPSEEK_MODEL", "deepseek-v4-pro")
+            .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
+            .env("CODEWHALE_NO_UPDATE_CHECK", "1")
+            .env("NO_ANIMATIONS", "1")
+            .env("RUST_LOG", "warn")
+            .args(args.iter().copied())
+            .size(40, 160)
+            .spawn()
+            .expect("start TUI")
+    };
+    let workspace_arg = workspace.workspace().to_str().expect("workspace UTF-8");
+    let mut tui = launch(&[
+        "--workspace",
+        workspace_arg,
+        "--no-project-config",
+        "--skip-onboarding",
+        "--fresh",
+    ]);
+    begin_new_session_from_startup(&mut tui);
+    expect_visible(&mut tui, "binary fixture acknowledged", "first reply");
+    wait_for_composer_ready(&mut tui);
+    submit_tui_command(&mut tui, "/exit");
+    assert_eq!(tui.wait_for_exit(BINARY_ACCEPTANCE_TIMEOUT), Some(0));
+    let _ = tui.shutdown();
 
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
+    for round in 1..=2 {
+        let mut tui = launch(&["resume", "--last"]);
+        if tui
+            .wait_for_text("Resumed session", BINARY_ACCEPTANCE_TIMEOUT)
+            .is_err()
+        {
+            panic!(
+                "resume {round} of a continued session failed\n{}",
+                short_diagnostics(&mut tui, None)
+            );
+        }
+        wait_for_composer_ready(&mut tui);
+        let prompt = format!("continue round {round}");
+        tui.type_line(&prompt).expect("send the resumed turn");
+        expect_visible(&mut tui, &prompt, "resumed prompt");
+        tui.wait_for_idle(
+            std::time::Duration::from_millis(500),
+            BINARY_ACCEPTANCE_TIMEOUT,
+        )
+        .expect("resumed turn settles");
+        wait_for_composer_ready(&mut tui);
+        submit_tui_command(&mut tui, "/exit");
+        assert_eq!(
+            tui.wait_for_exit(BINARY_ACCEPTANCE_TIMEOUT),
+            Some(0),
+            "round {round} exits cleanly"
+        );
+        let _ = tui.shutdown();
     }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
+    let _ = shutdown_tx.send(());
+    let _ = model_thread.join();
 }

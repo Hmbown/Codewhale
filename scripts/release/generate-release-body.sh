@@ -51,7 +51,7 @@ curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION="${tag}" sh
 For Windows, use the matching installer or archive below. For an existing
 direct install, run \`codewhale update\`; it prints the executable path and
 keeps newer builds. If the install directory is occupied by a different build,
-use the fresh-directory migration in [the installation guide](https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md).
+use the fresh-directory migration in [the installation guide](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md).
 
 ### Secondary packaging — npm and Cargo
 
@@ -70,7 +70,7 @@ from this Release. Both contain the same compiled runtime.
 docker run --rm -it \\
   -e DEEPSEEK_API_KEY="\$DEEPSEEK_API_KEY" \\
   -v codewhale-home:/home/codewhale/.codewhale \\
-  ghcr.io/hmbown/codewhale:${tag}
+  ghcr.io/codewhale-hq/codewhale:${tag}
 \`\`\`
 
 The image exposes the same runtime as both \`codewhale\` and \`codew\`. The
@@ -172,5 +172,5 @@ fi
 
 cat <<EOF
 
-See [CHANGELOG.md](https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md) for full notes and [docs/CHANGELOG_ARCHIVE.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/CHANGELOG_ARCHIVE.md) for older releases.
+See [CHANGELOG.md](https://github.com/codewhale-hq/CodeWhale/blob/main/CHANGELOG.md) for full notes and [docs/CHANGELOG_ARCHIVE.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/CHANGELOG_ARCHIVE.md) for older releases.
 EOF

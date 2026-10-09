@@ -94,6 +94,7 @@ impl Fixture {
             RuntimeThreadManagerConfig {
                 data_dir: path.clone(),
                 task_data_dir: self.home.path().join("tasks"),
+                sessions_dir: None,
                 max_active_threads: 2,
             },
         )
@@ -153,6 +154,25 @@ fn manifests(root: &Path) -> String {
 /// The measured shape (#6144): documents are bound to a store under
 /// *another* id's directory, and that directory has no document of its own.
 /// Only the store nothing binds may move.
+/// The reconcile lock sidecar is owner-only, even when an older release left
+/// it world-readable.
+#[cfg(unix)]
+#[test]
+fn reconcile_lock_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _lock = lock_test_env();
+    let fixture = Fixture::new();
+    let lock = fixture.dir().join(RECONCILE_LOCK_FILE);
+    let mode = || fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+
+    fixture.run();
+    assert_eq!(mode(), 0o600);
+
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    fixture.run();
+    assert_eq!(mode(), 0o600);
+}
+
 #[test]
 fn reconcile_sets_aside_only_stores_no_document_binds() {
     let _env = lock_test_env();

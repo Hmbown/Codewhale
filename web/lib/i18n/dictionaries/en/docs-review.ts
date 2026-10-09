@@ -43,7 +43,7 @@ export const docsReview: DocsReviewDict = {
           lang: "Codewhale",
         },
         {
-          p: "Restoring changes files, so it needs a trusted workspace (`/trust on`) or Full Access; anyone can list snapshots. You can also just ask — “undo your last edit” — and Codewhale can roll back its own turn.",
+          p: "Restoring changes files, so it needs a trusted workspace (`/trust on`) or Full Access; anyone can list snapshots. You can also ask in plain language: “undo your last edit” rolls back Codewhale's own turn.",
         },
         {
           p: "`/undo` is different: it removes the last exchange from the conversation. Use `/restore` when you want files back.",

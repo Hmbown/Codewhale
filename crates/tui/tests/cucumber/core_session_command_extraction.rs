@@ -1,10 +1,9 @@
 //! Gherkin binary health and eval harness smoke test for command extraction.
 //!
-//! This runs the binary through `codewhale-tui eval` and verifies that the
+//! This runs the binary through `codewhale eval` and verifies that the
 //! executable still loads and reports a successful JSON evaluation after the
 //! core/session command modules are extracted.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use cucumber::{World as _, given, then, when, writer::Stats as _};
@@ -36,7 +35,7 @@ fn eval_harness_runs_shell_command(world: &mut CoreSessionExtractionWorld) {
         .as_ref()
         .expect("evaluation workspace should exist");
 
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .args([
             "eval",
             "--json",
@@ -46,11 +45,11 @@ fn eval_harness_runs_shell_command(world: &mut CoreSessionExtractionWorld) {
         ])
         .arg(record_dir.path())
         .output()
-        .expect("codewhale-tui eval should start");
+        .expect("codewhale eval should start");
 
     assert!(
         output.status.success(),
-        "codewhale-tui eval failed\nstderr:\n{}",
+        "codewhale eval failed\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -143,21 +142,4 @@ async fn codewhale_eval_runs_after_extraction() {
         4,
         "scenario did not run: {CORE_SCENARIO}"
     );
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }

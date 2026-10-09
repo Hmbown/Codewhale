@@ -84,7 +84,7 @@ test("install failure hint explains release base override for blocked GitHub dow
   try {
     const error = Object.assign(
       new Error(
-        "fetch https://github.com/Hmbown/CodeWhale/releases/download/v0.8.19/codewhale-artifacts-sha256.txt failed after 5 attempts:\ngetaddrinfo ENOTFOUND github.com",
+        "fetch https://github.com/codewhale-hq/CodeWhale/releases/download/v0.8.19/codewhale-artifacts-sha256.txt failed after 5 attempts:\ngetaddrinfo ENOTFOUND github.com",
       ),
       { code: "ENOTFOUND" },
     );
@@ -184,7 +184,7 @@ test("ensureBinary adopts a manually placed target binary after checksum validat
   await fs.promises.writeFile(`${target}.version`, "0.8.24", "utf8");
 
   const result = await withoutForcedDownload(() =>
-    _internal.ensureBinary(target, assetName, version, "Hmbown/CodeWhale", async () => {
+    _internal.ensureBinary(target, assetName, version, "codewhale-hq/CodeWhale", async () => {
       checksumLoads += 1;
       return new Map([[assetName, sha256(content)]]);
     }),
@@ -209,7 +209,7 @@ test("ensureBinary adopts an official release-named binary placed in downloads",
   await fs.promises.writeFile(assetPath, content);
 
   const result = await withoutForcedDownload(() =>
-    _internal.ensureBinary(target, assetName, version, "Hmbown/CodeWhale", async () =>
+    _internal.ensureBinary(target, assetName, version, "codewhale-hq/CodeWhale", async () =>
       new Map([[assetName, sha256(content)]]),
     ),
   );

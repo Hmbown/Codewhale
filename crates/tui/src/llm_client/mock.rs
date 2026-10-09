@@ -74,7 +74,7 @@ pub enum FauxStep {
     /// outgoing request must still carry `reasoning_content` (represented in
     /// this model as a [`ContentBlock::Thinking`] block). If it is missing,
     /// DeepSeek V4 returns HTTP 400 on the follow-up turn. This guards the
-    /// [v0.4.9-v0.5.1 regression range](https://github.com/Hmbown/CodeWhale/compare/v0.4.9...v0.5.1)
+    /// [v0.4.9-v0.5.1 regression range](https://github.com/codewhale-hq/CodeWhale/compare/v0.4.9...v0.5.1)
     /// where that content was dropped.
     Factory(Box<dyn Fn(&MessageRequest) -> CannedTurn + Send + Sync>),
     /// Fail the request itself with this message, as a provider that refuses

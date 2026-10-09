@@ -58,7 +58,7 @@ until you review it.
 
 | Content | Authoritative source | Copies to check |
 | --- | --- | --- |
-| Catalog, WhaleWiki, Whalesong, Cloudflare Docs | `Hmbown/codewhale-plugin-marketplace` | Core catalog snapshot |
+| Catalog, WhaleWiki, Whalesong, Cloudflare Docs | `codewhale-hq/codewhale-plugin-marketplace` | Core catalog snapshot |
 | Bundled skills | Core active catalog and `crates/tui/assets/skills` | Marketplace `skills` and `skills/upstream.json` |
 | Computer Use | `Hmbown/codewhale-cu-plugin` | Marketplace plugin and Core bundled runtime |
 

@@ -1,15 +1,56 @@
 # 安装 Codewhale
 
 > 英文原文：[INSTALL.md](../INSTALL.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-29。本文按英文版当前结构（v0.10.0 安装实测版）整体重译；附录部分与英文一样，沿用上一版内容，未在 v0.10.0 上重测。
+> 最后与英文同步日期（last synced with English revision）：2026-10-06。按当前英文源码复核；下文 v0.10.0 安装记录与附录的原始测试范围保留，不能当作 v0.10.1 发布安装回执。
 
 Codewhale 是一个在终端里运行的开源编码智能体（coding agent）。你交给它一个任务（"修复失败的测试"、"加一个 CLI 参数"），它会读取你的仓库、编辑文件并运行命令。在默认的 **Ask**（询问）权限级别下，它会立即应用工作区内的文件编辑（并给你看 diff），但运行 shell 命令之前会先询问，所以请先提交或暂存你在意的改动。它支持多家模型提供商，默认是 **DeepSeek**。
 
 命令是 `codewhale`。`codew` 是同一个程序的较短别名。
 
-本指南是在一台全新的 **Ubuntu 24.04 x86_64** 机器上安装 **v0.10.0**（2026-09-22 发布）时写成的，这里描述的每条路径都实际走过。文中每条命令都运行过，输出也核对过（见[安装回执](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)）。在那台机器上无法运行的步骤标注为 **（该虚拟机上未测试：原因）**。macOS、Windows 和 Android 不在测试范围内，只有少量说明。第二轮在 **macOS 26.1（Apple silicon）** 上重新运行了安装器、手动下载、压缩包和 npm 路径、无密钥检查以及 zsh 补全，见 [macOS 说明](#macos-说明)。需要调用模型的步骤没有在 macOS 上重跑。
+安装路径最初是在一台全新的 **Ubuntu 24.04 x86_64** 机器上使用 **v0.10.0**（2026-09-22 发布）验证的。带日期的[安装回执](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)记录了当时实际运行的命令和核对的输出。在那台机器上无法运行的步骤标注为 **（该虚拟机上未测试：原因）**。macOS、Windows 和 Android 不在测试范围内，只有少量说明。第二轮在 **macOS 26.1（Apple silicon）** 上重新运行了安装器、手动下载、压缩包和 npm 路径、无密钥检查以及 zsh 补全，见 [macOS 说明](#macos-说明)。需要调用模型的步骤没有在 macOS 上重跑。
 
-使用 `latest` 的安装命令会解析到最新**已发布**的 GitHub Release 或包。两次发布之间，`main` 可能已经在描述下一个版本（例如 2026-09-28 之前的 v0.10.1 源码候选版）。候选版在其标签、校验和与发布资源齐备之前，都不能安装。
+使用 `latest` 的安装命令会解析到最新**已发布**的 GitHub Release 或包。两次发布之间，`main` 可能已经在描述下一个版本（例如尚未打标签的 v0.10.1 源码候选版）。预编译候选版只有在标签、校验和与发布资源齐备后，才可通过官方安装器获取；贡献者可以先从 `main` 构建源码。
+
+## 用一个账号管理提供商密钥
+
+[注册](https://app.codewhale.net/register)或[登录](https://app.codewhale.net/login)
+后，就能集中管理模型提供商的 API 密钥。在账号的[提供商设置](https://app.codewhale.net/providers)
+中添加、更换或移除密钥，也可以使用下面的终端命令。换一台设备时，登录并选择
+Codewhale 模型通道，就能使用同一组账号密钥，无需再次粘贴。
+
+```bash
+codewhale login
+codewhale account keys set deepseek  # 隐藏输入，不回显密钥
+codewhale account keys list         # 只显示状态，不显示密钥
+codewhale --provider codewhale      # 使用账号的模型通道
+```
+
+这里的账号设置说明针对 0.10.1 源码候选版。登录不会自动上传已有的本地密钥。
+如果明确希望复制本地密钥，请使用 `codewhale account keys set deepseek --from-local`。
+账号密钥保存在服务端，用于经过账号通道的请求，不会下载到每台设备的本地密钥存储。
+不注册账号也可以使用本地密钥或本地模型。更换密钥、选择账号或本地通道的说明见
+[账号密钥设置](CONFIGURATION.md#账号提供商密钥)。
+
+## 使用当前源码参与测试与贡献
+
+`latest` 表示最新已发布版本；想测试尚未发布的修复，请使用权威 GitHub
+`main`，或确认与它提交一致的 CNB `main`。不要把仓库版本号当作发布证明。
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/CodeWhale.git
+cd CodeWhale
+cargo build --release --locked -p codewhale-cli
+target/release/codewhale --version
+```
+
+构建前置条件见下文 Cargo 章节；使用仓库选定的 stable Rust，最低声明版本
+为 1.89。首次构建可能耗时较长。Windows 的可执行文件为
+`target/release/codewhale.exe`，并需要 MSVC 工具链。开发构建不等于已签名发布包。
+
+中国大陆网络可参阅 [CNB 镜像、下载与验证](CNB_MIRROR.md)。npm 的
+`--registry=https://registry.npmmirror.com` 只改变 npm 包来源；包装器仍需要
+从独立的 GitHub、有效的 CNB 发布或完整的 HTTPS 资产镜像下载二进制。
+腾讯轻量应用服务器自建路径见 [Lighthouse 中文/英文引导](../../scripts/tencent-lighthouse/README.md)。
 
 ---
 
@@ -108,7 +149,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 ```
 Installing Codewhale for linux-x64
-Release assets: https://github.com/Hmbown/CodeWhale/releases/latest/download
+Release assets: https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 Install dir: /home/you/.local/bin
 Checksums verified
 Installed checksummed release commands:
@@ -183,13 +224,13 @@ codewhale doctor        # diagnostics; see the note in §8 about what it does NO
 
 ## 3. 从 GitHub Releases 手动下载
 
-当你想亲自查看并校验每一个字节时使用。发布页：<https://github.com/Hmbown/CodeWhale/releases>。每个平台都有**裸二进制**（`codewhale-linux-x64`、`codew-linux-x64` 等）和一个**压缩包**（`codewhale-linux-x64.tar.gz`），压缩包里是同样的两个二进制外加一个 `install.sh`。
+当你想亲自查看并校验每一个字节时使用。发布页：<https://github.com/codewhale-hq/CodeWhale/releases>。每个平台都有**裸二进制**（`codewhale-linux-x64`、`codew-linux-x64` 等）和一个**压缩包**（`codewhale-linux-x64.tar.gz`），压缩包里是同样的两个二进制外加一个 `install.sh`。
 
 ### 3a. 裸二进制
 
 ```bash
 mkdir -p ~/codewhale-dl && cd ~/codewhale-dl
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64"          # use linux-arm64 on ARM
 curl -fsSLO "$base/codew-linux-x64"
 curl -fsSLO "$base/codewhale-artifacts-sha256.txt"
@@ -217,7 +258,7 @@ install -m 755 codew-linux-x64     ~/.local/bin/codew
 
 ```bash
 cd "$(mktemp -d)"
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64.tar.gz"
 curl -fsSLO "$base/codewhale-bundles-sha256.txt"     # note: *bundles*, not *artifacts*
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
@@ -244,6 +285,14 @@ codewhale --version
 ```
 
 这个包是一个很小的包装器。它的 `postinstall` 步骤会下载同样的 `codewhale`/`codew` 发布二进制，对照该发布的 SHA-256 清单校验，并把 `codewhale` 和 `codew` 链接到 npm 的全局 `bin`。整个过程在测试机上用了 6 秒。
+
+**Windows npm 会话：** Node 在整个原生会话期间仍是启动器。
+`taskkill /IM node.exe` 或 `Get-Process node | Stop-Process -Force` 会影响
+所有匹配的 Node 进程，也可能中断 npm 启动的 Codewhale，破坏正常终端清理。
+只停止自己启动的服务器 PID、占用目标端口的进程，或使用 Codewhale 任务取消。
+Windows 原生压缩包/安装器可避免 npm 父进程依赖；可选 JavaScript 工具仍可能需要
+Node。Codewhale 的 Windows shell 安全底线即使在 Full Access 下也会拦住已识别的
+整类 Node 进程终止命令；外部硬终止无法靠这个检查实现优雅退出。
 
 ### 如果遇到 `EACCES: permission denied`
 
@@ -288,10 +337,10 @@ sudo apt-get install -y build-essential pkg-config libdbus-1-dev git
 # Rust via rustup (the distro's cargo is too old for this edition-2024 workspace)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustc --version            # the workspace declares rust-version = 1.88
+rustc --version            # the workspace declares rust-version = 1.89
 ```
 
-（注释含义：发行版自带的 cargo 太旧，无法构建这个 edition-2024 的 workspace；workspace 声明的 rust-version 为 1.88。）
+（注释含义：发行版自带的 cargo 太旧，无法构建这个 edition-2024 的 workspace；workspace 声明的 rust-version 为 1.89。）
 
 `libdbus-1-dev` **是必需的**。没有它，构建会在大约一分钟后失败：
 
@@ -315,14 +364,14 @@ codewhale --version
 * `codewhale --version` 打印 `codewhale 0.10.0`，不带 commit 哈希。
 * 无头模式和 TUI 冒烟测试通过。
 
-> **文档里说"Rust 1.88+"，这对 v0.10.0 是错的。** 用 1.88.0 时，安装会在几秒内失败：
+> **v0.10.0 声明的"Rust 1.88+"是错的，工作区现在声明 1.89（CI 的 MSRV 任务所构建的版本）。** 用 1.88.0 时，安装会在几秒内失败：
 > `rustc 1.88.0 is not supported by the following package: serde-saphyr@1.3.0 requires rustc 1.89`。
 > 请使用当前 stable（`rustup update stable`）。
 
 ### 5b. 从 git 检出构建
 
 ```bash
-git clone --depth 1 --branch v0.10.0 https://github.com/Hmbown/CodeWhale.git
+git clone --depth 1 --branch v0.10.0 https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 cargo install --path crates/cli --locked      # installs ~/.cargo/bin/codewhale
 ```
@@ -376,8 +425,8 @@ Run `brew trust --formula hmbown/deepseek-tui/codewhale` or `brew trust hmbown/d
 # flakes are still experimental; the tested setup enabled them once:
 mkdir -p ~/.config/nix
 echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
-nix run github:Hmbown/CodeWhale -- --version
-# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:Hmbown/CodeWhale -- --version
+nix run github:codewhale-hq/CodeWhale -- --version
+# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:codewhale-hq/CodeWhale -- --version
 ```
 
 （注释含义：flakes 仍是实验特性，测试环境一次性启用了它；一次性替代写法在该虚拟机上未测试。）
@@ -489,7 +538,7 @@ codewhale doctor --probe-api
 #   · Testing connection...  ✓ API connection successful
 ```
 
-请用 `auth status`。单独运行 `codewhale doctor` **不会**告诉你：即使密钥已设置，它也会打印 `deepseek: env_source=not inspected`；即使找不到密钥，它也以 0 退出。
+单独运行 `codewhale doctor` 会列出它能看到的环境变量密钥（`deepseek: env_source=set via DEEPSEEK_API_KEY (value not shown; not checked offline)`），但不会读取密钥存储或验证密钥；`--probe-api` 会两者都做。即使找不到密钥，doctor 也以 0 退出，所以脚本请用 `auth status`。
 
 ### 删除已保存的密钥
 
@@ -596,7 +645,7 @@ codewhale exec --resume <id> "…"
 
 ### Ghostty（已测试：Linux/X11 上的 Ghostty 1.3.1）
 
-我检查的所有项目在 Ghostty 默认配置下（`TERM=xterm-ghostty`、`COLORTERM=truecolor`）都能正常工作。截图与[安装回执](https://github.com/Hmbown/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots)保存在一起。
+我检查的所有项目在 Ghostty 默认配置下（`TERM=xterm-ghostty`、`COLORTERM=truecolor`）都能正常工作。截图与[安装回执](https://github.com/codewhale-hq/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots)保存在一起。
 
 | 检查项 | 结果 |
 |---|---|
@@ -704,7 +753,7 @@ v0.10.0 的已知 bug。bash 和 fish 没问题。
 
 ## 附录：其他平台（本版未重测）
 
-下面各节原样沿用自本页的上一版。它们**没有**在上文的 v0.10.0 安装测试中重新运行（不在范围内：Windows、macOS、Android/Termux、FreeBSD、中国大陆镜像），仅 [macOS 说明](#macos-说明)中提到的 macOS 路径除外。通过检查已发布的 v0.10.0 资源，发现下列内容与之矛盾（[详情](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md)，D15 和 D16）：
+下面各节原样沿用自本页的上一版。它们**没有**在上文的 v0.10.0 安装测试中重新运行（不在范围内：Windows、macOS、Android/Termux、FreeBSD、中国大陆镜像），仅 [macOS 说明](#macos-说明)中提到的 macOS 路径除外。通过检查已发布的 v0.10.0 资源，发现下列内容与之矛盾（[详情](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md)，D15 和 D16）：
 
 * `packaging/winget/` 里的 winget 清单仍停留在 0.9.6。
 * v0.10.0 同时发布了 `codewhale-windows-x64.zip`（附带一个把文件复制到 `%USERPROFILE%\bin` 的 `install.bat`）和 `codewhale-windows-x64-portable.zip`；下面各节只提到了前者。
@@ -712,7 +761,7 @@ v0.10.0 的已知 bug。bash 和 fish 没问题。
 
 ### 支持平台与发布资源
 
-[最新稳定版](https://github.com/Hmbown/CodeWhale/releases/latest)发布了 Linux x64/arm64、macOS x64/arm64、Windows x64/arm64 和 Android arm64 的资源。资源存在不等于平台已通过验收。下表描述的是当前源码树的平台与次要打包支持；`latest` 安装仍然选择已发布的版本。Android/Termux 为预览状态，等待真机 QA。Linux ARM64 自 v0.8.8 起可用。Linux RISC-V 预编译暂时暂停，因为锁定的 `rquickjs-sys` 依赖没有提供 `riscv64gc-unknown-linux-gnu` 绑定。
+[最新稳定版](https://github.com/codewhale-hq/CodeWhale/releases/latest)发布了 Linux x64/arm64、macOS x64/arm64、Windows x64/arm64 和 Android arm64 的资源。资源存在不等于平台已通过验收。下表描述的是当前源码树的平台与次要打包支持；`latest` 安装仍然选择已发布的版本。Android/Termux 为预览状态，等待真机 QA。Linux ARM64 自 v0.8.8 起可用。Linux RISC-V 预编译暂时暂停，因为锁定的 `rquickjs-sys` 依赖没有提供 `riscv64gc-unknown-linux-gnu` 绑定。
 
 | 平台 | 架构 | GitHub 发布资源 | npm install | `cargo install` |
 | ------------ | ------------ | ----------------------------------------------------- | :---------: | :-------------: |
@@ -803,8 +852,8 @@ pkg install -y ca-certificates curl tar gzip coreutils
 
 ```bash
 cd "$HOME"
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
 
 tar xzf codewhale-android-arm64.tar.gz
@@ -920,20 +969,25 @@ codewhale --version
 
 Scoop 清单维护在本仓库的发布工作流之外，可能落后于 GitHub/npm/Cargo 的发布。当你需要立即拿到最新版本时，请使用 npm 或从 GitHub 手动下载发布资源。
 
-#### Windows winget（v0.9.5+）
+#### Windows winget
 
-Codewhale 为 `Hmbown.CodeWhale` 发布 winget 清单（解决 #1561）。Winget 只安装 `codewhale` + `codew` 命令。GitHub Releases 保留字节完全一致的 `codewhale-tui-*` 文件名，仅用于兼容旧版更新器；它们不是第三个已安装命令。
+已发布的 winget 包是 **`HunterBown.CodeWhale`**（2026-10-04 在
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/tree/master/manifests/h/HunterBown/CodeWhale)
+核实；最新发布版本为 0.10.0）。它是便携式 x64 包：winget 下载
+`codewhale-tui-windows-x64.exe`，将其安装为 `codewhale` 命令，并安装 Microsoft Visual C++ 2015+ x64 运行库。
 
 ```powershell
-winget install Hmbown.CodeWhale
+winget install HunterBown.CodeWhale
 codewhale --version
 ```
 
-清单位于 [`packaging/winget/Hmbown.CodeWhale.yaml`](../../packaging/winget/Hmbown.CodeWhale.yaml)（在 [`.winget/Hmbown.CodeWhale.yaml`](../../.winget/Hmbown.CodeWhale.yaml) 也镜像了一份），列出了 NSIS 安装器（`CodeWhaleSetup.exe`，每用户安装，会把 `%LOCALAPPDATA%\Programs\CodeWhale\bin` 加入用户 PATH）和便携 ZIP 备选（`codewhale-windows-x64.zip` / `codewhale-windows-arm64.zip`）。winget 会自动选择匹配的架构；两者都安装单二进制（`codewhale.exe` + `codew.exe`）。ZIP 里还包含 `codewhale.bat`。请双击这个启动器（而不是原始的 `.exe`），这样如果已安装 Windows Terminal，第一个窗口就是 Windows Terminal。
+使用 `winget upgrade HunterBown.CodeWhale` 或 `codewhale update` 更新。每个版本在 GitHub Release 之后都要经过 winget-pkgs 审核，因此 winget 可能落后于 GitHub/npm/Cargo；需要立即获得最新版本时，请使用 npm 或 GitHub Release 资源。
 
-通过 `winget upgrade Hmbown.CodeWhale` 或 `codewhale update` 更新。winget 包维护在本仓库的发布工作流之外，可能比 GitHub/npm/Cargo 的发布滞后一个验证周期——需要立即拿到最新版本时，请使用 npm 或 GitHub Release 资源。如果 `winget install` 报告哈希不匹配，请校验同一标签的 `codewhale-artifacts-sha256.txt`，并通过 `packaging/winget/generate-winget-manifest.sh` 重新生成清单（见 [`packaging/winget/README.md`](../../packaging/winget/README.md)），然后重新提交到 [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs)。
+winget 方式的已知限制：
 
-> **Windows ARM64 说明。** NSIS 安装器目前只包含 x64 二进制。Windows ARM64 用户应通过 `winget install Hmbown.CodeWhale`（ARM64 ZIP）安装，或在原生 ARM64 Node.js 下运行 `npm install -g codewhale`，或直接下载 `codewhale-windows-arm64.zip`——所有这些路径安装的都是原生 ARM64 二进制。
+* **仅 x64。** 已发布的清单没有 ARM64 安装包。在 Windows ARM64 上，请在原生 ARM64 Node.js 下运行 `npm install -g codewhale`，或从 GitHub Releases 下载 `codewhale-windows-arm64.zip`。
+* **仅安装 `codewhale`。** winget 不安装简短别名 `codew`；请使用 `codewhale`。
+* 本仓库中的清单（`packaging/winget/`）不是 winget 实际提供的清单；见 [`packaging/winget/README.md`](../../packaging/winget/README.md)。
 
 #### Windows NSIS 安装器
 
@@ -941,7 +995,7 @@ codewhale --version
 
 NSIS 安装器目前包含 Windows x64 二进制。Windows ARM64 用户应通过在原生 ARM64 Node.js 下运行的 npm 安装，或从同一个发布下载 `codewhale-windows-arm64.zip`；这两条路径使用的都是原生 ARM64 二进制。
 
-从[发布页](https://github.com/Hmbown/CodeWhale/releases/latest)**下载** `CodeWhaleSetup.exe`。
+从[发布页](https://github.com/codewhale-hq/CodeWhale/releases/latest)**下载** `CodeWhaleSetup.exe`。
 
 双击安装程序即可**安装**。安装器会：
 
@@ -1032,7 +1086,7 @@ cargo build --release --target aarch64-unknown-linux-gnu -p codewhale-cli   # si
 **前置条件（Windows）**
 
 1. 安装 Visual Studio 2022 Build Tools——选择 **"使用 C++ 的桌面开发（Desktop development with C++）"** 工作负载。
-2. 安装 [Rust](https://rustup.rs) 1.88+（如果从中国大陆下载，参见上文[中国大陆/镜像友好安装](#中国大陆镜像友好安装)）。
+2. 安装 [Rust](https://rustup.rs) 1.89+（如果从中国大陆下载，参见上文[中国大陆/镜像友好安装](#中国大陆镜像友好安装)）。
 3. 安装 [Git for Windows](https://git-scm.com/download/win)（提供 `git` 和 `git-bash` 终端）。
 
 **推荐的终端**：Windows Terminal、`git-bash` 或 PowerShell。`cmd.exe` 可用，但缓冲区较小，PATH 行为也有限。
@@ -1064,7 +1118,7 @@ $env:PATH     = "$msvc\bin\Hostx64\x64;$env:PATH"
 **构建**
 
 ```bash
-git clone https://github.com/Hmbown/CodeWhale.git
+git clone https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 set CARGO_HTTP_CHECK_REVOKE=false   # may be needed behind some Chinese ISPs
 cargo build --release
@@ -1117,6 +1171,19 @@ codewhale update
 ```
 
 镜像目录必须包含 `codewhale-artifacts-sha256.txt` 以及来自 GitHub 发布的各平台二进制。旧的 `DEEPSEEK_TUI_RELEASE_BASE_URL` 镜像变量仍作为别名受支持。
+
+`codewhale update` 只接受 HTTPS，允许 GitHub 发布主机、CNB 镜像以及
+`CODEWHALE_RELEASE_BASE_URL` 指定的主机；每一次重定向也检查相同规则。
+私有镜像若重定向到另一个 CDN 或对象存储域名，还需显式列出该下载主机：
+
+```bash
+CODEWHALE_UPDATE_ALLOWED_HOSTS=cdn.your-mirror.example.com,objects.example.net \
+CODEWHALE_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
+CODEWHALE_VERSION=X.Y.Z \
+codewhale update
+```
+
+被拒绝的主机和允许主机变量会出现在错误信息里。不要关闭校验或改用 HTTP。
 
 ### Windows 与 npm 下载故障排查
 
@@ -1189,4 +1256,4 @@ target/debug/build/libsqlite3-sys-*/build-script-build
 
 3. 通过 Cargo 安装，它在本地构建，不下载 GitHub 发布资源。见[第 5 节](#5-cargo-与从源码构建)。
 
-4. 从[发布页](https://github.com/Hmbown/CodeWhale/releases)下载匹配的 `codewhale` 和 `codew` 两个二进制，放到 `PATH` 上的某个目录并赋予可执行权限。见[第 3 节](#3-从-github-releases-手动下载)。
+4. 从[发布页](https://github.com/codewhale-hq/CodeWhale/releases)下载匹配的 `codewhale` 和 `codew` 两个二进制，放到 `PATH` 上的某个目录并赋予可执行权限。见[第 3 节](#3-从-github-releases-手动下载)。

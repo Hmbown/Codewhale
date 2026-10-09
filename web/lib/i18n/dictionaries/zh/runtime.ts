@@ -4,12 +4,12 @@ import type { RuntimeDict } from "../types";
 export const runtime: RuntimeDict = {
   metaTitle: "Runtime & 集成 · Codewhale",
   metaDescription:
-    "Codewhale 的本地 Runtime API、HTTP/SSE、ACP stdio 适配器、MCP 服务器、VS Code 配套扩展与消息桥接。",
+    "通过基于 HTTP/SSE 的本地 Runtime API、基础 ACP stdio 适配器、MCP 服务器、早期 VS Code 配套扩展和消息桥接，把编辑器、脚本和聊天应用连接到 Codewhale。",
   kicker: "Runtime & 集成",
-  title: "运行时与集成",
+  title: "用你自己的工具驱动 Codewhale",
   titleAside: "Runtime & Integrations",
   titleAsideLang: "en",
-  lede: "Codewhale 不仅是一个终端 Agent——它还是一个可通过多种协议和集成方式嵌入到你现有工作流中的本地控制平面。",
+  lede: "Codewhale 在终端之外还运行一个本地控制平面。编辑器、脚本和聊天应用通过它读取线程、接收事件流并回应审批。",
   integrationsTitle: "集成方式",
   experimental: "实验性",
   trustTitle: "信任边界",

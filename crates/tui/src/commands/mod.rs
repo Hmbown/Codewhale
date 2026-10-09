@@ -6,6 +6,7 @@
 //! module keeps registry construction, user-command precedence, and the
 //! fall-through behaviour.
 
+mod config_policy_host;
 mod contract;
 pub mod discovery;
 mod groups;
@@ -22,6 +23,12 @@ pub mod user_registry;
 #[cfg(test)]
 #[path = "epic_dispatch_acceptance.rs"]
 mod epic_dispatch_acceptance;
+
+// Extension slash commands through the real command table and `App` dispatch;
+// they cannot live in `extension_host`, a runtime module that may not depend
+// on this one.
+#[cfg(test)]
+mod extension_host_tests;
 
 #[cfg(test)]
 #[path = "epic_discovery_acceptance.rs"]
@@ -52,7 +59,7 @@ mod session_lifecycle_regression_tests;
 
 use std::sync::OnceLock;
 
-pub(crate) use groups::config::config::set_workspace_trust;
+pub(crate) use groups::config::config::{set_workspace_trust, trust_change_note};
 
 /// Stage a rollback of the last exchange for the UI to apply, or `None` when
 /// there is no user message to roll back. Nothing is mutated here.
@@ -195,6 +202,20 @@ pub fn registry() -> &'static traits::CommandRegistry {
     REGISTRY.get_or_init(build_registry)
 }
 
+/// The built-in command table as the extension host asks about it: the one
+/// read-only question "does a built-in command answer to this name?". The
+/// composition root installs it at startup (`lib.rs`), so the runtime-side host
+/// never depends on this module.
+pub(crate) struct BuiltinCommandNames;
+
+impl crate::extension_host::command::BuiltinCommandCatalog for BuiltinCommandNames {
+    fn answers_to(&self, name: &str) -> bool {
+        // `jihua` and `zidong` are mode aliases the dispatcher answers ahead
+        // of the registry.
+        matches!(name, "jihua" | "zidong") || registry().get(name).is_some()
+    }
+}
+
 pub fn command_infos() -> Vec<&'static CommandInfo> {
     registry().infos()
 }
@@ -203,8 +224,26 @@ pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
     registry().get_info(name)
 }
 
-/// Execute a slash command
+/// Execute a slash command with its captured active configuration.
+pub fn execute_with_config(
+    cmd: &str,
+    app: &mut App,
+    config: &crate::config::Config,
+) -> CommandResult {
+    execute_in_context(cmd, app, Some(config))
+}
+
+/// Legacy fixture entry; it cannot authorize a model route change.
+#[cfg(test)]
 pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
+    execute_in_context(cmd, app, None)
+}
+
+fn execute_in_context(
+    cmd: &str,
+    app: &mut App,
+    config: Option<&crate::config::Config>,
+) -> CommandResult {
     // Keep the command's raw remainder available for commands whose payload is
     // byte-sensitive. Most slash commands intentionally receive a normalized
     // argument below; `/preview-request --prompt`, however, must describe the
@@ -299,7 +338,7 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
                     capabilities,
                     handler: contextual,
                 } => {
-                    let mut bundle = app.command_contexts();
+                    let mut bundle = app.command_contexts_with_config(config);
                     contextual(bundle.contexts(capabilities), command_arg)
                 }
             };
@@ -326,10 +365,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
             if let Some(result) = groups::skills::run_skill_by_name(app, command.as_str(), arg) {
                 return result;
             }
-            let suggestions =
-                user_registry::with_registry_for_workspace(Some(&app.workspace), |user_commands| {
-                    suggest_command_names(command.as_str(), 3, user_commands)
-                });
+            let suggestions = user_registry::with_registry_for_app(app, |user_commands| {
+                suggest_command_names(command.as_str(), 3, user_commands)
+            });
             if suggestions.is_empty() {
                 CommandResult::error(format!(
                     "Unknown command: /{command}. Type /help for available commands."
@@ -477,13 +515,12 @@ fn suggest_command_names(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
     use crate::tools::todo::TodoStatus;
     use crate::tui::app::{App, AppAction, TuiOptions};
     use crate::tui::work_surface::{RailPanel, WorkSurfacePlacement};
     use codewhale_localization::{Locale, MessageId};
-    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
@@ -540,8 +577,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut app = create_test_app();
-        app.workspace = temp.path().to_path_buf();
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(temp.path()),
+        );
         super::user_registry::reload(Some(temp.path()));
 
         let result = execute("/help now", &mut app);
@@ -561,8 +599,9 @@ mod tests {
         let command_path = commands_dir.join("help.md");
         std::fs::write(&command_path, "user help").unwrap();
 
-        let mut app = create_test_app();
-        app.workspace = temp.path().to_path_buf();
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(temp.path()),
+        );
         super::user_registry::reload(Some(temp.path()));
         assert!(matches!(
             execute("/help config", &mut app).action,
@@ -798,14 +837,18 @@ mod tests {
                 .message
                 .as_deref()
                 .unwrap_or_default()
-                .contains(".deepseek/handoff.md")
+                .contains(crate::prompts::HANDOFF_RELATIVE_PATH)
         );
         let Some(AppAction::SendMessage(message)) = result.action else {
             panic!("expected SendMessage action");
         };
         assert!(message.contains("session relay"));
         assert!(message.contains("接力"));
-        assert!(message.contains("Write or update `.deepseek/handoff.md`"));
+        // The relay is written where the next session reads it first.
+        assert!(message.contains(&format!(
+            "Write or update `{}`",
+            crate::prompts::HANDOFF_RELATIVE_PATH
+        )));
         assert!(message.contains("# Session relay"));
         assert!(message.contains("Requested relay focus: verify install"));
         assert!(message.contains("Goal objective: Unify the work surface"));
@@ -1491,7 +1534,7 @@ mod tests {
             let msg = result.message.expect("links commands should return text");
             assert!(msg.contains("https://codewhale.net/en/docs"));
             assert!(msg.contains("https://codewhale.net/en/community"));
-            assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+            assert!(msg.contains("https://github.com/codewhale-hq/CodeWhale"));
             assert!(msg.contains("https://app.codewhale.net"));
             assert!(msg.contains("separate sign-in"));
             assert!(msg.contains("not connected to the current local session"));
@@ -1534,35 +1577,24 @@ mod tests {
         assert!(deepseek_result.action.is_none());
     }
 
+    /// Seals the user's home *and* points the config at the fixture's own
+    /// file. Dispatching every command reaches credentials, sessions, snapshots,
+    /// plugin bundles, audit logs and the `/import-claude` report — all of which
+    /// resolve under the home, so pinning the config path alone (as this once
+    /// did) left them on the developer's real profile.
     struct ConfigPathGuard {
-        previous: Option<OsString>,
-        _lock: crate::test_support::TestEnvLock,
+        // Fields drop in order: restore the config path, then the seal.
+        _config_path: crate::test_support::EnvVarGuard,
+        _home: crate::test_support::SealedHome,
     }
 
     impl ConfigPathGuard {
         fn new(config_path: &Path) -> Self {
-            let lock = crate::test_support::lock_test_env();
-            let previous = std::env::var_os("DEEPSEEK_CONFIG_PATH");
-            // Safety: test-only environment mutation guarded by a global mutex.
-            unsafe {
-                std::env::set_var("DEEPSEEK_CONFIG_PATH", config_path);
-            }
+            let home = crate::test_support::SealedHome::new();
+            let config = crate::test_support::EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", config_path);
             Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for ConfigPathGuard {
-        fn drop(&mut self) {
-            // Safety: test-only environment mutation guarded by a global mutex.
-            unsafe {
-                if let Some(previous) = self.previous.take() {
-                    std::env::set_var("DEEPSEEK_CONFIG_PATH", previous);
-                } else {
-                    std::env::remove_var("DEEPSEEK_CONFIG_PATH");
-                }
+                _config_path: config,
+                _home: home,
             }
         }
     }
@@ -1834,9 +1866,9 @@ mod tests {
     fn balance_command_dispatches_live_fetch_for_prepaid_providers() {
         let mut app = create_test_app();
         for provider in [
-            ApiProvider::Deepseek,
-            ApiProvider::Openrouter,
-            ApiProvider::Siliconflow,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Siliconflow,
         ] {
             app.api_provider = provider;
             let result = execute("/balance", &mut app);
@@ -1851,7 +1883,7 @@ mod tests {
     #[test]
     fn balance_command_reports_unsupported_provider_clearly() {
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::Ollama;
+        app.set_provider_identity(ProviderKind::Ollama, "ollama");
 
         let result = execute("/balance", &mut app);
         let msg = result
@@ -2103,6 +2135,9 @@ mod tests {
             "export",
             // FEAT-026 completes the session structural-copy slice.
             "structcopy",
+            // FEAT-027 config policy/status slice; remaining config stays legacy.
+            "permissions",
+            "status",
             // FEAT-029 complete debug group, including receipts and mutation.
             "tokens",
             "cost",
@@ -2394,36 +2429,9 @@ mod tests {
     // is asserted by the migration fixtures and live gate.
     // ---------------------------------------------------------------------
 
-    /// Pins HOME to a tempdir so global skill discovery stays hermetic.
-    struct Feat022ScopedHome {
-        prev: Option<std::ffi::OsString>,
-        _home: tempfile::TempDir,
-        _guard: crate::test_support::TestEnvLock,
-    }
-    impl Drop for Feat022ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn feat022_scoped_home(_tmp: &tempfile::TempDir) -> Feat022ScopedHome {
-        let guard = crate::test_support::lock_test_env();
-        let prev = std::env::var_os("HOME");
-        let home = tempfile::TempDir::new().expect("home tempdir");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        Feat022ScopedHome {
-            prev,
-            _home: home,
-            _guard: guard,
-        }
+    /// Seals the user's home so global skill discovery stays hermetic.
+    fn feat022_scoped_home(_tmp: &tempfile::TempDir) -> crate::test_support::SealedHome {
+        crate::test_support::SealedHome::new()
     }
 
     fn feat022_test_app(tmp: &tempfile::TempDir) -> App {
@@ -2733,6 +2741,7 @@ mod tests {
 
     #[test]
     fn feat020_plugin_dispatches_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
         let tmpdir = tempfile::TempDir::new().unwrap();
         let mut app = plugin_test_app(&tmpdir);
 
@@ -2756,6 +2765,7 @@ mod tests {
 
     #[test]
     fn feat020_public_dispatch_never_panics_on_plugin_commands() {
+        let _home = crate::test_support::SealedHome::new();
         let tmpdir = tempfile::TempDir::new().unwrap();
         let mut app = plugin_test_app(&tmpdir);
         for command in [
@@ -2880,6 +2890,7 @@ mod tests {
 
     #[test]
     fn feat023_lifecycle_commands_dispatch_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
         let mut app = create_test_app();
         app.workspace = PathBuf::from(".");
 
@@ -2933,6 +2944,7 @@ mod tests {
 
     #[test]
     fn feat024_control_commands_dispatch_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
         let mut app = create_test_app();
         app.workspace = PathBuf::from(".");
 
@@ -2941,7 +2953,7 @@ mod tests {
         let relay = execute("/relay handoff notes", &mut app);
         assert_eq!(
             relay.message.as_deref(),
-            Some("Preparing session relay at .deepseek/handoff.md...")
+            Some("Preparing session relay at .codewhale/handoff.md...")
         );
         let relay_message = match relay.action {
             Some(AppAction::SendMessage(message)) => message,
@@ -3101,3 +3113,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod config_policy_host_tests;
+#[cfg(test)]
+mod config_policy_permissions_tests;
+#[cfg(test)]
+mod config_policy_status_tests;

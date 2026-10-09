@@ -60,6 +60,7 @@ impl ApprovalReceipt {
     }
 
     /// A decision whose decider this call site does not know.
+    #[cfg(test)]
     pub(crate) fn decided(tool_call_id: impl Into<String>, outcome: ApprovalOutcome) -> Self {
         Self::decided_with(tool_call_id, outcome, None)
     }

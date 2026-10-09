@@ -244,6 +244,38 @@ fn explicit_400_402_and_429_quota_responses_are_typed_and_non_retryable() {
 }
 
 #[test]
+fn chatgpt_usage_limit_is_quota_and_carries_account_guidance() {
+    // Shape of the ChatGPT Codex backend's subscription-window 429, as
+    // openai/codex `codex-api/src/api_bridge.rs` parses it.
+    let raw = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1790000000}}"#;
+    let safe = sanitize_http_error_body(Some("OpenAI Codex"), 429, raw);
+    let error = LlmError::from_http_response(429, &safe);
+    assert!(!error.is_retryable());
+    let LlmError::QuotaExhausted(evidence) = error else {
+        panic!("usage_limit_reached must be typed quota, got {error:?}");
+    };
+    let rendered = LlmError::QuotaExhausted(evidence.with_guidance(
+        "This limit belongs to the ChatGPT account a@example.com (plus). Run `codewhale auth chatgpt`.",
+    ))
+    .to_string();
+    assert!(
+        rendered.contains("The usage limit has been reached"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("a@example.com (plus)"), "{rendered}");
+    assert!(rendered.contains("`codewhale auth chatgpt`"), "{rendered}");
+
+    // Same backend branch: the signed-in plan does not include Codex.
+    // Retrying cannot help, so it must not be a retryable rate limit.
+    let raw =
+        r#"{"error":{"type":"usage_not_included","message":"Your plan does not include Codex"}}"#;
+    let safe = sanitize_http_error_body(Some("OpenAI Codex"), 429, raw);
+    let error = LlmError::from_http_response(429, &safe);
+    assert!(!error.is_retryable());
+    assert!(matches!(error, LlmError::QuotaExhausted(_)), "{error:?}");
+}
+
+#[test]
 fn generic_429_stays_rate_limited_and_retryable() {
     for body in [
         "Too Many Requests",
@@ -329,4 +361,210 @@ async fn retry_loop_stops_after_one_authentication_failure() {
     .await;
     assert!(result.is_err());
     assert_eq!(calls, 1);
+}
+
+fn retry_receipt_observation() -> (
+    RequestRetryObservation,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let receipts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = receipts.clone();
+    (
+        RequestRetryObservation {
+            retries: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            emit: std::sync::Arc::new(move |message| {
+                let captured = captured.clone();
+                Box::pin(async move {
+                    captured.lock().unwrap().push(message);
+                })
+            }),
+        },
+        receipts,
+    )
+}
+
+fn immediate_retry_policy(max_retries: u32) -> RetryConfig {
+    RetryConfig {
+        max_retries,
+        initial_delay: 0.0,
+        jitter: false,
+        ..RetryConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn scoped_retry_records_first_transport_failure_and_recovery_without_remote_payload() {
+    let (observation, receipts) = retry_receipt_observation();
+    let count = observation.retries.clone();
+    let mut calls = 0;
+    let result = observe_request_retries(
+        Some(observation),
+        with_retry(
+            &immediate_retry_policy(2),
+            || {
+                calls += 1;
+                let call = calls;
+                async move {
+                    if call == 1 {
+                        Err(LlmError::ServerError {
+                            status: 503,
+                            message: "PRIVATE-PROVIDER-BODY".into(),
+                        })
+                    } else {
+                        Ok(17)
+                    }
+                }
+            },
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, 17);
+    assert_eq!(calls, 2);
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        *receipts.lock().unwrap(),
+        [
+            "Retry attempt: transport 1/2; upstream 503; waiting 0.00s",
+            "Retry recovery: transport request recovered after 1 retries",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn scoped_retry_exhaustion_retains_typed_original_error_and_every_attempt() {
+    let (observation, receipts) = retry_receipt_observation();
+    let count = observation.retries.clone();
+    let mut calls = 0;
+    let result: RetryResult<()> = observe_request_retries(
+        Some(observation),
+        with_retry(
+            &immediate_retry_policy(2),
+            || {
+                calls += 1;
+                async {
+                    Err(LlmError::ServerError {
+                        status: 503,
+                        message: "RAW-TERMINAL-PROVIDER-BODY".into(),
+                    })
+                }
+            },
+            None,
+        ),
+    )
+    .await;
+    let error = result.unwrap_err();
+    assert_eq!(calls, 3);
+    assert_eq!(error.attempts, 3);
+    assert!(
+        matches!(error.last_error, LlmError::ServerError { status: 503, ref message } if message == "RAW-TERMINAL-PROVIDER-BODY")
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        *receipts.lock().unwrap(),
+        [
+            "Retry attempt: transport 1/2; upstream 503; waiting 0.00s",
+            "Retry attempt: transport 2/2; upstream 503; waiting 0.00s",
+            "Retry exhaustion: transport request stopped after 2 retries; upstream 503",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn isolated_retry_scope_never_observes_foreground_attempts() {
+    let (observation, receipts) = retry_receipt_observation();
+    let count = observation.retries.clone();
+    let mut calls = 0;
+    let result = observe_request_retries(
+        Some(observation),
+        observe_request_retries(
+            None,
+            with_retry(
+                &immediate_retry_policy(2),
+                || {
+                    calls += 1;
+                    let call = calls;
+                    async move {
+                        if call == 1 {
+                            Err(LlmError::NetworkError("private endpoint".into()))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                None,
+            ),
+        ),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert_eq!(calls, 2);
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(receipts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_request_retry_observations_keep_exact_producing_scope() {
+    let (first, first_receipts) = retry_receipt_observation();
+    let (second, second_receipts) = retry_receipt_observation();
+    let first_count = first.retries.clone();
+    let second_count = second.retries.clone();
+    let mut first_calls = 0;
+    let mut second_calls = 0;
+    let first_policy = immediate_retry_policy(2);
+    let second_policy = immediate_retry_policy(4);
+    let (a, b) = tokio::join!(
+        observe_request_retries(
+            Some(first),
+            with_retry(
+                &first_policy,
+                || {
+                    first_calls += 1;
+                    let call = first_calls;
+                    async move {
+                        if call == 1 {
+                            Err(LlmError::Timeout(Duration::from_secs(1)))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                None
+            )
+        ),
+        observe_request_retries(
+            Some(second),
+            with_retry(
+                &second_policy,
+                || {
+                    second_calls += 1;
+                    let call = second_calls;
+                    async move {
+                        if call == 1 {
+                            Err(LlmError::ServerError {
+                                status: 502,
+                                message: "opaque".into(),
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                None
+            )
+        ),
+    );
+    assert!(a.is_ok() && b.is_ok());
+    assert_eq!((first_calls, second_calls), (2, 2));
+    assert_eq!(first_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(second_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        first_receipts.lock().unwrap()[0],
+        "Retry attempt: transport 1/2; timeout; waiting 0.00s"
+    );
+    assert_eq!(
+        second_receipts.lock().unwrap()[0],
+        "Retry attempt: transport 1/4; upstream 502; waiting 0.00s"
+    );
 }

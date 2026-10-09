@@ -3263,6 +3263,53 @@ fn migrate_config_reports_copied_legacy_path() {
     let _ = fs::remove_dir_all(home);
 }
 
+#[cfg(unix)]
+#[test]
+fn migrate_config_refuses_a_dangling_link_at_the_primary_path() {
+    let _lock = env_lock();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!(
+        "codewhale-config-migration-link-{}-{unique}",
+        std::process::id()
+    ));
+    let legacy_config = home.join(LEGACY_APP_DIR).join(CONFIG_FILE_NAME);
+    fs::create_dir_all(legacy_config.parent().expect("legacy parent")).expect("legacy dir");
+    fs::write(&legacy_config, b"provider = \"deepseek\"\n").expect("legacy config");
+    let primary = home.join(CODEWHALE_APP_DIR).join(CONFIG_FILE_NAME);
+    fs::create_dir_all(primary.parent().expect("primary parent")).expect("primary dir");
+    let target = home.join("elsewhere").join("created-through-the-link");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("target dir");
+    std::os::unix::fs::symlink(&target, &primary).expect("plant dangling link");
+
+    let _env = StateEnvRestore {
+        home: env::var_os("HOME"),
+        userprofile: env::var_os("USERPROFILE"),
+        codewhale_home: env::var_os("CODEWHALE_HOME"),
+    };
+    // Safety: test-only environment mutation is serialized by env_lock().
+    unsafe {
+        env::set_var("HOME", &home);
+        env::set_var("USERPROFILE", &home);
+        env::remove_var("CODEWHALE_HOME");
+    }
+
+    let error = migrate_config_if_needed().expect_err("a linked primary path is refused");
+    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    assert!(!target.exists(), "the link target must not be created");
+    assert!(
+        fs::symlink_metadata(&primary)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted link is left as it was"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
 #[test]
 fn explicit_codewhale_home_bypasses_legacy_config_fallback_and_migration() {
     let _lock = env_lock();

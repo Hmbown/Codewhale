@@ -9,10 +9,12 @@ import os from "node:os";
 import path from "node:path";
 import url from "node:url";
 import { spawn } from "node:child_process";
+import { containsRasterPin } from "../src/trajectory.mjs";
 
 const ROOT = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "..");
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-traj-state-"));
 const recDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-traj-rec-"));
+const callsFile = path.join(stateDir, "backend-calls.jsonl");
 let server;
 let buf = "";
 const pending = new Map();
@@ -33,7 +35,8 @@ async function tool(name, args = {}) {
 
 before(() => {
   server = spawn("node", [path.join(ROOT, "mcp", "server.mjs")], {
-    env: { ...process.env, CODEWHALE_CU_STATE_DIR: stateDir, CODEWHALE_CU_RECORDINGS_DIR: recDir, CODEWHALE_CU_APP: "off" },
+    env: { ...process.env, CODEWHALE_CU_STATE_DIR: stateDir, CODEWHALE_CU_RECORDINGS_DIR: recDir, CODEWHALE_CU_APP: "off",
+      CODEWHALE_CU_TEST_BACKEND: path.join(ROOT, "tests/fixtures/fake-backend.mjs"), FAKE_BACKEND_CALLS: callsFile },
     stdio: ["pipe", "pipe", "pipe"],
   });
   server.stdin.write(hostKeysLine());
@@ -139,6 +142,55 @@ test("trajectory_replay skips app_script", async () => {
   assert.deepEqual(dry.not_replayable, [0]);
   const replay = await tool("trajectory", { action: "replay", id: path.basename(stopped.file) });
   assert.deepEqual(replay.results, [{ tool: "app_script", ok: false, code: "not_replayable" }]);
+});
+
+test("saved capture pins cannot replay, including legacy files and nested actions", async () => {
+  assert.equal(containsRasterPin({ target: { type: "coordinate", raster_id: "saved" } }), true);
+  assert.equal(containsRasterPin({ action: "zoom", raster_id: "saved" }), true);
+  assert.equal(containsRasterPin({ from_target: { type: "coordinate", raster_id: "saved" } }), true);
+  assert.equal(containsRasterPin({ to: { type: "coordinate", raster_id: "saved" } }), true);
+  assert.equal(containsRasterPin({ steps: [{ tool: "click", arguments: { target: { raster_id: "saved" } } }] }), true);
+  assert.equal(containsRasterPin({ target: { type: "coordinate", x: 1, y: 1 } }), false);
+  assert.equal(containsRasterPin({ target: { type: "element", state_id: "s-1" } }), false);
+
+  const started = await tool("trajectory", { action: "start" });
+  const shot = await tool("screenshot");
+  assert.equal(shot.ok, true, JSON.stringify(shot));
+  const clicked = await tool("left_click", { target: { type: "coordinate", x: 1, y: 1, raster_id: shot.raster_id } });
+  assert.equal(clicked.ok, true, JSON.stringify(clicked));
+  const stopped = await tool("trajectory", { action: "stop" });
+  const lines = fs.readFileSync(stopped.file, "utf8").trim().split("\n").map(JSON.parse);
+  const pinned = lines.find(l => l.tool === "left_click");
+  assert.equal(pinned.args.target.raster_id, shot.raster_id, "the recorded pin is never removed");
+  assert.equal(pinned.replayable, false);
+  // Old files did not set this marker. Admission must still inspect their pins.
+  delete pinned.replayable;
+  fs.writeFileSync(stopped.file, lines.map(l => JSON.stringify(l)).join("\n") + "\n");
+  const countClicks = () => fs.readFileSync(callsFile, "utf8").trim().split("\n").map(JSON.parse).filter(c => c.method === "left_click").length;
+  const before = countClicks();
+  const dry = await tool("trajectory", { action: "replay", id: path.basename(stopped.file), dry_run: true });
+  assert.deepEqual(dry.not_replayable, [1]);
+  assert.equal(countClicks(), before, "review sends no input");
+  const replay = await tool("trajectory", { action: "replay", id: path.basename(stopped.file) });
+  assert.deepEqual(replay.results, [{ tool: "screenshot", ok: true }, { tool: "left_click", ok: false, code: "not_replayable" }]);
+  assert.equal(countClicks(), before, "a new replay screenshot cannot authorize the original pixel action");
+
+  for (const slot of ["from_target", "to"]) {
+    const batch = { type: "call", tool: "run_actions", args: { steps: [
+      { tool: "left_click", arguments: { target: { type: "coordinate", space: "screen", x: 1, y: 1 } } },
+      { tool: "left_click_drag", arguments: {
+        from_target: { type: "coordinate", space: "screen", x: 1, y: 1 },
+        to: { type: "coordinate", space: "screen", x: 2, y: 2 },
+        [slot]: { type: "coordinate", x: 1, y: 1, raster_id: shot.raster_id },
+      } },
+    ] } };
+    fs.writeFileSync(stopped.file, JSON.stringify(batch) + "\n");
+    const reviewed = await tool("trajectory", { action: "replay", id: path.basename(stopped.file), dry_run: true });
+    assert.deepEqual(reviewed.not_replayable, [0], `${slot} prevents the whole legacy batch from replaying`);
+    const refused = await tool("trajectory", { action: "replay", id: path.basename(stopped.file) });
+    assert.deepEqual(refused.results, [{ tool: "run_actions", ok: false, code: "not_replayable" }]);
+    assert.equal(countClicks(), before, "no earlier batch input is dispatched before the pinned drag refusal");
+  }
 });
 
 test("replay refuses escaping ids; the kill switch gates replay but not status", async () => {

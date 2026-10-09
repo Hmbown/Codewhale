@@ -106,6 +106,27 @@ bundle() {
   cp "${cli_path}" "${stage_dir}/${cli_dst}"
   cp "${shim_path}" "${stage_dir}/${shim_dst}"
 
+  # Optional images are projected from the same qualified, hash-checked
+  # catalog. Android and targets without a receipt remain CLI-only.
+  local host_dir="${artifact_dir}/codewhale-compiled-hosts"
+  if [[ -f "${host_dir}/codewhale-extension-hosts.json" ]]; then
+    node - "${host_dir}" "${stage_dir}" "${platform}" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const hosts = require('./npm/codewhale/scripts/compiled-hosts');
+const [directory, stage, target] = process.argv.slice(2);
+const catalog = hosts.parseCatalog(fs.readFileSync(path.join(directory, hosts.HOST_CATALOG), 'utf8'));
+const host = catalog.hosts.find((entry) => entry.target === target);
+if (host) {
+  hosts.verifyDirectory(directory, { ...catalog, hosts: [host] });
+  const ext = target.startsWith('windows-') ? '.exe' : '';
+  for (const [asset, name] of [[host.asset, hosts.HOST_NAME + ext], [host.notices_asset, hosts.HOST_NAME + '.LICENSES.txt'], [host.source_asset, hosts.HOST_NAME + '.relink-source.tar.gz']]) fs.copyFileSync(path.join(directory, asset), path.join(stage, name));
+  fs.writeFileSync(path.join(stage, hosts.HOST_NAME + '.release.json'), JSON.stringify(catalog, null, 2) + '\n');
+  if (!ext) fs.chmodSync(path.join(stage, hosts.HOST_NAME), 0o755);
+}
+NODE
+  fi
+
   # actions/upload-artifact intentionally normalizes downloaded files to 0644.
   # Restore the executable contract before constructing Unix archives.
   if [[ "${platform}" != windows-* ]]; then
@@ -128,6 +149,7 @@ bundle() {
       write_crlf_file \
         scripts/release/install.bat \
         "${stage_dir}/install.bat"
+      write_crlf_file scripts/release/install.ps1 "${stage_dir}/install.ps1"
     else
       cp scripts/release/install.sh "${stage_dir}/"
       chmod +x "${stage_dir}/install.sh"

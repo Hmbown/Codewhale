@@ -1,0 +1,326 @@
+{
+  "requests": [
+    {
+      "authorization": null,
+      "protocol_version": null,
+      "rpc": "initialize",
+      "session": null,
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "notifications/initialized",
+      "session": "session-1",
+      "status": 202
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/list",
+      "session": "session-1",
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/call",
+      "session": "session-1",
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/call",
+      "session": "session-1",
+      "status": 404
+    },
+    {
+      "authorization": null,
+      "protocol_version": null,
+      "rpc": "initialize",
+      "session": null,
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "notifications/initialized",
+      "session": "session-2",
+      "status": 202
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/list",
+      "session": "session-2",
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/call",
+      "session": "session-2",
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/call",
+      "session": "session-2",
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": null,
+      "rpc": "initialize",
+      "session": null,
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "notifications/initialized",
+      "session": "session-3",
+      "status": 202
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/list",
+      "session": "session-3",
+      "status": 200
+    },
+    {
+      "authorization": null,
+      "protocol_version": "2025-03-26",
+      "rpc": "tools/call",
+      "session": "session-3",
+      "status": 200
+    }
+  ],
+  "server_received": [
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "notify_tool"
+    },
+    {
+      "arguments": {
+        "text": "first"
+      },
+      "method": "tools/call",
+      "name": "echo"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "session_error"
+    },
+    {
+      "arguments": {
+        "text": "after session error"
+      },
+      "method": "tools/call",
+      "name": "echo"
+    }
+  ],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Echo.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Answers with a tools/list_changed notification.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_notify_tool"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Answers with a JSON-RPC error that mentions the session.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_session_error"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "notified",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_notify_tool"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Echo.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Answers with a tools/list_changed notification.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_notify_tool"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Answers with a JSON-RPC error that mentions the session.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_session_error"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "echo",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Only advertised after a reconnect.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_added_later"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Echo.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Answers with a tools/list_changed notification.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_notify_tool"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Answers with a JSON-RPC error that mentions the session.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_session_error"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP server 'conformance' connection closed during tool call 'session_error'; outcome unknown, not retried",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_session_error"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "echo",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    }
+  ]
+}

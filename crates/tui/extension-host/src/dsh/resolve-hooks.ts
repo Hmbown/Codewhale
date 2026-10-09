@@ -7,8 +7,9 @@
  * package declared it, and ignoring any copy under the package's own
  * `node_modules` — resolves to the single instance bundled into this host.
  *
- * `@deepseek-ai/dsh-tools` resolves to the definition-side compat module.
- * Any other `@deepseek-ai/dsh-*` package fails the import loudly: the host
+ * `@deepseek-ai/dsh-tools` resolves to the definition-side compat module, and
+ * `@deepseek-ai/dsh-commands/brand` (the `CommandDefinitionId` constructor DSH
+ * command plugins import) to its two identity functions. Any other `@deepseek-ai/dsh-*` package fails the import loudly: the host
  * does not provide it, and a silent partial load would be worse.
  *
  * Node: `module.registerHooks`. Bun has no `registerHooks` (a named import of
@@ -16,19 +17,34 @@
  * rules through `Bun.plugin`, with three pieces (see `installBunResolver`).
  */
 import * as nodeModule from 'node:module'
+import {createHash} from 'node:crypto'
+import {fileURLToPath,pathToFileURL} from 'node:url'
+import {resolve,isAbsolute,dirname} from 'node:path'
+import {readFileSync} from 'node:fs'
+import { canonicalPath, insideKey, pathKey, unlinkedKeyMatches } from './canonical-path.ts'
 import { RUNTIME } from '../runtime.ts'
+import { prepareBunSource, REVIEWED_IMPORT } from './bun-closure.ts'
 
 const SCHEME = 'codewhale-host:'
 const REGISTRY_KEY = Symbol.for('codewhale.extension-host.modules')
 
 /** Specifier → singleton key. */
 const SINGLETONS: Record<string, string> = {
+  '@codewhale/dsh-composition': 'dsh-composition',
+  '@deepseek-ai/cordis-plugin-loader': 'dsh-loader',
+  '@deepseek-ai/cordis-plugin-include': 'dsh-include',
+  '@deepseek-ai/cordis-plugin-group': 'dsh-group',
   '@deepseek-ai/cordis': 'cordis',
   '@deepseek-ai/schemastery': 'schemastery',
   '@deepseek-ai/cosmokit': 'cosmokit',
   cosmokit: 'cosmokit',
   '@deepseek-ai/dsh-tools': 'dsh-tools',
   '@deepseek-ai/dsh-util-values': 'dsh-util-values',
+}
+
+/** Subpaths of a refused package that are provided anyway: exact specifier → singleton key. */
+const SUBPATH_SINGLETONS: Record<string, string> = {
+  '@deepseek-ai/dsh-commands/brand': 'dsh-commands-brand',
 }
 
 export class UnsupportedPeerError extends Error {
@@ -46,6 +62,7 @@ function packageName(specifier: string): string {
 /** Map a bare specifier to a singleton key, `null` for "not ours", or throw for an unsupported DSH peer. */
 export function classifySpecifier(specifier: string): string | null {
   if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.includes(':')) return null
+  if (specifier in SUBPATH_SINGLETONS) return SUBPATH_SINGLETONS[specifier]
   const name = packageName(specifier)
   if (name in SINGLETONS) {
     if (specifier !== name) throw new UnsupportedPeerError(specifier)
@@ -103,10 +120,20 @@ export function explainImportError(error: unknown): unknown {
  */
 function installBunResolver(modules: Record<string, Record<string, unknown>>) {
   const bun = (globalThis as any).Bun
+  Object.defineProperty(globalThis,REVIEWED_IMPORT,{value:async(specifier:unknown,caller:string,options?:unknown)=>{
+    if(typeof specifier==='symbol')throw new TypeError('composition import specifier cannot be a symbol')
+    const name=String(specifier)
+    const closure=closureAt(caller)
+    if(!closure)throw new Error('composition module closure is no longer admitted')
+    const target=checkedBunSpecifier(name,closure.receipt,caller,false)
+    const singleton=classifySpecifier(target)
+    if(singleton!==null)return modules[singleton]
+    return import(target,options as any)
+  },writable:false,configurable:false})
   bun.plugin({
     name: 'codewhale-host-modules',
     setup(build: any) {
-      for (const [specifier, key] of Object.entries(SINGLETONS)) {
+      for (const [specifier, key] of Object.entries({ ...SINGLETONS, ...SUBPATH_SINGLETONS })) {
         if (key in modules) build.module(specifier, () => ({ exports: modules[key], loader: 'object' }))
       }
       build.onResolve({ filter: /^[^./]/ }, (args: { path: string }) => {
@@ -114,12 +141,114 @@ function installBunResolver(modules: Record<string, Record<string, unknown>>) {
         if (key !== null && !(key in modules)) throw new UnsupportedPeerError(args.path)
         return undefined
       })
-      build.onLoad({ filter: PEER_PATH }, (args: { path: string }) => {
+      build.onLoad({ filter: new RegExp(`${PEER_PATH.source}|\\.(?:mjs|js|cjs|mts|cts|ts|tsx|jsx|json)$`) }, (args: { path: string }) => {
         const match = PEER_PATH.exec(args.path)
-        throw new UnsupportedPeerError((match?.[1] ?? args.path).replaceAll('\\', '/'))
+        if(match)throw new UnsupportedPeerError(match[1].replaceAll('\\', '/'))
+        const closure=closureAt(pathToFileURL(args.path).href)
+        if(!closure) {
+          const extension=args.path.split('.').at(-1)
+          if(extension==='json')return {contents:`export default JSON.parse(${JSON.stringify(readFileSync(args.path,'utf8'))});`,loader:'js'}
+          const loader=extension==='tsx'?'tsx'
+            :extension==='ts' || extension==='mts' || extension==='cts'?'ts'
+              :extension==='jsx' || extension==='js'?'jsx':'js'
+          return {contents:readFileSync(args.path,'utf8'),loader}
+        }
+        if(!(closure.path in closure.receipt.files) || !unlinkedInside(closure.receipt,closure.path,args.path))throw new Error('module was absent from reviewed composition closure or contains a symbolic link')
+        const bytes=readFileSync(args.path)
+        if(bytes.length>64*1024*1024 || createHash('sha256').update(bytes).digest('hex')!==closure.receipt.files[closure.path])throw new Error('composition module bytes changed after review')
+        // Bun 1.4 runtime onLoad treats its JSON loader as JS. Preserve exact
+        // JSON semantics (including __proto__ data keys) via a JS data module.
+        if(closure.path.endsWith('.json'))return {contents:`export default JSON.parse(${JSON.stringify(bytes.toString('utf8'))});`,loader:'js'}
+        let source:string
+        try {source=prepareBunSource(bytes.toString('utf8'),args.path,(specifier,require)=>checkedBunSpecifier(specifier,closure.receipt,pathToFileURL(args.path).href,require))}
+        catch(error){if(error instanceof SyntaxError)throw new Error('reviewed composition module has unsupported JavaScript syntax');throw error}
+        return {contents:source,loader:'js'}
       })
     },
   })
+}
+
+function checkedBunSpecifier(specifier:string,closure:ReviewedClosure,caller:string,require:boolean):string {
+  const key=classifySpecifier(specifier)
+  if(key!==null) {
+    if(!(key in (globalThis as any)[REGISTRY_KEY]))throw new UnsupportedPeerError(specifier)
+    return specifier
+  }
+  if(nodeModule.isBuiltin(specifier))return specifier.startsWith('node:')?specifier:`node:${specifier}`
+  const file=(specifier.startsWith('file:') || specifier.startsWith('.') || isAbsolute(specifier))
+    ?new URL(specifier,caller):undefined
+  const path=file?(require && !specifier.startsWith('file:')?resolve(dirname(fileURLToPath(caller)),specifier):resolve(fileURLToPath(file))):undefined
+  if(!path)throw new Error('bare dependency is absent from this reviewed composition; package its reviewed relative source')
+  if(file?.search || file?.hash)throw new Error('Bun does not preserve reviewed module query or fragment identity; select [extension_host] runtime = \"node\" for this composition')
+  const inside=keyIn(closure,path)
+  if(inside===undefined || !(inside in closure.files))throw new Error('composition import escapes the reviewed file closure')
+  return require?path:file!.href
+}
+
+// Module graph admission for an already-reviewed composition. This is an
+// ephemeral resolver index over the existing tree's file receipt, not an owner,
+// session or plugin state store. Native JS remains arbitrary co-resident code.
+//
+// Keyed by the canonical root's `pathKey`. A module path is matched lexically
+// against the canonical root or a raw root it was admitted under — never a raw
+// spelling against a canonical one (see canonical-path.ts): on Windows the two
+// differ in prefix, 8.3 names and case for the very same directory.
+interface ReviewedClosure {files:Readonly<Record<string,string>>,refs:number,canonicalRoot:string,rawRoots:Set<string>}
+const reviewedClosures=new Map<string,ReviewedClosure>()
+function keyIn(closure:ReviewedClosure,path:string):string|undefined {
+  const canonical=insideKey(closure.canonicalRoot,path)
+  if(canonical!==undefined)return canonical
+  for(const root of closure.rawRoots) {
+    const raw=insideKey(root,path)
+    if(raw!==undefined)return raw
+  }
+}
+/** `path` is `root/key` with no link inside the root (both sides canonicalized). */
+function unlinkedInside(closure:ReviewedClosure,key:string,path:string):boolean {
+  let canonical:string
+  try {canonical=canonicalPath(path)} catch {return false}
+  return unlinkedKeyMatches(closure.canonicalRoot,key,canonical)
+}
+export function admitReviewedClosure(baseUrl:string,files:Readonly<Record<string,string>>):()=>void {
+  const rawRoot=resolve(fileURLToPath(baseUrl))
+  const canonicalRoot=canonicalPath(rawRoot)
+  const id=pathKey(canonicalRoot)
+  const accepted:Record<string,string>=Object.create(null)
+  const keys=Object.keys(files)
+  if (keys.length>4096) throw new Error('reviewed composition closure exceeds its file limit')
+  for (const key of keys) {
+    if (!key || key.split('/').some(part=>!part || part==='.' || part==='..') || key.includes('\\') || key.includes(':') || isAbsolute(key) || !/^[a-f0-9]{64}$/.test(files[key])) throw new Error('invalid reviewed composition closure file')
+    accepted[key]=files[key]
+  }
+  const existing=reviewedClosures.get(id)
+  if(existing) {
+    if(Object.keys(existing.files).length!==keys.length || keys.some(key=>existing.files[key]!==accepted[key])) throw new Error('the same composition root carries different file receipts')
+    existing.refs++
+    existing.rawRoots.add(rawRoot)
+  } else reviewedClosures.set(id,{files:Object.freeze(accepted),refs:1,canonicalRoot,rawRoots:new Set([rawRoot])})
+  let disposed=false
+  return ()=>{if(disposed)return;disposed=true;const current=reviewedClosures.get(id);if(current && --current.refs===0)reviewedClosures.delete(id)}
+}
+/** Both runtimes consume the same exact admitted source-file receipt. */
+export async function importReviewedModule(baseUrl:string,path:string):Promise<unknown> {
+  const rawRoot=resolve(fileURLToPath(baseUrl))
+  const id=pathKey(canonicalPath(rawRoot))
+  const receipt=reviewedClosures.get(id)
+  if(!receipt)throw new Error('composition module closure is no longer admitted')
+  // The entry keeps the caller's spelling of the root: the one the composition
+  // already read and hashed the module through.
+  const entry=resolve(rawRoot,path)
+  const admitted=closureAt(pathToFileURL(entry).href)
+  if(!admitted || admitted.root!==id || !(admitted.path in receipt.files))throw new Error('composition module is absent from reviewed closure')
+  return import(pathToFileURL(entry).href)
+}
+function closureAt(url:string|undefined) {
+  if(!url?.startsWith('file:'))return
+  const path=resolve(fileURLToPath(url))
+  for(const [root,receipt] of reviewedClosures) {
+    const inside=keyIn(receipt,path)
+    if(inside!==undefined)return {root,receipt,path:inside}
+  }
 }
 
 let installed = false
@@ -143,14 +272,31 @@ export function installResolveHooks(modules: Record<string, Record<string, unkno
         if (!(key in modules)) throw new UnsupportedPeerError(specifier)
         return { url: `${SCHEME}${key}`, format: 'module', shortCircuit: true }
       }
-      return nextResolve(specifier, context)
+      const caller=closureAt(context.parentURL)
+      if(caller && !nodeModule.isBuiltin(specifier) && !specifier.startsWith('.') && !specifier.startsWith('/') && !specifier.startsWith('file:')) throw new Error('bare dependency is absent from this reviewed composition; package its reviewed relative source')
+      const result=nextResolve(specifier, context)
+      if(caller && result.url.startsWith('file:')) {
+        const target=closureAt(result.url)
+        if(!target || target.root!==caller.root || !(target.path in caller.receipt.files)) throw new Error('composition import escapes the reviewed file closure')
+      }
+      return result
     },
     load(url, context, nextLoad) {
       if (url.startsWith(SCHEME)) {
         const key = url.slice(SCHEME.length)
         return { format: 'module', source: virtualSource(key, modules[key]), shortCircuit: true }
       }
-      return nextLoad(url, context)
+      const result=nextLoad(url, context)
+      const closure=closureAt(url)
+      if(closure) {
+        if(!(closure.path in closure.receipt.files) || result.source===undefined || result.source===null) throw new Error('module was absent from reviewed composition closure')
+        // Windows runs Node with --preserve-symlinks, so a linked module keeps
+        // its in-closure URL; refuse it here as the Bun loader does.
+        if(!unlinkedInside(closure.receipt,closure.path,fileURLToPath(url))) throw new Error('module was absent from reviewed composition closure or contains a symbolic link')
+        const source=typeof result.source==='string'?Buffer.from(result.source):Buffer.from(result.source as Uint8Array)
+        if(source.length>64*1024*1024 || createHash('sha256').update(source).digest('hex')!==closure.receipt.files[closure.path]) throw new Error('composition module bytes changed after review')
+      }
+      return result
     },
   })
 }

@@ -2,6 +2,7 @@
 
 > 英文原文：[TOOL_SURFACE.md](../TOOL_SURFACE.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐本地解释器权限与后端限制；现有 MCP 有界发现段落已核对。
 
 本文描述当前面向模型的工具（tool）契约。产生它的 v0.9.1 切换记录在
 `docs/RUNTIME_SIMPLIFICATION_DESIGN.md` 中；工作区版本请从 `Cargo.toml` 读取，
@@ -19,22 +20,23 @@
 
 ## 默认激活契约
 
-新回合开始时带有十一个预加载（eager）的原生名称，外加合成的 `tool_search`：
+新回合开始时带有十二个预加载（eager）的原生名称，外加合成的 `tool_search`：
 
 1. `read`
 2. `write`
 3. `edit`
-4. `bash`
-5. `agent`
-6. `workflow`
-7. `todo_write`
-8. `create_goal`
-9. `get_goal`
-10. `update_goal`
-11. `load_skill`
-12. `tool_search`（合成，始终激活）
+4. `file_search`
+5. `bash`
+6. `agent`
+7. `workflow`
+8. `todo_write`
+9. `create_goal`
+10. `get_goal`
+11. `update_goal`
+12. `load_skill`
+13. `tool_search`（合成，始终激活）
 
-这十一个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
+这十二个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
 `DEFAULT_ACTIVE_NATIVE_TOOLS`，由
 `default_active_contract_keeps_discovery_and_core_tools_eager` 固定住。
 权限边界（authority boundary）可以在子智能体达到最大深度时移除 `agent`，
@@ -65,6 +67,19 @@ Full Access（完全访问）会改变常规审批行为，但不会绕过硬性
 `tasks`、`Git`、`Run`、`Web`、`remember` 以及其他专门能力都是可搜索的，
 而不是首回合的必备仪式。
 
+## 本地代码执行
+
+`code_execution`（Python）与 `js_execution`（Node.js）使用工作区任务门禁/测试
+共用的权限感知启动器。常规调用保留会话策略。对被拒绝的精确调用申请更宽权限时，
+提供 `sandbox_permissions`（`workspace-write` 或 `danger-full-access`）与非空
+`justification`；Ask 模式需用户明确批准一次。获准策略只作用于该调用。
+
+两种工具从 stdin 读代码，返回 stdout / stderr / return_code，保留超时及进程树
+清理。它们不是持久 REPL；异常堆栈指向 stdin。独立 RLM/REPL 内核不受此次启动器
+整合影响。共享启动器的平台限制仍适用：没有可用的本地包装器时，workspace-write
+无法强制执行，read-only 则被拒绝。外部 sandbox 会话必须使用自己的 shell 路径，
+不能借此运行本地解释器。参见[沙箱限制](SANDBOX.md)。
+
 ## 延迟与动态工具
 
 `Web` 是有条件的、延迟的。只有当生效的策略与运行时（runtime）后端允许时，
@@ -82,6 +97,12 @@ Full Access（完全访问）会改变常规审批行为，但不会绕过硬性
 MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 注册
 诸如 `mcp_<server>_<tool>` 这样的名称；失败或已禁用的服务器不得被呈现为可用。
 除非用户在 `[tools].always_load` 中明确点名，MCP 与插件工具都是延迟的。
+
+对于尚未启动的已配置服务器，面向 MCP 的 `tool_search` 先在当前回合的服务器与
+工具权限范围内执行有界发现。连接后搜索服务器实际提供的模式，不会虚构
+`mcp_*` 定义。在 `execute_tools` 内搜索只描述模式而不激活；直接搜索沿用现有的
+有界激活缓存。无关的普通搜索不会启动可选服务器。CLI 的独立 MCP 检查命令
+使用单独的连接池。
 
 ### 代码模式（`execute_tools`）
 
@@ -279,6 +300,6 @@ cargo test --locked -p codewhale-tui --lib core::engine::tests::print_mode_tool_
 `1 passed`（被忽略的指标测试报告 `1 passed` 只是因为 `--ignored` 选中了它）；
 `0 passed` 意味着过滤器没匹配到任何东西，检查根本没跑。
 
-不依赖提供商的回执必须报告上面列出的十一个默认激活名称。另一份仓库范围的
+不依赖提供商的回执必须报告上面列出的十二个默认激活名称。另一份仓库范围的
 工具计数可能包含延迟、动态、受特性开关控制以及仅为兼容而存在的注册；
 它不是放进首回合模型目录的工具数量。

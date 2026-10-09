@@ -20,7 +20,7 @@
 import crypto from "node:crypto";
 
 const GITHUB_API = process.env.GITHUB_API_BASE || "https://api.github.com";
-const REPO = process.env.GITHUB_REPOSITORY || "Hmbown/CodeWhale";
+const REPO = process.env.GITHUB_REPOSITORY || "codewhale-hq/CodeWhale";
 const USER_AGENT = "codewhale-cnb-bridge";
 
 function fail(message) {

@@ -50,7 +50,7 @@ const SNAPSHOTS_DIR_NAME: &str = "snapshots";
 
 /// Publication marker, outside the plugin itself. It is checked along with
 /// every embedded byte and directory entry, never used as proof by itself.
-const STAMP_NAME: &str = ".stamp";
+pub(crate) const STAMP_NAME: &str = ".stamp";
 
 const COMPUTER_USE: &str = "computer-use";
 
@@ -80,6 +80,7 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
     bundle_file!("mcp.json"),
     bundle_file!("commands/computer.md"),
     bundle_file!("skills/computer-use/SKILL.md"),
+    bundle_file!("skills/computer-use/references/operating-details.md"),
     bundle_file!("skills/computer-use/references/quick-reference.md"),
     bundle_file!("skills/computer-use/references/refusal-codes.md"),
     bundle_file!("skills/recording/SKILL.md"),
@@ -123,7 +124,7 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
 
 /// Digest of one bundle's entire contents, including its file names, so a
 /// renamed or removed file is as much a change as an edited one.
-fn digest(files: &[(&str, &[u8])]) -> String {
+pub(crate) fn digest(files: &[(&str, &[u8])]) -> String {
     let mut hasher = Sha256::new();
     for (relative, contents) in files {
         hasher.update((relative.len() as u64).to_le_bytes());
@@ -132,6 +133,61 @@ fn digest(files: &[(&str, &[u8])]) -> String {
         hasher.update(contents);
     }
     super::manifest::hex_digest(hasher.finalize())
+}
+
+/// A bundle this build embeds, identified by the digest of its contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmbeddedBundle {
+    pub name: &'static str,
+    pub digest: String,
+}
+
+impl EmbeddedBundle {
+    /// Directory name of this build's snapshot under the snapshots root.
+    pub(crate) fn snapshot_dir_name(&self) -> String {
+        format!("{}-{}", self.name, self.digest)
+    }
+}
+
+/// The bundles this build would materialize. Garbage collection compares
+/// on-disk snapshots against this list to decide which belong to other builds.
+pub(crate) fn embedded_bundles() -> Vec<EmbeddedBundle> {
+    vec![EmbeddedBundle {
+        name: COMPUTER_USE,
+        digest: digest(COMPUTER_USE_FILES),
+    }]
+}
+
+/// `<home>/builtin-plugins/snapshots`, the only place snapshots are published.
+pub(crate) fn snapshots_dir(home: &Path) -> PathBuf {
+    home.join(BUILTIN_DIR_NAME).join(SNAPSHOTS_DIR_NAME)
+}
+
+/// Split `<bundle>-<64 hex>` into the embedded bundle name and its digest.
+/// Anything else in the snapshots root is not ours to classify.
+pub(crate) fn parse_snapshot_dir_name(
+    dir_name: &str,
+    bundles: &[EmbeddedBundle],
+) -> Option<(&'static str, String)> {
+    bundles.iter().find_map(|bundle| {
+        let digest = dir_name.strip_prefix(bundle.name)?.strip_prefix('-')?;
+        (digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| (bundle.name, digest.to_string()))
+    })
+}
+
+/// Record that this build started with `snapshot`, so garbage collection can
+/// tell a snapshot a recent binary still uses from one nobody has opened in
+/// weeks. Best effort and mtime only: the stamp's bytes are never touched.
+fn mark_snapshot_used(snapshot: &Path) {
+    if let Ok(Some(stamp)) =
+        super::registry::open_existing_regular_file(&snapshot.join(STAMP_NAME), true)
+    {
+        let _ = stamp.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// Discovery roots holding the built-in bundles, writing them out if what is
@@ -169,8 +225,24 @@ pub fn materialized_dirs() -> Vec<PathBuf> {
 /// into an existing home only keeps that promise, and costs nothing in
 /// practice — the home exists from the moment Codewhale is configured or run.
 fn materialize() -> io::Result<Option<PathBuf>> {
-    let home = codewhale_config::codewhale_home().map_err(io::Error::other)?;
+    let home = materialization_home()?;
     materialize_at_home(&home)
+}
+
+/// Startup materializes into any existing home, so an unsealed test would
+/// write the developer's real `~/.codewhale/builtin-plugins`; it gets a
+/// private home instead.
+#[cfg(test)]
+fn materialization_home() -> io::Result<PathBuf> {
+    match crate::test_support::unsealed_state_dir(".") {
+        Some(home) => Ok(home),
+        None => codewhale_config::codewhale_home().map_err(io::Error::other),
+    }
+}
+
+#[cfg(not(test))]
+fn materialization_home() -> io::Result<PathBuf> {
+    codewhale_config::codewhale_home().map_err(io::Error::other)
 }
 
 fn materialize_at_home(home: &Path) -> io::Result<Option<PathBuf>> {
@@ -211,7 +283,11 @@ fn materialize_at_home(home: &Path) -> io::Result<Option<PathBuf>> {
 /// never replaces an existing entry, including an empty or damaged directory.
 /// Concurrent publishers of identical bytes converge after verifying the winner;
 /// different builds retain different source paths and therefore trust identities.
-fn write_bundle(root: &Path, name: &str, files: &[(&str, &[u8])]) -> io::Result<PathBuf> {
+pub(crate) fn write_bundle(
+    root: &Path,
+    name: &str,
+    files: &[(&str, &[u8])],
+) -> io::Result<PathBuf> {
     reject_symlink(root)?;
     if !super::agent_plugin::is_standard_plugin_name(name) || files.is_empty() {
         return Err(invalid_bundle(
@@ -236,6 +312,7 @@ fn write_bundle(root: &Path, name: &str, files: &[(&str, &[u8])]) -> io::Result<
     }
     if snapshot_exists(&destination)? {
         verify_snapshot(&destination, &expected)?;
+        mark_snapshot_used(&destination);
         return Ok(destination);
     }
 
@@ -353,7 +430,7 @@ fn verify_snapshot(root: &Path, files: &BTreeMap<PathBuf, &[u8]>) -> io::Result<
 /// Atomic no-replace directory publication. A check followed by ordinary Unix
 /// rename is insufficient: rename is allowed to replace an existing empty dir.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
+pub(super) fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -384,7 +461,7 @@ fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
+pub(super) fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
     use windows::core::PCWSTR;
@@ -408,7 +485,7 @@ fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn publish_snapshot(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(super) fn publish_snapshot(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic built-in snapshot publication is unsupported on this platform",

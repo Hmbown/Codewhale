@@ -690,6 +690,16 @@ PASSWORD=hunter2hunter2"
     }
 
     #[test]
+    fn redact_keeps_a_provider_refusal_reason_readable() {
+        // xAI answers an exhausted account with a 403 whose body is the whole
+        // explanation. The `Authorization failed:` prefix is our label, not a
+        // header, so the reason after it must survive to the error card.
+        let input = "Authorization failed: You have run out of credits or need a Grok \
+                     subscription. Add credits at https://grok.com/?_s=usage.";
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
     fn redact_still_masks_a_bearer_token_assignment() {
         // Counterpart of the diagnostic test above: a real credential keyed
         // as `token` (or `api_token`) must still be dropped, including a

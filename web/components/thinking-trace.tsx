@@ -1,7 +1,7 @@
 import { getConstitution, pickText } from "@/lib/i18n/dictionaries";
 import { Icon } from "./icon";
 /**
- * "See how it decides" — a terminal-styled pane that illustrates how the
+ * "See how it decides" — explanatory prose that illustrates how the
  * constitution's rank shows up in a model's reasoning, paired with the
  * decision each line of reasoning led to.
  *
@@ -29,7 +29,7 @@ export const SCENES: Scene[] = [
       zh: "当上一会话的总结与仓库真实状态不符时……",
     },
     trace:
-      "Per Article II (truth) and V (verification), I report what's actually in the tree — not what the previous agent claimed.",
+      "Per Article II (truth) and V (verification), I report what's actually in the tree, not what the previous agent claimed.",
     cites: ["Article II · Truth", "Article V · Verification"],
     decision: {
       en: "Reported the uncommitted work the summary left out, instead of repeating the claim.",
@@ -43,7 +43,7 @@ export const SCENES: Scene[] = [
       zh: "当「暂停」信号与用户要求继续相冲突时……",
     },
     trace:
-      "The user's current request outranks the runtime statute — so I keep executing the task, not stopping on a technicality.",
+      "The user's current request outranks the runtime statute, so I keep executing the task, not stopping on a technicality.",
     cites: ["Article III · User agency", "Article VII · Hierarchy"],
     decision: {
       en: "Finished the work the user actually asked for.",
@@ -57,7 +57,7 @@ export const SCENES: Scene[] = [
       zh: "精简 README 时，本可删掉贡献者名单……",
     },
     trace:
-      "Deleting community credit would break the project's own ethos. Relocate it instead — zero names lost.",
+      "Deleting community credit would break the project's own ethos. Relocate it instead. No names lost.",
     cites: ["Community ethos"],
     decision: {
       en: "Moved 200 lines of credits to docs/CONTRIBUTORS.md and linked from the README.",
@@ -79,7 +79,7 @@ export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
             </span>
             <span className="trace-context">{pickText(s.context, locale)}</span>
           </figcaption>
-          <pre className="trace-body">{s.trace}</pre>
+          <p className="trace-body">{s.trace}</p>
           <p className="trace-cites">
             {s.cites.map((c) => (
               <span key={c} className="pill">{c}</span>

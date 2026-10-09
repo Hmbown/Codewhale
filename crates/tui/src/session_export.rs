@@ -159,7 +159,7 @@ pub fn write_session_archive(
         ));
     }
     let session_json = session_json(session)?;
-    let container_json = container_json(session)?;
+    let container_json = container_json(session, sessions_dir)?;
     let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -299,8 +299,24 @@ fn session_json(session: &SavedSession) -> io::Result<String> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn container_json(session: &SavedSession) -> io::Result<String> {
-    let container: SessionImportContainer = session.export_container("session-archive");
+/// The portable journal container. With a session store it also carries the
+/// entries bounded saves moved into the journal archive (#6842), so an export
+/// holds the full history, not only what the document still keeps.
+fn container_json(session: &SavedSession, sessions_dir: Option<&Path>) -> io::Result<String> {
+    let mut container: SessionImportContainer = session.export_container("session-archive");
+    if let Some(root) = sessions_dir {
+        let archived = crate::session_manager::load_journal_archive(root, &session.metadata.id)?;
+        if !archived.is_empty() {
+            let present: std::collections::HashSet<String> =
+                container.entries.iter().map(|e| e.id.clone()).collect();
+            let mut entries: Vec<_> = archived
+                .into_iter()
+                .filter(|e| !present.contains(&e.id))
+                .collect();
+            entries.append(&mut container.entries);
+            container.entries = entries;
+        }
+    }
     serde_json::to_string_pretty(&container)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -1012,5 +1028,47 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// #6842: entries a bounded save archived travel with the export.
+    #[test]
+    fn container_includes_journal_archive_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        let session = fixture_session();
+        let journal = session.journal.clone().expect("journal");
+        let root = journal.entries[0].id.clone();
+        let mut archived = journal.clone();
+        archived.branch_to(&root).expect("branch");
+        let extra = archived.append_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "archived alternative".to_string(),
+                cache_control: None,
+            }],
+        });
+        let entry = archived.entries.last().expect("entry").clone();
+        assert_eq!(entry.id, extra);
+        let archive_dir = sessions.join(crate::session_manager::JOURNAL_ARCHIVE_DIR);
+        fs::create_dir_all(&archive_dir).expect("archive dir");
+        let path = archive_dir.join(format!("{}.jsonl", session.metadata.id));
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let without: SessionImportContainer =
+            serde_json::from_str(&container_json(&session, None).unwrap()).unwrap();
+        let with: SessionImportContainer =
+            serde_json::from_str(&container_json(&session, Some(&sessions)).unwrap()).unwrap();
+        assert_eq!(with.entries.len(), without.entries.len() + 1);
+        assert!(with.entries.iter().any(|e| e.id == extra));
+        with.into_journal().expect("merged container validates");
     }
 }

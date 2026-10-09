@@ -22,6 +22,18 @@ fn target(root: &Path, path: &Path, create: bool) -> io::Result<WorkspaceFile> {
 }
 
 pub(crate) fn open_read(root: &Path, path: &Path) -> io::Result<File> {
+    open_regular(root, path, false)
+}
+
+/// [`open_read`] for a file another process may hold open for writing, such as
+/// a running worker's log. Windows denies those writers to [`open_read`] (it
+/// is the protected reader), so this takes the sharing reader; the links and
+/// regular-file policy is the same.
+pub(crate) fn open_read_shared(root: &Path, path: &Path) -> io::Result<File> {
+    open_regular(root, path, true)
+}
+
+fn open_regular(root: &Path, path: &Path, shared: bool) -> io::Result<File> {
     let target = target(root, path, false)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
@@ -38,7 +50,11 @@ pub(crate) fn open_read(root: &Path, path: &Path) -> io::Result<File> {
     }
     // The pinned parent and no-follow open enforce the same policy even if
     // the path changes after the metadata check. The handle is checked too.
-    target.open_file()
+    if shared {
+        target.open_file_shared()
+    } else {
+        target.open_file()
+    }
 }
 
 pub(crate) fn read_to_string(root: &Path, path: &Path) -> io::Result<String> {
@@ -106,6 +122,31 @@ mod tests {
         assert_eq!(read_to_string(root.path(), &path).unwrap(), "next");
     }
 
+    /// A running worker holds its log open for writing while the host reads
+    /// it (Windows denied that to the protected reader).
+    #[test]
+    fn a_shared_read_sees_a_file_a_writer_still_holds_open() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("logs/worker.log");
+        let mut writer = open_append(root.path(), &path).unwrap();
+        writer.write_all(b"started").unwrap();
+        writer.flush().unwrap();
+        let mut text = String::new();
+        open_read_shared(root.path(), &path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "started");
+        writer.write_all(b" and running").unwrap();
+        drop(writer);
+        assert_eq!(
+            read_to_string(root.path(), &path).unwrap(),
+            "started and running"
+        );
+        assert!(open_read_shared(root.path(), root.path()).is_err());
+        assert!(open_read_shared(root.path(), &root.path().join("../worker.log")).is_err());
+    }
+
     #[test]
     fn confined_files_refuse_paths_outside_the_root() {
         let root = tempfile::tempdir().unwrap();
@@ -150,6 +191,7 @@ mod tests {
             root.path().join("linked.md"),
         ] {
             assert!(open_read(root.path(), &path).is_err());
+            assert!(open_read_shared(root.path(), &path).is_err());
             assert!(open_append(root.path(), &path).is_err());
             assert!(write(root.path(), &path, b"next").is_err());
             assert_eq!(fs::read_to_string(&original).unwrap(), "original");

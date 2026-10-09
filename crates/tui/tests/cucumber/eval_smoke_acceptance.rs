@@ -10,7 +10,6 @@
 //! focused unit tests in command_palette.rs, widgets/mod.rs, and
 //! commands/mod.rs.
 
-use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
 use cucumber::{World as _, given, then, when, writer::Stats as _};
@@ -43,7 +42,7 @@ fn eval_harness_runs_shell_command(world: &mut EvalSmokeWorld) {
         .as_ref()
         .expect("evaluation workspace should exist");
 
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .args([
             "eval",
             "--json",
@@ -53,7 +52,7 @@ fn eval_harness_runs_shell_command(world: &mut EvalSmokeWorld) {
         ])
         .arg(record_dir.path())
         .output()
-        .expect("codewhale-tui eval should start");
+        .expect("codewhale eval should start");
 
     // Capture stdout/stderr for diagnostics
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -88,7 +87,7 @@ fn binary_exits_without_crashing(world: &mut EvalSmokeWorld) {
     assert_no_signal_crash(&status);
     assert!(
         exit_code == 0 || exit_code == 1,
-        "codewhale-tui eval exited with unexpected code {exit_code} (expected 0 or 1)"
+        "codewhale eval exited with unexpected code {exit_code} (expected 0 or 1)"
     );
 
     let report = world.report.as_ref().expect("eval report should exist");
@@ -164,7 +163,7 @@ fn assert_no_signal_crash(status: &ExitStatus) {
     use std::os::unix::process::ExitStatusExt;
     assert!(
         status.signal().is_none(),
-        "codewhale-tui eval was killed by signal {} (crash?)",
+        "codewhale eval was killed by signal {} (crash?)",
         status.signal().unwrap()
     );
 }
@@ -172,20 +171,3 @@ fn assert_no_signal_crash(status: &ExitStatus) {
 /// No-op on non-Unix platforms where `ExitStatusExt` is unavailable.
 #[cfg(not(unix))]
 fn assert_no_signal_crash(_status: &ExitStatus) {}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
-}

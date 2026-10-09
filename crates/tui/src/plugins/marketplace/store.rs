@@ -333,7 +333,7 @@ mod tests {
         let store = MarketplaceStore::open(Some(&state_path)).unwrap();
         let initial = store.load().unwrap();
         let catalog = initial.get("codewhale").expect("first-party catalog");
-        assert_eq!(catalog.catalog.total_candidates(), 6);
+        assert_eq!(catalog.catalog.total_candidates(), 19);
         assert_eq!(catalog.catalog.error_count(), 0);
         assert_eq!(catalog.catalog.warning_count(), 0);
         assert!(!catalog.catalog.provenance.grants_trust());
@@ -346,11 +346,9 @@ mod tests {
             else {
                 panic!("uninstallable candidate")
             };
-            assert!(
-                spec.starts_with(
-                    "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/"
-                )
-            );
+            assert!(spec.starts_with(
+                "https://codeload.github.com/codewhale-hq/codewhale-plugin-marketplace/"
+            ));
             assert!(spec.contains("#path="));
         }
         assert!(!store.path().exists(), "browsing must not write or fetch");

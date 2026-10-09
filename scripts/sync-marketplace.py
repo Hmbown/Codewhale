@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-REPOSITORY = "https://github.com/Hmbown/codewhale-plugin-marketplace"
+REPOSITORY = "https://github.com/codewhale-hq/codewhale-plugin-marketplace"
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--marketplace", type=Path, default=ROOT.parent / "codewhale-plugin-marketplace")
 parser.add_argument("--check", action="store_true")
@@ -31,7 +31,7 @@ for candidate in catalog["plugins"]:
     # comes from bumping the pin (the marketplace-sync workflow reports drift
     # against `main` weekly); `/plugin update` re-downloads the same archive
     # and reports no change until the pin moves.
-    candidate["source"] = f"https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/{revision}#path={relative}"
+    candidate["source"] = f"https://codeload.github.com/codewhale-hq/codewhale-plugin-marketplace/tar.gz/{revision}#path={relative}"
 snapshot = {"repository": REPOSITORY, "revision": revision, "catalog": catalog}
 rendered = json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n"
 output = ROOT / "crates/tui/assets/first-party-marketplace.json"

@@ -60,7 +60,7 @@ Codewhale 不会凭空编造远程插件 URL；缺失的插件只会从你添加
 | `chrome-devtools` MCP（`/mcp recommendations`） | 它自己驱动的一个 Chrome，可以包含已登录的页面 | DevTools 级别的检查和性能分析 |
 | Playwright MCP（`/mcp recommendations`） | 带 `--isolated` 的全新隔离 profile | 不带你身份的脚本化流程和测试 |
 | Computer Use 的 `browser_*` 工具（内置，审查前关闭） | 它自己启动的浏览器，用独立的 profile | 更宽泛的桌面任务里的浏览器步骤 |
-| Chromewhale（开发者预览版，`Hmbown/codewhale-plugin-marketplace`） | 你自己的、已经打开的 Chrome profile；以 unpacked 方式加载 | 读取或操作你当前正看的标签页，每次授权一个站点 |
+| Chromewhale（开发者预览版，`codewhale-hq/codewhale-plugin-marketplace`） | 你自己的、已经打开的 Chrome profile；以 unpacked 方式加载 | 读取或操作你当前正看的标签页，每次授权一个站点 |
 
 这些都不会主动推荐给你。按任务需要自己添加。
 

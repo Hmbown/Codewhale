@@ -351,20 +351,21 @@ impl AutomationEditor {
         locale: Locale,
         original: Option<AutomationRecord>,
     ) -> Self {
-        let provider = config.api_provider();
-        let identity = config
-            .active_provider_identity(provider)
-            .map(|identity| identity.key)
-            .unwrap_or_else(|_| {
+        let active = config.active_provider_identity().ok();
+        // Invalid configuration remains visible, but does not admit any route.
+        let identity = active
+            .as_ref()
+            .map(|identity| identity.key.to_string())
+            .unwrap_or_else(|| {
                 config
                     .provider
                     .clone()
-                    .unwrap_or_else(|| provider.as_str().to_string())
+                    .unwrap_or_else(|| "unavailable".to_string())
             });
         let mut models = vec![ModelChoice::default()];
         for (route, model, _) in super::super::fleet_setup::cross_provider_model_routes(
             config,
-            provider,
+            active.as_ref(),
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         ) {
             // `auto` may use configured cross-provider routing. It is not a
@@ -375,8 +376,8 @@ impl AutomationEditor {
             if let Ok(identity) = config.resolve_provider_identity(&route) {
                 let choice = ModelChoice {
                     model: Some(model),
-                    provider: Some(identity.provider.as_str().to_string()),
-                    provider_id: Some(identity.key),
+                    provider: Some(identity.persisted_kind().to_string()),
+                    provider_id: identity.persisted_id().map(str::to_string),
                 };
                 if !models.contains(&choice) {
                     models.push(choice);

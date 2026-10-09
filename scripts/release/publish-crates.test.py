@@ -21,7 +21,7 @@ class PublishPreflightTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.scripts = self.root / "scripts/release"
         self.scripts.mkdir(parents=True)
-        for name in ("publish-crates.sh", "validate-crate-publish-order.py"):
+        for name in ("publish-crates.sh", "validate-crate-publish-order.py", "check-crate-sizes.py"):
             shutil.copy2(SCRIPTS / name, self.scripts / name)
         (self.scripts / "crates.sh").write_text(
             "release_crates=(codewhale-preflight-base codewhale-preflight-app)\n"
@@ -139,6 +139,22 @@ class PublishPreflightTests(unittest.TestCase):
             ["bash", str(self.scripts / "publish-crates.sh"), "dry-run"], success=True
         )
         self.assertFalse(self.uploads.exists())
+
+    def test_oversized_tarball_is_refused_before_any_upload(self):
+        # crates.io refused codewhale-tui's 11.93 MiB tarball with HTTP 413 in
+        # v0.10.1, after 26 crates had already uploaded. An oversized tarball
+        # must stop the release before the first upload; incompressible bytes
+        # keep this fixture's packed tarball over the real 10 MiB limit.
+        manifest = self.root / "app/Cargo.toml"
+        manifest.write_text(manifest.read_text().replace('exclude = ["src/payload.txt"]\n', ""))
+        (self.root / "app/src/big.bin").write_bytes(os.urandom(11 * 1024 * 1024))
+        output = self.run_command(
+            ["bash", str(self.scripts / "publish-crates.sh"), "publish"], success=False
+        )
+        self.assertFalse(self.uploads.exists(), "upload reached before the size gate")
+        self.assertIn("codewhale-preflight-app", output)
+        self.assertIn("over the crates.io limit", output)
+        self.assertIn("10485760", output)
 
 
 if __name__ == "__main__":

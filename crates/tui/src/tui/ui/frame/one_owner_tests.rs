@@ -63,6 +63,7 @@ fn subagent(
         git_branch: None,
         agent_type: crate::tools::subagent::FleetRole::Worker,
         assignment: crate::tools::subagent::SubAgentAssignment {
+            native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
         },
@@ -696,7 +697,7 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
 /// missing coverage is evidence, independent of whether today's route is known.
 #[test]
 fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
-    use crate::config::{ApiProvider, ChromeRowPreset, StatusItem};
+    use crate::config::{ChromeRowPreset, ProviderKind, StatusItem};
     use crate::route_billing::{BillingPresentation, UsageChip};
 
     for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32)] {
@@ -705,7 +706,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
             content: "Review saved usage".to_string(),
         }];
         app.resync_history_revisions();
-        app.set_provider_identity(ApiProvider::Custom, "my-gateway");
+        app.set_provider_identity(ProviderKind::Custom, "my-gateway");
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
         app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::High;
@@ -716,7 +717,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
         app.metrics_line = ChromeRowPreset::Compact;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let expected = "cost: unknown (saved coverage unavailable)";
-        assert_eq!(app.api_provider, ApiProvider::Custom);
+        assert_eq!(app.api_provider, ProviderKind::Custom);
         assert!(matches!(app.cumulative_usage_chip(), UsageChip::Unknown(_)));
         assert_eq!(super::session_cost_label(&app), expected);
         let (rows, _) = draw_into(&mut app, &mut terminal);
@@ -809,7 +810,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
             priced.last().unwrap().contains("0.42"),
             "real fixture price survives Custom: {priced:?}"
         );
-        app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+        app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
         app.active_route_base_url = "https://api.deepseek.com/v1".to_string();
         app.model = "deepseek-v4-pro".to_string();
         app.billing_presentation = BillingPresentation::Metered;
@@ -819,7 +820,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
             priced.last(),
             "historical price does not follow today's provider"
         );
-        app.set_provider_identity(ApiProvider::Custom, "my-gateway");
+        app.set_provider_identity(ProviderKind::Custom, "my-gateway");
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
         app.billing_presentation = BillingPresentation::Unknown;

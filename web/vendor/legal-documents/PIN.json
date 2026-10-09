@@ -1,16 +1,21 @@
 {
-  "sourceRepository": "Hmbown/codewhale-platform",
-  "sourceCommit": "623abea63cad431bfa9cd4c60b579a7cb0328206",
+  "sourceRepository": "codewhale-hq/codewhale-platform",
+  "sourceCommit": "4cd9450aec07ed81d6c56b5ce741424fec533d6b",
   "files": [
     {
       "source": "packages/contracts/src/legal-documents.js",
       "path": "legal-documents.js",
-      "sha256": "680cff7561450eaefff5c597632e35f008dba38619d3f5392ba87221152de363"
+      "sha256": "49ec0eecc250328f326f9f06e751295349057aef943ec498bc4becd0644dda10"
     },
     {
       "source": "packages/contracts/src/legal-documents.d.ts",
       "path": "legal-documents.d.ts",
       "sha256": "ff356a67ec2692fd84dac4b1d475360123f3a4856e127830231d04c93d431408"
+    },
+    {
+      "source": "apps/web/components/legal/legal-content.tsx",
+      "path": "legal-content.tsx",
+      "sha256": "0ffc3568bb9a8dea5e05c497763a342377fec3526b16fa273103909be9f9a3c1"
     }
   ]
 }

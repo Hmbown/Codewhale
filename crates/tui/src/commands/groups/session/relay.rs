@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use super::CommandResult;
 use codewhale_command_contract::facets::{
-    CommandSessionControlContext, PlanProjection, PlanStepStatus,
+    CommandSessionControlContext, PlanProjection, PlanStepStatus, RelayProjection,
 };
 use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
 use codewhale_command_contract::metadata::{
@@ -56,29 +56,31 @@ pub(in crate::commands) fn relay_portable(
     arg: Option<&str>,
 ) -> CommandResult {
     let focus = arg.map(str::trim).filter(|value| !value.is_empty());
-    let message = build_relay_instruction(control, focus);
+    let projection = control.relay_projection();
+    let status = format!("Preparing session relay at {}...", projection.handoff_path);
+    let message = build_relay_instruction(projection, focus);
     CommandResult::with_message_and_action(
-        "Preparing session relay at .deepseek/handoff.md...",
+        status,
         codewhale_command_contract::outcome::SessionAction::SendMessage(message),
     )
 }
 
-/// Compose the byte-identical relay instruction from the portable snapshot.
-fn build_relay_instruction(
-    control: &dyn CommandSessionControlContext,
-    focus: Option<&str>,
-) -> String {
-    let projection = control.relay_projection();
+/// Compose the relay instruction from the portable snapshot.
+///
+/// The relay is written to `projection.handoff_path`, the path the next
+/// session reads first. A relay written to the legacy location is ignored
+/// whenever a file exists at that path.
+fn build_relay_instruction(projection: RelayProjection, focus: Option<&str>) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
         "Create a compact session relay (接力) for a future Codewhale thread."
     );
     let _ = writeln!(out);
-    let _ = writeln!(out, "Write or update `.deepseek/handoff.md`.");
+    let _ = writeln!(out, "Write or update `{}`.", projection.handoff_path);
     let _ = writeln!(
         out,
-        "Keep the existing file path for compatibility, but title the artifact `# Session relay`."
+        "Write exactly this path so the next session loads it, and title the artifact `# Session relay`."
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "Use this relay structure:");
@@ -196,9 +198,7 @@ fn write_plan_list(out: &mut String, label: &str, values: &[String]) {
 mod tests {
     use super::super::control_test_support::message;
     use super::*;
-    use codewhale_command_contract::facets::{
-        PlanSections, PlanStep, RelayProjection, TodoProjection,
-    };
+    use codewhale_command_contract::facets::{PlanSections, PlanStep, TodoProjection};
 
     #[test]
     fn relay_composes_exact_instruction_and_action() {
@@ -224,7 +224,8 @@ mod tests {
         assert!(message.contains("- Requested relay focus: focus on the handoff"));
         assert!(message.contains("- Goal objective: objective-y"));
         assert!(message.contains("- Goal token budget: 900"));
-        assert!(message.contains("Keep the existing file path for compatibility, but title the artifact `# Session relay`."));
+        assert!(message.contains("\n\nWrite or update `.codewhale/handoff.md`.\nWrite exactly this path so the next session loads it, and title the artifact `# Session relay`.\n"));
+        assert!(!message.contains(".deepseek"));
         assert!(message.contains("Before writing, inspect the current transcript context"));
         assert!(message.contains("Keep it under about 900 words"));
         assert!(!message.contains("Current To-do:"));
@@ -233,9 +234,33 @@ mod tests {
             result
                 .message
                 .as_deref()
-                .is_some_and(|m| m == "Preparing session relay at .deepseek/handoff.md...")
+                .is_some_and(|m| m == "Preparing session relay at .codewhale/handoff.md...")
         );
         assert_eq!(fake.calls.borrow().as_slice(), ["relay_projection"]);
+    }
+
+    #[test]
+    fn relay_names_the_path_the_host_reads_back() {
+        let mut fake = super::super::control_test_support::FakeControl {
+            relay: Some(RelayProjection {
+                handoff_path: "state/relay.md".to_string(),
+                ..super::super::control_test_support::relay_projection_fixture()
+            }),
+            ..super::super::control_test_support::FakeControl::default()
+        };
+        let result = relay_portable(&mut fake, None);
+        assert_eq!(
+            message(&result),
+            "Preparing session relay at state/relay.md..."
+        );
+        let instruction = match result.action {
+            Some(codewhale_command_contract::outcome::SessionAction::SendMessage(message)) => {
+                message
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        };
+        assert!(instruction.contains("Write or update `state/relay.md`."));
+        assert!(!instruction.contains("handoff.md"));
     }
 
     #[test]
@@ -243,6 +268,7 @@ mod tests {
         let mut fake = super::super::control_test_support::FakeControl {
             relay: Some(RelayProjection {
                 compact_template: "# Session relay".to_string(),
+                handoff_path: ".codewhale/handoff.md".to_string(),
                 workspace: "/work".to_string(),
                 mode: "operate".to_string(),
                 model: "model-x".to_string(),
@@ -272,6 +298,7 @@ mod tests {
         let mut fake = super::super::control_test_support::FakeControl {
             relay: Some(RelayProjection {
                 compact_template: "template".to_string(),
+                handoff_path: ".codewhale/handoff.md".to_string(),
                 workspace: "/w".to_string(),
                 mode: "m".to_string(),
                 model: "mo".to_string(),

@@ -71,7 +71,7 @@ impl ToolSpec for WebTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web, fetch a known URL, or wait for a local dev server. Prefer fetch for a canonical URL and search when the source is unknown. Web actions are read-only and network-policy aware."
+        "Search the web, fetch a known URL, or wait for a local dev server. fetch retrieves a canonical URL directly; search finds sources when the URL is unknown. Web actions are read-only and network-policy aware."
     }
 
     fn input_schema(&self) -> Value {
@@ -107,7 +107,10 @@ impl ToolSpec for WebTool {
                                 ]
                             },
                             "domains": { "type": "array", "items": { "type": "string" } },
-                            "locale": { "type": "string" }
+                            "locale": {
+                                "type": "string",
+                                "description": "BCP 47-style result locale tag such as zh-CN or ja-JP"
+                            }
                         }
                     }
                 },
@@ -133,7 +136,7 @@ impl ToolSpec for WebTool {
                 },
                 "locale": {
                     "type": "string",
-                    "description": "Requested result locale (action=search)"
+                    "description": "Requested result locale as a BCP 47-style tag such as zh-CN or ja-JP (action=search); malformed values are ignored and backends that cannot honor the region report it as degraded"
                 },
                 "url": {
                     "type": "string",

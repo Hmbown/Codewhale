@@ -1,14 +1,14 @@
 // End-to-end tests of the committed host bundle against a fake core.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { BUNDLE, HOST_ARGS, IS_BUN, activate, sha256File, startHost } from './harness.mjs'
-import { encodeFrame } from '../dist/protocol.mjs'
+import { BUNDLE, FIXTURES, HOST_ARGS, HOST_ENV, IS_BUN, activate, owner, sha256File, startHost } from './harness.mjs'
+import { ErrorCode, encodeFrame } from '../dist/protocol.mjs'
 
 // Budgets for a cold host start (the first host this file starts), gated in
 // the first test. Measured 2026-09-30 on macOS arm64, 5 starts each: Node 26
@@ -44,6 +44,9 @@ test('handshake reports protocol 1 and the digest of the running bundle', async 
   // The real runtime, not Bun's emulated `process.versions.node`.
   assert.deepEqual(host.hello.runtime, IS_BUN ? { name: 'bun', version: process.versions.bun } : { name: 'node', version: process.versions.node })
   assert.equal(host.hello.node_version, undefined)
+  // The tier the host serves and the built-in module digests it embeds.
+  assert.equal(host.hello.tier, 'plugin')
+  assert.deepEqual(host.hello.builtin_modules, builtinDigests())
   // No limit was asked for, so none is reported.
   assert.equal(host.hello.memory_limit_mib, undefined)
   const rss = residentMiB(host.child.pid)
@@ -67,17 +70,38 @@ test('the documented typed hello extension activates and executes unchanged', as
   t.after(() => host.stop())
   const entry = fileURLToPath(new URL('../../../../docs/examples/plugins/hello-extension/hello.mts', import.meta.url))
   const { result } = await activate(host, 'hello-extension', entry)
-  assert.deepEqual(result, { status: 'ok', tools: ['hello_greet'] })
-  const tool = host.registry.find((entry) => entry.op === 'register')
+  assert.deepEqual(result, { status: 'ok', tools: ['hello_greet'], commands: ['hello-greet'] })
+  const tool = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'tool')
   const output = await host.call('tool/call', { handle: tool.handle, call_id: 'hello-1', input: { name: 'Codewhale' }, deadline_ms: 5000 })
   assert.deepEqual(output.structured, { greeting: 'Hello, Codewhale!', callId: 'hello-1' })
+  const command = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'command')
+  assert.deepEqual(command.spec, { name: 'hello-greet', description: command.spec.description, argument_hint: '[name]' })
+  const said = await host.call('command/run', { handle: command.handle, command_id: 'c-1', raw_input: 'Codewhale', deadline_ms: 5000 })
+  assert.deepEqual(said, { kind: 'success', text: 'Hello, Codewhale!' })
+})
+
+test('the typed hello example reads its one setting, validated by its own Config schema', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const entry = fileURLToPath(new URL('../../../../docs/examples/plugins/hello-extension/hello.mts', import.meta.url))
+  const { result } = await activate(host, 'hello-extension', entry, { config: { greeting: 'Howdy' } })
+  assert.equal(result.status, 'ok')
+  const tool = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'tool')
+  const output = await host.call('tool/call', { handle: tool.handle, call_id: 'hello-2', input: { name: 'Codewhale' }, deadline_ms: 5000 })
+  assert.deepEqual(output.structured, { greeting: 'Howdy, Codewhale!', callId: 'hello-2' })
+  const command = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'command')
+  assert.deepEqual(await host.call('command/run', { handle: command.handle, command_id: 'c-2', raw_input: '', deadline_ms: 5000 }), { kind: 'success', text: 'Howdy, world!' })
+  // A value of the wrong type fails activation, naming the field.
+  const bad = await activate(host, 'hello-extension', entry, { config: { greeting: 3 } })
+  assert.equal(bad.result.status, 'failed')
+  assert.match(bad.result.diagnostic, /greeting/)
 })
 
 test('the published DSH plugin runs unmodified and returns its payload', async (t) => {
   const host = await startHost()
   t.after(() => host.stop())
   const { result } = await activate(host, 'dsh-workspace-deps')
-  assert.deepEqual(result, { status: 'ok', tools: ['load_workspace_dependencies'] })
+  assert.deepEqual(result, { status: 'ok', tools: ['load_workspace_dependencies'], commands: [] })
   const registration = host.registry.find((entry) => entry.op === 'register')
   assert.equal(registration.kind, 'tool')
   assert.deepEqual(registration.spec.input_schema, { type: 'object', properties: {} })
@@ -133,11 +157,11 @@ test('cancel aborts a running tool, and deactivate waits for the async disposer'
 
 test('injecting a service the host does not provide fails with its name', async (t) => {
   const host = await startHost()
-  const plugin = tempPlugin("export const name = 'needs-commands'\nexport const inject = ['commands']\nexport function apply() {}\n")
+  const plugin = tempPlugin("export const name = 'needs-secrets'\nexport const inject = ['secrets']\nexport function apply() {}\n")
   t.after(async () => { await host.stop(); plugin.cleanup() })
-  const { result } = await activate(host, 'needs-commands', plugin.entry)
+  const { result } = await activate(host, 'needs-secrets', plugin.entry)
   assert.equal(result.status, 'failed')
-  assert.match(result.diagnostic, /requires `commands`/)
+  assert.match(result.diagnostic, /requires `secrets`/)
 })
 
 test('an unsupported DSH peer fails the import loudly', async (t) => {
@@ -300,7 +324,7 @@ test('plugins share one Cordis and one schemastery with the host', async (t) => 
   )
   t.after(async () => { await host.stop(); plugin.cleanup() })
   const { result } = await activate(host, 'shared', plugin.entry)
-  assert.deepEqual(result, { status: 'ok', tools: ['shared_ok'] })
+  assert.deepEqual(result, { status: 'ok', tools: ['shared_ok'], commands: [] })
 })
 
 test('a changed entry file is refused before import', async (t) => {
@@ -324,7 +348,7 @@ test('console and stdout writes from plugins cannot corrupt the channel', async 
   )
   t.after(async () => { await host.stop(); plugin.cleanup() })
   const { result } = await activate(host, 'noisy', plugin.entry)
-  assert.deepEqual(result, { status: 'ok', tools: [] })
+  assert.deepEqual(result, { status: 'ok', tools: [], commands: [] })
   assert.match(host.stderr, /noise/)
   assert.match(host.stderr, /raw bytes/)
 })
@@ -471,4 +495,581 @@ test('a host stuck in plugin code dies with its parent', { skip: process.platfor
   assert.ok(dead, 'a blocked host must not outlive its parent')
   // Diagnostic only: the watchdog polls every 500 ms.
   console.error(`# blocked host died ${Date.now() - started} ms after its parent`)
+})
+
+// ---------------------------------------------------------------------------
+// Commands: `ctx.commands.register`, `command/run`
+// ---------------------------------------------------------------------------
+
+const commandsOf = (host) => host.registry.filter((entry) => entry.op === 'register' && entry.kind === 'command')
+const commandNamed = (host, name) => commandsOf(host).find((entry) => entry.spec.name === name)
+const runCommand = (host, name, rawInput = '') =>
+  host.call('command/run', { handle: commandNamed(host, name).handle, command_id: `c-${name}`, raw_input: rawInput, deadline_ms: 5000 })
+
+test('commands register as commands, run, and report each kind of answer', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { result } = await activate(host, 'ext-commands')
+  assert.deepEqual(result, {
+    status: 'ok',
+    tools: [],
+    commands: ['ext-ansi', 'ext-ask', 'ext-dsh', 'ext-echo', 'ext-fail', 'ext-slow', 'ext-throw'],
+  })
+  // A command registration carries a hint (native `argumentHint` or DSH `input.hint`) and no schema.
+  assert.deepEqual(commandNamed(host, 'ext-echo').spec, { name: 'ext-echo', description: 'Echo the arguments.', argument_hint: '<text>' })
+  assert.equal(commandNamed(host, 'ext-ask').spec.argument_hint, '<topic>')
+  assert.equal('argument_hint' in commandNamed(host, 'ext-fail').spec, false)
+  for (const entry of commandsOf(host)) assert.equal('input_schema' in entry.spec, false)
+
+  assert.deepEqual(await runCommand(host, 'ext-echo', 'hello there'), { kind: 'success', text: 'echo: hello there' })
+  assert.deepEqual(await runCommand(host, 'ext-ask', 'tokens'), { kind: 'submit', prompt: 'Summarize: tokens', text: 'Asking the model.' })
+  assert.deepEqual(await runCommand(host, 'ext-fail'), { kind: 'error', text: 'unknown topic' })
+  // A bare string is success text; escapes are the core's to strip.
+  assert.deepEqual(await runCommand(host, 'ext-ansi'), { kind: 'success', text: 'plain \u001b[31mred\u001b[0m \u001b]0;title\u0007end' })
+  // DSH's `rawInput` keeps the separator before the arguments.
+  assert.deepEqual(await runCommand(host, 'ext-dsh', 'a b'), { kind: 'success', text: '" a b"' })
+  assert.deepEqual(await runCommand(host, 'ext-dsh', ''), { kind: 'success', text: '""' })
+  // A throwing handler is an execution failure, not a host fault.
+  await assert.rejects(runCommand(host, 'ext-throw'), (error) => error.code === -32000 && /boom/.test(error.message))
+  assert.deepEqual(host.faulted, [])
+})
+
+test('cancel aborts a running command', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  await activate(host, 'ext-commands')
+  const { id, promise } = host.request('command/run', {
+    handle: commandNamed(host, 'ext-slow').handle,
+    command_id: 'c-slow',
+    raw_input: '60000',
+    deadline_ms: 60000,
+  })
+  const cancelledAt = performance.now()
+  setTimeout(() => host.cancel(id), 50)
+  await assert.rejects(promise, (error) => error.code === -32800)
+  assert.ok(performance.now() - cancelledAt < 500, 'cancel resolves well inside the 500 ms grace')
+})
+
+test('a refused command registration fails activation, and an unknown handle is not live', async (t) => {
+  const host = await startHost({ admit: (spec) => (spec.name === 'help' ? { refused: 'command `/help` collides with a built-in command' } : undefined) })
+  t.after(() => host.stop())
+  const { result } = await activate(host, 'commands-clash-builtin')
+  assert.equal(result.status, 'failed')
+  assert.match(result.diagnostic, /command `help` refused: command `\/help` collides with a built-in command/)
+  await assert.rejects(
+    host.call('command/run', { handle: 999, command_id: 'c', raw_input: '', deadline_ms: 1000 }),
+    (error) => error.code === -32001,
+  )
+})
+
+test('disposing a command registration removes exactly that handle, and deactivation removes the rest', async (t) => {
+  const host = await startHost()
+  const plugin = tempPlugin(`export const name = 'two-commands'
+export const inject = ['commands']
+export function apply(ctx) {
+  const dispose = ctx.commands.register({ name: 'first', description: 'first', handler: () => '1' })
+  ctx.commands.register({ name: 'second', description: 'second', handler: () => '2' })
+  setTimeout(() => { dispose(); dispose() }, 20)
+}
+`)
+  t.after(async () => { await host.stop(); plugin.cleanup() })
+  const { ref, result } = await activate(host, 'two-commands', plugin.entry)
+  assert.deepEqual(result.commands, ['first', 'second'])
+  const first = commandNamed(host, 'first').handle
+  const second = commandNamed(host, 'second').handle
+  // The early, idempotent disposer unregisters `first` once and leaves `second`.
+  await host.waitFor((message) => message.method === 'registry/unregister', 2000)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const unregisters = host.registry.filter((entry) => entry.op === 'unregister')
+  assert.deepEqual(unregisters.map((entry) => entry.handle), [first])
+  await assert.rejects(host.call('command/run', { handle: first, command_id: 'a', raw_input: '', deadline_ms: 1000 }), (e) => e.code === -32001)
+  assert.deepEqual(await host.call('command/run', { handle: second, command_id: 'b', raw_input: '', deadline_ms: 1000 }), { kind: 'success', text: '2' })
+
+  const ack = await host.call('ext/deactivate', { owner: ref })
+  assert.deepEqual(ack, { disposed: true, leaked: [] })
+  assert.ok(host.registry.some((entry) => entry.op === 'unregister' && entry.handle === second), 'deactivation unregisters the rest')
+  await assert.rejects(host.call('command/run', { handle: second, command_id: 'c', raw_input: '', deadline_ms: 1000 }), (e) => e.code === -32001)
+})
+
+test('an invalid command definition fails activation with its reason', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const failing = async (label, body) => {
+    const plugin = tempPlugin(`export const inject = ['commands']\nexport function apply(ctx) { ${body} }\n`)
+    t.after(plugin.cleanup)
+    const { result } = await activate(host, label, plugin.entry)
+    assert.equal(result.status, 'failed', label)
+    return result.diagnostic
+  }
+  assert.match(await failing('bad-name', "ctx.commands.register({ name: 'Bad Name', description: 'd', handler() {} })"), /command name "Bad Name" must match/)
+  assert.match(await failing('no-description', "ctx.commands.register({ name: 'ok', description: ' ', handler() {} })"), /needs a non-empty description/)
+  assert.match(await failing('no-handler', "ctx.commands.register({ name: 'ok', description: 'd' })"), /handler must be a function/)
+  assert.match(await failing('attachments', "ctx.commands.register({ name: 'ok', description: 'd', input: { hint: 'h', attachments: true }, handler() {} })"), /attachments are not supported/)
+  assert.match(await failing('empty-hint', "ctx.commands.register({ name: 'ok', description: 'd', argumentHint: '', handler() {} })"), /argument hint must be a non-empty string/)
+  assert.equal(commandsOf(host).length, 0, 'nothing reached the core')
+
+  // A handler's bad answer is an execution failure at run time.
+  const plugin = tempPlugin(`export const inject = ['commands']
+export function apply(ctx) {
+  ctx.commands.register({ name: 'wrong-kind', description: 'd', handler: () => ({ kind: 'approve' }) })
+  ctx.commands.register({ name: 'empty-submit', description: 'd', handler: () => ({ kind: 'submit', prompt: '' }) })
+  ctx.commands.register({ name: 'silent', description: 'd', handler() {} })
+}
+`)
+  t.after(plugin.cleanup)
+  const { result } = await activate(host, 'bad-answers', plugin.entry)
+  assert.equal(result.status, 'ok')
+  await assert.rejects(runCommand(host, 'wrong-kind'), (error) => error.code === -32000 && /unknown result kind/.test(error.message))
+  await assert.rejects(runCommand(host, 'empty-submit'), (error) => error.code === -32000 && /submit prompt must be a non-empty string/.test(error.message))
+  assert.deepEqual(await runCommand(host, 'silent'), { kind: 'success' })
+})
+
+test('plugins cannot provide `commands`, or rewrite the shim every plugin registers through', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const provider = tempPlugin(`export const inject = ['tools']
+export function apply(ctx) { ctx.root.provide('commands', { register() {} }) }
+`)
+  t.after(provider.cleanup)
+  const refused = await activate(host, 'commands-provider', provider.entry)
+  assert.equal(refused.result.status, 'failed')
+  assert.match(refused.result.diagnostic, /may not provide core service `commands`/)
+
+  const hijack = tempPlugin(`export const inject = ['commands']
+export function apply(ctx) {
+  const proto = Object.getPrototypeOf(ctx.root.commands)
+  proto.register = function () { return () => {} }
+}
+`)
+  t.after(hijack.cleanup)
+  const { result } = await activate(host, 'commands-hijack', hijack.entry)
+  assert.equal(result.status, 'failed')
+  assert.match(result.diagnostic, /read ?only|read-only|not extensible|Cannot assign/i)
+})
+
+test('a DSH-style command plugin registers through the compatible `commands` shim', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const plugin = tempPlugin(`import { CommandDefinitionId, CommandId } from '@deepseek-ai/dsh-commands/brand'
+export const name = 'dsh-style'
+export const inject = ['commands']
+export function apply(ctx) {
+  ctx.commands.register({
+    definitionId: CommandDefinitionId('dsh-style/echo'),
+    name: 'dsh-echo',
+    description: 'Echo, DSH style.',
+    input: { hint: '<text>' },
+    recordInput: false,
+    handler: ({ rawInput }) => ({ kind: 'success', text: CommandId(rawInput.trim()) }),
+  })
+}
+`)
+  t.after(plugin.cleanup)
+  const { result } = await activate(host, 'dsh-style', plugin.entry)
+  assert.deepEqual(result, { status: 'ok', tools: [], commands: ['dsh-echo'] })
+  assert.deepEqual(commandNamed(host, 'dsh-echo').spec, { name: 'dsh-echo', description: 'Echo, DSH style.', argument_hint: '<text>' })
+  assert.deepEqual(await runCommand(host, 'dsh-echo', 'hi there'), { kind: 'success', text: 'hi there' })
+
+  // Only the brand helpers are provided; the rest of the package still fails loudly.
+  const whole = tempPlugin("import '@deepseek-ai/dsh-commands'\nexport function apply() {}\n")
+  t.after(whole.cleanup)
+  const refused = await activate(host, 'dsh-whole', whole.entry)
+  assert.equal(refused.result.status, 'failed')
+  assert.match(refused.result.diagnostic, /requires `@deepseek-ai\/dsh-commands`/)
+})
+
+/** Activate several entries of one plugin under one owner, as the core does: one `ext/activate` per entry, in order. */
+async function activateEntries(host, name, files) {
+  const ref = owner(name)
+  const results = []
+  for (const file of files) {
+    const path = join(FIXTURES, name, file)
+    const result = await host.call('ext/activate', { owner: ref, plugin_name: name, entry: { path, sha256: sha256File(path) }, config: {} })
+    results.push(result)
+    if (result.status !== 'ok') break
+  }
+  return { ref, results }
+}
+
+test('a plugin with two entries activates both under one owner and tears both down together', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { ref, results } = await activateEntries(host, 'two-entries', ['tools.mjs', 'commands.mjs'])
+  assert.deepEqual(results[0], { status: 'ok', tools: ['two_first'], commands: [] })
+  // The second answer lists everything the owner has registered so far.
+  assert.deepEqual(results[1], { status: 'ok', tools: ['two_first', 'two_second'], commands: ['two-hello'] })
+  const registered = host.registry.filter((entry) => entry.op === 'register')
+  assert.deepEqual(registered.map((entry) => entry.spec.name), ['two_first', 'two_second', 'two-hello'])
+  assert.ok(registered.every((entry) => entry.owner.owner_token === ref.owner_token), 'one owner for every entry')
+  const second = registered.find((entry) => entry.spec.name === 'two_second')
+  assert.equal((await host.call('tool/call', { handle: second.handle, call_id: 'c1', input: {}, deadline_ms: 5000 })).content[0].text, 'second')
+
+  // Neither entry can be activated twice, and no other plugin can join the owner.
+  const again = await host.call('ext/activate', {
+    owner: ref,
+    plugin_name: 'two-entries',
+    entry: { path: join(FIXTURES, 'two-entries', 'tools.mjs'), sha256: sha256File(join(FIXTURES, 'two-entries', 'tools.mjs')) },
+    config: {},
+  })
+  assert.equal(again.status, 'failed')
+  assert.match(again.diagnostic, /already activated under this owner/)
+  const stranger = await host.call('ext/activate', {
+    owner: ref,
+    plugin_name: 'someone-else',
+    entry: { path: join(FIXTURES, 'two-entries', 'commands.mjs'), sha256: sha256File(join(FIXTURES, 'two-entries', 'commands.mjs')) },
+    config: {},
+  })
+  assert.equal(stranger.status, 'failed')
+
+  // One deactivate disposes the fibers of both entries.
+  assert.deepEqual(await host.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+  for (const entry of registered.filter((r) => r.kind === 'tool')) {
+    assert.ok(host.registry.some((e) => e.op === 'unregister' && e.handle === entry.handle), `${entry.spec.name} was unregistered`)
+  }
+})
+
+test('a failing second entry fails the owner and rolls back the first entry', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { ref, results } = await activateEntries(host, 'two-entries-failing', ['first.mjs', 'second.mjs'])
+  assert.equal(results[0].status, 'ok')
+  assert.equal(results[1].status, 'failed')
+  assert.match(results[1].diagnostic, /second entry refuses to start/)
+  const first = host.registry.find((entry) => entry.op === 'register' && entry.spec.name === 'tef_first')
+  assert.ok(first, 'the first entry registered its tool')
+  for (let i = 0; i < 40 && !host.registry.some((entry) => entry.op === 'unregister' && entry.handle === first.handle); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  assert.ok(host.registry.some((entry) => entry.op === 'unregister' && entry.handle === first.handle), "rollback unregistered the first entry's tool")
+  await assert.rejects(host.call('tool/call', { handle: first.handle, call_id: 'c1', input: {}, deadline_ms: 1000 }), (error) => error.code === -32001)
+  // The owner is gone: deactivating it is an idempotent success.
+  assert.deepEqual(await host.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+})
+
+test('a plugin is given its config, validated by its own Config schema, and each call carries the workspace and data directory', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const dataDir = mkdtempSync(join(tmpdir(), 'cw-ext-data-'))
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }))
+  const entry = join(FIXTURES, 'plugin-context', 'index.mjs')
+
+  // The plugin's `Config` schema fills the default for `limit`.
+  const { result } = await activate(host, 'plugin-context', entry, { config: { greeting: 'Hi' }, data_dir: dataDir })
+  assert.deepEqual(result, { status: 'ok', tools: ['ctx_frozen', 'ctx_note', 'ctx_probe'], commands: ['ctx-probe'] })
+  const handleOf = (name) => host.registry.find((e) => e.op === 'register' && e.spec.name === name).handle
+  const call = (name, input = {}, extra = {}) =>
+    host.call('tool/call', { handle: handleOf(name), call_id: 'c1', input, deadline_ms: 5000, ...extra })
+
+  const probe = await call('ctx_probe', {}, { workspace: '/w/project' })
+  assert.deepEqual(probe.structured, {
+    config: { greeting: 'Hi', limit: 3 },
+    workspace: '/w/project',
+    dataDir,
+    keys: ['args', 'callId', 'dataDir', 'signal', 'workspace'],
+  })
+  // The workspace is per call: a call that names none gets none.
+  const bare = await call('ctx_probe')
+  assert.equal(bare.structured.workspace, null)
+  assert.deepEqual(bare.structured.keys, ['args', 'callId', 'dataDir', 'signal'])
+  const other = await call('ctx_probe', {}, { workspace: '/w/other' })
+  assert.equal(other.structured.workspace, '/w/other')
+
+  // The data directory is the plugin's own to write.
+  const note = await call('ctx_note', { text: 'remember' })
+  assert.deepEqual(note.structured, { file: join(dataDir, 'note.txt'), text: 'remember' })
+  // The context is read-only.
+  assert.deepEqual((await call('ctx_frozen')).structured, { changed: false })
+
+  const command = host.registry.find((e) => e.op === 'register' && e.kind === 'command')
+  const said = await host.call('command/run', { handle: command.handle, command_id: 'c-1', raw_input: '', deadline_ms: 5000, workspace: '/w/project' })
+  assert.deepEqual(JSON.parse(said.text), { config: { greeting: 'Hi', limit: 3 }, workspace: '/w/project', dataDir })
+
+  // A config the plugin's own schema refuses fails the activation, naming the field.
+  const bad = await activate(host, 'plugin-context', entry, { config: { limit: 99 }, data_dir: dataDir })
+  assert.equal(bad.result.status, 'failed')
+  assert.match(bad.result.diagnostic, /limit/)
+  // And an activation with no config or data dir (an older core) still works.
+  const bare2 = await activate(host, 'plugin-context', entry)
+  assert.equal(bare2.result.status, 'ok')
+})
+
+// ---- Trust tiers: one host process per tier, told which with `--tier=`.
+
+test('the host refuses to start on an unknown tier, a tier with no value or a tier named twice', async () => {
+  for (const args of [['--tier=root'], ['--tier='], ['--tier'], ['--tier=Plugin'], ['--tier=plugin', '--tier=builtin'], ['--tier=builtin', '--tier=builtin']]) {
+    const child = spawn(process.execPath, [...HOST_ARGS, BUNDLE, ...args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...HOST_ENV },
+    })
+    let stderr = ''
+    let stdoutBytes = 0
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.stdout.on('data', (chunk) => { stdoutBytes += chunk.length })
+    const { code } = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
+    assert.equal(code, 64, `${args.join(' ')}: ${stderr}`)
+    assert.match(stderr, /tier/, args.join(' '))
+    assert.equal(stdoutBytes, 0, `${args.join(' ')}: a host that refuses its tier never says hello`)
+  }
+})
+
+test('a plugin-tier host refuses a host: owner and a builtin-tier host refuses a plugin owner, before loading anything', async (t) => {
+  const entry = join(FIXTURES, 'ext-commands', 'index.mjs')
+  const request = (ref) => ({ owner: ref, plugin_name: 'ext-commands', entry: { path: entry, sha256: sha256File(entry) }, config: {} })
+  const refused = (tier) => (error) => {
+    assert.equal(error.code, ErrorCode.InvalidParams)
+    assert.match(error.message, new RegExp(`this host serves the ${tier} tier`))
+    return true
+  }
+  // No `--tier=` is the plugin tier, the least-privileged one.
+  for (const tier of ['plugin', null]) {
+    const host = await startHost({ tier })
+    t.after(() => host.stop())
+    await assert.rejects(host.call('ext/activate', request(owner('host:ext-commands'))), refused('plugin'))
+    assert.equal(host.registry.length, 0, 'nothing of the refused owner was loaded')
+    // The same fixture activates under a plugin id.
+    const { result } = await activate(host, 'ext-commands')
+    assert.equal(result.status, 'ok')
+  }
+
+  const builtin = await startHost({ tier: 'builtin' })
+  t.after(() => builtin.stop())
+  await assert.rejects(builtin.call('ext/activate', request(owner('user/0123456789ab/ext-commands'))), refused('builtin'))
+  await assert.rejects(builtin.call('ext/activate', request(owner('ext-commands'))), refused('builtin'))
+  assert.equal(builtin.registry.length, 0, 'nothing of the refused owners was loaded')
+  // A `host:` owner is what a builtin-tier host takes.
+  const ref = owner('host:ext-commands')
+  const result = await builtin.call('ext/activate', request(ref))
+  assert.equal(result.status, 'ok')
+  assert.ok(result.commands.includes('ext-echo'))
+  assert.deepEqual(await builtin.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+})
+
+/** What `dist/builtin-modules.json` says, as `host/hello.builtin_modules` rows. */
+function builtinDigests() {
+  const manifest = JSON.parse(readFileSync(join(dirname(BUNDLE), 'builtin-modules.json'), 'utf8'))
+  return Object.entries(manifest.modules)
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([id, sha256]) => ({ id, sha256 }))
+}
+
+test('host/hello says which tier the host serves, and the built-in module digests its build embeds', async (t) => {
+  for (const [tier, reported] of [['plugin', 'plugin'], [null, 'plugin'], ['builtin', 'builtin']]) {
+    const host = await startHost({ tier })
+    t.after(() => host.stop())
+    assert.equal(host.hello.tier, reported, `--tier=${tier}`)
+    assert.deepEqual(host.hello.builtin_modules, builtinDigests(), `--tier=${tier}`)
+  }
+})
+
+test('the build records the digest of every built-in module, and only those', () => {
+  const dist = join(dirname(BUNDLE))
+  const manifest = JSON.parse(readFileSync(join(dist, 'builtin-modules.json'), 'utf8'))
+  const built = existsSync(join(dist, 'builtin')) ? readdirSync(join(dist, 'builtin')).sort() : []
+  assert.deepEqual(Object.keys(manifest.modules).map((id) => `${id}.mjs`).sort(), built)
+  for (const [id, digest] of Object.entries(manifest.modules)) {
+    assert.equal(sha256File(join(dist, 'builtin', `${id}.mjs`)), digest, id)
+  }
+})
+
+// ---- core/call: a tool asking the core to run a core tool for it (`exec.core`).
+
+const coreResult = (text, extra = {}) => ({ content: [{ type: 'text', text }], is_error: false, ...extra })
+
+async function coreCallTool(host, name, input, { ticket = 'ticket-1' } = {}) {
+  const { result } = await activate(host, 'core-call')
+  assert.equal(result.status, 'ok')
+  const registered = host.registry.find((entry) => entry.op === 'register' && entry.spec.name === name)
+  return {
+    registered,
+    call: (callInput, extra = {}) =>
+      host.request('tool/call', { handle: registered.handle, call_id: 'cc-1', input: callInput, deadline_ms: 5000, ...(ticket === null ? {} : { ticket }), ...extra }),
+  }
+}
+
+test('a tool called with a ticket reaches the core through exec.core, and core/call carries its owner, ticket, name and input', async (t) => {
+  const host = await startHost({ coreCall: (params) => coreResult(`ran ${params.name}`, { structured: { echoed: params.input } }) })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_call')
+  const { promise } = call({ name: 'read', input: { path: 'a.txt' } })
+  const out = await promise
+  assert.deepEqual(out.structured, { ok: { content: 'ran read', isError: false, structured: { echoed: { path: 'a.txt' } } } })
+  assert.equal(host.coreCalls.length, 1)
+  const sent = host.coreCalls[0]
+  assert.equal(sent.ticket, 'ticket-1')
+  assert.equal(sent.name, 'read')
+  assert.deepEqual(sent.input, { path: 'a.txt' })
+  assert.equal(sent.owner.plugin_id, 'core-call')
+  assert.deepEqual(Object.keys(sent).sort(), ['id', 'input', 'name', 'owner', 'ticket'])
+})
+
+test('without a ticket exec.core does not exist, and a command invocation never has one', async (t) => {
+  const host = await startHost({ coreCall: () => coreResult('x') })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_probe', {}, { ticket: null })
+  const bare = (await call({}).promise).structured
+  assert.equal(bare.hasCore, false)
+  assert.deepEqual(bare.keys, ['args', 'callId', 'signal'])
+  const withTicket = (await call({}, { ticket: 'tk' }).promise).structured
+  assert.equal(withTicket.hasCore, true)
+  assert.deepEqual(withTicket.coreKeys, ['call'])
+  const noCore = host.registry.find((entry) => entry.spec.name === 'cc_call')
+  assert.deepEqual((await host.request('tool/call', { handle: noCore.handle, call_id: 'c2', input: { name: 'read' }, deadline_ms: 5000 }).promise).structured, { noCore: true })
+  const command = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'command')
+  const said = await host.call('command/run', { handle: command.handle, command_id: 'c-1', raw_input: '', deadline_ms: 5000 })
+  assert.equal(JSON.parse(said.text).hasCore, false)
+  assert.equal(host.coreCalls.length, 0, 'nothing reached the core')
+})
+
+test('typed refusals reach the tool as CoreCallError codes', async (t) => {
+  const errors = {
+    refused: { code: ErrorCode.Refused, message: 'policy says no' },
+    denied: { code: ErrorCode.Denied, message: 'the user said no' },
+    cancelled: { code: ErrorCode.Cancelled, message: 'cancelled' },
+    unavailable: { code: ErrorCode.NotAvailable, message: 'turn ended' },
+    failed: { code: ErrorCode.Internal, message: 'boom' },
+  }
+  const host = await startHost({ coreCall: (params) => ({ error: errors[params.name] }) })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_call')
+  for (const [name, error] of Object.entries(errors)) {
+    const out = (await call({ name }).promise).structured
+    assert.deepEqual(out.failed, { name: 'CoreCallError', code: name, message: error.message }, name)
+  }
+})
+
+test('the host refuses what it must not send: a bad name, input that is not JSON', async (t) => {
+  const host = await startHost({ coreCall: () => coreResult('x') })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_local')
+  const out = (await call({}).promise).structured
+  for (const key of ['emptyName', 'longName', 'notJson', 'cyclic']) {
+    assert.equal(out[key].failed.code, 'failed', key)
+  }
+  assert.equal(host.coreCalls.length, 0)
+})
+
+test('cancelling the tool call cancels its pending core/call with $/cancel, and the answer that follows is dropped', async (t) => {
+  let release
+  const held = new Promise((resolve) => (release = resolve))
+  const host = await startHost({ coreCall: () => held })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_call')
+  const { id, promise } = call({ name: 'read' })
+  await host.waitFor((m) => m.method === 'core/call')
+  host.cancel(id)
+  await host.waitFor((m) => m.method === '$/cancel')
+  assert.deepEqual(host.cancels, [host.coreCalls[0].id])
+  await assert.rejects(promise, (error) => error.code === ErrorCode.Cancelled)
+  release(coreResult('late'))
+  // The host stays usable.
+  assert.deepEqual(await host.call('host/ping', {}), {})
+})
+
+test('shutdown drops a late core reply after the fake core closes stdin', async () => {
+  let release
+  const held = new Promise((resolve) => (release = resolve))
+  const host = await startHost({ coreCall: () => held })
+  const { call } = await coreCallTool(host, 'cc_call')
+  call({ name: 'read' })
+  await host.waitFor((m) => m.method === 'core/call')
+
+  const stopped = host.stop()
+  release(coreResult('late'))
+  await stopped
+})
+
+test('several core calls can be in flight at once, each answered to its own request', async (t) => {
+  const host = await startHost({ coreCall: async (params) => { await new Promise((r) => setTimeout(r, params.input.ms)); return coreResult(String(params.input.ms)) } })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_many')
+  // The input is the same for every call, so answers differ only by arrival; all four are answered.
+  const out = (await call({ name: 'read', input: { ms: 20 }, count: 4, parallel: true }).promise).structured
+  assert.equal(out.outcomes.length, 4)
+  assert.ok(out.outcomes.every((o) => o.ok.content === '20'))
+  assert.equal(host.coreCalls.length, 4)
+  assert.equal(new Set(host.coreCalls.map((c) => c.id)).size, 4)
+})
+
+test('storage survives owner reload, refuses disposed owner access, and call identity is per invocation', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const plugin = tempPlugin(`
+export const inject = ['tools', 'commands', 'storage']
+let savedStorage
+export async function apply(ctx, config) {
+  if (config.capture) savedStorage = ctx.storage
+  const identity = (exec) => ({
+    frozen: Object.isFrozen(exec),
+    sessionId: exec.sessionId ?? null,
+    agentId: exec.agentId ?? null,
+    originTurnId: exec.originTurnId ?? null,
+  })
+  ctx.tools.register({ name: config.tool, description: 'Read owner-local state.', parameters: { type: 'object' },
+    async execute(input, exec) {
+      if (input.saved) { try { await savedStorage.get('state'); return { accessed: true } } catch (error) { return { error: error.code } } }
+      if ('set' in input) await ctx.storage.set('state', input.set)
+      return { value: (await ctx.storage.get('state')) ?? null, ...identity(exec) }
+    },
+  })
+  ctx.commands.register({ name: config.command, description: 'Inspect invocation identity.',
+    handler: (exec) => JSON.stringify(identity(exec)),
+  })
+}
+`)
+  t.after(plugin.cleanup)
+  const firstDir = join(plugin.dir, 'first-state')
+  const otherDir = join(plugin.dir, 'other-state')
+  mkdirSync(firstDir)
+  mkdirSync(otherDir)
+  const firstConfig = { tool: 'first_state', command: 'first-state', capture: true }
+  const first = await activate(host, 'first-state-owner', plugin.entry, { config: firstConfig, data_dir: firstDir })
+  assert.equal(first.result.status, 'ok')
+  const handle = (name) => host.registry.findLast((entry) => entry.op === 'register' && entry.spec.name === name).handle
+  const tool = (name, input = {}, extra = {}) => host.call('tool/call', { handle: handle(name), call_id: 'state-call', input, deadline_ms: 5000, ...extra })
+  const identity = { session_id: 'session-one', agent_id: 'agent-one', origin_turn_id: 'turn-one' }
+  assert.deepEqual((await tool('first_state', { set: { count: 1 } }, identity)).structured,
+    { value: { count: 1 }, frozen: true, sessionId: 'session-one', agentId: 'agent-one', originTurnId: 'turn-one' })
+  assert.deepEqual((await tool('first_state')).structured,
+    { value: { count: 1 }, frozen: true, sessionId: null, agentId: null, originTurnId: null })
+  const command = await host.call('command/run', { handle: handle('first-state'), command_id: 'state-command', raw_input: '', deadline_ms: 5000, ...identity })
+  assert.deepEqual(JSON.parse(command.text), { frozen: true, sessionId: 'session-one', agentId: 'agent-one', originTurnId: 'turn-one' })
+  await host.call('ext/deactivate', { owner: first.ref })
+  const other = await activate(host, 'other-state-owner', plugin.entry, { config: { tool: 'other_state', command: 'other-state' }, data_dir: otherDir })
+  assert.equal(other.result.status, 'ok')
+  assert.deepEqual((await tool('other_state', { saved: true })).structured, { error: 'not_available' })
+  assert.equal((await tool('other_state')).structured.value, null, 'another owner directory has separate state')
+  const reloaded = await activate(host, 'reloaded-state-owner', plugin.entry, { config: { ...firstConfig, capture: false }, data_dir: firstDir })
+  assert.equal(reloaded.result.status, 'ok')
+  assert.deepEqual((await tool('first_state')).structured.value, { count: 1 }, 'the assigned owner directory preserves state on reload')
+})
+
+test('programmable pre-execute listeners propose deny, ask, rewrite and context without core authority', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { ref, result } = await activate(host, 'hook-policy')
+  assert.equal(result.status, 'ok')
+  const hook = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'hook')
+  assert.equal(hook.spec.name, 'tools/pre-execute')
+  const evaluate = (path) => host.call('hook/evaluate', {
+    handle: hook.handle, event: 'tools/pre-execute', deadline_ms: 5000,
+    payload: { name: 'read', call_id: 'hook-1', input: { path }, mode: 'Agent', workspace: '/workspace', model: 'fixture' },
+  })
+  assert.deepEqual(await evaluate('before.txt'), { kind: 'revise', input: { path: 'after.txt' } })
+  assert.deepEqual(await evaluate('blocked.txt'), { kind: 'deny', reason: 'blocked by fixture' })
+  assert.deepEqual(await evaluate('ask.txt'), { kind: 'ask', reason: 'fixture asks' })
+  assert.deepEqual(await evaluate('context.txt'), { kind: 'annotate', text: 'fixture context' })
+  assert.deepEqual(await evaluate('allow.txt'), { kind: 'abstain' })
+  assert.deepEqual(await evaluate('allow.txt'), { kind: 'abstain' })
+  assert.equal(host.logs.filter((log) => log.msg.includes('allow is an abstention')).length, 1)
+  assert.deepEqual(await evaluate('other.txt'), { kind: 'abstain' })
+  await assert.rejects(evaluate('malformed.txt'), /revise needs a JSON object/)
+  await assert.rejects(evaluate('throw.txt'), /fixture hook failure/)
+  const pending = host.request('hook/evaluate', {
+    handle: hook.handle, event: 'tools/pre-execute', deadline_ms: 5000,
+    payload: { name: 'read', call_id: 'hook-held', input: { path: 'held.txt' }, mode: 'Agent', workspace: '/workspace', model: 'fixture' },
+  })
+  host.cancel(pending.id)
+  await assert.rejects(pending.promise, (error) => error.code === ErrorCode.Cancelled)
+  assert.deepEqual(await host.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+  await assert.rejects(evaluate('before.txt'), (error) => error.code === ErrorCode.NotAvailable)
 })

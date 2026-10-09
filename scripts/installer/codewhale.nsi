@@ -1,6 +1,6 @@
 ; codewhale.nsi — NSIS installer for CodeWhale (Windows)
 ;
-; Requirements (see https://github.com/Hmbown/CodeWhale/issues/1983):
+; Requirements (see https://github.com/codewhale-hq/CodeWhale/issues/1983):
 ;   - Install codewhale.exe and codew.exe side-by-side (single binary, no codewhale-tui.exe)
 ;   - Default to %LOCALAPPDATA%\Programs\CodeWhale\bin
 ;   - Add install dir to current-user PATH
@@ -31,7 +31,7 @@
 
 !define PRODUCT_NAME "CodeWhale"
 !define PRODUCT_PUBLISHER "Hmbown"
-!define PRODUCT_WEB_SITE "https://github.com/Hmbown/CodeWhale"
+!define PRODUCT_WEB_SITE "https://github.com/codewhale-hq/CodeWhale"
 
 Name "${PRODUCT_NAME} ${VERSION}"
 OutFile "CodeWhaleSetup.exe"
@@ -51,6 +51,9 @@ BrandingText "${PRODUCT_NAME} Installer"
 ;--------------------------------
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
+!ifdef COMPILED_HOST
+!insertmacro MUI_PAGE_COMPONENTS
+!endif
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -123,6 +126,19 @@ FunctionEnd
 ;--------------------------------
 ; Uninstaller Section
 ;--------------------------------
+; Only a reviewed release build defines COMPILED_HOST. The component is
+; explicitly opt-in and never changes [extension_host] runtime = "node".
+!ifdef COMPILED_HOST
+Section /o "Compiled extension host (Bun, opt-in)" SecCompiledHost
+  SetOutPath "$INSTDIR\bin"
+  File "codewhale-extension-host.exe"
+  File "codewhale-extension-host.LICENSES.txt"
+  File "codewhale-extension-host.relink-source.tar.gz"
+  File "codewhale-extension-host.release.json"
+  WriteRegDWORD HKCU "Software\${PRODUCT_NAME}" "CompiledHostInstalled" 1
+SectionEnd
+!endif
+
 Section "Uninstall"
   ; Remove only CodeWhale's exact entry before deleting the helper. The helper
   ; handles PATH values longer than NSIS_MAX_STRLEN without truncation.
@@ -132,6 +148,13 @@ Section "Uninstall"
   Delete "$INSTDIR\bin\codewhale.exe"
   Delete "$INSTDIR\bin\codew.exe"
   Delete "$INSTDIR\bin\codewhale.bat"
+  ReadRegDWORD $R0 HKCU "Software\${PRODUCT_NAME}" "CompiledHostInstalled"
+  ${If} $R0 == 1
+    Delete "$INSTDIR\bin\codewhale-extension-host.exe"
+    Delete "$INSTDIR\bin\codewhale-extension-host.LICENSES.txt"
+    Delete "$INSTDIR\bin\codewhale-extension-host.relink-source.tar.gz"
+    Delete "$INSTDIR\bin\codewhale-extension-host.release.json"
+  ${EndIf}
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
   RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
   Delete "$INSTDIR\update-user-path.ps1"

@@ -1,0 +1,6 @@
+.rat-project { width: var(--container); margin: 0 auto 4rem; border-top: 1px solid var(--line); padding-top: 1.5rem; color: var(--text); }
+.rat-project h2 { font-size: .875rem; font-weight: 600; margin: 0 0 .6rem; }
+.rat-project-links { display: flex; flex-wrap: wrap; gap: .75rem 1.5rem; font-size: .8rem; }
+.rat-project-links a { display: inline-flex; gap: .5rem; align-items: center; }
+.rat-project-links a svg { width: 1rem; height: 1rem; }
+.rat-project-links code { color: var(--muted); font-size: .75rem; }

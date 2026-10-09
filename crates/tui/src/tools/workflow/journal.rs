@@ -5,7 +5,6 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -178,34 +177,34 @@ enum WorkflowJournalRecord {
 
 #[derive(Debug)]
 struct WorkflowRunJournal {
+    /// Workspace the ledger must stay inside; links below it are refused.
+    root: PathBuf,
     ledger_path: PathBuf,
 }
 
 impl WorkflowRunJournal {
+    /// Opening has no side effects: `.codewhale/` and the ledger appear with
+    /// the first appended record, and only through the confined helpers, so a
+    /// linked `.codewhale` never receives an empty `state/` or ledger.
     fn open(workspace: &Path) -> Self {
-        let dir = workspace.join(CODEWHALE_DIR);
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            warn!(
-                "workflow journal dir create failed ({}): {err}",
-                dir.display()
-            );
+        Self {
+            root: workspace.to_path_buf(),
+            ledger_path: workspace.join(CODEWHALE_DIR).join(WORKFLOW_RUNS_FILE),
         }
-        let ledger_path = dir.join(WORKFLOW_RUNS_FILE);
-        if !ledger_path.exists()
-            && let Err(err) = std::fs::write(&ledger_path, "")
-        {
-            warn!(
-                "workflow journal create failed ({}): {err}",
-                ledger_path.display()
-            );
-        }
-        Self { ledger_path }
     }
 
     fn hydrate_runs(&self, recover_orphans: bool) -> HashMap<String, WorkflowRunRecord> {
-        let file = match std::fs::File::open(&self.ledger_path) {
+        let file = match crate::fs_confined::open_read(&self.root, &self.ledger_path) {
             Ok(file) => file,
-            Err(_) => return HashMap::new(),
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "workflow journal unreadable ({}): {err}",
+                        self.ledger_path.display()
+                    );
+                }
+                return HashMap::new();
+            }
         };
         let mut runs = HashMap::new();
         for line in std::io::BufReader::new(file).lines() {
@@ -297,10 +296,7 @@ impl WorkflowRunJournal {
         let mut line =
             serde_json::to_string(record).map_err(|err| std::io::Error::other(err.to_string()))?;
         line.push('\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.ledger_path)?;
+        let mut file = crate::fs_confined::open_append(&self.root, &self.ledger_path)?;
         file.write_all(line.as_bytes())?;
         file.flush()?;
         Ok(())
@@ -379,6 +375,45 @@ mod tests {
             events_total: 0,
             events_dropped: 0,
         }
+    }
+
+    /// Opening the journal creates nothing; the first record creates the
+    /// ledger under a private `.codewhale/`.
+    #[test]
+    fn opening_the_journal_creates_nothing_until_a_record_is_appended() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        assert!(!tmp.path().join(CODEWHALE_DIR).exists());
+        state.record_snapshot(&sample_record("workflow_lazy", WorkflowRunStatus::Running));
+        assert!(state.journal_path().is_file());
+    }
+
+    /// A linked `.codewhale` gets no empty `state/` or ledger, and appends and
+    /// reads are refused instead of writing through the link.
+    #[cfg(unix)]
+    #[test]
+    fn journal_never_writes_through_a_linked_codewhale_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::os::unix::fs::symlink(&outside, workspace.join(CODEWHALE_DIR)).expect("link");
+
+        let journal = WorkflowRunJournal::open(&workspace);
+        assert!(journal.hydrate_runs(true).is_empty());
+        let err = journal
+            .append_snapshot(&sample_record("workflow_link", WorkflowRunStatus::Running))
+            .expect_err("append through a linked .codewhale must be refused");
+        assert!(!err.to_string().is_empty());
+
+        // The state-level entry points degrade to a warning, not a write.
+        let state = WorkflowWorkspaceState::open(&workspace);
+        state.record_progress("workflow_link", "phase: scan");
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("read outside").count(),
+            0
+        );
     }
 
     #[test]

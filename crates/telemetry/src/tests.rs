@@ -471,8 +471,8 @@ fn every_legitimately_recorded_event_survives_the_drain() {
     );
 
     // Dialect kinds (`deepseek-anthropic`, the Model Studio plan variants) are
-    // absent from `ProviderKind::ALL`, which is the 37-row *catalog* subset,
-    // but `ApiProvider::kind()` yields them for real routes. Narrowing the
+    // absent from the selectable `ProviderKind::ALL` catalog subset,
+    // but captured intrinsic kinds include them for real routes. Narrowing the
     // provider bound to the catalog would drop those users' `session_end`.
     for kind in [
         codewhale_config::ProviderKind::DeepseekAnthropic,
@@ -746,6 +746,31 @@ fn decision_matrix_is_exhaustive() {
             "{surface:?} uses default-on without inferring acceptance"
         );
     }
+}
+
+#[test]
+fn every_surface_spelling_parses_back_to_its_variant() {
+    // `Surface::parse` is the only place a name becomes a variant, and an
+    // embedder declares itself by name, so the round trip has to be exact in
+    // both directions. A value that can be spelled must parse; a variant must
+    // not be reachable under a second spelling.
+    for surface in Surface::ALL {
+        assert_eq!(
+            Surface::parse(surface.as_str()),
+            Some(*surface),
+            "{surface:?} does not parse back from its own wire spelling"
+        );
+    }
+    assert_eq!(
+        Surface::parse("TUI"),
+        None,
+        "parsing is exact, not case-folded"
+    );
+    assert_eq!(Surface::parse(" vscode-extension "), None, "no trimming");
+    assert_eq!(Surface::parse("vscode"), None);
+    assert_eq!(Surface::parse("ide"), None);
+    assert_eq!(Surface::parse(""), None);
+    assert_eq!(Surface::parse("desktop"), Some(Surface::Desktop));
 }
 
 #[test]

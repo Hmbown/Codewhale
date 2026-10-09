@@ -65,43 +65,11 @@ pub(crate) fn documented_server_side_web_search(
 ) -> CapabilityState {
     let provider_id = provider_id.trim().to_ascii_lowercase();
     let wire_model_id = wire_model_id.trim().to_ascii_lowercase();
-    let supported = match provider_id.as_str() {
-        "openai" => matches!(
-            wire_model_id.as_str(),
-            "gpt-5.6" | "gpt-5.5" | "gpt-5.4" | "gpt-4.1" | "gpt-4.1-mini" | "o4-mini"
-        ),
-        "anthropic" => matches!(
-            wire_model_id.as_str(),
-            "claude-fable-5"
-                | "claude-opus-4-8"
-                | "claude-mythos-5"
-                | "claude-mythos-preview"
-                | "claude-opus-4-7"
-                | "claude-opus-4-6"
-                | "claude-sonnet-5"
-                | "claude-sonnet-4-6"
-        ),
-        "xai" => matches!(wire_model_id.as_str(), "grok-4.6" | "grok-4.5"),
-        "xiaomi-mimo" => matches!(wire_model_id.as_str(), "mimo-v2.5-pro" | "mimo-v2.5"),
-        "zai" => matches!(
-            wire_model_id.as_str(),
-            "glm-5.3" | "glm-5.3-flash" | "glm-5.2" | "glm-5.1" | "glm-5-turbo"
-        ),
-        "modelstudio-token-plan" => matches!(
-            wire_model_id.as_str(),
-            "qwen3.8-max" | "qwen3.7-plus" | "qwen3.7-max"
-        ),
-        "deepseek" => matches!(
-            wire_model_id.as_str(),
-            "deepseek-flash"
-                | "deepseek-v4-flash"
-                | "deepseek-v4-pro"
-                | "deepseek-v4-flash-vision-exp"
-        ),
-        "moonshot" => matches!(wire_model_id.as_str(), "kimi-k3" | "kimi-k2.6"),
-        _ => false,
-    };
-    if supported {
+    if crate::catalog::reviewed::bundled_reviewed()
+        .search_models
+        .get(&provider_id)
+        .is_some_and(|models| models.contains(&wire_model_id))
+    {
         CapabilityState::Supported
     } else {
         CapabilityState::Unknown
@@ -143,10 +111,7 @@ pub(crate) fn documented_moonshot_web_search_for_route(
     }
     let model = wire_model_id.trim().to_ascii_lowercase();
     if crate::provider::is_exact_kimi_code_route(provider, base_url)
-        && matches!(
-            model.as_str(),
-            "k3" | "k3-256k" | "kimi-for-coding" | "kimi-for-coding-highspeed"
-        )
+        && crate::catalog::reviewed::route_model_set_contains("kimi_membership_search", &model)
     {
         return CapabilityState::Supported;
     }
@@ -175,7 +140,7 @@ pub(crate) fn documented_deepseek_files_api_for_route(
         return CapabilityState::Unknown;
     }
     let model = wire_model_id.trim().to_ascii_lowercase();
-    if matches!(model.as_str(), "deepseek-flash" | "deepseek-v4-flash") {
+    if crate::catalog::reviewed::route_model_set_contains("deepseek_files", &model) {
         CapabilityState::Supported
     } else {
         CapabilityState::Unknown
@@ -202,10 +167,7 @@ pub(crate) fn documented_deepseek_image_input_for_route(
         return CapabilityState::Unknown;
     }
     let model = wire_model_id.trim().to_ascii_lowercase();
-    if matches!(
-        model.as_str(),
-        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp"
-    ) {
+    if crate::catalog::reviewed::route_model_set_contains("deepseek_image", &model) {
         CapabilityState::Supported
     } else {
         CapabilityState::Unknown

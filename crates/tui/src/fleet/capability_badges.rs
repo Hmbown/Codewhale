@@ -5,7 +5,7 @@
 //! existing owners — the merged Models.dev catalog (via
 //! [`crate::provider_lake::catalog_offering_for_model`], provider-aware, with
 //! bundled/live/override layers) first, then the seeded
-//! [`crate::model_registry`] facts for ids no catalog row covers (custom
+//! reviewed intrinsic facts for ids no catalog row covers (custom
 //! providers, local models). No second model catalog is introduced here.
 //!
 //! Honesty rules: unknown facts are omitted rather than guessed, an explicit
@@ -16,9 +16,9 @@
 use codewhale_config::catalog::CatalogSource;
 use codewhale_config::route::{CapabilityState, RouteCapabilities, RouteLimits};
 
-use crate::config::ApiProvider;
-use crate::model_registry::{self, ModelMetadata};
+use crate::config::ProviderKind;
 use crate::utils::format_context_window;
+use codewhale_config::catalog::reviewed::IntrinsicModel;
 
 /// Resolved capability badges for one Fleet route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,8 +69,8 @@ pub fn resolve_route_capability_badges(
             });
         }
     }
-    let meta = model_registry::lookup(model)?;
-    let badges = badges_from_registry(&meta);
+    let meta = codewhale_config::catalog::reviewed::intrinsic_model(model)?;
+    let badges = badges_from_intrinsic(&meta);
     (!badges.is_empty()).then_some(RouteCapabilityBadges {
         badges,
         provenance: "registry",
@@ -89,8 +89,8 @@ fn effective_model(model: &str) -> Option<&str> {
 
 /// Accept only exact canonical built-in provider ids. Display labels and named
 /// custom table keys must not inherit a built-in catalog by similarity.
-fn exact_builtin_provider(provider_id: &str) -> Option<ApiProvider> {
-    ApiProvider::parse(provider_id).filter(|provider| provider.as_str() == provider_id)
+fn exact_builtin_provider(provider_id: &str) -> Option<ProviderKind> {
+    ProviderKind::parse(provider_id).filter(|provider| provider.as_str() == provider_id)
 }
 
 const fn catalog_provenance(source: &CatalogSource) -> &'static str {
@@ -118,18 +118,18 @@ fn badges_from_route(limits: &RouteLimits, capabilities: &RouteCapabilities) -> 
     badges
 }
 
-/// Badges from seeded registry facts. The registry has no tool/vision facts,
+/// Badges from reviewed intrinsic facts. The registry has no tool/vision facts,
 /// and its `supports_reasoning: false` is a heuristic default rather than a
 /// sourced denial, so only a positive reasoning fact is shown.
-fn badges_from_registry(meta: &ModelMetadata) -> Vec<String> {
+fn badges_from_intrinsic(meta: &IntrinsicModel) -> Vec<String> {
     let mut badges = Vec::new();
     if let Some(context) = meta.context_window {
         badges.push(format!("{} ctx", format_context_window(u64::from(context))));
     }
-    if let Some(output) = meta.max_output {
+    if let Some(output) = meta.generation_default.or(meta.max_output) {
         badges.push(format!("{} out", format_context_window(u64::from(output))));
     }
-    if meta.supports_reasoning {
+    if meta.reasoning == Some(true) {
         badges.push("reasoning".to_string());
     }
     badges

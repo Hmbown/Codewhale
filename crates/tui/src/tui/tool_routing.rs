@@ -659,11 +659,24 @@ fn fire_tool_completion_hooks(
         return;
     }
 
+    let input = app
+        .active_tool_details
+        .get(id)
+        .or_else(|| {
+            app.tool_cells
+                .get(id)
+                .and_then(|index| app.tool_details_by_cell.get(index))
+        })
+        .map(|detail| detail.input.clone());
     let context = app
         .base_hook_context()
         .with_tool_name(name)
         .with_tool_call_id(id)
         .with_tool_outcome(result);
+    let context = input.as_ref().map_or_else(
+        || context.clone(),
+        |input| context.clone().with_tool_args(input),
+    );
     let failed = context.tool_success == Some(false);
     let error_context = (wants_error && failed).then(|| {
         let text = context.tool_result.as_deref().unwrap_or_default();
@@ -2484,10 +2497,9 @@ mod tests {
     }
 
     /// #6582: hooks see a `bash` command's real exit code and status, for a
-    /// failing command as well as a passing one. `bash` reports a nonzero
-    /// exit or a timeout as a `ToolError`, and the hook used to read the code
-    /// only from a successful result, so every failing command reached
-    /// `tool_call_after` and `on_error` with no exit code.
+    /// failing command as well as a passing one. A nonzero exit is a
+    /// `ToolError`. A foreground wait that expires is not: the command moves
+    /// to the background and stays running, so `on_error` does not fire for it.
     #[cfg(unix)]
     #[test]
     fn bash_completion_hooks_get_exit_code_and_status_for_failures() {
@@ -2540,7 +2552,7 @@ mod tests {
         }
 
         let mut after = hook_log_lines_eventually(&after_log, 4);
-        let mut errors = hook_log_lines_eventually(&error_log, 3);
+        let mut errors = hook_log_lines_eventually(&error_log, 2);
         after.sort();
         errors.sort();
         assert_eq!(
@@ -2549,7 +2561,7 @@ mod tests {
                 "call-exit-0 0 completed true",
                 "call-exit-1 1 failed false",
                 "call-exit-127 127 failed false",
-                "call-timeout unset timed_out false",
+                "call-timeout unset running true",
             ]
         );
         assert_eq!(
@@ -2557,7 +2569,6 @@ mod tests {
             vec![
                 "call-exit-1 1 failed false",
                 "call-exit-127 127 failed false",
-                "call-timeout unset timed_out false",
             ]
         );
     }

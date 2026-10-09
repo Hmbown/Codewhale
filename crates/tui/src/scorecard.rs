@@ -14,7 +14,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 #[cfg(test)]
 use crate::config::{DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC};
 use crate::pricing::{
@@ -297,7 +297,7 @@ impl AvailableCost {
 }
 
 fn provider_scoped_cost(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     usage: &Usage,
     created_at: Option<&DateTime<Utc>>,
@@ -307,10 +307,10 @@ fn provider_scoped_cost(
     // override stale/junk recorded surfaces: they cannot become PAYG merely
     // because an older recorder wrote a bogus endpoint classification.
     let intrinsic_surface = match provider {
-        ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => {
+        ProviderKind::Ollama | ProviderKind::Sglang | ProviderKind::Vllm => {
             Some(crate::pricing::LOCAL_BILLING_SURFACE)
         }
-        ApiProvider::OpenaiCodex | ApiProvider::OpencodeGo => {
+        ProviderKind::OpenaiCodex | ProviderKind::OpencodeGo => {
             Some(crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE)
         }
         _ => None,
@@ -322,22 +322,22 @@ fn provider_scoped_cost(
     if billing_surface.is_none()
         && matches!(
             provider,
-            ApiProvider::Zai
-                | ApiProvider::Moonshot
-                | ApiProvider::Anthropic
-                | ApiProvider::XiaomiMimo
-                | ApiProvider::Xai
-                | ApiProvider::Minimax
-                | ApiProvider::MinimaxAnthropic
-                | ApiProvider::Stepfun
-                | ApiProvider::Custom
+            ProviderKind::Zai
+                | ProviderKind::Moonshot
+                | ProviderKind::Anthropic
+                | ProviderKind::XiaomiMimo
+                | ProviderKind::Xai
+                | ProviderKind::Minimax
+                | ProviderKind::MinimaxAnthropic
+                | ProviderKind::Stepfun
+                | ProviderKind::Custom
         )
     {
         return AvailableCost::failed_closed("missing_billing_surface");
     }
     let direct_deepseek = matches!(
         provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
     );
     let normalized_model = model.trim();
     let model_lower = normalized_model.to_ascii_lowercase();
@@ -352,8 +352,8 @@ fn provider_scoped_cost(
     // contract it had during its introductory window (Anthropic later made
     // that $2/$10 rate permanent; the row still prices at the turn's own time
     // rather than the wall clock, and undated turns still fail closed).
-    let needs_recorded_time =
-        direct_deepseek || (provider == ApiProvider::Anthropic && model_lower == "claude-sonnet-5");
+    let needs_recorded_time = direct_deepseek
+        || (provider == ProviderKind::Anthropic && model_lower == "claude-sonnet-5");
     let recorded_at = match (created_at, needs_recorded_time) {
         (Some(recorded_at), _) => recorded_at.to_owned(),
         // A time-windowed rate without a recorded time cannot be resolved to a
@@ -455,7 +455,7 @@ impl Scorecard {
                 .provider
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            let cost = provider.and_then(ApiProvider::parse).map_or_else(
+            let cost = provider.and_then(ProviderKind::parse).map_or_else(
                 AvailableCost::unknown_route,
                 |provider| {
                     provider_scoped_cost(
@@ -850,10 +850,10 @@ mod tests {
     fn dual_mode_routes_require_surface_but_intrinsic_routes_override_junk() {
         let usage = usage(10_000, 1_000, 0);
         for (provider, model) in [
-            (ApiProvider::Anthropic, "claude-haiku-4-5"),
-            (ApiProvider::Moonshot, "kimi-k2.7-code"),
-            (ApiProvider::Zai, "glm-5.2"),
-            (ApiProvider::Minimax, "minimax-m3"),
+            (ProviderKind::Anthropic, "claude-haiku-4-5"),
+            (ProviderKind::Moonshot, "kimi-k2.7-code"),
+            (ProviderKind::Zai, "glm-5.2"),
+            (ProviderKind::Minimax, "minimax-m3"),
         ] {
             let cost = provider_scoped_cost(provider, model, &usage, None, None);
             assert_eq!(
@@ -864,7 +864,7 @@ mod tests {
             assert!(cost.usd.is_none(), "{provider:?}");
         }
 
-        for provider in [ApiProvider::OpenaiCodex, ApiProvider::OpencodeGo] {
+        for provider in [ProviderKind::OpenaiCodex, ProviderKind::OpencodeGo] {
             let cost = provider_scoped_cost(
                 provider,
                 "gpt-5.5",
@@ -876,7 +876,7 @@ mod tests {
             assert!(!cost.counts_toward_money_coverage);
         }
         let local = provider_scoped_cost(
-            ApiProvider::Ollama,
+            ProviderKind::Ollama,
             "llama3.2",
             &usage,
             None,
@@ -886,7 +886,7 @@ mod tests {
         assert!(!local.counts_toward_money_coverage);
 
         let cloud = provider_scoped_cost(
-            ApiProvider::OllamaCloud,
+            ProviderKind::OllamaCloud,
             crate::config::DEFAULT_OLLAMA_CLOUD_MODEL,
             &usage,
             None,

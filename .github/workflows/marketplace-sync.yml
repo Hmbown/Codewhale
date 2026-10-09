@@ -46,7 +46,7 @@ jobs:
           PY
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          repository: Hmbown/codewhale-plugin-marketplace
+          repository: codewhale-hq/codewhale-plugin-marketplace
           ref: ${{ steps.source.outputs.revision }}
           path: marketplace
           persist-credentials: false

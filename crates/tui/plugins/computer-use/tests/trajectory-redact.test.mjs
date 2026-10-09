@@ -2,13 +2,14 @@
 // run_actions steps and the merged clipboard tool, is replaced before writing.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { redactCall, REDACTED } from "../src/trajectory.mjs";
+import { redactCall, containsRasterPin, REDACTED } from "../src/trajectory.mjs";
 
 test("redactCall removes entered text from every text-entry tool", () => {
   for (const [tool, args, field] of [
     ["type", { text: "pw", press_enter: true }, "text"],
     ["set_value", { value: "pw", target: { type: "element", index: 1 } }, "value"],
     ["browser_type", { text: "pw", selector: "#p" }, "text"],
+    ["browser", { action: "type", text: "pw" }, "text"],
     ["clipboard", { action: "write", text: "pw" }, "text"],
     ["write_clipboard", { text: "pw" }, "text"],
   ]) {
@@ -24,4 +25,8 @@ test("redactCall removes entered text from every text-entry tool", () => {
   const plain = redactCall("left_click", { target: { type: "coordinate", x: 1, y: 2 } });
   assert.equal(plain.redacted, false);
   assert.equal(redactCall("key", { text: "return" }).redacted, false, "key names are not entered text");
+  const aliased = redactCall("run_actions", { steps: [{ tool: "type", args: { text: "private" } }] });
+  assert.equal(aliased.redacted, true);
+  assert.equal(aliased.args.steps[0].args.text, REDACTED);
+  assert.equal(containsRasterPin({ steps: [{ tool: "left_click", args: { target: { raster_id: "saved-capture" } } }] }), true);
 });

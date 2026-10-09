@@ -12,7 +12,7 @@
 //!   `work_surface_top_height` (5..=16) or `work_surface_side_width`
 //!   (26..=80) to `settings.toml`.
 //! - **panel** — what it shows. [`RailPanel`]: `Tasks` (default) | `Agents` |
-//!   `Background` | `Files` | `Notepad` | `Context` | `Git` | `Price`, from
+//!   `Background` | `Terminal` | `Files` | `Notepad` | `Context` | `Git` | `Price`, from
 //!   the `rail_panel` setting. The legacy `sidebar_focus` key migrates into
 //!   it.
 //!
@@ -65,6 +65,7 @@ mod input;
 mod interaction;
 mod model;
 mod render;
+mod terminal;
 mod views;
 
 pub use input::{cycle_view, enter_agents, handle_key, handle_mouse};
@@ -72,6 +73,7 @@ pub(crate) use interaction::{agent_details_closed, release_focus, select_dock_pa
 pub use model::{RailPanel, WorkSurfacePlacement, WorkSurfaceState};
 pub(crate) use render::collapse_strip;
 pub use render::{height, render, split_chat};
+pub(crate) use terminal::{handle_paste as handle_terminal_paste, poll as poll_terminal};
 
 #[cfg(test)]
 mod tests {
@@ -83,7 +85,7 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
 
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tools::subagent::{
         AgentWorkerStatus, FleetRole, MailboxMessage, SubAgentAssignment, SubAgentResult,
         SubAgentStatus,
@@ -1006,6 +1008,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "Wire settled file activity".to_string(),
                 role: Some("general".to_string()),
             },
@@ -1096,6 +1099,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: format!("objective for {id}"),
                 role: Some(role.to_string()),
             },
@@ -1386,10 +1390,10 @@ mod tests {
 
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Deepseek,
-            ApiProvider::Deepseek.as_str(),
+            ProviderKind::Deepseek,
+            ProviderKind::Deepseek.as_str(),
             "deepseek-v4-pro",
-            Some(ApiProvider::Deepseek.default_base_url()),
+            Some(ProviderKind::Deepseek.provider().default_base_url()),
             chrono::Utc::now(),
         );
         let usage = |source_id: &str, input_tokens, output_tokens| MailboxMessage::TokenUsage {
@@ -2006,6 +2010,7 @@ mod tests {
                 git_branch: Some("codex/details".to_string()),
                 agent_type: FleetRole::Builder,
                 assignment: SubAgentAssignment {
+                    native_preset: None,
                     objective: "Verify keyboard and mouse convergence".to_string(),
                     role: Some("worker".to_string()),
                 },
@@ -3134,7 +3139,8 @@ mod tests {
         assert!(first_row.contains("Fleet"), "{first_row:?}");
         assert!(!first_row.contains("Tasks 3"), "{first_row:?}");
         assert!(!first_row.contains("Fleet 1"), "{first_row:?}");
-        assert!(first_row.contains("Context"), "{first_row:?}");
+        assert!(first_row.contains("Terminal"), "{first_row:?}");
+        assert!(!first_row.contains("Context"), "{first_row:?}");
         // Shed from the right: price goes before any work view.
         assert!(!first_row.contains("Cost"), "{first_row:?}");
     }

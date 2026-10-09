@@ -59,26 +59,30 @@ impl FinanceEndpoints {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct FinanceRequest {
     requested_ticker: String,
     resolved_symbol: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FinanceQuoteResponse {
     requested_ticker: String,
     ticker: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(deserialize_with = "deserialize_host_float")]
     price: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     change: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     change_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     previous_close: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     market_state: Option<String>,
@@ -87,9 +91,43 @@ struct FinanceQuoteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     exchange: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_host_optional")]
     market_time: Option<i64>,
     source: String,
     fallback_used: bool,
+}
+
+fn deserialize_host_float<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<f64, D::Error> {
+    let text = String::deserialize(decoder)?;
+    if text.len() > 32 {
+        return Err(serde::de::Error::custom(
+            "host numeric field exceeds its bound",
+        ));
+    }
+    text.parse().map_err(serde::de::Error::custom)
+}
+fn deserialize_host_optional<'de, D, T>(decoder: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    Option::<String>::deserialize(decoder)?
+        .map(|text| {
+            if text.len() > 32 {
+                return Err(serde::de::Error::custom(
+                    "host numeric field exceeds its bound",
+                ));
+            }
+            text.parse().map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+fn serialize_timestamp<S: serde::Serializer>(
+    value: &Option<i64>,
+    encoder: S,
+) -> Result<S::Ok, S::Error> {
+    value.map(|time| time.to_string()).serialize(encoder)
 }
 
 #[derive(Debug, Clone)]
@@ -265,8 +303,24 @@ impl ToolSpec for FinanceTool {
         // so `timeout_ms` — and the Timeout error that reports it — is the
         // real wall-clock bound rather than half of it.
         let deadline = std::time::Instant::now() + timeout;
-        let quote_result =
-            fetch_quote_endpoint(&self.client, timeout, &self.endpoints, &request).await;
+        let host = context
+            .features
+            .enabled(crate::features::Feature::FinanceHost);
+        let quote_result = if host {
+            fetch_host_endpoint(
+                &self.client,
+                timeout,
+                &self.endpoints,
+                &request,
+                context,
+                deadline,
+                false,
+            )
+            .await
+            .map_err(|error| normalize_host_error(error, timeout_ms))?
+        } else {
+            fetch_quote_endpoint(&self.client, timeout, &self.endpoints, &request).await
+        };
         match quote_result {
             Ok(result) => {
                 ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
@@ -276,7 +330,22 @@ impl ToolSpec for FinanceTool {
                 let chart_result = if remaining.is_zero() {
                     Err(AttemptFailure::timeout(CHART_SOURCE))
                 } else {
-                    fetch_chart_endpoint(&self.client, remaining, &self.endpoints, &request).await
+                    if host {
+                        fetch_host_endpoint(
+                            &self.client,
+                            remaining,
+                            &self.endpoints,
+                            &request,
+                            context,
+                            deadline,
+                            true,
+                        )
+                        .await
+                        .map_err(|error| normalize_host_error(error, timeout_ms))?
+                    } else {
+                        fetch_chart_endpoint(&self.client, remaining, &self.endpoints, &request)
+                            .await
+                    }
                 };
                 match chart_result {
                     Ok(result) => ToolResult::json(&result)
@@ -341,6 +410,152 @@ fn normalize_request(raw_ticker: &str, type_hint: Option<&str>) -> FinanceReques
         requested_ticker,
         resolved_symbol,
     }
+}
+
+fn normalize_host_error(error: ToolError, timeout_ms: u64) -> ToolError {
+    match error {
+        ToolError::Timeout { .. } => ToolError::Timeout {
+            seconds: millis_to_timeout_seconds(timeout_ms),
+        },
+        error => error,
+    }
+}
+
+/// The inner error is an upstream/business failure and may take the existing
+/// chart fallback. Host admission/runtime/result errors are outer errors and
+/// leave immediately, so an enabled Host failure never runs Rust normalization.
+async fn fetch_host_endpoint(
+    client: &Client,
+    timeout: Duration,
+    endpoints: &FinanceEndpoints,
+    request: &FinanceRequest,
+    context: &ToolContext,
+    deadline: std::time::Instant,
+    chart: bool,
+) -> Result<Result<FinanceQuoteResponse, AttemptFailure>, ToolError> {
+    let endpoint = if chart { CHART_SOURCE } else { QUOTE_SOURCE };
+    let url = if chart {
+        endpoints.chart_url(&request.resolved_symbol)
+    } else {
+        endpoints.quote_url(&request.resolved_symbol)
+    };
+    let body = tokio::select! {
+        biased;
+        _ = async { if let Some(cancel) = context.cancel_token.as_ref() { cancel.cancelled().await } else { std::future::pending::<()>().await } } => return Err(ToolError::not_available("finance cancelled")),
+        body = fetch_response_body_bounded(client, timeout, &url, endpoint) => match body { Ok(body) => body, Err(error) => return Ok(Err(error)) },
+    };
+    let parsed = if chart {
+        serde_json::from_str::<ChartEndpointResponse>(&body).and_then(serde_json::to_value)
+    } else {
+        serde_json::from_str::<QuoteEndpointResponse>(&body).and_then(serde_json::to_value)
+    };
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(Err(AttemptFailure::upstream(
+                endpoint,
+                format!("invalid JSON response: {error}"),
+            )));
+        }
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(Err(AttemptFailure::timeout(endpoint)));
+    }
+    let result = crate::extension_host::manager()
+        .execute_stock(
+            if chart {
+                crate::extension_host::StockOperation::FinanceChart
+            } else {
+                crate::extension_host::StockOperation::FinanceQuote
+            },
+            json!({"request":request,"parsed":parsed}),
+            context,
+            remaining,
+        )
+        .await?;
+    let metadata = result
+        .metadata
+        .ok_or_else(|| ToolError::execution_failed("Host finance result omitted metadata"))?;
+    if result.success {
+        let quote: FinanceQuoteResponse = serde_json::from_value(metadata)
+            .map_err(|_| ToolError::execution_failed("Host finance result malformed"))?;
+        if quote.requested_ticker != request.requested_ticker
+            || quote.source != endpoint
+            || quote.fallback_used != chart
+            || !quote.price.is_finite()
+        {
+            return Err(ToolError::execution_failed(
+                "Host finance result changed its captured request",
+            ));
+        }
+        Ok(Ok(quote))
+    } else {
+        if metadata.get("endpoint").and_then(Value::as_str) != Some(endpoint) {
+            return Err(ToolError::execution_failed(
+                "Host finance failure changed its endpoint",
+            ));
+        }
+        let detail = metadata
+            .get("detail")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::execution_failed("Host finance failure omitted detail"))?;
+        let failure = match metadata.get("kind").and_then(Value::as_str) {
+            Some("not_found") => AttemptFailure::not_found(endpoint, detail),
+            Some("upstream") => AttemptFailure::upstream(endpoint, detail),
+            _ => {
+                return Err(ToolError::execution_failed(
+                    "Host finance failure malformed",
+                ));
+            }
+        };
+        Ok(Err(failure))
+    }
+}
+
+/// Host captures are bounded before JSON parsing and before broker admission.
+/// The request's existing timeout includes every streamed body chunk.
+async fn fetch_response_body_bounded(
+    client: &Client,
+    timeout: Duration,
+    url: &str,
+    endpoint: &'static str,
+) -> Result<String, AttemptFailure> {
+    const MAX_BODY: usize = 1024 * 1024;
+    let mut response = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                AttemptFailure::timeout(endpoint)
+            } else {
+                AttemptFailure::upstream(endpoint, format!("request failed: {error}"))
+            }
+        })?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        if error.is_timeout() {
+            AttemptFailure::timeout(endpoint)
+        } else {
+            AttemptFailure::upstream(endpoint, format!("failed to read response body: {error}"))
+        }
+    })? {
+        if chunk.len() > MAX_BODY.saturating_sub(bytes.len()) {
+            return Err(AttemptFailure::upstream(
+                endpoint,
+                "Host finance response exceeds 1 MiB",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    if !status.is_success() {
+        return Err(status_failure(endpoint, status, &body));
+    }
+    Ok(body)
 }
 
 async fn fetch_quote_endpoint(
@@ -572,18 +787,18 @@ fn truncate_for_error(text: &str) -> String {
     out
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QuoteEndpointResponse {
     quote_response: QuoteResponseBody,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct QuoteResponseBody {
     result: Vec<QuoteItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QuoteItem {
     symbol: String,
@@ -600,6 +815,7 @@ struct QuoteItem {
     #[serde(default)]
     regular_market_previous_close: Option<f64>,
     #[serde(default)]
+    #[serde(serialize_with = "serialize_timestamp")]
     regular_market_time: Option<i64>,
     #[serde(default)]
     market_state: Option<String>,
@@ -613,12 +829,12 @@ struct QuoteItem {
     full_exchange_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartEndpointResponse {
     chart: ChartBody,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartBody {
     #[serde(default)]
     result: Option<Vec<ChartResult>>,
@@ -626,12 +842,12 @@ struct ChartBody {
     error: Option<ChartErrorBody>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartResult {
     meta: ChartMeta,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChartMeta {
     symbol: String,
@@ -644,6 +860,7 @@ struct ChartMeta {
     #[serde(default)]
     regular_market_price: Option<f64>,
     #[serde(default)]
+    #[serde(serialize_with = "serialize_timestamp")]
     regular_market_time: Option<i64>,
     #[serde(default)]
     chart_previous_close: Option<f64>,
@@ -657,7 +874,7 @@ struct ChartMeta {
     full_exchange_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChartErrorBody {
     #[serde(default)]
     code: Option<String>,
@@ -1171,3 +1388,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "stock_host_tests.rs"]
+mod stock_host_tests;

@@ -244,7 +244,7 @@ export async function POST(req: Request) {
     // unknown, the post it may have created is looked for (from shortly
     // before that attempt) instead of posting blind a second time.
     const identity = await reviewedBodyHash(JSON.stringify({
-      repo: env.GITHUB_REPO ?? "Hmbown/CodeWhale", type: draft.type,
+      repo: env.GITHUB_REPO ?? "codewhale-hq/CodeWhale", type: draft.type,
       target: draft.targetNumber, body: commentBody,
     }));
     let unknownAt: string | null;
@@ -357,7 +357,7 @@ export async function POST(req: Request) {
       const firstLine = digestBody.split("\n")[0].replace(/^#+\s*/, "").trim();
       const title = firstLine || `Weekly Digest ${draft.id}`;
 
-      const digestRepo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+      const digestRepo = env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
       const issuesUrl = `https://api.github.com/repos/${digestRepo}/issues`;
 
       let issue: { number?: number; html_url?: string } | undefined;
@@ -423,7 +423,7 @@ export async function POST(req: Request) {
       });
     }
 
-    const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+    const repo = env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
     const commentUrl = `https://api.github.com/repos/${repo}/issues/${draft.targetNumber}/comments`;
 
     let reconciled = false;

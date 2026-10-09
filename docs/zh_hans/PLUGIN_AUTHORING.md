@@ -2,6 +2,8 @@
 
 > 英文原文：[PLUGIN_AUTHORING.md](../PLUGIN_AUTHORING.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 核对 DSH 静态转换、显式 Native 入口及本地 Node MCP 工作目录边界。
+> 2026-10-07 同步 DSH 经审查 Native 组合与 skill 根目录注册的说明。
 
 先从一个 skill 开始：把 Markdown 指令文件放进一个小型插件包。
 [hello-codewhale 示例](../examples/plugins/hello-codewhale/plugin.json)
@@ -139,6 +141,7 @@ Codewhale 确认激活后，再发送普通消息 `请打个招呼。`。
 | Commands | Markdown 命令文件；参见[命令元数据](../architecture/command-dispatch.md#user-commands)。 |
 | Agent profiles | Fleet TOML 配置文件；参见[Fleet 编写指南](./FLEET.md#编写-agent-配置fleet-setup)。 |
 | Hooks | `HooksConfig` TOML 文件；参见[事件与进程行为](./HOOKS.md)。 |
+| Native mod（实验性） | 已审查的 ESM 入口，可注册工具、命令、执行前监听器、提示词片段及插件本地 JSON 状态；参见[扩展契约](./EXTENSIONS.md)。 |
 
 Commands、Agents 和 Hooks 的路径声明放在 `plugin.json` 的
 `extensions["net.codewhale"]` 中，详见
@@ -151,7 +154,50 @@ ES 模块文件，由 TypeScript 扩展宿主运行，`/plugin validate` 会拒�
 Full Access（完全访问）、Bypass，或针对该已审查构建的精确会话授权，都可以满足这一要求而不再弹出审批
 （[设计文档](../design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25)）。
 可运行的类型化示例、生命周期和按插件归属显示的诊断见
-[扩展工具编写指南](../EXTENSIONS.md)。`.mts` 只支持 Node 可直接擦除的类型语法，无需单独的编译器；需要转换的语法不受支持。
+[扩展编写指南](./EXTENSIONS.md)。`.mts` 只支持 Node 可直接擦除的类型语法，无需单独的编译器；需要转换的语法不受支持。
+
+## 编写有明确作用范围的 Native mod
+
+[mod-extension 示例](../examples/plugins/mod-extension/README.md) 是可运行的
+ESM 插件包，不需要安装依赖或运行编译器。它注册 `mod_counter` 工具、
+`/mod-count` 用户命令、一个提示词片段，以及只处理自身工具的执行前监听器。
+工具返回结构化 JSON 计数结果；`ctx.storage` 将计数保存在 Rust 指定的插件目录中。
+清理函数可重复调用，会撤销注册并等待排队的工作结束。停用后监听器和提示词片段
+被撤回，计数状态仍然保留。
+
+先明确开启实验性的 `extension_host` 功能，再安装示例目录，验证并查看其 Native
+能力。由本人审查源代码和精确的内容/能力哈希，执行审查给出的信任命令后再启用。
+功能关闭时，Native 代码只列入清单，不执行。源文件变更需要重新审查；
+`/plugin reload` 是手动刷新，不是自动监视或热重载。
+
+可用的编写服务包括 `tools`、`commands`、`prompt`、`storage`、`logger` 和 Cordis
+生命周期机制。`ctx.on('tools/pre-execute', ...)` 可以返回不干预、拒绝、请求审批、
+修订对象输入或补充上下文。Rust 合并这些提议；输入变更后重新准备调用并检查权限。
+`allow` 不授予批准，`next()` 只表示不干预。异常、格式错误、超时及已撤销的所有者
+都会使当前调用被拒绝。这是执行前提议契约，不提供包裹实际执行的中间件，也不支持
+改写执行后的结果。
+
+`ctx.prompt.registerSection({id, text})` 提交有边界、带来源的指令，通过现有 Engine
+运行时消息进入上下文。`ctx.storage.get/set/delete` 保存有大小限制的插件本地 JSON，
+可跨代保留。两者都不能替换系统提示词、会话存储或凭据服务。工具和命令调用可获得
+本次调用的只读 `sessionId`、`agentId`、`originTurnId` 字符串，Rust 未提供时字段缺省；
+这些是标识标签，不是运行时操作句柄。目前没有已发布的插件编写 SDK，示例使用文档
+规定的宿主适配服务。
+
+`ctx.skills.registerRoot({path: 'profiles/review-skills'})` 把已审查包内的子 `SKILL.md`
+技能包加入现有的 Rust 技能目录；其 disposer 会撤销该根目录，禁用、撤销信任和宿主退出
+同样会撤销。发现或加载 skill 时 Rust 会重新检查 Native 审查凭据、文件哈希和当前注册；
+进程或宿主重启后，先前保存的 Native 选择失效。路径规则与数量/字节上限见
+[技能根目录契约](./EXTENSIONS.md#注册技能目录)。该 API 只增加
+指令，工具权限仍由共享引擎掌握。
+
+下文的 DSH 导入器既能转换可移植的声明式组件，也能为封闭的包准备一份经审查的 Native
+组合。自定义 Ratatui/GPUI 控件、DSH 浏览器 UI 插槽及 DSH 自身的 agent 运行时尚未提供。兼容的 Claude 插件包仍使用原有的声明组件适配器；此 Native API 不加载
+Claude 的 agent loop，也不会自动适配 Pi 扩展 API。可执行 mod 需按文档中的宿主契约
+移植。扩展工具只有在模型直接调用它、且共享 turn gate 正在处理本次调用时，
+才能使用 `exec.core.call`。命令及激活代码没有 core 句柄。嵌套 shell 和网络调用必须
+弹出用户审批；无法打开审批的模式会拒绝执行。完整的拒绝列表、取消语义和调用上限
+见[请求核心执行工具](./EXTENSIONS.md#请求核心执行工具)。
 
 插件信任**不是操作系统沙箱**。本地 MCP 服务器或 hook 可以启动进程；
 启用前需审查其代码和权限。Skills 不授予权限：仓库指令、权限规则、沙箱策略
@@ -249,24 +295,33 @@ npm 包）由 Codewhale 原生导入，而不是通过此脚本（`--bundle` 已
 `config` **不会**做深度合并。这不是完整的 profile 解析器：其他插件包、用户叠加层和
 部署配置都不在其中。普通 YAML 标量遵循 YAML 1.2 core schema，与 DSH 自己的解析器一致。
 
-被禁用的组会把禁用状态传递给其后代。被禁用的 MCP 声明保持禁用。被禁用的 skill 会被
+在可移植的声明式转换中，被禁用的组会把禁用状态传递给其后代。被禁用的 MCP 声明保持禁用。被禁用的 skill 会被
 省略并给出明确的回执，因为原生 skill 格式没有禁用状态。组或可移植条目上带条件的/
 非布尔的 `disabled` 值会使导入被拒绝，而不会假定它已启用。不受支持的条目策略/依赖字段
 （包括 `inject`、`intercept` 和 `isolate`）同样会使包含它们的条目或组的导入被拒绝。
 请在手工移植时保留它们的激活规则和权限规则。
 
-外部运行时插件和 `dsh.client` 界面代码不会被执行或转换。其他无法表示的组件会记录在
+包含受支持的本地模块、包内 ESM 导出或受支持的 DSH 服务桥的包可以生成 Native 组合：
+导入器封存包内源文件和模块哈希，然后生成一个或多个 Native 入口。只要 Native 图中有一行
+无法解析或不受支持，整个图都会被拒绝，不会悄悄安装恰好能解析的部分。经审查的 agent 预设包可以生成各自的 Native 入口，
+其贡献范围由所选的默认或子预设决定。导入和审查永远
+不会执行插件代码。`dsh.client` 界面代码和上游 agent loop 不在此契约之内。无法表示的可移植组件会记录在
 插件包的 `CONVERSION.md` 和结构化的 `CONVERSION.json` 中，其中包含源包名/版本、清单和
 有序各层的 SHA-256 哈希、转换器版本、逐条目的结果，以及需要手工移植的内容。未应用的
 patch 操作也会出现在结构化的手工移植列表中，并附带其来源层和从 1 开始的操作序号。
 
-能被转换（lowering）的 `!!js` 表达式只有 `process.execPath`（变成 `node`）和不含转义或插值的
+在可移植转换中，能被转换（lowering）的 `!!js` 表达式只有 `process.execPath`（变成 `node`）和不含转义或插值的
 简单带引号/模板字面量。环境变量表达式（包括带回退值的）永远不会按本机环境求值。
 已打包的 Node MCP 只有在其相对入口（以及声明的相对工作目录）解析后位于包内时才会被
 转换；包外的服务器会被跳过，宿主路径永远不会被复制。`@deepseek-ai/dsh-skill-filesystem`
 条目只有在其字面的 `customSkillDirs` 子目录位于包内时，才会贡献这些子目录。默认的用户
-和项目 skill 根目录、文件监视器以及外部服务依赖都不会被导入。任意 DSH TypeScript
-插件的执行不在此兼容范围之内。
+和项目 skill 根目录、文件监视器以及外部服务依赖都不会被导入。DSH 模块仅通过实验性的
+TypeScript 扩展宿主运行（`[features] extension_host`，默认关闭），可以来自明确编写的 Native 入口，
+也可以来自导入器生成并经过审查的组合。生成的 Native 组合在显式启用 `extension_host`、且已安装的包
+经过审查、信任并启用之前保持不活动；宿主在加载前校验其源文件闭包，Rust 保留工具审批和会话权限。
+工具、命令、提示词片段、技能、钩子和 owner 本地存储沿用 Codewhale 现有的消费者与审批规则。
+这是受支持的兼容子集：导入成功并不表示每个上游 DSH 服务都可用。参见[扩展编写指南](./EXTENSIONS.md)与
+[宿主设计](../design/TS_EXTENSION_HOST.md)。
 
 ### 本地 Node MCP 服务器
 
@@ -357,5 +412,5 @@ Bundle patch 的语义已对照 DSH
 ## 社区背景
 
 本指南回应了 [giancarlocp 在讨论 #5827 中提出的插件编写指南与 OpenCode
-转换需求](https://github.com/Hmbown/Codewhale/discussions/5827)。
-简体中文版本遵循 [SparkofSpike 在 issue #5482 中提出的中文文档工作方向](https://github.com/Hmbown/Codewhale/issues/5482)。
+转换需求](https://github.com/codewhale-hq/Codewhale/discussions/5827)。
+简体中文版本遵循 [SparkofSpike 在 issue #5482 中提出的中文文档工作方向](https://github.com/codewhale-hq/Codewhale/issues/5482)。

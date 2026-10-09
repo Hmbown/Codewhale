@@ -95,7 +95,7 @@ def write_budget(
             "it needs a reviewer to say why in the PR. Regenerate with: "
             "python3 scripts/check-dead-code-budget.py --update"
         ),
-        "_issue": "https://github.com/Hmbown/CodeWhale/issues/4785",
+        "_issue": "https://github.com/codewhale-hq/CodeWhale/issues/4785",
         "_expect_blind_spot": (
             "Until #6241 this gate counted only the `allow` spelling, so "
             "rewriting an allow as an expect lowered the number without "

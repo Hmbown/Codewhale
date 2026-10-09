@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Arka plan kontrolünü çalıştır", body: "Yardımcı geçici bir deneme penceresi açar, metin girer ve o pencerenin görüntüsünü alır. Çalışma sırasında imlecin veya etkin uygulamanın değişip değişmediğini kontrol eder." },
     { title: "Codewhale'e bağla", body: "Codewhale eklenti mağazasında Computer Use'u incele, güvenilir olarak işaretle ve etkinleştir. Yerel eylemlerin yardımcının Pause ve Stop denetimlerinden geçmesi için eklentinin 0.3.1 veya üzeri sürümünü kullan." },
   ],
-  controlsTitle: "Çalışmaya devam et. Denetim sende kalsın.",
+  controlsTitle: "Uygulama denetimini duraklat veya durdur",
   controlsBody: "Desteklenen eylemler seçili uygulamada arka planda çalışır. Ön planda denetim gerektiren uygulamalar ve hareketler için senin onayın gerekir. Menü hedefi ve giriş modunu gösterir; Pause (Duraklat) yardımcının girişini askıya alır, Stop (Durdur) ise mevcut oturumlarını sonlandırır.",
   updateTitle: "Güncellemeler sen istediğinde",
   updateBody: "Uygulamadan Check for updates'i (Güncellemeleri denetle) seç. Bir güncellemeyi kurmadan önce indirmeyi, Codewhale imzasını ve Apple noter onayını doğrular; kurtarma için önceki uygulamayı saklar.",

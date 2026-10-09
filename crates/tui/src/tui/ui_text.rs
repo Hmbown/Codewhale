@@ -95,6 +95,12 @@ pub(crate) fn semantic_truncate(text: &str, max_width: usize) -> String {
                 last_word_end = Some(byte_idx);
                 in_word = false;
             }
+        } else if breaks_after_cjk(grapheme) {
+            // Han and kana have no spaces to wait for: every character is a
+            // word end. Without this, one space early in a Chinese or
+            // Japanese line cuts everything after it.
+            last_word_end = Some(cut_byte);
+            in_word = false;
         } else {
             in_word = true;
         }
@@ -114,6 +120,19 @@ pub(crate) fn semantic_truncate(text: &str, max_width: usize) -> String {
     let mut out = body.to_string();
     out.push(ELLIPSIS);
     out
+}
+
+/// A cut may follow a Han, kana or CJK punctuation character, except an
+/// opening bracket, which would be left dangling before the ellipsis.
+fn breaks_after_cjk(grapheme: &str) -> bool {
+    let Some(first) = grapheme.chars().next() else {
+        return false;
+    };
+    crate::tui::translation::is_cjk(first)
+        && !matches!(
+            first,
+            '（' | '「' | '『' | '【' | '〔' | '《' | '〈' | '［' | '｛'
+        )
 }
 
 pub(crate) fn semantic_truncate_with_affixes(
@@ -445,6 +464,18 @@ mod tests {
         let cjk = semantic_truncate("中文测试文本", 7);
         assert_eq!(cjk, "中文测…");
         assert!(text_display_width(&cjk) <= 7);
+    }
+
+    #[test]
+    fn semantic_truncate_breaks_between_cjk_after_a_space() {
+        // The space after "Operate" used to be the only word end, so the
+        // Chinese clause after it was dropped whole.
+        let out = semantic_truncate("Operate 把你的提示词变成目标", 20);
+        assert_eq!(out, "Operate 把你的提示…");
+        assert!(text_display_width(&out) <= 20);
+
+        // An opening bracket is not left dangling before the ellipsis.
+        assert_eq!(semantic_truncate("模型已切换（原为", 13), "模型已切换…");
     }
 
     #[test]

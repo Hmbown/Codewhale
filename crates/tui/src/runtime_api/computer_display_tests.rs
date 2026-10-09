@@ -415,18 +415,107 @@ mod live {
     }
 
     #[tokio::test]
+    async fn watch_client_token_cannot_acquire_control_or_send_input_through_a_ticket() {
+        let h = harness().await;
+        let http = codewhale_release::tls::reqwest_client();
+        let minted: Value = http
+            .post(format!("{}/v1/auth/client-tokens", h.base))
+            .bearer_auth(MASTER)
+            // A legacy label cannot broaden the omitted, default-watch intent.
+            .json(&json!({ "device_id": "same-device", "label": "cwc-seat:drive" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(minted["intent"], "watch");
+        let watch = minted["token"].as_str().unwrap();
+        let drive: Value = http
+            .post(format!("{}/v1/auth/client-tokens", h.base))
+            .bearer_auth(MASTER)
+            .json(&json!({ "device_id": "same-device", "intent": "drive" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = http
+            .post(format!("{}/v1/computer/control/acquire", h.base))
+            .bearer_auth(drive["token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(lease.status(), StatusCode::OK);
+        for (token, expected) in [(watch, false), (drive["token"].as_str().unwrap(), true)] {
+            let status = http
+                .get(format!("{}/v1/computer", h.base))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK);
+            let status: Value = status.json().await.unwrap();
+            assert_eq!(status["control"]["you_hold_lease"], expected);
+        }
+        for (action, body) in [
+            ("acquire", json!({})),
+            ("acquire", json!({ "force": true })),
+            ("release", json!({})),
+        ] {
+            let refused = http
+                .post(format!("{}/v1/computer/control/{action}", h.base))
+                .bearer_auth(watch)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            h.computer.sweep_lease().unwrap().holder,
+            "device:same-device"
+        );
+        let ticket: Value = http
+            .post(format!("{}/v1/computer/display/tickets", h.base))
+            .bearer_auth(watch)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ws = connect(
+            &h,
+            None,
+            &format!("?ticket={}", ticket["ticket"].as_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        let (mut watcher, _, _) = RfbClient::handshake(ws).await;
+        let mut burst = Vec::from(KEY);
+        burst.extend_from_slice(&POINTER);
+        burst.extend_from_slice(&FUR);
+        watcher.send(&burst).await;
+        assert_eq!(wait_for_received(&h, FUR.len()).await, FUR);
+        assert_eq!(h.received.lock().len(), FUR.len());
+    }
+
+    #[tokio::test]
     async fn client_tokens_are_owner_minted_scoped_and_revocable() {
         let h = harness().await;
         let http = codewhale_release::tls::reqwest_client();
         let resp = http
             .post(format!("{}/v1/auth/client-tokens", h.base))
             .bearer_auth(MASTER)
-            .json(&json!({ "device_id": "mac-1", "ttl_seconds": 999999 }))
+            .json(&json!({ "device_id": "mac-1", "ttl_seconds": 999999, "intent": "drive" }))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 201);
         let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["intent"], "drive");
         let token = body["token"].as_str().unwrap().to_string();
         let id = body["id"].as_str().unwrap().to_string();
         let expires: DateTime<Utc> = body["expires_at"].as_str().unwrap().parse().unwrap();

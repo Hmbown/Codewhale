@@ -37,8 +37,8 @@ pub const GITHUB_MIGRATION_HELP: &str = r#"Install the official GitHub release i
   command -v codewhale codew
 Future updates: "$codewhale_install_dir/codewhale" update
 Keep the chosen PATH directory in your shell profile after verifying it.
-Windows: https://github.com/Hmbown/CodeWhale/releases/latest
-PATH and migration: https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md"#;
+Windows: https://github.com/codewhale-hq/CodeWhale/releases/latest
+PATH and migration: https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md"#;
 
 /// The package manager (if any) that owns the running executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

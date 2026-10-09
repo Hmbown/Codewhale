@@ -16,8 +16,8 @@ run before execution reaches this boundary.
 | Mechanism | Platform | Selection | What Codewhale reports |
 |---|---|---|---|
 | Seatbelt (`sandbox-exec`) | macOS | Automatic when the runtime probe succeeds | `macos-seatbelt` |
-| Bubblewrap (`/usr/bin/bwrap`) | Linux | `prefer_bwrap = true` and the file is executable | `linux-bwrap` |
-| No OS wrapper | Linux without usable opt-in bwrap | Default | `none` |
+| Bubblewrap (`/usr/bin/bwrap`) | Linux | Default when installed and a wrapped probe run succeeds; `prefer_bwrap = false` opts out | `linux-bwrap` |
+| No OS wrapper | Linux without usable bwrap, or opted out | `prefer_bwrap = false`, or bwrap absent/unusable | `none` |
 | No OS wrapper | Windows | Current implementation | `none` |
 | OpenSandbox-compatible service | Any supported host | `sandbox_backend = "opensandbox"` | External execution path |
 
@@ -43,16 +43,21 @@ If the probe fails or `sandbox-exec` is unavailable, Codewhale reports no OS
 sandbox and launches the command without a Seatbelt wrapper. It does not set a
 Seatbelt marker on that fallback.
 
-## Linux: opt-in bubblewrap
+## Linux: default bubblewrap
 
-Linux command sandboxing is opt-in. Set the top-level configuration key:
+Linux command sandboxing is on by default whenever bubblewrap works. Set the
+top-level configuration key to opt out:
 
 ```toml
-prefer_bwrap = true
+prefer_bwrap = false
 ```
 
-Codewhale selects bubblewrap only when `/usr/bin/bwrap` is a regular executable
-file. The wrapper derives its mounts and network namespace from the resolved
+Codewhale selects bubblewrap only when `/usr/bin/bwrap` is a regular
+executable file AND a wrapped probe run proves it can create its namespaces
+on this host — the exec bit alone lies where user namespaces are restricted
+(e.g. Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns`),
+where every wrapped command would fail rather than run unsandboxed. The
+wrapper derives its mounts and network namespace from the resolved
 `SandboxPolicy`:
 
 ```text
@@ -91,11 +96,12 @@ by default. Codewhale adds `--share-net` only when the policy's
 `network_access` is true. `danger-full-access` and `external-sandbox` bypass the
 local wrapper entirely.
 
-If the user does not opt in, or `/usr/bin/bwrap` is missing or non-executable,
-Codewhale reports `none` and launches the command without a Linux OS wrapper.
-There is no marker-only fallback to a different Linux sandbox.
+If the user opts out, or `/usr/bin/bwrap` is missing, non-executable, or
+cannot actually confine a child, Codewhale reports `none` and launches the
+command without a Linux OS wrapper. There is no marker-only fallback to a
+different Linux sandbox.
 
-Install bubblewrap separately when this opt-in fits the workflow:
+Install bubblewrap separately to get enforcement on Linux:
 
 - Ubuntu/Debian: `apt install bubblewrap`
 - Fedora: `dnf install bubblewrap`
@@ -180,8 +186,9 @@ backend:
 - `CODEWHALE_SANDBOX_URL`
 - `CODEWHALE_SANDBOX_API_KEY`
 
-There is no `CODEWHALE_PREFER_BWRAP` environment override; use the top-level
-`prefer_bwrap` config key.
+`CODEWHALE_PREFER_BWRAP` (legacy alias `DEEPSEEK_PREFER_BWRAP`) overrides the
+preference explicitly; the top-level `prefer_bwrap` config key is the durable
+setting.
 
 ## Diagnostics and failure attribution
 
@@ -219,7 +226,7 @@ Denial attribution is intentionally conservative:
 
 - `crates/tui/src/sandbox/mod.rs` — truthful selection and public capability markers
 - `crates/tui/src/sandbox/seatbelt.rs` — macOS wrapper and availability probe
-- `crates/tui/src/sandbox/bwrap.rs` — Linux opt-in wrapper
+- `crates/tui/src/sandbox/bwrap.rs` — Linux wrapper and functional availability probe
 - `crates/tui/src/sandbox/process_hardening.rs` — Linux parent-process hardening
 - `crates/tui/src/sandbox/backend.rs` — external backend selection
 - `crates/tui/src/tools/diagnostics.rs` — machine-readable diagnostics

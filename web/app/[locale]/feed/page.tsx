@@ -69,14 +69,14 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
   const lede = (
     <>
       {ledeParts[0]}
-      <Link href="https://github.com/Hmbown/CodeWhale" className="link">Hmbown/CodeWhale</Link>
+      <Link href="https://github.com/codewhale-hq/CodeWhale" className="link">codewhale-hq/CodeWhale</Link>
       {ledeParts[1]}
     </>
   );
   const actionLinks: { href: string; icon: IconName; label: string }[] = [
-    { href: "https://github.com/Hmbown/CodeWhale/issues/new/choose", icon: "alert", label: t.openIssue },
-    { href: "https://github.com/Hmbown/CodeWhale/compare", icon: "git-pull-request", label: t.openPull },
-    { href: "https://github.com/Hmbown/CodeWhale/discussions/new", icon: "message", label: t.startDiscussion },
+    { href: "https://github.com/codewhale-hq/CodeWhale/issues/new/choose", icon: "alert", label: t.openIssue },
+    { href: "https://github.com/codewhale-hq/CodeWhale/compare", icon: "git-pull-request", label: t.openPull },
+    { href: "https://github.com/codewhale-hq/CodeWhale/discussions/new", icon: "message", label: t.startDiscussion },
   ];
   const columns = [
     { id: "feed-pulls", title: t.pulls, items: pulls, status: pullsStatus },

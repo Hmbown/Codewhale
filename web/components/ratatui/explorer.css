@@ -1,0 +1,132 @@
+.ratatui-page .page-head { padding-block: 2.25rem 1.5rem; }
+.ratatui-page .page-lede { max-width: 65ch; }
+.ratatui-page .page-title { font-size: clamp(1.8rem, 3vw, 2.6rem); }
+.rat-explorer { width: var(--container); margin: 0 auto 4rem; display: grid; grid-template-columns: 15rem minmax(0, 1fr); border-top: 1px solid var(--line); color: var(--text); scroll-margin-top: 5rem; }
+.rat-explorer button, .rat-explorer input, .rat-explorer select { font: inherit; }
+.rat-explorer button, .rat-explorer select { cursor: pointer; }
+.rat-explorer button:disabled { opacity: .4; cursor: default; }
+.rat-explorer :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.rat-explorer ::selection { background: var(--accent); color: var(--bg); }
+.rat-explorer input { caret-color: var(--accent); }
+.rat-explorer svg { width: 1rem; height: 1rem; flex-shrink: 0; }
+.rat-explorer a { text-underline-offset: .2em; }
+.rat-task-picker { grid-column: 1 / -1; display: grid; gap: 1rem; padding-block: 1.25rem; border-bottom: 1px solid var(--line); }
+.rat-task-picker h2 { font-size: 1.1rem; font-weight: 600; margin: 0 0 .25rem; }
+.rat-task-picker p { margin: 0; color: var(--muted); font-size: .875rem; line-height: 1.55; max-width: 70ch; }
+.rat-task-options { display: flex; flex-wrap: wrap; gap: .5rem; }
+.rat-task-options .rat-button[aria-pressed=true] { background: var(--panel); color: var(--accent); border-color: var(--accent); }
+.rat-task-options .rat-button { min-height: 2.75rem; }
+.rat-usage-panel > p { font-size: .95rem; line-height: 1.6; max-width: 70ch; }
+.rat-usage-panel > p:first-child { margin-top: 0; }
+.rat-usage-panel .rat-code-heading { margin-top: 1.25rem; }
+.rat-usage-links { display: flex; gap: .75rem 1.5rem; flex-wrap: wrap; margin-block: 1.25rem; }
+.rat-empty-study { display: grid; align-content: start; justify-items: start; gap: 1rem; min-height: 20rem; }
+.rat-empty-study p { color: var(--muted); max-width: 65ch; line-height: 1.6; }
+.rat-browser { padding: 1.5rem 1.25rem 0 0; min-width: 0; border-inline-end: 1px solid var(--line); }
+.rat-search { display: block; }
+.rat-search > span, .rat-field, .rat-family-field { font-size: .8rem; font-weight: 500; }
+.rat-search > div { display: flex; align-items: center; gap: .5rem; border-bottom: 1px solid var(--line-strong); padding-block: .5rem; margin-top: .2rem; }
+.rat-search input { width: 100%; min-width: 0; background: none; border: 0; font-size: .875rem; color: var(--text); padding-block: .25rem; }
+.rat-search input::placeholder { color: var(--muted); opacity: 1; }
+.rat-search kbd { color: var(--muted); font-size: .75rem; }
+.rat-family-field { display: grid; gap: .35rem; margin-top: 1.25rem; }
+.rat-explorer select { color: var(--text); background: var(--bg); border: 1px solid var(--line-strong); border-radius: var(--radius-control); min-height: 2.4rem; padding: .35rem .5rem; max-width: 100%; min-width: 0; width: 100%; font-size: .875rem; }
+.rat-count { font-size: .75rem; color: var(--muted); margin-block: .75rem 1rem; font-variant-numeric: tabular-nums; }
+.rat-entry-list { max-height: 65rem; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; padding-inline-end: .25rem; }
+.rat-family { margin-bottom: 1.5rem; }
+.rat-family h3 { font-size: .8rem; font-weight: 600; color: var(--muted); margin: 0 0 .5rem .5rem; }
+.rat-family-count { font-weight: 400; font-variant-numeric: tabular-nums; }
+.rat-family-index h2 { font-size: .95rem; font-weight: 600; margin: 0; line-height: 1.35; }
+.rat-family-index .rat-entry-list { max-height: none; overflow: visible; }
+.rat-family-index a.rat-entry { color: var(--text); text-decoration: none; align-items: center; }
+.rat-family-index a.rat-entry:hover { background: var(--surface); }
+.rat-index-back { margin-top: 1.25rem; color: var(--accent); }
+.rat-entry { display: flex; justify-content: space-between; gap: .5rem; width: 100%; min-height: 2.4rem; text-align: start; padding: .5rem; border: 0; background: none; color: var(--text); border-radius: var(--radius-control); line-height: 1.3; font-size: .875rem !important; }
+.rat-entry:hover { background: var(--surface); }
+.rat-entry[aria-current] { background: var(--panel); color: var(--accent); font-weight: 600; }
+.rat-entry-width { color: var(--muted); font-size: .7rem; padding-top: .12rem; font-weight: 400; font-variant-numeric: tabular-nums; }
+.rat-study { min-width: 0; padding: 1.5rem 0 0 2rem; }
+.rat-study-heading { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.rat-study-heading p { color: var(--muted); font-size: .8rem; margin: 0 0 .35rem; }
+.rat-study h2 { font-size: 1.625rem; font-weight: 600; line-height: 1.2; margin: 0; text-wrap: balance; }
+.rat-link { display: inline-flex; gap: .4rem; align-items: center; font-size: .8rem; white-space: nowrap; }
+.rat-description { font-size: .95rem; color: var(--muted); line-height: 1.55; max-width: 68ch; margin-block: .75rem 1.25rem; }
+.rat-study-tabs { display: flex; align-items: stretch; flex-wrap: wrap; gap: .25rem 1.25rem; border-bottom: 1px solid var(--line); }
+.rat-study-tabs > button { background: none; border: 0; color: var(--muted); padding: .65rem 0; font-size: .875rem; min-height: 2.75rem; border-bottom: 2px solid transparent; }
+.rat-study-tabs > button[aria-pressed=true] { color: var(--text); border-bottom-color: var(--accent); }
+.rat-pager { margin-inline-start: auto; display: flex; gap: .25rem; }
+.rat-pager button { background: none; border: 0; color: var(--text); padding: .65rem; }
+.rat-prev-icon { transform: rotate(180deg); }
+.rat-preview-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 1rem; padding-block: 1rem; }
+.rat-field { display: grid; gap: .3rem; }
+.rat-scale { margin-inline-start: auto; }
+.rat-button { background: var(--bg); color: var(--text); border: 1px solid var(--line-strong); border-radius: var(--radius-control); display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: 2.4rem; padding: .4rem .7rem; font-size: .8rem !important; }
+.rat-button:hover { background: var(--surface); }
+.rat-button-primary { background: var(--accent); color: var(--on-brand); border-color: var(--accent); }
+.rat-button-primary:hover { background: var(--accent-hover); }
+.rat-terminal { overflow: auto; max-height: 48rem; background: var(--surface); scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--surface); border-radius: var(--radius-surface); }
+.rat-terminal img { display: block; width: auto; max-width: none; }
+.rat-terminal-fit img { width: auto; max-width: 100%; height: auto; margin-inline: auto; }
+.rat-preview-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; color: var(--muted); font-family: var(--font-mono); font-size: .7rem; margin-block: .75rem; font-variant-numeric: tabular-nums; }
+.rat-preview-meta a { margin-inline-start: auto; font-family: var(--font-body); }
+.rat-note { color: var(--muted); font-size: .8rem; line-height: 1.55; margin-block: .75rem; max-width: 70ch; }
+.rat-note a { display: inline-flex; align-items: center; gap: .4rem; color: var(--accent); }
+.rat-load { display: grid; place-content: center; justify-items: center; min-height: 18rem; background: var(--surface); color: var(--muted); gap: 1rem; border-radius: var(--radius-surface); font-size: .875rem; }
+.rat-code-panel { padding-block: 1.25rem; }
+.rat-code-heading { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: .75rem; }
+.rat-code-heading h3 { font-size: 1rem; font-weight: 600; }
+.rat-code-panel pre { overflow: auto; max-height: 37rem; background: var(--surface); border-radius: var(--radius-surface); padding: 1.25rem; font-size: .8rem; line-height: 1.65; color: var(--text); scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--surface); }
+.rat-copy-status { display: block; color: var(--muted); font-size: .75rem; margin-top: .2rem; }
+.rat-api { border-top: 1px solid var(--line); padding-top: 1.25rem; margin-top: 1.5rem; }
+.rat-api h3 { font-size: .875rem; font-weight: 600; margin-bottom: .6rem; }
+.rat-api > div { display: flex; flex-wrap: wrap; gap: .5rem 1rem; }
+.rat-api code { color: var(--accent); font-size: .8rem; }
+.rat-api p { color: var(--muted); font-size: .8rem; margin-top: .75rem; line-height: 1.5; }
+.rat-empty { padding: 1rem .5rem; font-size: .875rem; line-height: 1.5; }
+.rat-empty h3 { font-size: 1rem; font-weight: 600; }
+.rat-empty p { color: var(--muted); margin-block: .5rem 1rem; }
+.rat-motion-intro { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-block: 0 1rem; font-size: .8rem; }
+.rat-motion-intro span { color: var(--muted); }
+.rat-motion-controls { display: flex; align-items: end; flex-wrap: wrap; gap: .75rem 1rem; padding-top: 1rem; }
+.rat-motion-controls .rat-field { grid-template-columns: auto auto; align-items: center; }
+.rat-motion-controls .rat-field select { width: auto; }
+.rat-scrubber { display: flex; flex: 1; gap: .6rem; align-items: center; font-size: .8rem; }
+.rat-scrubber input { min-width: 5rem; flex: 1; accent-color: var(--accent); }
+.rat-scrubber output { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+@media (max-width: 1050px) {
+  .rat-explorer { grid-template-columns: 13rem minmax(0, 1fr); }
+  .rat-study { padding-inline-start: 1.25rem; }
+  .rat-study-heading { align-items: start; flex-direction: column; gap: .5rem; }
+}
+@media (max-width: 760px) {
+  .ratatui-page .page-head { padding-block: 1.5rem; }
+  .rat-explorer { display: block; }
+  .rat-browser { border-inline-end: 0; border-bottom: 1px solid var(--line); padding: 1rem 0; }
+  .rat-family-field { margin-top: .75rem; }
+  .rat-entry-list { max-height: 11.5rem; }
+  .rat-family { margin-bottom: 1rem; }
+  .rat-entry { min-height: 2.5rem; }
+  .rat-study { padding: 1.5rem 0 0; }
+  .rat-study-heading { flex-direction: row; }
+  .rat-study-heading > .rat-link { font-size: 0; gap: 0; padding: .4rem; }
+  .rat-study-heading > .rat-link svg { width: 1.25rem; height: 1.25rem; }
+  .rat-preview-controls { gap: .75rem; }
+  .rat-preview-controls .rat-field:first-child { flex: 1; min-width: 10rem; }
+  .rat-scale { margin-inline-start: 0; }
+  .rat-terminal-fit:not(.rat-terminal-scaled) img { width: auto; min-width: min(100%, 400px); max-width: none; }
+  .rat-scrubber { flex-basis: 100%; order: 1; }
+  .rat-preview-meta { gap: .75rem; }
+}
+
+.rat-browser-results > summary { display: none; }
+@media (min-width: 761px) {
+  .ratatui-page .page-head-text { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 2rem; }
+  .ratatui-page .page-head-text .page-title, .ratatui-page .page-head-text .page-lede { grid-column: 1; }
+  .ratatui-page .page-head-text .actions { grid-column: 2; grid-row: 1 / span 2; align-self: center; margin: 0; }
+}
+@media (max-width: 760px) {
+  .rat-browser-results > summary { display: flex; justify-content: space-between; align-items: center; min-height: 2.5rem; padding-block: .5rem; cursor: pointer; font-size: .875rem; }
+  .rat-browser-results > summary svg { transition: transform var(--dur-state) var(--ease-out); }
+  .rat-browser-results[open] > summary svg { transform: rotate(180deg); }
+  .rat-browser-results > summary + nav { margin-top: .5rem; }
+}

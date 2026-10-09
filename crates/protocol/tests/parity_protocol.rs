@@ -97,6 +97,7 @@ fn mcp_is_error_metadata_fails_closed_when_present_but_not_boolean() {
 #[test]
 fn thread_resume_params_round_trip() {
     let request = ThreadRequest::Resume(ThreadResumeParams {
+        operation_key: None,
         thread_id: "thread-123".to_string(),
         history: None,
         path: None,
@@ -430,4 +431,37 @@ fn submit_user_input_app_request_round_trip() {
     assert_eq!(request_id, "ui-1");
     assert_eq!(answers.len(), 1);
     assert_eq!(answers[0].label, "All");
+}
+
+#[test]
+fn retained_thread_operation_keys_are_additive_and_survive_explicit_retry() {
+    for (method, params) in [
+        ("start", json!({})),
+        ("resume", json!({"thread_id":"thread-123"})),
+        ("fork", json!({"thread_id":"thread-123"})),
+    ] {
+        let legacy = json!({"type":method,"params":params});
+        // Use the enum's actual serde tag rather than a second fixture protocol.
+        let mut wire = match method {
+            "start" => serde_json::to_value(ThreadRequest::Start(
+                serde_json::from_value(json!({})).unwrap(),
+            ))
+            .unwrap(),
+            "resume" => serde_json::to_value(ThreadRequest::Resume(
+                serde_json::from_value(legacy["params"].clone()).unwrap(),
+            ))
+            .unwrap(),
+            _ => serde_json::to_value(ThreadRequest::Fork(
+                serde_json::from_value(legacy["params"].clone()).unwrap(),
+            ))
+            .unwrap(),
+        };
+        assert!(wire.get("operation_key").is_none());
+        wire["operation_key"] = json!("captured-client-intent");
+        let decoded: ThreadRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["operation_key"],
+            "captured-client-intent"
+        );
+    }
 }

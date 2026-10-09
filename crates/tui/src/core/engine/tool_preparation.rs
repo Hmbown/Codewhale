@@ -138,7 +138,7 @@ pub(super) fn prepare_tool_call(
         return Ok(conservative_execution_policy(
             name,
             input,
-            "Run model-provided Python code in local execution sandbox",
+            "Run model-provided Python code with the current execution policy",
             session_auto_approve,
         ));
     }
@@ -169,7 +169,7 @@ pub(super) fn prepare_tool_call(
         return Ok(conservative_execution_policy(
             name,
             input,
-            "Run model-provided JavaScript code in local Node.js execution sandbox",
+            "Run model-provided JavaScript code with the current execution policy",
             session_auto_approve,
         ));
     }

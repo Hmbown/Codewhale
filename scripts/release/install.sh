@@ -51,10 +51,11 @@ required_glibc_for_binary() {
 
 preflight_glibc() {
     local bin="$1"
+    local role="${2:-CLI}"
     if [[ "$(uname -s)" != "Linux" ]]; then
         return 0
     fi
-    if [[ "${CODEWHALE_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_TUI_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_SKIP_GLIBC_CHECK:-}" == "1" ]]; then
+    if [[ "${role}" != "compiled host" && ( "${CODEWHALE_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_TUI_SKIP_GLIBC_CHECK:-}" == "1" || "${DEEPSEEK_SKIP_GLIBC_CHECK:-}" == "1" ) ]]; then
         return 0
     fi
 
@@ -66,21 +67,29 @@ preflight_glibc() {
     local host
     if ! host="$(detect_host_glibc)" || [[ -z "$host" ]]; then
         echo "ERROR: $(basename "$bin") requires GLIBC_$required, but no GNU libc was detected." >&2
-        echo "Official Codewhale Linux release assets (x64 and arm64) are static musl builds" >&2
-        echo "with no glibc dependency, so this binary is not an official release asset." >&2
+        if [[ "$(basename "$bin")" == codewhale-extension-host ]]; then
+            echo "The optional compiled Bun image has a separate libc floor; use Node on this installation. The Codewhale CLI remains static musl." >&2
+        else
+            echo "Official Codewhale Linux release assets (x64 and arm64) are static musl builds" >&2
+            echo "with no glibc dependency, so this binary is not an official release asset." >&2
+        fi
         echo "Check where it came from, or build from source on this host." >&2
         echo "Build from source instead: cargo install codewhale-cli --locked" >&2
-        echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2
+        if [[ "$role" != "compiled host" ]]; then echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2; fi
         return 1
     fi
 
     if [[ "$(version_code "$host")" -lt "$(version_code "$required")" ]]; then
         echo "ERROR: $(basename "$bin") requires GLIBC_$required, but this system has glibc $host." >&2
-        echo "Official Codewhale Linux release assets (x64 and arm64) are static musl builds" >&2
-        echo "with no glibc dependency, so this binary is not an official release asset." >&2
+        if [[ "$(basename "$bin")" == codewhale-extension-host ]]; then
+            echo "The optional compiled Bun image has a separate libc floor; use Node on this installation. The Codewhale CLI remains static musl." >&2
+        else
+            echo "Official Codewhale Linux release assets (x64 and arm64) are static musl builds" >&2
+            echo "with no glibc dependency, so this binary is not an official release asset." >&2
+        fi
         echo "Check where it came from, or build from source on this host." >&2
         echo "Build from source instead: cargo install codewhale-cli --locked" >&2
-        echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2
+        if [[ "$role" != "compiled host" ]]; then echo "Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk." >&2; fi
         return 1
     fi
 }
@@ -103,10 +112,10 @@ esac
 [[ -w "$BIN_DIR" ]] || { echo "ERROR: $BIN_DIR is not writable; choose a user PREFIX (no sudo)" >&2; exit 1; }
 
 check_destination() {
-    local src="$1" dst="$2"
+    local src="$1" dst="$2" mode="${3:-0755}"
     destination_exists=0
     if [[ -e "$dst" || -L "$dst" ]]; then
-        if [[ ! -L "$dst" && -f "$dst" && -x "$dst" ]] && cmp -s "$src" "$dst"; then
+        if [[ ! -L "$dst" && -f "$dst" ]] && [[ "$mode" != 0755 || -x "$dst" ]] && cmp -s "$src" "$dst"; then
             destination_exists=1
             return 0
         fi
@@ -122,12 +131,22 @@ check_destination() {
     fi
 }
 
-# Validate both sources and every destination before the first write.
-for bin in codewhale codew; do
+# The image is an explicit installer choice; presence never changes Core's
+# Node default. Archives carry notices/source beside any qualified image.
+payloads=(codewhale codew)
+if [[ "${CODEWHALE_INSTALL_COMPILED_HOST:-}" == 1 ]]; then
+    for file in codewhale-extension-host codewhale-extension-host.LICENSES.txt codewhale-extension-host.relink-source.tar.gz codewhale-extension-host.release.json; do
+        [[ -f "$SCRIPT_DIR/$file" && ! -L "$SCRIPT_DIR/$file" ]] || { echo "ERROR: compiled host requested but archive has no complete qualified payload ($file); use Node" >&2; exit 1; }
+        payloads+=("$file")
+    done
+fi
+# Validate every source and destination before the first write.
+for bin in "${payloads[@]}"; do
     src="$SCRIPT_DIR/$bin"
     [[ -f "$src" ]] || { echo "ERROR: $src not found in archive" >&2; exit 1; }
-    preflight_glibc "$src"
-    check_destination "$src" "$BIN_DIR/$bin"
+    mode=0644
+    case "$bin" in codewhale|codew|codewhale-extension-host) mode=0755; preflight_glibc "$src" "${bin/codewhale-extension-host/compiled host}" ;; esac
+    check_destination "$src" "$BIN_DIR/$bin" "$mode"
 done
 legacy_tui="$BIN_DIR/codewhale-tui"
 if [[ -e "$legacy_tui" || -L "$legacy_tui" ]]; then
@@ -159,8 +178,8 @@ on_exit() {
 }
 trap on_exit EXIT
 install_binary() {
-    local src="$1" dst="$2"
-    check_destination "$src" "$dst"
+    local src="$1" dst="$2" mode="${3:-0755}"
+    check_destination "$src" "$dst" "$mode"
     if [[ "$destination_exists" == 1 ]]; then
         echo "  $dst (already installed)"
         return
@@ -168,7 +187,7 @@ install_binary() {
     stage_dir="$(mktemp -d "$BIN_DIR/.codewhale-install.XXXXXX")"
     stage="$stage_dir/$(basename "$dst")"
     cp "$src" "$stage"
-    chmod 0755 "$stage"
+    chmod "$mode" "$stage"
     # Same-directory hard-link publication is atomic and never overwrites a
     # destination created between preflight and this operation.
     # The explicit parent operand avoids treating a raced-in destination
@@ -187,8 +206,10 @@ install_binary() {
 }
 
 echo "Installing codewhale to $BIN_DIR ..."
-for bin in codewhale codew; do
-    install_binary "$SCRIPT_DIR/$bin" "$BIN_DIR/$bin"
+for bin in "${payloads[@]}"; do
+    mode=0644
+    case "$bin" in codewhale|codew|codewhale-extension-host) mode=0755 ;; esac
+    install_binary "$SCRIPT_DIR/$bin" "$BIN_DIR/$bin" "$mode"
 done
 
 echo ""

@@ -3,7 +3,7 @@ import type { FeedDict } from "../types";
 /** Chinese dictionary for `app/[locale]/feed/page.tsx`. */
 export const feed: FeedDict = {
   metaTitle: "动态 · Codewhale",
-  metaDescription: "来自 Hmbown/CodeWhale GitHub 仓库的议题、拉取请求和发布的实时动态。",
+  metaDescription: "来自 codewhale-hq/CodeWhale GitHub 仓库的议题、拉取请求和发布的实时动态。",
   title: "动态",
   titleAside: "Activity",
   titleAsideLang: "en",

@@ -19,22 +19,23 @@ Implementation sources:
 
 ## Default-active contract
 
-New turns start with eleven eager native names plus synthetic `tool_search`:
+New turns start with twelve eager native names plus synthetic `tool_search`:
 
 1. `read`
 2. `write`
 3. `edit`
-4. `bash`
-5. `agent`
-6. `workflow`
-7. `todo_write`
-8. `create_goal`
-9. `get_goal`
-10. `update_goal`
-11. `load_skill`
-12. `tool_search` (synthetic, always active)
+4. `file_search`
+5. `bash`
+6. `agent`
+7. `workflow`
+8. `todo_write`
+9. `create_goal`
+10. `get_goal`
+11. `update_goal`
+12. `load_skill`
+13. `tool_search` (synthetic, always active)
 
-The eleven native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
+The twelve native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
 `crates/tui/src/core/engine/tool_catalog.rs`, pinned by
 `default_active_contract_keeps_discovery_and_core_tools_eager`. An authority
 boundary may remove `agent` at the maximum child depth, but route size alone
@@ -66,6 +67,25 @@ ordinary approval behavior but does not bypass hard safety or repository law.
 not model-visible. `tasks`, `Git`, `Run`, `Web`, `remember`, and other
 specialized capabilities are searchable rather than first-turn ceremony.
 
+## Local code execution
+
+`code_execution` (Python) and `js_execution` (Node.js) use the same
+permission-aware local launcher as workspace task gates and test runs. Ordinary
+approval retains the effective session policy. To retry a denied exact call
+with wider permissions, supply `sandbox_permissions` (`workspace-write` or
+`danger-full-access`) and a nonempty `justification`; Ask mode requires explicit
+one-shot user approval. The approved policy affects only that call.
+
+Both tools read source from stdin, return stdout/stderr/return_code, and keep
+the existing timeout and process-tree cleanup. They are not persistent REPLs;
+tracebacks refer to stdin rather than a temporary script path. The separate
+RLM/REPL kernel is not changed by this launcher integration.
+
+Platform/backend limits of the shared launcher still apply: no available local
+wrapper means workspace-write remains unenforced, while read-only is refused.
+An external sandbox session cannot use these local interpreter tools and must
+use its shell execution path. See [sandbox limits](SANDBOX.md).
+
 ## Deferred and dynamic tools
 
 `Web` is conditional and deferred. It is discoverable through `tool_search`
@@ -87,6 +107,14 @@ MCP tools are dynamic. Successfully connected servers register names such as
 `mcp_<server>_<tool>` from `~/.codewhale/mcp.json`; a failed or disabled server
 must not be presented as available. MCP and plugin tools are deferred unless a
 user explicitly names them in `[tools].always_load`.
+
+For an unstarted configured server, an MCP-focused `tool_search` first
+performs bounded discovery under the current turn's server/tool ceiling.
+It searches real server-provided schemas after connection, rather than
+inventing `mcp_*` definitions. A search inside `execute_tools` describes
+those schemas without activating them; a direct search uses the existing
+bounded activation cache. Ordinary unrelated searches leave optional servers
+unstarted. The CLI's standalone MCP inspection commands own a separate pool.
 
 ### Code mode (`execute_tools`)
 
@@ -323,7 +351,7 @@ above must report `1 passed` (the ignored metrics test reports `1 passed`
 only because `--ignored` selects it); `0 passed` means the filter matched
 nothing and the check did not run.
 
-The provider-free receipt must report the eleven default-active names listed
+The provider-free receipt must report the twelve default-active names listed
 above. A separate repository-wide tool count may include deferred, dynamic,
 feature-gated, and compatibility-only registrations; it is not the number of
 tools placed in the first-turn model catalog.

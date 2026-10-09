@@ -1,0 +1,156 @@
+{
+  "description": "Deny rules naming single tools. Pins Rust McpPool::authorize_call / tool_allowed / Engine::execute_mcp_tool_with_pool: a denied tool (rule match is case-insensitive) leaves the catalog, a call to it is refused as not available before anything reaches the server, and its siblings and the resource tools keep working. server_received proves the refused calls were never sent.",
+  "server_name": "conformance",
+  "disallowed_tools": [
+    "MCP_CONFORMANCE_FAILS",
+    "mcp_get_prompt"
+  ],
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "deny-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "prompts": {}
+        }
+      }
+    },
+    "tools/list": {
+      "result": {
+        "tools": [
+          {
+            "name": "echo",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "fails",
+            "inputSchema": {
+              "type": "object"
+            }
+          }
+        ]
+      }
+    },
+    "resources/list": {
+      "result": {
+        "resources": [
+          {
+            "uri": "fixture://readme",
+            "name": "readme",
+            "mimeType": "text/plain"
+          }
+        ]
+      }
+    },
+    "prompts/list": {
+      "result": {
+        "prompts": [
+          {
+            "name": "summarize",
+            "description": "Summarize."
+          }
+        ]
+      }
+    },
+    "resources/read": [
+      {
+        "match": {
+          "uri": "fixture://readme"
+        },
+        "result": {
+          "contents": [
+            {
+              "uri": "fixture://readme",
+              "mimeType": "text/plain",
+              "text": "readme\n"
+            }
+          ]
+        }
+      }
+    ],
+    "prompts/get": [
+      {
+        "match": {
+          "name": "summarize"
+        },
+        "result": {
+          "messages": [
+            {
+              "role": "user",
+              "content": {
+                "type": "text",
+                "text": "Summarize."
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "tools/call": [
+      {
+        "match": {
+          "name": "echo"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "echo"
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "fails"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ran"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_fails",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_get_prompt",
+      "input": {
+        "server": "conformance",
+        "name": "summarize"
+      }
+    },
+    {
+      "op": "call",
+      "tool": "mcp_read_resource",
+      "input": {
+        "server": "conformance",
+        "uri": "fixture://readme"
+      }
+    }
+  ]
+}

@@ -102,7 +102,7 @@ export async function curate(
   }));
 
   const userPayload = {
-    repo: "Hmbown/CodeWhale",
+    repo: "codewhale-hq/CodeWhale",
     stats: {
       stars: stats.stars,
       forks: stats.forks,
@@ -128,7 +128,7 @@ export async function curate(
 }
 
 const SAFE_HREF_RE = /^https:\/\/(?:github\.com|api\.github\.com|codewhale\.net|crates\.io|www\.npmjs\.com|docs\.rs)\//;
-const FALLBACK_HREF = "https://github.com/Hmbown/CodeWhale";
+const FALLBACK_HREF = "https://github.com/codewhale-hq/CodeWhale";
 
 function safeHref(u: unknown): string {
   return typeof u === "string" && SAFE_HREF_RE.test(u) ? u : FALLBACK_HREF;

@@ -15,8 +15,8 @@ Codewhale 可以执行由模型提出的 shell 命令。审批策略、感知工
 | 机制 | 平台 | 选择方式 | Codewhale 报告的结果 |
 |---|---|---|---|
 | Seatbelt（`sandbox-exec`） | macOS | 运行时探测成功时自动启用 | `macos-seatbelt` |
-| Bubblewrap（`/usr/bin/bwrap`） | Linux | `prefer_bwrap = true` 且该文件可执行 | `linux-bwrap` |
-| 无操作系统包装器 | Linux，没有可用且已启用的 bwrap | 默认 | `none` |
+| Bubblewrap（`/usr/bin/bwrap`） | Linux | 默认启用，前提是已安装且探测包装运行成功；`prefer_bwrap = false` 可退出 | `linux-bwrap` |
+| 无操作系统包装器 | Linux，bwrap 不可用或已退出 | `prefer_bwrap = false`，或 bwrap 不存在/不可用 | `none` |
 | 无操作系统包装器 | Windows | 当前实现 | `none` |
 | 兼容 OpenSandbox 的服务 | 任何受支持的主机 | `sandbox_backend = "opensandbox"` | 外部执行路径 |
 
@@ -39,15 +39,18 @@ Seatbelt profile。
 探测失败，或 `sandbox-exec` 不可用时，Codewhale 会报告未启用操作系统沙箱，
 直接启动命令，不套 Seatbelt 包装器。这条回退路径上也不会打任何 Seatbelt 标记。
 
-## Linux：需要主动启用的 bubblewrap
+## Linux：默认启用的 bubblewrap
 
-Linux 下的命令沙箱需要主动启用。设置顶层配置项：
+只要 bubblewrap 可用，Linux 下的命令沙箱默认启用。退出使用顶层配置项：
 
 ```toml
-prefer_bwrap = true
+prefer_bwrap = false
 ```
 
-只有当 `/usr/bin/bwrap` 是普通的可执行文件时，Codewhale 才会选用 bubblewrap。
+只有当 `/usr/bin/bwrap` 是普通的可执行文件，且一次实际的包装探测运行证明
+它能在这台主机上创建命名空间时，Codewhale 才会选用 bubblewrap —— 仅有可执行
+位会骗人：在限制用户命名空间的主机上（例如开启了 `kernel.apparmor_restrict_unprivileged_userns`
+的 Ubuntu 24.04），每条被包装的命令都会失败，而不是以未沙箱化方式运行。
 包装器根据解析后的 `SandboxPolicy` 推导自己的挂载点和网络命名空间：
 
 ```text
@@ -84,11 +87,11 @@ prefer_bwrap = true
 时，Codewhale 才补上 `--share-net`。`danger-full-access` 和 `external-sandbox`
 完全绕过本地包装器。
 
-如果用户没有主动启用，或者 `/usr/bin/bwrap` 不存在、不可执行，Codewhale 会
-报告 `none`，直接启动命令，不带任何 Linux 操作系统包装器。这里没有回退做法：
-不会只打个标记，就把它当成另一种 Linux 沙箱。
+如果用户选择退出，或者 `/usr/bin/bwrap` 不存在、不可执行、或实际上无法
+限制子进程，Codewhale 会报告 `none`，直接启动命令，不带任何 Linux 操作
+系统包装器。这里没有回退做法：不会只打个标记，就把它当成另一种 Linux 沙箱。
 
-如果这套主动启用的方案适合你的工作流，请另行安装 bubblewrap：
+在 Linux 上获得强制力，请另行安装 bubblewrap：
 
 - Ubuntu/Debian：`apt install bubblewrap`
 - Fedora：`dnf install bubblewrap`
@@ -165,7 +168,8 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 - `CODEWHALE_SANDBOX_URL`
 - `CODEWHALE_SANDBOX_API_KEY`
 
-不存在 `CODEWHALE_PREFER_BWRAP` 环境变量覆盖；请使用顶层的 `prefer_bwrap` 配置项。
+`CODEWHALE_PREFER_BWRAP`（旧别名 `DEEPSEEK_PREFER_BWRAP`）可显式覆盖此偏好；
+顶层 `prefer_bwrap` 配置项是持久设置。
 
 ## 诊断与失败归因
 

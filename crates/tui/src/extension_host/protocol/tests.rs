@@ -28,10 +28,27 @@ fn params_schema(method: &str, generator: &mut SchemaGenerator) -> Schema {
         "ext/activate" => generator.subschema_for::<ActivateParams>(),
         "ext/deactivate" => generator.subschema_for::<DeactivateParams>(),
         "tool/call" => generator.subschema_for::<ToolCallParams>(),
+        "command/run" => generator.subschema_for::<CommandRunParams>(),
+        "hook/evaluate" => generator.subschema_for::<HookEvaluateParams>(),
+        "harness/run" => generator.subschema_for::<HarnessRunParams>(),
+        "exec/redeem" => generator.subschema_for::<ExecutionRedeemParams>(),
+        "mcp/open" => generator.subschema_for::<McpOpenParams>(),
+        "mcp/request" => generator.subschema_for::<McpRequestParams>(),
+        "mcp/close" => generator.subschema_for::<McpCloseParams>(),
+        "proc/launch" => generator.subschema_for::<ProcLaunchParams>(),
+        "proc/read" => generator.subschema_for::<ProcSessionParams>(),
+        "proc/write" => generator.subschema_for::<ProcWriteParams>(),
+        "proc/close" => generator.subschema_for::<ProcSessionParams>(),
+        "net/start" => generator.subschema_for::<ProcLaunchParams>(),
+        "net/fetch" => generator.subschema_for::<NetFetchParams>(),
+        "net/read" | "net/release" => generator.subschema_for::<NetReadParams>(),
+        "net/close" => generator.subschema_for::<ProcSessionParams>(),
+
         "$/cancel" => generator.subschema_for::<CancelParams>(),
         "host/hello" => generator.subschema_for::<HelloParams>(),
         "registry/register" => generator.subschema_for::<RegisterParams>(),
         "registry/unregister" => generator.subschema_for::<UnregisterParams>(),
+        "core/call" => generator.subschema_for::<CoreCallParams>(),
         "ext/faulted" => generator.subschema_for::<FaultedParams>(),
         "log" => generator.subschema_for::<LogParams>(),
         other => panic!("method `{other}` has no params type in the TypeScript generator"),
@@ -83,6 +100,25 @@ fn parse_ty(at: &str, schema: &Value) -> Ty {
     };
     if let Some(name) = ref_name(schema) {
         return Ty::Ref(name);
+    }
+    // Optional object fields use anyOf(ref, null), while scalar options use a
+    // nullable type array below. Normalize both to the present field's type:
+    // Rust omits None and the host requires a valid value when a field exists.
+    if let Some(variants) = object.get("anyOf").and_then(Value::as_array)
+        && variants.len() == 2
+        && variants
+            .iter()
+            .filter(|variant| variant.get("type").and_then(Value::as_str) == Some("null"))
+            .count()
+            == 1
+    {
+        return parse_ty(
+            at,
+            variants
+                .iter()
+                .find(|variant| variant.get("type").and_then(Value::as_str) != Some("null"))
+                .expect("one non-null variant"),
+        );
     }
     if let Some(value) = object.get("const").and_then(Value::as_str) {
         return Ty::Const(value.to_string());
@@ -319,6 +355,8 @@ fn render() -> String {
     let _ = generator.subschema_for::<ActivateResult>();
     let _ = generator.subschema_for::<DeactivateResult>();
     let _ = generator.subschema_for::<ToolResultWire>();
+    let _ = generator.subschema_for::<CommandResultWire>();
+    let _ = generator.subschema_for::<HookVerdictWire>();
     let defs: BTreeMap<String, Def> = generator
         .definitions()
         .iter()
@@ -359,15 +397,17 @@ fn render() -> String {
         let _ = writeln!(out, "  {name}: {code},");
     }
     out.push_str("} as const\n\nexport type Direction = 'core_to_host' | 'host_to_core'\n");
-    out.push_str("\n/** Every method either side may send; nothing else is admitted. */\nexport const METHODS = [\n");
+    out.push_str("\n/** Every method either side may send, and the trust tiers it is allowed on; nothing else is admitted. */\nexport const METHODS = [\n");
     for (spec, params) in &methods {
+        let tiers: Vec<String> = spec.tiers.iter().map(|tier| quote(tier.name())).collect();
         let _ = writeln!(
             out,
-            "  {{ name: {}, direction: {}, request: {}, params: {} }},",
+            "  {{ name: {}, direction: {}, request: {}, params: {}, tiers: [{}] }},",
             quote(spec.name),
             quote(spec.direction.as_str()),
             spec.request,
-            quote(params)
+            quote(params),
+            tiers.join(", ")
         );
     }
     out.push_str("] as const\n");
@@ -458,6 +498,76 @@ const CORE_ONLY: &[&str] = &[
 const REVIEWED: &[(&str, &str, &str)] = &[
     (
         "core_to_host",
+        "harness/run",
+        "pinned Builtin orchestration of an opaque exact Rust-gated job; no launch, environment, approval or session writer",
+    ),
+    (
+        "host_to_core",
+        "exec/redeem",
+        "Builtin-only host:harness; one single-use Execution grant for a Rust-held caller and prepared launch, current owner/generation/selection checks and bounded process cleanup",
+    ),
+    (
+        "host_to_core",
+        "net/start",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/fetch",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/read",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/release",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/close",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "core_to_host",
+        "mcp/open",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "core_to_host",
+        "mcp/request",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "core_to_host",
+        "mcp/close",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/launch",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/read",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/write",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/close",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "core_to_host",
         "host/initialize",
         "the core states its limits; the host answers `{}`",
     ),
@@ -488,8 +598,18 @@ const REVIEWED: &[(&str, &str, &str)] = &[
     ),
     (
         "core_to_host",
+        "command/run",
+        "sent only when the user runs the command themselves; the answer is text or a prompt that the core shows or submits through the ordinary turn",
+    ),
+    (
+        "core_to_host",
         "$/cancel",
         "the core withdraws its own request",
+    ),
+    (
+        "core_to_host",
+        "hook/evaluate",
+        "the core evaluates a reviewed owner's listener; monotonic proposals are folded and any input revision is re-gated in Rust, with no approval or tool handle exposed",
     ),
     (
         "host_to_core",
@@ -504,12 +624,17 @@ const REVIEWED: &[(&str, &str, &str)] = &[
     (
         "host_to_core",
         "registry/register",
-        "a proposal the core admits or refuses; an admitted tool always needs approval",
+        "a proposal the core admits or refuses; an admitted tool always needs approval, and an admitted command only runs when the user invokes it",
     ),
     (
         "host_to_core",
         "registry/unregister",
         "the host can only withdraw its own owner's registration",
+    ),
+    (
+        "host_to_core",
+        "core/call",
+        "a request the core serves only for a ticket it minted for a call that already passed its gate, then plans and approves through the same gate as a model's call; the host names a tool and an input, never an approval, a card text, an argv, a URL or a ticket's contents",
     ),
     (
         "host_to_core",
@@ -524,7 +649,7 @@ const REVIEWED: &[(&str, &str, &str)] = &[
     (
         "host_to_core",
         "$/cancel",
-        "ignored: phase 1 has no host-originated requests to cancel",
+        "the host withdraws its own in-flight request; the core cancels that request's task and drops whatever it produces",
     ),
 ];
 
@@ -575,4 +700,100 @@ fn host_protocol_never_gains_core_authority() {
         seen >= METHODS.len(),
         "the source scan matched only {seen} literals"
     );
+}
+
+/// The tier rule, against a table with methods reserved for the built-in tier
+/// (the production table has none yet): refused to a plugin-tier host in both
+/// directions, by the parser and by the sender's check, and open methods stay
+/// open to both.
+#[test]
+fn a_method_reserved_for_the_builtin_tier_is_refused_in_both_directions() {
+    const RESERVED: &[MethodSpec] = &[
+        MethodSpec {
+            tiers: &[HostTier::Builtin],
+            ..row(Direction::HostToCore, "test/reserved", true)
+        },
+        MethodSpec {
+            tiers: &[HostTier::Builtin],
+            ..row(Direction::CoreToHost, "test/reserved-in", false)
+        },
+        row(Direction::HostToCore, "test/shared", true),
+    ];
+    use Direction::{CoreToHost, HostToCore};
+    use HostTier::{Builtin, Plugin};
+
+    assert_eq!(
+        admit_in(RESERVED, HostToCore, "test/reserved", Some(1), Builtin),
+        Ok(Some(1))
+    );
+    assert_eq!(
+        admit_in(RESERVED, CoreToHost, "test/reserved-in", None, Builtin),
+        Ok(None)
+    );
+    for (direction, method, id) in [
+        (HostToCore, "test/reserved", Some(1)),
+        (CoreToHost, "test/reserved-in", None),
+    ] {
+        let refused = admit_in(RESERVED, direction, method, id, Plugin).unwrap_err();
+        assert!(
+            refused.0.contains("not allowed on the plugin tier"),
+            "{refused}"
+        );
+        assert!(allowed_in(RESERVED, direction, method, Builtin));
+        assert!(!allowed_in(RESERVED, direction, method, Plugin));
+    }
+    // Open to both tiers, and a name or direction the table lacks is unknown
+    // (not "reserved"), whatever the tier.
+    for tier in HostTier::ALL {
+        assert_eq!(
+            admit_in(RESERVED, HostToCore, "test/shared", Some(2), tier),
+            Ok(Some(2))
+        );
+        assert!(allowed_in(RESERVED, HostToCore, "test/shared", tier));
+        for (direction, method) in [(HostToCore, "test/none"), (CoreToHost, "test/reserved")] {
+            assert!(
+                admit_in(RESERVED, direction, method, Some(3), tier)
+                    .unwrap_err()
+                    .0
+                    .contains("unknown"),
+                "{method}"
+            );
+            assert!(!allowed_in(RESERVED, direction, method, tier));
+        }
+    }
+}
+
+/// The production table: `allowed_on` says what each row says, and the
+/// families the design reserves for the built-in tier (the process broker, the
+/// fetch proxy and the MCP client; none exist yet) can never be added to the
+/// plugin tier by accident.
+#[test]
+fn production_methods_follow_their_tier_rows_and_reserved_families_stay_builtin_only() {
+    for spec in METHODS {
+        for tier in HostTier::ALL {
+            assert_eq!(
+                allowed_on(spec.direction, spec.name, tier),
+                spec.tiers.contains(&tier),
+                "{}",
+                spec.name
+            );
+        }
+        assert!(!spec.tiers.is_empty(), "{} allows no tier", spec.name);
+        if ["proc/", "net/", "mcp/"]
+            .iter()
+            .any(|family| spec.name.starts_with(family))
+        {
+            assert_eq!(
+                spec.tiers,
+                &[HostTier::Builtin],
+                "{} is reserved for the built-in tier",
+                spec.name
+            );
+        }
+    }
+    assert!(!allowed_on(
+        Direction::HostToCore,
+        "no/such-method",
+        HostTier::Builtin
+    ));
 }

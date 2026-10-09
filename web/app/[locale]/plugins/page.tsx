@@ -8,8 +8,8 @@ import { pickText } from "@/lib/i18n/dictionaries";
 
 export const revalidate = 300;
 
-const MARKETPLACE_REPO = "https://github.com/Hmbown/codewhale-plugin-marketplace";
-const AUTHORING_DOC = "https://github.com/Hmbown/CodeWhale/blob/main/docs/PLUGIN_AUTHORING.md";
+const MARKETPLACE_REPO = "https://github.com/codewhale-hq/codewhale-plugin-marketplace";
+const AUTHORING_DOC = "https://github.com/codewhale-hq/CodeWhale/blob/main/docs/PLUGIN_AUTHORING.md";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;

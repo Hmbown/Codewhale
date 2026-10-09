@@ -109,6 +109,8 @@ fn default_capability_state() -> String {
 /// byte-identical: `{"kind":"send_message", ...fields}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution: Option<serde_json::Value>,
     #[serde(
         default,
         rename = "maxOutputTokens",
@@ -538,6 +540,7 @@ pub fn headless_send_message_op(thread_id: ThreadId, content: impl Into<String>)
         thread_id: thread_id.clone(),
         session_id: SessionId::new(),
         op: Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: content.into(),
             images: Vec::new(),

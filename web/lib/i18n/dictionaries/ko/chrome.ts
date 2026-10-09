@@ -48,7 +48,7 @@ export const chrome: ChromeDict = {
   themeTitle: "테마 · 자동 / 밝게 / 어둡게",
 
   footerTagline:
-    "원하는 모델로 만들고 싶은 것을 구현하고 일상적인 작업을 자동화하세요.",
+    "내 모델과 연결된 도구로 앱을 만들고 업무를 자동화하세요.",
   footerProduct: "제품",
   footerProject: "프로젝트",
   footerDocs: "문서",

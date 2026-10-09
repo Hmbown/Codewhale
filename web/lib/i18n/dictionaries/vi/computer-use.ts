@@ -30,7 +30,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Chạy kiểm tra nền", body: "Trợ lý mở một cửa sổ thử nghiệm dùng một lần, nhập văn bản và chụp cửa sổ đó, đồng thời kiểm tra xem con trỏ hoặc ứng dụng đang hoạt động có thay đổi trong lúc chạy hay không." },
     { title: "Kết nối với Codewhale", body: "Xem lại, tin cậy và bật Computer Use trong chợ plugin của Codewhale. Hãy dùng plugin 0.3.1 trở lên để các thao tác cục bộ đi qua nút Pause và Stop của trợ lý." },
   ],
-  controlsTitle: "Tiếp tục làm việc. Giữ quyền kiểm soát.",
+  controlsTitle: "Tạm dừng hoặc dừng điều khiển ứng dụng",
   controlsBody: "Các thao tác được hỗ trợ chạy trong nền trên ứng dụng đã chọn. Ứng dụng và cử chỉ cần điều khiển ở nền trước phải được bạn cho phép. Menu hiển thị ứng dụng mục tiêu và chế độ nhập; Pause (tạm dừng) ngưng thao tác nhập của trợ lý, còn Stop (dừng) kết thúc các phiên hiện có của nó.",
   updateTitle: "Cập nhật khi bạn muốn",
   updateBody: "Chọn Check for updates (kiểm tra cập nhật) trong ứng dụng. Trước khi cài bản cập nhật, ứng dụng kiểm tra tệp tải về, chữ ký Codewhale và công chứng của Apple, đồng thời giữ lại bản cũ để khôi phục khi cần.",

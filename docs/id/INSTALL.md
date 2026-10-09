@@ -6,7 +6,7 @@ Jika Anda hanya menginginkan versi singkat, lihat [README utama](../../README.md
 
 Perintah `latest` memilih rilis yang sudah diterbitkan, bukan build kandidat dari
 kode sumber. Pada pemeriksaan 2026-09-04, rilis stabil terbaru adalah
-[v0.9.11](https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.11).
+[v0.9.11](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11).
 
 ---
 
@@ -21,7 +21,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 Skrip ini akan mengunduh biner rilis `codewhale` dan `codew` yang cocok, memverifikasinya terhadap `codewhale-artifacts-sha256.txt`, dan menginstalnya ke `~/.local/bin` secara bawaan. Nama aset `codewhale-tui-*` hanya dipertahankan untuk kompatibilitas updater lama dan bukan perintah ketiga.
 
 Di Windows, pilih installer atau arsip yang sesuai dari
-[GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest).
+[GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest).
 Untuk instalasi biner langsung yang sudah ada:
 
 ```bash

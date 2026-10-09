@@ -23,7 +23,7 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-use crate::config::ApiProvider;
+use crate::config::{ProviderIdentity, ProviderKind};
 
 /// Endpoint identity for a string that is not a parseable URL.
 ///
@@ -64,7 +64,7 @@ pub fn endpoint_identity(base_url: &str) -> String {
 pub struct CredentialGeneration(String);
 
 impl CredentialGeneration {
-    fn derive(base_url: &str, credential: &str) -> Self {
+    pub(crate) fn derive(base_url: &str, credential: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"codewhale/turn-route/credential-generation/v1\0");
         hasher.update(
@@ -104,8 +104,7 @@ impl fmt::Debug for CredentialGeneration {
 /// Immutable proof of the exact base route a turn's client was installed on.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TurnRouteReceipt {
-    provider: ApiProvider,
-    provider_identity: String,
+    identity: ProviderIdentity,
     wire_model: String,
     endpoint_identity: String,
     credential_generation: CredentialGeneration,
@@ -118,19 +117,62 @@ impl TurnRouteReceipt {
     /// `base_url` and `credential` are consumed here and never stored: only the
     /// redacted endpoint identity and the one-way generation digest survive.
     #[must_use]
-    pub fn new(
-        provider: ApiProvider,
-        provider_identity: &str,
+    pub(crate) fn from_admitted(
+        identity: &ProviderIdentity,
         wire_model: &str,
         base_url: &str,
         credential: &str,
     ) -> Self {
         Self {
-            provider,
-            provider_identity: provider_identity.trim().to_string(),
+            identity: identity.clone(),
             wire_model: wire_model.trim().to_string(),
             endpoint_identity: endpoint_identity(base_url),
             credential_generation: CredentialGeneration::derive(base_url, credential),
+            openrouter_vendor: None,
+        }
+    }
+
+    /// Test facts do not read a runtime config; production mints from admission.
+    #[cfg(test)]
+    pub(crate) fn new(
+        provider: ProviderKind,
+        provider_identity: &str,
+        wire_model: &str,
+        base_url: &str,
+        credential: &str,
+    ) -> Self {
+        let identity = ProviderIdentity {
+            provider,
+            key: provider_identity.into(),
+            exact_id: Some(provider_identity.into()),
+            migrated_legacy_ollama_cloud_route: false,
+            legacy_root_custom_generation: None,
+        };
+        Self::from_admitted(&identity, wire_model, base_url, credential)
+    }
+
+    /// Non-executing fixture projection for cache scope tests. It uses the
+    /// canonical Config admission and only an already provable read-only
+    /// credential generation. An opaque source gets distinct synthetic facts;
+    /// the production lookup still refuses to reuse that evidence.
+    #[cfg(test)]
+    pub(crate) fn for_test_fixture(
+        config: &crate::config::Config,
+        kind: ProviderKind,
+        model: &str,
+    ) -> Self {
+        let identity = config.test_identity_for_kind(kind);
+        let base_url = config.base_url_for_route(&identity);
+        let generation = config
+            .readonly_health_credential_generation(&identity)
+            .unwrap_or_else(|| {
+                CredentialGeneration::derive(&base_url, "opaque-test-only-generation")
+            });
+        Self {
+            identity,
+            wire_model: model.to_string(),
+            endpoint_identity: endpoint_identity(&base_url),
+            credential_generation: generation,
             openrouter_vendor: None,
         }
     }
@@ -148,13 +190,17 @@ impl TurnRouteReceipt {
     }
 
     #[must_use]
-    pub fn provider(&self) -> ApiProvider {
-        self.provider
+    pub fn provider(&self) -> ProviderKind {
+        self.identity.provider
     }
 
     #[must_use]
     pub fn provider_identity(&self) -> &str {
-        &self.provider_identity
+        self.identity.key.as_str()
+    }
+
+    pub(crate) fn admitted_identity(&self) -> &ProviderIdentity {
+        &self.identity
     }
 
     #[must_use]
@@ -186,8 +232,8 @@ impl TurnRouteReceipt {
 impl fmt::Debug for TurnRouteReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TurnRouteReceipt")
-            .field("provider", &self.provider)
-            .field("provider_identity", &self.provider_identity)
+            .field("provider", &self.identity.provider)
+            .field("provider_identity", &self.identity.key)
             .field("wire_model", &self.wire_model)
             .field("endpoint_identity", &self.endpoint_identity)
             .field("credential_generation", &self.credential_generation)
@@ -197,7 +243,7 @@ impl fmt::Debug for TurnRouteReceipt {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiProvider, CredentialGeneration, TurnRouteReceipt, endpoint_identity};
+    use super::{CredentialGeneration, ProviderKind, TurnRouteReceipt, endpoint_identity};
 
     const USERINFO_URL: &str = "https://svc-user:hunter2@api.example.com/v1?api_key=sk-live-abc123\
                                 &token=tok-secret-xyz&region=us-east";
@@ -249,7 +295,7 @@ mod tests {
     #[test]
     fn debug_never_renders_credential_material() {
         let receipt = TurnRouteReceipt::new(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "deepseek-chat",
             USERINFO_URL,
@@ -292,7 +338,7 @@ mod tests {
     #[test]
     fn matches_live_route_detects_userinfo_swap_behind_identical_redaction() {
         let receipt = TurnRouteReceipt::new(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "deepseek-chat",
             "https://svc:original@api.deepseek.com/v1",

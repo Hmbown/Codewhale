@@ -6,8 +6,8 @@
 //! fields and are unaffected by fleet extensions.
 //!
 //! See:
-//! - <https://github.com/Hmbown/CodeWhale/issues/3154> (Agent Fleet control plane)
-//! - <https://github.com/Hmbown/CodeWhale/issues/3096> (Runtime API sub-agent direction)
+//! - <https://github.com/codewhale-hq/CodeWhale/issues/3154> (Agent Fleet control plane)
+//! - <https://github.com/codewhale-hq/CodeWhale/issues/3096> (Runtime API sub-agent direction)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

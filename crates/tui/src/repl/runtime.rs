@@ -128,7 +128,7 @@ pub struct BatchResp {
 /// Trait-object handle for dispatching Python RPCs back into Rust.
 ///
 /// Each RLM turn supplies one. Implementations forward to the LLM client
-/// (and recursively into `run_rlm_turn_inner` for `Rlm` / `RlmBatch`).
+/// (and recursively through the same captured Engine for `Rlm` / `RlmBatch`).
 pub trait RpcDispatcher: Send + Sync {
     fn dispatch<'a>(
         &'a self,

@@ -1,0 +1,25 @@
+{
+  "requests": [
+    {
+      "authorization": "<bearer>",
+      "protocol_version": null,
+      "rpc": "initialize",
+      "session": null,
+      "status": 307
+    }
+  ],
+  "server_received": [],
+  "sink_requests": 0,
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": {
+        "err": "conformance: MCP HTTP destination is a restricted IP address"
+      }
+    },
+    {
+      "op": "catalog",
+      "tools": []
+    }
+  ]
+}

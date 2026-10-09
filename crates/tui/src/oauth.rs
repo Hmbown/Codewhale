@@ -1,5 +1,5 @@
-//! The ONE access-route flow: Codex CLI import (read-only, consented) plus
-//! the unified OAuth login core every subscription provider runs through.
+//! Codewhale-owned OAuth login and protected credential lifecycle.
+//! ChatGPT uses its official dynamic registration and direct inference grant.
 //! Providers are data rows in the parameter table below, not modules.
 //!
 //! External Codex CLI credentials are read only after an exact, provider-scoped
@@ -11,7 +11,7 @@
 //! redact sensitive fields.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write as _};
+use std::io::{BufRead as _, IsTerminal, Read, Write as _};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,18 +20,18 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codewhale_config::ExternalCredentialReadGrant;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::Config;
+use crate::config::{Config, ProviderKind};
 
 /// OAuth token payload stored in `auth.json`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct AuthTokens {
     access_token: Option<String>,
-    account_id: Option<String>,
 }
 
 /// Top-level structure of Codex CLI's `auth.json`.
@@ -45,7 +45,6 @@ struct CodexAuthFile {
 #[derive(Debug, Clone)]
 pub struct CodexCredentials {
     pub access_token: String,
-    pub account_id: Option<String>,
 }
 
 /// JWT claims subset for expiry extraction.
@@ -130,27 +129,7 @@ fn load_credentials(grant: &ExternalCredentialReadGrant) -> Result<Option<CodexC
         Some(t) if !t.trim().is_empty() => t,
         _ => return Ok(None),
     };
-    Ok(Some(CodexCredentials {
-        access_token,
-        account_id: tokens.account_id,
-    }))
-}
-
-/// Prompt-free, non-refreshing readiness check for picker/onboarding surfaces.
-/// It reads process-level token variables only; no file or network access occurs.
-#[must_use]
-pub fn credentials_from_env() -> Option<CodexCredentials> {
-    ["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"]
-        .iter()
-        .find_map(|name| {
-            std::env::var(name)
-                .ok()
-                .filter(|token| !token.trim().is_empty())
-        })
-        .map(|access_token| CodexCredentials {
-            access_token,
-            account_id: codex_account_id_env(),
-        })
+    Ok(Some(CodexCredentials { access_token }))
 }
 
 /// Validate only the stored OAuth file, excluding token environment
@@ -161,6 +140,7 @@ pub fn credentials_from_env() -> Option<CodexCredentials> {
 /// this to find out whether the consented file *still* holds a usable token,
 /// because a record that outlives its token would otherwise read as stored.
 #[must_use]
+#[cfg(test)]
 pub fn stored_credentials_present(grant: &ExternalCredentialReadGrant) -> bool {
     load_credentials(grant)
         .ok()
@@ -180,22 +160,9 @@ pub fn get_credentials(grant: &ExternalCredentialReadGrant) -> Result<CodexCrede
     }
 
     bail!(
-        "Codex access token in {} is expired. Read-only consent never refreshes or rewrites another CLI's credentials. Sign in with ChatGPT via `codewhale auth chatgpt`, run `codex login` again, or provide OPENAI_CODEX_ACCESS_TOKEN for this process.",
+        "Codex access token in {} is expired. Read-only consent never refreshes or rewrites another CLI's credentials. Use `codewhale auth chatgpt` for the official ChatGPT plan route. To inspect this legacy credential file again, renew its login with `codex login`.",
         codewhale_config::quote_os_path(grant.path())
     )
-}
-
-/// Read a ChatGPT account id from env overrides only.
-fn codex_account_id_env() -> Option<String> {
-    for var in ["OPENAI_CODEX_ACCOUNT_ID", "CODEX_ACCOUNT_ID"] {
-        if let Ok(value) = std::env::var(var) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
 }
 
 // ── ONE access-route flow ─────────────────────────────────────────────
@@ -235,6 +202,7 @@ pub enum OAuthProvider {
         reason = "3b-i(b) wires the PKCE login that constructs this"
     )]
     Chatgpt,
+    Claude,
 }
 
 impl AccessMethod {
@@ -248,6 +216,7 @@ impl AccessMethod {
         match self {
             AccessMethod::OwnedOAuth(OAuthProvider::Xai) => "xAI subscription",
             AccessMethod::OwnedOAuth(OAuthProvider::Chatgpt) => "ChatGPT subscription",
+            AccessMethod::OwnedOAuth(OAuthProvider::Claude) => "Claude subscription",
             AccessMethod::ExternalImport(ExternalImportSource::GrokCli) => "Grok CLI import",
             AccessMethod::ExternalImport(ExternalImportSource::CodexCli) => "Codex CLI import",
             AccessMethod::ExternalImport(ExternalImportSource::Antigravity) => "Antigravity import",
@@ -279,53 +248,63 @@ pub struct OAuthEnvOverrides {
     pub client_id_vars: &'static [&'static str],
     pub scope_vars: &'static [&'static str],
     pub no_browser_var: &'static str,
+    /// Set (to anything) to drop [`OAuthProviderParams::account_choice_extras`]
+    /// from the authorize URL, in case the issuer rejects them.
+    pub no_account_prompt_var: Option<&'static str>,
 }
 
 /// Everything about one provider's OAuth login that is not logic.
-pub struct OAuthProviderParams {
+pub struct OAuthProviderParams<'a> {
     /// Human name for prompts and errors: "xAI", "ChatGPT".
-    pub display_name: &'static str,
-    pub default_issuer: &'static str,
-    pub default_client_id: &'static str,
-    pub default_scopes: &'static str,
+    pub display_name: &'a str,
+    pub default_issuer: &'a str,
+    pub default_client_id: &'a str,
+    pub default_scopes: &'a str,
     pub env: OAuthEnvOverrides,
     /// `Some` device-authorization path under the issuer (xAI); `None`
     /// means the issuer offers no device flow and device login must fail
     /// loudly instead of guessing (ChatGPT).
-    pub device_code_path: Option<&'static str>,
+    pub device_code_path: Option<&'a str>,
     /// `Some` browser authorization path under the issuer (ChatGPT PKCE);
     /// `None` means the issuer offers no browser flow and browser login
     /// fails the same loud way (xAI is device-code only).
-    pub authorize_path: Option<&'static str>,
+    pub authorize_path: Option<&'a str>,
     /// Token path under the issuer.
-    pub token_path: &'static str,
+    pub token_path: &'a str,
     /// Whether the issuer was discovered (xAI) or pinned (ChatGPT paths).
     pub discover_endpoints: bool,
     /// Seconds the device-code poll runs past the server's `expires_in`.
     pub device_poll_floor_secs: u64,
     /// Extra authorize-endpoint parameters beyond the standard OAuth set,
     /// sent verbatim so the issuer sees exactly who is calling.
-    pub authorize_extras: &'static [(&'static str, &'static str)],
+    pub authorize_extras: &'a [(&'a str, &'a str)],
+    /// Authorize parameters that ask the issuer to let the user choose the
+    /// account instead of reusing the browser's session. Sent unless
+    /// [`OAuthEnvOverrides::no_account_prompt_var`] is set.
+    pub account_choice_extras: &'a [(&'a str, &'a str)],
     /// Honest client identity for issuers that require one (ChatGPT's
     /// `originator`). Never impersonate another CLI.
-    pub originator: Option<&'static str>,
+    pub originator: Option<&'a str>,
     /// Remote revoke path under the issuer, pinned rather than discovered:
     /// revoke must still clear local credentials when the issuer is
     /// unreachable, so a discovery fetch would only add a failure mode to a
     /// path whose contract is to clean up regardless. `None` when
     /// revocation is purely local (xAI).
-    pub revoke_path: Option<&'static str>,
+    pub revoke_path: Option<&'a str>,
     /// Registered loopback redirect for browser flows.
-    pub callback_path: &'static str,
+    pub callback_path: &'a str,
     /// Loopback ports the public client registered, in preference order.
-    pub loopback_ports: &'static [u16],
+    pub loopback_ports: &'a [u16],
     /// The command that re-runs this provider's login, for error guidance.
-    pub relogin_hint: &'static str,
+    pub relogin_hint: &'a str,
+    /// The slash command that re-runs this login inside a running session
+    /// and switches that session's live client.
+    pub session_login_hint: &'a str,
     /// What to tell the user when every callback port is taken.
-    pub callback_conflict_hint: &'static str,
+    pub callback_conflict_hint: &'a str,
 }
 
-pub const XAI_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
+pub const XAI_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
     display_name: "xAI",
     // Single source: the legacy module still owns these strings until its
     // activation path unifies and they move here in 3b-iii.
@@ -337,6 +316,7 @@ pub const XAI_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
         client_id_vars: &["GROK_OIDC_CLIENT_ID", "XAI_OIDC_CLIENT_ID"],
         scope_vars: &["GROK_OIDC_SCOPES", "XAI_OIDC_SCOPES"],
         no_browser_var: "CODEWHALE_XAI_OAUTH_NO_BROWSER",
+        no_account_prompt_var: None,
     },
     device_code_path: Some("oauth2/device/code"),
     authorize_path: None,
@@ -344,51 +324,548 @@ pub const XAI_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
     discover_endpoints: true,
     device_poll_floor_secs: 30,
     authorize_extras: &[],
+    account_choice_extras: &[],
     originator: None,
     revoke_path: None,
     callback_path: "",
     loopback_ports: &[],
     relogin_hint: "codewhale auth xai-device",
+    session_login_hint: "/auth xai-device",
     callback_conflict_hint: "",
 };
 
-pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
+pub const CLAUDE_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
+    display_name: "Claude",
+    default_issuer: "https://console.anthropic.com",
+    default_client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    default_scopes: "org:create_api_key user:profile user:inference",
+    env: OAuthEnvOverrides {
+        issuer_vars: &[],
+        client_id_vars: &[],
+        scope_vars: &[],
+        no_browser_var: "CODEWHALE_CLAUDE_OAUTH_NO_BROWSER",
+        no_account_prompt_var: None,
+    },
+    device_code_path: None,
+    authorize_path: Some("oauth/authorize"),
+    token_path: "v1/oauth/token",
+    discover_endpoints: false,
+    device_poll_floor_secs: 0,
+    authorize_extras: &[],
+    account_choice_extras: &[],
+    originator: None,
+    revoke_path: None,
+    callback_path: "/oauth/code/callback",
+    loopback_ports: &[],
+    relogin_hint: "codewhale auth claude",
+    session_login_hint: "/auth claude",
+    callback_conflict_hint: "",
+};
+
+pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
     display_name: "ChatGPT",
     // Single source: same arrangement as the xAI row above.
     default_issuer: CHATGPT_OAUTH_ISSUER,
     default_client_id: CHATGPT_OAUTH_CLIENT_ID,
     default_scopes: CHATGPT_OAUTH_SCOPE,
-    originator: Some(CHATGPT_OAUTH_ORIGINATOR),
+    originator: None,
     env: OAuthEnvOverrides {
         issuer_vars: &["CODEWHALE_CHATGPT_OAUTH_ISSUER"],
         client_id_vars: &["CODEWHALE_CHATGPT_OAUTH_CLIENT_ID"],
         scope_vars: &[],
         no_browser_var: "CODEWHALE_CHATGPT_OAUTH_NO_BROWSER",
+        no_account_prompt_var: Some("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT"),
     },
     device_code_path: None,
-    authorize_path: Some("oauth/authorize"),
-    token_path: "oauth/token",
+    authorize_path: Some("api/accounts/authorize"),
+    token_path: "api/accounts/oauth/token",
     discover_endpoints: false,
     device_poll_floor_secs: 30,
-    authorize_extras: &[("id_token_add_organizations", "true")],
+    authorize_extras: &[("resource", CHATGPT_OAUTH_RESOURCE)],
+    // `prompt=login` (OIDC Core 1.0 §3.1.2.1) asks the issuer to re-prompt
+    // instead of silently reusing whichever ChatGPT account the browser is
+    // already signed into. Returning registrations still require the same
+    // verified account; a new account explicitly starts dynamic registration.
+    // Every browser login here is user-initiated; refresh
+    // never visits the authorize endpoint. CODEWHALE_CHATGPT_OAUTH_NO_PROMPT
+    // drops it should the issuer ever refuse it.
+    account_choice_extras: &[("prompt", "login")],
     revoke_path: Some("api/accounts/oauth/revoke"),
     callback_path: "/auth/callback",
-    loopback_ports: &[1455, 1457],
+    loopback_ports: &[1455, 1457, 0],
     relogin_hint: "codewhale auth chatgpt",
-    callback_conflict_hint: "Stop the process holding that port, or import Codex CLI credentials with `codewhale auth external-consent`.",
+    session_login_hint: "/auth chatgpt",
+    callback_conflict_hint: "Close the process holding the callback port and retry `codewhale auth chatgpt`.",
 };
 
 /// The parameter table. A provider login looks its row up here; adding a
 /// provider means adding a row, never a module.
 #[must_use]
-pub fn oauth_provider_params(provider: OAuthProvider) -> &'static OAuthProviderParams {
+pub fn oauth_provider_params(provider: OAuthProvider) -> &'static OAuthProviderParams<'static> {
     match provider {
         OAuthProvider::Xai => &XAI_OAUTH_PARAMS,
         OAuthProvider::Chatgpt => &CHATGPT_OAUTH_PARAMS,
+        OAuthProvider::Claude => &CLAUDE_OAUTH_PARAMS,
     }
 }
 
+/// OrcaRouter's public authentication origin. Inference lives on a different
+/// host (`https://api.orcarouter.ai/v1`); neither origin is derived from the
+/// other.
+pub const ORCAROUTER_AUTH_BASE: &str = "https://www.orcarouter.ai";
+/// OrcaRouter's public inference/catalog origin.
+pub const ORCAROUTER_API_BASE: &str = "https://api.orcarouter.ai/v1";
+/// OrcaRouter has no client registration step: the public client id is a
+/// constant label, not a secret. PKCE — not a client secret — binds the auth
+/// code to this process.
+pub const ORCAROUTER_CLIENT_ID: &str = "codewhale";
+/// Shown on the OrcaRouter consent screen.
+pub const ORCAROUTER_APP_NAME: &str = "Codewhale";
+/// Consent endpoint path. Not an API route: the browser is pointed at it.
+pub const ORCAROUTER_AUTHORIZE_PATH: &str = "auth";
+/// Code-for-key exchange path under the **auth** origin. The relay's
+/// `/v1/auth/keys` is a different route and a 404; the auth API lives at
+/// `/api/v1/auth/keys`.
+pub const ORCAROUTER_EXCHANGE_PATH: &str = "/api/v1/auth/keys";
+/// The scope this client asks for, and the only scope it accepts back.
+pub const ORCAROUTER_SCOPE: &str = "api";
+
+pub const ORCAROUTER_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
+    display_name: "OrcaRouter",
+    default_issuer: ORCAROUTER_AUTH_BASE,
+    default_client_id: ORCAROUTER_CLIENT_ID,
+    default_scopes: ORCAROUTER_SCOPE,
+    env: OAuthEnvOverrides {
+        // Explicit overrides win over the shared fallback, which wins over the
+        // public default. See [`resolve_orcarouter_auth_base`].
+        issuer_vars: &[
+            "ORCA_AUTH_BASE_URL",
+            "ORCA_BASE_URL",
+            "ORCAROUTER_AUTH_BASE_URL",
+        ],
+        client_id_vars: &["ORCAROUTER_OAUTH_CLIENT_ID"],
+        scope_vars: &["ORCAROUTER_OAUTH_SCOPE"],
+        no_browser_var: "CODEWHALE_ORCAROUTER_OAUTH_NO_BROWSER",
+        no_account_prompt_var: None,
+    },
+    device_code_path: None,
+    // Empty so the generic builder emits no `client_id`/`redirect_uri`;
+    // OrcaRouter's authorize contract is built by
+    // [`build_orcarouter_authorize_url`] instead.
+    authorize_path: Some(""),
+    // Unused: the exchange is JSON-formatted by
+    // [`exchange_orcarouter_code`]. Kept empty so a future generic caller
+    // cannot silently hit the wrong path.
+    token_path: "",
+    discover_endpoints: false,
+    device_poll_floor_secs: 30,
+    authorize_extras: &[],
+    account_choice_extras: &[],
+    originator: None,
+    revoke_path: None,
+    callback_path: "/callback",
+    // OrcaRouter validates `callback_url` per request and accepts any
+    // loopback port, so ask the OS for a free one rather than guessing.
+    loopback_ports: &[0],
+    relogin_hint: "codewhale auth orcarouter",
+    session_login_hint: "/auth orcarouter",
+    callback_conflict_hint: "Close the process holding the OrcaRouter callback port and retry `codewhale auth orcarouter`.",
+};
+
+/// Resolve the OrcaRouter **authentication** origin.
+///
+/// Precedence: an explicit auth override, then the shared self-hosted
+/// fallback, then the public default. The inference origin is never derived
+/// from this value.
+#[must_use]
+pub fn resolve_orcarouter_auth_base() -> String {
+    let first_set = |vars: &[&str]| {
+        vars.iter()
+            .filter_map(|var| std::env::var(var).ok())
+            .find(|value| !value.trim().is_empty())
+    };
+    let params = &ORCAROUTER_OAUTH_PARAMS;
+    first_set(params.env.issuer_vars).unwrap_or_else(|| ORCAROUTER_AUTH_BASE.to_string())
+}
+
+/// Resolve the OrcaRouter **inference/catalog** origin.
+///
+/// Precedence: an explicit API override, then the shared self-hosted
+/// fallback, then the public default. The auth origin is never derived from
+/// this value.
+#[must_use]
+pub fn resolve_orcarouter_api_base() -> String {
+    let first_set = |vars: &[&str]| {
+        vars.iter()
+            .filter_map(|var| std::env::var(var).ok())
+            .find(|value| !value.trim().is_empty())
+    };
+    first_set(&["ORCA_API_BASE_URL", "ORCA_BASE_URL", "ORCAROUTER_BASE_URL"])
+        .unwrap_or_else(|| ORCAROUTER_API_BASE.to_string())
+}
+
+/// The credential the rest of Codewhale consumes for OrcaRouter.
+///
+/// Both authentication adapters produce **this same value**: the hand-typed
+/// API-key adapter wraps the pasted `sk-orca-…` string, and the PKCE adapter
+/// wraps the key the exchange returned. Downstream code — the secret-store
+/// write, the route binding, model discovery, and every AI entry point — must
+/// read only this type and never branch on how the key was obtained.
+///
+/// No `Debug`: the key must not reach a log, an error, or a snapshot.
+#[derive(Clone)]
+pub struct OrcaCredential {
+    key: String,
+    /// The scope OrcaRouter actually granted, read back from the response.
+    /// Never the scope this client requested.
+    granted_scope: String,
+    source: OrcaCredentialSource,
+}
+
+/// How an [`OrcaCredential`] was obtained. Presentation only: it selects copy,
+/// never behaviour. Nothing downstream of the credential seam may read it to
+/// decide whether the key is usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrcaCredentialSource {
+    /// Pasted by the user through the API-key path.
+    ApiKey,
+    /// Issued by the OrcaRouter PKCE exchange.
+    Pkce,
+}
+
+impl OrcaCredentialSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::Pkce => "pkce",
+        }
+    }
+}
+
+impl OrcaCredential {
+    /// The API-key adapter: a key the user already holds.
+    ///
+    /// Prefix checking is deliberately only a shape check — an `sk-orca-`
+    /// prefix is not proof the credential is valid, and no billing request is
+    /// sent from a settings form to find out.
+    pub fn from_api_key(raw: &str) -> Result<Self> {
+        let key = codewhale_secrets::normalize_api_key(raw);
+        anyhow::ensure!(!key.is_empty(), "OrcaRouter API key must not be empty");
+        anyhow::ensure!(
+            key.starts_with("sk-orca-"),
+            "OrcaRouter API keys start with `sk-orca-`; paste the full key from the OrcaRouter console"
+        );
+        Ok(Self {
+            key,
+            // A pasted key carries no response scope; the API-key path asks
+            // for `api` and accepts it.
+            granted_scope: ORCAROUTER_SCOPE.to_string(),
+            source: OrcaCredentialSource::ApiKey,
+        })
+    }
+
+    pub(crate) fn from_exchange(
+        key: String,
+        granted_scope: String,
+        source: OrcaCredentialSource,
+    ) -> Self {
+        Self {
+            key,
+            granted_scope,
+            source,
+        }
+    }
+
+    /// The key material. Callers must not log, echo, or embed this value.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn granted_scope(&self) -> &str {
+        &self.granted_scope
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> OrcaCredentialSource {
+        self.source
+    }
+
+    /// Whether the granted scope satisfies this client's purpose. A
+    /// downgraded grant must be surfaced, not assumed away.
+    #[must_use]
+    pub fn scope_satisfies_purpose(&self) -> bool {
+        self.granted_scope == ORCAROUTER_SCOPE
+    }
+}
+
+/// Where an injected OrcaRouter login reads its inputs from. Tests override
+/// this so the whole adapter — bind, authorize URL, callback, exchange — runs
+/// against a local fake auth server with no network egress.
+pub struct OrcaLoginInputs {
+    pub auth_base: String,
+    pub api_base: String,
+    pub app_name: String,
+    pub open_browser: bool,
+}
+
+impl OrcaLoginInputs {
+    /// Production inputs: env-resolved origins, the real app name, and the
+    /// browser open flag (off when the no-browser var is set).
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            auth_base: resolve_orcarouter_auth_base(),
+            api_base: resolve_orcarouter_api_base(),
+            app_name: ORCAROUTER_APP_NAME.to_string(),
+            open_browser: std::env::var_os(ORCAROUTER_OAUTH_PARAMS.env.no_browser_var).is_none(),
+        }
+    }
+}
+
+/// The OrcaRouter authorize URL.
+///
+/// Deliberately NOT [`build_authorize_url`]: OrcaRouter's contract is
+/// `GET {auth}/auth?callback_url=…&code_challenge=…&code_challenge_method=S256&state=…&app_name=…&scope=api`.
+/// There is no `client_id`, no `response_type`, and the redirect parameter is
+/// named `callback_url` — three facts the generic builder gets wrong.
+pub fn build_orcarouter_authorize_url(
+    inputs: &OrcaLoginInputs,
+    callback_url: &str,
+    state: &str,
+    pkce: &PkceChallenge,
+) -> Result<String> {
+    let mut url = oauth_endpoint_url(&format!(
+        "{}/{}",
+        inputs.auth_base.trim_end_matches('/'),
+        ORCAROUTER_AUTHORIZE_PATH
+    ))
+    .with_context(|| "OrcaRouter auth base is not a valid secure URL — check ORCA_AUTH_BASE_URL")?;
+    url.query_pairs_mut()
+        .append_pair("callback_url", callback_url)
+        .append_pair("code_challenge", &pkce.challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("app_name", &inputs.app_name)
+        .append_pair("scope", ORCAROUTER_SCOPE);
+    Ok(url.to_string())
+}
+
+/// The OrcaRouter code-for-key exchange endpoint, always on the **auth**
+/// origin.
+pub fn orcarouter_exchange_url(auth_base: &str) -> String {
+    format!(
+        "{}{}",
+        auth_base.trim_end_matches('/'),
+        ORCAROUTER_EXCHANGE_PATH
+    )
+}
+
+/// The response body shape of a successful exchange:
+/// `{ "key": "sk-orca-…", "user_id": "…", "scope": "api" }`.
+#[derive(Deserialize)]
+struct OrcaExchangeResponse {
+    #[serde(default, alias = "access_token")]
+    key: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Exchange an OrcaRouter auth code for a durable API key.
+///
+/// A PKCE-issued key is **not** a refresh token; there is no refresh grant and
+/// no long-lived secret is stored. The response's granted `scope` is read back
+/// and returned, never the scope this client asked for.
+pub(crate) fn exchange_orcarouter_code(
+    client: &dyn OAuthFormClient,
+    auth_base: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<OrcaCredential> {
+    let url = orcarouter_exchange_url(auth_base);
+    let (status, body) = client.post_form(
+        &url,
+        &[
+            ("code", code),
+            ("code_verifier", verifier),
+            ("code_challenge_method", "S256"),
+        ],
+    )?;
+    let parsed: OrcaExchangeResponse = serde_json::from_str(&body).map_err(|_| {
+        // Never echo the body: it carries the freshly minted key.
+        anyhow::anyhow!(
+            "OrcaRouter code exchange returned HTTP {status} that was not exchange JSON"
+        )
+    })?;
+    if !(200..300).contains(&status) {
+        // The server may reflect credentials or control text in `error` too.
+        // Only fixed protocol codes may cross the display/log boundary.
+        let err = match parsed.error.as_deref() {
+            Some("invalid_grant") => "invalid_grant",
+            Some("invalid_request") => "invalid_request",
+            Some("access_denied") => "access_denied",
+            Some("server_error") => "server_error",
+            Some("temporarily_unavailable") => "temporarily_unavailable",
+            _ => "exchange_failed",
+        };
+        // 400 = method mismatch / downgrade defence; 403 = code unknown,
+        // expired, or already used, or verifier mismatch. Both are terminal
+        // for this attempt; neither is retried.
+        bail!(
+            "OrcaRouter sign-in could not exchange the authorization code (HTTP {status}, {err}). Run `codewhale auth orcarouter` again."
+        );
+    }
+    let key = parsed
+        .key
+        .filter(|key| !key.trim().is_empty())
+        .context("OrcaRouter sign-in returned no API key")?;
+    let key = codewhale_secrets::normalize_api_key(&key);
+    anyhow::ensure!(
+        key.starts_with("sk-orca-"),
+        "OrcaRouter sign-in returned a key this client cannot use"
+    );
+    let granted_scope = parsed
+        .scope
+        .filter(|scope| !scope.trim().is_empty())
+        .unwrap_or_else(|| ORCAROUTER_SCOPE.to_string());
+    let _ = parsed.user_id;
+    Ok(OrcaCredential::from_exchange(
+        key,
+        granted_scope,
+        OrcaCredentialSource::Pkce,
+    ))
+}
+
+/// Bind the OrcaRouter loopback callback: always `127.0.0.1`, ephemeral port.
+///
+/// OrcaRouter validates `http://127.0.0.1:<port>` (and `localhost`/`[::1]`)
+/// per request and has no pre-registered redirect URI, so a fresh port per
+/// attempt is correct rather than a conflict.
+pub fn bind_orcarouter_callback() -> Result<Vec<TcpListener>> {
+    let params = &ORCAROUTER_OAUTH_PARAMS;
+    let mut listeners = Vec::new();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).with_context(|| {
+        format!(
+            "{} callback could not bind 127.0.0.1; {}",
+            params.display_name, params.callback_conflict_hint
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("{} callback listener is not pollable", params.display_name))?;
+    listeners.push(listener);
+    Ok(listeners)
+}
+
+/// One interactive OrcaRouter PKCE login.
+///
+/// Protocol-identical to the ChatGPT flow — the crypto, the loopback listener,
+/// the callback handling, the timeout and the terminal gate are the same code
+/// paths — but it produces an [`OrcaCredential`] instead of refreshable token
+/// material, because what OrcaRouter hands back is a durable API key.
+pub fn orcarouter_pkce_login(
+    inputs: &OrcaLoginInputs,
+    challenge: &mut dyn std::io::Write,
+) -> Result<OrcaCredential> {
+    let params = &ORCAROUTER_OAUTH_PARAMS;
+    let listeners = bind_orcarouter_callback()?;
+    let request = start_orcarouter_auth_request(&listeners, inputs)?;
+    writeln!(
+        challenge,
+        "{} sign-in (OAuth 2.0 + PKCE)",
+        params.display_name
+    )?;
+    writeln!(challenge, "  Open:  {}", request.authorize_url)?;
+    if inputs.open_browser && crate::utils::open_url(&request.authorize_url).is_err() {
+        writeln!(
+            challenge,
+            "  Browser could not be opened; copy the URL above into a browser."
+        )?;
+    }
+    let code = wait_for_callback(&listeners, params, &request.state)?;
+    let client = ReqwestOAuthFormClient;
+    let credential =
+        exchange_orcarouter_code(&client, &inputs.auth_base, &code.0, &request.pkce.verifier)?;
+    if !credential.scope_satisfies_purpose() {
+        writeln!(
+            challenge,
+            "  Note: OrcaRouter granted scope \"{}\" while this client asked for \"{}\"; continuing with the narrower grant.",
+            credential.granted_scope(),
+            ORCAROUTER_SCOPE
+        )?;
+    }
+    Ok(credential)
+}
+
+/// Persist an [`OrcaCredential`] through the host's ordinary, transactional
+/// provider-credential path.
+///
+/// This is the single activation seam for **both** OrcaRouter adapters: the
+/// pasted API key and the PKCE exchange both arrive here and are stored
+/// identically, under the existing `orcarouter` secret-store slot with
+/// `auth_mode = "api_key"` metadata. Nothing downstream can tell which adapter
+/// produced the key, and nothing here treats it as refreshable OAuth material.
+///
+/// Live-config mirroring is the caller's job, exactly as it is for the other
+/// owned logins: a shell command reloads config, while the in-session path
+/// mutates the running `Config`.
+pub fn activate_orcarouter_credential(
+    credential: &OrcaCredential,
+    config_path: Option<&Path>,
+) -> Result<crate::config::SavedCredential> {
+    let route_config = Config::load(config_path.map(Path::to_path_buf), None)?;
+    let identity = route_config
+        .builtin_provider_identity(crate::config::ProviderKind::Orcarouter)
+        .map_err(anyhow::Error::msg)?;
+    // Audit only the adapter, never the key: `api_key` or `pkce`. Both
+    // adapters reach this seam and nothing downstream distinguishes them.
+    tracing::info!(
+        target: "codewhale::oauth",
+        source = credential.source().as_str(),
+        "OrcaRouter credential activated"
+    );
+    crate::config::save_api_key_for_identity(&identity, &route_config, credential.expose())
+}
+
+/// Build the loopback callback URL + authorize URL for one OrcaRouter attempt.
+///
+/// `redirect_uri` uses the literal `127.0.0.1` the listener bound, so the
+/// value the user's browser is sent cannot disagree with the socket that is
+/// waiting for it.
+pub fn start_orcarouter_auth_request(
+    listeners: &[TcpListener],
+    inputs: &OrcaLoginInputs,
+) -> Result<BrowserAuthRequest> {
+    let port = listeners
+        .first()
+        .context("OrcaRouter OAuth callback has no bound listener")?
+        .local_addr()
+        .context("OrcaRouter OAuth callback listener has no local address")?
+        .port();
+    let redirect_uri = format!(
+        "http://127.0.0.1:{port}{}",
+        ORCAROUTER_OAUTH_PARAMS.callback_path
+    );
+    let pkce = generate_pkce();
+    let state = generate_state();
+    let authorize_url = build_orcarouter_authorize_url(inputs, &redirect_uri, &state, &pkce)?;
+    Ok(BrowserAuthRequest {
+        state,
+        nonce: String::new(),
+        pkce,
+        redirect_uri,
+        authorize_url,
+    })
+}
+
 /// Resolved login inputs: schema defaults, environment-tested in order.
+#[derive(Clone)]
 pub struct ResolvedOAuthInputs {
     pub issuer: String,
     pub client_id: String,
@@ -396,7 +873,7 @@ pub struct ResolvedOAuthInputs {
     pub open_browser: bool,
 }
 
-impl OAuthProviderParams {
+impl OAuthProviderParams<'_> {
     /// Resolve issuer/client/scopes from the environment, first var wins.
     #[must_use]
     pub fn resolve_inputs(&self) -> ResolvedOAuthInputs {
@@ -424,9 +901,18 @@ pub struct OAuthTokenMaterial {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
+    #[serde(default)]
+    pub earliest_refresh_at: Option<Value>,
     /// OpenID Connect id token; carries the account claim when issued.
     #[serde(default)]
     pub id_token: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub token_type: Option<String>,
+    /// Set only after cryptographic validation, never deserialized from a server.
+    #[serde(skip)]
+    pub(crate) verified_chatgpt: Option<ChatgptRegistration>,
     #[serde(default)]
     pub interval: Option<u64>,
     #[serde(default)]
@@ -483,12 +969,21 @@ fn oauth_endpoint_url(raw: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-fn oauth_http_client(purpose: &str) -> Result<reqwest::blocking::Client> {
-    crate::tls::reqwest_blocking_client_builder()
+fn oauth_http_client(endpoint: &reqwest::Url, purpose: &str) -> Result<reqwest::blocking::Client> {
+    let builder = crate::tls::reqwest_blocking_client_builder()
         // An issuer-approved endpoint cannot delegate credential-bearing forms
         // to a redirect destination, including HTTPS-to-HTTP downgrades.
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(OAUTH_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(OAUTH_REQUEST_TIMEOUT_SECS));
+    // Every caller admits this URL through oauth_endpoint_url. Its HTTP
+    // exception authorizes only a local exchange, never forwarding the form
+    // through an ambient system or environment proxy.
+    let builder = if endpoint.scheme() == "http" {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
         .build()
         .with_context(|| format!("Failed to build OAuth {purpose} client"))
 }
@@ -498,23 +993,6 @@ fn parse_oauth_json<T: serde::de::DeserializeOwned>(
     operation: &str,
 ) -> Result<(reqwest::StatusCode, T)> {
     let status = response.status();
-    // Join every content-type value: some test doubles stack a second one
-    // next to the body's implicit type, and the diagnostic must name what
-    // the server actually sent, not whichever header won the map lookup.
-    let content_type = {
-        let joined = response
-            .headers()
-            .get_all(reqwest::header::CONTENT_TYPE)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if joined.is_empty() {
-            "missing".to_string()
-        } else {
-            joined
-        }
-    };
     let mut reader = response.take(OAUTH_RESPONSE_BODY_LIMIT + 1);
     let mut body = Vec::new();
     reader
@@ -530,9 +1008,7 @@ fn parse_oauth_json<T: serde::de::DeserializeOwned>(
         } else {
             ""
         };
-        anyhow::anyhow!(
-            "{operation} returned HTTP {status} with content type {content_type}; expected JSON{limit}"
-        )
+        anyhow::anyhow!("{operation} returned HTTP {status}; expected JSON{limit}")
     })?;
     Ok((status, parsed))
 }
@@ -624,7 +1100,7 @@ fn discover_oauth_endpoints(params: &OAuthProviderParams, issuer: &str) -> Resul
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     ))?;
-    let client = oauth_http_client("OIDC discovery")?;
+    let client = oauth_http_client(&discovery_url, "OIDC discovery")?;
     #[cfg(test)]
     crate::external_credentials::record_oauth_network();
     let response = client
@@ -721,7 +1197,7 @@ fn request_device_grant(
     scopes: &str,
 ) -> Result<DeviceGrantResponse> {
     let device_authorization_endpoint = oauth_endpoint_url(device_authorization_endpoint)?;
-    let client = oauth_http_client("device-code")?;
+    let client = oauth_http_client(&device_authorization_endpoint, "device-code")?;
     let params = [("client_id", client_id), ("scope", scopes)];
     #[cfg(test)]
     crate::external_credentials::record_oauth_network();
@@ -763,7 +1239,7 @@ fn poll_device_grant(
 ) -> Result<codewhale_config::device_code::DevicePollOutcome<OAuthTokenMaterial>> {
     use codewhale_config::device_code::DevicePollOutcome;
     let token_endpoint = oauth_endpoint_url(token_endpoint)?;
-    let client = oauth_http_client("device-code poll")?;
+    let client = oauth_http_client(&token_endpoint, "device-code poll")?;
     let params = [
         ("client_id", client_id),
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
@@ -797,8 +1273,39 @@ fn poll_device_grant(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthChallengeStream {
+    Stderr,
+    Stdout,
+}
+
+fn oauth_challenge_stream(
+    stderr_terminal: bool,
+    stdout_terminal: bool,
+) -> Result<OAuthChallengeStream> {
+    if stderr_terminal {
+        Ok(OAuthChallengeStream::Stderr)
+    } else if stdout_terminal {
+        Ok(OAuthChallengeStream::Stdout)
+    } else {
+        bail!(
+            "Sign-in requires a terminal for the private login challenge; run codewhale auth in an interactive terminal without redirecting both output streams"
+        );
+    }
+}
+
+fn oauth_challenge_writer() -> Result<Box<dyn std::io::Write + Send>> {
+    match oauth_challenge_stream(
+        std::io::stderr().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )? {
+        OAuthChallengeStream::Stderr => Ok(Box::new(std::io::stderr())),
+        OAuthChallengeStream::Stdout => Ok(Box::new(std::io::stdout())),
+    }
+}
+
 /// Interactive device-code login for any provider whose row offers it.
-/// Prints the verification URL + user code to stderr and polls until
+/// Shows the verification URL + user code only on a terminal and polls until
 /// approved. A provider with no device flow (ChatGPT) fails here with the
 /// reason, instead of deep in transport code.
 pub async fn device_code_login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
@@ -814,17 +1321,30 @@ pub async fn device_code_login(provider: OAuthProvider) -> Result<PendingOAuthLo
     }
     let inputs = params.resolve_inputs();
     let display_name = params.display_name;
-    tokio::task::spawn_blocking(move || device_code_login_with(provider, &inputs))
+    let challenge = oauth_challenge_writer()?;
+    device_code_login_on_worker(provider, inputs, challenge)
         .await
-        .with_context(|| format!("{display_name} device-code login worker failed"))?
+        .with_context(|| format!("{display_name} device-code login worker failed"))
 }
 
-/// Blocking worker body for [`device_code_login`]. `pub(crate)` so the
-/// legacy activation tests can drive the unified login end to end until
-/// activation unifies in 3b-ii.
-pub(crate) fn device_code_login_with(
+async fn device_code_login_on_worker(
+    provider: OAuthProvider,
+    inputs: ResolvedOAuthInputs,
+    mut challenge: Box<dyn std::io::Write + Send>,
+) -> Result<PendingOAuthLogin> {
+    tokio::task::spawn_blocking(move || {
+        device_code_login_with(provider, &inputs, challenge.as_mut())
+    })
+    .await
+    .context("device-code protocol worker failed")?
+}
+
+/// Blocking protocol worker. Production callers capture a terminal first;
+/// protocol tests inject a private output buffer or sink.
+fn device_code_login_with(
     provider: OAuthProvider,
     inputs: &ResolvedOAuthInputs,
+    challenge: &mut dyn std::io::Write,
 ) -> Result<PendingOAuthLogin> {
     let params = oauth_provider_params(provider);
     let display_name = params.display_name;
@@ -849,15 +1369,25 @@ pub(crate) fn device_code_login_with(
         &format!("{display_name} device-code request"),
     )?;
     let user_code = grant.user_code.unwrap_or_default();
+    anyhow::ensure!(
+        user_code.len() <= 1024 && !user_code.chars().any(char::is_control),
+        "device-code login returned invalid user-code display data"
+    );
 
-    eprintln!("{display_name} device-code login");
-    eprintln!("  Open:  {verify}");
-    eprintln!("  Code:  {user_code}");
-    eprintln!("Waiting for approval in the browser… (Ctrl+C to abort)");
-    if inputs.open_browser
-        && let Err(err) = webbrowser::open(&verify)
-    {
-        eprintln!("Could not open the browser automatically: {err}");
+    writeln!(challenge, "{display_name} device-code login")?;
+    writeln!(challenge, "  Open:  {verify}")?;
+    writeln!(challenge, "  Code:  {user_code}")?;
+    writeln!(challenge, "{}", account_choice_hint(display_name))?;
+    writeln!(
+        challenge,
+        "Waiting for approval in the browser… (Ctrl+C to abort)"
+    )?;
+    challenge.flush()?;
+    if inputs.open_browser && webbrowser::open(&verify).is_err() {
+        writeln!(
+            challenge,
+            "Could not open the browser automatically; open the displayed URL manually"
+        )?;
     }
 
     let lifetime = Duration::from_secs(
@@ -900,7 +1430,54 @@ pub(crate) fn device_code_login_with(
 /// One login entry point for every provider: the params row decides whether
 /// the grant is device-code or browser PKCE. A provider with neither fails
 /// here with the reason.
+async fn claude_login() -> Result<PendingOAuthLogin> {
+    let mut output = oauth_challenge_writer()?;
+    tokio::task::spawn_blocking(move || {
+        let params = &CLAUDE_OAUTH_PARAMS;
+        let pkce = generate_pkce();
+        let redirect = "https://console.anthropic.com/oauth/code/callback";
+        let mut url = reqwest::Url::parse("https://claude.ai/oauth/authorize")?;
+        url.query_pairs_mut().extend_pairs([
+            ("code", "true"), ("client_id", params.default_client_id),
+            ("response_type", "code"), ("redirect_uri", redirect),
+            ("scope", params.default_scopes), ("code_challenge", pkce.challenge.as_str()),
+            ("code_challenge_method", "S256"), ("state", pkce.verifier.as_str()),
+        ]);
+        writeln!(output, "Open this URL to sign in with Claude:\n{url}\nPaste the authorization code (code#state):")?;
+        output.flush()?;
+        if std::env::var_os(params.env.no_browser_var).is_none() {
+            let _ = webbrowser::open(url.as_str());
+        }
+        let mut input = String::new();
+        std::io::stdin().lock().take(8193).read_line(&mut input)?;
+        anyhow::ensure!(input.len() <= 8192, "Claude authorization code is too long");
+        let (code, state) = input.trim().split_once('#').context("Expected Claude authorization code#state")?;
+        anyhow::ensure!(!code.is_empty() && !code.chars().any(char::is_control)
+            && codewhale_core::secret_eq::constant_time_eq(state.as_bytes(), pkce.verifier.as_bytes()),
+            "Claude authorization state did not match the pending login");
+        let (status, body) = ReqwestOAuthFormClient.post_form(
+            &form_token_url(params, params.default_issuer), &[
+                ("grant_type", "authorization_code"), ("client_id", params.default_client_id),
+                ("code", code), ("state", state), ("redirect_uri", redirect),
+                ("code_verifier", &pkce.verifier),
+            ],
+        )?;
+        let token = parse_oauth_form_response(status, &body, "sign-in", params)?;
+        Ok(PendingOAuthLogin {
+            provider: OAuthProvider::Claude, issuer: params.default_issuer.to_string(),
+            client_id: params.default_client_id.to_string(), token,
+        })
+    }).await.context("Claude login worker failed")?
+}
+
 pub async fn login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
+    if provider == OAuthProvider::Claude {
+        return claude_login().await;
+    }
+    if provider == OAuthProvider::Chatgpt {
+        let config = Config::load(None, None)?;
+        return login_with_config(provider, &config).await;
+    }
     let params = oauth_provider_params(provider);
     if params.device_code_path.is_some() {
         device_code_login(provider).await
@@ -909,6 +1486,36 @@ pub async fn login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
     } else {
         bail!("{} offers no sign-in flow", params.display_name);
     }
+}
+
+/// Reauthorize the registration selected by the caller's actual config.
+pub async fn login_with_config(
+    provider: OAuthProvider,
+    config: &Config,
+) -> Result<PendingOAuthLogin> {
+    if provider == OAuthProvider::Claude {
+        return claude_login().await;
+    }
+    if provider != OAuthProvider::Chatgpt {
+        let params = oauth_provider_params(provider);
+        return if params.device_code_path.is_some() {
+            device_code_login(provider).await
+        } else {
+            pkce_login(provider).await
+        };
+    }
+    let selected = official_chatgpt_registration(config).ok();
+    let inputs = oauth_provider_params(provider).resolve_inputs();
+    anyhow::ensure!(
+        inputs.issuer == CHATGPT_OAUTH_ISSUER,
+        "Official ChatGPT sign-in requires https://auth.openai.com; remove the issuer override"
+    );
+    let mut challenge = oauth_challenge_writer()?;
+    tokio::task::spawn_blocking(move || {
+        pkce_login_with_selected(provider, &inputs, selected, challenge.as_mut())
+    })
+    .await
+    .context("ChatGPT PKCE login worker failed")?
 }
 
 // ── form-post transport seam ──────────────────────────────────────────
@@ -920,21 +1527,63 @@ pub async fn login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
 
 pub(crate) trait OAuthFormClient {
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(u16, String)>;
+    fn chatgpt_jwks(&self, issuer: &str) -> Result<JwkSet> {
+        fetch_chatgpt_jwks(issuer)
+    }
+    fn revocation_endpoint(&self, params: &OAuthProviderParams, issuer: &str) -> Result<String> {
+        remote_revoke_url(params, issuer).context("OAuth has no remote revoke endpoint")
+    }
 }
 
 pub(crate) struct ReqwestOAuthFormClient;
 
 impl OAuthFormClient for ReqwestOAuthFormClient {
+    fn revocation_endpoint(&self, params: &OAuthProviderParams, issuer: &str) -> Result<String> {
+        if params.display_name != "ChatGPT" {
+            return remote_revoke_url(params, issuer)
+                .context("OAuth has no remote revoke endpoint");
+        }
+        anyhow::ensure!(
+            issuer == CHATGPT_OAUTH_ISSUER,
+            "ChatGPT revocation issuer is invalid"
+        );
+        let discovery_url =
+            oauth_endpoint_url(&format!("{issuer}/.well-known/openid-configuration"))?;
+        let response = oauth_http_client(&discovery_url, "revocation discovery")?
+            .get(discovery_url)
+            .send()
+            .context("ChatGPT revocation discovery failed")?;
+        let (status, document): (_, Value) =
+            parse_oauth_json(response, "ChatGPT revocation discovery")?;
+        anyhow::ensure!(
+            status.is_success() && document.get("issuer").and_then(Value::as_str) == Some(issuer),
+            "ChatGPT revocation discovery issuer is invalid"
+        );
+        let endpoint = document
+            .get("revocation_endpoint")
+            .and_then(Value::as_str)
+            .context("ChatGPT did not publish a revocation endpoint")?;
+        let url = oauth_endpoint_url(endpoint)?;
+        anyhow::ensure!(
+            url.origin() == oauth_endpoint_url(issuer)?.origin()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "ChatGPT revocation endpoint is invalid"
+        );
+        Ok(url.to_string())
+    }
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
         let url = oauth_endpoint_url(url)?;
         #[cfg(test)]
         crate::external_credentials::record_oauth_network();
-        let client = oauth_http_client("form")?;
-        let response = client
-            .post(url)
-            .form(form)
-            .send()
-            .context("OAuth form request failed")?;
+        let client = oauth_http_client(&url, "form")?;
+        let request = client.post(url.clone());
+        let request = if url.as_str() == "https://console.anthropic.com/v1/oauth/token" {
+            request.json(&form.iter().copied().collect::<BTreeMap<_, _>>())
+        } else {
+            request.form(form)
+        };
+        let response = request.send().context("OAuth token request failed")?;
         let status = response.status().as_u16();
         let mut reader = response.take(OAUTH_RESPONSE_BODY_LIMIT + 1);
         let mut body = Vec::new();
@@ -975,6 +1624,15 @@ pub(crate) fn parse_oauth_form_response(
     })?;
     if !(200..300).contains(&status) || parsed.error.is_some() {
         let err = parsed.error.as_deref().unwrap_or("token_error");
+        let err = if params.display_name == "Claude"
+            && !matches!(
+                err,
+                "invalid_grant" | "invalid_client" | "invalid_request" | "access_denied"
+            ) {
+            "token_error"
+        } else {
+            err
+        };
         if matches!(
             err,
             "invalid_grant"
@@ -1017,14 +1675,15 @@ pub(crate) fn refresh_access_token_via(
 ) -> Result<OAuthTokenMaterial> {
     #[cfg(test)]
     crate::external_credentials::record_oauth_refresh();
-    let (status, body) = client.post_form(
-        token_url,
-        &[
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id),
-            ("refresh_token", refresh_token),
-        ],
-    )?;
+    let mut fields = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id),
+        ("refresh_token", refresh_token),
+    ];
+    if params.display_name == "ChatGPT" {
+        fields.push(("resource", CHATGPT_OAUTH_RESOURCE));
+    }
+    let (status, body) = client.post_form(token_url, &fields)?;
     parse_oauth_form_response(status, &body, "refresh", params)
 }
 
@@ -1037,18 +1696,17 @@ pub(crate) fn revoke_remote_token_via(
     client_id: &str,
     token: &str,
 ) -> Result<()> {
-    let Some(revoke_url) = remote_revoke_url(params, issuer) else {
-        bail!("{} has no remote revoke endpoint", params.display_name);
-    };
-    let (status, body) =
-        client.post_form(&revoke_url, &[("token", token), ("client_id", client_id)])?;
-    if !(200..300).contains(&status) {
-        bail!(
-            "{} OAuth revoke failed with HTTP {status}: {}",
-            params.display_name,
-            compact_form_error(&body)
-        );
+    let revoke_url = client.revocation_endpoint(params, issuer)?;
+    let mut fields = vec![("token", token), ("client_id", client_id)];
+    if params.display_name == "ChatGPT" {
+        fields.push(("token_type_hint", "refresh_token"));
     }
+    let (status, _) = client.post_form(&revoke_url, &fields)?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "{} OAuth revoke failed with HTTP {status}",
+        params.display_name
+    );
     Ok(())
 }
 
@@ -1076,6 +1734,7 @@ impl std::fmt::Debug for PkceChallenge {
 #[derive(Clone)]
 pub struct BrowserAuthRequest {
     pub state: String,
+    pub nonce: String,
     pub pkce: PkceChallenge,
     pub redirect_uri: String,
     pub authorize_url: String,
@@ -1087,23 +1746,44 @@ impl std::fmt::Debug for BrowserAuthRequest {
             .field("state", &self.state)
             .field("pkce", &self.pkce)
             .field("redirect_uri", &self.redirect_uri)
-            .field("authorize_url", &self.authorize_url)
+            .field("authorize_url", &"<redacted>")
             .finish()
     }
 }
 
 /// Parsed callback query: a code+state pair, or the issuer's refusal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CallbackOutcome {
     Success {
         code: String,
         state: String,
+        client_id: Option<String>,
     },
     Error {
         error: String,
         description: Option<String>,
         state: Option<String>,
     },
+}
+
+impl std::fmt::Debug for CallbackOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success {
+                state, client_id, ..
+            } => f
+                .debug_struct("Success")
+                .field("code", &"<redacted>")
+                .field("state", state)
+                .field("client_id", client_id)
+                .finish(),
+            Self::Error { state, .. } => f
+                .debug_struct("Error")
+                .field("error", &"<redacted>")
+                .field("state", state)
+                .finish(),
+        }
+    }
 }
 
 /// RFC 7636 S256 PKCE pair.
@@ -1180,6 +1860,15 @@ pub fn build_authorize_url(
     for (key, value) in params.authorize_extras {
         url.query_pairs_mut().append_pair(key, value);
     }
+    let account_prompt_disabled = params
+        .env
+        .no_account_prompt_var
+        .is_some_and(|var| std::env::var_os(var).is_some());
+    if !account_prompt_disabled {
+        for (key, value) in params.account_choice_extras {
+            url.query_pairs_mut().append_pair(key, value);
+        }
+    }
     Ok(url.to_string())
 }
 
@@ -1190,15 +1879,31 @@ pub fn parse_callback_query(params: &OAuthProviderParams, query: &str) -> Result
     let mut state = None;
     let mut error = None;
     let mut description = None;
+    let mut client_id = None;
+    let mut seen = std::collections::HashSet::new();
     for (key, value) in parsed.query_pairs() {
+        if matches!(
+            key.as_ref(),
+            "code" | "state" | "error" | "error_description" | "client_id"
+        ) {
+            anyhow::ensure!(
+                seen.insert(key.to_string()),
+                "OAuth callback contains a duplicate parameter"
+            );
+        }
         match key.as_ref() {
             "code" => code = Some(value.into_owned()),
             "state" => state = Some(value.into_owned()),
             "error" => error = Some(value.into_owned()),
             "error_description" => description = Some(value.into_owned()),
+            "client_id" => client_id = Some(value.into_owned()),
             _ => {}
         }
     }
+    anyhow::ensure!(
+        code.is_none() || error.is_none(),
+        "OAuth callback contains both success and error"
+    );
     if let Some(error) = error {
         return Ok(CallbackOutcome::Error {
             error,
@@ -1212,33 +1917,49 @@ pub fn parse_callback_query(params: &OAuthProviderParams, query: &str) -> Result
     let state = state
         .filter(|s| !s.trim().is_empty())
         .context("OAuth callback missing state")?;
-    Ok(CallbackOutcome::Success { code, state })
+    Ok(CallbackOutcome::Success {
+        code,
+        state,
+        client_id,
+    })
 }
 
+#[cfg(test)]
 pub fn accept_callback(expected_state: &str, outcome: CallbackOutcome) -> Result<String> {
+    accept_callback_with_client(expected_state, outcome).map(|(code, _)| code)
+}
+
+fn accept_callback_with_client(
+    expected_state: &str,
+    outcome: CallbackOutcome,
+) -> Result<(String, Option<String>)> {
     match outcome {
-        CallbackOutcome::Success { code, state } => {
+        CallbackOutcome::Success {
+            code,
+            state,
+            client_id,
+        } => {
             anyhow::ensure!(
-                state == expected_state,
+                codewhale_core::secret_eq::constant_time_eq(
+                    state.as_bytes(),
+                    expected_state.as_bytes(),
+                ),
                 "OAuth callback state did not match the pending login"
             );
-            Ok(code)
+            Ok((code, client_id))
         }
         CallbackOutcome::Error {
             error,
             description,
             state,
         } => {
-            if let Some(state) = state {
-                anyhow::ensure!(
-                    state == expected_state,
-                    "OAuth error callback state did not match the pending login"
-                );
-            }
-            let detail = description
-                .filter(|text| !text.trim().is_empty())
-                .unwrap_or(error);
-            bail!("sign-in was not completed: {detail}")
+            anyhow::ensure!(
+                state.as_deref() == Some(expected_state),
+                "OAuth error callback state did not match the pending login"
+            );
+            let _ = description;
+            let error = compact_form_error(&error);
+            bail!("sign-in was not completed ({error})")
         }
     }
 }
@@ -1266,17 +1987,8 @@ fn query_from_target<'a>(params: &OAuthProviderParams, target: &'a str) -> Resul
     Ok(target.split_once('?').map(|(_, q)| q).unwrap_or(""))
 }
 
-/// Bind the loopback callback on both IP stacks for the first free port.
-///
-/// The redirect URI has to say `localhost` — that is what is registered with
-/// the authorization server, and redirect matching is exact — but `localhost`
-/// resolves to `::1` before `127.0.0.1` on IPv6-first hosts. Binding only
-/// IPv4 left the browser connecting to a closed port, which browsers paper
-/// over with Happy Eyeballs fallback: a working sign-in becomes a slow one,
-/// and a broken one wherever that fallback is disabled. Binding both is the
-/// fix that keeps the registered redirect URI intact.
-///
-/// A host with only one stack available binds only that one and still works.
+/// Bind ChatGPT's exact 127.0.0.1 callback, with an ephemeral-port fallback.
+/// Other providers using localhost bind both IP stacks when available.
 pub fn bind_loopback_callback(params: &OAuthProviderParams) -> Result<Vec<TcpListener>> {
     let name = params.display_name;
     let mut last_error = None;
@@ -1286,6 +1998,9 @@ pub fn bind_loopback_callback(params: &OAuthProviderParams) -> Result<Vec<TcpLis
             SocketAddr::from((Ipv4Addr::LOCALHOST, *port)),
             SocketAddr::from((Ipv6Addr::LOCALHOST, *port)),
         ] {
+            if params.display_name == "ChatGPT" && addr.is_ipv6() {
+                continue;
+            }
             match TcpListener::bind(addr) {
                 Ok(listener) => {
                     listener.set_nonblocking(true).with_context(|| {
@@ -1338,10 +2053,16 @@ pub(crate) fn start_auth_request_on(
             )
         })?
         .port();
-    let redirect_uri = format!("http://localhost:{port}{}", params.callback_path);
+    let host = if params.display_name == "ChatGPT" {
+        "127.0.0.1"
+    } else {
+        "localhost"
+    };
+    let redirect_uri = format!("http://{host}:{port}{}", params.callback_path);
     let pkce = generate_pkce();
     let state = generate_state();
-    let authorize_url = build_authorize_url(
+    let nonce = generate_state();
+    let mut authorize_url = reqwest::Url::parse(&build_authorize_url(
         params,
         &inputs.issuer,
         &inputs.client_id,
@@ -1349,16 +2070,26 @@ pub(crate) fn start_auth_request_on(
         &redirect_uri,
         &state,
         &pkce,
-    )?;
+    )?)?;
+    if params.display_name == "ChatGPT" {
+        authorize_url.query_pairs_mut().append_pair("nonce", &nonce);
+        if inputs.client_id == CHATGPT_OAUTH_CLIENT_ID {
+            authorize_url
+                .query_pairs_mut()
+                .append_pair("agent_name_hint", "Codewhale");
+        }
+    }
     Ok(BrowserAuthRequest {
         state,
+        nonce,
         pkce,
         redirect_uri,
-        authorize_url,
+        authorize_url: authorize_url.to_string(),
     })
 }
 
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+// Allow time for browser authentication and 2FA, as in the MCP OAuth flow.
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
 const CALLBACK_HTML_OK: &str = "<!doctype html><html><body><p>Signed in to Codewhale. You can close this tab.</p></body></html>";
 const CALLBACK_HTML_ERR: &str = "<!doctype html><html><body><p>Sign-in did not complete. You can close this tab and retry in Codewhale.</p></body></html>";
 
@@ -1366,7 +2097,16 @@ fn wait_for_callback(
     listeners: &[TcpListener],
     params: &OAuthProviderParams,
     expected_state: &str,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
+    wait_for_callback_validated(listeners, params, expected_state, None)
+}
+
+fn wait_for_callback_validated(
+    listeners: &[TcpListener],
+    params: &OAuthProviderParams,
+    expected_state: &str,
+    expected_issuer: Option<&str>,
+) -> Result<(String, Option<String>)> {
     let deadline = Instant::now() + CALLBACK_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
@@ -1380,7 +2120,12 @@ fn wait_for_callback(
         for listener in listeners {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    return handle_callback_stream(stream, params, expected_state);
+                    return handle_callback_stream_validated(
+                        stream,
+                        params,
+                        expected_state,
+                        expected_issuer,
+                    );
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
@@ -1397,11 +2142,21 @@ fn wait_for_callback(
     }
 }
 
+#[cfg(test)]
 fn handle_callback_stream(
+    stream: TcpStream,
+    params: &OAuthProviderParams,
+    expected_state: &str,
+) -> Result<(String, Option<String>)> {
+    handle_callback_stream_validated(stream, params, expected_state, None)
+}
+
+fn handle_callback_stream_validated(
     mut stream: TcpStream,
     params: &OAuthProviderParams,
     expected_state: &str,
-) -> Result<String> {
+    expected_issuer: Option<&str>,
+) -> Result<(String, Option<String>)> {
     // BSD sockets (macOS) hand the accepted stream the listener's O_NONBLOCK;
     // the bounded read below needs a blocking socket with a timeout.
     stream.set_nonblocking(false).with_context(|| {
@@ -1436,8 +2191,11 @@ fn handle_callback_stream(
     let result = (|| {
         let target = parse_http_request_target(request_line)?;
         let query = query_from_target(params, &target)?;
+        if let Some(issuer) = expected_issuer {
+            validate_plugin_callback(query, issuer)?;
+        }
         let outcome = parse_callback_query(params, query)?;
-        accept_callback(expected_state, outcome)
+        accept_callback_with_client(expected_state, outcome)
     })();
     let (status, body) = match &result {
         Ok(_) => ("200 OK", CALLBACK_HTML_OK),
@@ -1460,21 +2218,28 @@ pub(crate) fn exchange_authorization_code(
     code: &str,
     verifier: &str,
 ) -> Result<OAuthTokenMaterial> {
-    let (status, body) = client.post_form(
-        token_endpoint,
-        &[
-            ("grant_type", "authorization_code"),
-            ("client_id", client_id),
-            ("redirect_uri", redirect_uri),
-            ("code", code),
-            ("code_verifier", verifier),
-        ],
-    )?;
+    let mut fields = vec![
+        ("grant_type", "authorization_code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("code", code),
+        ("code_verifier", verifier),
+    ];
+    if params.display_name == "ChatGPT" {
+        fields.push(("resource", CHATGPT_OAUTH_RESOURCE));
+    }
+    let (status, body) = client.post_form(token_endpoint, &fields)?;
     parse_oauth_form_response(status, &body, "authorization code exchange", params)
 }
 
+/// Terminal-or-stdout challenge writer for shell commands that drive a login
+/// outside the TUI (`codewhale auth ...`).
+pub fn cli_challenge_writer() -> Result<Box<dyn std::io::Write + Send>> {
+    oauth_challenge_writer()
+}
+
 /// Interactive PKCE browser login for any provider whose row offers it.
-/// Prints the authorize URL, opens a browser, and waits for the loopback
+/// Shows the authorize URL only on a terminal, opens a browser, and waits for the loopback
 /// callback. A provider with no browser flow (xAI) fails here with the
 /// reason, before any listener binds.
 pub async fn pkce_login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
@@ -1486,49 +2251,143 @@ pub async fn pkce_login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
         );
     }
     let inputs = params.resolve_inputs();
+    if provider == OAuthProvider::Chatgpt {
+        anyhow::ensure!(
+            inputs.issuer == CHATGPT_OAUTH_ISSUER,
+            "Official ChatGPT sign-in requires https://auth.openai.com; remove the issuer override"
+        );
+    }
     let display_name = params.display_name;
-    tokio::task::spawn_blocking(move || pkce_login_with(provider, &inputs))
-        .await
-        .with_context(|| format!("{display_name} PKCE login worker failed"))?
+    let mut challenge = oauth_challenge_writer()?;
+    tokio::task::spawn_blocking(move || {
+        pkce_login_with_selected(provider, &inputs, None, challenge.as_mut())
+    })
+    .await
+    .with_context(|| format!("{display_name} PKCE login worker failed"))?
 }
 
-/// Blocking worker body for [`pkce_login`]. `pub(crate)` so the activation
-/// tests can drive the unified login end to end until activation unifies.
-pub(crate) fn pkce_login_with(
+/// Blocking browser protocol worker with a previously admitted terminal.
+fn pkce_login_with_selected(
     provider: OAuthProvider,
     inputs: &ResolvedOAuthInputs,
+    selected: Option<ChatgptRegistration>,
+    challenge: &mut dyn std::io::Write,
 ) -> Result<PendingOAuthLogin> {
     let params = oauth_provider_params(provider);
     let display_name = params.display_name;
-    let listeners = bind_loopback_callback(params)?;
-    let request = start_auth_request_on(&listeners, params, inputs)?;
-    eprintln!("{display_name} sign-in (PKCE)");
-    eprintln!("  Open:  {}", request.authorize_url);
-    eprintln!("Waiting for the browser callback… (Ctrl+C to abort)");
-    if inputs.open_browser
-        && let Err(err) = webbrowser::open(&request.authorize_url)
-    {
-        eprintln!("Could not open the browser automatically: {err}");
+    let mut host = if provider == OAuthProvider::Chatgpt {
+        Some(prepare_chatgpt_host()?)
+    } else {
+        None
+    };
+    if let Some(host) = &mut host {
+        if !std::env::var("CODEWHALE_CHATGPT_NEW_ACCOUNT").is_ok_and(|value| value == "1")
+            && let Some(mut selected) = selected
+        {
+            selected.host_id = host.host_id.clone();
+            host.registration = Some(selected);
+        }
+        if let Some(registration) = &host.registration {
+            anyhow::ensure!(
+                registration.issuer == inputs.issuer,
+                "Saved ChatGPT registration belongs to a different issuer; credentials were not replaced"
+            );
+        }
     }
-    let code = wait_for_callback(&listeners, params, &request.state)?;
-    let token = exchange_authorization_code(
+    let mut inputs = inputs.clone();
+    if let Some(host) = &host {
+        inputs.client_id = host.registration.as_ref().map_or_else(
+            || CHATGPT_OAUTH_CLIENT_ID.to_string(),
+            |registration| registration.client_id.clone(),
+        );
+    }
+    let listeners = bind_loopback_callback(params)?;
+    let mut request = start_auth_request_on(&listeners, params, &inputs)?;
+    if let Some(host) = &host {
+        let mut url = reqwest::Url::parse(&request.authorize_url)?;
+        url.query_pairs_mut()
+            .append_pair("ext_agent_host_id", &host.host_id);
+        if let Some(email) = host
+            .registration
+            .as_ref()
+            .and_then(|registration| registration.email.as_deref())
+        {
+            url.query_pairs_mut().append_pair("login_hint", email);
+        }
+        request.authorize_url = url.to_string();
+    }
+    writeln!(challenge, "{display_name} sign-in (PKCE)")?;
+    writeln!(challenge, "  Open:  {}", request.authorize_url)?;
+    writeln!(challenge, "{}", account_choice_hint(display_name))?;
+    writeln!(
+        challenge,
+        "Waiting for the browser callback… (Ctrl+C to abort)"
+    )?;
+    challenge.flush()?;
+    if inputs.open_browser && webbrowser::open(&request.authorize_url).is_err() {
+        writeln!(
+            challenge,
+            "Could not open the browser automatically; open the displayed URL manually"
+        )?;
+    }
+    let (code, callback_id) = wait_for_callback(&listeners, params, &request.state)?;
+    let client_id = if provider == OAuthProvider::Chatgpt {
+        issued_callback_client_id(&inputs.client_id, callback_id.as_deref())?
+    } else {
+        inputs.client_id.clone()
+    };
+    let mut token = exchange_authorization_code(
         &ReqwestOAuthFormClient,
         params,
         &form_token_url(params, &inputs.issuer),
-        &inputs.client_id,
+        &client_id,
         &request.redirect_uri,
         &code,
         &request.pkce.verifier,
     )?;
+    if let Some(host) = &host {
+        require_chatgpt_scopes(token.scope.as_deref())?;
+        anyhow::ensure!(
+            token
+                .token_type
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("bearer")),
+            "ChatGPT token response did not return Bearer credentials"
+        );
+        let keys = fetch_chatgpt_jwks(&inputs.issuer)?;
+        let registration = verify_chatgpt_id_token(
+            token
+                .id_token
+                .as_deref()
+                .context("ChatGPT sign-in omitted its ID token")?,
+            &keys,
+            &inputs.issuer,
+            &client_id,
+            Some(&request.nonce),
+            host.registration
+                .as_ref()
+                .map(|registration| registration.subject.as_str()),
+            &host.host_id,
+        )?;
+        verify_chatgpt_access_token(
+            token
+                .access_token
+                .as_deref()
+                .context("ChatGPT sign-in omitted its access token")?,
+            &keys,
+            &registration,
+        )?;
+        token.verified_chatgpt = Some(registration);
+    }
     Ok(PendingOAuthLogin {
         provider,
         issuer: inputs.issuer.clone(),
-        client_id: inputs.client_id.clone(),
+        client_id,
         token,
     })
 }
 
-// ── owned credential storage (one store, two providers) ───────────────
+// ── owned credential storage (one shared store) ───────────────
 //
 // Codewhale-owned OAuth generations live in the config crate's credential
 // store under per-provider generation prefixes. xAI historically stored the
@@ -1545,33 +2404,319 @@ pub(crate) const DEVICE_POLL_MAX_SECS: u64 = 900;
 
 /// ChatGPT issuer and public client.
 pub const CHATGPT_OAUTH_ISSUER: &str = "https://auth.openai.com";
-pub const CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// Honest originator; never impersonate `codex_cli_rs`.
-pub const CHATGPT_OAUTH_ORIGINATOR: &str = "codewhale";
-pub const CHATGPT_OAUTH_SCOPE: &str = "openid profile email offline_access";
+pub const CHATGPT_OAUTH_CLIENT_ID: &str = "dynamic_agent_client";
+pub const CHATGPT_OAUTH_RESOURCE: &str = "https://api.openai.com/v1";
+pub const CHATGPT_OAUTH_SCOPE: &str =
+    "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
+
+/// Verified registration identity. The client ID also binds the selected workspace.
+/// One active registration is supported; use CODEWHALE_CHATGPT_NEW_ACCOUNT=1
+/// to explicitly replace it after a new, fully validated browser sign-in.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ChatgptRegistration {
+    pub issuer: String,
+    pub client_id: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub host_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChatgptHost {
+    host_id: String,
+    #[serde(default)]
+    registration: Option<ChatgptRegistration>,
+}
+
+fn valid_issued_chatgpt_client_id(value: &str) -> bool {
+    value.starts_with("oaiapp_")
+        && value.len() > 7
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn validate_chatgpt_host(host: &ChatgptHost) -> Result<()> {
+    let id = host
+        .host_id
+        .strip_prefix("urn:uuid:")
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .context("ChatGPT host identifier is invalid")?;
+    anyhow::ensure!(
+        id.get_version_num() == 4,
+        "ChatGPT host identifier must be a UUIDv4"
+    );
+    if let Some(registration) = &host.registration {
+        anyhow::ensure!(
+            registration.host_id == host.host_id
+                && valid_issued_chatgpt_client_id(&registration.client_id)
+                && !registration.subject.trim().is_empty(),
+            "Saved ChatGPT registration is invalid"
+        );
+    }
+    Ok(())
+}
+
+fn prepare_chatgpt_host() -> Result<ChatgptHost> {
+    codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+        let name = codewhale_config::CHATGPT_HOST_FILE_NAME;
+        let mut host: ChatgptHost = match store.read_to_string(name)? {
+            Some(raw) => {
+                serde_json::from_str(&raw).context("Saved ChatGPT host metadata is invalid")?
+            }
+            None => ChatgptHost {
+                host_id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                registration: None,
+            },
+        };
+        validate_chatgpt_host(&host)?;
+        // Persist before opening a browser, including after a cancelled first login.
+        store.write(name, &serde_json::to_vec(&host)?, true)?;
+        if std::env::var("CODEWHALE_CHATGPT_NEW_ACCOUNT").is_ok_and(|value| value == "1") {
+            host.registration = None;
+        }
+        Ok(host)
+    })
+}
+
+fn require_chatgpt_scopes(scope: Option<&str>) -> Result<()> {
+    let scope = scope.context("ChatGPT token response omitted granted scopes; sign in again")?;
+    for required in ["chatgpt.tokens.use.direct", "resource.invoke"] {
+        anyhow::ensure!(
+            scope
+                .split_ascii_whitespace()
+                .any(|value| value == required),
+            "ChatGPT plan permission was not granted; authorize plan usage in ChatGPT and sign in again"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Deserialize)]
+struct ChatgptIdClaims {
+    sub: String,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+fn fetch_chatgpt_jwks(issuer: &str) -> Result<JwkSet> {
+    let url = oauth_endpoint_url(&format!(
+        "{}/.well-known/jwks.json",
+        issuer.trim_end_matches('/')
+    ))?;
+    let response = oauth_http_client(&url, "identity verification")?
+        .get(url)
+        .send()
+        .context("ChatGPT identity verification keys could not be retrieved")?;
+    let (status, keys) = parse_oauth_json(response, "ChatGPT verification keys")?;
+    anyhow::ensure!(
+        status.is_success(),
+        "ChatGPT identity verification keys are unavailable"
+    );
+    Ok(keys)
+}
+
+fn verify_chatgpt_jwt<T: serde::de::DeserializeOwned + Clone>(
+    token: &str,
+    keys: &JwkSet,
+    issuer: &str,
+    audience: &str,
+) -> Result<T> {
+    let header = decode_header(token).context("ChatGPT identity token header is invalid")?;
+    anyhow::ensure!(
+        matches!(
+            header.alg,
+            Algorithm::RS256
+                | Algorithm::RS384
+                | Algorithm::RS512
+                | Algorithm::ES256
+                | Algorithm::ES384
+                | Algorithm::EdDSA
+        ),
+        "ChatGPT identity token uses an unsupported signature algorithm"
+    );
+    let kid = header
+        .kid
+        .as_deref()
+        .context("ChatGPT identity token omitted its verification key")?;
+    let jwk = keys
+        .find(kid)
+        .context("ChatGPT identity token verification key is unknown")?;
+    let key = DecodingKey::from_jwk(jwk).context("ChatGPT identity verification key is invalid")?;
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    validation.validate_nbf = true;
+    validation.leeway = 0;
+    let claims = decode::<Value>(token, &key, &validation)
+        .map_err(|_| {
+            anyhow::anyhow!("ChatGPT token signature or identity claims failed verification")
+        })?
+        .claims;
+    let exact_audience = claims.get("aud").is_some_and(|aud| {
+        aud.as_str() == Some(audience)
+            || aud
+                .as_array()
+                .is_some_and(|values| values.len() == 1 && values[0].as_str() == Some(audience))
+    });
+    anyhow::ensure!(
+        exact_audience,
+        "ChatGPT token audience does not match this registration"
+    );
+    serde_json::from_value(claims).context("ChatGPT token identity claims are invalid")
+}
+
+fn verify_chatgpt_id_token(
+    token: &str,
+    keys: &JwkSet,
+    issuer: &str,
+    client_id: &str,
+    nonce: Option<&str>,
+    expected_subject: Option<&str>,
+    host_id: &str,
+) -> Result<ChatgptRegistration> {
+    let claims: ChatgptIdClaims = verify_chatgpt_jwt(token, keys, issuer, client_id)?;
+    anyhow::ensure!(
+        !claims.sub.trim().is_empty(),
+        "ChatGPT identity token has no subject"
+    );
+    if let Some(nonce) = nonce {
+        anyhow::ensure!(
+            claims.nonce.as_deref() == Some(nonce),
+            "ChatGPT identity token nonce did not match the pending login"
+        );
+    }
+    if let Some(subject) = expected_subject {
+        anyhow::ensure!(
+            claims.sub == subject,
+            "ChatGPT sign-in returned a different account; the selected registration was not replaced"
+        );
+    }
+    Ok(ChatgptRegistration {
+        issuer: issuer.to_string(),
+        client_id: client_id.to_string(),
+        subject: claims.sub,
+        email: claims.email,
+        host_id: host_id.to_string(),
+    })
+}
+
+#[derive(Clone, Deserialize)]
+struct ChatgptAccessClaims {
+    sub: String,
+    client_id: String,
+    scope: String,
+}
+
+fn verify_chatgpt_access_token(
+    token: &str,
+    keys: &JwkSet,
+    registration: &ChatgptRegistration,
+) -> Result<()> {
+    let claims: ChatgptAccessClaims =
+        verify_chatgpt_jwt(token, keys, &registration.issuer, CHATGPT_OAUTH_RESOURCE)?;
+    anyhow::ensure!(
+        claims.sub == registration.subject && claims.client_id == registration.client_id,
+        "ChatGPT access token does not match the selected account registration"
+    );
+    require_chatgpt_scopes(Some(&claims.scope))
+}
+
+fn issued_callback_client_id(pending_id: &str, callback_id: Option<&str>) -> Result<String> {
+    if pending_id == CHATGPT_OAUTH_CLIENT_ID {
+        let issued =
+            callback_id.context("ChatGPT registration did not return an issued client ID")?;
+        anyhow::ensure!(
+            valid_issued_chatgpt_client_id(issued),
+            "ChatGPT registration returned an invalid client ID"
+        );
+        Ok(issued.to_string())
+    } else {
+        anyhow::ensure!(
+            valid_issued_chatgpt_client_id(pending_id),
+            "Saved ChatGPT client ID is invalid; register again"
+        );
+        anyhow::ensure!(
+            callback_id.is_none_or(|value| value == pending_id),
+            "ChatGPT callback changed the selected registration; credentials were not replaced"
+        );
+        Ok(pending_id.to_string())
+    }
+}
+
+fn registration_from_entry(entry: &OwnedAuthEntry) -> Result<ChatgptRegistration> {
+    let registration: ChatgptRegistration =
+        serde_json::from_value(entry.extra.get("siwc_registration").cloned().context(
+            "Existing ChatGPT credentials need reauthorization; run `codewhale auth chatgpt`",
+        )?)
+        .context("Saved official ChatGPT registration is invalid; sign in again")?;
+    anyhow::ensure!(
+        registration.issuer == CHATGPT_OAUTH_ISSUER
+            && entry.oidc_issuer.as_deref() == Some(registration.issuer.as_str())
+            && entry.oidc_client_id.as_deref() == Some(registration.client_id.as_str())
+            && entry.account_id.as_deref() == Some(registration.subject.as_str())
+            && valid_issued_chatgpt_client_id(&registration.client_id)
+            && !registration.subject.trim().is_empty(),
+        "Saved ChatGPT grant does not match its verified registration; sign in again"
+    );
+    require_chatgpt_scopes(entry.extra.get("siwc_scope").and_then(Value::as_str))?;
+    let access = entry
+        .access_token
+        .as_deref()
+        .context("Saved ChatGPT access token is missing")?;
+    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(access.as_bytes()));
+    anyhow::ensure!(
+        entry.extra.get("siwc_token_sha256").and_then(Value::as_str) == Some(fingerprint.as_str()),
+        "Saved ChatGPT token does not match its validated grant; sign in again"
+    );
+    Ok(registration)
+}
+
+/// Metadata only: no network, refresh, token return, or external credential import.
+pub(crate) fn official_chatgpt_registration(config: &Config) -> Result<ChatgptRegistration> {
+    let identity = config
+        .builtin_provider_identity(OAuthProvider::Chatgpt.api())
+        .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        config
+            .provider_config_for(&identity)
+            .and_then(|entry| entry.auth_mode.as_deref())
+            == Some("oauth"),
+        "Sign in with ChatGPT using `codewhale auth chatgpt`; the selected route has no official OAuth grant"
+    );
+    let path = configured_owned_auth_file_path(OAuthProvider::Chatgpt, config)?
+        .context("Sign in with ChatGPT using `codewhale auth chatgpt`")?;
+    let mut file = load_owned_auth_file(&path)?.context("Saved ChatGPT credentials are missing")?;
+    let (_, entry) = select_entry(OAuthProvider::Chatgpt, &mut file)
+        .context("Saved ChatGPT credentials are missing")?;
+    registration_from_entry(&entry)
+}
 
 impl OAuthProvider {
     /// The engine provider this OAuth row belongs to.
     #[must_use]
-    pub fn api(self) -> crate::config::ApiProvider {
+    pub fn api(self) -> crate::config::ProviderKind {
         match self {
-            OAuthProvider::Xai => crate::config::ApiProvider::Xai,
-            OAuthProvider::Chatgpt => crate::config::ApiProvider::OpenaiCodex,
+            OAuthProvider::Xai => crate::config::ProviderKind::Xai,
+            OAuthProvider::Chatgpt => crate::config::ProviderKind::OpenaiCodex,
+            OAuthProvider::Claude => crate::config::ProviderKind::Anthropic,
         }
     }
 
     /// `[providers.<key>]` table this provider's auth state lives under.
     fn config_key(self) -> &'static str {
-        crate::config::provider_config_key(self.api()).unwrap_or(match self {
-            OAuthProvider::Xai => "xai",
-            OAuthProvider::Chatgpt => "openai_codex",
-        })
+        codewhale_config::descriptors::compatibility_for_kind(self.api()).config_key
     }
 
     fn legacy_file_name(self) -> &'static str {
         match self {
             OAuthProvider::Xai => codewhale_config::LEGACY_XAI_OAUTH_FILE_NAME,
             OAuthProvider::Chatgpt => codewhale_config::LEGACY_CHATGPT_OAUTH_FILE_NAME,
+            OAuthProvider::Claude => codewhale_config::LEGACY_CLAUDE_OAUTH_FILE_NAME,
         }
     }
 
@@ -1580,6 +2725,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => codewhale_config::is_valid_xai_oauth_generation(name),
             OAuthProvider::Chatgpt => codewhale_config::is_valid_chatgpt_oauth_generation(name),
+            OAuthProvider::Claude => codewhale_config::is_valid_claude_oauth_generation(name),
         }
     }
 
@@ -1587,6 +2733,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => codewhale_config::validate_xai_oauth_generation(name),
             OAuthProvider::Chatgpt => codewhale_config::validate_chatgpt_oauth_generation(name),
+            OAuthProvider::Claude => codewhale_config::validate_claude_oauth_generation(name),
         }
         .map(|_| ())
     }
@@ -1595,6 +2742,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => codewhale_config::xai_oauth_generation_path(name),
             OAuthProvider::Chatgpt => codewhale_config::chatgpt_oauth_generation_path(name),
+            OAuthProvider::Claude => codewhale_config::claude_oauth_generation_path(name),
         }
     }
 
@@ -1604,6 +2752,10 @@ impl OAuthProvider {
             OAuthProvider::Xai => (
                 codewhale_config::XAI_OAUTH_GENERATION_PREFIX,
                 codewhale_config::XAI_OAUTH_GENERATION_SUFFIX,
+            ),
+            OAuthProvider::Claude => (
+                codewhale_config::CLAUDE_OAUTH_GENERATION_PREFIX,
+                codewhale_config::CLAUDE_OAUTH_GENERATION_SUFFIX,
             ),
             OAuthProvider::Chatgpt => (
                 codewhale_config::CHATGPT_OAUTH_GENERATION_PREFIX,
@@ -1667,6 +2819,8 @@ fn redacted(present: bool) -> &'static str {
 pub struct OwnedOAuthCredentials {
     pub access_token: String,
     pub account_id: Option<String>,
+    /// Display label (email, plan) of the entry these credentials came from.
+    pub account_label: Option<String>,
     #[allow(dead_code, reason = "read by provider routes and tests as needed")]
     pub refresh_token: Option<String>,
     #[allow(dead_code, reason = "diagnostic surface only")]
@@ -1683,6 +2837,54 @@ pub struct OAuthActivation {
     pub credentials: OwnedOAuthCredentials,
     pub config_path: PathBuf,
     pub auth_path: PathBuf,
+    pub provider: OAuthProvider,
+    /// Non-secret label (email, plan) of the account just signed in.
+    pub account_label: Option<String>,
+    /// `Some` when this login replaced an existing Codewhale-owned sign-in;
+    /// the inner value is that account's label when it had one.
+    pub replaced: Option<Option<String>>,
+}
+
+impl OAuthActivation {
+    /// "Signed in to ChatGPT as you@example.com (plus)." plus, on its own
+    /// line, which sign-in this login replaced. Never token material. Shell
+    /// commands pass [`Locale::En`](codewhale_localization::Locale::En); the
+    /// TUI passes its UI locale.
+    #[must_use]
+    pub fn summary(&self, locale: codewhale_localization::Locale) -> String {
+        use codewhale_localization::{MessageId, tr};
+        let name = oauth_provider_params(self.provider).display_name;
+        let signed_in = match self.account_label.as_deref() {
+            Some(label) => tr(locale, MessageId::AuthSignedInAs)
+                .replace("{provider}", name)
+                .replace("{account}", label),
+            None => tr(locale, MessageId::AuthSignedInWithoutEmail).replace("{provider}", name),
+        };
+        let replaced = match &self.replaced {
+            Some(Some(previous)) if Some(previous) != self.account_label.as_ref() => Some(
+                tr(locale, MessageId::AuthReplacedPreviousSignInAs)
+                    .replace("{provider}", name)
+                    .replace("{account}", previous),
+            ),
+            Some(Some(_)) => {
+                Some(tr(locale, MessageId::AuthSameAccountAsBefore).replace("{provider}", name))
+            }
+            Some(None) => {
+                Some(tr(locale, MessageId::AuthReplacedPreviousSignIn).replace("{provider}", name))
+            }
+            None => None,
+        };
+        match replaced {
+            Some(replaced) => format!("{signed_in}\n{replaced}"),
+            None => signed_in,
+        }
+    }
+
+    /// Official ChatGPT sign-in never uses an ambient process token.
+    #[must_use]
+    pub fn env_override_warning(&self, _locale: codewhale_localization::Locale) -> Option<String> {
+        None
+    }
 }
 
 impl std::fmt::Debug for OAuthActivation {
@@ -1691,6 +2893,9 @@ impl std::fmt::Debug for OAuthActivation {
             .field("credentials", &redacted(true))
             .field("config_path", &self.config_path)
             .field("auth_path", &self.auth_path)
+            .field("provider", &self.provider)
+            .field("account_label", &self.account_label)
+            .field("replaced", &self.replaced)
             .finish()
     }
 }
@@ -1779,6 +2984,18 @@ fn load_external_auth_file(
 }
 
 fn select_entry(provider: OAuthProvider, file: &mut AuthFile) -> Option<(String, OwnedAuthEntry)> {
+    if provider == OAuthProvider::Chatgpt {
+        let mut official = file
+            .iter()
+            .filter(|(_, entry)| registration_from_entry(entry).is_ok());
+        if let Some((scope, entry)) = official.next() {
+            // Ambiguous profile selection fails closed. Login writes one account.
+            return official
+                .next()
+                .is_none()
+                .then(|| (scope.clone(), entry.clone()));
+        }
+    }
     // Prefer this provider's registered client-id scope when present.
     let preferred_suffix = format!("::{}", oauth_provider_params(provider).default_client_id);
     if let Some((k, v)) = file
@@ -1803,6 +3020,21 @@ fn entry_has_usable_secret(entry: &OwnedAuthEntry) -> bool {
             .is_some_and(|t| !t.trim().is_empty())
 }
 
+fn chatgpt_refresh_not_before(value: &Value) -> Result<i64> {
+    value
+        .as_i64()
+        .or_else(|| {
+            value.as_str().and_then(|value| {
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| parse_rfc3339_secs(value))
+            })
+        })
+        .filter(|value| *value >= 0)
+        .context("ChatGPT earliest refresh time is invalid; sign in again")
+}
+
 const REFRESH_SKEW_SECS: i64 = 60;
 
 fn entry_access_token_is_fresh(entry: &OwnedAuthEntry) -> bool {
@@ -1817,11 +3049,19 @@ fn entry_access_token_is_fresh(entry: &OwnedAuthEntry) -> bool {
     let token_expiry = jwt_expiry_seconds(token).and_then(|exp| i64::try_from(exp).ok());
     // A later stored expiry must not hide an already-expired access token.
     // Opaque tokens still use stored expiry; no known expiry remains stale.
+    let now = now_unix_secs().unwrap_or(0);
+    let refresh_blocked = entry
+        .extra
+        .get("siwc_earliest_refresh_at")
+        .and_then(|value| chatgpt_refresh_not_before(value).ok())
+        .is_some_and(|earliest| earliest > now);
     stored_expiry
         .into_iter()
         .chain(token_expiry)
         .min()
-        .is_some_and(|exp| exp.saturating_sub(now_unix_secs().unwrap_or(0)) > REFRESH_SKEW_SECS)
+        .is_some_and(|exp| {
+            exp.saturating_sub(now) > REFRESH_SKEW_SECS || (refresh_blocked && exp > now)
+        })
 }
 
 fn credentials_from_entry(
@@ -1833,6 +3073,7 @@ fn credentials_from_entry(
     OwnedOAuthCredentials {
         access_token,
         account_id: entry.account_id.clone(),
+        account_label: entry.account_label(),
         refresh_token: entry.refresh_token.clone(),
         expires_at: entry.expires_at.clone(),
         issuer: entry
@@ -1873,6 +3114,58 @@ fn apply_token_response(
     client_id: &str,
     token: &OAuthTokenMaterial,
 ) -> Result<()> {
+    if provider == OAuthProvider::Chatgpt {
+        let registration = token
+            .verified_chatgpt
+            .as_ref()
+            .context("ChatGPT credentials were not cryptographically verified; sign in again")?;
+        anyhow::ensure!(
+            registration.issuer == issuer && registration.client_id == client_id,
+            "Verified ChatGPT registration does not match the token exchange"
+        );
+        require_chatgpt_scopes(token.scope.as_deref())?;
+        entry.extra.insert(
+            "siwc_registration".to_string(),
+            serde_json::to_value(registration)?,
+        );
+        entry.extra.insert(
+            "siwc_scope".to_string(),
+            Value::String(token.scope.clone().unwrap_or_default()),
+        );
+        let access = token
+            .access_token
+            .as_deref()
+            .context("token response missing access_token")?;
+        entry.extra.insert(
+            "siwc_token_sha256".to_string(),
+            Value::String(URL_SAFE_NO_PAD.encode(Sha256::digest(access.as_bytes()))),
+        );
+        if let Some(value) = &token.earliest_refresh_at {
+            let earliest = chatgpt_refresh_not_before(value)?;
+            entry.extra.insert(
+                "siwc_earliest_refresh_at".to_string(),
+                Value::from(earliest),
+            );
+        } else {
+            entry.extra.remove("siwc_earliest_refresh_at");
+        }
+        entry.account_id = Some(registration.subject.clone());
+    }
+    if provider == OAuthProvider::Claude {
+        anyhow::ensure!(
+            token
+                .expires_in
+                .is_some_and(|seconds| seconds > 60 && seconds < 31_536_000),
+            "Claude token response omitted a usable expiration"
+        );
+        anyhow::ensure!(
+            token
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()),
+            "Claude token response omitted its rotating refresh token"
+        );
+    }
     let access = token
         .access_token
         .as_deref()
@@ -1893,7 +3186,9 @@ fn apply_token_response(
         .originator
         .map(ToOwned::to_owned);
     if let Some(id_token) = token.id_token.clone() {
-        if let Some(account_id) = account_id_from_id_token(&id_token) {
+        if provider != OAuthProvider::Chatgpt
+            && let Some(account_id) = account_id_from_id_token(&id_token)
+        {
             entry.account_id = Some(account_id);
         }
         entry.id_token = Some(id_token);
@@ -1921,6 +3216,159 @@ fn account_id_from_id_token(token: &str) -> Option<String> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Longest email the label keeps (RFC 5321 path limit); plan names are short.
+const ACCOUNT_EMAIL_MAX_CHARS: usize = 254;
+const ACCOUNT_PLAN_MAX_CHARS: usize = 32;
+/// Leading characters of a ChatGPT account id shown to tell two workspaces
+/// on one email apart.
+const ACCOUNT_ID_PREFIX_CHARS: usize = 8;
+/// ChatGPT plans that belong to one person, where email and plan already
+/// identify the account. Any other plan (team, business, enterprise, edu,
+/// or one this list has not seen) is a workspace a person may hold several
+/// of under one email, so its label carries an account-id prefix.
+const PERSONAL_CHATGPT_PLANS: &[&str] = &["free", "go", "plus", "pro"];
+
+/// Non-secret account label from an ID token's claims, decoded locally:
+/// `email`, `email (plan)`, or for a workspace plan
+/// `email (plan, workspace 1a2b3c4d)`. The signature is not verified: the
+/// label is for display only and never authorizes anything. Claim text is
+/// bounded and stripped of control characters so a hostile token cannot
+/// smuggle terminal escapes into status output. `None` when no usable email
+/// claim exists.
+#[must_use]
+pub fn account_label_from_id_token(token: &str) -> Option<String> {
+    let payload = jwt_payload(token)?;
+    let claim_text = |value: Option<&Value>, max: usize| {
+        let text: String = value?
+            .as_str()?
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(max)
+            .collect();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    let email = claim_text(payload.get("email"), ACCOUNT_EMAIL_MAX_CHARS).or_else(|| {
+        claim_text(
+            payload
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| profile.get("email")),
+            ACCOUNT_EMAIL_MAX_CHARS,
+        )
+    })?;
+    let plan = claim_text(
+        payload
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| auth.get("chatgpt_plan_type")),
+        ACCOUNT_PLAN_MAX_CHARS,
+    );
+    let workspace = plan
+        .as_deref()
+        .filter(|plan| {
+            !PERSONAL_CHATGPT_PLANS
+                .iter()
+                .any(|personal| plan.eq_ignore_ascii_case(personal))
+        })
+        .and_then(|_| account_id_from_id_token(token))
+        .map(|id| {
+            id.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(ACCOUNT_ID_PREFIX_CHARS)
+                .collect::<String>()
+        })
+        .filter(|prefix| !prefix.is_empty());
+    Some(match (plan, workspace) {
+        (Some(plan), Some(workspace)) => format!("{email} ({plan}, workspace {workspace})"),
+        (Some(plan), None) => format!("{email} ({plan})"),
+        (None, _) => email,
+    })
+}
+
+impl OwnedAuthEntry {
+    /// Display label for the account this entry signs in as.
+    fn account_label(&self) -> Option<String> {
+        self.id_token
+            .as_deref()
+            .and_then(account_label_from_id_token)
+    }
+}
+
+/// Whether an owned entry can still produce a bearer: a fresh access token,
+/// or a refresh token to mint one. The same test gates [`credentials_valid`]
+/// and the account label, so a label is never shown for an entry the
+/// runtime would refuse.
+fn owned_entry_is_usable(entry: &OwnedAuthEntry) -> bool {
+    entry_access_token_is_fresh(entry)
+        || entry
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+}
+
+/// Account label of the Codewhale-owned sign-in stored in one generation
+/// file. Reads only that file; never refreshes, writes, or touches the
+/// network. `Ok(None)` when the usable entry's ID token carries no email;
+/// `Err` (a fixed, token-free reason) when the generation name is invalid,
+/// the file is missing or unreadable, or it holds no usable sign-in.
+pub fn owned_account_label_for_generation(
+    provider: OAuthProvider,
+    generation: &str,
+) -> Result<Option<String>> {
+    let path = provider
+        .generation_path(generation)
+        .map_err(|_| anyhow::anyhow!("invalid generation pointer"))?;
+    owned_account_label_at(provider, &path)
+}
+
+fn owned_account_label_at(provider: OAuthProvider, path: &Path) -> Result<Option<String>> {
+    let mut file = load_owned_auth_file(path)
+        .map_err(|_| anyhow::anyhow!("sign-in file is unreadable"))?
+        .ok_or_else(|| anyhow::anyhow!("sign-in file is missing"))?;
+    let (_, entry) = select_entry(provider, &mut file)
+        .filter(|(_, entry)| {
+            (provider != OAuthProvider::Chatgpt || registration_from_entry(entry).is_ok())
+                && owned_entry_is_usable(entry)
+        })
+        .ok_or_else(|| anyhow::anyhow!("sign-in file holds no usable sign-in"))?;
+    Ok(entry.account_label())
+}
+
+/// What to tell someone whose subscription sign-in hit a plan limit: which
+/// account made the request (label only, never a token) and how to sign in
+/// with a different one, both inside a running session and from a shell.
+/// A shell login does not reach a session that is already open, so the
+/// shell route says to restart.
+#[must_use]
+pub fn usage_limit_guidance(provider: OAuthProvider, account_label: Option<&str>) -> String {
+    let params = oauth_provider_params(provider);
+    let name = params.display_name;
+    let switch = if provider == OAuthProvider::Chatgpt {
+        "To continue with a different ChatGPT account, run `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt` in a shell and then restart open Codewhale sessions. `/auth chatgpt` reauthorizes the selected account.".to_string()
+    } else {
+        format!(
+            "To continue with a different {name} account, run `{}` in Codewhale, or `{}` in a shell and then restart open Codewhale sessions.",
+            params.session_login_hint, params.relogin_hint
+        )
+    };
+    match account_label {
+        Some(label) => format!("This request used the {name} account {label}. {switch}"),
+        None => switch,
+    }
+}
+
+/// Printed beside a login URL: the issuer signs in whichever account the
+/// browser already holds unless the user picks another.
+fn account_choice_hint(display_name: &str) -> String {
+    if display_name == "ChatGPT" {
+        return "Returning sign-in must use the selected ChatGPT account. To replace it, start a new login with `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`. If the browser shows a different account, sign out there first or open the login URL in a private window.".to_string();
+    }
+    format!(
+        "Approve with the {display_name} account Codewhale should use. If the page is already \
+         signed in to a different account, sign out there first or open the URL above in a \
+         private window."
+    )
 }
 
 fn jwt_payload(token: &str) -> Option<Value> {
@@ -1996,13 +3444,25 @@ fn configured_owned_auth_file_path(
     provider: OAuthProvider,
     config: &Config,
 ) -> Result<Option<PathBuf>> {
+    let identity = config
+        .builtin_provider_identity(provider.api())
+        .map_err(anyhow::Error::msg)?;
     let generation = config
-        .provider_config_for(provider.api())
+        .provider_config_for(&identity)
         .and_then(|entry| entry.oauth_credential_generation.as_deref());
     match generation {
         Some(generation) => provider.generation_path(generation).map(Some),
         None => Ok(None),
     }
+}
+
+/// A subscription sign-in the structural check found usable, named by the
+/// same read that proved it usable. Holds a display label only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsableSignIn {
+    /// Email (and plan) of the account that entry signs in as; `None` when
+    /// its ID token carries no email claim.
+    pub account_label: Option<String>,
 }
 
 /// Prompt-free structural check for owned OAuth material. Never refreshes,
@@ -2012,69 +3472,88 @@ fn configured_owned_auth_file_path(
 /// (#5772).
 #[must_use]
 pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
+    usable_sign_in(provider, config).is_some()
+}
+
+/// [`credentials_valid`], also naming the account of the entry that passed:
+/// the configured Codewhale-owned generation, else (xAI) the legacy owned
+/// file or the consented Grok CLI import — the credential the route would
+/// send. Readiness surfaces take the label from here so naming the account
+/// costs no second credential read.
+#[must_use]
+pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<UsableSignIn> {
+    let identity = config.builtin_provider_identity(provider.api()).ok()?;
+    let usable = |entry: &OwnedAuthEntry| UsableSignIn {
+        account_label: entry.account_label(),
+    };
     // Codewhale-owned OAuth bytes are inert until the provider route
     // explicitly selects OAuth. A failed post-login config finalization can
     // therefore never make a newly written token silently ready on the next
     // launch.
+    if matches!(provider, OAuthProvider::Chatgpt | OAuthProvider::Claude)
+        && config
+            .provider_config_for(&identity)
+            .and_then(|entry| entry.auth_mode.as_deref())
+            != Some("oauth")
+    {
+        return None;
+    }
     if provider == OAuthProvider::Xai
         && !config
-            .provider_config_for(provider.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.auth_mode.as_deref())
             .is_some_and(auth_mode_uses_xai_oauth)
     {
-        return false;
+        return None;
     }
     if let Ok(Some(path)) = configured_owned_auth_file_path(provider, config)
         && let Ok(Some(mut file)) = load_owned_auth_file(&path)
         && let Some((_, entry)) = select_entry(provider, &mut file)
-        && (entry_access_token_is_fresh(&entry)
-            || entry
-                .refresh_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty()))
+        && (provider != OAuthProvider::Chatgpt || registration_from_entry(&entry).is_ok())
+        && (provider != OAuthProvider::Claude
+            || (entry.oidc_issuer.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_issuer)
+                && entry.oidc_client_id.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_client_id)))
+        && owned_entry_is_usable(&entry)
     {
-        return true;
+        return Some(usable(&entry));
     }
     if config
-        .provider_config_for(provider.api())
+        .provider_config_for(&identity)
         .and_then(|entry| entry.oauth_credential_generation.as_deref())
         .is_some()
     {
         // A configured generation is authoritative. Invalid, missing, unsafe,
         // or malformed owned storage must not fall through to an external CLI.
-        return false;
+        return None;
     }
     if provider == OAuthProvider::Xai {
         // The pre-generation legacy file is the last owned location.
         if let Ok(path) = codewhale_config::legacy_xai_oauth_path()
             && let Ok(Some(mut file)) = load_owned_auth_file(&path)
             && let Some((_, entry)) = select_entry(provider, &mut file)
-            && (entry_access_token_is_fresh(&entry)
-                || entry
-                    .refresh_token
-                    .as_deref()
-                    .is_some_and(|token| !token.trim().is_empty()))
+            && owned_entry_is_usable(&entry)
         {
-            return true;
+            return Some(usable(&entry));
         }
         // #5772: with no persisted consent record there is no external path
         // to resolve and nothing to open.
         if let Some(consent_path) = config
-            .provider_config_for(provider.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.external_credentials.as_ref())
             .map(|consent| consent.path.clone())
             && let Ok(grant) = config.external_credential_read_grant(
-                provider.api(),
+                &identity,
                 codewhale_config::ExternalCredentialSource::GrokCli,
                 &consent_path,
             )
             && let Ok(mut file) = load_external_auth_file(&grant)
         {
             return select_entry(provider, &mut file)
-                .is_some_and(|(_, entry)| entry_access_token_is_fresh(&entry));
+                .filter(|(_, entry)| entry_access_token_is_fresh(entry))
+                .map(|(_, entry)| usable(&entry));
         }
     }
-    false
+    None
 }
 
 #[must_use]
@@ -2112,10 +3591,14 @@ pub fn validate_grok_external_credentials(
 /// credentials may refresh and rewrite Codewhale-owned storage; external
 /// credentials are read-only.
 pub fn get_xai_credentials(config: &Config) -> Result<OwnedOAuthCredentials> {
+    let identity = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
-        config.api_provider() == crate::config::ApiProvider::Xai
+        identity.provider == crate::config::ProviderKind::Xai
+            && identity.key.as_str() == crate::config::ProviderKind::Xai.as_str()
             && config
-                .provider_config_for(crate::config::ApiProvider::Xai)
+                .provider_config_for(&identity)
                 .and_then(|entry| entry.auth_mode.as_deref())
                 .is_some_and(auth_mode_uses_xai_oauth),
         "Codewhale-owned xAI OAuth credentials are inactive until the xAI route explicitly selects OAuth"
@@ -2130,7 +3613,7 @@ pub fn get_xai_credentials(config: &Config) -> Result<OwnedOAuthCredentials> {
 
     let external_path = grok_auth_file_path();
     let grant = config.external_credential_read_grant(
-        crate::config::ApiProvider::Xai,
+        &identity,
         codewhale_config::ExternalCredentialSource::GrokCli,
         &external_path,
     )?;
@@ -2160,17 +3643,75 @@ pub fn get_xai_credentials(config: &Config) -> Result<OwnedOAuthCredentials> {
     ))
 }
 
-pub fn get_xai_access_token(config: &Config) -> Result<String> {
-    Ok(get_xai_credentials(config)?.access_token)
-}
-
-/// Load ChatGPT owned credentials from the configured generation,
+/// Load owned subscription credentials from the configured generation,
 /// refreshing through the seam when stale.
 pub fn get_owned_credentials(
     provider: OAuthProvider,
     config: &Config,
 ) -> Result<OwnedOAuthCredentials> {
+    let identity = config
+        .builtin_provider_identity(provider.api())
+        .map_err(anyhow::Error::msg)?;
+    if matches!(provider, OAuthProvider::Chatgpt | OAuthProvider::Claude) {
+        anyhow::ensure!(
+            config
+                .provider_config_for(&identity)
+                .and_then(|entry| entry.auth_mode.as_deref())
+                == Some("oauth"),
+            "Owned subscription credentials are inactive; sign in again"
+        );
+    }
     get_owned_credentials_with(provider, config, &ReqwestOAuthFormClient)
+}
+
+/// Read-only diagnostics: never refreshes or changes protected storage.
+pub(crate) fn get_owned_credentials_read_only(
+    provider: OAuthProvider,
+    config: &Config,
+) -> Result<OwnedOAuthCredentials> {
+    anyhow::ensure!(
+        matches!(provider, OAuthProvider::Chatgpt | OAuthProvider::Claude),
+        "Read-only credentials require an owned subscription sign-in"
+    );
+    if provider == OAuthProvider::Chatgpt {
+        official_chatgpt_registration(config)?;
+    }
+    let label = oauth_provider_params(provider).display_name;
+    let path = configured_owned_auth_file_path(provider, config)?
+        .with_context(|| format!("{label} credentials are not configured"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Codewhale-owned OAuth path must have a UTF-8 basename")?;
+    if provider == OAuthProvider::Claude {
+        validate_saved_claude_generation(config, name, false)?;
+    }
+    let mut file =
+        load_owned_auth_file(&path)?.with_context(|| format!("{label} credentials are missing"))?;
+    let (scope, entry) = select_entry(provider, &mut file)
+        .with_context(|| format!("{label} credentials are unavailable"))?;
+    if provider == OAuthProvider::Chatgpt {
+        registration_from_entry(&entry)?;
+    }
+    if provider == OAuthProvider::Claude {
+        anyhow::ensure!(
+            entry.oidc_issuer.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_issuer)
+                && entry.oidc_client_id.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_client_id),
+            "Claude credential issuer or client is invalid"
+        );
+    }
+    anyhow::ensure!(
+        entry_access_token_is_fresh(&entry),
+        "{label} access token needs runtime refresh; read-only diagnostics do not refresh"
+    );
+    let access = entry
+        .access_token
+        .clone()
+        .with_context(|| format!("{label} access token is missing"))?;
+    if provider == OAuthProvider::Claude {
+        validate_saved_claude_generation(config, name, false)?;
+    }
+    Ok(credentials_from_entry(provider, &scope, &entry, access))
 }
 
 fn get_owned_credentials_with(
@@ -2189,10 +3730,52 @@ fn get_owned_credentials_with(
         .and_then(|name| name.to_str())
         .context("Codewhale-owned OAuth path must have a UTF-8 basename")?;
     codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-        get_owned_credentials_locked(provider, store, name, |issuer, client_id, refresh| {
-            refresh_for_provider(provider, client, issuer, client_id, refresh)
-        })
+        if provider == OAuthProvider::Claude {
+            validate_saved_claude_generation(config, name, true)?;
+        }
+        let credentials = get_owned_credentials_locked(
+            provider,
+            store,
+            name,
+            client,
+            |issuer, client_id, refresh| {
+                refresh_for_provider(provider, client, issuer, client_id, refresh)
+            },
+        )?;
+        if provider == OAuthProvider::Claude {
+            validate_saved_claude_generation(config, name, true)?;
+        }
+        Ok(credentials)
     })
+}
+
+fn validate_saved_claude_generation(config: &Config, name: &str, locked: bool) -> Result<()> {
+    let path = crate::config_persistence::config_toml_path(config.loaded_config_path.as_deref())?;
+    let validate = |path: &Path| {
+        let store = codewhale_config::ConfigStore::load(Some(path.to_path_buf()))
+            .context("Could not verify current Claude sign-in configuration")?;
+        let contents = store
+            .original_body()
+            .context("Current Claude sign-in configuration is missing")?;
+        let saved = Config::from_saved_document(contents, config.account_profile.as_deref())
+            .map_err(|_| anyhow::anyhow!("Current Claude sign-in configuration is invalid"))?;
+        let identity = saved
+            .builtin_provider_identity(ProviderKind::Anthropic)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            saved.provider_config_for(&identity).is_some_and(|entry| {
+                entry.auth_mode.as_deref() == Some("oauth")
+                    && entry.oauth_credential_generation.as_deref() == Some(name)
+            }),
+            "Claude sign-in was removed or changed; sign in again"
+        );
+        Ok(())
+    };
+    if locked {
+        codewhale_config::with_config_write_lock(&path, validate)
+    } else {
+        validate(&path)
+    }
 }
 
 fn get_owned_credentials_at(provider: OAuthProvider, path: &Path) -> Result<OwnedOAuthCredentials> {
@@ -2210,15 +3793,21 @@ fn get_owned_credentials_at(provider: OAuthProvider, path: &Path) -> Result<Owne
         "Codewhale-owned OAuth path has an invalid basename"
     );
     codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-        get_owned_credentials_locked(provider, store, name, |issuer, client_id, refresh| {
-            refresh_for_provider(
-                provider,
-                &ReqwestOAuthFormClient,
-                issuer,
-                client_id,
-                refresh,
-            )
-        })
+        get_owned_credentials_locked(
+            provider,
+            store,
+            name,
+            &ReqwestOAuthFormClient,
+            |issuer, client_id, refresh| {
+                refresh_for_provider(
+                    provider,
+                    &ReqwestOAuthFormClient,
+                    issuer,
+                    client_id,
+                    refresh,
+                )
+            },
+        )
     })
 }
 
@@ -2226,6 +3815,7 @@ fn get_owned_credentials_locked<F>(
     provider: OAuthProvider,
     store: &codewhale_config::XaiOAuthCredentialStore,
     name: &str,
+    client: &dyn OAuthFormClient,
     refresh_access: F,
 ) -> Result<OwnedOAuthCredentials>
 where
@@ -2245,7 +3835,19 @@ where
             codewhale_config::quote_os_path(&path)
         )
     })?;
+    let registration = if provider == OAuthProvider::Chatgpt {
+        Some(registration_from_entry(&entry)?)
+    } else {
+        None
+    };
 
+    if provider == OAuthProvider::Claude {
+        anyhow::ensure!(
+            entry.oidc_issuer.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_issuer)
+                && entry.oidc_client_id.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_client_id),
+            "Claude credential issuer or client is invalid; sign in again"
+        );
+    }
     if entry_access_token_is_fresh(&entry) {
         let token = entry
             .access_token
@@ -2273,7 +3875,54 @@ where
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| client_id_from_scope(provider, &scope));
 
-    let refreshed = refresh_access(&issuer, &client_id, refresh)?;
+    if let Some(value) = entry.extra.get("siwc_earliest_refresh_at") {
+        anyhow::ensure!(
+            chatgpt_refresh_not_before(value)?
+                <= now_unix_secs().context("System clock is unavailable for ChatGPT refresh")?,
+            "ChatGPT refresh window has not opened; retry later"
+        );
+    }
+    let mut refreshed = refresh_access(&issuer, &client_id, refresh)?;
+    if let Some(registration) = registration {
+        require_chatgpt_scopes(refreshed.scope.as_deref())?;
+        anyhow::ensure!(
+            refreshed
+                .token_type
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("bearer")),
+            "ChatGPT refresh did not return Bearer credentials"
+        );
+        anyhow::ensure!(
+            refreshed
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()),
+            "ChatGPT refresh omitted its rotating refresh token; sign in again"
+        );
+        let keys = client.chatgpt_jwks(&issuer)?;
+        verify_chatgpt_access_token(
+            refreshed
+                .access_token
+                .as_deref()
+                .context("ChatGPT refresh omitted its access token")?,
+            &keys,
+            &registration,
+        )?;
+        if let Some(id_token) = &refreshed.id_token {
+            let refreshed_registration = verify_chatgpt_id_token(
+                id_token,
+                &keys,
+                &issuer,
+                &client_id,
+                None,
+                Some(&registration.subject),
+                &registration.host_id,
+            )?;
+            refreshed.verified_chatgpt = Some(refreshed_registration);
+        } else {
+            refreshed.verified_chatgpt = Some(registration);
+        }
+    }
     apply_token_response(provider, &mut entry, &issuer, &client_id, &refreshed)?;
     file.insert(scope.clone(), entry.clone());
     write_auth_file_to_store(store, name, &file, true)?;
@@ -2349,12 +3998,12 @@ fn activate_login_locked(
             }
             None => None,
         };
-        // Carry the previous generation's other scopes forward. A valid
-        // pointer whose file is gone (interrupted revocation, external
-        // cleanup) must not brick login: only a successful activation can
-        // ever rewrite the pointer, so treat the missing generation like a
-        // fresh start instead of failing (#5032).
-        let mut file = match previous_owned_name.as_deref() {
+        // Read the previous generation only to name the account it signed
+        // in as. A valid pointer whose file is gone (interrupted revocation,
+        // external cleanup) must not brick login: only a successful
+        // activation can ever rewrite the pointer, so treat the missing
+        // generation like a fresh start instead of failing (#5032).
+        let mut previous_file = match previous_owned_name.as_deref() {
             Some(name) => load_owned_auth_file_from_store(store, name)?.unwrap_or_else(|| {
                 tracing::warn!(
                     target: "codewhale::oauth",
@@ -2366,7 +4015,17 @@ fn activate_login_locked(
             None => BTreeMap::new(),
         };
         let scope = format!("{}::{}", pending.issuer, pending.client_id);
-        let mut entry = file.remove(&scope).unwrap_or_else(|| OwnedAuthEntry {
+        // A new login replaces the whole sign-in: the new generation holds
+        // only this entry. Merging into the old entry would let a previous
+        // account's refresh token, id token or account id survive whenever
+        // the new grant omits one; carrying other scopes forward would let
+        // an older account's entry under a differently spelled issuer
+        // outrank this login in `select_entry` and keep its refresh token
+        // on disk. `replaced` names the entry the runtime was actually using.
+        let replaced =
+            select_entry(provider, &mut previous_file).map(|(_, entry)| entry.account_label());
+        let mut file = AuthFile::new();
+        let mut entry = OwnedAuthEntry {
             access_token: None,
             refresh_token: None,
             expires_at: None,
@@ -2377,7 +4036,7 @@ fn activate_login_locked(
             originator: None,
             auth_mode: Some("oidc".to_string()),
             extra: BTreeMap::new(),
-        });
+        };
         apply_token_response(
             provider,
             &mut entry,
@@ -2413,10 +4072,12 @@ fn activate_login_locked(
         Ok((
             previous_owned_name,
             credentials_from_entry(provider, &scope, &entry, access),
+            entry.account_label(),
+            replaced,
         ))
     });
 
-    let (previous_owned_name, credentials) = match activation {
+    let (previous_owned_name, credentials, account_label, replaced) = match activation {
         Ok(activation) => activation,
         Err(error) => {
             if stage_written && let Err(cleanup_error) = store.remove(&generation) {
@@ -2430,12 +4091,33 @@ fn activate_login_locked(
             ));
         }
     };
+    if let Some(registration) = pending.token.verified_chatgpt.as_ref() {
+        let host = ChatgptHost {
+            host_id: registration.host_id.clone(),
+            registration: Some(registration.clone()),
+        };
+        if let Err(error) = serde_json::to_vec(&host)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| store.write(codewhale_config::CHATGPT_HOST_FILE_NAME, &bytes, true))
+        {
+            tracing::warn!(target: "codewhale::oauth", error = %error, "ChatGPT grant activated; retaining its signed-out registration failed");
+        }
+    }
 
     if let Some(config) = live_config {
         match provider {
-            OAuthProvider::Xai => config.mark_codewhale_owned_xai_oauth(generation.clone()),
+            OAuthProvider::Claude => {
+                let identity = config
+                    .builtin_provider_identity(provider.api())
+                    .map_err(anyhow::Error::msg)?;
+                let entry = config.provider_config_for_mut(&identity)?;
+                entry.auth_mode = Some("oauth".to_string());
+                entry.oauth_credential_generation = Some(generation.clone());
+                entry.external_credentials = None;
+            }
+            OAuthProvider::Xai => config.mark_codewhale_owned_xai_oauth(generation.clone())?,
             OAuthProvider::Chatgpt => {
-                config.mark_codewhale_owned_chatgpt_oauth(generation.clone());
+                config.mark_codewhale_owned_chatgpt_oauth(generation.clone())?;
             }
         }
     }
@@ -2449,14 +4131,13 @@ fn activate_login_locked(
             "new OAuth generation committed but superseded generation cleanup failed"
         );
     }
-    eprintln!(
-        "Signed in with {display_name}. Codewhale-owned credentials activated at {}.",
-        codewhale_config::quote_os_path(&auth_path)
-    );
     Ok(OAuthActivation {
         credentials,
         config_path,
         auth_path,
+        provider,
+        account_label,
+        replaced,
     })
 }
 
@@ -2521,7 +4202,7 @@ fn revoke_owned_login_locked_with(
             .and_then(|provider| provider.get("auth_mode"))
             .and_then(toml_edit::Item::as_str)
             == Some("oauth");
-        if auth_mode_is_oauth {
+        if auth_mode_is_oauth && provider != OAuthProvider::Claude {
             codewhale_config::unset_config_document_value(
                 document,
                 &["providers", key_inside, "auth_mode"],
@@ -2529,10 +4210,26 @@ fn revoke_owned_login_locked_with(
         }
         Ok(previous)
     })?;
-    if let Some(config) = live_config
-        && provider == OAuthProvider::Chatgpt
-    {
-        config.clear_codewhale_owned_chatgpt_oauth();
+    let live_config_clear = match live_config {
+        Some(config) if provider == OAuthProvider::Claude => {
+            let identity = config
+                .builtin_provider_identity(provider.api())
+                .map_err(anyhow::Error::msg)?;
+            let entry = config.provider_config_for_mut(&identity)?;
+            entry.oauth_credential_generation = None;
+            Ok(())
+        }
+        Some(config) if provider == OAuthProvider::Chatgpt => {
+            config.clear_codewhale_owned_chatgpt_oauth()
+        }
+        _ => Ok(()),
+    };
+    if provider == OAuthProvider::Claude {
+        store.clear_claude().context(
+            "Claude sign-in was disabled, but local credential cleanup failed; retry sign-out",
+        )?;
+        return live_config_clear
+            .context("Signed out locally, but the live route could not be refreshed");
     }
     let names = match previous.as_deref() {
         Some(generation) if provider.is_valid_generation(generation) => {
@@ -2540,6 +4237,7 @@ fn revoke_owned_login_locked_with(
         }
         _ => vec![provider.legacy_file_name().to_string()],
     };
+    let mut remote_unconfirmed = false;
     for name in names {
         if let Ok(Some(raw)) = store.read_to_string(&name)
             && let Ok(file) = parse_auth_file(&raw, &store.path_for(&name)?)
@@ -2566,6 +4264,7 @@ fn revoke_owned_login_locked_with(
                         client_id,
                         token,
                     ) {
+                        remote_unconfirmed |= provider == OAuthProvider::Chatgpt;
                         tracing::warn!(
                             target: "codewhale::oauth",
                             error = %error,
@@ -2575,8 +4274,20 @@ fn revoke_owned_login_locked_with(
                 }
             }
         }
-        let _ = store.remove(&name);
+        store
+            .remove(&name)
+            .context("OAuth sign-out could not clear local credential storage")?;
     }
+    // A refused live mirror must not leave durable tokens behind. Report it
+    // only after local removal and preserve an unconfirmed remote outcome.
+    if remote_unconfirmed {
+        return live_config_clear.context(
+            "Signed out locally, but the live route could not be refreshed and remote revocation was not confirmed.",
+        ).and_then(|()| anyhow::bail!(
+            "Signed out locally, but remote revocation was not confirmed. Disconnect Codewhale in ChatGPT Settings to end the renewable session."
+        ));
+    }
+    live_config_clear.context("Signed out locally, but the live route could not be refreshed")?;
     Ok(())
 }
 
@@ -2592,12 +4303,15 @@ fn revoke_owned_login_locked_with(
 /// configured, a malformed generation pointer (a different, already
 /// fail-closed failure), or a generation whose owned file is present.
 ///
-/// [#5032]: https://github.com/Hmbown/CodeWhale/issues/5032
+/// [#5032]: https://github.com/codewhale-hq/CodeWhale/issues/5032
 #[must_use]
 pub fn owned_generation_is_dangling(provider: OAuthProvider, config: &Config) -> bool {
+    let Ok(identity) = config.builtin_provider_identity(provider.api()) else {
+        return false;
+    };
     if provider == OAuthProvider::Xai
         && !config
-            .provider_config_for(provider.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.auth_mode.as_deref())
             .is_some_and(auth_mode_uses_xai_oauth)
     {
@@ -2623,7 +4337,7 @@ pub fn owned_generation_is_dangling(provider: OAuthProvider, config: &Config) ->
 /// error as non-fatal — log a warning and continue. Returns `Ok(())` when
 /// the stale pointer was removed (or was already absent).
 ///
-/// [#5032]: https://github.com/Hmbown/CodeWhale/issues/5032
+/// [#5032]: https://github.com/codewhale-hq/CodeWhale/issues/5032
 pub fn clear_dangling_generation(
     provider: OAuthProvider,
     config_path: Option<&Path>,
@@ -2693,6 +4407,7 @@ pub fn grok_auth_file_path() -> PathBuf {
 #[must_use]
 pub fn missing_auth_message(provider: OAuthProvider) -> String {
     match provider {
+        OAuthProvider::Claude => "Claude sign-in is unavailable. Run `codewhale auth claude`, or use an Anthropic API key with separate API billing.".to_string(),
         OAuthProvider::Xai => format!(
             "xAI OAuth credentials not found.\n\
              Options:\n\
@@ -2703,22 +4418,438 @@ pub fn missing_auth_message(provider: OAuthProvider) -> String {
              codewhale auth set --provider xai",
             codewhale_config::quote_os_path(&grok_auth_file_path())
         ),
-        OAuthProvider::Chatgpt => format!(
-            "OpenAI Codex OAuth credentials are unavailable.\n\
-             \n\
-             Sign in with ChatGPT (subscription billing, Codewhale-owned tokens):\n\
-             `codewhale auth chatgpt` or /provider setup openai-codex.\n\
-             The openai API-key route is a different billing owner.\n\
-             \n\
-             Alternatives:\n\
-             - Process token: OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN\n\
-             - Explicit Codex CLI import (not a prerequisite): after `codex login`, run \
-             `codewhale auth external-consent --provider openai-codex --mode read-only --path {}`\n\
-             Read-only access never refreshes or rewrites the Codex CLI file.\n\
-             Revoke Codewhale-owned tokens with `codewhale auth chatgpt-revoke`.",
-            codewhale_config::quote_os_path(&auth_file_path())
-        ),
+        OAuthProvider::Chatgpt => "Official ChatGPT credentials are unavailable.
+\
+             Run `codewhale auth chatgpt` or /provider setup openai-codex.
+\
+             Authorize ChatGPT plan usage to use your plan allowance.
+\
+             Revoke Codewhale-owned tokens with `codewhale auth chatgpt-revoke`.
+\
+             The openai API-key route uses separate API billing."
+            .to_string(),
     }
+}
+
+/// Declarative public OAuth configuration for a reviewed plugin provider.
+// Plugin OAuth uses the same PKCE, callback, bounded HTTP and secure-store
+// primitives as built-in logins. This declarative boundary intentionally does
+// not execute plugin callbacks, expose refresh tokens, support confidential
+// clients, or discover endpoints: plugins name reviewed, same-issuer endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginOAuthConfig {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default = "plugin_callback_path")]
+    pub callback_path: String,
+}
+
+fn plugin_callback_path() -> String {
+    "/oauth/callback".into()
+}
+
+impl PluginOAuthConfig {
+    pub fn validate(&self) -> Result<()> {
+        let issuer = oauth_endpoint_url(&self.issuer)?;
+        for endpoint in [&self.authorization_endpoint, &self.token_endpoint] {
+            let url = oauth_endpoint_url(endpoint)?;
+            anyhow::ensure!(
+                url.origin() == issuer.origin(),
+                "Plugin OAuth endpoints must belong to the issuer origin"
+            );
+            anyhow::ensure!(
+                url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "Plugin OAuth endpoint must not contain credentials, query or fragment"
+            );
+        }
+        anyhow::ensure!(
+            issuer.query().is_none()
+                && issuer.fragment().is_none()
+                && issuer.username().is_empty()
+                && issuer.password().is_none(),
+            "Plugin OAuth issuer must not contain credentials, query or fragment"
+        );
+        anyhow::ensure!(
+            !self.client_id.trim().is_empty(),
+            "Plugin OAuth client_id must not be empty"
+        );
+        anyhow::ensure!(
+            self.callback_path.starts_with('/')
+                && !self.callback_path.starts_with("//")
+                && !self.callback_path.contains(['?', '#'])
+                && !self.callback_path.chars().any(char::is_control),
+            "Plugin OAuth callback_path must be an absolute path without query or fragment"
+        );
+        anyhow::ensure!(
+            self.scopes
+                .iter()
+                .all(|scope| !scope.is_empty() && !scope.chars().any(char::is_whitespace)),
+            "Plugin OAuth scopes must be nonempty individual scope names"
+        );
+        if let Some(resource) = &self.resource {
+            let resource = oauth_endpoint_url(resource)?;
+            anyhow::ensure!(
+                resource.fragment().is_none()
+                    && resource.username().is_empty()
+                    && resource.password().is_none(),
+                "Plugin OAuth resource must not contain credentials or a fragment"
+            );
+        }
+        Ok(())
+    }
+
+    fn callback_params(&self) -> OAuthProviderParams<'_> {
+        OAuthProviderParams {
+            display_name: "Plugin provider",
+            default_issuer: &self.issuer,
+            default_client_id: &self.client_id,
+            default_scopes: "",
+            env: OAuthEnvOverrides {
+                issuer_vars: &[],
+                client_id_vars: &[],
+                scope_vars: &[],
+                no_browser_var: "CODEWHALE_PLUGIN_OAUTH_NO_BROWSER",
+                no_account_prompt_var: None,
+            },
+            device_code_path: None,
+            authorize_path: None,
+            token_path: "",
+            discover_endpoints: false,
+            device_poll_floor_secs: 0,
+            authorize_extras: &[],
+            account_choice_extras: &[],
+            originator: None,
+            revoke_path: None,
+            callback_path: &self.callback_path,
+            loopback_ports: &[],
+            relogin_hint: "codewhale auth plugin-login",
+            session_login_hint: "/auth plugin-login",
+            callback_conflict_hint: "",
+        }
+    }
+
+    fn authorize_url(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+        pkce: &PkceChallenge,
+    ) -> Result<String> {
+        self.validate()?;
+        let mut url = oauth_endpoint_url(&self.authorization_endpoint)?;
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &self.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", &self.scopes.join(" "))
+            .append_pair("state", state)
+            .append_pair("code_challenge", &pkce.challenge)
+            .append_pair("code_challenge_method", "S256");
+        if let Some(resource) = &self.resource {
+            url.query_pairs_mut().append_pair("resource", resource);
+        }
+        Ok(url.into())
+    }
+}
+
+fn validate_plugin_callback(query: &str, issuer: &str) -> Result<()> {
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1/?{query}"))?;
+    let mut fields = BTreeMap::new();
+    for (key, value) in url.query_pairs() {
+        if matches!(
+            key.as_ref(),
+            "code" | "state" | "iss" | "error" | "error_description"
+        ) {
+            anyhow::ensure!(
+                fields
+                    .insert(key.into_owned(), value.into_owned())
+                    .is_none(),
+                "Plugin OAuth callback contains duplicate parameters"
+            );
+        }
+    }
+    anyhow::ensure!(
+        fields.get("state").is_some_and(|state| !state.is_empty()),
+        "Plugin OAuth callback missing state"
+    );
+    // RFC 9207: when an authorization server supplies `iss`, bind it exactly
+    // to the reviewed issuer. Servers not advertising that extension still
+    // have the single in-flight endpoint and PKCE/state binding.
+    if let Some(actual) = fields.get("iss") {
+        anyhow::ensure!(
+            actual == issuer,
+            "Plugin OAuth callback issuer does not match"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct PluginOAuthTokens {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: u64,
+}
+
+fn plugin_oauth_slot(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+) -> Result<String> {
+    descriptor.validate()?;
+    oauth_endpoint_url(base_url)?;
+    anyhow::ensure!(!provider.trim().is_empty(), "Plugin provider name is empty");
+    let binding = serde_json::to_vec(&(provider, base_url, descriptor))?;
+    let hash: String = Sha256::digest(binding)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("plugin-oauth:{hash}"))
+}
+
+#[derive(Deserialize)]
+struct PluginTokenResponse {
+    #[serde(flatten)]
+    material: OAuthTokenMaterial,
+    #[serde(default)]
+    token_type: Option<String>,
+}
+
+fn plugin_token_response(
+    descriptor: &PluginOAuthConfig,
+    form: &[(&str, &str)],
+    previous_refresh: Option<String>,
+) -> Result<PluginOAuthTokens> {
+    let endpoint = oauth_endpoint_url(&descriptor.token_endpoint)?;
+    let response = oauth_http_client(&endpoint, "plugin token exchange")?
+        .post(endpoint)
+        .form(form)
+        .send()?;
+    let (status, response): (_, PluginTokenResponse) =
+        parse_oauth_json(response, "Plugin OAuth token exchange")?;
+    let token = response.material;
+    anyhow::ensure!(
+        status.is_success() && token.error.is_none(),
+        "Plugin OAuth token exchange failed with HTTP {}",
+        status.as_u16()
+    );
+    anyhow::ensure!(
+        response
+            .token_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("bearer")),
+        "Plugin OAuth token response requires Bearer token_type"
+    );
+    let access_token = token
+        .access_token
+        .filter(|token| !token.trim().is_empty())
+        .context("Plugin OAuth token exchange returned no access token")?;
+    let lifetime = token
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .context("Plugin OAuth token response requires a positive expires_in")?;
+    Ok(PluginOAuthTokens {
+        access_token,
+        refresh_token: token
+            .refresh_token
+            .filter(|token| !token.trim().is_empty())
+            .or(previous_refresh),
+        expires_at: (now_unix_secs().context("System clock before UNIX epoch")? as u64)
+            .saturating_add(lifetime),
+    })
+}
+
+/// Core-owned standard public-client PKCE login. Blocking sockets and secure
+/// storage stay on the dedicated worker; plugins never receive token material.
+pub async fn plugin_oauth_login(
+    provider: String,
+    base_url: String,
+    descriptor: PluginOAuthConfig,
+    authority: crate::plugins::types::PluginAuthority,
+) -> Result<()> {
+    let policy = crate::plugins::activation::extension_host_policy_enabled();
+    tokio::task::spawn_blocking(move || {
+        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+        crate::plugins::providers::verify_provider_binding(
+            &authority,
+            &provider,
+            &base_url,
+            &descriptor,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let slot = plugin_oauth_slot(&provider, &base_url, &descriptor)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let redirect_uri = format!(
+            "http://127.0.0.1:{}{}",
+            listener.local_addr()?.port(),
+            descriptor.callback_path
+        );
+        let pkce = generate_pkce();
+        let state = generate_state();
+        let authorize_url = descriptor.authorize_url(&redirect_uri, &state, &pkce)?;
+        eprintln!("{provider} sign-in (PKCE)\n  Open: {authorize_url}");
+        if std::env::var_os("CODEWHALE_PLUGIN_OAUTH_NO_BROWSER").is_none() {
+            let _ = webbrowser::open(&authorize_url);
+        }
+        let (code, _) = wait_for_callback_validated(
+            &[listener],
+            &descriptor.callback_params(),
+            &state,
+            Some(&descriptor.issuer),
+        )?;
+        crate::plugins::providers::verify_provider_binding(
+            &authority,
+            &provider,
+            &base_url,
+            &descriptor,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut form = vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", descriptor.client_id.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code", code.as_str()),
+            ("code_verifier", pkce.verifier.as_str()),
+        ];
+        if let Some(resource) = &descriptor.resource {
+            form.push(("resource", resource));
+        }
+        let token = plugin_token_response(&descriptor, &form, None)?;
+        crate::plugins::providers::verify_provider_binding(
+            &authority,
+            &provider,
+            &base_url,
+            &descriptor,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        codewhale_secrets::Secrets::auto_detect().set(&slot, &serde_json::to_string(&token)?)?;
+        Ok(())
+    })
+    .await
+    .context("Plugin OAuth login worker failed")?
+}
+
+/// Prompt-free stored-login status. Readiness reads only this exact host-owned
+/// secure slot, without refreshing, migrating or contacting the issuer.
+pub fn plugin_oauth_credentials_present(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+) -> Result<bool> {
+    let slot = plugin_oauth_slot(provider, base_url, descriptor)?;
+    let secrets = codewhale_secrets::Secrets::auto_detect_read_only();
+    let Some(raw) = secrets.get(&slot)? else {
+        return Ok(false);
+    };
+    plugin_oauth_saved_token(&raw)
+}
+
+fn plugin_oauth_saved_token(raw: &str) -> Result<bool> {
+    let token: PluginOAuthTokens = serde_json::from_str(raw)
+        .map_err(|_| anyhow::anyhow!("Plugin OAuth credential store contains invalid data"))?;
+    let now = now_unix_secs().context("System clock before UNIX epoch")? as u64;
+    Ok(!token.access_token.trim().is_empty()
+        && (token.expires_at > now
+            || token
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())))
+}
+
+/// Resolve only the exact provider, endpoint and descriptor-bound credential.
+/// Async consumers must call this sync secure-store/HTTP worker off-runtime.
+pub fn plugin_oauth_access_token(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+    read_only: bool,
+) -> Result<String> {
+    let slot = plugin_oauth_slot(provider, base_url, descriptor)?;
+    let secrets = if read_only {
+        codewhale_secrets::Secrets::auto_detect_read_only()
+    } else {
+        codewhale_secrets::Secrets::auto_detect()
+    };
+    plugin_oauth_access_token_with_store(&slot, descriptor, read_only, &secrets)
+}
+
+fn plugin_oauth_access_token_with_store(
+    slot: &str,
+    descriptor: &PluginOAuthConfig,
+    read_only: bool,
+    secrets: &codewhale_secrets::Secrets,
+) -> Result<String> {
+    let resolve = |raw: &mut Option<String>| -> Result<String> {
+        let stored = raw.as_ref().context(
+            "Plugin OAuth login missing; run codewhale auth plugin-login --provider <provider>",
+        )?;
+        let mut token: PluginOAuthTokens = serde_json::from_str(stored)
+            .map_err(|_| anyhow::anyhow!("Plugin OAuth credential store contains invalid data"))?;
+        let now = now_unix_secs().context("System clock before UNIX epoch")? as u64;
+        // The refresh window is not expiration. Non-refreshable grants and
+        // read-only diagnostics may use a token for its actual valid lifetime.
+        let expired = now >= token.expires_at;
+        let refresh_due = !read_only
+            && token.refresh_token.is_some()
+            && now.saturating_add(60) >= token.expires_at;
+        if expired || refresh_due {
+            anyhow::ensure!(
+                !read_only,
+                "Plugin OAuth token expired; diagnostics never refresh credentials"
+            );
+            let refresh = token
+                .refresh_token
+                .as_ref()
+                .context("Plugin OAuth token expired; sign in again")?;
+            let mut form = vec![
+                ("grant_type", "refresh_token"),
+                ("client_id", descriptor.client_id.as_str()),
+                ("refresh_token", refresh.as_str()),
+            ];
+            if let Some(resource) = &descriptor.resource {
+                form.push(("resource", resource));
+            }
+            token = plugin_token_response(descriptor, &form, Some(refresh.clone()))?;
+            *raw = Some(serde_json::to_string(&token)?);
+        }
+        Ok(token.access_token)
+    };
+    if read_only {
+        return resolve(&mut secrets.get(slot)?);
+    }
+    // Serialize rotating refresh grants with the existing backend authority:
+    // concurrent inference cannot replay an already consumed refresh token.
+    secrets
+        .with_entry_transaction(slot, |raw| {
+            resolve(raw)
+                .map_err(|error| codewhale_secrets::SecretsError::Keyring(error.to_string()))
+        })
+        .map_err(Into::into)
+}
+
+/// Local logout is authoritative; declarative plugins do not get a remote
+/// revocation hook or raw refresh token.
+pub fn plugin_oauth_logout(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+) -> Result<()> {
+    let slot = plugin_oauth_slot(provider, base_url, descriptor)?;
+    codewhale_secrets::Secrets::auto_detect().delete(&slot)?;
+    Ok(())
 }
 
 /// Pending-login test constructor shared by the activation tests.
@@ -2738,13 +4869,33 @@ pub(crate) fn pending_login_with_id_token_for_test(
     refresh_token: &str,
     id_token: Option<&str>,
 ) -> PendingOAuthLogin {
+    let registration = (provider == OAuthProvider::Chatgpt).then(|| ChatgptRegistration {
+        issuer: CHATGPT_OAUTH_ISSUER.to_string(),
+        client_id: "oaiapp_codewhale_test".to_string(),
+        subject: id_token
+            .and_then(account_id_from_id_token)
+            .unwrap_or_else(|| "test-sub".to_string()),
+        email: None,
+        host_id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+    });
     PendingOAuthLogin {
         provider,
         issuer: oauth_provider_params(provider).default_issuer.to_string(),
-        client_id: oauth_provider_params(provider)
-            .default_client_id
-            .to_string(),
+        client_id: registration.as_ref().map_or_else(
+            || {
+                oauth_provider_params(provider)
+                    .default_client_id
+                    .to_string()
+            },
+            |registration| registration.client_id.clone(),
+        ),
         token: OAuthTokenMaterial {
+            earliest_refresh_at: None,
+            scope: registration
+                .as_ref()
+                .map(|_| CHATGPT_OAUTH_SCOPE.to_string()),
+            token_type: Some("Bearer".to_string()),
+            verified_chatgpt: registration,
             access_token: Some(access_token.to_string()),
             refresh_token: Some(refresh_token.to_string()),
             expires_in: Some(3600),
@@ -2756,10 +4907,64 @@ pub(crate) fn pending_login_with_id_token_for_test(
     }
 }
 
+/// Local stored-proof fixture only; signature verification has separate tests.
+/// The caller must isolate CODEWHALE_HOME before using this helper.
+#[cfg(test)]
+pub(crate) fn install_test_chatgpt_registration(config: &mut Config) -> Result<String> {
+    install_test_chatgpt_registration_for(config, "test-sub", "oaiapp_codewhale_test")
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_chatgpt_registration_for(
+    config: &mut Config,
+    subject: &str,
+    client_id: &str,
+) -> Result<String> {
+    let mut pending = pending_login_for_test(
+        OAuthProvider::Chatgpt,
+        "siwc-test-access",
+        "siwc-test-refresh",
+    );
+    pending.client_id = client_id.to_string();
+    let registration = pending
+        .token
+        .verified_chatgpt
+        .as_mut()
+        .expect("fixture registration");
+    registration.subject = subject.to_string();
+    registration.client_id = client_id.to_string();
+    let generation = OAuthProvider::Chatgpt.new_generation();
+    let mut entry = OwnedAuthEntry {
+        access_token: None,
+        refresh_token: None,
+        expires_at: None,
+        id_token: None,
+        account_id: None,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        originator: None,
+        auth_mode: None,
+        extra: BTreeMap::new(),
+    };
+    apply_token_response(
+        OAuthProvider::Chatgpt,
+        &mut entry,
+        &pending.issuer,
+        &pending.client_id,
+        &pending.token,
+    )?;
+    let file = BTreeMap::from([(format!("{}::{}", pending.issuer, pending.client_id), entry)]);
+    codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+        write_auth_file_to_store(store, &generation, &file, false)
+    })?;
+    config.mark_codewhale_owned_chatgpt_oauth(generation)?;
+    Ok("siwc-test-access".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -3012,20 +5217,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_auth_message_explains_disabled_default_and_explicit_consent() {
-        let _lock = crate::test_support::lock_test_env();
+    fn missing_auth_message_guides_official_sign_in() {
         let message = missing_auth_message(OAuthProvider::Chatgpt);
-
-        assert!(message.contains("OpenAI Codex OAuth credentials are unavailable"));
-        assert!(message.contains("OPENAI_CODEX_ACCESS_TOKEN"));
-        assert!(message.contains("CODEX_ACCESS_TOKEN"));
-        assert!(message.contains(&codewhale_config::quote_os_path(&auth_file_path())));
+        assert!(message.contains("Official ChatGPT credentials"));
         assert!(message.contains("codewhale auth chatgpt"));
-        assert!(message.contains("subscription billing"));
+        assert!(message.contains("ChatGPT plan usage"));
         assert!(message.contains("openai API-key"));
-        assert!(message.contains("codex login"));
-        assert!(message.contains("external-consent"));
         assert!(message.contains("chatgpt-revoke"));
+        assert!(!message.contains("external-consent"));
+        assert!(!message.contains("CODEX_ACCESS_TOKEN"));
     }
 
     #[test]
@@ -3168,6 +5368,25 @@ mod tests {
         assert_eq!(material.access_token.as_deref(), Some("at"));
     }
 
+    #[test]
+    fn oauth_challenges_require_a_terminal_and_avoid_redirected_streams() {
+        assert_eq!(
+            oauth_challenge_stream(true, false).unwrap(),
+            OAuthChallengeStream::Stderr
+        );
+        assert_eq!(
+            oauth_challenge_stream(true, true).unwrap(),
+            OAuthChallengeStream::Stderr
+        );
+        assert_eq!(
+            oauth_challenge_stream(false, true).unwrap(),
+            OAuthChallengeStream::Stdout
+        );
+        let error = oauth_challenge_stream(false, false).unwrap_err();
+        assert!(error.to_string().contains("requires a terminal"));
+        assert!(!error.to_string().contains("token"));
+    }
+
     #[tokio::test]
     async fn device_login_without_a_device_flow_fails_before_network() {
         let result = device_code_login(OAuthProvider::Chatgpt).await;
@@ -3178,6 +5397,73 @@ mod tests {
             error.to_string().contains("no device-code flow"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn oauth_loopback_forms_bypass_ambient_proxies() {
+        const PROBE_ENDPOINT: &str = "CODEWHALE_TEST_OAUTH_PROXY_ENDPOINT";
+        if let Ok(endpoint) = std::env::var(PROBE_ENDPOINT) {
+            let (status, _) = ReqwestOAuthFormClient
+                .post_form(&endpoint, &[("refresh_token", "synthetic-refresh")])
+                .expect("local OAuth form remains usable with an ambient proxy");
+            assert_eq!(status, 200);
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use wiremock::matchers::{body_string_contains, method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+            let issuer = MockServer::start().await;
+            let proxy = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("refresh_token=synthetic-refresh"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&issuer)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(502))
+                .expect(0)
+                .mount(&proxy)
+                .await;
+            // A fresh process gives reqwest an uncontaminated proxy cache and
+            // keeps ambient proxy changes out of the shared test process.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "oauth::tests::oauth_loopback_forms_bypass_ambient_proxies",
+                    "--test-threads=1",
+                ])
+                .env(PROBE_ENDPOINT, format!("{}/token", issuer.uri()))
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy");
+            for variable in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                child.env(variable, proxy.uri());
+            }
+            let output = tokio::task::spawn_blocking(move || child.output().unwrap())
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(issuer.received_requests().await.unwrap().len(), 1);
+            assert!(proxy.received_requests().await.unwrap().is_empty());
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3331,8 +5617,9 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let result =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs));
+        let result = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut std::io::sink())
+        });
         let Err(error) = result else {
             panic!("a non-web verification URI must abort login");
         };
@@ -3340,6 +5627,51 @@ mod tests {
             format!("{error:#}").contains("untrusted verification URI"),
             "{error:#}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn device_login_refuses_terminal_controls_before_display_or_polling() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": server.uri(),
+                "device_authorization_endpoint": format!("{}/device", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri())
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "fixture-private-device-code",
+                "user_code": "CW-\u{1b}]52;clipboard-payload",
+                "verification_uri": format!("{}/verify", server.uri()),
+                "expires_in": 60,
+                "interval": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let inputs = ResolvedOAuthInputs {
+            issuer: server.uri(),
+            client_id: "test-client".to_string(),
+            scopes: "openid".to_string(),
+            open_browser: false,
+        };
+        let mut challenge = Vec::new();
+        let error = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut challenge)
+        })
+        .err()
+        .expect("terminal controls must be refused");
+        assert!(error.to_string().contains("invalid user-code display data"));
+        assert!(challenge.is_empty());
+        assert!(!error.to_string().contains("clipboard-payload"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     /// Discovery + device grant run on the blocking worker: this fails with
@@ -3374,7 +5706,12 @@ mod tests {
         let _no_browser =
             crate::test_support::EnvVarGuard::set("CODEWHALE_XAI_OAUTH_NO_BROWSER", "1");
 
-        let result = device_code_login(OAuthProvider::Xai).await;
+        let result = device_code_login_on_worker(
+            OAuthProvider::Xai,
+            XAI_OAUTH_PARAMS.resolve_inputs(),
+            Box::new(std::io::sink()),
+        )
+        .await;
         let Err(error) = result else {
             panic!("mock device request must fail without a runtime-drop panic");
         };
@@ -3427,9 +5764,16 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let pending =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs))
-                .expect("mock login exchanges");
+        let mut challenge = Vec::new();
+        let pending = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut challenge)
+        })
+        .expect("mock login exchanges");
+        let challenge = String::from_utf8(challenge).unwrap();
+        assert!(challenge.contains(&format!("{}/verify", server.uri())));
+        assert!(challenge.contains("CW-TEST"));
+        assert!(!challenge.contains("unified-access"));
+        assert!(!challenge.contains("unified-refresh"));
         assert_eq!(pending.issuer, server.uri());
         assert_eq!(
             pending.token.access_token.as_deref(),
@@ -3530,8 +5874,9 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let result =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs));
+        let result = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut std::io::sink())
+        });
         let Err(error) = result else {
             panic!("user denial must stop the login");
         };
@@ -3540,21 +5885,21 @@ mod tests {
         assert!(message.contains("HTTP 400"), "{message}");
     }
 
-    /// Non-JSON answers name the content type, never the body.
+    /// Non-JSON answers disclose neither response metadata nor the body.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn device_transport_reports_non_json_without_echoing_body() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        // set_body_bytes carries no implicit content type, so the inserted
-        // text/html is the only one on the wire (set_body_string would
-        // stack text/plain next to it and the diagnostic would name both).
         Mock::given(method("POST"))
             .and(path("/oauth2/device-code"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes("<html>sentinel-body-bytes</html>".as_bytes())
-                    .insert_header("content-type", "text/html"),
+                    .insert_header(
+                        "content-type",
+                        "text/html; credential=sentinel-header-bytes",
+                    ),
             )
             .expect(1)
             .mount(&server)
@@ -3564,7 +5909,10 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes("<html>sentinel-body-bytes</html>".as_bytes())
-                    .insert_header("content-type", "text/html"),
+                    .insert_header(
+                        "content-type",
+                        "text/html; credential=sentinel-header-bytes",
+                    ),
             )
             .expect(1)
             .mount(&server)
@@ -3590,7 +5938,9 @@ mod tests {
             panic!("non-JSON poll must fail");
         };
         for message in [format!("{grant_error:#}"), format!("{poll_error:#}")] {
-            assert!(message.contains("text/html"), "{message}");
+            assert!(message.contains("HTTP 200"), "{message}");
+            assert!(message.contains("expected JSON"), "{message}");
+            assert!(!message.contains("sentinel-header-bytes"), "{message}");
             assert!(!message.contains("sentinel-body-bytes"), "{message}");
         }
     }
@@ -3647,9 +5997,10 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let pending =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs))
-                .expect("mock login exchanges");
+        let pending = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut std::io::sink())
+        })
+        .expect("mock login exchanges");
         assert_eq!(pending.token.access_token.as_deref(), Some("form-access"));
     }
 
@@ -3730,7 +6081,7 @@ mod tests {
         format!("header.{payload}.sig")
     }
 
-    fn chatgpt() -> &'static OAuthProviderParams {
+    fn chatgpt() -> &'static OAuthProviderParams<'static> {
         oauth_provider_params(OAuthProvider::Chatgpt)
     }
 
@@ -3770,7 +6121,9 @@ mod tests {
     }
 
     #[test]
-    fn authorize_url_is_honest_originator_and_pkce() {
+    fn authorize_url_uses_documented_chatgpt_parameters_and_pkce() {
+        let _lock = crate::test_support::lock_test_env();
+        let _prompt = crate::test_support::EnvVarGuard::remove("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT");
         let pkce = PkceChallenge {
             verifier: "verifier".into(),
             challenge: "challenge".into(),
@@ -3785,13 +6138,393 @@ mod tests {
             &pkce,
         )
         .expect("static issuer parses");
-        assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
+        assert!(url.starts_with("https://auth.openai.com/api/accounts/authorize?"));
         assert!(url.contains("code_challenge=challenge"));
         assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("originator=codewhale"));
+        assert!(!url.contains("originator="), "{url}");
         assert!(!url.contains("codex_cli_rs"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
-        assert!(url.contains("id_token_add_organizations=true"));
+        assert!(url.contains("resource=https%3A%2F%2Fapi.openai.com%2Fv1"));
+        // Account choice: the issuer must re-prompt rather than reuse the
+        // browser's current ChatGPT session.
+        let query: BTreeMap<String, String> = reqwest::Url::parse(&url)
+            .expect("authorize URL parses")
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(query.get("prompt").map(String::as_str), Some("login"));
+        assert_eq!(url.matches("prompt=").count(), 1, "{url}");
+
+        // Opt-out, should the issuer ever refuse the parameter.
+        let _opt_out =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT", "1");
+        let url = build_authorize_url(
+            chatgpt(),
+            CHATGPT_OAUTH_ISSUER,
+            CHATGPT_OAUTH_CLIENT_ID,
+            CHATGPT_OAUTH_SCOPE,
+            "http://localhost:1455/auth/callback",
+            "state-1",
+            &pkce,
+        )
+        .expect("static issuer parses");
+        assert!(!url.contains("prompt="), "{url}");
+        assert!(
+            url.contains("resource=https%3A%2F%2Fapi.openai.com%2Fv1"),
+            "{url}"
+        );
+    }
+
+    fn id_token(claims: &serde_json::Value) -> String {
+        format!(
+            "header.{}.sig",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("claims serialize"))
+        )
+    }
+
+    #[test]
+    fn account_label_reads_email_and_plan_claims() {
+        let chatgpt = id_token(&serde_json::json!({
+            "email": "a@example.com",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus", "chatgpt_account_id": "acct-1"},
+        }));
+        assert_eq!(
+            account_label_from_id_token(&chatgpt).as_deref(),
+            Some("a@example.com (plus)")
+        );
+        // Profile-namespaced email is the fallback the ChatGPT issuer uses.
+        let profile = id_token(&serde_json::json!({
+            "https://api.openai.com/profile": {"email": "b@example.com"},
+        }));
+        assert_eq!(
+            account_label_from_id_token(&profile).as_deref(),
+            Some("b@example.com")
+        );
+        // A workspace plan names its account-id prefix: one email can hold
+        // several workspaces, and email + plan alone would read the same.
+        let team = id_token(&serde_json::json!({
+            "email": "a@corp.com",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "team", "chatgpt_account_id": "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809"},
+        }));
+        assert_eq!(
+            account_label_from_id_token(&team).as_deref(),
+            Some("a@corp.com (team, workspace 1a2b3c4d)")
+        );
+        // xAI: plain OIDC email, no plan claim.
+        let xai = id_token(&serde_json::json!({"email": "grok@example.com", "sub": "u1"}));
+        assert_eq!(
+            account_label_from_id_token(&xai).as_deref(),
+            Some("grok@example.com")
+        );
+    }
+
+    #[test]
+    fn account_label_rejects_malformed_tokens_and_missing_claims() {
+        for token in [
+            "",
+            "not-a-jwt",
+            "header.%%%.sig",
+            &format!("header.{}.sig", URL_SAFE_NO_PAD.encode("not json")),
+            &id_token(&serde_json::json!({"sub": "u1"})),
+            &id_token(&serde_json::json!({"email": "   "})),
+            &id_token(&serde_json::json!({"email": 42})),
+            // A plan alone does not identify an account.
+            &id_token(&serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+            })),
+        ] {
+            assert_eq!(account_label_from_id_token(token), None, "{token}");
+        }
+    }
+
+    #[test]
+    fn account_label_strips_control_characters_and_bounds_length() {
+        let hostile = id_token(&serde_json::json!({
+            "email": "\u{1b}[31mevil@example.com\u{7}",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "x".repeat(500)},
+        }));
+        let label = account_label_from_id_token(&hostile).expect("label");
+        assert!(!label.chars().any(char::is_control), "{label:?}");
+        assert!(label.starts_with("[31mevil@example.com ("), "{label}");
+        assert!(label.len() <= ACCOUNT_EMAIL_MAX_CHARS + ACCOUNT_PLAN_MAX_CHARS + 3);
+    }
+
+    #[test]
+    fn usage_limit_guidance_names_account_and_switch_command() {
+        let chatgpt = usage_limit_guidance(OAuthProvider::Chatgpt, Some("a@example.com (plus)"));
+        assert!(
+            chatgpt.contains("a@example.com (plus)"),
+            "usage guidance must name the selected account"
+        );
+        assert!(
+            chatgpt.contains("`CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`"),
+            "usage guidance must name the explicit account replacement command"
+        );
+        // A running session does not see a shell login. Returning login
+        // stays on its verified account; explicit replacement needs a restart.
+        assert!(
+            chatgpt.contains("`/auth chatgpt` reauthorizes the selected account"),
+            "{chatgpt}"
+        );
+        assert!(
+            chatgpt.contains("restart open Codewhale sessions"),
+            "{chatgpt}"
+        );
+        let xai = usage_limit_guidance(OAuthProvider::Xai, None);
+        assert!(xai.contains("`codewhale auth xai-device`"), "{xai}");
+        assert!(xai.contains("`/auth xai-device`"), "{xai}");
+        assert!(!xai.contains("None"), "{xai}");
+    }
+
+    #[test]
+    fn relogin_with_another_account_replaces_the_owned_entry() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let token_a = id_token(&serde_json::json!({
+            "email": "a@example.com",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus", "chatgpt_account_id": "acct-a"},
+        }));
+        let first = activate_login(
+            pending_login_with_id_token_for_test(
+                OAuthProvider::Chatgpt,
+                "access-a",
+                "refresh-a",
+                Some(&token_a),
+            ),
+            Some(&config_path),
+            None,
+        )
+        .expect("first login");
+        assert_eq!(first.account_label.as_deref(), Some("a@example.com (plus)"));
+        assert_eq!(first.replaced, None);
+        assert_eq!(
+            first.summary(codewhale_localization::Locale::En),
+            "Signed in to ChatGPT as a@example.com (plus)."
+        );
+
+        // Account B has its own offline grant and no account claim in the
+        // display token: nothing from account A may survive into B's credential.
+        let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
+        let pending_b = pending_login_with_id_token_for_test(
+            OAuthProvider::Chatgpt,
+            "access-b",
+            "refresh-b",
+            Some(&token_b),
+        );
+        let second = activate_login(pending_b, Some(&config_path), None).expect("second login");
+        assert_eq!(second.account_label.as_deref(), Some("b@example.com"));
+        assert_eq!(
+            second.replaced,
+            Some(Some("a@example.com (plus)".to_string()))
+        );
+        let summary = second.summary(codewhale_localization::Locale::En);
+        assert_eq!(
+            summary,
+            "Signed in to ChatGPT as b@example.com.\nReplaced the previous Codewhale ChatGPT sign-in (a@example.com (plus))."
+        );
+        assert!(!summary.contains("access-"), "{summary}");
+        // The TUI transcript renders the same facts in the UI locale.
+        let localized = second.summary(codewhale_localization::Locale::Ja);
+        assert_ne!(localized, summary);
+        assert!(localized.contains("b@example.com"), "{localized}");
+        assert!(localized.contains("a@example.com (plus)"), "{localized}");
+
+        let persisted = std::fs::read_to_string(&second.auth_path).expect("generation");
+        assert!(!persisted.contains("refresh-a"), "{persisted}");
+        assert!(!persisted.contains("acct-a"), "{persisted}");
+        assert!(!persisted.contains("access-a"), "{persisted}");
+        let generation = second
+            .auth_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name");
+        assert_eq!(
+            owned_account_label_for_generation(OAuthProvider::Chatgpt, generation)
+                .expect("usable sign-in")
+                .as_deref(),
+            Some("b@example.com")
+        );
+        let mut config = Config::default();
+        config
+            .mark_codewhale_owned_chatgpt_oauth(generation.to_string())
+            .expect("admitted OAuth fixture");
+        assert_eq!(
+            usable_sign_in(OAuthProvider::Chatgpt, &config),
+            Some(UsableSignIn {
+                account_label: Some("b@example.com".to_string())
+            })
+        );
+        // An invalid generation name never resolves to a path.
+        assert!(
+            owned_account_label_for_generation(OAuthProvider::Chatgpt, "../auth.json").is_err()
+        );
+    }
+
+    /// A login replaces the whole sign-in, not just its own scope: an older
+    /// account's entry under a differently spelled issuer must neither
+    /// outrank the new login nor keep its refresh token on disk.
+    #[test]
+    fn relogin_drops_other_scopes_and_names_the_account_it_replaced() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
+        let mut pending_a = pending_login_with_id_token_for_test(
+            OAuthProvider::Xai,
+            "access-a",
+            "refresh-a",
+            Some(&token_a),
+        );
+        // '/' sorts before ':', so this scope comes first in the file.
+        pending_a.issuer = format!("{XAI_OIDC_ISSUER}/");
+        activate_login(pending_a, Some(&config_path), None).expect("login A");
+
+        let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
+        let second = activate_login(
+            pending_login_with_id_token_for_test(
+                OAuthProvider::Xai,
+                "access-b",
+                "refresh-b",
+                Some(&token_b),
+            ),
+            Some(&config_path),
+            None,
+        )
+        .expect("login B");
+        assert_eq!(second.replaced, Some(Some("a@example.com".to_string())));
+        let persisted = std::fs::read_to_string(&second.auth_path).expect("generation");
+        assert!(!persisted.contains("refresh-a"), "{persisted}");
+        assert!(!persisted.contains("access-a"), "{persisted}");
+        let generation = second
+            .auth_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name");
+        let mut config = Config::default();
+        config
+            .mark_codewhale_owned_xai_oauth(generation.to_string())
+            .expect("admitted OAuth fixture");
+        assert_eq!(
+            usable_sign_in(OAuthProvider::Xai, &config)
+                .and_then(|sign_in| sign_in.account_label)
+                .as_deref(),
+            Some("b@example.com")
+        );
+    }
+
+    /// #6715 review: a login under a non-default client id (for example
+    /// `XAI_OIDC_CLIENT_ID`) must become the account requests use.
+    /// `select_entry` prefers the built-in client id, so an old account's
+    /// entry under that id, carried into the new generation, would keep
+    /// winning both the runtime credential and the displayed account.
+    #[test]
+    fn relogin_under_another_client_id_switches_runtime_credentials_and_label() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let mut config = Config {
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
+            ..Config::default()
+        };
+        let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
+        activate_login(
+            pending_login_with_id_token_for_test(
+                OAuthProvider::Xai,
+                "access-a",
+                "refresh-a",
+                Some(&token_a),
+            ),
+            Some(&config_path),
+            Some(&mut config),
+        )
+        .expect("login A");
+        assert_eq!(
+            get_xai_credentials(&config)
+                .expect("account A")
+                .access_token,
+            "access-a"
+        );
+
+        let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
+        let mut pending_b = pending_login_with_id_token_for_test(
+            OAuthProvider::Xai,
+            "access-b",
+            "refresh-b",
+            Some(&token_b),
+        );
+        pending_b.client_id = "alternate-client".to_string();
+        let second =
+            activate_login(pending_b, Some(&config_path), Some(&mut config)).expect("login B");
+        assert_eq!(second.account_label.as_deref(), Some("b@example.com"));
+        assert_eq!(second.replaced, Some(Some("a@example.com".to_string())));
+
+        // Requests: the runtime credential is account B's, under B's client.
+        let runtime = get_xai_credentials(&config).expect("account B");
+        assert_eq!(runtime.access_token, "access-b");
+        assert_eq!(runtime.client_id, "alternate-client");
+        assert_eq!(runtime.account_label.as_deref(), Some("b@example.com"));
+        // Status: readiness/picker and `auth status` name account B too.
+        assert_eq!(
+            usable_sign_in(OAuthProvider::Xai, &config)
+                .and_then(|sign_in| sign_in.account_label)
+                .as_deref(),
+            Some("b@example.com")
+        );
+        let generation = second
+            .auth_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name");
+        assert_eq!(
+            owned_account_label_for_generation(OAuthProvider::Xai, generation)
+                .expect("usable sign-in")
+                .as_deref(),
+            Some("b@example.com")
+        );
+        let persisted = std::fs::read_to_string(&second.auth_path).expect("generation");
+        assert!(!persisted.contains("refresh-a"), "{persisted}");
+    }
+
+    /// The label follows the same usability test as the runtime: an entry
+    /// with an expired access token and no refresh token names no account.
+    #[test]
+    fn stale_owned_entry_names_no_account() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let generation = "chatgpt-auth-0123456789abcdef0123456789abcdef.json";
+        let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
+        let file = serde_json::json!({
+            format!("{CHATGPT_OAUTH_ISSUER}::{CHATGPT_OAUTH_CLIENT_ID}"): {
+                "access_token": "access-stale",
+                "expires_at": "2000-01-01T00:00:00Z",
+                "id_token": token_a,
+            }
+        });
+        codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            store.write(generation, file.to_string().as_bytes(), false)
+        })
+        .expect("seed stale generation");
+        let mut config = Config::default();
+        config
+            .mark_codewhale_owned_chatgpt_oauth(generation.to_string())
+            .expect("admitted OAuth fixture");
+        assert!(!credentials_valid(OAuthProvider::Chatgpt, &config));
+        assert_eq!(usable_sign_in(OAuthProvider::Chatgpt, &config), None);
+        let reason = owned_account_label_for_generation(OAuthProvider::Chatgpt, generation)
+            .expect_err("stale entry is unusable");
+        assert_eq!(reason.to_string(), "sign-in file holds no usable sign-in");
     }
 
     #[test]
@@ -3833,7 +6566,8 @@ mod tests {
         )
         .unwrap();
         let err = accept_callback("s1", outcome).unwrap_err().to_string();
-        assert!(err.contains("nope"), "{err}");
+        assert!(err.contains("access_denied"), "{err}");
+        assert!(!err.contains("nope"), "{err}");
         assert!(!err.contains("access_token"));
     }
 
@@ -3870,7 +6604,10 @@ mod tests {
         assert_eq!(token.access_token.as_deref(), Some("at-1"));
         let posts = client.posts.lock().unwrap();
         assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].0, "https://auth.openai.com/oauth/token");
+        assert_eq!(
+            posts[0].0,
+            "https://auth.openai.com/api/accounts/oauth/token"
+        );
         let form: std::collections::BTreeMap<_, _> = posts[0].1.iter().cloned().collect();
         assert_eq!(form["grant_type"], "authorization_code");
         assert_eq!(form["code_verifier"], "verifier");
@@ -3925,7 +6662,7 @@ mod tests {
         )
         .unwrap();
         let code = server.join().expect("server").expect("callback ok");
-        assert_eq!(code, "tok");
+        assert_eq!(code.0, "tok");
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind error port");
         listener.set_nonblocking(false).unwrap();
@@ -3983,7 +6720,7 @@ mod tests {
                 .join()
                 .expect("server")
                 .unwrap_or_else(|error| panic!("callback on {target_addr} rejected: {error}"));
-            assert_eq!(code, "tok", "callback on {target_addr}");
+            assert_eq!(code.0, "tok", "callback on {target_addr}");
         }
     }
 
@@ -4078,7 +6815,7 @@ mod tests {
         let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -4126,7 +6863,7 @@ mod tests {
         let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -4180,7 +6917,7 @@ mod tests {
         let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -4263,7 +7000,7 @@ mod tests {
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let _key_guard = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -4287,7 +7024,10 @@ mod tests {
             "an expired external access token is not usable material"
         );
         assert!(
-            !crate::config::has_api_key_for(&config, ApiProvider::Xai),
+            !crate::config::has_api_key_for(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             "expired external xAI OAuth must fall through to the missing-key path"
         );
         assert_eq!(
@@ -4317,7 +7057,10 @@ mod tests {
         )
         .unwrap();
         assert!(credentials_present(OAuthProvider::Xai, &config));
-        assert!(crate::config::has_api_key_for(&config, ApiProvider::Xai));
+        assert!(crate::config::has_api_key_for(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Xai)
+        ));
     }
 
     #[test]
@@ -4370,9 +7113,13 @@ mod tests {
             store.write(generation, stored.as_bytes(), false)?;
             // A fresh stored token must be used as-is: refreshing here would
             // mean an existing login stopped working offline.
-            get_owned_credentials_locked(OAuthProvider::Xai, store, generation, |_, _, _| {
-                panic!("a fresh stored token must not be refreshed")
-            })
+            get_owned_credentials_locked(
+                OAuthProvider::Xai,
+                store,
+                generation,
+                &ReqwestOAuthFormClient,
+                |_, _, _| panic!("a fresh stored token must not be refreshed"),
+            )
         })
         .expect("read back a credential stored in the current format");
 
@@ -4411,6 +7158,9 @@ mod tests {
             credentials: credentials.clone(),
             config_path: PathBuf::from("/tmp/config.toml"),
             auth_path: PathBuf::from("/tmp/auth.json"),
+            provider: OAuthProvider::Xai,
+            account_label: None,
+            replaced: None,
         };
 
         let rendered = format!("{entry:?} {activation:?}");
@@ -4505,12 +7255,17 @@ mod tests {
                     OAuthProvider::Xai,
                     store,
                     &first_generation,
+                    &ReqwestOAuthFormClient,
                     |_, _, refresh| {
                         assert_eq!(refresh, "initial-refresh");
                         first_refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         entered_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                         Ok(OAuthTokenMaterial {
+                            earliest_refresh_at: None,
+                            scope: None,
+                            token_type: None,
+                            verified_chatgpt: None,
                             id_token: None,
                             access_token: Some("rotated-access".to_string()),
                             refresh_token: Some("rotated-refresh".to_string()),
@@ -4535,6 +7290,7 @@ mod tests {
                     OAuthProvider::Xai,
                     store,
                     &second_generation,
+                    &ReqwestOAuthFormClient,
                     |_, _, _| {
                         second_refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         bail!("second refresh must observe the first thread's committed token")
@@ -4589,10 +7345,15 @@ mod tests {
                     OAuthProvider::Xai,
                     store,
                     &refresh_generation,
+                    &ReqwestOAuthFormClient,
                     |_, _, _| {
                         entered_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                         Ok(OAuthTokenMaterial {
+                            earliest_refresh_at: None,
+                            scope: None,
+                            token_type: None,
+                            verified_chatgpt: None,
                             id_token: None,
                             access_token: Some("last-refresh-access".to_string()),
                             refresh_token: Some("last-refresh-rotation".to_string()),
@@ -4730,7 +7491,9 @@ consent_version = 1
                 & 0o777,
             0o600
         );
-        let live_xai = live.provider_config_for(ApiProvider::Xai).unwrap();
+        let live_xai = live
+            .provider_config_for(&live.test_identity_for_kind(ProviderKind::Xai))
+            .unwrap();
         assert_eq!(live_xai.auth_mode.as_deref(), Some("oauth"));
         assert_eq!(
             live_xai.oauth_credential_generation.as_deref(),
@@ -4893,7 +7656,7 @@ consent_version = 1
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
 
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -4912,7 +7675,7 @@ consent_version = 1
         // Specificity: OAuth selected but no generation configured is the normal
         // "needs auth" state, not a dangling pointer.
         let unconfigured = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -5010,7 +7773,9 @@ consent_version = 1
         );
         let error = result.expect_err("invalid backup path must fail activation");
         assert!(error.to_string().contains("not activated"), "{error:#}");
-        let live_xai = live.provider_config_for(ApiProvider::Xai).unwrap();
+        let live_xai = live
+            .provider_config_for(&live.test_identity_for_kind(ProviderKind::Xai))
+            .unwrap();
         assert_eq!(live_xai.auth_mode.as_deref(), Some("api_key"));
         assert!(live_xai.oauth_credential_generation.is_none());
         assert_eq!(
@@ -5304,7 +8069,11 @@ consent_version = 1
             open_browser: false,
         };
         let unified = tokio::task::block_in_place(|| {
-            crate::oauth::device_code_login_with(crate::oauth::OAuthProvider::Xai, &inputs)
+            crate::oauth::device_code_login_with(
+                crate::oauth::OAuthProvider::Xai,
+                &inputs,
+                &mut std::io::sink(),
+            )
         })
         .expect("device login against mock xAI");
         let pending = unified;
@@ -5344,6 +8113,10 @@ consent_version = 1
             extra: BTreeMap::new(),
         };
         let token = OAuthTokenMaterial {
+            earliest_refresh_at: None,
+            scope: None,
+            token_type: None,
+            verified_chatgpt: None,
             id_token: None,
             access_token: Some("fresh-access".to_string()),
             refresh_token: Some("fresh-refresh".to_string()),
@@ -5393,6 +8166,10 @@ consent_version = 1
             extra: BTreeMap::new(),
         };
         let token = OAuthTokenMaterial {
+            earliest_refresh_at: None,
+            scope: None,
+            token_type: None,
+            verified_chatgpt: None,
             id_token: None,
             access_token: None,
             refresh_token: None,
@@ -5454,7 +8231,7 @@ consent_version = 1
     }
 
     #[test]
-    fn store_persist_refresh_and_revoke_use_mock_issuer() {
+    fn siwc_legacy_credentials_require_reauthorization_and_revoke_retains_host() {
         let _lock = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let root = home.path().canonicalize().expect("canonical home");
@@ -5481,10 +8258,12 @@ consent_version = 1
             .unwrap()
             .to_string();
         let mut config = Config {
-            provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+            provider: Some(ProviderKind::OpenaiCodex.as_str().to_string()),
             ..Config::default()
         };
-        config.mark_codewhale_owned_chatgpt_oauth(generation.clone());
+        config
+            .mark_codewhale_owned_chatgpt_oauth(generation.clone())
+            .expect("admitted OAuth fixture");
         assert!(credentials_valid(OAuthProvider::Chatgpt, &config));
 
         let stale = jwt_with_exp(1_000_000_000);
@@ -5497,7 +8276,7 @@ consent_version = 1
                 "expires_at": rfc3339_from_now(3600),
                 "oidc_issuer": CHATGPT_OAUTH_ISSUER,
                 "oidc_client_id": CHATGPT_OAUTH_CLIENT_ID,
-                "originator": CHATGPT_OAUTH_ORIGINATOR
+                "originator": "codewhale"
             }
         });
         codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
@@ -5518,16 +8297,15 @@ consent_version = 1
             })
             .to_string(),
         )]);
-        let refreshed =
-            get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &mock).expect("refresh");
-        assert_eq!(refreshed.access_token, "access-2");
-        let stored = codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-            store.read_to_string(&generation)
-        })
-        .unwrap()
-        .unwrap();
-        assert!(stored.contains("refresh-2"), "{stored}");
-        assert!(!stored.contains("refresh-old"), "{stored}");
+        let error = match get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &mock) {
+            Ok(_) => panic!("legacy credentials must not be sent to the official API"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("reauthorization"), "{error}");
+        assert!(
+            mock.posts.lock().unwrap().is_empty(),
+            "legacy tokens must not be refreshed"
+        );
 
         let revoke_mock = MockTokenClient::new(vec![(200, String::new())]);
         codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
@@ -5542,10 +8320,73 @@ consent_version = 1
         .expect("revoke");
         let after = std::fs::read_to_string(&config_path).expect("config after revoke");
         assert!(!after.contains("chatgpt-auth-"), "{after}");
+        assert!(
+            root.join("credentials")
+                .join(codewhale_config::CHATGPT_HOST_FILE_NAME)
+                .exists(),
+            "signout retains the host and registration"
+        );
         let posts = revoke_mock.posts.lock().unwrap();
         assert!(
             posts.iter().any(|(url, _)| url.contains("/oauth/revoke")),
             "{posts:?}"
+        );
+    }
+
+    #[test]
+    fn chatgpt_revoke_removes_durable_tokens_when_live_mirror_refuses() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let pending = pending_login_with_id_token_for_test(
+            OAuthProvider::Chatgpt,
+            "access-1",
+            "refresh-1",
+            Some(&jwt_with_account("acct-7")),
+        );
+        let activation = activate_login(pending, Some(&config_path), None).expect("activate");
+        assert!(activation.auth_path.exists());
+        let mut live = Config::default();
+        live.providers
+            .get_or_insert_with(Default::default)
+            .custom
+            .insert(
+                ProviderKind::OpenaiCodex.as_str().to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://localhost:1234/v1".to_string()),
+                    ..Default::default()
+                },
+            );
+        assert!(live.clear_codewhale_owned_chatgpt_oauth().is_err());
+        let mock = MockTokenClient::new(vec![(200, String::new())]);
+        let error = codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            revoke_owned_login_locked_with(
+                OAuthProvider::Chatgpt,
+                Some(&config_path),
+                Some(&mut live),
+                store,
+                &mock,
+            )
+        })
+        .expect_err("live mirror refusal remains visible");
+        assert!(error.to_string().contains("Signed out locally"));
+        assert!(
+            !activation.auth_path.exists(),
+            "local tokens cannot survive a refused mirror"
+        );
+        let after = std::fs::read_to_string(&config_path).expect("config after revoke");
+        assert!(
+            !after.contains("chatgpt-auth-"),
+            "durable generation pointer removed"
+        );
+        assert_eq!(
+            mock.posts.lock().unwrap().len(),
+            1,
+            "one captured remote revoke"
         );
     }
 
@@ -5573,6 +8414,7 @@ consent_version = 1
             credentials: OwnedOAuthCredentials {
                 access_token: "secret-access".into(),
                 account_id: None,
+                account_label: None,
                 refresh_token: Some("secret-refresh".into()),
                 expires_at: None,
                 issuer: "issuer".into(),
@@ -5580,9 +8422,1463 @@ consent_version = 1
             },
             config_path: PathBuf::from("/tmp/config.toml"),
             auth_path: PathBuf::from("/tmp/auth.json"),
+            provider: OAuthProvider::Chatgpt,
+            account_label: Some("a@example.com (plus)".into()),
+            replaced: None,
         };
         let rendered = format!("{activation:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("secret-access"));
+    }
+    struct SiwcSigningFixture {
+        pair: ring::signature::Ed25519KeyPair,
+        keys: JwkSet,
+    }
+
+    impl SiwcSigningFixture {
+        fn new() -> Self {
+            use ring::signature::KeyPair as _;
+            let pkcs8 =
+                ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .unwrap();
+            let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let keys = serde_json::from_value(serde_json::json!({"keys": [{
+                "kty": "OKP", "crv": "Ed25519", "kid": "siwc-fixture", "alg": "EdDSA", "use": "sig",
+                "x": URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
+            }]}))
+            .unwrap();
+            Self { pair, keys }
+        }
+        fn token(&self, claims: Value) -> String {
+            let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"siwc-fixture"}"#);
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+            let message = format!("{header}.{payload}");
+            format!(
+                "{message}.{}",
+                URL_SAFE_NO_PAD.encode(self.pair.sign(message.as_bytes()).as_ref())
+            )
+        }
+        fn id_claims(&self) -> Value {
+            serde_json::json!({"iss": CHATGPT_OAUTH_ISSUER, "aud": "oaiapp_codewhale_test", "sub": "test-sub", "nonce": "pending-nonce", "exp": now_unix_secs().unwrap() + 3600})
+        }
+        fn access(&self, subject: &str) -> String {
+            self.token(serde_json::json!({"iss": CHATGPT_OAUTH_ISSUER, "aud": CHATGPT_OAUTH_RESOURCE, "sub": subject, "client_id": "oaiapp_codewhale_test", "scope": CHATGPT_OAUTH_SCOPE, "exp": now_unix_secs().unwrap() + 3600}))
+        }
+    }
+
+    #[test]
+    fn siwc_signed_identity_requires_signature_issuer_audience_expiry_nonce_and_account() {
+        let signer = SiwcSigningFixture::new();
+        let verify = |token: &str| {
+            verify_chatgpt_id_token(
+                token,
+                &signer.keys,
+                CHATGPT_OAUTH_ISSUER,
+                "oaiapp_codewhale_test",
+                Some("pending-nonce"),
+                Some("test-sub"),
+                "urn:uuid:00000000-0000-4000-8000-000000000001",
+            )
+        };
+        let claims = signer.id_claims();
+        let signed = signer.token(claims.clone());
+        assert_eq!(verify(&signed).unwrap().subject, "test-sub");
+        for (field, wrong) in [
+            ("iss", Value::from("https://other.invalid")),
+            ("aud", Value::from("oaiapp_other")),
+            (
+                "aud",
+                serde_json::json!(["oaiapp_codewhale_test", "another-audience"]),
+            ),
+            ("exp", Value::from(1)),
+            ("nonce", Value::from("another-nonce")),
+            ("sub", Value::from("another-subject")),
+            ("sub", Value::from("")),
+        ] {
+            let mut changed = claims.clone();
+            changed[field] = wrong;
+            assert!(
+                verify(&signer.token(changed)).is_err(),
+                "accepted invalid {field}"
+            );
+        }
+        for required in ["iss", "aud", "exp", "sub", "nonce"] {
+            let mut changed = claims.clone();
+            changed.as_object_mut().unwrap().remove(required);
+            assert!(
+                verify(&signer.token(changed)).is_err(),
+                "accepted missing {required}"
+            );
+        }
+        let other_signer = SiwcSigningFixture::new();
+        assert!(verify(&other_signer.token(claims.clone())).is_err());
+        let parts: Vec<_> = signed.split('.').collect();
+        let bad_payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"attacker"}"#);
+        assert!(verify(&format!("{}.{}.{}", parts[0], bad_payload, parts[2])).is_err());
+        let symmetric_header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","kid":"siwc-fixture"}"#);
+        assert!(verify(&format!("{}.{}.{}", symmetric_header, parts[1], parts[2])).is_err());
+    }
+
+    #[test]
+    fn siwc_callback_and_grant_guards_reject_registration_substitution() {
+        assert!(issued_callback_client_id(CHATGPT_OAUTH_CLIENT_ID, None).is_err());
+        assert!(
+            issued_callback_client_id(CHATGPT_OAUTH_CLIENT_ID, Some(CHATGPT_OAUTH_CLIENT_ID))
+                .is_err()
+        );
+        assert_eq!(
+            issued_callback_client_id(CHATGPT_OAUTH_CLIENT_ID, Some("oaiapp_first")).unwrap(),
+            "oaiapp_first"
+        );
+        assert_eq!(
+            issued_callback_client_id("oaiapp_first", None).unwrap(),
+            "oaiapp_first"
+        );
+        assert!(issued_callback_client_id("oaiapp_first", Some("oaiapp_other")).is_err());
+        assert!(require_chatgpt_scopes(Some("openid resource.invoke")).is_err());
+        assert!(require_chatgpt_scopes(Some("chatgpt.tokens.use.direct")).is_err());
+        assert!(require_chatgpt_scopes(Some(CHATGPT_OAUTH_SCOPE)).is_ok());
+        assert!(parse_callback_query(&CHATGPT_OAUTH_PARAMS, "code=x&state=a&state=b").is_err());
+        assert!(
+            parse_callback_query(&CHATGPT_OAUTH_PARAMS, "code=x&state=a&error=denied").is_err()
+        );
+        let error = parse_callback_query(&CHATGPT_OAUTH_PARAMS, "error=access_denied").unwrap();
+        assert!(accept_callback("pending", error).is_err());
+        let success = parse_callback_query(
+            &CHATGPT_OAUTH_PARAMS,
+            "code=secret-code&state=a&client_id=oaiapp_first",
+        )
+        .unwrap();
+        assert!(!format!("{success:?}").contains("secret-code"));
+    }
+
+    #[test]
+    fn siwc_signed_access_requires_resource_account_registration_and_plan_scope() {
+        let signer = SiwcSigningFixture::new();
+        let registration = verify_chatgpt_id_token(
+            &signer.token(signer.id_claims()),
+            &signer.keys,
+            CHATGPT_OAUTH_ISSUER,
+            "oaiapp_codewhale_test",
+            Some("pending-nonce"),
+            None,
+            "host",
+        )
+        .unwrap();
+        assert!(
+            verify_chatgpt_access_token(&signer.access("test-sub"), &signer.keys, &registration)
+                .is_ok()
+        );
+        assert!(
+            verify_chatgpt_access_token(
+                &signer.access("another-subject"),
+                &signer.keys,
+                &registration
+            )
+            .is_err()
+        );
+        for (field, wrong) in [
+            ("aud", CHATGPT_OAUTH_ISSUER),
+            ("client_id", "oaiapp_other"),
+            ("scope", "openid resource.invoke"),
+        ] {
+            let mut claims = serde_json::json!({"iss": CHATGPT_OAUTH_ISSUER, "aud": CHATGPT_OAUTH_RESOURCE, "sub": "test-sub", "client_id": "oaiapp_codewhale_test", "scope": CHATGPT_OAUTH_SCOPE, "exp": now_unix_secs().unwrap() + 3600});
+            claims[field] = Value::from(wrong);
+            let token = signer.token(claims);
+            assert!(
+                verify_chatgpt_access_token(&token, &signer.keys, &registration).is_err(),
+                "accepted invalid {field}"
+            );
+        }
+    }
+
+    struct SiwcRefreshClient {
+        keys: JwkSet,
+        access: String,
+        posts: Mutex<Vec<MockPost>>,
+    }
+    impl OAuthFormClient for SiwcRefreshClient {
+        fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
+            self.posts.lock().unwrap().push((
+                url.to_string(),
+                form.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ));
+            Ok((200, serde_json::json!({"access_token": self.access, "refresh_token": "rotated-refresh", "expires_in": 3600, "scope": CHATGPT_OAUTH_SCOPE, "token_type": "Bearer"}).to_string()))
+        }
+        fn chatgpt_jwks(&self, _: &str) -> Result<JwkSet> {
+            Ok(self.keys.clone())
+        }
+    }
+
+    #[test]
+    fn siwc_refresh_rotates_atomically_and_rejects_a_different_account() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let signer = SiwcSigningFixture::new();
+        let mut config = Config {
+            provider: Some("openai-codex".into()),
+            ..Default::default()
+        };
+        install_test_chatgpt_registration(&mut config).unwrap();
+        let original = get_owned_credentials_read_only(OAuthProvider::Chatgpt, &config).unwrap();
+        let original_scope = crate::client::CodewhaleClient::new(&config)
+            .unwrap()
+            .chatgpt_reasoning_api;
+        let path = configured_owned_auth_file_path(OAuthProvider::Chatgpt, &config)
+            .unwrap()
+            .unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            let mut file = load_owned_auth_file_from_store(store, name)?.unwrap();
+            for entry in file.values_mut() {
+                entry.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+            }
+            write_auth_file_to_store(store, name, &file, true)
+        })
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wrong = SiwcRefreshClient {
+            keys: signer.keys.clone(),
+            access: signer.access("another-account"),
+            posts: Mutex::new(Vec::new()),
+        };
+        assert!(get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &wrong).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let right = SiwcRefreshClient {
+            keys: signer.keys.clone(),
+            access: signer.access("test-sub"),
+            posts: Mutex::new(Vec::new()),
+        };
+        let refreshed =
+            get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &right).unwrap();
+        assert_ne!(original.access_token, refreshed.access_token);
+        assert_eq!(
+            original_scope,
+            crate::client::CodewhaleClient::new(&config)
+                .unwrap()
+                .chatgpt_reasoning_api
+        );
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(
+            official_chatgpt_registration(&config).unwrap().subject,
+            "test-sub"
+        );
+        assert!(get_owned_credentials_read_only(OAuthProvider::Chatgpt, &config).is_ok());
+        let posts = right.posts.lock().unwrap();
+        assert_eq!(
+            posts[0].0,
+            "https://auth.openai.com/api/accounts/oauth/token"
+        );
+        assert!(
+            posts[0]
+                .1
+                .contains(&("client_id".to_string(), "oaiapp_codewhale_test".to_string()))
+        );
+        assert!(
+            posts[0]
+                .1
+                .contains(&("resource".to_string(), CHATGPT_OAUTH_RESOURCE.to_string()))
+        );
+        assert!(
+            posts[0]
+                .1
+                .contains(&("refresh_token".to_string(), "siwc-test-refresh".to_string()))
+        );
+    }
+
+    #[test]
+    fn siwc_replacing_account_drops_previous_registration_and_token() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mut config = Config::default();
+        let first = pending_login_for_test(OAuthProvider::Chatgpt, "first-access", "first-refresh");
+        activate_login(first, Some(&config_path), Some(&mut config)).unwrap();
+        let mut next =
+            pending_login_for_test(OAuthProvider::Chatgpt, "next-access", "next-refresh");
+        next.client_id = "oaiapp_next".to_string();
+        let registration = next.token.verified_chatgpt.as_mut().unwrap();
+        registration.client_id = "oaiapp_next".to_string();
+        registration.subject = "next-sub".to_string();
+        let activated = activate_login(next, Some(&config_path), Some(&mut config)).unwrap();
+        let registration = official_chatgpt_registration(&config).unwrap();
+        assert_eq!(registration.subject, "next-sub");
+        assert_eq!(registration.client_id, "oaiapp_next");
+        let raw = std::fs::read_to_string(activated.auth_path).unwrap();
+        assert!(!raw.contains("first-access"));
+        assert!(!raw.contains("first-refresh"));
+        let mut file: AuthFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(file.len(), 1);
+        let (_, mut entry) = select_entry(OAuthProvider::Chatgpt, &mut file).unwrap();
+        entry.account_id = Some("unverified-account".to_string());
+        assert!(registration_from_entry(&entry).is_err());
+        entry.account_id = Some("next-sub".to_string());
+        entry.access_token = Some("unverified-replacement".to_string());
+        assert!(registration_from_entry(&entry).is_err());
+    }
+
+    // === OrcaRouter: API-key + PKCE adapters over one credential seam =======
+
+    fn orca_inputs(auth_base: &str) -> OrcaLoginInputs {
+        OrcaLoginInputs {
+            auth_base: auth_base.to_string(),
+            api_base: "https://api.orcarouter.ai/v1".to_string(),
+            app_name: ORCAROUTER_APP_NAME.to_string(),
+            open_browser: false,
+        }
+    }
+
+    const ORCA_FAKE_KEY: &str = "sk-orca-test-key-not-a-real-credential";
+
+    #[test]
+    fn orcarouter_api_key_adapter_shapes_and_rejects() {
+        let from_key = OrcaCredential::from_api_key(&format!("  {ORCA_FAKE_KEY}  ")).unwrap();
+        assert_eq!(
+            from_key.expose(),
+            ORCA_FAKE_KEY,
+            "outer whitespace is trimmed"
+        );
+        assert_eq!(from_key.source(), OrcaCredentialSource::ApiKey);
+        assert_eq!(from_key.granted_scope(), ORCAROUTER_SCOPE);
+        assert!(from_key.scope_satisfies_purpose());
+
+        for bad in ["", "   ", "sk-openai-not-orca", "orca-key"] {
+            let err = match OrcaCredential::from_api_key(bad) {
+                Ok(_) => panic!("non-OrcaRouter key must be refused: {bad:?}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(!err.contains(bad) || bad.trim().is_empty(), "{err}");
+        }
+    }
+
+    /// Both adapters must produce the same credential type, and nothing about
+    /// the adapter may be observable downstream beyond the presentation label.
+    #[test]
+    fn orcarouter_adapters_produce_the_same_credential_result() {
+        let api_key = OrcaCredential::from_api_key(ORCA_FAKE_KEY).unwrap();
+        let exchanged = exchange_orcarouter_code(
+            &MockFormClient::new(vec![(
+                200,
+                serde_json::json!({"key": ORCA_FAKE_KEY, "user_id": "u-1", "scope": "api"})
+                    .to_string(),
+            )]),
+            ORCAROUTER_AUTH_BASE,
+            "auth-code",
+            "verifier-value",
+        )
+        .unwrap();
+        assert_eq!(api_key.expose(), exchanged.expose());
+        assert_eq!(api_key.granted_scope(), exchanged.granted_scope());
+        assert!(api_key.scope_satisfies_purpose() && exchanged.scope_satisfies_purpose());
+        assert_ne!(
+            api_key.source(),
+            exchanged.source(),
+            "the source is presentation only and never changes the key"
+        );
+        assert_eq!(exchanged.source(), OrcaCredentialSource::Pkce);
+        assert_eq!(api_key.source().as_str(), "api_key");
+        assert_eq!(exchanged.source().as_str(), "pkce");
+    }
+
+    #[test]
+    fn orcarouter_authorize_url_is_the_documented_contract() {
+        let inputs = orca_inputs("https://www.orcarouter.ai");
+        let pkce = PkceChallenge {
+            verifier: "verifier".into(),
+            challenge: "challenge-abc".into(),
+        };
+        let url = build_orcarouter_authorize_url(
+            &inputs,
+            "http://127.0.0.1:41234/callback",
+            "state-1",
+            &pkce,
+        )
+        .unwrap();
+        assert!(
+            url.starts_with("https://www.orcarouter.ai/auth?"),
+            "authorize path is fixed at /auth: {url}"
+        );
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let form: std::collections::BTreeMap<_, _> = parsed.query_pairs().collect();
+        assert_eq!(form["callback_url"], "http://127.0.0.1:41234/callback");
+        assert_eq!(form["code_challenge"], "challenge-abc");
+        assert_eq!(form["code_challenge_method"], "S256");
+        assert_eq!(form["state"], "state-1");
+        assert_eq!(form["app_name"], ORCAROUTER_APP_NAME);
+        assert_eq!(form["scope"], ORCAROUTER_SCOPE);
+        assert!(!form.contains_key("client_id"), "no client id in the URL");
+        assert!(
+            !form.contains_key("client_secret"),
+            "PKCE never carries a client secret"
+        );
+        assert!(!form.contains_key("response_type"));
+        assert!(
+            !url.contains(&pkce.verifier),
+            "the verifier must never reach the browser"
+        );
+    }
+
+    #[test]
+    fn orcarouter_exchange_uses_the_auth_origin_path_and_body() {
+        let client = MockFormClient::new(vec![(
+            200,
+            serde_json::json!({"key": ORCA_FAKE_KEY, "user_id": "u", "scope": "api"}).to_string(),
+        )]);
+        exchange_orcarouter_code(&client, ORCAROUTER_AUTH_BASE, "code-1", "verifier-1").unwrap();
+        let posts = client.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            posts[0].0, "https://www.orcarouter.ai/api/v1/auth/keys",
+            "the exchange is on the auth origin at /api/v1/auth/keys"
+        );
+        assert!(
+            !posts[0].0.contains("api.orcarouter.ai"),
+            "the exchange must never target the inference origin"
+        );
+        let form: std::collections::BTreeMap<_, _> = posts[0].1.iter().cloned().collect();
+        assert_eq!(form["code"], "code-1");
+        assert_eq!(form["code_verifier"], "verifier-1");
+        assert_eq!(form["code_challenge_method"], "S256");
+        assert!(
+            !form.contains_key("client_secret"),
+            "no client secret is ever sent"
+        );
+    }
+
+    #[test]
+    fn orcarouter_exchange_error_does_not_echo_the_response_body() {
+        let client = MockFormClient::new(vec![(
+            403,
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "secret-must-not-leak"
+            })
+            .to_string(),
+        )]);
+        let err = match exchange_orcarouter_code(&client, ORCAROUTER_AUTH_BASE, "used", "verifier")
+        {
+            Ok(_) => panic!("a rejected code must fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("invalid_grant"), "{err}");
+        assert!(err.contains("codewhale auth orcarouter"), "{err}");
+        assert!(!err.contains("secret-must-not-leak"), "{err}");
+        assert!(!err.contains(ORCA_FAKE_KEY), "{err}");
+    }
+
+    #[test]
+    fn orcarouter_exchange_error_field_never_discloses_untrusted_text() {
+        let code = "authorization-code-sentinel";
+        let verifier = "verifier-sentinel";
+        for server_error in [
+            ORCA_FAKE_KEY.to_string(),
+            format!("invalid_grant\r\n{code} {verifier}\u{1b}[2J"),
+        ] {
+            let client = MockFormClient::new(vec![(
+                403,
+                serde_json::json!({"error": server_error, "key": ORCA_FAKE_KEY}).to_string(),
+            )]);
+            let error = exchange_orcarouter_code(&client, ORCAROUTER_AUTH_BASE, code, verifier)
+                .err()
+                .expect("a rejected exchange must fail")
+                .to_string();
+            assert!(!error.contains(ORCA_FAKE_KEY));
+            assert!(!error.contains(code));
+            assert!(!error.contains(verifier));
+            assert!(!error.chars().any(char::is_control));
+            assert!(error.contains("HTTP 403"));
+            assert!(error.contains("exchange_failed"));
+            assert_eq!(client.posts.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// 400 is the method-mismatch / downgrade defence; it is terminal for the
+    /// attempt, never retried, and never prints the code or verifier.
+    #[test]
+    fn orcarouter_exchange_400_is_terminal_and_leaks_nothing() {
+        let client = MockFormClient::new(vec![(
+            400,
+            serde_json::json!({"error": "invalid_request", "error_description": "downgrade"})
+                .to_string(),
+        )]);
+        let err = match exchange_orcarouter_code(&client, ORCAROUTER_AUTH_BASE, "c", "v") {
+            Ok(_) => panic!("400 must fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("invalid_request"), "{err}");
+        assert!(!err.contains("downgrade"), "{err}");
+        assert_eq!(client.posts.lock().unwrap().len(), 1, "no retry");
+    }
+
+    /// A granted scope other than the requested one is surfaced, not assumed.
+    #[test]
+    fn orcarouter_exchange_records_the_granted_scope_not_the_requested_one() {
+        let narrowed = exchange_orcarouter_code(
+            &MockFormClient::new(vec![(
+                200,
+                serde_json::json!({"key": ORCA_FAKE_KEY, "scope": "read"}).to_string(),
+            )]),
+            ORCAROUTER_AUTH_BASE,
+            "c",
+            "v",
+        )
+        .unwrap();
+        assert_eq!(narrowed.granted_scope(), "read");
+        assert!(
+            !narrowed.scope_satisfies_purpose(),
+            "a downgraded grant must not be treated as satisfying the purpose"
+        );
+
+        let silent = exchange_orcarouter_code(
+            &MockFormClient::new(vec![(
+                200,
+                serde_json::json!({"key": ORCA_FAKE_KEY}).to_string(),
+            )]),
+            ORCAROUTER_AUTH_BASE,
+            "c",
+            "v",
+        )
+        .unwrap();
+        assert_eq!(silent.granted_scope(), ORCAROUTER_SCOPE);
+    }
+
+    #[test]
+    fn orcarouter_exchange_rejects_non_orca_and_empty_keys() {
+        for body in [
+            serde_json::json!({"key": "sk-not-orca", "scope": "api"}),
+            serde_json::json!({"key": "   ", "scope": "api"}),
+            serde_json::json!({"user_id": "u", "scope": "api"}),
+        ] {
+            assert!(
+                exchange_orcarouter_code(
+                    &MockFormClient::new(vec![(200, body.to_string())]),
+                    ORCAROUTER_AUTH_BASE,
+                    "c",
+                    "v",
+                )
+                .is_err(),
+                "a key this client cannot use must be refused"
+            );
+        }
+    }
+
+    /// Flow A state handling: the callback state is compared before the code is
+    /// accepted, a denial is terminal, and a reused code is not retried.
+    #[test]
+    fn orcarouter_callback_state_mismatch_and_denial_are_terminal() {
+        let params = &ORCAROUTER_OAUTH_PARAMS;
+
+        let success = parse_callback_query(params, "code=code-1&state=state-1").unwrap();
+        assert_eq!(
+            accept_callback_with_client("state-1", success).unwrap().0,
+            "code-1"
+        );
+
+        let mismatched = parse_callback_query(params, "code=code-1&state=other").unwrap();
+        let err = accept_callback_with_client("state-1", mismatched)
+            .expect_err("state mismatch must be refused")
+            .to_string();
+        assert!(err.contains("state did not match"), "{err}");
+
+        let denied = parse_callback_query(
+            params,
+            "error=access_denied&error_description=nope&state=state-1",
+        )
+        .unwrap();
+        let err = accept_callback_with_client("state-1", denied)
+            .expect_err("a denial must be terminal")
+            .to_string();
+        assert!(err.contains("access_denied"), "{err}");
+        assert!(
+            !err.contains("nope"),
+            "the description is not echoed: {err}"
+        );
+
+        let duplicated = parse_callback_query(params, "code=a&code=b&state=s");
+        assert!(duplicated.is_err(), "a duplicate code is refused");
+    }
+
+    #[test]
+    fn orcarouter_pkce_pair_is_s256_and_ephemeral() {
+        let pkce = generate_pkce();
+        assert!(pkce.verifier.len() >= 43);
+        assert_eq!(
+            pkce.challenge,
+            URL_SAFE_NO_PAD.encode(Sha256::digest(pkce.verifier.as_bytes()))
+        );
+        assert!(!pkce.challenge.contains('='), "challenge is unpadded");
+        assert_ne!(generate_state(), generate_state());
+    }
+
+    /// Both origins are explicit and independently overridable; a remote plain
+    /// HTTP auth origin is refused because PKCE must not run in the clear.
+    #[test]
+    fn orcarouter_origins_are_separate_and_enforce_https() {
+        assert_eq!(ORCAROUTER_AUTH_BASE, "https://www.orcarouter.ai");
+        assert_eq!(ORCAROUTER_API_BASE, "https://api.orcarouter.ai/v1");
+        assert!(
+            !ORCAROUTER_API_BASE.contains("www.orcarouter.ai"),
+            "the inference origin is not derived from the auth origin"
+        );
+        assert_eq!(
+            orcarouter_exchange_url("https://www.orcarouter.ai/"),
+            "https://www.orcarouter.ai/api/v1/auth/keys"
+        );
+        let exchange = orcarouter_exchange_url(ORCAROUTER_AUTH_BASE);
+        assert_eq!(exchange, "https://www.orcarouter.ai/api/v1/auth/keys");
+        assert!(
+            !exchange.starts_with("https://api.orcarouter.ai"),
+            "the exchange runs on the auth origin, not the inference origin"
+        );
+        let inputs = orca_inputs("http://evil.example");
+        let pkce = PkceChallenge {
+            verifier: "v".into(),
+            challenge: "c".into(),
+        };
+        assert!(
+            build_orcarouter_authorize_url(&inputs, "http://127.0.0.1:1/callback", "s", &pkce)
+                .is_err(),
+            "a remote plain-HTTP auth origin must be refused"
+        );
+    }
+
+    /// OrcaRouter has no owned OAuth generation: PKCE hands back a durable API
+    /// key, not refreshable token material. It therefore never appears in
+    /// `OAuthProvider` and is driven by its own [`orcarouter_pkce_login`] path.
+    #[test]
+    fn orcarouter_is_not_an_owned_generation_provider() {
+        for provider in [OAuthProvider::Xai, OAuthProvider::Chatgpt] {
+            assert!(provider.is_valid_generation(&provider.new_generation()));
+        }
+        assert_eq!(ORCAROUTER_EXCHANGE_PATH, "/api/v1/auth/keys");
+        assert!(
+            !ORCAROUTER_EXCHANGE_PATH.starts_with("/v1/auth/keys"),
+            "the exchange path is not the relay model route"
+        );
+    }
+
+    /// The loopback listener binds an ephemeral port on 127.0.0.1 and the
+    /// authorize URL's callback matches that exact port.
+    #[test]
+    fn orcarouter_loopback_request_matches_the_bound_port() {
+        let listeners = bind_orcarouter_callback().unwrap();
+        let inputs = orca_inputs(ORCAROUTER_AUTH_BASE);
+        let request = start_orcarouter_auth_request(&listeners, &inputs).unwrap();
+        assert!(request.redirect_uri.starts_with("http://127.0.0.1:"));
+        assert!(request.redirect_uri.ends_with("/callback"));
+        let port = listeners[0].local_addr().unwrap().port();
+        assert!(request.redirect_uri.contains(&port.to_string()));
+        assert!(request.authorize_url.contains(&request.state));
+        assert!(request.authorize_url.contains(&request.pkce.challenge));
+        assert!(!request.authorize_url.contains(&request.pkce.verifier));
+        assert!(
+            !format!("{request:?}").contains(&request.pkce.verifier),
+            "Debug output must not print the verifier"
+        );
+    }
+
+    #[test]
+    fn orcarouter_credential_debug_never_prints_the_key() {
+        let credential = OrcaCredential::from_api_key(ORCA_FAKE_KEY).unwrap();
+        // OrcaCredential is deliberately Debug-free; prove the key does not
+        // leak through the presentation label or the scope accessors.
+        assert!(!credential.source().as_str().contains(ORCA_FAKE_KEY));
+        assert!(!credential.granted_scope().contains(ORCA_FAKE_KEY));
+        assert_eq!(credential.source().as_str(), "api_key");
+    }
+
+    /// One local fake auth server that plays both the browser and the
+    /// exchange endpoint over real sockets. It answers `GET {auth}/auth` with a
+    /// 302 to the `callback_url` the client sent — carrying the client's own
+    /// `state`, which is the only way the callback is accepted — and answers
+    /// `POST {auth}/api/v1/auth/keys` with the minted key. The PKCE verifier
+    /// never reaches this server: only the S256 challenge does.
+    struct FakeOrcaAuthServer {
+        port: u16,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeOrcaAuthServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(25);
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let head = read_fixture_request(&mut stream);
+                            seen.lock().unwrap().push(head.clone());
+                            let request_line = head.lines().next().unwrap_or_default();
+                            let mut parts = request_line.split_whitespace();
+                            let method = parts.next().unwrap_or("");
+                            let target = parts.next().unwrap_or("");
+                            let url = reqwest::Url::parse("http://127.0.0.1")
+                                .and_then(|base| base.join(target))
+                                .ok();
+                            let query = |name: &str| -> Option<String> {
+                                url.as_ref().and_then(|url| {
+                                    url.query_pairs()
+                                        .find(|(key, _)| key == name)
+                                        .map(|(_, value)| value.into_owned())
+                                })
+                            };
+                            let reply = if method == "GET" {
+                                match (query("callback_url"), query("state")) {
+                                    (Some(callback), Some(state)) => format!(
+                                        "HTTP/1.1 302 Found\r\nLocation: {callback}?code=local-flows-code&state={state}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                    ),
+                                    _ => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                        .to_string(),
+                                }
+                            } else if method == "POST"
+                                && url
+                                    .as_ref()
+                                    .is_some_and(|url| url.path() == ORCAROUTER_EXCHANGE_PATH)
+                            {
+                                let body = serde_json::json!({
+                                    "key": ORCA_FAKE_KEY,
+                                    "user_id": "u",
+                                    "scope": "api"
+                                })
+                                .to_string();
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else {
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                    .to_string()
+                            };
+                            let _ = stream.write_all(reply.as_bytes());
+                        }
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self { port, requests }
+        }
+
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        fn urls(&self) -> String {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|head| head.lines().next().map(str::to_string))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    /// Read one whole request for the fake auth server: the head, then the
+    /// `Content-Length` bytes of body. The fixture's listener is non-blocking
+    /// and Windows and BSD sockets hand that mode to the accepted stream, so a
+    /// single `read` can return `WouldBlock` before the client has written a
+    /// byte. Answering that empty read puts a response on the wire ahead of
+    /// the request, which the client reports as "received unexpected message
+    /// from connection"; closing with the body still unread resets the
+    /// connection under the reply.
+    fn read_fixture_request(stream: &mut TcpStream) -> String {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while raw.len() < 64 * 1024 {
+            if let Some(head_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&raw[..head_end]);
+                let body_len = header_value(&head, "content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= head_end + 4 + body_len {
+                    break;
+                }
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => raw.extend_from_slice(&chunk[..read]),
+            }
+        }
+        String::from_utf8_lossy(&raw).to_string()
+    }
+
+    /// The full connect adapter over a local fake auth server: the adapter
+    /// binds its own loopback callback, the fake server redirects the code to
+    /// exactly that callback with the adapter's own state, and the exchange
+    /// POST returns the key. Nothing here fakes the flow for the adapter — it
+    /// runs `orcarouter_pkce_login` end to end over real sockets.
+    /// Captures the `Open: <url>` line the login prints, so the test can play
+    /// the browser leg. The PKCE verifier is never part of that line.
+    struct AuthorizeUrlCapture {
+        seen: String,
+        sent: std::sync::mpsc::Sender<String>,
+        done: bool,
+    }
+
+    impl std::io::Write for AuthorizeUrlCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.seen.push_str(&String::from_utf8_lossy(buf));
+            if !self.done
+                && let Some(start) = self.seen.find("http")
+            {
+                let url: String = self.seen[start..]
+                    .chars()
+                    .take_while(|c| !c.is_whitespace())
+                    .collect();
+                if url.contains("/auth?") {
+                    self.done = true;
+                    let _ = self.sent.send(url);
+                }
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One raw HTTP/1.1 GET over a fresh socket. The fake server speaks plain
+    /// loopback HTTP, so the browser leg needs no client library.
+    fn raw_get(url: &str) -> String {
+        let parsed = reqwest::Url::parse(url).expect("callback url");
+        let host = parsed.host_str().expect("host").to_string();
+        let port = parsed.port_or_known_default().expect("port");
+        let target = match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().to_string(),
+        };
+        let mut stream = TcpStream::connect((host.as_str(), port)).expect("connect");
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    fn header_value(response: &str, name: &str) -> Option<String> {
+        response.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// The fake auth server must answer the request, not the accept: a client
+    /// that connects, pauses, and then sends its head and body in separate
+    /// segments still gets the exchange reply, and the server saw the body.
+    #[test]
+    fn fake_orca_auth_server_waits_for_a_late_fragmented_request() {
+        let auth = FakeOrcaAuthServer::start();
+        let mut stream = TcpStream::connect(("127.0.0.1", auth.port())).expect("connect");
+        // Longer than the fixture's accept poll, so it accepts an empty socket.
+        std::thread::sleep(Duration::from_millis(100));
+        let body = r#"{"code":"late-fragment"}"#;
+        write!(
+            stream,
+            "POST {ORCAROUTER_EXCHANGE_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write head");
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(body.as_bytes()).expect("write body");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let recorded = auth.requests.lock().unwrap().join("\n");
+        assert!(recorded.contains("late-fragment"), "{recorded}");
+    }
+
+    #[test]
+    fn orcarouter_connect_adapter_runs_authorize_callback_exchange_end_to_end() {
+        let auth = FakeOrcaAuthServer::start();
+        let auth_base = format!("http://127.0.0.1:{}", auth.port());
+        let inputs = OrcaLoginInputs {
+            auth_base: auth_base.clone(),
+            api_base: ORCAROUTER_API_BASE.to_string(),
+            app_name: ORCAROUTER_APP_NAME.to_string(),
+            open_browser: false,
+        };
+        let (url_tx, url_rx) = std::sync::mpsc::channel();
+        let login = std::thread::spawn(move || {
+            let mut capture = AuthorizeUrlCapture {
+                seen: String::new(),
+                sent: url_tx,
+                done: false,
+            };
+            orcarouter_pkce_login(&inputs, &mut capture)
+        });
+
+        let authorize_url = url_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the adapter prints the authorize URL before it waits for the callback");
+        assert!(
+            authorize_url.starts_with(&format!("{auth_base}/auth?")),
+            "{authorize_url}"
+        );
+
+        // Browser leg 1: the authorize endpoint redirects to the adapter's own
+        // loopback callback, carrying the code and the adapter's own state.
+        let redirect = raw_get(&authorize_url);
+        let callback = header_value(&redirect, "location")
+            .expect("the authorize endpoint returns a loopback redirect");
+        assert!(callback.starts_with("http://127.0.0.1:"), "{callback}");
+
+        // Browser leg 2: the loopback callback receives it; the login thread
+        // then POSTs the code and the S256 verifier to the exchange endpoint.
+        let _ = raw_get(&callback);
+
+        let credential = login.join().expect("login worker").expect("login");
+        assert_eq!(credential.expose(), ORCA_FAKE_KEY);
+        assert_eq!(credential.source(), OrcaCredentialSource::Pkce);
+        assert!(credential.scope_satisfies_purpose());
+
+        // The auth server saw the authorize GET and the exchange POST, both on
+        // the auth origin, and never the verifier or the minted key.
+        let seen = auth.urls();
+        let expected_post = format!("POST {ORCAROUTER_EXCHANGE_PATH}");
+        assert!(seen.contains("GET /auth?"), "{seen}");
+        assert!(seen.contains(&expected_post), "{seen}");
+        assert!(!seen.contains("code_verifier"), "{seen}");
+        assert!(!seen.contains(ORCA_FAKE_KEY), "{seen}");
+    }
+}
+
+#[cfg(test)]
+mod plugin_oauth_tests {
+    use super::*;
+
+    fn descriptor() -> PluginOAuthConfig {
+        PluginOAuthConfig {
+            issuer: "https://issuer.example".into(),
+            authorization_endpoint: "https://issuer.example/authorize".into(),
+            token_endpoint: "https://issuer.example/token".into(),
+            client_id: "public-client".into(),
+            scopes: vec!["models:invoke".into()],
+            resource: Some("https://api.example/oauth".into()),
+            callback_path: plugin_callback_path(),
+        }
+    }
+
+    #[test]
+    fn plugin_oauth_rejects_insecure_or_cross_origin_endpoints() {
+        let mut config = descriptor();
+        assert!(config.validate().is_ok());
+        config.token_endpoint = "https://attacker.example/token".into();
+        assert!(config.validate().is_err());
+        config.token_endpoint = "http://issuer.example/token".into();
+        assert!(config.validate().is_err());
+        config.token_endpoint = "https://issuer.example/token?secret=value".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn plugin_oauth_callback_rejects_duplicate_state_and_issuer_mixup() {
+        assert!(
+            validate_plugin_callback(
+                "code=x&state=s&iss=https%3A%2F%2Fissuer.example",
+                "https://issuer.example"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_callback("code=x&state=s&state=other", "https://issuer.example")
+                .is_err()
+        );
+        assert!(
+            validate_plugin_callback(
+                "code=x&state=s&iss=https%3A%2F%2Fattacker.example",
+                "https://issuer.example"
+            )
+            .is_err()
+        );
+        assert!(validate_plugin_callback("error=access_denied", "https://issuer.example").is_err());
+    }
+
+    #[test]
+    fn plugin_callback_preserves_client_identity_and_rejects_issuer_mixup() {
+        fn callback(query: &str) -> Result<(String, Option<String>)> {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let address = listener.local_addr()?;
+            let server = std::thread::spawn(move || {
+                let config = descriptor();
+                let (stream, _) = listener.accept()?;
+                handle_callback_stream_validated(
+                    stream,
+                    &config.callback_params(),
+                    "expected-state",
+                    Some(&config.issuer),
+                )
+            });
+            let mut client = TcpStream::connect(address)?;
+            write!(
+                client,
+                "GET /oauth/callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )?;
+            server.join().expect("callback worker")
+        }
+        let (code, client_id) = callback(
+            "code=code-sentinel&state=expected-state&client_id=oaiapp_callback_fixture&iss=https%3A%2F%2Fissuer.example",
+        ).unwrap();
+        assert_eq!(code, "code-sentinel");
+        assert_eq!(client_id.as_deref(), Some("oaiapp_callback_fixture"));
+        assert!(
+            callback("code=code-sentinel&state=expected-state&iss=https%3A%2F%2Fother.example",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_oauth_binding_is_exact_and_authorization_uses_pkce_resource() {
+        let config = descriptor();
+        let slot = plugin_oauth_slot("example", "https://api.example/v1", &config).unwrap();
+        assert_ne!(
+            slot,
+            plugin_oauth_slot("other", "https://api.example/v1", &config).unwrap()
+        );
+        assert_ne!(
+            slot,
+            plugin_oauth_slot("example", "https://other.example/v1", &config).unwrap()
+        );
+        let mut changed = config.clone();
+        changed.scopes.push("balance:read".into());
+        assert_ne!(
+            slot,
+            plugin_oauth_slot("example", "https://api.example/v1", &changed).unwrap()
+        );
+        let pkce = generate_pkce();
+        let url = reqwest::Url::parse(
+            &config
+                .authorize_url("http://127.0.0.1:1234/oauth/callback", "state", &pkce)
+                .unwrap(),
+        )
+        .unwrap();
+        let pairs: BTreeMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.get("code_challenge_method").unwrap(), "S256");
+        assert_eq!(pairs.get("resource").unwrap(), "https://api.example/oauth");
+        assert!(!url.as_str().contains(&pkce.verifier));
+    }
+
+    #[test]
+    fn plugin_oauth_diagnostics_do_not_refresh_or_mutate_expired_credentials() {
+        let secrets = codewhale_secrets::Secrets::new(std::sync::Arc::new(
+            codewhale_secrets::InMemoryKeyringStore::default(),
+        ));
+        let config = descriptor();
+        let raw = serde_json::to_string(&PluginOAuthTokens {
+            access_token: "expired".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: 1,
+        })
+        .unwrap();
+        secrets.set("test-slot", &raw).unwrap();
+        assert!(plugin_oauth_saved_token(&raw).unwrap());
+        let unusable = serde_json::to_string(&PluginOAuthTokens {
+            access_token: "expired".into(),
+            refresh_token: None,
+            expires_at: 1,
+        })
+        .unwrap();
+        assert!(!plugin_oauth_saved_token(&unusable).unwrap());
+        let error =
+            plugin_oauth_access_token_with_store("test-slot", &config, true, &secrets).unwrap_err();
+        assert!(error.to_string().contains("diagnostics never refresh"));
+        assert_eq!(
+            secrets.get("test-slot").unwrap().as_deref(),
+            Some(raw.as_str())
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_oauth_short_lived_nonrefreshable_token_uses_its_actual_lifetime() -> Result<()>
+    {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "short-lived",
+                "expires_in": 30,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = descriptor();
+        config.issuer = server.uri();
+        config.authorization_endpoint = format!("{}/authorize", server.uri());
+        config.token_endpoint = format!("{}/token", server.uri());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut token = plugin_token_response(
+                &config,
+                &[("grant_type", "authorization_code"), ("code", "test-code")],
+                None,
+            )?;
+            assert!(token.refresh_token.is_none());
+            assert!(
+                token.expires_at > now_unix_secs().context("test clock before UNIX epoch")? as u64
+            );
+            let secrets = codewhale_secrets::Secrets::new(std::sync::Arc::new(
+                codewhale_secrets::InMemoryKeyringStore::default(),
+            ));
+            let raw = serde_json::to_string(&token)?;
+            secrets.set("short-lifetime", &raw)?;
+            for read_only in [true, false] {
+                assert_eq!(
+                    plugin_oauth_access_token_with_store(
+                        "short-lifetime",
+                        &config,
+                        read_only,
+                        &secrets,
+                    )?,
+                    "short-lived"
+                );
+                assert_eq!(
+                    secrets.get("short-lifetime")?.as_deref(),
+                    Some(raw.as_str())
+                );
+            }
+            // Read-only use also preserves a still-valid refreshable grant.
+            token.refresh_token = Some("unused-refresh".into());
+            let refreshable = serde_json::to_string(&token)?;
+            secrets.set("short-lifetime", &refreshable)?;
+            assert_eq!(
+                plugin_oauth_access_token_with_store("short-lifetime", &config, true, &secrets)?,
+                "short-lived"
+            );
+            assert_eq!(
+                secrets.get("short-lifetime")?.as_deref(),
+                Some(refreshable.as_str())
+            );
+            // Model the actual expiry boundary without a wall-clock sleep.
+            token.refresh_token = None;
+            token.expires_at = now_unix_secs().context("test clock before UNIX epoch")? as u64;
+            let expired = serde_json::to_string(&token)?;
+            secrets.set("short-lifetime", &expired)?;
+            for read_only in [true, false] {
+                let error = plugin_oauth_access_token_with_store(
+                    "short-lifetime",
+                    &config,
+                    read_only,
+                    &secrets,
+                )
+                .expect_err("an actually expired token must be refused");
+                assert!(error.to_string().contains("expired"));
+                assert_eq!(
+                    secrets.get("short-lifetime")?.as_deref(),
+                    Some(expired.as_str())
+                );
+            }
+            Ok(())
+        })
+        .await??;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_oauth_refresh_rotation_serializes_concurrent_requests() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=old-refresh"))
+            .and(body_string_contains("resource=https%3A%2F%2Fapi.example%2Foauth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token":"fresh", "refresh_token":"rotated", "expires_in":3600, "token_type":"Bearer"})))
+            .expect(1).mount(&server).await;
+        let mut config = descriptor();
+        config.issuer = server.uri();
+        config.authorization_endpoint = format!("{}/authorize", server.uri());
+        config.token_endpoint = format!("{}/token", server.uri());
+        let secrets = std::sync::Arc::new(codewhale_secrets::Secrets::new(std::sync::Arc::new(
+            codewhale_secrets::InMemoryKeyringStore::default(),
+        )));
+        secrets
+            .set(
+                "rotation",
+                &serde_json::to_string(&PluginOAuthTokens {
+                    access_token: "expired".into(),
+                    refresh_token: Some("old-refresh".into()),
+                    expires_at: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let config = config.clone();
+            let secrets = secrets.clone();
+            workers.push(tokio::task::spawn_blocking(move || {
+                plugin_oauth_access_token_with_store("rotation", &config, false, &secrets)
+            }));
+        }
+        for worker in workers {
+            assert_eq!(worker.await.unwrap().unwrap(), "fresh");
+        }
+        let stored: PluginOAuthTokens =
+            serde_json::from_str(&secrets.get("rotation").unwrap().unwrap()).unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rotated"));
+        secrets.delete("rotation").unwrap();
+        assert!(
+            plugin_oauth_access_token_with_store("rotation", &config, false, &secrets).is_err()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_oauth_failed_refresh_preserves_secret_without_exposing_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let responses = [
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "secret-response-material"
+            })),
+            ResponseTemplate::new(400)
+                .set_body_bytes(b"secret-response-material")
+                .insert_header(
+                    "content-type",
+                    "text/html; credential=secret-header-material",
+                ),
+        ];
+        for response in responses {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut config = descriptor();
+            config.issuer = server.uri();
+            config.authorization_endpoint = format!("{}/authorize", server.uri());
+            config.token_endpoint = format!("{}/token", server.uri());
+            let secrets = codewhale_secrets::Secrets::new(std::sync::Arc::new(
+                codewhale_secrets::InMemoryKeyringStore::default(),
+            ));
+            let raw = serde_json::to_string(&PluginOAuthTokens {
+                access_token: "still-valid".into(),
+                refresh_token: Some("refresh".into()),
+                expires_at: (now_unix_secs().unwrap() as u64).saturating_add(30),
+            })
+            .unwrap();
+            secrets.set("denied", &raw).unwrap();
+            let (error, unchanged) = tokio::task::spawn_blocking(move || {
+                let error =
+                    plugin_oauth_access_token_with_store("denied", &config, false, &secrets)
+                        .unwrap_err();
+                (error.to_string(), secrets.get("denied").unwrap().unwrap())
+            })
+            .await
+            .unwrap();
+            assert!(error.contains("HTTP 400"));
+            assert!(!error.contains("secret-response-material"));
+            assert!(!error.contains("secret-header-material"));
+            assert_eq!(unchanged, raw);
+            server.verify().await;
+        }
+    }
+    #[test]
+    fn plugin_oauth_reviewed_provider_real_client_refresh_chat_catalog_and_revocation() {
+        use crate::client::CodewhaleClient;
+        use crate::llm_client::LlmClient;
+        use crate::plugins::discovery::{DiscoveryConfig, discover_with_config};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path().join("owned"));
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let root = temp.path().to_owned();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/token"))
+                .and(body_string_contains("refresh_token=old-refresh"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token":"rotated-access", "refresh_token":"rotated-refresh", "expires_in":3600, "token_type":"Bearer"})))
+                .expect(1).mount(&server).await;
+            Mock::given(method("GET")).and(path("/v1/models"))
+                .and(header("authorization", "Bearer rotated-access"))
+                .and(header("x-fixture-route", "main"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":[{"id":"fixture-model", "object":"model"}]})))
+                .expect(1).mount(&server).await;
+            Mock::given(method("POST")).and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer rotated-access"))
+                .and(header("x-fixture-route", "main"))
+                .and(|request: &wiremock::Request| serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| body.get("stream").is_none()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"fixture", "object":"chat.completion", "model":"fixture-model", "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}], "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})))
+                .expect(1).mount(&server).await;
+            Mock::given(method("POST")).and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer rotated-access"))
+                .and(header("x-fixture-route", "main"))
+                .and(body_string_contains("\"stream\":true"))
+                .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string("data: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"))
+                .expect(1).mount(&server).await;
+            let issuer = server.uri();
+            let (live, discovery, slot) = tokio::task::spawn_blocking(move || {
+                let workspace = root.join("workspace");
+                let plugin = root.join("plugins/provider-fixture");
+                std::fs::create_dir_all(&workspace).unwrap();
+                std::fs::create_dir_all(&plugin).unwrap();
+                let mut config = descriptor();
+                config.issuer = issuer.clone();
+                config.authorization_endpoint = format!("{issuer}/authorize");
+                config.token_endpoint = format!("{issuer}/token");
+                let declared_base_url = format!("{issuer}/v1/");
+                let manifest = serde_json::json!({
+                    "$schema": crate::plugins::agent_plugin::PLUGIN_SCHEMA_URL,
+                    "name":"provider-fixture", "version":"1.0.0",
+                    "extensions":{"net.codewhale":{"providers":{"fixture-gateway":{
+                        "base_url":declared_base_url, "model":"fixture-model", "models":["fixture-model"], "http_headers":{"X-Fixture-Route":"main"}, "oauth":config
+                    }}}}
+                });
+                std::fs::write(plugin.join("plugin.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+                let discovery = DiscoveryConfig { workspace:workspace.clone(), user_plugins_dir:root.join("plugins"), workspace_plugins_dir:workspace.join(".codewhale/plugins"), builtin_plugin_dirs:vec![], state_path:root.join("state/plugins.json") };
+                let mut registry = discover_with_config(&discovery);
+                registry.trust("provider-fixture").unwrap();
+                registry.enable("provider-fixture").unwrap();
+                let registry = discover_with_config(&discovery);
+                let mut live = Config { provider:Some("fixture-gateway".into()), http_headers:Some(std::collections::HashMap::from([
+                    ("Authorization".into(), "Bearer ambient-global".into()),
+                    ("X-Api-Key".into(), "ambient-global".into()),
+                    ("Cookie".into(), "secret=ambient-global".into()),
+                    ("X-Unreviewed".into(), "ambient-global".into()),
+                ])), ..Config::default() };
+                crate::plugins::providers::apply_providers(&mut live, &registry).unwrap();
+                let auth_entry = crate::plugins::providers::plugin_auth_entry(
+                    &live,
+                    "fixture-gateway",
+                )
+                .unwrap();
+                let base_url = auth_entry.base_url.unwrap();
+                assert_eq!(base_url, format!("{issuer}/v1"));
+                assert_eq!(base_url, live.base_url_for_route(&live.resolve_provider_pin_identity("fixture-gateway").unwrap()));
+                let slot = plugin_oauth_slot("fixture-gateway", &base_url, &config).unwrap();
+                let secrets = codewhale_secrets::Secrets::auto_detect();
+                let expired = PluginOAuthTokens { access_token:"private-expired-token".into(), refresh_token:Some("old-refresh".into()), expires_at:1 };
+                secrets.set(&slot, &serde_json::to_string(&expired).unwrap()).unwrap();
+                assert!(crate::config::has_api_key(&live));
+                assert!(crate::config::has_api_key_for(&live, &live.active_provider_identity().unwrap()));
+                (live, discovery, slot)
+            }).await.unwrap();
+            // Exercise the real async constructor with an already-expired
+            // stored credential: only the actual request worker may refresh.
+            let (generic_key, source) = live.active_route_api_key_with_source().unwrap();
+            assert!(generic_key.is_empty());
+            assert_eq!(source, "host-managed plugin OAuth");
+            assert!(live.active_route_api_key_read_only().unwrap().is_empty());
+            let diagnostic = live.with_read_only_api_key_for_diagnostic().unwrap();
+            assert!(diagnostic.plugin_oauth_read_only);
+            assert!(!live.plugin_oauth_read_only);
+            let diagnostic_client = CodewhaleClient::new(&diagnostic).unwrap();
+            assert!(diagnostic_client.list_models().await.is_err());
+            assert!(server.received_requests().await.unwrap().is_empty());
+            // Even a valid stored credential for an in-memory endpoint edit
+            // cannot reuse the receipt for the originally reviewed declaration.
+            let mut altered = live.clone();
+            let altered_base = format!("{}/other", server.uri());
+            let altered_entry = altered.providers.as_mut().unwrap().custom.get_mut("fixture-gateway").unwrap();
+            altered_entry.base_url = Some(altered_base.clone());
+            let altered_descriptor = altered_entry.oauth.clone().unwrap();
+            tokio::task::spawn_blocking(move || {
+                let altered_slot = plugin_oauth_slot("fixture-gateway", &altered_base, &altered_descriptor).unwrap();
+                let credential = PluginOAuthTokens { access_token:"review-bypass-token".into(), refresh_token:None, expires_at:(now_unix_secs().unwrap() as u64).saturating_add(3600) };
+                codewhale_secrets::Secrets::auto_detect().set(&altered_slot, &serde_json::to_string(&credential).unwrap()).unwrap();
+            }).await.unwrap();
+            let altered_client = CodewhaleClient::new(&altered).unwrap();
+            assert!(altered_client.list_models().await.is_err());
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let client = CodewhaleClient::new(&live).unwrap();
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let models = client.list_models().await.unwrap();
+            assert!(models.iter().any(|model| model.id == "fixture-model"));
+            let input = codewhale_models::MessageRequest {
+                model:"fixture-model".into(), messages:vec![codewhale_models::Message { role:codewhale_models::Role::User, content:vec![codewhale_models::ContentBlock::Text { text:"hello".into(), cache_control:None }] }], max_tokens:8,
+                system:None, tools:None, tool_choice:None, metadata:None, thinking:None, reasoning_effort:None, stream:Some(false), temperature:None, top_p:None,
+            };
+            client.create_message(input.clone()).await.unwrap();
+            let mut stream_input = input.clone();
+            stream_input.stream = Some(true);
+            let mut stream = client.create_message_stream(stream_input).await.unwrap();
+            let mut count = 0;
+            while let Some(event) = stream.next().await { event.unwrap(); count += 1; }
+            assert!(count > 0);
+            let refresh_started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let notify_refresh = std::sync::Arc::clone(&refresh_started);
+            Mock::given(method("POST")).and(path("/token"))
+                .and(body_string_contains("refresh_token=rotated-refresh"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    notify_refresh.notify_one();
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(2))
+                        .set_body_json(serde_json::json!({"access_token":"revoked-during-refresh", "refresh_token":"new-refresh", "expires_in":3600, "token_type":"Bearer"}))
+                })
+                .expect(1).mount(&server).await;
+            let seed_slot = slot.clone();
+            tokio::task::spawn_blocking(move || {
+                let expired = PluginOAuthTokens { access_token:"rotated-access".into(), refresh_token:Some("rotated-refresh".into()), expires_at:1 };
+                codewhale_secrets::Secrets::auto_detect().set(&seed_slot, &serde_json::to_string(&expired).unwrap()).unwrap();
+            }).await.unwrap();
+            let before_refresh = server.received_requests().await.unwrap().len();
+            let revoked_config = live.clone();
+            let revoke = async move {
+                refresh_started.notified().await;
+                tokio::task::spawn_blocking(move || {
+                let mut registry = discover_with_config(&discovery);
+                registry.disable("provider-fixture").unwrap();
+                assert!(!crate::config::has_api_key_for(&revoked_config, &revoked_config.active_provider_identity().unwrap()));
+                // Private material can remain in secure storage; receipt revocation
+                // must still prevent reuse by an already constructed client.
+                assert!(codewhale_secrets::Secrets::auto_detect().get(&slot).unwrap().is_some());
+                }).await.unwrap();
+            };
+            let (during_refresh, ()) = tokio::join!(client.list_models(), revoke);
+            assert!(during_refresh.is_err());
+            // The already-authorized refresh may complete; the model request
+            // must not leave the host after receipt revocation during that wait.
+            assert_eq!(server.received_requests().await.unwrap().len(), before_refresh + 1);
+            let before = server.received_requests().await.unwrap().len();
+            assert!(client.list_models().await.is_err());
+            // Two failures trigger the actual /models recovery probe. It must
+            // obey the same review check and make no extra network request.
+            for _ in 0..2 { assert!(client.create_message(input.clone()).await.is_err()); }
+            assert_eq!(server.received_requests().await.unwrap().len(), before);
+            for request in server.received_requests().await.unwrap() {
+                for header in ["x-api-key", "cookie", "x-unreviewed"] {
+                    assert!(!request.headers.contains_key(header));
+                }
+                assert!(request.headers.get("authorization").is_none_or(|value| value != "Bearer ambient-global"));
+            }
+            server.verify().await;
+        });
     }
 }

@@ -1,0 +1,24 @@
+{
+  "description": "A server that answers initialize with a redirect to a different origin (a second loopback server, a different port). Pins Rust McpHttpClient::execute_inner / client_for_target: the redirect is refused (the secondary origin gets no operator authority), nothing is advertised, and the second server receives no request at all, so no credential can have been forwarded to it.",
+  "server_name": "conformance",
+  "bearer_secret": "conformance-secret-token-5d08b6aa13",
+  "expect_boot": "error",
+  "record_requests": "full",
+  "sink": true,
+  "server": {
+    "initialize": {
+      "http": {
+        "status": 307,
+        "headers": {
+          "Location": "{{sink_url}}"
+        },
+        "body": ""
+      }
+    }
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    }
+  ]
+}

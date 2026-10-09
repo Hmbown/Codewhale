@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PROVIDER_LABEL_MAP } from "../scripts/facts-lib.mjs";
+import { readFileSync } from "node:fs";
 import { isRepoFacts } from "./facts";
-import { deriveFactsFromRemote, PROVIDER_LABELS, runFactsDrift } from "./facts-drift";
+import { deriveFactsFromRemote, runFactsDrift } from "./facts-drift";
 
 const REVISION = "b".repeat(40);
 
@@ -14,7 +14,7 @@ const VALID_GENERATED_FACTS =
 
 function installGitHubFixture(
   toolCountSource: string | null,
-  releaseHtmlUrl = "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+  releaseHtmlUrl = "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.0",
   sourceOverrides: Record<string, string> = {},
 ): void {
   vi.stubGlobal(
@@ -41,9 +41,15 @@ function installGitHubFixture(
       const rawPath = url.split(`/${REVISION}/`)[1];
       const sources: Record<string, string> = {
         "Cargo.toml": 'version = "0.9.2"\nmembers = ["crates/tui"]',
-        "crates/tui/src/config.rs":
-          'pub enum ApiProvider {\n    Deepseek,\n}\nconst DEFAULT_TEXT_MODEL: &str = "remote-model";',
-        "crates/tui/src/config/models.rs": "",
+        "crates/config/assets/provider_descriptors.json": JSON.stringify({
+          schema_version: 3,
+          providers: [{ kind: "Deepseek", id: "deepseek", label: "Remote DeepSeek", default_model: "remote-model", env_vars: ["REMOTE_KEY"], retired: false, selectable: true, web: { order: 0 }, tui_wire_tag: "deepseek", catalog_id: "deepseek", catalog_source_id: "deepseek" }],
+          constant_refs: { DEFAULT_TEXT_MODEL: { provider: "deepseek", field: "default_model" } },
+        }),
+        "crates/config/assets/models_dev.bundled.json": JSON.stringify({ _reviewed: {
+          revision: "remote-reviewed", intrinsic: { "deepseek-v4-pro": { source: "exact remote fixture", context_window: 1000000, max_output: 128000, reasoning: true } },
+          public_models: [{ id: "deepseek-v4-pro", label: "DeepSeek", added_at: "2026-07-01", aliases: [] }],
+        } }),
         "crates/tui/src/sandbox/mod.rs": `
           pub const PUBLIC_SANDBOX_BACKENDS: &[&str] = &[
             "seatbelt (macOS, when available)",
@@ -82,6 +88,8 @@ describe("deriveFactsFromRemote", () => {
     expect(facts?.sourceRevision).toBe(REVISION);
     expect(facts?.version).toBe("0.9.2");
     expect(facts?.toolCount).toBe(73);
+    expect(facts?.defaultModel).toBe("remote-model");
+    expect(facts?.providers).toEqual([{ id: "deepseek", label: "Remote DeepSeek", env: "REMOTE_KEY" }]);
     expect(facts?.models).toEqual([
       {
         id: "deepseek-v4-pro",
@@ -102,30 +110,38 @@ describe("deriveFactsFromRemote", () => {
     ).toBe(false);
   });
 
+  it("refuses missing, malformed or incompatible exact-revision provider metadata", async () => {
+    for (const metadata of ["not json", "{}", '{"schema_version":1,"providers":[]}']) {
+      installGitHubFixture(VALID_GENERATED_FACTS, undefined, {
+        "crates/config/assets/provider_descriptors.json": metadata,
+      });
+      await expect(deriveFactsFromRemote()).resolves.toBeNull();
+    }
+  });
+
   it("fails derivation when the exact revision has no valid tool count", async () => {
     installGitHubFixture(null);
 
     await expect(deriveFactsFromRemote()).resolves.toBeNull();
   });
 
-  it("fails derivation when the exact revision has malformed model rows", async () => {
-    installGitHubFixture(
-      'export const FACTS: RepoFacts = {"toolCount":73,"models":[{"id":42}]};',
-    );
-
-    await expect(deriveFactsFromRemote()).resolves.toBeNull();
+  it("refuses missing or malformed model metadata from the exact source revision", async () => {
+    for (const catalog of ["not json", "{}", '{"_reviewed":{"revision":"x","intrinsic":{},"public_models":[{"id":42}]}}']) {
+      installGitHubFixture(VALID_GENERATED_FACTS, undefined, { "crates/config/assets/models_dev.bundled.json": catalog });
+      await expect(deriveFactsFromRemote()).resolves.toBeNull();
+    }
   });
 
   it("stores a canonical release URL when GitHub answers with the repo's other casing", async () => {
     installGitHubFixture(
       VALID_GENERATED_FACTS,
-      "https://github.com/Hmbown/Codewhale/releases/tag/v0.9.0",
+      "https://github.com/codewhale-hq/Codewhale/releases/tag/v0.9.0",
     );
 
     const facts = await deriveFactsFromRemote();
 
     expect(facts?.latestPublishedRelease?.url).toBe(
-      "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+      "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.0",
     );
     expect(isRepoFacts(facts)).toBe(true);
   });
@@ -135,7 +151,7 @@ describe("runFactsDrift", () => {
   it("writes a KV snapshot that getFacts() accepts", async () => {
     installGitHubFixture(
       VALID_GENERATED_FACTS,
-      "https://github.com/Hmbown/Codewhale/releases/tag/v0.9.0",
+      "https://github.com/codewhale-hq/Codewhale/releases/tag/v0.9.0",
     );
     const store = new Map<string, string>();
     const kv = {
@@ -192,9 +208,23 @@ describe("runFactsDrift", () => {
   });
 });
 
-describe("PROVIDER_LABELS", () => {
-  it("matches the build-time PROVIDER_LABEL_MAP, so cron snapshots keep every provider", () => {
-    expect(Object.keys(PROVIDER_LABEL_MAP).length).toBeGreaterThan(0);
-    expect(PROVIDER_LABELS).toEqual(PROVIDER_LABEL_MAP);
+describe("complete remote provider roster", () => {
+  it("keeps all public providers with the labels and credentials from that exact revision", async () => {
+    const metadata = JSON.parse(readFileSync(new URL("../../crates/config/assets/provider_descriptors.json", import.meta.url), "utf8"));
+    for (const row of metadata.providers) {
+      if (row.web && !row.retired) {
+        row.web.label = `Pinned ${row.id}`;
+        row.web.env = `PINNED_${row.id}`;
+      }
+    }
+    installGitHubFixture(VALID_GENERATED_FACTS, undefined, {
+      "crates/tui/src/config.rs": readFileSync(new URL("../../crates/tui/src/config.rs", import.meta.url), "utf8"),
+      "crates/config/assets/provider_descriptors.json": JSON.stringify(metadata),
+    });
+    const facts = await deriveFactsFromRemote();
+    expect(facts?.sourceRevision).toBe(REVISION);
+    expect(facts?.providers).toHaveLength(50);
+    expect(new Set(facts?.providers.map(row => row.id)).size).toBe(50);
+    expect(facts?.providers.every(row => row.label === `Pinned ${row.id}` && row.env === `PINNED_${row.id}`)).toBe(true);
   });
 });

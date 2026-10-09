@@ -27,7 +27,7 @@ Use `request_access` to inspect readiness; a loaded plugin alone does not prove
 its OS permissions work.
 
 When the standalone Computer Use helper is registered, it owns local input
-even when Codewhale carries an embedded native helper. Version 0.12.0 keeps its
+even when Codewhale carries an embedded native helper. Version 0.12.1 keeps its
 whale menu, permission setup, disposable background check and human
 Pause/Stop controls, and retires the daemon when its native owner disappears. A registered helper that cannot start causes a clear
 error; the client does not silently bypass its controls. Without a registered
@@ -97,7 +97,8 @@ Arbitrary background dragging remains unavailable. Rebuild Core to include
 the updated native helper; updating a separate marketplace checkout alone
 does not update an already-installed Core binary.
 
-This embedded source matches canonical 9a261c4. Windows controlled-desktop
+The canonical runtime revision is recorded in `../computer-use.upstream-sha`;
+this guide and package identity are specific to the Engine bundle. Windows controlled-desktop
 acceptance passed in upstream CI; signed Windows distribution, mixed-DPI/raw
 input and continuous keyboard coexistence remain unqualified. Core discovery
 and materialization tests do not constitute an installed model-driven trial.

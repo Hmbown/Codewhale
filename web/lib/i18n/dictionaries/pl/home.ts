@@ -1,115 +1,134 @@
 import type { HomeDict } from "../types";
 
-/**
- * Polish home dictionary — native copy for the Tidal Folio landing page,
- * in the current direction: your models, more capable together; agents
- * and control on your own machine; availability stated per surface as it
- * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
- * Auto-Review / Full Access, Codewhale, TUI, codewhale exec, Fleet).
- */
+/** Polish home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale — Twórz i automatyzuj z wybranymi przez siebie modelami",
+  metaTitle: "Codewhale: twórz z własnymi modelami i narzędziami",
   metaDescription:
-    "Twórz oprogramowanie, pracuj ze swoimi plikami i automatyzuj codzienne zadania za pomocą agentów z otwartym kodem i wybranych przez siebie hostowanych lub lokalnych modeli AI.",
-  heroTitle: "Twórz i automatyzuj z wybranymi przez siebie modelami",
+    "Twórz aplikacje, automatyzuj pracę i korzystaj z połączonych narzędzi w Codewhale. Otwarty kod, własne API modeli oraz lokalne lub samodzielnie hostowane wnioskowanie.",
+  heroTitle: "Twórz aplikacje i automatyzuj swoją pracę.",
   heroIntro:
-    "{brand} daje Ci agentów, którzy mogą tworzyć oprogramowanie, pracować z Twoimi plikami i zamieniać powtarzalne zadania w przepływy pracy, z których można korzystać wielokrotnie. Powiedz, co chcesz osiągnąć, i wybierz hostowane lub lokalne modele odpowiednie do zadania, z możliwością zmiany dostawców w trakcie pracy.",
-  getCodewhale: "Pobierz Codewhale",
+    "{brand} to agent open source, który pisze kod, uruchamia polecenia i pracuje z narzędziami, które podłączysz. Korzystaj z używanych już API modeli lub uruchamiaj modele lokalnie i na własnych serwerach.",
+  getCodewhale: "Zainstaluj Codewhale",
   heroInstallAria: "Polecenie instalacji",
-  exploreProduct: "Poznaj produkt",
+  exploreProduct: "Poznaj Codewhale",
   shotPreview: "Podgląd terminala",
-  shotBuild: "kompilacja deweloperska v{version}",
   screenshotAlt:
-    "Codewhale v{version}, kompilacja deweloperska: wieloryb, nowa sesja, pole wiadomości, uprawnienia Ask, tryb Work i stan modelu. Obraz rzeczywistego wyjścia odizolowanego terminala.",
+    "Codewhale v{version}: zrzut terminala z rozmową, polem wiadomości i kontrolkami sesji.",
   latestRelease: "Najnowsze wydanie {tag}",
   releaseUnavailable: "Status wydania niedostępny",
   currentSource: "Źródło",
   sourceCandidate: "Niewydane",
   publishedRelease: "wydane",
-  figcaptionSourceCandidate: "niewydane",
-  chapterTerminal: "Twój terminal",
-  chapterTerminalTitle: "Zacznij od tego, co chcesz stworzyć",
-  gainHeading:
-    "Co możesz zrobić z Codewhale",
+  gainHeading: "Co możesz zrobić",
   gainLede:
-    "Zacznij od projektu, pytania albo zadania, które chcesz zautomatyzować, a następnie pracuj z jednym agentem lub przydziel części większej pracy kilku agentom.",
+    "Opisz, co chcesz stworzyć lub zautomatyzować. Codewhale może edytować pliki, uruchamiać polecenia i sprawdzać wyniki, a Ty kontrolujesz jego dostęp.",
   gain: [
     [
-      "Stwórz coś",
-      "Opisz, co chcesz stworzyć, i pracuj z agentami, którzy mogą czytać Twój kod, edytować pliki, uruchamiać polecenia i sprawdzać wynik."
+      "Twórz aplikacje i narzędzia",
+      "Stwórz aplikację, dodaj funkcję lub napisz skrypt. Codewhale może pracować z plikami projektu, uruchamiać kod i testować to, co tworzy."
     ],
     [
-      "Automatyzuj codzienną pracę",
-      "Twórz skrypty i przepływy pracy dla powtarzających się zadań, aby móc ponownie uruchamiać je z terminala, gdy tylko będą potrzebne."
+      "Automatyzuj powtarzalną pracę",
+      "Uruchamiaj przepływy pracy z terminala, skryptów lub CI. Przy większych zadaniach deleguj części pracy zespołowi Fleet złożonemu z agentów korzystających z różnych modeli."
     ],
     [
-      "Pracuj z różnymi modelami",
-      "Korzystaj z hostowanych lub lokalnych modeli dla swoich agentów i dobieraj różne modele oraz role do odpowiednich części zadania."
+      "Połącz swoje narzędzia",
+      "Dodawaj narzędzia przez wtyczki i serwery MCP lub korzystaj z API we własnych skryptach. Każda usługa wymaga osobnej konfiguracji i uwierzytelnienia."
     ]
   ],
   chapterModels: "Twoje modele",
-  modelsHeading: "Wybór modeli do każdego zadania",
+  modelsHeading: "Używaj wybranych przez siebie modeli",
   modelsBody:
-    "Połącz się bezpośrednio z dostawcą modeli hostowanych, użyj bramki, by korzystać z kilku dostawców, lub uruchom model lokalnie, a następnie wybieraj w trakcie pracy model dla każdej sesji.",
+    "Połącz konta dostawców, endpoint zgodny z OpenAI albo modele lokalne i utrzymywane na własnej infrastrukturze. Wybierz model dla sesji i dla każdego agenta w zespole Fleet.",
   modelsFacts: [
-    ["Hostowane", "Twój własny klucz API zapisany przez codewhale auth set --provider <id>"],
-    ["Bramka", "Jeden endpoint do wielu modeli, dostawcę nadal wybierasz Ty"],
-    ["Lokalne", "vLLM, SGLang, Ollama na localhost — zwykle bez klucza"],
-  ],
-  modelsLink: "Poznaj modele i dostawców",
-  startHeading: "Pierwsze kroki z Codewhale",
-  startLede:
-    "Po zainstalowaniu Codewhale i podłączeniu modelu możesz opisać pierwsze zadanie w terminalu, a gdy zechcesz rozdzielić pracę między kilku agentów, dodać Fleet.",
-  startGuideLink: "Przeczytaj przewodnik na start",
-  startVocabularyLink: "Zobacz słownik produktu",
-  chapterAvailability: "Gdzie działa",
-  availabilityHeading: "Gdzie możesz korzystać z Codewhale",
-  availabilityLede:
-    "Możesz już dziś korzystać z Codewhale w terminalu, a my pracujemy nad aplikacją webową, aplikacją desktopową i komputerami w chmurze.",
-  availability: [
     [
-      "Terminal",
-      "Wydany",
-      "Gotowe pliki binarne z wydań GitHub dla systemów Linux, macOS i Windows; npm i Cargo to alternatywy. Android w Termux to wersja podglądowa."
+      "Twoje konta API",
+      "Połącz OpenAI, Anthropic, Google lub DeepSeek za pomocą własnych kluczy."
     ],
     [
-      "Aplikacja webowa",
+      "Twoja brama",
+      "Użyj punktu końcowego zgodnego z OpenAI i wybierz oferowane przez niego modele."
+    ],
+    [
+      "Twoje wnioskowanie",
+      "Uruchamiaj modele lokalne lub samodzielnie hostowane przez Ollama, vLLM lub SGLang."
+    ]
+  ],
+  modelsLink: "Przeglądaj modele i dostawców",
+  startHeading: "Jak zacząć",
+  startLede:
+    "Zainstaluj Codewhale, połącz model i otwórz folder projektu. W razie potrzeby możesz dodać wtyczki i kolejnych agentów.",
+  startGuideLink: "Skorzystaj z przewodnika na start",
+  startVocabularyLink: "Zobacz słownik produktu",
+  chapterAvailability: "Gdzie działa",
+  availabilityHeading: "Dostępne teraz i w fazie rozwoju",
+  availabilityLede:
+    "Terminal i lokalny klient przeglądarkowy są dostępne. Natywna aplikacja desktopowa i przebudowana aplikacja webowa są w trakcie rozwoju.",
+  availability: [
+    [
+      "Terminal i lokalna przeglądarka",
+      "Wydany",
+      "Zainstaluj w systemie Linux, macOS lub Windows, a następnie uruchom codewhale albo codewhale web, aby otworzyć lokalnego klienta w przeglądarce. Działają też npm i Cargo; Android w Termux to wersja podglądowa."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Dostępny",
+      "Osobny projekt utrzymywany przez społeczność: czat, wątki i zmiany plików w panelu bocznym VS Code na tym samym Codewhale Runtime. Zainstaluj z VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
+    ],
+    [
+      "Hostowana aplikacja webowa",
       "Podgląd deweloperski",
-      "Dostęp do konta i parowanie z przeglądarką w podglądzie deweloperskim."
+      "Budowana od nowa według wzoru aplikacji desktopowej. Dziś możesz się zalogować i wpisać /rc w działającej sesji terminala, aby kontynuować ją w przeglądarce; wykonywanie zadań w chmurze jest nadal weryfikowane."
     ],
     [
       "Aplikacja desktopowa",
       "Kompilacja deweloperska",
-      "Aplikacja na macOS jest w przygotowaniu; publiczna wersja do pobrania pojawi się później."
+      "Natywna aplikacja, która staje się głównym klientem Codewhale: foldery, rozmowy i połączenia z modelami w jednym oknie. Publiczna wersja do pobrania nie jest jeszcze dostępna."
     ],
     [
       "Komputery w chmurze",
       "W przygotowaniu",
-      "Komputery w chmurze do wykonywania Twoich zadań."
+      "Komputery w chmurze, które wykonują Twoje zadania."
     ]
   ],
   availabilityNote:
-    "Możesz korzystać z terminala bez konta Codewhale, a opłaty za użycie modeli hostowanych nalicza Twój dostawca.",
+    "Terminal, lokalna przeglądarka i GUI nie wymagają konta Codewhale. Hostowana wersja webowa i aplikacja desktopowa korzystają z konta. Jeśli używasz własnego klucza dostawcy, opłaty za to użycie nalicza ten dostawca.",
   accountLink: "Załóż konto",
-  surfacesHeading: "Sposoby pracy z Codewhale",
+  surfacesHeading: "Pracuj z plikami i narzędziami",
   surfaces: [
-    ["TUI", "Interaktywna praca w terminalu"],
-    ["codewhale exec", "Skrypty i CI"],
-    ["Lokalny klient webowy","Interfejs na localhost; hostowane środowisko pracy w przeglądarce jest w przygotowaniu"],
-    ["Runtime API + MCP", "Lokalne integracje"],
-    ["Fleet","Kilku agentów przy jednym zadaniu"],
+    [
+      "Pliki i terminal",
+      "Twórz pliki, uruchamiaj polecenia, analizuj dane i testuj rezultaty. Ty określasz katalog roboczy i uprawnienia."
+    ],
+    [
+      "Wtyczki i połączone aplikacje",
+      "Dodawaj umiejętności i narzędzia przez wtyczki i MCP. Sprawdzaj i włączaj połączenia, z których ma korzystać agent."
+    ],
+    [
+      "Przeglądarka i komputer · podgląd",
+      "Używaj narzędzi przeglądarkowych i wtyczki Computer Use w aplikacjach i witrynach w granicach przyznanego dostępu."
+    ],
+    [
+      "Sesje, do których wrócisz",
+      "Zachowuj razem rozmowę, wyniki narzędzi i historię pracy. Wznawiaj zadanie w terminalu lub lokalnym kliencie przeglądarkowym."
+    ],
+    [
+      "Zespoły agentów",
+      "Podziel duże zadanie w Fleet między agentów z różnymi rolami i modelami. Śledź ich postępy w jednym miejscu."
+    ]
   ],
-  runtimeLink: "Poznaj integracje",
-  installBandHeading: "Zainstaluj Codewhale w systemie macOS lub Linux",
+  runtimeLink: "Poznaj narzędzia i integracje",
+  installBandHeading: "Zainstaluj w systemie macOS lub Linux",
   copy: "Kopiuj",
   copied: "Skopiowano ✓",
   binaries: "Binarki",
   chinaMirrors: "Mirrory w Chinach",
   installGuideLink: "Przeczytaj przewodnik instalacji",
-  communityHeading: "Pomóż ulepszać Codewhale",
+  communityHeading: "Współtwórz Codewhale",
   communityBody:
-    "Niezależnie od tego, czy udało Ci się znaleźć błąd, masz pomysł na funkcję, czy chcesz przesłać swój pierwszy pull request, chętnie Cię wysłuchamy i wspólnie popracujemy nad dalszym rozwojem.",
+    "Zgłoś błąd, popraw dokumentację lub dodaj kod na GitHubie. Możesz też tworzyć wtyczki i dzielić się przepływami pracy z innymi użytkownikami.",
   communityLinksAria: "Linki społeczności",
-  contribute: "Wyślij pull request",
+  contribute: "Współtwórz na GitHubie",
 };

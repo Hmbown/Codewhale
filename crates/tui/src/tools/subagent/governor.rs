@@ -23,7 +23,7 @@
 //!    oscillation a symmetric controller would show.
 //!
 //! Retries themselves stay in the LLM call path (see
-//! `request_subagent_model_response_with_retries`): the governor never
+//! the canonical Engine model-step dispatch): the governor never
 //! delays an in-flight call, it only decides whether *new* launches may be
 //! admitted. `QuotaExhausted` is deliberately not reported — quota is a
 //! billing condition, not a transient throttle, and must keep following the

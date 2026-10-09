@@ -13,7 +13,12 @@ fn app_with_open_picker(root: &std::path::Path) -> (App, Config) {
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let mut config = Config::default();
-    config.set_provider_api_key_override(ApiProvider::Deepseek, Some("fixture-key".into()));
+    config
+        .set_provider_api_key_override(
+            &config.test_identity_for_kind(ProviderKind::Deepseek),
+            Some("fixture-key".into()),
+        )
+        .unwrap();
     let mut app = App::new(crate::test_support::test_tui_options(&workspace), &config);
     app.workspace = workspace;
     let picker = ModelPickerView::new(&app, &config);

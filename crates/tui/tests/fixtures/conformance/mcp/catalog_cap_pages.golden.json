@@ -1,0 +1,15 @@
+{
+  "server_received": [],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": {
+        "err": "conformance: MCP server 'conformance' discovery failed: tools/list exceeded the 64-page catalogue limit"
+      }
+    },
+    {
+      "op": "catalog",
+      "tools": []
+    }
+  ]
+}

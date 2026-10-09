@@ -1,0 +1,32 @@
+{
+  "direction": "core_to_host",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "method": "ext/activate",
+    "params": {
+      "owner": {
+        "plugin_id": "user/ab12cd34/greeter",
+        "generation": 4,
+        "owner_token": "5f0c6a3e9b2d4c1a8e7f60123456789a"
+      },
+      "plugin_name": "greeter",
+      "entry": {
+        "path": "/home/u/.codewhale/plugins/.runtime/x/index.mjs",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "config": {
+        "greeting": "Hello",
+        "limit": 3,
+        "nested": {
+          "tags": [
+            "a",
+            "b"
+          ]
+        }
+      },
+      "data_dir": "/home/u/.codewhale/extension-host/data/plugins/greeter-0a1b2c3d4e5f"
+    }
+  }
+}

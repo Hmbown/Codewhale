@@ -67,7 +67,7 @@ pub(crate) fn record(app: &mut App, approval_id: &str, request: PendingChildRequ
 /// wait): forget it and retire its card wherever it sits in the stack.
 pub(crate) fn resolve(app: &mut App, approval_id: &str) -> bool {
     let known = app.pending_child_requests.remove(approval_id).is_some();
-    let removed_card = app.view_stack.remove_approval_by_id(approval_id);
+    let removed_card = app.view_stack.remove_tool_decision_by_id(approval_id);
     if known || removed_card {
         app.needs_redraw = true;
     }
@@ -85,7 +85,7 @@ pub(crate) fn retire(app: &mut App, approval_id: &str) -> bool {
     retired || withdrawn
 }
 
-/// Child-approval bookkeeping for one engine event, run before any session
+/// Approval retirement and child bookkeeping, run before any session
 /// or idle filter (approvals M1, minor 4):
 ///
 /// - agent lifecycle events record which conversation owns each agent, so a
@@ -94,11 +94,16 @@ pub(crate) fn retire(app: &mut App, approval_id: &str) -> bool {
 ///   waiting ends that wait by identity — answered anywhere, cancelled,
 ///   stopped — whatever conversation is active. The engine sends it without
 ///   back-pressure drops.
+/// - a typed withdrawal retires any approval card and its web mirror by id.
 ///
-/// Returns `true` when the event was only a withdrawal for an agent that has
-/// already ended (terminal status): nothing else should process it.
+/// Returns `true` when the event only retires a request: nothing else should
+/// process it.
 pub(crate) fn observe_engine_event(app: &mut App, event: &EngineEvent) -> bool {
     match event {
+        EngineEvent::ApprovalWithdrawn { id } => {
+            retire(app, id);
+            true
+        }
         EngineEvent::AgentSpawned {
             owner_session_id,
             id,
@@ -180,7 +185,7 @@ pub(crate) fn clear_all(app: &mut App) {
 /// One footer row per agent that is waiting on the person and whose card is
 /// not the view on top: "Approval needed in {agent} — /agents".
 pub(crate) fn footer_rows(app: &App) -> Vec<String> {
-    let top = app.view_stack.top_approval_id();
+    let top = app.view_stack.top_tool_decision_id();
     let mut agents: Vec<&str> = Vec::new();
     for (id, request) in &app.pending_child_requests {
         if top == Some(id.as_str()) || agents.contains(&request.agent_id.as_str()) {
@@ -214,7 +219,7 @@ pub(crate) fn repush_for_agent(
         .pending_child_requests
         .iter()
         .filter(|(id, request)| {
-            request.agent_id == agent_id && !app.view_stack.contains_approval_id(id)
+            request.agent_id == agent_id && !app.view_stack.contains_tool_decision_id(id)
         })
         .map(|(id, request)| (id.clone(), request.clone()))
         .collect();

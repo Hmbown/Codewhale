@@ -939,10 +939,14 @@ pub(crate) fn codewhale_route_identity(
     config: &crate::config::Config,
     workspace: &Path,
 ) -> Result<CodewhaleRouteIdentity, String> {
-    let provider = config.api_provider();
+    let identity = config.active_provider_identity()?;
+    let provider = identity.provider;
     let configured_model = config.default_model();
-    let route =
-        crate::route_runtime::resolve_runtime_route(config, provider, Some(&configured_model))?;
+    let route = crate::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        &identity,
+        Some(&configured_model),
+    )?;
     let candidate = &route.candidate;
     let base_url = candidate.endpoint().base_url.clone();
     let protocol = match candidate.protocol() {
@@ -953,10 +957,18 @@ pub(crate) fn codewhale_route_identity(
         }
     };
     let keyless_local = crate::config::provider_route_is_keyless_self_hosted(provider, &base_url);
-    let api_key_env = provider.env_vars().first().map(|s| (*s).to_string());
+    let api_key_env = provider
+        .provider()
+        .env_vars()
+        .first()
+        .map(|s| (*s).to_string());
     Ok(CodewhaleRouteIdentity {
         provider_id: candidate.provider_id().as_str().to_string(),
-        provider_label: provider.display_name().to_string(),
+        provider_label: route
+            .identity
+            .compatibility()
+            .map_or(route.identity.key.as_str(), |row| row.label)
+            .to_string(),
         model: candidate.wire_model_id().as_str().to_string(),
         base_url,
         protocol,

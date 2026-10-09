@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ use super::types::{
     LoadedPlugin, PluginAuthority, PluginDiagnostic, PluginDiagnosticLevel, PluginId,
     PluginTrustStatus,
 };
+
+pub(crate) mod gc;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_REVIEW_HISTORY: usize = 32;
@@ -75,12 +77,110 @@ pub struct PluginRegistry {
     workspace: PathBuf,
     discovery_context: Option<std::sync::Arc<super::context::PluginDiscoveryContext>>,
     catalog_stamp: super::discovery::PluginCatalogStamp,
+    /// Ephemeral caller binding, never persisted in plugin state.
+    caller_selection: Option<crate::extension_host::composition_scope::SelectionRevision>,
+    selected_native_entries: Vec<crate::extension_host::composition_scope::NativePresetRef>,
+    /// Catalog-only Native owners with no upstream default. Ephemeral caller
+    /// selection data; an empty entry list must not broaden these owners.
+    unselected_native_catalogs: BTreeSet<String>,
 }
 
 impl PluginRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn caller_selection(
+        &self,
+    ) -> Option<crate::extension_host::composition_scope::SelectionRevision> {
+        self.caller_selection
+    }
+    pub(crate) fn bind_caller(
+        &self,
+        revision: crate::extension_host::composition_scope::SelectionRevision,
+    ) -> Self {
+        let mut view = self.clone();
+        view.caller_selection = Some(revision);
+        view
+    }
+    pub(crate) fn selected_native_entries(
+        &self,
+    ) -> &[crate::extension_host::composition_scope::NativePresetRef] {
+        &self.selected_native_entries
+    }
+    /// Keep a narrowed selector across rediscovery even when its receipt is now
+    /// invalid. Desired-owner admission then withdraws it; failure must never
+    /// widen this caller back to every Native entry.
+    pub(crate) fn retain_native_selection_from(&self, previous: &Self) -> Self {
+        let mut view = self.clone();
+        if !previous.selected_native_entries.is_empty()
+            || !previous.unselected_native_catalogs.is_empty()
+        {
+            view.selected_native_entries = previous.selected_native_entries.clone();
+            view.unselected_native_catalogs = previous.unselected_native_catalogs.clone();
+        }
+        view
+    }
+
+    pub(crate) fn native_catalog_requires_selection(&self, plugin_id: &str) -> bool {
+        self.unselected_native_catalogs.contains(plugin_id)
+    }
+
+    pub(crate) fn native_entry_selected(&self, plugin_id: &str, path: &str, sha256: &str) -> bool {
+        if self.unselected_native_catalogs.contains(plugin_id) {
+            return false;
+        }
+        if self.selected_native_entries.is_empty() {
+            return true;
+        }
+        self.selected_native_entries.iter().any(|selected| {
+            selected.plugin_id == plugin_id
+                && selected.entry.path == path
+                && selected.entry.sha256 == sha256
+                && self
+                    .get(plugin_id)
+                    .is_some_and(|plugin| plugin.content_hash == selected.content_hash)
+        })
+    }
+
+    /// Select one reviewed Native inventory entry. No additional Agent capability.
+    pub(crate) fn with_native_preset(
+        &self,
+        selected: crate::extension_host::composition_scope::NativePresetRef,
+    ) -> Result<Self, String> {
+        let (sources, _) =
+            super::runtime::active_component_sources(self, PluginActivationCapability::Native);
+        let source = sources
+            .into_iter()
+            .find(|source| {
+                source.authority.plugin_id.as_str() == selected.plugin_id
+                    && source.authority.content_hash == selected.content_hash
+                    && source.path.to_string_lossy() == selected.entry.path
+            })
+            .ok_or("Native preset is not in the current reviewed inventory")?;
+        if let Some(problem) = super::runtime::native_entry_problem(&source.path, true) {
+            return Err(problem.into());
+        }
+        let file = super::manifest::open_bundle_file(&source.path)
+            .map_err(|_| "Native preset cannot be opened")?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Native preset cannot be read")?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err("Native preset entry exceeds the bundle limit".into());
+        }
+        if crate::hashing::sha256_hex(&bytes) != selected.entry.sha256 {
+            return Err("Native preset bytes changed".into());
+        }
+        let mut view = self.clone();
+        view.caller_selection = None;
+        view.unselected_native_catalogs.remove(&selected.plugin_id);
+        view.selected_native_entries
+            .retain(|entry| entry.plugin_id != selected.plugin_id);
+        view.selected_native_entries.push(selected);
+        Ok(view)
     }
 
     /// Construct a fail-closed registry for a workspace without consulting
@@ -146,6 +246,9 @@ impl PluginRegistry {
             workspace,
             discovery_context,
             catalog_stamp,
+            caller_selection: None,
+            selected_native_entries: Vec::new(),
+            unselected_native_catalogs: BTreeSet::new(),
         };
         for plugin in plugins {
             registry.register_loaded(plugin);
@@ -220,6 +323,12 @@ impl PluginRegistry {
                     }
                 }
             }
+        }
+        if self.selected_native_entries.is_empty() && self.unselected_native_catalogs.is_empty() {
+            (
+                self.selected_native_entries,
+                self.unselected_native_catalogs,
+            ) = super::native_presets::default_selection(self);
         }
     }
 
@@ -672,6 +781,10 @@ impl PluginRegistry {
         mutate(&mut next)?;
         save_state(path, &next)?;
         self.state = next;
+        // Runtime selection rechecks the persisted review through its own
+        // read lock. Publish the completed state transaction before deriving
+        // that view; retaining the writer here would deadlock on enable.
+        drop(_guard);
         self.apply_state();
         Ok(())
     }
@@ -851,6 +964,7 @@ fn persist_plugin_state_with_directory_sync(
 #[cfg(windows)]
 fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Foundation::WIN32_ERROR;
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileAttributesW,
@@ -878,14 +992,35 @@ fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Resul
         format!("failed to prepare private plugin state temp file for publication: {error}")
     })?;
 
+    // The state lock serializes writers, but not everything that opens the
+    // stable file: another registry re-applies the state directory's
+    // inheritable ACL before it takes that lock, and Defender or the indexer
+    // can scan the file. Each holds the destination only briefly, and
+    // MoveFileExW then reports a refusal that clears on its own. Re-attempt
+    // only the rename, on the schedule the other atomic writers share; the
+    // hardened temporary and the stable file are both left untouched.
+    let mut attempt = 0;
     // SAFETY: both paths are NUL-terminated and live.
-    if let Err(error) = unsafe {
+    while let Err(error) = unsafe {
         MoveFileExW(
             PCWSTR::from_raw(temporary_wide.as_ptr()),
             PCWSTR::from_raw(destination_wide.as_ptr()),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     } {
+        // MoveFileExW reports an HRESULT; the shared classifier reads the
+        // Win32 code it wraps.
+        let backoff = WIN32_ERROR::from_error(&error).and_then(|code| {
+            crate::utils::windows_publish_retry_delay(
+                &std::io::Error::from_raw_os_error(code.0 as i32),
+                attempt,
+            )
+        });
+        if let Some(backoff) = backoff {
+            std::thread::sleep(backoff);
+            attempt += 1;
+            continue;
+        }
         // Restore tempfile's cleanup hint on the still-private source. The
         // stable state path remains untouched when MoveFileExW fails.
         // SAFETY: `temporary_wide` is NUL-terminated and live.
@@ -1264,15 +1399,20 @@ fn builtin_predecessor<'a>(
         .filter(|entry| entry.trust.is_some())
 }
 
-fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+/// Directory name of a plugin id's runtime snapshots under `.runtime/v2`.
+fn runtime_stage_key(id: &PluginId) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codewhale-plugin-stage-v2\0");
     hasher.update(id.as_str().as_bytes());
-    let key = hasher
+    hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+        .collect::<String>()
+}
+
+fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+    let key = runtime_stage_key(id);
     let state_parent = state_path.parent().unwrap_or_else(|| Path::new("."));
     let state_parent = state_parent
         .canonicalize()
@@ -2758,6 +2898,42 @@ mod windows_acl_tests {
             b"old-authoritative-state"
         );
         drop(retained);
+    }
+
+    #[test]
+    fn transient_state_replacement_contention_is_retried() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        std::fs::write(&state_path, b"old-authoritative-state").unwrap();
+        // FILE_SHARE_READ alone omits delete sharing: the short-lived handle a
+        // concurrent ACL pass or scanner holds on the stable file.
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&state_path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(retained);
+        });
+
+        save_state_with_hardener(
+            &state_path,
+            &PluginStateFile::default(),
+            harden_plugin_state_file,
+        )
+        .expect("retry contended plugin state replacement");
+
+        release.join().unwrap();
+        let published = std::fs::read_to_string(&state_path).unwrap();
+        assert!(published.contains("\"schema_version\": 1"));
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("state.json")]);
     }
 
     #[test]

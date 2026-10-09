@@ -1,6 +1,6 @@
 # Installing Codewhale
 
-> 阅读简体中文版：[zh_hans/INSTALL.md](zh_hans/INSTALL.md) (not yet updated for this revision)
+> 阅读简体中文版：[zh_hans/INSTALL.md](zh_hans/INSTALL.md)
 
 Codewhale is an open-source coding agent that runs in your terminal. You give
 it a task ("fix the failing test", "add a CLI flag"). It reads your repository,
@@ -11,9 +11,9 @@ works with many model providers. **DeepSeek** is the default.
 
 The command is `codewhale`. `codew` is a shorter alias for the same program.
 
-This guide was written by installing **v0.10.0** (released 2026-09-22) on a
-fresh **Ubuntu 24.04 x86_64** machine, on every path described here. Every
-command shown was run and its output checked (see the [install receipts](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)). Steps that
+The installation paths were first checked with **v0.10.0** (released 2026-09-22) on a
+fresh **Ubuntu 24.04 x86_64** machine. The dated
+[install receipts](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md) record the commands and output checked at that time. Steps that
 could not be run on that machine are marked **(untested on this VM: reason)**.
 macOS, Windows and Android are out of scope, apart from a few notes. A second
 pass re-ran the installer, manual-download, archive and npm paths, the no-key
@@ -23,9 +23,53 @@ there.
 
 Install commands that use `latest` resolve to the latest **published** GitHub
 Release or package. Between releases, `main` may already describe the next
-version (for example a v0.10.1 source candidate before its tag). A
-candidate isn't installable until its tag, checksums and release assets
-exist.
+version (for example a v0.10.2 source candidate before its tag). A
+prebuilt candidate is available through the official installer only after its
+tag, checksums and release assets exist. Contributors can build `main` now.
+
+## One account for your provider keys
+
+[Register](https://app.codewhale.net/register) or [sign in](https://app.codewhale.net/login)
+to keep your model providers' API keys in one place. Add, replace or remove
+keys in your account's [Providers settings](https://app.codewhale.net/providers),
+or use the terminal commands below. On another device, sign in and select the
+Codewhale model route to use the same account keys without pasting them again.
+
+```bash
+codewhale login
+codewhale account keys set deepseek  # asks for the key without echoing it
+codewhale account keys list         # shows status, never the key itself
+codewhale --provider codewhale      # use your account's model route
+```
+
+The account setup here describes the 0.10.1 source candidate. Signing in does
+not upload existing local keys. To copy one deliberately, use
+`codewhale account keys set deepseek --from-local`. Account keys stay on the
+service; they are used for account-routed requests, not downloaded into each
+device's local key store. You can keep using local keys or a local model
+without an account. See [account key settings](CONFIGURATION.md#account-provider-keys)
+for updating keys and switching between these options.
+
+## Test and contribute to current source
+
+`latest` selects the latest published release. To test unreleased repairs,
+build canonical GitHub `main`, or CNB `main` after verifying its commit matches.
+The source version number alone does not establish a published package.
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/CodeWhale.git
+cd CodeWhale
+cargo build --release --locked -p codewhale-cli
+target/release/codewhale --version
+```
+
+See the Cargo section for build prerequisites; use the repository's stable Rust
+selection (declared minimum 1.89). Windows uses `target/release/codewhale.exe`
+and needs MSVC. A development build is separate from a signed release package.
+For mainland-China downloads and source validation, see [CNB mirror](CNB_MIRROR.md).
+The [Tencent Lighthouse bootstrap](../scripts/tencent-lighthouse/README.md) is
+bilingual. An npm registry mirror serves the wrapper; native binary downloads
+still need an available release asset source.
 
 ---
 
@@ -148,7 +192,7 @@ Expected output:
 
 ```
 Installing Codewhale for linux-x64
-Release assets: https://github.com/Hmbown/CodeWhale/releases/latest/download
+Release assets: https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 Install dir: /home/you/.local/bin
 Checksums verified
 Installed checksummed release commands:
@@ -244,7 +288,7 @@ codewhale doctor        # diagnostics; see the note in §8 about what it does NO
 ## 3. Manual download from GitHub Releases
 
 Use this when you want to see and verify every byte yourself. Releases:
-<https://github.com/Hmbown/CodeWhale/releases>. Each platform has **bare
+<https://github.com/codewhale-hq/CodeWhale/releases>. Each platform has **bare
 binaries** (`codewhale-linux-x64`, `codew-linux-x64`, …) and an **archive**
 (`codewhale-linux-x64.tar.gz`) that holds the same two binaries plus an
 `install.sh`.
@@ -253,7 +297,7 @@ binaries** (`codewhale-linux-x64`, `codew-linux-x64`, …) and an **archive**
 
 ```bash
 mkdir -p ~/codewhale-dl && cd ~/codewhale-dl
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64"          # use linux-arm64 on ARM
 curl -fsSLO "$base/codew-linux-x64"
 curl -fsSLO "$base/codewhale-artifacts-sha256.txt"
@@ -287,7 +331,7 @@ the manifest from the same tag.
 
 ```bash
 cd "$(mktemp -d)"
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64.tar.gz"
 curl -fsSLO "$base/codewhale-bundles-sha256.txt"     # note: *bundles*, not *artifacts*
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
@@ -319,6 +363,18 @@ The package is a small wrapper. Its `postinstall` step downloads the same
 `codewhale`/`codew` release binaries, checks them against the release's SHA-256
 manifest, and links `codewhale` and `codew` into npm's global `bin`. The whole
 thing took 6 s here.
+
+**Windows npm sessions:** Node remains the native program's launcher for the
+whole session. A process-name kill such as `taskkill /IM node.exe` or
+`Get-Process node | Stop-Process -Force` can interrupt this and other npm
+Codewhale sessions and prevent normal terminal cleanup. Stop only the server
+PID you started or the process owning its port, or use Codewhale's task
+cancellation. The Windows
+native archive/installer avoids this npm-parent dependency; this does not
+remove Node requirements for optional JavaScript tools. Codewhale's Windows
+shell safety floor holds recognized image-wide Node kills even in Full Access.
+An external hard kill or an arbitrary program that terminates the launcher
+cannot be made graceful by this shell-command check.
 
 ### If you get `EACCES: permission denied`
 
@@ -378,7 +434,7 @@ sudo apt-get install -y build-essential pkg-config libdbus-1-dev git
 # Rust via rustup (the distro's cargo is too old for this edition-2024 workspace)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustc --version            # the workspace declares rust-version = 1.88
+rustc --version            # the workspace declares rust-version = 1.89
 ```
 
 `libdbus-1-dev` **is required**. Without it the build fails after about a
@@ -407,7 +463,8 @@ Tested result: **works**, with current stable Rust (1.98.1).
 * `codewhale --version` prints `codewhale 0.10.0`, with no commit hash.
 * Headless and TUI smoke tests passed.
 
-> **The docs say "Rust 1.88+". That's wrong for v0.10.0.** With 1.88.0 the
+> **v0.10.0 declared "Rust 1.88+", which was wrong.** The workspace now
+> declares 1.89, the version CI's MSRV job builds. With 1.88.0 the v0.10.0
 > install fails in seconds:
 > `rustc 1.88.0 is not supported by the following package: serde-saphyr@1.3.0 requires rustc 1.89`.
 > Use current stable (`rustup update stable`).
@@ -415,7 +472,7 @@ Tested result: **works**, with current stable Rust (1.98.1).
 ### 5b. From a git checkout
 
 ```bash
-git clone --depth 1 --branch v0.10.0 https://github.com/Hmbown/CodeWhale.git
+git clone --depth 1 --branch v0.10.0 https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 cargo install --path crates/cli --locked      # installs ~/.cargo/bin/codewhale
 ```
@@ -498,8 +555,8 @@ execution tool use it when it is on PATH.
 # flakes are still experimental; the tested setup enabled them once:
 mkdir -p ~/.config/nix
 echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
-nix run github:Hmbown/CodeWhale -- --version
-# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:Hmbown/CodeWhale -- --version
+nix run github:codewhale-hq/CodeWhale -- --version
+# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:codewhale-hq/CodeWhale -- --version
 ```
 
 Nix 2.35 installed fine; single-user mode needs `/nix` created by root once.
@@ -637,9 +694,10 @@ codewhale doctor --probe-api
 #   · Testing connection...  ✓ API connection successful
 ```
 
-Use `auth status`. Plain `codewhale doctor` does **not** tell you: it prints
-`deepseek: env_source=not inspected` even when the key is set, and it exits 0
-even when no key is found.
+Plain `codewhale doctor` names an environment key it can see
+(`deepseek: env_source=set via DEEPSEEK_API_KEY (value not shown; not checked offline)`)
+but does not read the secret store or check the key; `--probe-api` does both.
+Doctor exits 0 even when no key is found, so scripts should use `auth status`.
 
 ### Remove a stored key
 
@@ -771,7 +829,7 @@ following `exec --continue` fails with `No saved sessions found for workspace`.
 
 Everything I checked worked in Ghostty with its default config
 (`TERM=xterm-ghostty`, `COLORTERM=truecolor`). Screenshots are kept with the
-[install receipts](https://github.com/Hmbown/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots).
+[install receipts](https://github.com/codewhale-hq/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots).
 
 | Check | Result |
 |---|---|
@@ -908,9 +966,11 @@ this page. They were **not re-run** for the v0.10.0 install test above
 (out of scope: Windows, macOS, Android/Termux, FreeBSD, mainland-China
 mirrors), apart from the macOS paths noted in [macOS notes](#macos-notes).
 Known contradictions with the published v0.10.0 assets, found by inspecting
-them ([details](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md), D15 and D16):
+them ([details](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md), D15 and D16):
 
-* The winget manifest in `packaging/winget/` is still at 0.9.6.
+* The winget manifest kept in `packaging/winget/` is stale (0.9.6) and not the
+  published package; winget serves `HunterBown.CodeWhale`, see
+  [Windows winget](#windows-winget).
 * v0.10.0 publishes both `codewhale-windows-x64.zip` (with an `install.bat`
   that copies to `%USERPROFILE%\bin`) and `codewhale-windows-x64-portable.zip`;
   the sections below mention only the first.
@@ -918,7 +978,7 @@ them ([details](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b
 
 ### Supported platforms and assets
 
-The [latest stable release](https://github.com/Hmbown/CodeWhale/releases/latest)
+The [latest stable release](https://github.com/codewhale-hq/CodeWhale/releases/latest)
 publishes Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, and Android arm64
 assets. Artifact presence is distinct from platform qualification.
 The table below describes the current source tree's platform and secondary
@@ -1062,8 +1122,8 @@ defaults to `~/.local`, while Termux users normally expect commands under
 
 ```bash
 cd "$HOME"
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
 
 tar xzf codewhale-android-arm64.tar.gz
@@ -1211,38 +1271,33 @@ Scoop manifests are maintained outside this repository's release workflow and
 can lag GitHub/npm/Cargo releases. Use npm or manual GitHub release downloads
 when you need the newest version immediately.
 
-#### Windows winget (v0.9.5+)
+#### Windows winget
 
-Codewhale publishes a winget manifest for `Hmbown.CodeWhale` (resolves #1561).
-Winget installs only the `codewhale` + `codew` commands. GitHub Releases retain
-byte-identical `codewhale-tui-*` filenames only for legacy updater compatibility;
-they are not a third installed command.
+The published winget package is **`HunterBown.CodeWhale`** (verified in
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/tree/master/manifests/h/HunterBown/CodeWhale)
+on 2026-10-04; latest published version 0.10.0). It is a portable x64 package:
+winget downloads `codewhale-tui-windows-x64.exe`, installs it as the `codewhale`
+command, and pulls in the Microsoft Visual C++ 2015+ x64 runtime.
 
 ```powershell
-winget install Hmbown.CodeWhale
+winget install HunterBown.CodeWhale
 codewhale --version
 ```
 
-The manifest is at [`packaging/winget/Hmbown.CodeWhale.yaml`](../packaging/winget/Hmbown.CodeWhale.yaml)
-(also mirrored at [`.winget/Hmbown.CodeWhale.yaml`](../.winget/Hmbown.CodeWhale.yaml)) and lists both
-the NSIS installer (`CodeWhaleSetup.exe`, per-user, adds `%LOCALAPPDATA%\Programs\CodeWhale\bin` to the user PATH)
-and the portable ZIP fallback (`codewhale-windows-x64.zip` / `codewhale-windows-arm64.zip`). winget
-selects the matching architecture automatically; both install the single binary (`codewhale.exe` + `codew.exe`).
-The zips also include `codewhale.bat`. Double-click that launcher (not the raw `.exe`) so the first
-window is Windows Terminal when it is installed.
+Update with `winget upgrade HunterBown.CodeWhale` or `codewhale update`. Each
+version goes through winget-pkgs review after the GitHub Release, so winget can
+lag GitHub/npm/Cargo; use npm or the GitHub Release asset when you need the
+newest version immediately.
 
-Update via `winget upgrade Hmbown.CodeWhale` or `codewhale update`. The winget package is
-maintained outside this repo's release workflow and can lag GitHub/npm/Cargo releases by one
-validation cycle — use npm or the GitHub Release asset when you need the newest version immediately.
-If `winget install` reports a hash mismatch, verify `codewhale-artifacts-sha256.txt` for the same
-tag and regenerate the manifest via `packaging/winget/generate-winget-manifest.sh` (see
-[`packaging/winget/README.md`](../packaging/winget/README.md)) before re-submitting to
-[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs).
+Known limits of the winget route:
 
-> **Windows ARM64 note.** The NSIS installer currently contains only the x64 binaries.
-> Windows ARM64 users should install via `winget install Hmbown.CodeWhale` (ARM64 ZIP) or
-> `npm install -g codewhale` under native ARM64 Node.js, or download
-> `codewhale-windows-arm64.zip` directly — all paths install native ARM64 binaries.
+* **x64 only.** The published manifest has no ARM64 installer. On Windows ARM64,
+  use `npm install -g codewhale` under native ARM64 Node.js, or download
+  `codewhale-windows-arm64.zip` from GitHub Releases.
+* **`codewhale` only.** The short `codew` alias is not installed by winget; use
+  `codewhale`.
+* The manifest in this repository (`packaging/winget/`) is not the one winget
+  serves; see [`packaging/winget/README.md`](../packaging/winget/README.md).
 
 #### Windows NSIS Installer
 
@@ -1256,7 +1311,7 @@ users should install through npm running under native ARM64 Node.js or download
 ARM64 binaries.
 
 **Download** `CodeWhaleSetup.exe` from the
-[Releases page](https://github.com/Hmbown/CodeWhale/releases/latest).
+[Releases page](https://github.com/codewhale-hq/CodeWhale/releases/latest).
 
 **Install** by double-clicking the setup executable. The installer:
 
@@ -1377,7 +1432,7 @@ Building on Windows requires the **MSVC C toolchain** from
 
 1. Install Visual Studio 2022 Build Tools — select the **"Desktop development
    with C++"** workload.
-2. Install [Rust](https://rustup.rs) 1.88+ (see the
+2. Install [Rust](https://rustup.rs) 1.89+ (see the
    [China mirror instructions](#china--mirror-friendly-install) above if
    downloading from mainland China).
 3. Install [Git for Windows](https://git-scm.com/download/win) (provides `git`
@@ -1417,7 +1472,7 @@ that session and run `cargo build` from the project root.
 **Build**
 
 ```bash
-git clone https://github.com/Hmbown/CodeWhale.git
+git clone https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 set CARGO_HTTP_CHECK_REVOKE=false   # may be needed behind some Chinese ISPs
 cargo build --release
@@ -1493,6 +1548,22 @@ codewhale update
 The mirror directory must contain `codewhale-artifacts-sha256.txt` and the
 platform binaries from the GitHub release. The legacy
 `DEEPSEEK_TUI_RELEASE_BASE_URL` mirror variable remains supported as an alias.
+
+`codewhale update` only talks HTTPS, and only to GitHub's release hosts, the CNB
+mirror, and the host of the `CODEWHALE_RELEASE_BASE_URL` you set; every
+redirect hop is held to the same rule, so a plain-`http://` mirror is refused.
+A private mirror therefore works as soon as its base URL is HTTPS. If that
+mirror redirects asset downloads to a separate download host (a CDN or an
+object-store domain), name that host too:
+
+```bash
+CODEWHALE_UPDATE_ALLOWED_HOSTS=cdn.your-mirror.example.com,objects.example.net \
+CODEWHALE_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
+CODEWHALE_VERSION=X.Y.Z \
+codewhale update
+```
+
+The error message for a refused host names it and this variable.
 
 ### Windows and npm-download troubleshooting
 
@@ -1586,6 +1657,6 @@ Use one of these paths:
    assets. See [Section 4](#5-cargo-and-building-from-source).
 
 4. Download both matching `codewhale` and `codew`
-   binaries from the [Releases page](https://github.com/Hmbown/CodeWhale/releases),
+   binaries from the [Releases page](https://github.com/codewhale-hq/CodeWhale/releases),
    place them in a directory on `PATH`, and make them executable. See
    [Section 6](#3-manual-download-from-github-releases).

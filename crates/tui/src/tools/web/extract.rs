@@ -4,11 +4,11 @@
 //! fetched bytes and turns them into one normalized document so `fetch_url`
 //! and `web.run` cannot disagree about HTML, Markdown, PDF, or media handling.
 
+use super::adapter::{AdapterFailure, AdapterResult};
 use std::sync::OnceLock;
 
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
 use regex::Regex;
-use tokio_util::sync::CancellationToken;
 
 use crate::tools::spec::ToolError;
 
@@ -64,13 +64,13 @@ pub(crate) async fn extract_document(
     url: &str,
     content_type: Option<&str>,
     bytes: &[u8],
-    cancel: Option<&CancellationToken>,
-) -> Result<ExtractedDocument, ToolError> {
+    context: Option<&super::super::spec::ToolContext>,
+) -> AdapterResult<ExtractedDocument> {
     extract_document_with_pdf_command(
         url,
         content_type,
         bytes,
-        super::super::pdf::PdfTextCommand::system(cancel),
+        super::super::pdf::PdfTextCommand::system(context),
     )
     .await
 }
@@ -80,7 +80,8 @@ pub(crate) async fn extract_document_with_pdf_command(
     content_type: Option<&str>,
     bytes: &[u8],
     pdf_command: super::super::pdf::PdfTextCommand<'_>,
-) -> Result<ExtractedDocument, ToolError> {
+) -> AdapterResult<ExtractedDocument> {
+    let context = pdf_command.context();
     let declared = normalized_content_type(content_type);
     let declared = declared.as_deref();
 
@@ -97,17 +98,26 @@ pub(crate) async fn extract_document_with_pdf_command(
     }
 
     if validate_pdf_response(url, content_type, bytes)? {
-        return extract_pdf(bytes, pdf_command).await;
+        return extract_pdf(bytes, pdf_command).await.map_err(|error| {
+            if context
+                .is_some_and(|context| context.features.enabled(crate::features::Feature::PdfHost))
+            {
+                AdapterFailure::host(error)
+            } else {
+                error.into()
+            }
+        });
     }
 
     if let Some(signature) = sniff_media(bytes) {
         if let Some(declared_family) = declared_media_family(declared)
             && declared_family != signature.family
         {
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "Response media type `{}` did not match its bytes",
                 declared.unwrap_or("unknown")
-            )));
+            )))
+            .into());
         }
         return Ok(ExtractedDocument {
             kind: DocumentKind::Media,
@@ -121,16 +131,23 @@ pub(crate) async fn extract_document_with_pdf_command(
     }
 
     if declared_media_family(declared).is_some() {
-        return Err(ToolError::execution_failed(format!(
+        return Err((ToolError::execution_failed(format!(
             "Response claimed media type `{}`, but its bytes did not match a supported media signature",
             declared.unwrap_or("unknown")
-        )));
+        ))).into());
     }
 
     let sniff_html = should_sniff_html_encoding(declared, url, bytes);
     let body = decode_response_body(bytes, content_type, sniff_html)?;
     if sniff_html || is_html(declared, url, &body) {
-        return extract_html(url, &body);
+        if let Some(context) = context.filter(|context| {
+            context
+                .features
+                .enabled(crate::features::Feature::WebExtractHost)
+        }) {
+            return extract_html_with_host(url, &body, context).await;
+        }
+        return extract_html(url, &body).map_err(Into::into);
     }
     if is_markdown(declared, url) {
         return Ok(ExtractedDocument {
@@ -155,10 +172,11 @@ pub(crate) async fn extract_document_with_pdf_command(
         });
     }
 
-    Err(ToolError::execution_failed(format!(
+    Err((ToolError::execution_failed(format!(
         "Unsupported binary response type `{}`; use a dedicated download tool",
         declared.unwrap_or("unknown")
     )))
+    .into())
 }
 
 pub(crate) fn validate_pdf_response(
@@ -184,6 +202,64 @@ pub(crate) fn validate_pdf_response(
     Ok(claimed)
 }
 
+async fn extract_html_with_host(
+    url: &str,
+    html: &str,
+    context: &super::super::spec::ToolContext,
+) -> AdapterResult<ExtractedDocument> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Choice {
+        kind: String,
+        candidate: Option<u8>,
+    }
+    let parsed_url = reqwest::Url::parse(url)
+        .map_err(|error| ToolError::invalid_input(format!("invalid URL: {error}")))?;
+    let candidates = main_html_candidates(html);
+    let facts=candidates.iter().map(|(id,html)| {
+        let text=html_to_plain_text(html);
+        serde_json::json!({"id":id,"non_whitespace":text.chars().filter(|value|!value.is_whitespace()).count(),"words":text.split_whitespace().count()})
+    }).collect::<Vec<_>>();
+    let budget = context
+        .turn_deadline
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or(std::time::Duration::from_secs(15));
+    let choice: Choice = super::adapter::transform(
+        crate::extension_host::StockOperation::WebExtract,
+        serde_json::json!({"candidates":facts}),
+        context,
+        budget,
+    )
+    .await?;
+    if choice.kind != "web_extract" {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host returned a malformed HTML region choice",
+        )));
+    }
+    let expected = candidates
+        .iter()
+        .find(|(_, html)| meaningful_html(html))
+        .map(|(id, _)| *id);
+    if choice.candidate != expected {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host changed mandatory readable-region order or meaningfulness",
+        )));
+    }
+    let Some(selected) = choice.candidate else {
+        return Err(js_required_error(url).into());
+    };
+    let cleaned = candidates
+        .into_iter()
+        .find(|(id, _)| *id == selected)
+        .map(|(_, html)| html)
+        .ok_or_else(|| {
+            AdapterFailure::host(ToolError::execution_failed(
+                "Web Host returned an unknown HTML region",
+            ))
+        })?;
+    document_from_html_region(url, &parsed_url, html_title(html), cleaned).map_err(Into::into)
+}
+
 fn extract_html(url: &str, html: &str) -> Result<ExtractedDocument, ToolError> {
     let parsed_url = reqwest::Url::parse(url)
         .map_err(|err| ToolError::invalid_input(format!("invalid URL: {err}")))?;
@@ -196,7 +272,16 @@ fn extract_html(url: &str, html: &str) -> Result<ExtractedDocument, ToolError> {
     // main-content regex retains the meaningful-content signal used by the
     // tests (≥32 non-whitespace chars, ≥5 words) without the duplicate tree.
     let cleaned_html = fallback_main_html(html).ok_or_else(|| js_required_error(url))?;
-    let markdown = html_to_markdown_with_base_url(&cleaned_html, &parsed_url).map_err(|err| {
+    document_from_html_region(url, &parsed_url, original_title, cleaned_html)
+}
+
+fn document_from_html_region(
+    url: &str,
+    parsed_url: &reqwest::Url,
+    original_title: Option<String>,
+    cleaned_html: String,
+) -> Result<ExtractedDocument, ToolError> {
+    let markdown = html_to_markdown_with_base_url(&cleaned_html, parsed_url).map_err(|err| {
         ToolError::execution_failed(format!(
             "Failed to convert readable HTML to Markdown: {err}"
         ))
@@ -289,7 +374,7 @@ fn resolve_relative_http_href(base_url: &reqwest::Url, href: &str) -> Option<Str
 /// Known limits: the lazy regexes do not balance nested same-name elements
 /// (an `<article>` inside an `<article>` ends at the inner close tag), and no
 /// JavaScript runs, so a client-rendered shell still yields nothing.
-fn fallback_main_html(html: &str) -> Option<String> {
+fn main_html_candidates(html: &str) -> Vec<(u8, String)> {
     let [article, main, body] = FALLBACK_RE.get_or_init(|| {
         ["article", "main", "body"].map(|tag| {
             Regex::new(&format!(r"(?is)<{tag}(?:\s[^>]*)?>(.*?)</{tag}\s*>"))
@@ -303,16 +388,19 @@ fn fallback_main_html(html: &str) -> Option<String> {
         .filter(|content| !html_to_plain_text(content).is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    if meaningful_html(&articles) {
-        return Some(articles);
+    let mut candidates = vec![(0, articles)];
+    for (id, re, strip_header) in [(1, main, false), (2, body, true)] {
+        if let Some(content) = re.captures(html).and_then(|capture| capture.get(1)) {
+            candidates.push((id, strip_page_chrome(content.as_str(), strip_header)));
+        }
     }
-    [(main, false), (body, true)]
+    candidates
+}
+
+fn fallback_main_html(html: &str) -> Option<String> {
+    main_html_candidates(html)
         .into_iter()
-        .find_map(|(re, strip_header)| {
-            let content = re.captures(html)?.get(1)?;
-            let cleaned = strip_page_chrome(content.as_str(), strip_header);
-            meaningful_html(&cleaned).then_some(cleaned)
-        })
+        .find_map(|(_, html)| meaningful_html(&html).then_some(html))
 }
 
 fn strip_page_chrome(html: &str, strip_header: bool) -> String {
@@ -951,7 +1039,7 @@ mod tests {
             "the shell failure must name the URL: {message}"
         );
         assert!(
-            is_js_shell_error(&error),
+            is_js_shell_error(&error.error),
             "the fetch pipeline recognizes this failure by marker: {message}"
         );
         assert!(
@@ -1345,3 +1433,7 @@ mod tests {
         assert!(!document.markdown.contains("Log in"));
     }
 }
+
+#[cfg(test)]
+#[path = "extract_host_tests.rs"]
+mod host_tests;

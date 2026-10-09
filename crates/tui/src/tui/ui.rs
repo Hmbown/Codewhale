@@ -55,10 +55,11 @@ use crate::client::{
 use crate::commands;
 use crate::compaction::CompactionConfig;
 use crate::compaction::{estimate_input_tokens_conservative, estimate_tokens};
+#[cfg(test)]
+use crate::config::ProviderConfig;
 use crate::config::{
-    ApiProvider, Config, ProviderConfig, ProviderIdentity, ProvidersConfig, StatusItem,
-    UpdateConfig, persist_external_credential_consent_for_at,
-    revoke_external_credential_consent_for_at,
+    Config, ProviderIdentity, ProviderKind, ProvidersConfig, StatusItem, UpdateConfig,
+    persist_external_credential_consent_for_at, revoke_external_credential_consent_for_at,
 };
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
@@ -66,7 +67,9 @@ use crate::core::ops::{Op, ProviderRuntimeStatus, UserInputProvenance};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::prompts;
-use crate::route_runtime::{resolve_runtime_route, resolve_runtime_route_for_identity};
+#[cfg(test)]
+use crate::route_runtime::resolve_runtime_route;
+use crate::route_runtime::resolve_runtime_route_for_identity;
 #[cfg(test)]
 use crate::session_manager::create_saved_session_with_id_and_mode;
 use crate::session_manager::{
@@ -150,7 +153,7 @@ use super::approval::{
     ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
 };
 use super::history::{
-    ExecCell, HistoryCell, ReasoningAction, ThinkingFold, ToolCell, ToolStatus,
+    CellFoldAction, ExecCell, HistoryCell, ToolCell, ToolStatus, TranscriptFold,
     history_cells_from_message, summarize_tool_output,
 };
 use super::slash_menu::{
@@ -188,8 +191,9 @@ use self::activity_detail::{
 const SLASH_MENU_LIMIT: usize = 128;
 const MIN_CHAT_HEIGHT: u16 = 3;
 const MIN_COMPOSER_HEIGHT: u16 = 2;
-const CONTEXT_WARNING_THRESHOLD_PERCENT: f64 = 85.0;
-const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
+use codewhale_runtime::context_budget::{
+    CONTEXT_CRITICAL_THRESHOLD_PERCENT, CONTEXT_WARNING_THRESHOLD_PERCENT,
+};
 const CONTEXT_SUGGEST_COMPACT_THRESHOLD_PERCENT: f64 = 60.0;
 const UI_IDLE_POLL_MS: u64 = 48;
 const UI_ACTIVE_POLL_MS: u64 = 24;
@@ -763,7 +767,7 @@ fn tool_result_content_for_api_message(app: &App, name: &str, output: &ToolResul
 #[derive(Debug, Clone)]
 pub(crate) struct UserDispatchOutcome {
     turn_compaction: CompactionConfig,
-    effective_provider: ApiProvider,
+    effective_provider: ProviderKind,
     effective_model: String,
     effective_provider_identity: String,
     effective_provider_label: String,
@@ -888,6 +892,7 @@ use std::process::{Command, Stdio};
 // moved verbatim, and are re-exported so every existing path still resolves.
 mod apply;
 mod approval_routing;
+pub(crate) mod feedback_host;
 use approval_routing::*;
 mod event_loop;
 mod handlers;
@@ -973,7 +978,7 @@ async fn execute_command_input(
         return Ok(false);
     }
 
-    let result = commands::execute(input, app);
+    let result = commands::execute_with_config(input, app, config);
     // The NOTES view reads the notes file off the render path on the
     // workspace-context tick; a `/note` change refreshes it at once (#6565).
     if input
@@ -993,7 +998,7 @@ async fn execute_command_input(
         // already removes all saved keys; clearing only the active slot here
         // prevents surprising side-effects when the user has multiple providers
         // configured.
-        clear_active_provider_api_key_from_memory(app, config);
+        clear_active_provider_api_key_from_memory(app, config).map_err(anyhow::Error::msg)?;
         app.api_key_env_only = crate::config::active_provider_uses_env_only_api_key(config);
     }
     apply_command_result(terminal, app, engine_handle, task_manager, config, result).await
@@ -1070,6 +1075,7 @@ pub(crate) struct ApprovalDecisionEvent {
 }
 
 fn mark_active_turn_cancelled_locally(app: &mut App) {
+    settle_pending_human_requests(app);
     app.retire_action_notices(None);
     // #2739: every local cancel surface (Esc, Ctrl+C, approval abort, paused
     // command abort) must snapshot before it clears turn state. Otherwise
@@ -1079,6 +1085,9 @@ fn mark_active_turn_cancelled_locally(app: &mut App) {
     app.finalize_streaming_assistant_as_interrupted();
     persist_recovery_snapshot(app);
     app.is_loading = false;
+    // #6800: a dispatch still waiting on engine admission fails back now, not
+    // after its 60 s bound; its closure retires `dispatch_in_flight`.
+    app.cancel_in_flight_dispatch();
     app.dispatch_started_at = None;
     app.turn_started_at = None;
     app.turn_last_activity_at = None;
@@ -1177,55 +1186,49 @@ fn ignore_stale_stream_event_while_idle(event: &EngineEvent) -> bool {
     )
 }
 
-type ProviderKeyVerification<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+/// `Ok` carries the `/models` roster the probe already downloaded, when it
+/// was one complete listing (see [`crate::client::verify_provider_api_key`]).
+type ProviderKeyVerification<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<codewhale_config::catalog::ProviderCatalogDelta>, String>>
+            + Send
+            + 'a,
+    >,
+>;
 
-pub(crate) fn request_foreground_shell_background(app: &mut App) {
-    if !app.is_loading {
-        app.status_message = Some("No foreground shell wait to move to /jobs".to_string());
-        return;
-    }
-    if !active_foreground_shell_running(app) {
-        // #3032 AC3: name the reason backgrounding is unavailable —
-        // interactive execs and non-shell blocking tools are visibly running
-        // but cannot be detached, and a generic shrug reads like a bug.
-        let reason = if terminal_pause_has_live_owner(app) {
-            "the running command is interactive"
-        } else if app
-            .active_cell
-            .as_ref()
-            .is_some_and(|active| !active.is_empty())
-        {
-            "the running tool is not a foreground shell command"
-        } else {
-            "no foreground shell command is running"
-        };
-        app.status_message = Some(format!(
-            "Cannot move to /jobs: {reason}. Press Ctrl+C to cancel the turn, or wait for completion."
-        ));
-        return;
-    }
-
-    match request_active_foreground_shell_background(app) {
-        Ok(()) => {
-            app.status_message = Some("Moving current shell command to /jobs...".to_string());
+pub(crate) fn request_shell_wait_detach(app: &mut App) {
+    let (notice, level) = match request_active_shell_wait_detach(app) {
+        Ok(true) => (
+            app.tr(MessageId::ShellWaitReleased)
+                .replace("{jobs}", "/jobs"),
+            StatusToastLevel::Info,
+        ),
+        Ok(false) => {
+            let message = if terminal_pause_has_live_owner(app) {
+                MessageId::ShellWaitInteractive
+            } else if app.is_loading {
+                MessageId::ShellWaitUnavailable
+            } else {
+                MessageId::ShellWaitNoActive
+            };
+            (app.tr(message).to_string(), StatusToastLevel::Info)
         }
-        Err(err) => {
-            app.status_message = Some(err.to_string());
-        }
-    }
+        Err(err) => (err.to_string(), StatusToastLevel::Error),
+    };
+    app.push_status_toast(notice, level, Some(6_000));
 }
 
-fn request_active_foreground_shell_background(app: &App) -> Result<()> {
-    let shell_manager = app
-        .runtime_services
-        .shell_manager
-        .clone()
-        .context("No shell session is active.")?;
+fn request_active_shell_wait_detach(app: &App) -> Result<bool> {
+    let Some(session_id) = app.current_session_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(shell_manager) = app.runtime_services.shell_manager.as_ref() else {
+        return Ok(false);
+    };
     let mut manager = shell_manager.lock().map_err(|_| {
         anyhow::anyhow!("Shell tracking hit an internal error — restart Codewhale to recover.")
     })?;
-    manager.request_foreground_background();
-    Ok(())
+    Ok(manager.request_shell_wait_detach(session_id))
 }
 
 pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
@@ -1244,20 +1247,6 @@ pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
     app.cursor_position = app.input.len();
     app.status_message = Some("Press Enter to cancel all running commands".to_string());
     true
-}
-
-pub(crate) fn active_foreground_shell_running(app: &App) -> bool {
-    app.active_cell.as_ref().is_some_and(|active| {
-        active.entries().iter().any(|cell| {
-            matches!(
-                cell,
-                HistoryCell::Tool(ToolCell::Exec(exec))
-                    if exec.status == ToolStatus::Running
-                        && exec.interaction.is_none()
-                        && exec.shell_task_id.is_none()
-            )
-        })
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1404,7 +1393,7 @@ impl UpdateNotice {
         };
         format!(
             "Update available: v{current} -> v{latest}\n\
-             Release notes: https://github.com/Hmbown/CodeWhale/releases/tag/v{latest}\n\
+             Release notes: https://github.com/codewhale-hq/CodeWhale/releases/tag/v{latest}\n\
              {action}",
             current = self.current,
             latest = self.latest
@@ -1473,7 +1462,7 @@ mod provider_key_validation_tests {
         // transcript). The Bottom default (round 3, 2026-09-01) has its own
         // coverage in work_surface::rail_panels_render_in_all_placements.
         app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::Top;
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
         app.model = "deepseek-v4-pro".to_string();
         app.auto_model = false;
         app
@@ -1504,14 +1493,18 @@ mod provider_key_validation_tests {
             ..Default::default()
         };
 
-        mirror_saved_api_key_in_config(
-            &mut config,
-            ApiProvider::Xai,
-            "codewhale-owned-api-key".to_string(),
-        );
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Xai);
+            mirror_saved_api_key_in_config(
+                &mut config,
+                &captured_fixture_identity,
+                "codewhale-owned-api-key".to_string(),
+            )
+            .expect("admitted API-key fixture")
+        };
 
         let xai = config
-            .provider_config_for(ApiProvider::Xai)
+            .provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai))
             .expect("xAI live config");
         assert_eq!(xai.auth_mode.as_deref(), Some("api_key"));
         assert_eq!(xai.api_key.as_deref(), Some("codewhale-owned-api-key"));
@@ -1520,18 +1513,25 @@ mod provider_key_validation_tests {
 
     struct MockProviderKeyVerifier {
         result: Result<(), String>,
-        calls: std::sync::Mutex<Vec<(ApiProvider, String, String)>>,
+        roster: Option<codewhale_config::catalog::ProviderCatalogDelta>,
+        calls: std::sync::Mutex<Vec<(ProviderKind, String, String)>>,
     }
 
     impl MockProviderKeyVerifier {
         fn new(result: Result<(), String>) -> Self {
             Self {
                 result,
+                roster: None,
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
 
-        fn calls(&self) -> Vec<(ApiProvider, String, String)> {
+        fn with_roster(mut self, roster: codewhale_config::catalog::ProviderCatalogDelta) -> Self {
+            self.roster = Some(roster);
+            self
+        }
+
+        fn calls(&self) -> Vec<(ProviderKind, String, String)> {
             self.calls.lock().expect("calls lock").clone()
         }
     }
@@ -1539,7 +1539,7 @@ mod provider_key_validation_tests {
     impl ProviderKeyVerifier for MockProviderKeyVerifier {
         fn verify<'a>(
             &'a self,
-            provider: ApiProvider,
+            provider: ProviderKind,
             api_key: &'a str,
             base_url: &'a str,
         ) -> ProviderKeyVerification<'a> {
@@ -1548,7 +1548,9 @@ mod provider_key_validation_tests {
                 api_key.to_string(),
                 base_url.to_string(),
             ));
-            Box::pin(std::future::ready(self.result.clone()))
+            Box::pin(std::future::ready(
+                self.result.clone().map(|()| self.roster.clone()),
+            ))
         }
     }
 
@@ -1624,6 +1626,92 @@ mod provider_key_validation_tests {
         );
     }
 
+    /// Release QA: a DeepSeek key probe returned two served ids, yet guided
+    /// setup offered catalog rows the endpoint rejects at the first turn. The
+    /// roster the probe already downloaded must become the route's model list.
+    #[tokio::test]
+    async fn provider_key_probe_roster_becomes_the_model_pick_roster() {
+        use codewhale_config::catalog::{
+            CatalogOffering, CatalogSource, ProviderCatalogDelta, base_url_fingerprint, now_unix,
+        };
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::provider_catalog_live::reset_cache_for_test();
+                crate::provider_lake::clear_live_snapshot();
+            }
+        }
+        let _config_env = ConfigPathEnvGuard::new();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let _reset = Reset;
+        crate::provider_catalog_live::reset_cache_for_test();
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = Config::default();
+        let identity = picker_provider_identity(&config, ProviderKind::Deepseek, None)
+            .expect("DeepSeek identity");
+        let mut scoped = config.clone();
+        scoped
+            .scope_to_provider_identity(&identity)
+            .expect("scope DeepSeek");
+        let base_url = scoped.active_route_base_url();
+        let fingerprint = base_url_fingerprint(&base_url);
+        let fetched_at = now_unix();
+        let served = ["deepseek-flash", "deepseek-v4-pro"];
+        // Scoped to the provider kind, exactly as the live probe returns it,
+        // plus an id the catalog does not offer as a chat model.
+        let roster = ProviderCatalogDelta {
+            provider: "deepseek".into(),
+            base_url_fingerprint: fingerprint.clone(),
+            fetched_at,
+            offerings: served
+                .iter()
+                .chain(&["deepseek-embedding-fixture"])
+                .map(|id| CatalogOffering {
+                    provider: "deepseek".into(),
+                    wire_model_id: (*id).into(),
+                    endpoint_key: "chat".into(),
+                    source: CatalogSource::Live {
+                        base_url_fingerprint: fingerprint.clone(),
+                        fetched_at,
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        assert_ne!(
+            crate::provider_lake::catalog_models_for_route(
+                ProviderKind::Deepseek,
+                identity.key.as_str(),
+                &base_url,
+            ),
+            served,
+            "precondition: the catalog fallback lists more than the endpoint serves"
+        );
+        let verifier = MockProviderKeyVerifier::new(Ok(())).with_roster(roster);
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            identity.clone(),
+            "sk-verified".to_string(),
+            None,
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
+        assert_eq!(
+            crate::provider_lake::catalog_models_for_route(
+                ProviderKind::Deepseek,
+                identity.key.as_str(),
+                &base_url,
+            ),
+            served
+        );
+    }
+
     #[tokio::test]
     async fn provider_key_submit_opens_model_pick_without_persisting_on_validation_success() {
         let config_env = ConfigPathEnvGuard::new();
@@ -1631,7 +1719,7 @@ mod provider_key_validation_tests {
         let mut engine = mock_engine_handle();
         let mut config = openrouter_config("https://mock.openrouter.test/v1");
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_api_key_with_verifier(
@@ -1648,14 +1736,14 @@ mod provider_key_validation_tests {
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "sk-verified".to_string(),
                 "https://mock.openrouter.test/v1".to_string()
             )]
         );
         // Validation success must not persist or switch yet (#3875 residual):
         // the guided flow continues at model pick first.
-        assert_eq!(app.api_provider, ApiProvider::Deepseek);
+        assert_eq!(app.api_provider, ProviderKind::Deepseek);
         assert_eq!(config.provider.as_deref(), None);
         assert_eq!(
             config
@@ -1674,9 +1762,20 @@ mod provider_key_validation_tests {
             "status names connection-probe success: {:?}",
             app.status_message
         );
+        // The probe proves only this temporary credential generation, not the
+        // original uncredentialed Config or any model's entitlement.
+        let mut probed_config = config.clone();
+        let probed_identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
+            .expect("captured OpenRouter identity");
+        probed_config
+            .scope_to_provider_identity(&probed_identity)
+            .expect("scope probe");
+        probed_config
+            .set_provider_api_key_override(&probed_identity, Some("sk-verified".to_string()))
+            .expect("temporary probe key");
         let verified_route = crate::provider_readiness::route_identity_for_model(
-            &config,
-            ApiProvider::Openrouter,
+            &probed_config,
+            &probed_identity,
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert_eq!(
@@ -1720,7 +1819,7 @@ mod provider_key_validation_tests {
             providers.openrouter.api_key = Some("sk-saved".to_string());
         }
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_test_connection_with_verifier(
@@ -1736,7 +1835,7 @@ mod provider_key_validation_tests {
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "sk-saved".to_string(),
                 "https://mock.openrouter.test/v1".to_string()
             )]
@@ -1753,7 +1852,7 @@ mod provider_key_validation_tests {
         );
         let verified_route = crate::provider_readiness::route_identity_for_model(
             &config,
-            ApiProvider::Openrouter,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert_eq!(
@@ -1784,7 +1883,7 @@ mod provider_key_validation_tests {
         let mut engine = mock_engine_handle();
         let mut config = openrouter_config("https://mock.openrouter.test/v1");
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_test_connection_with_verifier(
@@ -1808,7 +1907,7 @@ mod provider_key_validation_tests {
         );
         let verified_route = crate::provider_readiness::route_identity_for_model(
             &config,
-            ApiProvider::Openrouter,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert_eq!(
@@ -1836,7 +1935,7 @@ mod provider_key_validation_tests {
             "HTTP 401: upstream echoed sk-saved in a long diagnostic body that must not stay visible"
                 .repeat(4),
         ));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_test_connection_with_verifier(
@@ -1869,7 +1968,7 @@ mod provider_key_validation_tests {
         );
         let verified_route = crate::provider_readiness::route_identity_for_model(
             &config,
-            ApiProvider::Openrouter,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert!(matches!(
@@ -1893,7 +1992,7 @@ mod provider_key_validation_tests {
         let mut engine = mock_engine_handle();
         let mut config = Config::default();
         let verifier = MockProviderKeyVerifier::new(Ok(()));
-        let identity = picker_provider_identity(&config, ApiProvider::Stepfun, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Stepfun, None)
             .expect("StepFun identity");
 
         apply_provider_picker_api_key_with_verifier(
@@ -1910,7 +2009,7 @@ mod provider_key_validation_tests {
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Stepfun,
+                ProviderKind::Stepfun,
                 "step-plan-key".to_string(),
                 crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL.to_string()
             )],
@@ -1940,7 +2039,7 @@ mod provider_key_validation_tests {
         let mut app = create_test_app();
         let mut engine = mock_engine_handle();
         let mut config = Config::default();
-        let identity = picker_provider_identity(&config, ApiProvider::Stepfun, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Stepfun, None)
             .expect("StepFun identity");
 
         apply_provider_picker_setup_confirmed(
@@ -2010,7 +2109,7 @@ auth_mode = "kimi_oauth"
             }),
             ..Config::default()
         };
-        let identity = picker_provider_identity(&config, ApiProvider::Moonshot, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Moonshot, None)
             .expect("Moonshot identity");
         let verifier = MockProviderKeyVerifier::new(Ok(()));
 
@@ -2028,7 +2127,7 @@ auth_mode = "kimi_oauth"
         assert_eq!(
             verifier.calls(),
             vec![(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "sk-kimi-supported".to_string(),
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string(),
             )],
@@ -2094,7 +2193,7 @@ api_key = "fixture-other-provider-key"
             .anthropic
             .api_key = Some("fixture-other-provider-key".to_string());
         let model = "deepseek/deepseek-v4-pro".to_string();
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_setup_confirmed(
@@ -2109,7 +2208,7 @@ api_key = "fixture-other-provider-key"
         )
         .await;
 
-        assert_eq!(app.api_provider, ApiProvider::Openrouter);
+        assert_eq!(app.api_provider, ProviderKind::Openrouter);
         assert_eq!(config.provider.as_deref(), Some("openrouter"));
         assert_eq!(
             config
@@ -2156,7 +2255,7 @@ api_key = "fixture-other-provider-key"
         let mut engine = mock_engine_handle();
         let mut config = openrouter_config("https://mock.openrouter.test/v1");
         let verifier = MockProviderKeyVerifier::new(Err("HTTP 401: unauthorized".to_string()));
-        let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
+        let identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
             .expect("OpenRouter identity");
 
         apply_provider_picker_api_key_with_verifier(
@@ -2170,7 +2269,7 @@ api_key = "fixture-other-provider-key"
         )
         .await;
 
-        assert_eq!(app.api_provider, ApiProvider::Deepseek);
+        assert_eq!(app.api_provider, ProviderKind::Deepseek);
         assert_eq!(config.provider.as_deref(), None);
         assert_eq!(
             config
@@ -2214,11 +2313,11 @@ api_key = "fixture-other-provider-key"
     async fn named_custom_verification_failure_and_dismiss_keep_committed_a_route() {
         let _config_env = ConfigPathEnvGuard::new();
         let mut app = create_test_app();
-        app.set_provider_identity(ApiProvider::Custom, "custom-a");
+        app.set_provider_identity(ProviderKind::Custom, "custom-a");
         app.set_model_selection("model-a".to_string());
         let mut engine = mock_engine_handle();
         let mut config = two_named_custom_routes();
-        let identity = picker_provider_identity(&config, ApiProvider::Custom, Some("custom-b"))
+        let identity = picker_provider_identity(&config, ProviderKind::Custom, Some("custom-b"))
             .expect("custom B identity");
         let verifier = MockProviderKeyVerifier::new(Err("HTTP 401: unauthorized".to_string()));
 
@@ -2238,7 +2337,7 @@ api_key = "fixture-other-provider-key"
         app.view_stack.pop().expect("failed verifier picker");
         sync_config_provider_from_app(&mut config, &app);
         let route = validated_app_runtime_route(&app, &config).expect("committed A route");
-        assert_eq!(route.identity.key, "custom-a");
+        assert_eq!(route.identity.key.as_str(), "custom-a");
         assert_eq!(route.client.base_url(), "http://127.0.0.1:18181/v1");
     }
 
@@ -2262,11 +2361,11 @@ model = "model-b"
         )
         .expect("seed named custom config");
         let mut app = create_test_app();
-        app.set_provider_identity(ApiProvider::Custom, "custom-a");
+        app.set_provider_identity(ProviderKind::Custom, "custom-a");
         app.set_model_selection("model-a".to_string());
         let mut engine = mock_engine_handle();
         let mut config = two_named_custom_routes();
-        let identity = picker_provider_identity(&config, ApiProvider::Custom, Some("custom-b"))
+        let identity = picker_provider_identity(&config, ProviderKind::Custom, Some("custom-b"))
             .expect("custom B identity");
 
         apply_provider_picker_setup_confirmed(
@@ -2342,11 +2441,14 @@ default_text_model = "legacy-model"
                 .expect("repeat legacy identity"),
             identity
         );
-        let route =
-            resolve_runtime_route(&reloaded, ApiProvider::Custom, Some("legacy-model-updated"))
-                .expect("resolve reloaded legacy")
-                .validate()
-                .expect("preflight reloaded legacy");
+        let route = resolve_runtime_route(
+            &reloaded,
+            ProviderKind::Custom,
+            Some("legacy-model-updated"),
+        )
+        .expect("resolve reloaded legacy")
+        .validate()
+        .expect("preflight reloaded legacy");
         assert_eq!(route.client.base_url(), "http://127.0.0.1:18180/v1");
     }
 

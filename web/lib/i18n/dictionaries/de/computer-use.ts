@@ -30,7 +30,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Hintergrundprüfung ausführen", body: "Der Helfer öffnet ein temporäres Übungsfenster, gibt Text ein und erfasst dieses Fenster. Dabei prüft er, ob sich der Zeiger oder die aktive App während des Durchlaufs verändert hat." },
     { title: "Mit Codewhale verbinden", body: "Prüfe Computer Use im Plugin-Marktplatz von Codewhale, stufe es als vertrauenswürdig ein und aktiviere es. Verwende Plugin 0.3.1 oder neuer, damit lokale Aktionen über die Pause- und Stop-Steuerung des Helfers laufen." },
   ],
-  controlsTitle: "Weiterarbeiten. Kontrolle behalten.",
+  controlsTitle: "App-Steuerung pausieren oder stoppen",
   controlsBody: "Unterstützte Aktionen laufen in der ausgewählten App im Hintergrund. Apps und Gesten, die Steuerung im Vordergrund brauchen, erfordern deine Freigabe. Das Menü zeigt Ziel und Eingabemodus; Pause setzt die Eingaben des Helfers aus, Stop beendet seine laufenden Sitzungen.",
   updateTitle: "Updates, wann du willst",
   updateBody: "Wähle in der App Check for updates. Vor der Installation eines Updates prüft die App den Download, die Codewhale-Signatur und die Beglaubigung durch Apple und behält die vorherige App zur Wiederherstellung.",

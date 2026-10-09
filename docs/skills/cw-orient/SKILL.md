@@ -38,8 +38,9 @@ This is stage 1 of the loop: **orient → [cw-slice](../cw-slice/SKILL.md) →
    git worktree list
    git branch --sort=-committerdate --format='%(committerdate:short) %(refname:short)' | head -20
    ```
-   If the work you were asked to do already has a worktree, use it. Do not
-   start a second copy of the same lane.
+   If the work you were asked to do already has a checkout or worktree, use
+   it. Do not start a second copy of the same lane, and do not create a
+   worktree just because another agent is in this one — partition by file.
 
 3. **Read the dirt before you touch it.** Modified files you did not write
    belong to someone else — another agent, another lane, an in-flight slice:
@@ -48,8 +49,8 @@ This is stage 1 of the loop: **orient → [cw-slice](../cw-slice/SKILL.md) →
    git diff --stat
    ```
    Preserve them. Leave them unstaged, and do not `git checkout --` or stash
-   another writer's work to get a clean tree. If your change genuinely conflicts
-   with the dirt, work in a fresh worktree instead.
+   another writer's work to get a clean tree. Only if your change genuinely
+   conflicts with that dirt is a fresh worktree warranted ([cw-land](../cw-land/SKILL.md)).
 
 4. **Fix which guidance applies.** The nearest scoped `AGENTS.md` wins over the
    root one, and it is where the per-area rules actually live:

@@ -28,6 +28,21 @@ use serde_json::Value;
 
 use super::AppState;
 
+// ── Upstream deadlines ─────────────────────────────────────────────────
+
+/// Connect budget for the upstream forward. Matches the 10s connect bound
+/// used by the TUI client's non-streaming requests (vision, the shared
+/// retry client).
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Total budget for one upstream forward, connect through body end. The
+/// handler rejects streaming (`stream: true`) and reads the full upstream
+/// body, so without a client-level total a provider that accepts the
+/// connection and stalls — or trickles the body — wedges this handler (and
+/// the caller's connection) indefinitely. 1800s mirrors the TUI client's
+/// non-streaming envelope for the same request class.
+const UPSTREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
 // ── Resolved endpoint ──────────────────────────────────────────────────
 
 /// Everything needed to forward a single chat-completions request upstream.
@@ -397,8 +412,12 @@ pub(crate) async fn chat_completions_handler(
             .into_response();
     }
 
-    // Build upstream request.
+    // Build upstream request. The shared platform builder sets no timeouts,
+    // so the proxy would hang forever on an accept-and-stall upstream;
+    // bound both the connect and the whole non-streaming round trip.
     let upstream_req = codewhale_release::platform_http_client_builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .timeout(UPSTREAM_TOTAL_TIMEOUT)
         .build()
         .map_err(|e| {
             (
@@ -496,6 +515,29 @@ mod tests {
 
     fn install_crypto_provider() {
         crate::install_test_crypto_provider();
+    }
+
+    // The proxy forwards with a client built per request, and reqwest gives
+    // no accessor for a built client's budgets, so a behavioral test would
+    // need an accept-and-stall upstream and a multi-second (connect) or
+    // half-hour (total) wait. Pin the values instead: if the handler stops
+    // applying them this test cannot see it, but a silent constant change
+    // or an inversion of the connect/total ordering cannot slip through.
+    #[test]
+    fn upstream_deadlines_are_bounded_and_ordered() {
+        assert_eq!(UPSTREAM_CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
+        assert_eq!(UPSTREAM_TOTAL_TIMEOUT, std::time::Duration::from_secs(1800));
+        assert!(
+            UPSTREAM_TOTAL_TIMEOUT > UPSTREAM_CONNECT_TIMEOUT,
+            "the total forward budget must leave room beyond the connect budget"
+        );
+        // The shared platform builder must accept both bounds; the handler
+        // chains them onto this builder.
+        codewhale_release::platform_http_client_builder()
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .timeout(UPSTREAM_TOTAL_TIMEOUT)
+            .build()
+            .expect("platform builder accepts the proxy deadlines");
     }
 
     /// Start a minimal upstream mock server that echoes back what it received.

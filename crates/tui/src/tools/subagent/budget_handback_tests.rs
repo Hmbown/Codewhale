@@ -1,4 +1,4 @@
-use super::tests::{make_worker_spec, stub_runtime};
+use super::tests::{chat_fixture_response, make_worker_spec, stub_runtime};
 use super::*;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use tempfile::{TempDir, tempdir};
@@ -71,7 +71,7 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
             async move {
                 let call = {
                     let mut requests = requests.lock().unwrap();
-                    requests.push(body);
+                    requests.push(body.clone());
                     requests.len()
                 };
                 let choice = if call == 1 {
@@ -102,7 +102,7 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
                     else if call == 1 { json!({"prompt_tokens": first_tokens.saturating_sub(5), "completion_tokens": 5, "total_tokens": first_tokens}) }
                     else if mode == "resume-unknown" { json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}) }
                     else { json!({"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}) };
-                Json(json!({"id": format!("handback-{call}"), "model": "deepseek-v4-flash", "choices": [choice], "usage": usage})).into_response()
+                chat_fixture_response(body.get("stream").and_then(Value::as_bool).unwrap_or(false), json!({"id": format!("handback-{call}"), "model": "deepseek-v4-flash", "choices": [choice], "usage": usage})).into_response()
             }
         }
     }));
@@ -453,6 +453,28 @@ async fn budget_handback_turn_missing_report_usage_is_not_claimed_as_zero_cost()
     let report = result.result.as_deref().unwrap();
     assert!(report.contains("PARTIAL_REPORT"));
     assert!(report.contains("only a subtotal, not a zero-cost report"));
+    let host_receipts: Vec<_> = result
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. }
+                if text.starts_with("Host budget hand-back receipt:") =>
+            {
+                Some(text)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        host_receipts.len(),
+        1,
+        "one attributed canonical report outcome"
+    );
+    assert!(host_receipts[0].contains("unreported provider usage remains unknown"));
 }
 
 #[tokio::test]
@@ -468,7 +490,7 @@ async fn budget_handback_inflight_wall_timeout_persists_unreported_usage() {
             .result
             .as_deref()
             .unwrap()
-            .contains("wall-time budget exhausted during a model request")
+            .contains("child wall-time work budget exhausted")
     );
     assert_eq!(
         fixture.requests.lock().unwrap().len(),
@@ -580,9 +602,23 @@ async fn budget_handback_turn_cancellation_after_response_preserves_actual_usage
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let entry = fixture.mailbox.recv().await.unwrap();
-            if matches!(entry.message, MailboxMessage::TokenUsage { ref source_id, .. } if source_id.contains(":handback:")) { break; }
+            if let MailboxMessage::TokenUsage {
+                agent_id,
+                source_id,
+                usage,
+                ..
+            } = entry.message
+                && agent_id == "report-worker"
+                && usage_total_tokens(&usage) == 30
+            {
+                assert!(source_id.starts_with("child:report-worker:turn:"));
+                assert!(source_id.contains(":request:1:dispatch:"));
+                break;
+            }
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     fixture.cancel.cancel();
     drop(guard);
     let result = fixture.finish().await;
@@ -632,22 +668,28 @@ async fn budget_handback_expired_original_deadline_refuses_the_model_call() {
         .write()
         .await
         .register_worker(make_worker_spec("expired", tmp.path().to_path_buf()));
-    let mut steps = 1;
-    let outcome = budget_handback::request_report(
-        &runtime,
-        "expired",
-        &SubAgentAssignment::new("report".to_string(), None),
-        &mut vec![],
-        &mut steps,
-        2,
-        Some(Instant::now() - Duration::from_millis(1)),
-        "wall-time budget exhausted",
-    )
-    .await;
-    assert!(
-        matches!(outcome, budget_handback::Outcome::Fallback(ref why) if why.contains("deadline has expired"))
+    runtime.worker_profile.wall_deadline_ms = Some(epoch_millis_now().saturating_sub(1));
+    let authority = engine::ChildAuthority::capture(
+        runtime.clone(),
+        FleetRole::Worker,
+        "expired".into(),
+        "report".into(),
+        None,
     );
-    assert_eq!(steps, 1, "no model turn was admitted");
+    let job = engine::ChildJob::admitted(
+        authority,
+        SubAgentAssignment::new("report".into(), None),
+        Instant::now(),
+        2,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let outcome =
+        budget_handback::admit_report(&job, &[], "wall-time budget exhausted", 1024).await;
+    assert!(matches!(outcome, Err(ref why) if why.contains("deadline has expired")));
+    assert_eq!(job.steps(), 0, "no model turn was admitted");
     assert!(!runtime.manager.read().await.worker_records["expired"].has_unreported_usage);
     assert!(
         runtime
@@ -699,6 +741,7 @@ async fn cancel_appends_work_preservation_note_once() {
             FleetRole::Worker,
             "work that gets stopped".to_string(),
             SubAgentAssignment {
+                native_preset: None,
                 objective: "edit".to_string(),
                 role: Some("worker".to_string()),
             },
@@ -767,6 +810,7 @@ async fn cancel_receipts_each_writing_descendant_stopped_with_its_parent() {
             FleetRole::Worker,
             "work that gets stopped".to_string(),
             SubAgentAssignment {
+                native_preset: None,
                 objective: "edit".to_string(),
                 role: Some("worker".to_string()),
             },

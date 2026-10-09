@@ -196,7 +196,7 @@ fn prepare_payload(
     // Capture the shared policy's intended sinks. Neither closure performs IO;
     // the response says prepared, never dispatched/delivered. The native host
     // owns the subsequent permission check and submission receipt.
-    let outcome = crate::tui::notifications::notify_with_sinks(
+    let outcome = crate::notify::delivery::notify_with_sinks(
         method,
         false,
         payload,

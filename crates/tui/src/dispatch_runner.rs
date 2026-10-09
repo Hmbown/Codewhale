@@ -1479,12 +1479,15 @@ mod tests {
     #[test]
     fn forge_slug_parses_https_and_ssh_and_rejects_foreign_hosts() {
         assert_eq!(
-            forge_slug(Forge::Github, "https://github.com/Hmbown/CodeWhale.git"),
-            Some("Hmbown/CodeWhale".to_string())
+            forge_slug(
+                Forge::Github,
+                "https://github.com/codewhale-hq/CodeWhale.git"
+            ),
+            Some("codewhale-hq/CodeWhale".to_string())
         );
         assert_eq!(
-            forge_slug(Forge::Github, "git@github.com:Hmbown/CodeWhale.git"),
-            Some("Hmbown/CodeWhale".to_string())
+            forge_slug(Forge::Github, "git@github.com:codewhale-hq/CodeWhale.git"),
+            Some("codewhale-hq/CodeWhale".to_string())
         );
         assert_eq!(
             forge_slug(Forge::Cnb, "https://cnb.cool/codewhale.net/codewhale.git"),

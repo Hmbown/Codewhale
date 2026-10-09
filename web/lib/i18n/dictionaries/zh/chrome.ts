@@ -38,7 +38,7 @@ export const chrome: ChromeDict = {
   themeTitle: "主题 · 自动 / 浅色 / 深色",
 
   footerTagline:
-    "用你选择的模型构建想做的项目，并自动处理日常工作。",
+    "用自己的模型和连接的工具，构建应用，让工作自动完成。",
   footerProduct: "产品",
   footerProject: "项目",
   footerDocs: "文档",

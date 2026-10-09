@@ -107,6 +107,10 @@ const MODIFIERS = {
   shift: 1 << 17, ctrl: 1 << 18, control: 1 << 18, alt: 1 << 19, opt: 1 << 19, option: 1 << 19,
   fn: 1 << 23, function: 1 << 23,
 };
+const KEY_ALIASES = {
+  pgdn: "pagedown", pgup: "pageup", arrowleft: "left", arrowright: "right",
+  arrowup: "up", arrowdown: "down", del: "forwarddelete", kpenter: "enter",
+};
 // CGEventType values (CGEventTypes.h). The dragged codes are easy to get
 // wrong: 6 is LeftMouseDragged and 7 is RightMouseDragged, so a left drag sent
 // as 7 is delivered as a right-button drag and no view ever sees it.
@@ -438,7 +442,11 @@ export function create({ exec }) {
   }
 
   function parseChord(text) {
-    const parts = String(text).split("+").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const parts = String(text).split("+").map((s) => {
+      const key = s.trim().toLowerCase();
+      const normalized = key.length > 1 ? key.replace(/[\s_-]/g, "") : key;
+      return KEY_ALIASES[normalized] ?? normalized;
+    }).filter(Boolean);
     if (!parts.length) throw new ExecError("empty key text");
     let flags = 0;
     let key = null;
@@ -901,9 +909,9 @@ export function create({ exec }) {
     },
     list_windows: listWindows,
     open_application: openApplication,
-    get_app_state: async ({ app_ref, detail, depth, window_id, include_ocr = false, ocr_region } = {}) => {
+    get_app_state: async ({ app_ref, detail, depth, window_id, query, role, include_ocr = false, ocr_region } = {}) => {
       const t0 = Date.now();
-      const t = await native("get_app_state", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref, detail, window_id });
+      const t = await native("get_app_state", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref, detail, window_id, query: query?.trim() || undefined, role: role || undefined });
       if (process.env.CODEWHALE_CU_DEBUG_OBSERVE) console.error(`observe ${Date.now() - t0}ms elements=${t.elements?.length} truncated=${t.truncated}`);
       if (!t.found) throw new ExecError("application not found — call list_apps for exact names/pids");
       if (include_ocr) {

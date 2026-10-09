@@ -32,9 +32,9 @@ Press `Ctrl+T` to cycle reasoning effort.
 Run `/mode` to open the mode picker, or switch directly with `/mode work`,
 `/mode plan`, or `/mode operate`.
 
-- **Plan**: design-first prompting. The stable primitive names remain familiar, but the runtime centrally refuses file mutation and shell execution. Read-only inspection and policy-allowed research, including deferred Web search/fetch, remain available.
-- **Work** (internally `agent`): ordinary multi-step execution. The first-turn toolbox includes `read`, `write`, `edit`, `bash`, `agent`, `workflow`, and `todo_write`, plus `create_goal`, `get_goal`, and `update_goal` so goal controls are available without discovery. Goals still require an explicit user request; approval, sandbox, repository law, and managed policy decide what may execute.
-- **Operate**: manage a goal through planned steps and verified results. Fleet configures the same sub-agents and roles that execute those steps. It has the same primitive identities and execution authority as Work. Goals are model-decided: the agent calls `create_goal` when a request is a durable objective, and `/goal` always works as the direct user control — the host never infers a goal from wording. Once a goal exists, the transcript shows `◆ goal set · Operate keeps working until it is verified · /goal to edit`. An explicit `/goal` declaration always wins, `/goal` still edits it, and an existing goal is never replaced. The parent session is the **operator**: handle small or tightly coupled tasks directly. Before multi-step delegation, state a compact plan with named steps, dependencies, bounded file scopes and a completion check — or skip the ceremony when the delegation is a single bounded child — then run it through the existing Workflow tool. Parallelize independent steps; each phase receives the previous phase's results, and a dependent step cannot start when a required result is missing. A single bounded independent task can use a direct `agent` call. Reuse a worker with followup for corrections and report completed, blocked and next steps. **Dispatch is not completion** — write-capable children must return real verification evidence. The first Operate turn of a session appends this contract once as a user-role runtime message (append-only history, never the pinned system prompt), so Plan, Work, and Operate keep one shared prompt prefix.
+- **Plan**: design-first prompting. The stable primitive names remain familiar, but the runtime centrally refuses file mutation and shell execution. Read-only inspection and policy-allowed research, including deferred Web search/fetch, remain available. When a Plan turn successfully finishes a nonempty response, including a prose-only plan, the TUI asks how to continue: Work (Ask), Work (Auto-Review), or keep planning. Work sends the exact approved response as a normal follow-up and preserves that turn's existing To-dos, or adds one pending plan item without replacing unrelated work.
+- **Work** (internally `agent`): ordinary multi-step execution. The first-turn toolbox includes `read`, `write`, `edit`, `bash`, `agent`, `workflow`, and `todo_write`, plus `create_goal`, `get_goal`, and `update_goal` so goal controls are available without discovery. The agent calls `create_goal` when a request is a durable objective; the host never infers a goal from wording, and the contract must not tell the model otherwise. Approval, sandbox, repository law, and managed policy decide what may execute.
+- **Operate**: Work at full strength, the "ultra" mode. Same tools and authority as Work; the difference is how they are used. Each substantive request becomes a goal (`create_goal`), the plan stays visible (`todo_write`), multi-part work runs through `workflow` and parallel `agent` workers, non-trivial changes get an independent reviewer before they are called done, long commands keep running in the background, and recurring or watch-type work is offered as an `automation` (created after approval). It keeps going until the goal is verified, blocked on you, or paused.
 
 `Act` and `/mode act` remain compatibility aliases for Work. Saved settings
 still normalize to the internal value `agent`.
@@ -77,8 +77,9 @@ or make mode the approval authority. Durable tasks and automation keep
 conservative omitted-field defaults and receive shell authority only when their
 settings explicitly grant it. Stateful terminal/background controls are
 specialized deferred tools rather than fields on the small foreground `bash`
-schema. Full Access changes the permission posture while hard safety and
-repository-policy holds remain authoritative.
+schema. Full Access changes the permission posture: the deterministic
+Auto-Review floor applies in the reviewing postures and is skipped under Full
+Access, while repository-policy holds remain authoritative.
 
 Action-capable modes can discover the deferred `rlm` family through
 `tool_search`; its `open`, `eval`, `configure`, and `close` actions own persistent
@@ -246,11 +247,14 @@ tells the model to retry a denied command exactly once with the narrowest wider
 mode plus a justification. DeepSeek Harness does not add an LLM reviewer to
 that path. Codewhale's autonomous posture adds only the single stateless
 guardian request described above; deterministic hard blocks remain
-non-bypassable.
+non-bypassable in the reviewing postures.
 - `bypass` (**Full Access**): ordinary tool calls do not show approval prompts,
-  while deliberate user questions remain available. Non-bypassable registered
-  holds auto-approve instead of opening a contradictory modal. Repository-law
-  and managed-policy holds fail closed as hard blocks instead of contradicting
+  while deliberate user questions remain available. The deterministic
+  Auto-Review floor is skipped — publish-like commands, destructive
+  background/headless work, and the Windows npm-launcher platform hold do not
+  strand a call the person already granted. Non-bypassable registered holds
+  auto-approve instead of opening a contradictory modal. Repository-law and
+  managed-policy holds fail closed as hard blocks instead of contradicting
   Full Access with an approval modal.
 - `never`: blocks any tool that is not considered safe/read-only; deliberate
   user questions remain available.
@@ -278,8 +282,9 @@ auto-approve bit:
   and the person's answer is routed back to it, whether the parent turn is
   idle or itself awaiting an approval. Hosts that cannot prompt deny with the
   reason.
-- **Full Access**: ordinary calls run; destructive detached work still fails
-  closed, because children are background workers.
+- **Full Access**: calls run, including destructive detached work — the
+  Auto-Review floor is skipped exactly as it is for the parent turn. The
+  execution envelope still applies and never widens.
 
 Role posture and the execution envelope are checked before and after this
 gate and never widen. Every decision a person did not make at a prompt is
@@ -353,7 +358,8 @@ Codewhale has three related but intentionally separate recovery paths:
   conversation and records the source session id. This is the safe way to
   explore a different answer path without overwriting the original session.
 - Esc-Esc backtrack rewinds the live transcript to a previous user prompt and
-  restores that prompt into the composer for editing.
+  restores that prompt into the composer for editing. It does not change
+  files; `/undo` afterwards puts back the files that request changed.
 - `/restore` and the `revert_turn` tool restore workspace files from side-git
   snapshots. `/restore list [N]` lists more snapshot options before choosing a
   rollback point. They do not rewrite conversation history.

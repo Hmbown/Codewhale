@@ -195,7 +195,7 @@ its failure rather than silently send notes to another backend.
 A future first-class backend must cover capture, search, correction, deletion,
 scope and error reporting across every memory entry point. It must also keep
 volatile recall in append-only history under the cache contract above. That
-complete migration is tracked in [#6050](https://github.com/Hmbown/CodeWhale/issues/6050);
+complete migration is tracked in [#6050](https://github.com/codewhale-hq/CodeWhale/issues/6050);
 0.9.13 does not claim that migration or a commercial memory integration.
 
 ## Configuration reference
@@ -219,5 +219,5 @@ enabled = true                    # default false; or set DEEPSEEK_MEMORY=on
 - `docs/SUBAGENTS.md` — sub-agents inherit memory and can use the
   `remember` tool too.
 - `docs/CONFIGURATION.md` — full config reference.
-- Issue [#489](https://github.com/Hmbown/CodeWhale/issues/489)
+- Issue [#489](https://github.com/codewhale-hq/CodeWhale/issues/489)
   — phase-1 EPIC tracking the work.

@@ -309,54 +309,7 @@ impl ProviderKind {
     /// stay on the enum for serde and `provider_for_kind`, but they are not
     /// first-class catalog rows. Plan is `mode` / base_url; dialect is
     /// `wire = openai|anthropic` on the primary provider config.
-    pub const ALL: [Self; 46] = [
-        Self::Deepseek,
-        Self::NvidiaNim,
-        Self::Openai,
-        Self::Atlascloud,
-        Self::WanjieArk,
-        Self::Volcengine,
-        Self::Openrouter,
-        Self::Orcarouter,
-        Self::XiaomiMimo,
-        Self::Novita,
-        Self::Fireworks,
-        Self::Siliconflow,
-        Self::Arcee,
-        Self::SiliconflowCN,
-        Self::Moonshot,
-        Self::Sglang,
-        Self::Vllm,
-        Self::Ollama,
-        Self::OllamaCloud,
-        Self::Huggingface,
-        Self::Together,
-        Self::Qianfan,
-        Self::OpenaiCodex,
-        Self::Anthropic,
-        Self::Openmodel,
-        Self::Zai,
-        Self::Stepfun,
-        Self::Minimax,
-        Self::Deepinfra,
-        Self::Sakana,
-        Self::LongCat,
-        Self::OpencodeGo,
-        Self::OpencodeZen,
-        Self::Meta,
-        Self::Xai,
-        Self::Mistral,
-        Self::Telecomjs,
-        Self::ModelstudioTokenPlan,
-        Self::Modelscope,
-        Self::Google,
-        Self::Edenai,
-        Self::Zenmux,
-        Self::Csdn,
-        Self::Concentrate,
-        Self::Codewhale,
-        Self::Custom,
-    ];
+    pub const ALL: [Self; 46] = crate::descriptors::SELECTABLE_PROVIDER_KINDS;
 
     #[must_use]
     pub fn all() -> &'static [Self] {
@@ -385,8 +338,9 @@ impl ProviderKind {
         // surface must never be able to resolve one back into a route.
         Self::all().iter().copied().find(|kind| {
             let p = kind.provider();
-            trimmed.eq_ignore_ascii_case(p.id())
-                || p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a))
+            crate::descriptors::builtin_provider_descriptor(*kind).selectable
+                && (trimmed.eq_ignore_ascii_case(p.id())
+                    || p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a)))
         })
     }
 
@@ -453,14 +407,7 @@ impl ProviderKind {
     ///   one variant held the key.
     #[must_use]
     pub fn secret_store_slot(self) -> &'static str {
-        match self {
-            Self::SiliconflowCN => "siliconflow",
-            Self::ModelstudioTokenPlan
-            | Self::ModelstudioTokenPlanAnthropic
-            | Self::ModelstudioCodingPlan
-            | Self::ModelstudioCodingPlanAnthropic => "modelstudio-token-plan",
-            _ => self.as_str(),
-        }
+        crate::descriptors::builtin_provider_descriptor(self).secret_store_slot
     }
 
     /// Return the built-in metadata entry for this provider.

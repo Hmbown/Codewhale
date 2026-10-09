@@ -9,12 +9,12 @@ import type { FaqDict } from "../types";
 export const faq: FaqDict = {
   metaTitle: "FAQ · Codewhale",
   metaDescription:
-    "Codewhale frequently asked questions: install, config, providers, models, modes, security, and privacy. Answers sourced from real code, docs, and GitHub issues.",
+    "Answers about installing and configuring Codewhale, providers, models, modes, security, and privacy, each sourced from code, docs, or GitHub issues.",
   eyebrow: "FAQ",
   title: "Frequently asked questions",
   titleAside: "常见问题",
   titleAsideLang: "zh",
-  lead: "Answers sourced from real code, docs, release notes, and GitHub issues. Sources are cited below each answer. If your question isn't covered, open an issue on GitHub.",
+  lead: "Each answer cites its sources: code, docs, release notes, or GitHub issues. If your question is missing, open an issue on GitHub.",
   notCovered: "Didn't find your question?",
   openIssue: "Open an issue",
   searchPlaceholder: "Search the FAQ",

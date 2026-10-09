@@ -592,13 +592,15 @@ fn flush_inner(
         Err(err) => report.failures.push((what, err.kind())),
     };
 
+    // Document saves are bounded (#6842): an oversized journal is archived
+    // and pruned here, on the actor, never on the UI loop.
     for (session_id, session) in std::mem::take(&mut pending.sessions) {
-        let result = manager.save_session_owned(session).map(|_| ());
+        let result = manager.save_session_bounded(session).map(|_| ());
         health.record(&session_id, &result);
         record(format!("session:{session_id}"), result);
     }
     for (session_id, session) in std::mem::take(&mut pending.completed_commits) {
-        let commit_result = manager.save_session_owned(session);
+        let commit_result = manager.save_session_bounded(session);
         health.record(&session_id, &commit_result);
         let save_succeeded = commit_result.is_ok();
         record(

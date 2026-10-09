@@ -8,7 +8,7 @@ import type { FeedDict } from "../types";
 export const feed: FeedDict = {
   metaTitle: "Activity · Codewhale",
   metaDescription:
-    "Live feed of issues, pull requests, and releases mirrored from the Hmbown/CodeWhale GitHub repo.",
+    "Live feed of issues, pull requests, and releases mirrored from the codewhale-hq/CodeWhale GitHub repo.",
   title: "Activity",
   titleAside: "动态",
   titleAsideLang: "zh",

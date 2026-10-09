@@ -1,7 +1,7 @@
 /**
  * roadmap-feed.ts — fetch the live roadmap from GitHub.
  *
- *   "Shipped"    ← last 8 published Releases on Hmbown/CodeWhale
+ *   "Shipped"    ← last 8 published Releases on codewhale-hq/CodeWhale
  *   "Underway"   ← open issues with label `roadmap:underway`
  *   "Considered" ← open issues with label `roadmap:considered`
  *   "Ruled out"  ← issues (open or closed) with label `roadmap:ruled-out`
@@ -15,7 +15,7 @@
 import { OUTBOUND_TIMEOUT_MS } from "./bounded-body";
 import { truncateChars } from "./truncate";
 
-const REPO = process.env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+const REPO = process.env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
 const KV_KEY = "roadmap:feed";
 const KV_TTL = 60 * 30;
 
@@ -64,7 +64,7 @@ const FALLBACK_SHIPPED: RoadmapItem[] = [
   {
     title: "v0.8.45",
     note: "Moonshot/Kimi provider support, API-key setup guidance, provider-surface sync, and current Windows install/runtime guidance",
-    href: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.45",
+    href: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.45",
   },
 ];
 
@@ -76,9 +76,25 @@ function withPinnedShipped(items: RoadmapItem[]): RoadmapItem[] {
 
 function summarizeReleaseBody(body: string | null): string {
   if (!body) return "";
-  // First non-empty line, stripped of markdown headers / bullets / links
-  const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const candidate = lines.find((l) => !l.startsWith("#") && !l.startsWith("---") && l.length > 8);
+  const lines = body.split(/\r?\n/).map((l) => l.trim());
+  // Every release body opens with the same blockquote boilerplate and install
+  // steps, so the document's first prose line is not release-specific. Prefer
+  // the release's own "What's in vX.Y.Z" section when the template provides
+  // one, and never summarize a code fence, heading, blockquote, or separator.
+  const whatsIn = lines.findIndex((l) => /^#+\s+what's\s+in\b/i.test(l));
+  const scoped = whatsIn >= 0 ? lines.slice(whatsIn + 1) : lines;
+  let fenced = false;
+  let candidate = "";
+  for (const line of scoped) {
+    if (line.startsWith("```")) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced || line.length <= 8) continue;
+    if (line.startsWith("#") || line.startsWith("---") || line.startsWith(">")) continue;
+    candidate = line;
+    break;
+  }
   if (!candidate) return "";
   // Strip bullets and links, then cap length without splitting a character
   const stripped = candidate.replace(/^[*\-•]\s+/, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").trim();

@@ -10,14 +10,14 @@ export const community: CommunityDict = {
   metaDescription:
     "File issues, send pull requests, improve translations, and see who contributed to each Codewhale release.",
   kicker: "International open-source community",
-  title: "Build Codewhale with contributors around the world.",
-  lede: "The runtime, docs, tests, and translations come from contributors across countries, languages, and platforms. A first contribution does not have to be a feature. A clear bug report, a documentation fix, or a small tested patch counts.",
+  title: "Build Codewhale with contributors worldwide.",
+  lede: "Contributors across countries, languages, and platforms write the runtime, docs, tests, and translations. Your first contribution can be a clear bug report, a docs fix, or a small tested patch.",
   fileIssue: "File an issue",
   browsePulls: "Browse pull requests",
   readGuide: "Read the contribution guide",
   pathsTitle: "Start with one small thing.",
   pathsScope:
-    "Bug reports, code, tests, docs, translations, and review all help. Pick the one that fits the time you have.",
+    "Bug reports, code, tests, docs, translations, and review all help. Pick the one that fits your time.",
   recordTitle: "From proposal to release, in the open.",
   recordScope:
     "The activity feed shows recent repository work. The community digest keeps the weekly archive of repository activity. The roadmap separates what shipped from what is still being discussed.",

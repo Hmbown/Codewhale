@@ -1,0 +1,36 @@
+{
+  "mode": "test",
+  "checkoutEnabled": false,
+  "supplierSubmissionEnabled": false,
+  "siteOrigin": "http://localhost:3187",
+  "countries": {
+    "CN": {
+      "regionCode": "",
+      "shippingLevelCode": "",
+      "currency": "cny",
+      "usdExchangeRate": 6.7,
+      "feeRate": 0.039,
+      "flatFeeUsd": 0.3,
+      "taxReviewed": false,
+      "taxNote": "",
+      "supplierPricesUsdReviewed": false,
+      "addressPolicyReviewed": false,
+      "allowedPostalPrefixes": [],
+      "blockedPostalPrefixes": []
+    }
+  },
+  "products": {
+    "use-codewhale": {
+      "CN": { "approved": false, "designCode": "", "skuBySize": {}, "productionCostUsd": 5.12 }
+    },
+    "compiling": {
+      "CN": { "approved": false, "designCode": "", "skuBySize": {}, "productionCostUsd": 5.12 }
+    },
+    "whale-bro": {
+      "CN": { "approved": false, "designCode": "", "skuBySize": {}, "productionCostUsd": 5.12 }
+    },
+    "contributor": {
+      "CN": { "approved": false, "designCode": "", "contributorDesigns": {}, "skuBySize": {}, "productionCostUsd": 5.12 }
+    }
+  }
+}

@@ -251,12 +251,8 @@ pub fn reconcile(
         dry_run: options.dry_run,
         ..ReconcileSummary::default()
     };
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(sessions_dir.join(RECONCILE_LOCK_FILE))?;
+    let lock_file =
+        crate::session_manager::open_private_lock_file(&sessions_dir.join(RECONCILE_LOCK_FILE))?;
     if !crate::runtime_threads::try_lock_file_exclusive(&lock_file)? {
         summary.skipped_concurrent = true;
         return Ok(summary);

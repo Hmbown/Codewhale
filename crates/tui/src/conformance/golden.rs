@@ -112,14 +112,32 @@ fn first_difference(expected: &str, actual: &str) -> String {
         .zip(&actual_lines)
         .position(|(left, right)| left != right)
         .unwrap_or_else(|| expected_lines.len().min(actual_lines.len()));
+    let character = match (expected_lines.get(index), actual_lines.get(index)) {
+        (Some(left), Some(right)) => left
+            .chars()
+            .zip(right.chars())
+            .take_while(|(left, right)| left == right)
+            .count(),
+        _ => 0,
+    };
+    let start = character.saturating_sub(40);
     let show = |lines: &[&str]| {
-        lines
-            .get(index)
-            .map_or_else(|| "<end of file>".to_string(), |line| truncate(line, 600))
+        lines.get(index).map_or_else(
+            || "<end of file>".to_string(),
+            |line| {
+                let window: String = line.chars().skip(start).take(601).collect();
+                format!(
+                    "{}{}",
+                    if start == 0 { "" } else { "…" },
+                    truncate(&window, 600)
+                )
+            },
+        )
     };
     format!(
-        "first difference at line {} (expected {} lines, got {}):\n  expected: {}\n  actual:   {}",
+        "first difference at line {}, character {} (expected {} lines, got {}):\n  expected: {}\n  actual:   {}",
         index + 1,
+        character + 1,
         expected_lines.len(),
         actual_lines.len(),
         show(&expected_lines),
@@ -411,6 +429,16 @@ fn golden_comparison_rejects_changed_bytes_and_missing_output() {
     // A CRLF golden must not be silently normalized either.
     std::fs::write(&path, "expected\r\n").expect("write CRLF golden");
     assert!(check_golden(&path, "expected\n").is_err());
+
+    // A large snapshot's common prefix must not hide its actual differing
+    // field; the comparison still rejects the entire changed document.
+    let prefix = "x".repeat(700);
+    let expected = jsonl(&[serde_json::json!({"prefix": prefix, "tail": "old"})]);
+    let actual = jsonl(&[serde_json::json!({"prefix": prefix, "tail": "new"})]);
+    std::fs::write(&path, expected).expect("write long JSON golden");
+    let diagnostic = check_golden(&path, &actual).unwrap_err();
+    assert!(diagnostic.contains("\"tail\":\"old\""));
+    assert!(diagnostic.contains("\"tail\":\"new\""));
 }
 
 #[test]

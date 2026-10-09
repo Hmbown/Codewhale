@@ -24,8 +24,23 @@ pub fn snapshot_dir_for(workspace: &Path) -> io::Result<PathBuf> {
     // An explicit profile must never read or create ambient snapshots. The
     // shared resolver also preserves legacy stores and rejects invalid
     // overrides; do not silently fall back to the OS home or working directory.
-    let base = codewhale_config::resolve_state_dir("snapshots").map_err(io::Error::other)?;
+    let base = snapshot_state_base()?;
     Ok(snapshot_dir_with_base(workspace, &base))
+}
+
+/// The shared snapshot store. An unsealed test gets a private one: a snapshot
+/// repo opened by a fixture must not land in the developer's real store.
+#[cfg(test)]
+fn snapshot_state_base() -> io::Result<PathBuf> {
+    match crate::test_support::unsealed_state_dir("snapshots") {
+        Some(base) => Ok(base),
+        None => codewhale_config::resolve_state_dir("snapshots").map_err(io::Error::other),
+    }
+}
+
+#[cfg(not(test))]
+fn snapshot_state_base() -> io::Result<PathBuf> {
+    codewhale_config::resolve_state_dir("snapshots").map_err(io::Error::other)
 }
 
 fn snapshot_dir_with_base(workspace: &Path, base: &Path) -> PathBuf {

@@ -1,0 +1,12 @@
+{
+  "direction": "core_to_host",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "error": {
+      "code": -32002,
+      "message": "core/call refused"
+    }
+  }
+}

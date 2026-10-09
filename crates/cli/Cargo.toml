@@ -17,7 +17,7 @@ mimalloc-allocator = ["dep:mimalloc"]
 # mimalloc v2.4.5 remake — no C compiler, no build script) instead of the
 # default mimalloc. Off by default; the default build is unchanged.
 # Build with: cargo build -p codewhale-cli --no-default-features --features rusty-alloc
-rusty-alloc = ["dep:rusty_alloc-api", "codewhale-tui/rusty-alloc"]
+rusty-alloc = ["dep:rusty_alloc-api"]
 
 [[bin]]
 name = "codewhale"
@@ -27,18 +27,18 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-codewhale-tui = { path = "../tui", version = "0.10.1", default-features = false }
-codewhale-agent = { path = "../agent", version = "0.10.1" }
-codewhale-app-server = { path = "../app-server", version = "0.10.1" }
-codewhale-config = { path = "../config", version = "0.10.1" }
-codewhale-lane = { path = "../lane", version = "0.10.1" }
-codewhale-workflow = { path = "../workflow", version = "0.10.1" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.10.1" }
-codewhale-paths = { path = "../paths", version = "0.10.1" }
-codewhale-release = { path = "../release", version = "0.10.1" }
-codewhale-secrets = { path = "../secrets", version = "0.10.1" }
-codewhale-state = { path = "../state", version = "0.10.1" }
-codewhale-telemetry = { path = "../telemetry", version = "0.10.1" }
+codewhale-tui = { path = "../tui", version = "0.10.2", default-features = false }
+codewhale-agent = { path = "../agent", version = "0.10.2" }
+codewhale-app-server = { path = "../app-server", version = "0.10.2" }
+codewhale-config = { path = "../config", version = "0.10.2" }
+codewhale-lane = { path = "../lane", version = "0.10.2" }
+codewhale-workflow = { path = "../workflow", version = "0.10.2" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.10.2" }
+codewhale-paths = { path = "../paths", version = "0.10.2" }
+codewhale-release = { path = "../release", version = "0.10.2" }
+codewhale-secrets = { path = "../secrets", version = "0.10.2" }
+codewhale-state = { path = "../state", version = "0.10.2" }
+codewhale-telemetry = { path = "../telemetry", version = "0.10.2" }
 chrono.workspace = true
 console = "0.16.3"
 dirs.workspace = true
@@ -58,7 +58,7 @@ webbrowser = "1.0"
 zeroize = "1.8.2"
 
 [build-dependencies]
-codewhale-build-support = { path = "../build-support", version = "0.10.1" }
+codewhale-build-support = { path = "../build-support", version = "0.10.2" }
 
 # Parent-death cleanup for delegated server children (#3259): on Linux the
 # dispatcher sets PR_SET_PDEATHSIG so the child is signalled if the dispatcher

@@ -51,7 +51,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
-      - uses: Hmbown/CodeWhale@ACTION_COMMIT_SHA
+      - uses: codewhale-hq/CodeWhale@ACTION_COMMIT_SHA
         id: review
         with:
           version: v0.10.0

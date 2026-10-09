@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale" --version
 ```
 
-[已发布的 v0.9.11 版本](https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.11)
+[已发布的 v0.9.11 版本](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
 包含 `codewhale-linux-arm64` 和 `codew-linux-arm64`；有产物存在，并不代表它兼容每一台
 HarmonyOS 设备。各版本的具体要求和 Cargo 兜底方案见
 [Linux ARM64 可移植性](./INSTALL.md#linux-arm64-可移植性)。

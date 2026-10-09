@@ -67,6 +67,15 @@ pub enum Surface {
     Desktop,
     /// Control-plane application interactions.
     ControlPlane,
+    /// A VS Code-family extension client of this schema.
+    ///
+    /// Deliberately **generic**, the way `web-app` and `desktop` are: the
+    /// client is not one publisher's extension, and a surface naming a vendor
+    /// would narrow the whitelist for every later extension built on the same
+    /// client. The editor's own name and version are **not** collected — this
+    /// value names the kind of client that emitted the batch, never the host
+    /// application it happened to run inside.
+    VscodeExtension,
 }
 
 impl Surface {
@@ -82,6 +91,7 @@ impl Surface {
         Self::WebApp,
         Self::Desktop,
         Self::ControlPlane,
+        Self::VscodeExtension,
     ];
 
     /// The wire spelling.
@@ -98,7 +108,22 @@ impl Surface {
             Self::WebApp => "web-app",
             Self::Desktop => "desktop",
             Self::ControlPlane => "control-plane",
+            Self::VscodeExtension => "vscode-extension",
         }
+    }
+
+    /// The inverse of [`Self::as_str`], or `None` for anything else.
+    ///
+    /// The round trip is pinned by a test, so a value that can be spelled can
+    /// also be parsed and vice versa. This is the only place a surface name is
+    /// turned back into a variant, which is what lets an *embedder* declare one
+    /// without a second copy of the closed list.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|surface| surface.as_str() == value)
     }
 }
 
@@ -758,8 +783,8 @@ pub fn is_reduced_panic_site(value: &str) -> bool {
 /// Whether `value` is a provider id this build knows.
 ///
 /// Checked against the **full** provider registry, not
-/// `ProviderKind::all()`: that constant is the 36-row *catalog* subset, and
-/// `ApiProvider::kind()` legitimately yields dialect kinds
+/// `ProviderKind::all()`: that list is the selectable catalog subset, while
+/// captured intrinsic kinds legitimately include dialect kinds
 /// (`deepseek-anthropic`, the Model Studio plan variants) that are absent from
 /// it. Narrowing to the catalog would silently drop a real user's route.
 #[must_use]

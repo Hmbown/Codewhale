@@ -12,11 +12,12 @@ use crate::config::{SearchProvider, tavily_env_key, tavily_key_from};
 use crate::network_policy::{Decision, NetworkPolicyDecider};
 use async_trait::async_trait;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::web::adapter::{self, AdapterFailure, AdapterResult};
 use super::web::backend::SearchBackendChain;
 use super::web::cache;
 use super::web::contract::{
@@ -63,11 +64,13 @@ const VOLCENGINE_MIN_TIMEOUT_MS: u64 = 90_000;
 struct QueryFilters<'a> {
     recency: Option<Recency>,
     locale: Option<&'a str>,
+    prepared: Option<&'a PreparedFilters>,
 }
 
 impl<'a> QueryFilters<'a> {
     fn of(query: &'a SearchQuery) -> Self {
         Self {
+            prepared: None,
             recency: query.recency,
             locale: query
                 .locale
@@ -78,7 +81,10 @@ impl<'a> QueryFilters<'a> {
     }
 
     /// `day` / `week` / `month` / `year`, rounded up from the request.
-    fn window(self) -> Option<&'static str> {
+    fn window(self) -> Option<&'a str> {
+        if let Some(prepared) = self.prepared {
+            return prepared.window.as_deref();
+        }
         self.recency.map(|recency| match recency.days() {
             0..=1 => "day",
             2..=7 => "week",
@@ -89,6 +95,9 @@ impl<'a> QueryFilters<'a> {
 
     /// Lowercase language subtag (`en` from `en-US`).
     fn language(self) -> Option<String> {
+        if let Some(prepared) = self.prepared {
+            return prepared.language.clone();
+        }
         let language = self.locale?.split(['-', '_']).next()?;
         (matches!(language.len(), 2 | 3) && language.chars().all(|ch| ch.is_ascii_alphabetic()))
             .then(|| language.to_ascii_lowercase())
@@ -96,10 +105,337 @@ impl<'a> QueryFilters<'a> {
 
     /// Two-letter region subtag, uppercase (`US` from `en-US`).
     fn region(self) -> Option<String> {
+        if let Some(prepared) = self.prepared {
+            return prepared.region.clone();
+        }
         let region = self.locale?.split(['-', '_']).nth(1)?;
         (region.len() == 2 && region.chars().all(|ch| ch.is_ascii_alphabetic()))
             .then(|| region.to_ascii_uppercase())
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedFilters {
+    kind: String,
+    window: Option<String>,
+    language: Option<String>,
+    region: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestProposal {
+    kind: String,
+    payload: Value,
+    pairs: Vec<(String, String)>,
+}
+
+async fn host_request(
+    backend: &str,
+    query: &str,
+    filters: QueryFilters<'_>,
+    max_results: usize,
+    context: &ToolContext,
+    timeout_ms: u64,
+) -> AdapterResult<Option<RequestProposal>> {
+    if !adapter::search_selected(context) {
+        return Ok(None);
+    }
+    let proposal: RequestProposal = adapter::transform(
+        crate::extension_host::StockOperation::WebRequest,
+        json!({"backend":backend,"query":query,"max_results":max_results,
+            "locale":filters.locale,"filters":{"window":filters.window(),
+            "language":filters.language(),"region":filters.region()}}),
+        context,
+        Duration::from_millis(timeout_ms),
+    )
+    .await?;
+    let valid = proposal.kind == "web_request"
+        && match backend {
+            "serply" | "searxng" | "bing" | "duckduckgo" => {
+                proposal.payload.is_null()
+                    && proposal.pairs.first() == Some(&("q".into(), query.into()))
+                    && proposal
+                        .pairs
+                        .iter()
+                        .enumerate()
+                        .all(|(index, (key, value))| {
+                            !proposal.pairs[..index]
+                                .iter()
+                                .any(|(prior, _)| prior == key)
+                                && (key != "q" || value == query)
+                                && (key != "num" || value == &max_results.to_string())
+                        })
+                    && proposal.pairs.iter().all(|(key, _)| {
+                        matches!(
+                            key.as_str(),
+                            "q" | "num" | "hl" | "gl" | "format" | "time_range" | "language"
+                        )
+                    })
+            }
+            "volcengine" => {
+                proposal.pairs.is_empty()
+                    && proposal
+                        .payload
+                        .as_object()
+                        .is_some_and(|value| value.len() == 1 && value.contains_key("input"))
+            }
+            name => {
+                let (query_path, count_path) = match name {
+                    "firecrawl" => ("/query", "/limit"),
+                    "tavily" | "sofya" => ("/query", "/max_results"),
+                    "bocha" => ("/query", "/count"),
+                    "metaso" => ("/q", "/size"),
+                    "baidu" => ("/messages/0/content", "/resource_type_filter/0/top_k"),
+                    _ => ("", ""),
+                };
+                proposal.pairs.is_empty()
+                    && proposal.payload.pointer(query_path).and_then(Value::as_str) == Some(query)
+                    && proposal.payload.pointer(count_path).and_then(Value::as_u64)
+                        == Some(max_results as u64)
+                    && proposal.payload.as_object().is_some_and(|value| {
+                        value.keys().all(|key| {
+                            matches!(
+                                key.as_str(),
+                                "query"
+                                    | "q"
+                                    | "limit"
+                                    | "max_results"
+                                    | "count"
+                                    | "size"
+                                    | "sources"
+                                    | "tbs"
+                                    | "country"
+                                    | "search_depth"
+                                    | "time_range"
+                                    | "freshness"
+                                    | "scope"
+                                    | "messages"
+                                    | "search_source"
+                                    | "resource_type_filter"
+                            )
+                        })
+                    })
+            }
+        };
+    if !valid {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host returned a request outside the captured query contract",
+        )));
+    }
+    Ok(Some(proposal))
+}
+
+#[derive(Default)]
+pub(crate) struct OpaqueUrls(std::collections::HashMap<String, String>);
+impl OpaqueUrls {
+    pub(crate) fn capture(&mut self, value: &str) -> String {
+        if value.trim().is_empty() {
+            return value.into();
+        }
+        let token = format!("web-url-{}", self.0.len());
+        let leading = value.len() - value.trim_start().len();
+        let trailing = value.trim_end().len();
+        let wire = format!("{}{}{}", &value[..leading], token, &value[trailing..]);
+        self.0.insert(token, value.trim().into());
+        self.0.insert(wire.clone(), value.into());
+        wire
+    }
+    pub(crate) fn restore(&self, value: &str) -> AdapterResult<String> {
+        if value.trim().is_empty() {
+            return Ok(value.into());
+        }
+        self.0.get(value).cloned().ok_or_else(|| {
+            AdapterFailure::host(ToolError::execution_failed(
+                "Web Host returned an unknown source handle",
+            ))
+        })
+    }
+}
+
+fn provider_projection(value: &Value, urls: &mut OpaqueUrls, secret: Option<&str>) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    // Only fields consumed by a registered adapter cross the process.
+                    if !matches!(
+                        key.as_str(),
+                        "results"
+                            | "title"
+                            | "name"
+                            | "url"
+                            | "link"
+                            | "content"
+                            | "snippet"
+                            | "summary"
+                            | "description"
+                            | "markdown"
+                            | "data"
+                            | "web"
+                            | "webpages"
+                            | "webPages"
+                            | "value"
+                            | "pages"
+                            | "references"
+                            | "success"
+                            | "error"
+                            | "message"
+                            | "msg"
+                            | "code"
+                            | "error_code"
+                            | "error_msg"
+                            | "output"
+                            | "type"
+                            | "text"
+                            | "score"
+                    ) {
+                        return None;
+                    }
+                    let projected = if matches!(key.as_str(), "url" | "link") && value.is_string() {
+                        Value::String(urls.capture(value.as_str().expect("string")))
+                    } else {
+                        provider_projection(value, urls, secret)
+                    };
+                    Some((key.clone(), projected))
+                })
+                .collect(),
+        ),
+        Value::Array(array) => Value::Array(
+            array
+                .iter()
+                .map(|value| provider_projection(value, urls, secret))
+                .collect(),
+        ),
+        Value::String(text) => Value::String(match secret.filter(|key| !key.is_empty()) {
+            Some(key) => text.replace(key, "[redacted]"),
+            None => text.clone(),
+        }),
+        _ => value.clone(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderProposal {
+    kind: String,
+    entries: Vec<WebSearchEntry>,
+    error: Option<String>,
+}
+
+async fn host_provider(
+    backend: &str,
+    parsed: &Value,
+    max_results: usize,
+    secret: Option<&str>,
+    context: &ToolContext,
+    timeout_ms: u64,
+) -> AdapterResult<Option<Vec<WebSearchEntry>>> {
+    if !adapter::search_selected(context) {
+        return Ok(None);
+    }
+    let mut urls = OpaqueUrls::default();
+    let captured;
+    let source = if backend == "volcengine" {
+        // Rust's existing JSON/scalar guard is also the privacy boundary: never
+        // forward the raw model body or an embedded credential-bearing URL.
+        captured = if let Some(error) = parsed.get("error") {
+            json!({"error":provider_projection(error,&mut urls,secret)})
+        } else if let Some(text) = volcengine_extract_text(parsed) {
+            let inner = serde_json::from_str::<Value>(extract_json_block(&text).unwrap_or(&text))
+                .ok()
+                .map(|value| provider_projection(&value, &mut urls, secret));
+            json!({"output":[{"type":"message","content":[{"text":inner.map(|value| value.to_string()).unwrap_or_default()}]}]})
+        } else {
+            json!({})
+        };
+        &captured
+    } else {
+        parsed
+    };
+    let projection = if backend == "volcengine" {
+        source.clone()
+    } else {
+        provider_projection(source, &mut urls, secret)
+    };
+    let mut numbers = serde_json::Map::new();
+    for key in ["code", "error_code"] {
+        if let Some(value) = parsed.get(key) {
+            numbers.insert(
+                format!("/{key}"),
+                json!({"i64":value.as_i64().map(|value| value.to_string())}),
+            );
+        }
+    }
+    if backend == "searxng"
+        && let Some(values) = parsed.get("results").and_then(Value::as_array)
+    {
+        for (index, value) in values.iter().enumerate() {
+            numbers.insert(
+                format!("/results/{index}/score"),
+                json!({"score":searxng_score(value).to_string()}),
+            );
+        }
+    }
+    let mut proposal: ProviderProposal = adapter::transform(crate::extension_host::StockOperation::WebProvider,
+        json!({"backend":backend,"max_results":max_results,"parsed":projection.as_object().map(|_| &projection).unwrap_or(&json!({})),"number_facts":numbers}),
+        context,Duration::from_millis(timeout_ms)).await?;
+    if proposal.kind != "web_provider" || proposal.entries.len() > max_results {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host returned an invalid provider proposal",
+        )));
+    }
+    if let Some(error) = proposal.error {
+        return Err(ToolError::execution_failed(error).into());
+    }
+    for entry in &mut proposal.entries {
+        entry.url = urls.restore(&entry.url)?;
+    }
+    Ok(Some(proposal.entries))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntriesProposal {
+    kind: String,
+    entries: Vec<super::web::contract::CapturedSearchEntry>,
+}
+
+pub(crate) async fn normalize_captured_entries(
+    entries: Vec<super::web::contract::CapturedSearchEntry>,
+    context: &ToolContext,
+    budget: Duration,
+) -> AdapterResult<Vec<super::web::contract::CapturedSearchEntry>> {
+    if !adapter::search_selected(context) {
+        return Ok(entries);
+    }
+    let mut urls = OpaqueUrls::default();
+    let mut captured = entries.clone();
+    for entry in &mut captured {
+        entry.url = urls.capture(&entry.url);
+    }
+    let proposal: EntriesProposal = adapter::transform(
+        crate::extension_host::StockOperation::WebEntries,
+        json!({"entries":captured}),
+        context,
+        budget,
+    )
+    .await?;
+    if proposal.kind != "web_entries" || proposal.entries.len() != entries.len() {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host changed the captured source count",
+        )));
+    }
+    proposal
+        .entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.url = urls.restore(&entry.url)?;
+            Ok(entry)
+        })
+        .collect()
 }
 
 /// Credential-free endpoint selected for an explicit doctor reachability
@@ -216,7 +552,8 @@ fn get_bearer_token_re() -> &'static Regex {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WebSearchEntry {
     title: String,
     url: String,
@@ -236,7 +573,7 @@ impl ToolSpec for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web and return ranked results with URLs, snippets, session-scoped ref_ids, and an execution receipt. Open a result ref_id with `web.run` when the short summary is not enough; fetch only the few sources needed. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise keyless Firecrawl is the default. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"firecrawl\" | \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\" | \"serply\"` in config.toml. Firecrawl Cloud works keyless with a bounded quota. For a known canonical URL, prefer `fetch_url` directly."
+        "Search the web and return ranked results with URLs, snippets, session-scoped ref_ids, and an execution receipt. `web.run` opens a result ref_id when the short summary is not enough. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise keyless Firecrawl is the default. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"firecrawl\" | \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\" | \"serply\"` in config.toml. Firecrawl Cloud works keyless with a bounded quota. `fetch_url` retrieves a known canonical URL directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -293,7 +630,7 @@ impl ToolSpec for WebSearchTool {
                 },
                 "locale": {
                     "type": "string",
-                    "description": "Requested result locale. Unsupported backends report it as degraded."
+                    "description": "Requested result locale as a BCP 47-style tag such as zh-CN or ja-JP; malformed values are ignored. The keyless Bing scrape honors it via its mkt/setlang market parameters; the keyless DuckDuckGo scrape maps a fixed region list and reports malformed or unmapped regions as ignored; unsupported backends report it as degraded."
                 }
             }
         })
@@ -330,19 +667,21 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<(Vec<WebSearchEntry>, String), ToolError> {
+    ) -> AdapterResult<(Vec<WebSearchEntry>, String)> {
         let env_key = std::env::var("FIRECRAWL_API_KEY").ok();
-        self.run_firecrawl_search_at(
+        self.run_firecrawl_search_at_for_context(
             FIRECRAWL_ENDPOINT,
             query,
             filters,
             max_results,
             timeout_ms,
             context.search_api_key.as_deref().or(env_key.as_deref()),
+            context,
         )
         .await
     }
 
+    #[cfg(test)]
     async fn run_firecrawl_search_at(
         &self,
         endpoint: &str,
@@ -352,6 +691,33 @@ impl WebSearchTool {
         timeout_ms: u64,
         api_key: Option<&str>,
     ) -> Result<(Vec<WebSearchEntry>, String), ToolError> {
+        let context = ToolContext::new(
+            std::env::current_dir()
+                .map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        );
+        self.run_firecrawl_search_at_for_context(
+            endpoint,
+            query,
+            filters,
+            max_results,
+            timeout_ms,
+            api_key,
+            &context,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn run_firecrawl_search_at_for_context(
+        &self,
+        endpoint: &str,
+        query: &str,
+        filters: QueryFilters<'_>,
+        max_results: usize,
+        timeout_ms: u64,
+        api_key: Option<&str>,
+        context: &ToolContext,
+    ) -> AdapterResult<(Vec<WebSearchEntry>, String)> {
         let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_millis(timeout_ms))
             .user_agent(USER_AGENT)
@@ -360,17 +726,30 @@ impl WebSearchTool {
                 ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
             })?;
         let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
-        let mut payload = json!({
-            "query": query,
-            "limit": max_results,
-            "sources": [{"type": "web"}],
-        });
-        if let Some(window) = filters.window() {
-            payload["tbs"] = json!(format!("qdr:{}", &window[..1]));
-        }
-        if let Some(region) = filters.region() {
-            payload["country"] = json!(region);
-        }
+        let payload = if let Some(plan) = host_request(
+            "firecrawl",
+            query,
+            filters,
+            max_results,
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            plan.payload
+        } else {
+            {
+                let mut payload =
+                    json!({"query":query,"limit":max_results,"sources":[{"type":"web"}]});
+                if let Some(window) = filters.window() {
+                    payload["tbs"] = json!(format!("qdr:{}", &window[..1]));
+                }
+                if let Some(region) = filters.region() {
+                    payload["country"] = json!(region);
+                }
+                payload
+            }
+        };
         let mut request = client.post(endpoint).json(&payload);
         if let Some(key) = api_key {
             request = request.bearer_auth(key);
@@ -379,9 +758,13 @@ impl WebSearchTool {
             ToolError::execution_failed(format!("Firecrawl search request failed: {e}"))
         })?;
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read Firecrawl response: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(response, context).await?
+        } else {
+            response.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read Firecrawl response: {e}"))
+            })?
+        };
         if !status.is_success() {
             let message = match status.as_u16() {
                 401 | 403 if api_key.is_none() => "Firecrawl rejected keyless search; set `[search] api_key` or FIRECRAWL_API_KEY".to_string(),
@@ -390,17 +773,41 @@ impl WebSearchTool {
                 429 => "Firecrawl quota is exhausted; retry later or check the configured account limits".to_string(),
                 code => format!("Firecrawl search failed: HTTP {code} — {}", truncate_error_body(&body)),
             };
-            return Err(ToolError::execution_failed(message));
+            return Err((ToolError::execution_failed(message)).into());
         }
         let parsed: Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse Firecrawl response: {e}"))
         })?;
+        if let Some(entries) = host_provider(
+            "firecrawl",
+            &parsed,
+            max_results,
+            api_key,
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            return Ok((
+                entries,
+                format!(
+                    "Firecrawl {}",
+                    if api_key.is_some() {
+                        "authenticated"
+                    } else {
+                        "keyless"
+                    }
+                ),
+            ));
+        }
+
         if parsed.get("success").and_then(Value::as_bool) == Some(false) {
             let detail = first_non_empty_string(&parsed, &["error", "message"])
                 .unwrap_or_else(|| "unknown API error".to_string());
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "Firecrawl search failed: {detail}"
-            )));
+            )))
+            .into());
         }
         let mode = if api_key.is_some() {
             "authenticated"
@@ -421,8 +828,20 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<(Vec<WebSearchEntry>, String), ToolError> {
-        let (url, host) = searxng_search_url(context.search_base_url.as_deref(), query, filters)?;
+    ) -> AdapterResult<(Vec<WebSearchEntry>, String)> {
+        let (url, host) = if let Some(plan) =
+            host_request("searxng", query, filters, max_results, context, timeout_ms).await?
+        {
+            // The configured origin/path/query are private Core authority.
+            let (base, host) = searxng_search_base(context.search_base_url.as_deref())?;
+            let mut url = base;
+            for (key, value) in plan.pairs {
+                url.query_pairs_mut().append_pair(&key, &value);
+            }
+            (url.to_string(), host)
+        } else {
+            searxng_search_url(context.search_base_url.as_deref(), query, filters)?
+        };
         check_policy(context.network_policy.as_ref(), &host)?;
 
         let client = crate::tls::reqwest_client_builder()
@@ -443,9 +862,15 @@ impl WebSearchTool {
             })?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read SearXNG response from {host}: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!(
+                    "Failed to read SearXNG response from {host}: {e}"
+                ))
+            })?
+        };
 
         if !status.is_success() {
             let truncated = truncate_error_body(&body);
@@ -458,7 +883,7 @@ impl WebSearchTool {
                 ),
                 code => format!("SearXNG search failed: HTTP {code} from {host}. {truncated}"),
             };
-            return Err(ToolError::execution_failed(msg));
+            return Err((ToolError::execution_failed(msg)).into());
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
@@ -466,6 +891,12 @@ impl WebSearchTool {
                 "Failed to parse SearXNG JSON response from {host}: {e}. Ensure the instance supports format=json and JSON output is enabled."
             ))
         })?;
+
+        if let Some(entries) =
+            host_provider("searxng", &parsed, max_results, None, context, timeout_ms).await?
+        {
+            return Ok((entries, host));
+        }
 
         Ok((parse_searxng_results(&parsed, max_results), host))
     }
@@ -478,7 +909,7 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+    ) -> AdapterResult<Vec<WebSearchEntry>> {
         let api_key = tavily_key_from(context.search_api_key.as_deref())
             .or_else(|| {
                 // An explicit `provider = "tavily"` still accepts any
@@ -506,7 +937,15 @@ impl WebSearchTool {
                 ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
             })?;
 
-        let payload = tavily_search_payload(&api_key, query, filters, max_results);
+        let mut payload = if let Some(plan) =
+            host_request("tavily", query, filters, max_results, context, timeout_ms).await?
+        {
+            plan.payload
+        } else {
+            tavily_search_payload(&api_key, query, filters, max_results)
+        };
+        // The credential never enters a transform snapshot or its grant.
+        payload["api_key"] = json!(api_key);
 
         let resp = client
             .post(TAVILY_ENDPOINT)
@@ -519,21 +958,39 @@ impl WebSearchTool {
             })?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read Tavily response: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read Tavily response: {e}"))
+            })?
+        };
 
         if !status.is_success() {
             let truncated = truncate_error_body(&body);
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "Tavily search failed: HTTP {} — {truncated}",
                 status.as_u16()
-            )));
+            )))
+            .into());
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse Tavily response: {e}"))
         })?;
+
+        if let Some(entries) = host_provider(
+            "tavily",
+            &parsed,
+            max_results,
+            Some(&api_key),
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            return Ok(entries);
+        }
 
         Ok(parse_tavily_results(&parsed, max_results))
     }
@@ -545,7 +1002,7 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+    ) -> AdapterResult<Vec<WebSearchEntry>> {
         let env_key = std::env::var("SOFYA_API_KEY").ok();
         let api_key = context
             .search_api_key
@@ -564,10 +1021,23 @@ impl WebSearchTool {
                 ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
             })?;
 
-        let payload = json!({
-            "query": query,
-            "max_results": max_results,
-        });
+        let payload = if let Some(plan) = host_request(
+            "sofya",
+            query,
+            QueryFilters::default(),
+            max_results,
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            plan.payload
+        } else {
+            json!({
+                "query": query,
+                "max_results": max_results,
+            })
+        };
 
         let resp = client
             .post(SOFYA_ENDPOINT)
@@ -581,21 +1051,39 @@ impl WebSearchTool {
             })?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read Sofya response: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read Sofya response: {e}"))
+            })?
+        };
 
         if !status.is_success() {
             let truncated = truncate_error_body(&body);
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "Sofya search failed: HTTP {} — {truncated}",
                 status.as_u16()
-            )));
+            )))
+            .into());
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse Sofya response: {e}"))
         })?;
+
+        if let Some(entries) = host_provider(
+            "sofya",
+            &parsed,
+            max_results,
+            Some(api_key),
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            return Ok(entries);
+        }
 
         Ok(parse_sofya_results(&parsed, max_results))
     }
@@ -609,7 +1097,7 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+    ) -> AdapterResult<Vec<WebSearchEntry>> {
         let env_key = std::env::var("SERPLY_API_KEY").ok();
         let api_key = context
             .search_api_key
@@ -628,8 +1116,20 @@ impl WebSearchTool {
                 ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
             })?;
 
+        let url = if let Some(plan) =
+            host_request("serply", query, filters, max_results, context, timeout_ms).await?
+        {
+            let mut url = reqwest::Url::parse(SERPLY_ENDPOINT)
+                .map_err(|error| ToolError::invalid_input(error.to_string()))?;
+            for (key, value) in plan.pairs {
+                url.query_pairs_mut().append_pair(&key, &value);
+            }
+            url
+        } else {
+            serply_search_url(query, filters, max_results)?
+        };
         let resp = client
-            .get(serply_search_url(query, filters, max_results)?)
+            .get(url)
             .header("X-Api-Key", api_key)
             .header("Accept", "application/json")
             .send()
@@ -639,21 +1139,39 @@ impl WebSearchTool {
             })?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read Serply response: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read Serply response: {e}"))
+            })?
+        };
 
         if !status.is_success() {
             let truncated = truncate_error_body(&body);
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "Serply search failed: HTTP {}: {truncated}",
                 status.as_u16()
-            )));
+            )))
+            .into());
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse Serply response: {e}"))
         })?;
+
+        if let Some(entries) = host_provider(
+            "serply",
+            &parsed,
+            max_results,
+            Some(api_key),
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            return Ok(entries);
+        }
 
         Ok(parse_serply_results(&parsed, max_results))
     }
@@ -665,7 +1183,7 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+    ) -> AdapterResult<Vec<WebSearchEntry>> {
         let api_key = context
             .search_api_key
             .as_deref()
@@ -682,11 +1200,24 @@ impl WebSearchTool {
                 ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
             })?;
 
-        let payload = json!({
-            "query": query,
-            "freshness": "noLimit",
-            "count": max_results,
-        });
+        let payload = if let Some(plan) = host_request(
+            "bocha",
+            query,
+            QueryFilters::default(),
+            max_results,
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            plan.payload
+        } else {
+            json!({
+                "query": query,
+                "freshness": "noLimit",
+                "count": max_results,
+            })
+        };
 
         let resp = client
             .post(BOCHA_ENDPOINT)
@@ -700,24 +1231,42 @@ impl WebSearchTool {
             })?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read Bocha response: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read Bocha response: {e}"))
+            })?
+        };
 
         if !status.is_success() {
             let truncated = truncate_error_body(&body);
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "Bocha search failed: HTTP {} — {truncated}",
                 status.as_u16()
-            )));
+            )))
+            .into());
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse Bocha response: {e}"))
         })?;
 
+        if let Some(entries) = host_provider(
+            "bocha",
+            &parsed,
+            max_results,
+            Some(api_key),
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            return Ok(entries);
+        }
+
         if let Some(error) = bocha_error_message(&parsed) {
-            return Err(ToolError::execution_failed(error));
+            return Err((ToolError::execution_failed(error)).into());
         }
 
         Ok(parse_bocha_results(&parsed, max_results))
@@ -731,7 +1280,7 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+    ) -> AdapterResult<Vec<WebSearchEntry>> {
         let env_key = std::env::var("METASO_API_KEY").ok();
         let api_key = context
             .search_api_key
@@ -751,11 +1300,24 @@ impl WebSearchTool {
             })?;
 
         let size = max_results.clamp(1, 100);
-        let payload = json!({
-            "q": query,
-            "scope": "webpage",
-            "size": size,
-        });
+        let payload = if let Some(plan) = host_request(
+            "metaso",
+            query,
+            QueryFilters::default(),
+            max_results,
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            plan.payload
+        } else {
+            json!({
+                "q": query,
+                "scope": "webpage",
+                "size": size,
+            })
+        };
 
         let resp = client
             .post(format!("{METASO_ENDPOINT}/search"))
@@ -769,9 +1331,13 @@ impl WebSearchTool {
             })?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read Metaso response: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read Metaso response: {e}"))
+            })?
+        };
 
         if !status.is_success() {
             let msg = match status.as_u16() {
@@ -782,12 +1348,18 @@ impl WebSearchTool {
                     format!("Metaso server error (HTTP {status}) — {truncated}")
                 }
             };
-            return Err(ToolError::execution_failed(msg));
+            return Err((ToolError::execution_failed(msg)).into());
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse Metaso response: {e}"))
         })?;
+
+        if let Some(entries) =
+            host_provider("metaso", &parsed, size, Some(api_key), context, timeout_ms).await?
+        {
+            return Ok(entries);
+        }
 
         // Check business-logic error codes in the response body.
         if let Some(code) = parsed.get("code").and_then(|v| v.as_i64())
@@ -797,11 +1369,11 @@ impl WebSearchTool {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            return Err(ToolError::execution_failed(match code {
+            return Err((ToolError::execution_failed(match code {
                 3003 => "Metaso: daily search limit reached — set METASO_API_KEY or get one at https://metaso.cn/search-api/playground".to_string(),
                 2005 => "Metaso API key rejected — check METASO_API_KEY or set `[search] api_key` in config.toml".to_string(),
                 _ => format!("Metaso API error (code {code}: {msg})"),
-            }));
+            })).into());
         }
 
         Ok(parse_metaso_results(&parsed, size))
@@ -814,7 +1386,7 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+    ) -> AdapterResult<Vec<WebSearchEntry>> {
         let env_key = std::env::var("BAIDU_SEARCH_API_KEY").ok();
         let api_key = context
             .search_api_key
@@ -833,7 +1405,20 @@ impl WebSearchTool {
                 ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
             })?;
 
-        let payload = baidu_search_payload(query, max_results);
+        let payload = if let Some(plan) = host_request(
+            "baidu",
+            query,
+            QueryFilters::default(),
+            max_results,
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            plan.payload
+        } else {
+            baidu_search_payload(query, max_results)
+        };
 
         // Baidu's AI Search endpoint accepts conversational messages rather
         // than an index-only query. Treat the entire request/response decode
@@ -853,9 +1438,13 @@ impl WebSearchTool {
             })?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read Baidu response: {e}"))
-        })?;
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read Baidu response: {e}"))
+            })?
+        };
 
         if !status.is_success() {
             let msg = match status.as_u16() {
@@ -866,15 +1455,28 @@ impl WebSearchTool {
                     format!("Baidu search failed: HTTP {} — {truncated}", status.as_u16())
                 }
             };
-            return Err(ToolError::execution_failed(msg));
+            return Err((ToolError::execution_failed(msg)).into());
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse Baidu response: {e}"))
         })?;
 
+        if let Some(entries) = host_provider(
+            "baidu",
+            &parsed,
+            max_results,
+            Some(api_key),
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            return Ok(entries);
+        }
+
         if let Some(error) = baidu_error_message(&parsed) {
-            return Err(ToolError::execution_failed(error));
+            return Err((ToolError::execution_failed(error)).into());
         }
 
         Ok(parse_baidu_results(&parsed, max_results))
@@ -887,7 +1489,7 @@ impl WebSearchTool {
         max_results: usize,
         timeout_ms: u64,
         context: &ToolContext,
-    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+    ) -> AdapterResult<Vec<WebSearchEntry>> {
         let volc_key = std::env::var("VOLCENGINE_API_KEY").ok();
         let volc_ark_key = std::env::var("VOLCENGINE_ARK_API_KEY").ok();
         let ark_key = std::env::var("ARK_API_KEY").ok();
@@ -918,7 +1520,24 @@ impl WebSearchTool {
                 ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
             })?;
 
-        let payload = volcengine_search_payload(query, max_results);
+        let mut payload = if let Some(plan) = host_request(
+            "volcengine",
+            query,
+            QueryFilters::default(),
+            max_results,
+            context,
+            timeout_ms,
+        )
+        .await?
+        {
+            plan.payload
+        } else {
+            volcengine_search_payload(query, max_results)
+        };
+        // The fixed Core route/model/tool selection is never Host authority.
+        payload["model"] = json!("doubao-seed-2-0-lite-260428");
+        payload["stream"] = json!(false);
+        payload["tools"] = json!([{"type":"web_search"}]);
 
         // Unlike the ordinary index-search backends, Volcengine's Responses
         // endpoint runs a named model and returns model-generated text. Keep
@@ -942,11 +1561,15 @@ impl WebSearchTool {
             {
                 Ok(resp) => {
                     let status = resp.status();
-                    let body = resp.text().await.map_err(|e| {
-                        ToolError::execution_failed(format!(
-                            "Failed to read Volcengine response: {e}"
-                        ))
-                    })?;
+                    let body = if adapter::search_selected(context) {
+                        adapter::read_response(resp, context).await?
+                    } else {
+                        resp.text().await.map_err(|e| {
+                            ToolError::execution_failed(format!(
+                                "Failed to read Volcengine response: {e}"
+                            ))
+                        })?
+                    };
 
                     if !status.is_success() {
                         let msg = match status.as_u16() {
@@ -957,7 +1580,7 @@ impl WebSearchTool {
                                 format!("Volcengine search failed: HTTP {} — {truncated}", status.as_u16())
                             }
                         };
-                        return Err(ToolError::execution_failed(msg));
+                        return Err((ToolError::execution_failed(msg)).into());
                     }
 
                     let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
@@ -966,8 +1589,21 @@ impl WebSearchTool {
                         ))
                     })?;
 
+                    if let Some(entries) = host_provider(
+                        "volcengine",
+                        &parsed,
+                        max_results,
+                        Some(api_key),
+                        context,
+                        timeout_ms,
+                    )
+                    .await?
+                    {
+                        return Ok(entries);
+                    }
+
                     if let Some(error) = volcengine_error_message(&parsed) {
-                        return Err(ToolError::execution_failed(error));
+                        return Err((ToolError::execution_failed(error)).into());
                     }
 
                     let response_text = volcengine_extract_text(&parsed).ok_or_else(|| {
@@ -979,9 +1615,10 @@ impl WebSearchTool {
                 Err(e) => {
                     let is_transient = e.is_timeout() || e.is_connect();
                     if !is_transient || attempt == 2 {
-                        return Err(ToolError::execution_failed(format!(
+                        return Err((ToolError::execution_failed(format!(
                             "Volcengine search request failed: {e}"
-                        )));
+                        )))
+                        .into());
                     }
                     last_err = Some(ToolError::execution_failed(format!(
                         "Volcengine search request failed (attempt {}/3): {e}",
@@ -992,9 +1629,11 @@ impl WebSearchTool {
         }
 
         // Unreachable — the final iteration always returns above.
-        Err(last_err.unwrap_or_else(|| {
-            ToolError::execution_failed("Volcengine search: unexpected retry exit")
-        }))
+        Err(last_err
+            .unwrap_or_else(|| {
+                ToolError::execution_failed("Volcengine search: unexpected retry exit")
+            })
+            .into())
     }
 }
 
@@ -1063,8 +1702,15 @@ pub(crate) async fn execute_search(
             fallback_budget_after_first,
         )
         .await?;
-    let mut response =
-        finalize_search_response(query.clone(), chained.capabilities, chained.raw, started);
+    let mut response = finalize_search_response_for_context(
+        query.clone(),
+        chained.capabilities,
+        chained.raw,
+        started,
+        context,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .await?;
     register_search_citations(&mut response, context);
     cache::insert_search(
         &context.state_namespace,
@@ -1249,6 +1895,106 @@ const fn default_backend_host(backend: BackendId) -> Option<&'static str> {
     }
 }
 
+async fn finalize_search_response_for_context(
+    query: SearchQuery,
+    capabilities: super::web::contract::QueryCapabilities,
+    mut raw: BackendSearch,
+    started: Instant,
+    context: &ToolContext,
+    budget: Duration,
+) -> AdapterResult<SearchResponse> {
+    if !adapter::search_selected(context) {
+        return Ok(finalize_search_response(query, capabilities, raw, started));
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Proposal {
+        kind: String,
+        honored: HonoredQueryCapabilities,
+        degraded: Vec<DegradedReason>,
+        prefix: String,
+        suffix: String,
+    }
+    let initial = raw.degraded.clone();
+    apply_domain_constraints(&query, capabilities, &mut raw);
+    let domain_extra = raw
+        .degraded
+        .iter()
+        .filter(|reason| !initial.contains(reason))
+        .cloned()
+        .collect::<Vec<_>>();
+    raw.results.truncate(usize::from(query.max_results));
+    rerank(&mut raw.results);
+    let proposal:Proposal=adapter::transform(crate::extension_host::StockOperation::WebFinalize,
+        json!({"requested":{"recency":query.recency.is_some(),"domains":!query.domains.is_empty(),"locale":query.locale.is_some()},
+            "capabilities":capabilities,"count":raw.results.len(),"degraded":initial,"domain_extra":domain_extra,"has_note":raw.note.is_some()}),context,budget).await?;
+    let known = |reason: &DegradedReason| {
+        initial.contains(reason)
+            || domain_extra.contains(reason)
+            || matches!(
+                reason,
+                DegradedReason::KnobIgnored {
+                    knob: QueryKnob::Recency | QueryKnob::Locale
+                }
+            )
+    };
+    if proposal.kind != "web_finalize"
+        || proposal.prefix.len() > 128
+        || proposal.suffix.len() > 128
+        || !proposal.degraded.iter().all(known)
+        || !initial
+            .iter()
+            .chain(&domain_extra)
+            .all(|reason| proposal.degraded.contains(reason))
+        || proposal.honored.domains != !query.domains.is_empty()
+        || proposal.honored.max_results
+            != matches!(
+                capabilities.max_results,
+                super::web::contract::CapabilityState::Supported
+            )
+        || (proposal.honored.recency
+            && (!query.recency.is_some()
+                || !matches!(
+                    capabilities.recency,
+                    super::web::contract::CapabilityState::Supported
+                )))
+        || (proposal.honored.locale
+            && (!query.locale.is_some()
+                || !matches!(
+                    capabilities.locale,
+                    super::web::contract::CapabilityState::Supported
+                )))
+    {
+        return Err(AdapterFailure::host(ToolError::execution_failed(
+            "Web Host returned an inconsistent final receipt",
+        )));
+    }
+    let count = raw.results.len();
+    let message = format!(
+        "{}{}{}",
+        proposal.prefix,
+        raw.note.as_deref().unwrap_or_default(),
+        proposal.suffix
+    );
+    Ok(SearchResponse {
+        query: query.query.clone(),
+        source: raw.source,
+        count,
+        message,
+        results: raw.results,
+        receipt: SearchReceipt {
+            backend: raw.backend,
+            backend_detail: raw.backend_detail,
+            requested: query,
+            capabilities,
+            honored: proposal.honored,
+            degraded: proposal.degraded,
+            latency_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            cache_hit: false,
+        },
+    })
+}
+
 fn finalize_search_response(
     query: SearchQuery,
     capabilities: super::web::contract::QueryCapabilities,
@@ -1381,7 +2127,7 @@ pub(crate) async fn run_backend_search(
     query: &SearchQuery,
     deadline: Instant,
     context: &ToolContext,
-) -> Result<BackendSearch, ToolError> {
+) -> AdapterResult<BackendSearch> {
     let timeout_ms = u64::try_from(
         deadline
             .saturating_duration_since(Instant::now())
@@ -1390,7 +2136,36 @@ pub(crate) async fn run_backend_search(
     )
     .unwrap_or(u64::MAX);
     let max_results = usize::from(query.max_results);
-    let filters = QueryFilters::of(query);
+    let prepared = if adapter::search_selected(context) {
+        let value: PreparedFilters = adapter::transform(
+            crate::extension_host::StockOperation::WebFilters,
+            json!({"recency_days":query.recency.map(Recency::days),"locale":query.locale}),
+            context,
+            Duration::from_millis(timeout_ms),
+        )
+        .await?;
+        if value.kind != "web_filters"
+            || value
+                .window
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "day" | "week" | "month" | "year"))
+            || value.language.as_deref().is_some_and(|value| {
+                !matches!(value.len(), 2 | 3) || !value.chars().all(|c| c.is_ascii_lowercase())
+            })
+            || value.region.as_deref().is_some_and(|value| {
+                value.len() != 2 || !value.chars().all(|c| c.is_ascii_uppercase())
+            })
+        {
+            return Err(AdapterFailure::host(ToolError::execution_failed(
+                "Web Host returned malformed filters",
+            )));
+        }
+        Some(value)
+    } else {
+        None
+    };
+    let mut filters = QueryFilters::of(query);
+    filters.prepared = prepared.as_ref();
     let tool = WebSearchTool;
     let simple = |backend, entries: Vec<WebSearchEntry>| BackendSearch {
         backend,
@@ -1502,6 +2277,10 @@ pub(crate) async fn run_backend_search(
     }
 }
 
+/// Share of the search budget a DuckDuckGo request may use when Bing is allowed
+/// to answer after it (#6746).
+const DUCKDUCKGO_BUDGET_SHARE: f64 = 0.6;
+
 #[derive(Clone, Copy)]
 struct ScrapeEndpoints<'a> {
     bing: &'a str,
@@ -1522,7 +2301,7 @@ async fn run_scrape_search(
     query: &SearchQuery,
     timeout_ms: u64,
     context: &ToolContext,
-) -> Result<BackendSearch, ToolError> {
+) -> AdapterResult<BackendSearch> {
     let fallback_context = (provider == SearchProvider::DuckDuckGo
         && context.search_provider != SearchProvider::DuckDuckGo)
         .then(|| {
@@ -1547,10 +2326,12 @@ async fn run_scrape_search_with_endpoints(
     timeout_ms: u64,
     context: &ToolContext,
     endpoints: ScrapeEndpoints<'_>,
-) -> Result<BackendSearch, ToolError> {
+) -> AdapterResult<BackendSearch> {
+    let started = Instant::now();
+    let budget = Duration::from_millis(timeout_ms);
     let decider = context.network_policy.as_ref();
     let client = crate::tls::reqwest_client_builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .timeout(budget)
         .user_agent(USER_AGENT)
         .build()
         .map_err(|error| {
@@ -1561,7 +2342,21 @@ async fn run_scrape_search_with_endpoints(
 
     if provider == SearchProvider::Bing {
         check_policy(decider, BING_HOST)?;
-        let results = run_bing_search(&client, &query.query, max_results, endpoints.bing).await?;
+        if bing_locale_was_ignored(query.locale.as_deref()) {
+            degraded.push(DegradedReason::KnobIgnored {
+                knob: QueryKnob::Locale,
+            });
+        }
+        let results = run_bing_search(
+            &client,
+            &query.query,
+            query.locale.as_deref(),
+            max_results,
+            endpoints.bing,
+            budget,
+            context,
+        )
+        .await?;
         return Ok(BackendSearch {
             backend: BackendId::Bing,
             source: "bing".to_string(),
@@ -1572,22 +2367,95 @@ async fn run_scrape_search_with_endpoints(
         });
     }
 
-    let (url, duckduckgo_host) =
-        duckduckgo_search_url(context.search_base_url.as_deref(), &query.query)?;
+    let market = scrape_market(query.locale.as_deref(), &query.query);
+    if ddg_locale_was_ignored(query.locale.as_deref(), market.as_deref()) {
+        degraded.push(DegradedReason::KnobIgnored {
+            knob: QueryKnob::Locale,
+        });
+    }
+    let accept_language = scrape_accept_language(market.as_deref());
+    let (url, duckduckgo_host) = if let Some(plan) = host_request(
+        "duckduckgo",
+        &query.query,
+        QueryFilters::default(),
+        max_results,
+        context,
+        timeout_ms,
+    )
+    .await?
+    {
+        let (mut url, host) = duckduckgo_search_base(context.search_base_url.as_deref())?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in plan.pairs {
+                pairs.append_pair(&key, &value);
+            }
+            // The scrape chain hands the host adapter default filters, so the
+            // plan never carries the locale; the verified `kl` region pair
+            // (see [`ddg_region_param`]) rides along in either request shape.
+            if let Some(region) = market.as_deref().and_then(ddg_region_param) {
+                pairs.append_pair("kl", &region);
+            }
+        }
+        (url.to_string(), host)
+    } else {
+        duckduckgo_search_url(
+            context.search_base_url.as_deref(),
+            &query.query,
+            market.as_deref(),
+        )?
+    };
     let allow_bing_fallback = endpoints
         .allow_bing_fallback
         .unwrap_or_else(|| duckduckgo_allows_bing_fallback(context.search_base_url.as_deref()));
     check_policy(decider, &duckduckgo_host)?;
-    let fetched = fetch_duckduckgo_html(&client, &url).await;
+    // #6746: a hanging DuckDuckGo must leave the Bing fallback time to answer.
+    // When Bing may follow, DuckDuckGo gets a share of the budget and Bing
+    // the remainder; without the fallback DuckDuckGo keeps the whole budget.
+    let duckduckgo_budget = if allow_bing_fallback {
+        budget.mul_f64(DUCKDUCKGO_BUDGET_SHARE)
+    } else {
+        budget
+    };
+    let fetched =
+        fetch_duckduckgo_html(&client, &url, &accept_language, duckduckgo_budget, context).await;
+    let bing_budget = || {
+        budget
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(1))
+    };
     let body = match fetched {
         Ok(body) => body,
         // #6746: an unreachable DuckDuckGo (connection error, timeout, or a
         // non-2xx status) must still reach the Bing fallback, not end the
         // chain. Only a Bing answer with results replaces the DuckDuckGo
         // error; otherwise the original failure is reported.
+        Err(error)
+            if !error.content()
+                || matches!(
+                    error.error,
+                    ToolError::Cancelled { .. } | ToolError::Timeout { seconds: 0 }
+                ) =>
+        {
+            return Err(error);
+        }
         Err(error) if allow_bing_fallback => {
+            let error = match error.error {
+                ToolError::ExecutionFailed { message, .. } => message,
+                other => other.to_string(),
+            };
             check_policy(decider, BING_HOST)?;
-            return match run_bing_search(&client, &query.query, max_results, endpoints.bing).await {
+            return match run_bing_search(
+                &client,
+                &query.query,
+                query.locale.as_deref(),
+                max_results,
+                endpoints.bing,
+                bing_budget(),
+                context,
+            )
+            .await
+            {
                 Ok(results) if !results.is_empty() => {
                     degraded.push(DegradedReason::BackendUnavailable {
                         backend: BackendId::DuckDuckGo,
@@ -1596,6 +2464,7 @@ async fn run_scrape_search_with_endpoints(
                         from: BackendId::DuckDuckGo,
                         to: BackendId::Bing,
                     });
+                    prune_fallback_locale_ignored(&mut degraded, query.locale.as_deref());
                     Ok(BackendSearch {
                         backend: BackendId::Bing,
                         source: "bing".to_string(),
@@ -1605,22 +2474,30 @@ async fn run_scrape_search_with_endpoints(
                         note: Some(format!("{error}; used Bing fallback")),
                     })
                 }
-                Ok(_) => Err(ToolError::execution_failed(format!(
+                Ok(_) => Err((ToolError::execution_failed(format!(
                     "{error}; Bing fallback returned no results"
-                ))),
-                Err(bing_error) => Err(ToolError::execution_failed(format!(
+                )))
+                .into()),
+                Err(bing_error) if !bing_error.content() => Err(bing_error),
+                Err(bing_error) => Err((ToolError::execution_failed(format!(
                     "{error}; Bing fallback failed: {}",
-                    match &bing_error {
+                    match &bing_error.error {
                         ToolError::ExecutionFailed { message, .. } => message.clone(),
                         other => other.to_string(),
                     }
-                ))),
+                )))
+                .into()),
             };
         }
-        Err(error) => return Err(ToolError::execution_failed(error)),
+        Err(error) => return Err(error),
     };
 
-    let results = parse_duckduckgo_results(&body, max_results);
+    let results = normalize_scraped_entries(
+        parse_duckduckgo_results(&body, max_results),
+        context,
+        bing_budget(),
+    )
+    .await?;
     let blocked = is_duckduckgo_challenge(&body);
     if !results.is_empty() {
         return Ok(BackendSearch {
@@ -1643,9 +2520,9 @@ async fn run_scrape_search_with_endpoints(
     }
     if !allow_bing_fallback {
         if blocked {
-            return Err(ToolError::execution_failed(format!(
+            return Err((ToolError::execution_failed(format!(
                 "DuckDuckGo-compatible search endpoint at {duckduckgo_host} returned a bot challenge; check the private search service, credentials, or network policy"
-            )));
+            ))).into());
         }
         return Ok(BackendSearch {
             backend: BackendId::DuckDuckGo,
@@ -1658,12 +2535,23 @@ async fn run_scrape_search_with_endpoints(
     }
 
     check_policy(decider, BING_HOST)?;
-    match run_bing_search(&client, &query.query, max_results, endpoints.bing).await {
+    match run_bing_search(
+        &client,
+        &query.query,
+        query.locale.as_deref(),
+        max_results,
+        endpoints.bing,
+        bing_budget(),
+        context,
+    )
+    .await
+    {
         Ok(results) if !results.is_empty() => {
             degraded.push(DegradedReason::ScrapeFallback {
                 from: BackendId::DuckDuckGo,
                 to: BackendId::Bing,
             });
+            prune_fallback_locale_ignored(&mut degraded, query.locale.as_deref());
             Ok(BackendSearch {
                 backend: BackendId::Bing,
                 source: "bing".to_string(),
@@ -1677,12 +2565,15 @@ async fn run_scrape_search_with_endpoints(
                 }),
             })
         }
-        Ok(_) if blocked => Err(ToolError::execution_failed(
+        Err(error) if !error.content() => Err(error),
+        Ok(_) if blocked => Err((ToolError::execution_failed(
             "DuckDuckGo returned a bot challenge and Bing fallback returned no results",
-        )),
-        Err(error) if blocked => Err(ToolError::execution_failed(format!(
+        ))
+        .into()),
+        Err(error) if blocked => Err((ToolError::execution_failed(format!(
             "DuckDuckGo returned a bot challenge and Bing fallback failed: {error}"
-        ))),
+        )))
+        .into()),
         Ok(_) | Err(_) => Ok(BackendSearch {
             backend: BackendId::DuckDuckGo,
             source: "duckduckgo".to_string(),
@@ -1696,26 +2587,73 @@ async fn run_scrape_search_with_endpoints(
 
 /// Fetch the DuckDuckGo HTML results page. A transport failure or a non-2xx
 /// status is an error so the caller can decide whether Bing may answer.
-async fn fetch_duckduckgo_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
+async fn fetch_duckduckgo_html(
+    client: &reqwest::Client,
+    url: &str,
+    accept_language: &str,
+    timeout: Duration,
+    context: &ToolContext,
+) -> AdapterResult<String> {
     let resp = client
         .get(url)
+        .timeout(timeout)
         .header(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         )
-        .header("Accept-Language", "en-US,en;q=0.5")
+        .header("Accept-Language", accept_language)
         .send()
         .await
-        .map_err(|error| format!("Web search request failed: {error}"))?;
+        .map_err(|error| {
+            ToolError::execution_failed(format!("Web search request failed: {error}"))
+        })?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|error| format!("Failed to read response: {error}"))?;
+    let body = if adapter::search_selected(context) {
+        adapter::read_response_with_limit(resp, context, super::web::fetch::HARD_MAX_BYTES).await?
+    } else {
+        resp.text().await.map_err(|error| {
+            ToolError::execution_failed(format!("Failed to read response: {error}"))
+        })?
+    };
     if !status.is_success() {
-        return Err(format!("Web search failed: HTTP {}", status.as_u16()));
+        return Err(ToolError::execution_failed(format!(
+            "Web search failed: HTTP {}",
+            status.as_u16()
+        ))
+        .into());
     }
     Ok(body)
+}
+
+async fn normalize_scraped_entries(
+    entries: Vec<WebSearchEntry>,
+    context: &ToolContext,
+    budget: Duration,
+) -> AdapterResult<Vec<WebSearchEntry>> {
+    normalize_captured_entries(
+        entries
+            .into_iter()
+            .map(|entry| super::web::contract::CapturedSearchEntry {
+                title: entry.title,
+                url: entry.url,
+                snippet: entry.snippet,
+                published: None,
+            })
+            .collect(),
+        context,
+        budget,
+    )
+    .await
+    .map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| WebSearchEntry {
+                title: entry.title,
+                url: entry.url,
+                snippet: entry.snippet,
+            })
+            .collect()
+    })
 }
 
 fn normalize_entries(entries: Vec<WebSearchEntry>) -> Vec<SearchResult> {
@@ -2367,39 +3305,298 @@ fn search_query_items(input: &Value) -> impl Iterator<Item = &Value> {
         .flat_map(|items| items.iter())
 }
 
+/// Whether `query` contains Han ideographs (unified ideographs plus
+/// Extension A). Kana and Hangul are deliberately excluded: this heuristic
+/// exists only to pick a Chinese market for the keyless Bing/DuckDuckGo
+/// scrapes when the model omits `locale`, and forcing Japanese or Korean
+/// queries into the zh-CN market would be worse than sending no market
+/// signal at all.
+fn query_contains_han(query: &str) -> bool {
+    query
+        .chars()
+        .any(|c| matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}'))
+}
+
+/// Whether `query` carries kana or hangul — the scripts that make a
+/// Han-bearing query Japanese or Korean rather than Chinese. Real Japanese
+/// queries almost always contain kana alongside kanji, so a Han-bearing
+/// query with any kana or hangul must keep the no-market request instead of
+/// being pushed onto the zh-CN market (the inverse of the drift the
+/// fallback exists to fix). Only a purely Han-script query — rare for
+/// search and indistinguishable from Chinese — still takes the fallback,
+/// alongside unmarked Traditional Chinese (the accepted cost).
+fn query_contains_kana_or_hangul(query: &str) -> bool {
+    query.chars().any(|c| {
+        matches!(
+            c,
+            '\u{3040}'..='\u{30FF}' // hiragana + katakana
+                | '\u{31F0}'..='\u{31FF}' // katakana phonetic extensions
+                | '\u{AC00}'..='\u{D7AF}' // hangul syllables
+                | '\u{1100}'..='\u{11FF}' // hangul jamo
+                | '\u{3130}'..='\u{318F}' // hangul compatibility jamo
+        )
+    })
+}
+
+/// Market tag the scrape backends should request, or `None` to keep the
+/// historical no-market-signal request. An explicit locale wins; otherwise a
+/// Han-script query without kana or hangul falls back to zh-CN because
+/// without any market hint (and with an English `Accept-Language`) Bing
+/// serves unrelated Japanese results for Chinese queries. The model-supplied
+/// locale is shape-checked first so a malformed value cannot become a broken
+/// market tag or header.
+fn scrape_market(locale: Option<&str>, query: &str) -> Option<String> {
+    locale
+        .map(str::trim)
+        .filter(|tag| is_plausible_locale_tag(tag))
+        .map(|tag| tag.replace('_', "-"))
+        .or_else(|| {
+            (query_contains_han(query) && !query_contains_kana_or_hangul(query))
+                .then(|| "zh-CN".to_string())
+        })
+}
+
+/// Light shape check for a model-supplied `locale`: an alphabetic primary
+/// language subtag followed by alphanumeric subtags separated by `-`/`_`,
+/// each at most 8 characters, with no empty or separator-only edges. The
+/// alphabetic primary matters for receipt honesty: `12345` is not a locale,
+/// and transmitting it (with `honored.locale=true`) would contradict the
+/// schema text promising that malformed values are ignored. Anything else
+/// (e.g. `-CN`, `zh CN`, an injection attempt) is treated as no locale and
+/// keeps the historical request shape.
+fn is_plausible_locale_tag(tag: &str) -> bool {
+    if tag.is_empty() || tag.len() > 35 {
+        return false;
+    }
+    let mut subtags = tag.split(['-', '_']);
+    let primary = subtags.next().unwrap_or_default();
+    if primary.is_empty() || primary.len() > 8 || !primary.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    subtags.all(|subtag| {
+        !subtag.is_empty() && subtag.len() <= 8 && subtag.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+/// `Accept-Language` matching [`scrape_market`]. With no market resolved the
+/// English default is kept — the value the Bing path has always sent
+/// (`en-US,en;q=0.9`); the DuckDuckGo path previously sent `q=0.5` and now
+/// shares this one rule.
+fn scrape_accept_language(market: Option<&str>) -> String {
+    match market {
+        None => "en-US,en;q=0.9".to_string(),
+        Some(market) => {
+            let primary = market
+                .split(['-', '_'])
+                .next()
+                .filter(|tag| !tag.is_empty())
+                .unwrap_or("en");
+            let mut value = if market.eq_ignore_ascii_case(primary) {
+                format!("{market};q=0.9")
+            } else {
+                format!("{market},{primary};q=0.9")
+            };
+            // The generic `en` fallback duplicates the primary tag for
+            // English markets (`en-US,en;q=0.9,en;q=0.8`), where two q-values
+            // for one range have no defined precedence — only add it when it
+            // contributes a distinct range.
+            if !primary.eq_ignore_ascii_case("en") {
+                value.push_str(",en;q=0.8");
+            }
+            value
+        }
+    }
+}
+
+/// Bing request adjustments for the resolved market: the `mkt`/`setlang`
+/// query parameters and the `Accept-Language` header value.
+fn scrape_locale_params(locale: Option<&str>, query: &str) -> (Vec<(String, String)>, String) {
+    let market = scrape_market(locale, query);
+    let accept_language = scrape_accept_language(market.as_deref());
+    let Some(market) = market else {
+        return (Vec::new(), accept_language);
+    };
+    let primary = market
+        .split(['-', '_'])
+        .next()
+        .filter(|tag| !tag.is_empty())
+        .unwrap_or("en");
+    // Bing expects `setlang` to carry a script tag for Chinese (a bare `zh`
+    // is invalid and silently defaults to `en`). An explicit script subtag
+    // wins (`zh-Hant-TW` must not degrade to Simplified); otherwise the
+    // script is picked from the market's region subtag, defaulting to
+    // Simplified because the heuristic that reaches this branch without an
+    // explicit region is Han-driven.
+    let setlang = if primary.eq_ignore_ascii_case("zh") {
+        let segments: Vec<&str> = market.split(['-', '_']).collect();
+        if segments
+            .iter()
+            .any(|segment| segment.eq_ignore_ascii_case("hant"))
+        {
+            "zh-Hant"
+        } else if segments
+            .iter()
+            .any(|segment| segment.eq_ignore_ascii_case("hans"))
+        {
+            "zh-Hans"
+        } else {
+            match segments.get(1) {
+                Some(region)
+                    if matches!(region.to_ascii_lowercase().as_str(), "tw" | "hk" | "mo") =>
+                {
+                    "zh-Hant"
+                }
+                _ => "zh-Hans",
+            }
+        }
+    } else {
+        primary
+    };
+    (
+        vec![
+            ("mkt".to_string(), market.clone()),
+            ("setlang".to_string(), setlang.to_string()),
+        ],
+        accept_language,
+    )
+}
+
+/// True when an explicit `locale` was supplied but cannot shape a market
+/// signal for the Bing scrape (`mkt`/`setlang`): the value is malformed, so
+/// the request proceeds with no locale signal at all and the receipt must
+/// say so instead of claiming the knob was honored.
+fn bing_locale_was_ignored(locale: Option<&str>) -> bool {
+    locale.is_some_and(|tag| !is_plausible_locale_tag(tag.trim()))
+}
+
+/// The Bing fallback resolves the locale through Bing's own market mapping,
+/// so a `KnobIgnored` flag pushed for the DuckDuckGo leg (whose verified
+/// `kl` list is narrow) no longer describes the backend that produced the
+/// results: drop it and re-derive from Bing's rule, where anything
+/// shape-valid was sent as `mkt`/`setlang` and only an implausible tag
+/// stays ignored.
+fn prune_fallback_locale_ignored(degraded: &mut Vec<DegradedReason>, locale: Option<&str>) {
+    degraded.retain(|reason| {
+        !matches!(
+            reason,
+            DegradedReason::KnobIgnored {
+                knob: QueryKnob::Locale,
+            }
+        )
+    });
+    if bing_locale_was_ignored(locale) {
+        degraded.push(DegradedReason::KnobIgnored {
+            knob: QueryKnob::Locale,
+        });
+    }
+}
+
+/// True when an explicit `locale` was supplied but the DuckDuckGo scrape
+/// honors no part of it as a region signal: the value is malformed (the
+/// shape check fails, independently of how [`scrape_market`] resolved the
+/// market — a pure-Han query still falls back to the `zh-CN` market for a
+/// malformed locale) or the resolved market is outside the verified `kl`
+/// region list. In the unmapped case no `kl` parameter is sent, but the
+/// `Accept-Language` header still carries the locale (see
+/// [`scrape_accept_language`]); only the missing region signal is
+/// receipted, so the schema's "malformed values are ignored" promise — and
+/// parity with the Bing leg — holds either way.
+fn ddg_locale_was_ignored(locale: Option<&str>, market: Option<&str>) -> bool {
+    locale.is_some_and(|tag| {
+        !is_plausible_locale_tag(tag.trim()) || market.and_then(ddg_region_param).is_none()
+    })
+}
+
+/// Translate a BCP 47-style market tag into DuckDuckGo's `kl` region value.
+/// DuckDuckGo's HTML endpoints take `kl` from a fixed, non-systematic list
+/// (`cn-zh`, `us-en`, `jp-jp`, `kr-kr`, `tw-tzh`, `hk-tzh`, ...), so a
+/// mechanical reversal of a BCP 47 tag produces off-list junk for most
+/// non-English locales. Only verified pairs are translated; anything else
+/// sends no `kl` at all — exactly the no-region request the scrape made
+/// before this knob existed. Custom DuckDuckGo-compatible services typically
+/// ignore `kl` entirely.
+fn ddg_region_param(market: &str) -> Option<String> {
+    let normalized = market.to_ascii_lowercase().replace('_', "-");
+    // Script+region Chinese tags reduce to their region pair: the schema
+    // teaches BCP 47, where the script subtag is best practice for Chinese,
+    // and the verified list maps the region form.
+    let region = match normalized.as_str() {
+        "zh-cn" | "zh-hans-cn" => "cn-zh",
+        "en-us" => "us-en",
+        "ja-jp" => "jp-jp",
+        "ko-kr" => "kr-kr",
+        "zh-tw" | "zh-hant-tw" => "tw-tzh",
+        "zh-hk" | "zh-hant-hk" => "hk-tzh",
+        _ => return None,
+    };
+    Some(region.to_string())
+}
+
 async fn run_bing_search(
     client: &reqwest::Client,
     query: &str,
+    locale: Option<&str>,
     max_results: usize,
     endpoint: &str,
-) -> Result<Vec<WebSearchEntry>, ToolError> {
+    timeout: Duration,
+    context: &ToolContext,
+) -> AdapterResult<Vec<WebSearchEntry>> {
     let mut url = reqwest::Url::parse(endpoint)
         .map_err(|error| ToolError::invalid_input(format!("Invalid Bing endpoint: {error}")))?;
-    url.query_pairs_mut().append_pair("q", query);
+    let (extra_params, accept_language) = scrape_locale_params(locale, query);
+    if let Some(plan) = host_request(
+        "bing",
+        query,
+        QueryFilters::default(),
+        max_results,
+        context,
+        u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+    )
+    .await?
+    {
+        for (key, value) in plan.pairs {
+            url.query_pairs_mut().append_pair(&key, &value);
+        }
+    } else {
+        url.query_pairs_mut().append_pair("q", query);
+    }
+    // The scrape chain hands the host adapter default filters, so the plan
+    // never carries the locale; the mkt/setlang parameters ride along in
+    // either request shape so the receipt cannot overclaim locale support.
+    for (key, value) in &extra_params {
+        url.query_pairs_mut().append_pair(key, value);
+    }
     let resp = client
         .get(url)
+        .timeout(timeout)
         .header(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         )
-        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Language", accept_language)
         .send()
         .await
         .map_err(|e| ToolError::execution_failed(format!("Bing search request failed: {e}")))?;
 
     let status = resp.status();
-    let body = resp.text().await.map_err(|e| {
-        ToolError::execution_failed(format!("Failed to read Bing search response: {e}"))
-    })?;
+    let body = if adapter::search_selected(context) {
+        adapter::read_response_with_limit(resp, context, super::web::fetch::HARD_MAX_BYTES).await?
+    } else {
+        resp.text().await.map_err(|e| {
+            ToolError::execution_failed(format!("Failed to read Bing search response: {e}"))
+        })?
+    };
 
     if !status.is_success() {
-        return Err(ToolError::execution_failed(format!(
+        return Err((ToolError::execution_failed(format!(
             "Bing search failed: HTTP {}",
             status.as_u16()
-        )));
+        )))
+        .into());
     }
 
-    Ok(parse_bing_results(&body, max_results))
+    normalize_scraped_entries(parse_bing_results(&body, max_results), context, timeout).await
 }
 
 fn parse_duckduckgo_results(html: &str, max_results: usize) -> Vec<WebSearchEntry> {
@@ -2424,28 +3621,40 @@ fn web_search_entry_from_scraped(entry: ScrapedSearchResult) -> WebSearchEntry {
     }
 }
 
-fn duckduckgo_search_url(
-    base_url: Option<&str>,
-    query: &str,
-) -> Result<(String, String), ToolError> {
+fn duckduckgo_search_base(base_url: Option<&str>) -> Result<(reqwest::Url, String), ToolError> {
     let raw = configured_search_base_url(base_url).unwrap_or(DUCKDUCKGO_ENDPOINT);
-    let mut url = reqwest::Url::parse(raw).map_err(|err| {
+    let url = reqwest::Url::parse(raw).map_err(|err| {
         ToolError::invalid_input(format!(
             "Invalid DuckDuckGo-compatible search base_url: {err}"
         ))
     })?;
-    url.query_pairs_mut().append_pair("q", query);
     let host = url.host_str().ok_or_else(|| {
         ToolError::invalid_input("DuckDuckGo-compatible search base_url must include a host")
     })?;
-    Ok((url.to_string(), host.to_string()))
+    let host = host.to_owned();
+    Ok((url, host))
 }
 
-fn searxng_search_url(
+fn duckduckgo_search_url(
     base_url: Option<&str>,
     query: &str,
-    filters: QueryFilters<'_>,
+    market: Option<&str>,
 ) -> Result<(String, String), ToolError> {
+    let (mut url, host) = duckduckgo_search_base(base_url)?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("q", query);
+        // DuckDuckGo HTML endpoints take the market hint as `kl`; see
+        // [`ddg_region_param`] for the verified region-language mapping.
+        // Custom DDG-compatible services simply ignore the extra parameter.
+        if let Some(region) = market.and_then(ddg_region_param) {
+            pairs.append_pair("kl", &region);
+        }
+    }
+    Ok((url.to_string(), host))
+}
+
+fn searxng_search_base(base_url: Option<&str>) -> Result<(reqwest::Url, String), ToolError> {
     let raw = configured_search_base_url(base_url).ok_or_else(|| {
         ToolError::invalid_input(
             "SearXNG search requires [search] base_url = \"https://your-searxng.example\"; no public instance is used by default.",
@@ -2465,6 +3674,15 @@ fn searxng_search_url(
     } else if path != "/search" && !path.ends_with("/search") {
         url.set_path(&format!("{path}/search"));
     }
+    Ok((url, host))
+}
+
+fn searxng_search_url(
+    base_url: Option<&str>,
+    query: &str,
+    filters: QueryFilters<'_>,
+) -> Result<(String, String), ToolError> {
+    let (mut url, host) = searxng_search_base(base_url)?;
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("q", query).append_pair("format", "json");
@@ -2492,14 +3710,16 @@ mod tests {
     use super::{
         ERROR_BODY_PREVIEW_BYTES, KIMI_K3_FORMULA_MIN_TIMEOUT_MS, QueryFilters, ScrapeEndpoints,
         SearchProbeTargetError, WebSearchTool, acquire_model_backed_search_inference_participant,
-        baidu_search_payload, bocha_error_message, domain_matches, duckduckgo_search_url,
-        extract_search_query, finalize_search_response, native_answer_time_budget,
-        optional_search_max_results, parse_baidu_results, parse_bocha_results,
-        parse_metaso_results, parse_searxng_results, parse_serply_results, parse_sofya_results,
-        parse_tavily_results, parse_volcengine_results, register_search_citations, rerank,
-        run_scrape_search_with_endpoints, sanitize_error_body, search_probe_target,
-        search_timeout_budgets, searxng_score, searxng_search_url, serply_search_url,
-        truncate_error_body, volcengine_extract_text,
+        baidu_search_payload, bing_locale_was_ignored, bocha_error_message, ddg_locale_was_ignored,
+        ddg_region_param, domain_matches, duckduckgo_search_url, extract_search_query,
+        finalize_search_response, native_answer_time_budget, optional_search_max_results,
+        parse_baidu_results, parse_bocha_results, parse_metaso_results, parse_searxng_results,
+        parse_serply_results, parse_sofya_results, parse_tavily_results, parse_volcengine_results,
+        prune_fallback_locale_ignored, register_search_citations, rerank,
+        run_scrape_search_with_endpoints, sanitize_error_body, scrape_accept_language,
+        scrape_locale_params, scrape_market, search_probe_target, search_timeout_budgets,
+        searxng_score, searxng_search_url, serply_search_url, truncate_error_body,
+        volcengine_extract_text,
     };
     use crate::config::SearchProvider;
     use crate::tools::web::contract::{
@@ -3291,7 +4511,10 @@ mod tests {
         // A configured Serply route that reaches the adapter after a failed
         // provider-native attempt must stop the chain, not degrade to DuckDuckGo.
         assert!(
-            matches!(err, crate::tools::spec::ToolError::InvalidInput { .. }),
+            matches!(
+                err.error,
+                crate::tools::spec::ToolError::InvalidInput { .. }
+            ),
             "missing key must be classified fail-closed; got `{err:?}`"
         );
     }
@@ -3446,6 +4669,7 @@ mod tests {
         let (url, host) = duckduckgo_search_url(
             Some("https://search.internal.example/html/?region=us"),
             "rust async",
+            None,
         )
         .expect("custom duckduckgo-compatible url");
 
@@ -3463,6 +4687,339 @@ mod tests {
         assert!(!super::duckduckgo_allows_bing_fallback(Some(
             "https://search.internal.example/html/"
         )));
+    }
+
+    #[test]
+    fn bing_locale_params_follow_explicit_locale() {
+        let (params, accept_language) = scrape_locale_params(Some("zh-CN"), "rust async");
+        assert_eq!(
+            params,
+            vec![
+                ("mkt".to_string(), "zh-CN".to_string()),
+                ("setlang".to_string(), "zh-Hans".to_string()),
+            ]
+        );
+        assert_eq!(accept_language, "zh-CN,zh;q=0.9,en;q=0.8");
+
+        let (params, accept_language) = scrape_locale_params(Some("en-US"), "rust async");
+        assert_eq!(
+            params,
+            vec![
+                ("mkt".to_string(), "en-US".to_string()),
+                ("setlang".to_string(), "en".to_string()),
+            ]
+        );
+        assert_eq!(accept_language, "en-US,en;q=0.9");
+
+        // Bing's setlang table keys the Chinese script off the region:
+        // Taiwan/Hong Kong/Macao are Traditional, everything else (including
+        // the Han-heuristic default) is Simplified.
+        let (params, _) = scrape_locale_params(Some("zh-TW"), "rust async");
+        assert_eq!(params[1].1, "zh-Hant");
+        let (params, _) = scrape_locale_params(Some("zh-HK"), "rust async");
+        assert_eq!(params[1].1, "zh-Hant");
+    }
+
+    #[test]
+    fn bing_locale_params_fall_back_to_china_market_for_han_queries() {
+        // Without this fallback a locale-less Chinese query used to get no
+        // market hint plus an English Accept-Language, and Bing served
+        // unrelated Japanese results.
+        let (params, accept_language) = scrape_locale_params(None, "凹语言 编程");
+        assert_eq!(
+            params,
+            vec![
+                ("mkt".to_string(), "zh-CN".to_string()),
+                ("setlang".to_string(), "zh-Hans".to_string()),
+            ]
+        );
+        assert_eq!(accept_language, "zh-CN,zh;q=0.9,en;q=0.8");
+    }
+
+    #[test]
+    fn bing_locale_params_keep_english_default_without_locale_signal() {
+        let (params, accept_language) = scrape_locale_params(None, "rust async");
+        assert!(params.is_empty());
+        assert_eq!(accept_language, "en-US,en;q=0.9");
+    }
+
+    #[test]
+    fn bing_locale_params_normalize_underscore_separators() {
+        // The model often writes `zh_CN`; the underscore must not leak into
+        // the `mkt` parameter or the `Accept-Language` ranges.
+        let (params, accept_language) = scrape_locale_params(Some("zh_CN"), "rust async");
+        assert_eq!(
+            params,
+            vec![
+                ("mkt".to_string(), "zh-CN".to_string()),
+                ("setlang".to_string(), "zh-Hans".to_string()),
+            ]
+        );
+        assert_eq!(accept_language, "zh-CN,zh;q=0.9,en;q=0.8");
+    }
+
+    #[test]
+    fn bing_setlang_keeps_an_explicit_script_subtag() {
+        // `zh-Hant-TW` must not degrade to Simplified: the explicit script
+        // subtag wins over the region-derived default.
+        let (params, _) = scrape_locale_params(Some("zh-Hant-TW"), "rust async");
+        assert_eq!(params[1].1, "zh-Hant");
+        let (params, _) = scrape_locale_params(Some("zh-Hans-CN"), "rust async");
+        assert_eq!(params[1].1, "zh-Hans");
+        let (params, _) = scrape_locale_params(Some("zh-Hant"), "rust async");
+        assert_eq!(params[1].1, "zh-Hant");
+    }
+
+    #[test]
+    fn ddg_locale_ignored_only_when_an_explicit_locale_yields_no_region() {
+        // Mapped regions are honored.
+        assert!(!ddg_locale_was_ignored(Some("zh-CN"), Some("zh-CN")));
+        // Unmapped but well-formed regions send no `kl`: the receipt must
+        // not claim the knob was honored.
+        assert!(ddg_locale_was_ignored(Some("fr-FR"), Some("fr-FR")));
+        // Malformed values resolve no market at all.
+        assert!(ddg_locale_was_ignored(Some("zh CN"), None));
+        // Malformed values stay ignored even when a pure-Han query makes
+        // scrape_market fall back to the zh-CN market — the shape check is
+        // independent of the market resolution, matching the Bing leg.
+        assert!(ddg_locale_was_ignored(Some("zh CN"), Some("zh-CN")));
+        assert!(ddg_locale_was_ignored(Some("中文"), Some("zh-CN")));
+        // No explicit locale: the Han fallback is the tool's own choice,
+        // never a dropped knob.
+        assert!(!ddg_locale_was_ignored(None, Some("zh-CN")));
+        assert!(!ddg_locale_was_ignored(None, None));
+    }
+
+    #[test]
+    fn ddg_malformed_locale_with_han_query_receipt_stays_ignored() {
+        // End-to-end across the DDG leg: a malformed locale plus a pure-Han
+        // query resolves the zh-CN market via the Han heuristic, but the
+        // receipt must keep KnobIgnored (honored.locale=false), exactly what
+        // the Bing leg reports for the same input.
+        let locale = Some("中文");
+        let han_query = "凹语言 编程";
+        let market = scrape_market(locale, han_query);
+        assert_eq!(market.as_deref(), Some("zh-CN"));
+        let degraded: Vec<DegradedReason> = if ddg_locale_was_ignored(locale, market.as_deref()) {
+            vec![DegradedReason::KnobIgnored {
+                knob: QueryKnob::Locale,
+            }]
+        } else {
+            Vec::new()
+        };
+        let raw = BackendSearch {
+            backend: BackendId::DuckDuckGo,
+            source: "duckduckgo".to_string(),
+            backend_detail: None,
+            results: Vec::new(),
+            degraded,
+            note: None,
+        };
+        let query = SearchQuery::new(
+            han_query.to_string(),
+            5,
+            None,
+            Vec::new(),
+            locale.map(str::to_string),
+        );
+        let capabilities = QueryCapabilities {
+            max_results: CapabilityState::Supported,
+            recency: CapabilityState::Unsupported,
+            domains: CapabilityState::Unsupported,
+            locale: CapabilityState::Supported,
+            published_date: CapabilityState::Unknown,
+        };
+        let response = finalize_search_response(query, capabilities, raw, Instant::now());
+        assert!(
+            !response.receipt.honored.locale,
+            "a malformed locale must be receipted as ignored even when the \
+             Han heuristic supplies a market"
+        );
+        assert!(response.receipt.degraded.iter().any(|reason| matches!(
+            reason,
+            DegradedReason::KnobIgnored {
+                knob: QueryKnob::Locale
+            }
+        )));
+
+        // fr-FR (well-formed, unmapped on the verified kl list) stays
+        // ignored on the DDG leg, as before the fix.
+        let market = scrape_market(Some("fr-FR"), "rust async");
+        assert_eq!(market.as_deref(), Some("fr-FR"));
+        assert!(ddg_locale_was_ignored(Some("fr-FR"), market.as_deref()));
+
+        // A mapped, well-formed value (ja-JP) is honored.
+        let market = scrape_market(Some("ja-JP"), "rust async");
+        assert_eq!(market.as_deref(), Some("ja-JP"));
+        assert!(!ddg_locale_was_ignored(Some("ja-JP"), market.as_deref()));
+    }
+
+    #[test]
+    fn bing_locale_ignored_only_for_malformed_explicit_values() {
+        assert!(!bing_locale_was_ignored(Some("zh-CN")));
+        assert!(!bing_locale_was_ignored(None));
+        assert!(bing_locale_was_ignored(Some("zh CN")));
+        assert!(bing_locale_was_ignored(Some("-CN")));
+    }
+
+    #[test]
+    fn han_detection_covers_han_only_and_ignores_other_cjk_scripts() {
+        assert!(super::query_contains_han("学 rust"));
+        assert!(super::query_contains_han("\u{3400}")); // Extension A
+        assert!(!super::query_contains_han("rust async 123"));
+        assert!(!super::query_contains_han("ルスト programming")); // Katakana
+        assert!(!super::query_contains_han("러스트 programming")); // Hangul
+    }
+
+    #[test]
+    fn duckduckgo_url_adds_kl_for_resolved_market() {
+        let (url, _) = duckduckgo_search_url(None, "凹语言 编程", Some("zh-CN")).expect("ddg url");
+        let parsed = reqwest::Url::parse(&url).expect("valid url");
+        assert_eq!(
+            parsed.query_pairs().find(|(key, _)| key == "kl").unwrap().1,
+            "cn-zh"
+        );
+
+        // A locale with no verified kl pair sends no kl at all rather than
+        // an off-list guess.
+        let (url, _) = duckduckgo_search_url(None, "rust async", Some("fr-FR")).expect("ddg url");
+        let parsed = reqwest::Url::parse(&url).expect("valid url");
+        assert!(parsed.query_pairs().all(|(key, _)| key != "kl"));
+
+        let (url, _) = duckduckgo_search_url(None, "rust async", None).expect("ddg url");
+        let parsed = reqwest::Url::parse(&url).expect("valid url");
+        assert!(parsed.query_pairs().all(|(key, _)| key != "kl"));
+    }
+
+    #[test]
+    fn ddg_region_param_translates_only_verified_pairs() {
+        // DuckDuckGo's kl list is fixed and non-systematic; only pairs
+        // verified against that list are translated (China, US, Japan,
+        // Korea, Taiwan, Hong Kong). A mechanical reversal of a BCP 47 tag
+        // produced off-list junk such as `jp-ja` (the real value is
+        // `jp-jp`), so anything unverified sends no kl at all.
+        assert_eq!(ddg_region_param("zh-CN").as_deref(), Some("cn-zh"));
+        assert_eq!(ddg_region_param("en_US").as_deref(), Some("us-en"));
+        assert_eq!(ddg_region_param("ja-JP").as_deref(), Some("jp-jp"));
+        assert_eq!(ddg_region_param("ko-KR").as_deref(), Some("kr-kr"));
+        assert_eq!(ddg_region_param("zh-TW").as_deref(), Some("tw-tzh"));
+        assert_eq!(ddg_region_param("zh-HK").as_deref(), Some("hk-tzh"));
+        // Unverified locales and script/bare tags send no region hint —
+        // the no-kl request is the historical shape and strictly safer
+        // than guessing an off-list value.
+        assert_eq!(ddg_region_param("fr-FR"), None);
+        assert_eq!(ddg_region_param("zh-Hans"), None);
+        assert_eq!(ddg_region_param("zh"), None);
+        // Script+region Chinese tags reduce to their verified region pair:
+        // the schema teaches BCP 47 where the script subtag is best
+        // practice for Chinese.
+        assert_eq!(ddg_region_param("zh-Hans-CN").as_deref(), Some("cn-zh"));
+        assert_eq!(ddg_region_param("zh-Hant-TW").as_deref(), Some("tw-tzh"));
+        assert_eq!(ddg_region_param("zh-Hant-HK").as_deref(), Some("hk-tzh"));
+    }
+
+    #[test]
+    fn bing_fallback_rederives_the_locale_flag_from_bings_rule() {
+        // A shape-valid locale the DuckDuckGo leg could not map (no kl
+        // pair) is carried by the Bing fallback through mkt/setlang, so the
+        // stale DDG-leg flag must not keep the receipt claiming the knob
+        // was ignored.
+        let mut degraded = vec![DegradedReason::KnobIgnored {
+            knob: QueryKnob::Locale,
+        }];
+        prune_fallback_locale_ignored(&mut degraded, Some("fr-FR"));
+        assert!(
+            !degraded.iter().any(|reason| matches!(
+                reason,
+                DegradedReason::KnobIgnored {
+                    knob: QueryKnob::Locale,
+                }
+            )),
+            "the DDG-leg ignored flag must not survive the Bing fallback: \
+             {degraded:?}"
+        );
+        // An implausible tag stays ignored on the fallback too.
+        let mut degraded = vec![DegradedReason::KnobIgnored {
+            knob: QueryKnob::Locale,
+        }];
+        prune_fallback_locale_ignored(&mut degraded, Some("zh CN"));
+        assert!(degraded.iter().any(|reason| matches!(
+            reason,
+            DegradedReason::KnobIgnored {
+                knob: QueryKnob::Locale,
+            }
+        )));
+    }
+
+    #[test]
+    fn ddg_accept_language_unifies_with_bing_rule() {
+        assert_eq!(scrape_accept_language(None), "en-US,en;q=0.9");
+        assert_eq!(
+            scrape_accept_language(Some("zh-CN")),
+            "zh-CN,zh;q=0.9,en;q=0.8"
+        );
+        // A bare-language market (reachable through an explicit `locale: en`)
+        // emits a single range and, like every English market, never appends
+        // a duplicate `en` fallback.
+        assert_eq!(scrape_accept_language(Some("en")), "en;q=0.9");
+    }
+
+    #[test]
+    fn implausible_locale_values_are_treated_as_no_locale() {
+        // The locale reaches URLs and the Accept-Language header, so a
+        // malformed model-supplied value keeps the historical no-market
+        // request instead of becoming a broken tag or header value.
+        assert_eq!(scrape_market(Some("-CN"), "rust async"), None);
+        assert_eq!(scrape_market(Some("zh CN"), "rust async"), None);
+        assert_eq!(scrape_market(Some(""), "rust async"), None);
+        assert_eq!(scrape_market(Some("zh=CN"), "rust async"), None);
+        assert_eq!(scrape_market(Some("  "), "rust async"), None);
+        // Digits are not a language: the primary subtag must be alphabetic,
+        // or the value would be transmitted (and receipted as honored)
+        // against schema text promising malformed values are ignored.
+        assert_eq!(scrape_market(Some("12345"), "rust async"), None);
+        assert_eq!(scrape_market(Some("en-123456789"), "rust async"), None);
+        // Well-formed tags survive the shape check verbatim.
+        assert_eq!(
+            scrape_market(Some("zh-TW"), "rust async").as_deref(),
+            Some("zh-TW")
+        );
+        // The Han fallback is untouched by the shape check.
+        assert_eq!(scrape_market(None, "凹语言 编程").as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
+    fn oversized_primary_locale_is_ignored_even_with_han_fallback() {
+        let locale = Some("abcdefghij-US");
+        assert_eq!(scrape_market(locale, "rust async"), None);
+        assert!(bing_locale_was_ignored(locale));
+        assert!(ddg_locale_was_ignored(locale, None));
+
+        // A query-derived market must not hide the invalid explicit knob.
+        let market = scrape_market(locale, "中国 的 首都");
+        assert_eq!(market.as_deref(), Some("zh-CN"));
+        assert!(ddg_locale_was_ignored(locale, market.as_deref()));
+    }
+
+    #[test]
+    fn han_fallback_vetoes_kana_and_hangul_queries() {
+        // A Han-bearing query with kana is Japanese: pushing it onto the
+        // zh-CN market would be the inverse of the drift the fallback
+        // exists to fix, so it keeps the no-market request.
+        assert_eq!(scrape_market(None, "東京の天気"), None);
+        assert_eq!(scrape_market(None, "日本の地図"), None);
+        // Hangul-bearing queries likewise never take the fallback.
+        assert_eq!(scrape_market(None, "러스트 프로그래밍"), None);
+        // Purely Han queries (indistinguishable from Chinese) and an
+        // explicit locale keep the existing behavior.
+        assert_eq!(
+            scrape_market(None, "中国 的 首都").as_deref(),
+            Some("zh-CN")
+        );
+        assert_eq!(
+            scrape_market(Some("ja-JP"), "東京の天気").as_deref(),
+            Some("ja-JP")
+        );
     }
 
     #[test]
@@ -4014,7 +5571,7 @@ mod tests {
 
         let output = crate::tools::spec::ToolResult::json(&response).expect("json");
         let context = crate::core::engine::compact_tool_result_for_route(
-            crate::config::ApiProvider::Deepseek,
+            crate::config::ProviderKind::Deepseek,
             "deepseek-v3.2-128k",
             None,
             "web_search",
@@ -4678,6 +6235,139 @@ mod tests {
         assert!(error.to_string().contains("HTTP 503"), "{error}");
     }
 
+    /// #6746: a DuckDuckGo that accepts the connection and then hangs must not
+    /// eat the whole budget; Bing answers inside the same total.
+    #[tokio::test]
+    async fn hanging_duckduckgo_leaves_bing_time_inside_the_total_budget() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolContext;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/bing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <ol><li class="b_algo">
+                  <h2><a href="https://example.com/after-hang">After the hang</a></h2>
+                  <div class="b_caption"><p>Bing answered after DuckDuckGo hung.</p></div>
+                </li></ol>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut context = ToolContext::new(tmp.path().to_path_buf());
+        context.search_provider = SearchProvider::DuckDuckGo;
+        context.search_base_url = Some(format!("{}/html/", server.uri()));
+        let query = SearchQuery::new("hang".to_string(), 5, None, Vec::new(), None);
+        let budget = Duration::from_millis(3_000);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            budget,
+            run_scrape_search_with_endpoints(
+                SearchProvider::DuckDuckGo,
+                &query,
+                3_000,
+                &context,
+                ScrapeEndpoints {
+                    bing: &format!("{}/bing", server.uri()),
+                    allow_bing_fallback: Some(true),
+                },
+            ),
+        )
+        .await
+        .expect("the whole search must finish inside its budget");
+        let raw = outcome.expect("Bing fallback should answer after DuckDuckGo hangs");
+
+        assert_eq!(raw.backend, BackendId::Bing);
+        assert_eq!(raw.results.len(), 1);
+        assert!(started.elapsed() < budget, "{:?}", started.elapsed());
+        assert!(
+            raw.degraded.contains(&DegradedReason::BackendUnavailable {
+                backend: BackendId::DuckDuckGo
+            }),
+            "{:?}",
+            raw.degraded
+        );
+    }
+
+    /// #6746: a custom `search_base_url` keeps no public fallback and keeps the
+    /// whole budget: a slow private endpoint is waited for, and Bing is never
+    /// contacted, whether the endpoint answers late or hangs.
+    #[tokio::test]
+    async fn custom_base_url_keeps_full_budget_and_never_reaches_bing() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolContext;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let query = SearchQuery::new("private".to_string(), 5, None, Vec::new(), None);
+        for (delay, expect_results) in [
+            (Duration::from_millis(1_500), true),
+            (Duration::from_secs(30), false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/html/"))
+                .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_string(
+                    r#"
+                            <html><body>
+                              <a class="result__a" href="https://example.com/private">Private</a>
+                              <div class="result__snippet">Private result</div>
+                            </body></html>
+                            "#,
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/bing"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let mut context = ToolContext::new(tmp.path().to_path_buf());
+            context.search_provider = SearchProvider::DuckDuckGo;
+            context.search_base_url = Some(format!("{}/html/", server.uri()));
+            // 60% of 2s would be 1.2s: a 1.5s answer only arrives if the
+            // private endpoint kept the whole budget.
+            let outcome = run_scrape_search_with_endpoints(
+                SearchProvider::DuckDuckGo,
+                &query,
+                2_000,
+                &context,
+                ScrapeEndpoints {
+                    bing: &format!("{}/bing", server.uri()),
+                    allow_bing_fallback: None,
+                },
+            )
+            .await;
+            if expect_results {
+                let raw = outcome.expect("a slow private endpoint keeps its full budget");
+                assert_eq!(raw.backend, BackendId::DuckDuckGo);
+                assert_eq!(raw.results.len(), 1);
+            } else {
+                assert!(outcome.is_err(), "a hanging private endpoint is an error");
+            }
+            let bing_requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|request| request.url.path() == "/bing")
+                .count();
+            assert_eq!(bing_requests, 0, "custom base URL must not reach Bing");
+        }
+    }
+
     #[tokio::test]
     async fn search_base_url_with_non_duckduckgo_provider_is_explicit_error() {
         use crate::config::SearchProvider;
@@ -4897,6 +6587,71 @@ mod tests {
         assert_eq!(response.results[0].title, "A");
         assert_eq!(response.results[1].title, "B");
         assert!(response.message.contains('2'), "{}", response.message);
+    }
+
+    #[test]
+    fn finalize_search_response_does_not_claim_an_ignored_locale_was_honored() {
+        // A scrape flagged the explicit locale as ignored (here: an unmapped
+        // DuckDuckGo region): the receipt must keep `honored.locale` false
+        // instead of claiming the knob was honored.
+        let query = SearchQuery::new(
+            "query".to_string(),
+            5,
+            None,
+            Vec::new(),
+            Some("fr-FR".to_string()),
+        );
+        let raw = BackendSearch {
+            backend: BackendId::DuckDuckGo,
+            source: "duckduckgo".to_string(),
+            backend_detail: None,
+            results: Vec::new(),
+            degraded: vec![DegradedReason::KnobIgnored {
+                knob: QueryKnob::Locale,
+            }],
+            note: None,
+        };
+        let scrape_capabilities = QueryCapabilities {
+            max_results: CapabilityState::Supported,
+            recency: CapabilityState::Unsupported,
+            domains: CapabilityState::Unsupported,
+            locale: CapabilityState::Supported,
+            published_date: CapabilityState::Unknown,
+        };
+        let response = finalize_search_response(query, scrape_capabilities, raw, Instant::now());
+        assert!(
+            !response.receipt.honored.locale,
+            "an ignored locale must not be reported as honored"
+        );
+        assert!(
+            response.receipt.degraded.iter().any(|reason| matches!(
+                reason,
+                DegradedReason::KnobIgnored {
+                    knob: QueryKnob::Locale
+                }
+            )),
+            "the degraded receipt must carry the locale flag exactly once"
+        );
+        assert_eq!(response.receipt.degraded.len(), 1);
+
+        // A mapped locale with no scrape flag stays honored.
+        let query = SearchQuery::new(
+            "query".to_string(),
+            5,
+            None,
+            Vec::new(),
+            Some("zh-CN".to_string()),
+        );
+        let raw = BackendSearch {
+            backend: BackendId::DuckDuckGo,
+            source: "duckduckgo".to_string(),
+            backend_detail: None,
+            results: Vec::new(),
+            degraded: Vec::new(),
+            note: None,
+        };
+        let response = finalize_search_response(query, scrape_capabilities, raw, Instant::now());
+        assert!(response.receipt.honored.locale);
     }
 
     #[test]
@@ -5193,3 +6948,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "web/search_host_tests.rs"]
+mod host_tests;

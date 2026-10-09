@@ -1,36 +1,28 @@
 {
   "_comment": "Runtime -> UI boundary ratchet (docs/design/TUI_DECONSTRUCTION.md, runtime split). Counts may only go down. Regenerate with python3 scripts/split/module_graph.py --update after removing references; never raise a count by hand.",
   "totals": {
-    "prod": 74,
-    "test": 88,
+    "prod": 12,
+    "test": 35,
     "late": 1,
     "uilib": 1,
-    "doc": 1
+    "doc": 0
   },
   "counts": {
     "prod": {
-      "config|tui": 23,
-      "core|tui": 28,
-      "fleet|lib.rs": 1,
-      "local_ollama|tui": 1,
       "runtime_api|commands": 9,
-      "runtime_api|tui": 1,
-      "runtime_threads|lib.rs": 2,
       "tools|commands": 2,
-      "tools|tui": 7
+      "tools|tui": 1
     },
     "test": {
       "client|tui": 3,
-      "config|tui": 9,
-      "core|tui": 39,
-      "doctor|lib.rs": 5,
-      "fleet|lib.rs": 4,
+      "config|tui": 2,
+      "core|tui": 2,
+      "fleet|lib.rs": 3,
       "prompts|tui": 1,
       "runtime_api|commands": 2,
-      "runtime_api|lib.rs": 1,
       "session_manager|tui": 3,
       "test_support|tui": 7,
-      "tools|tui": 14
+      "tools|tui": 12
     },
     "late": {
       "core|exec_agent": 1
@@ -38,8 +30,6 @@
     "uilib": {
       "tools|crossterm": 1
     },
-    "doc": {
-      "core|tui": 1
-    }
+    "doc": {}
   }
 }

@@ -9,7 +9,7 @@ fi
 CODEWHALE_USER="${CODEWHALE_USER:-${DEEPSEEK_USER:-codewhale}}"
 CODEWHALE_ROOT="${CODEWHALE_ROOT:-${DEEPSEEK_ROOT:-/opt/codewhale}}"
 WHALEBRO_ROOT="${WHALEBRO_ROOT:-/opt/whalebro}"
-REPO_URL="${CODEWHALE_REPO_URL:-${DEEPSEEK_REPO_URL:-https://github.com/Hmbown/CodeWhale.git}}"
+REPO_URL="${CODEWHALE_REPO_URL:-${DEEPSEEK_REPO_URL:-https://github.com/codewhale-hq/CodeWhale.git}}"
 WHALEBRO_EXTRA_REPOS="${WHALEBRO_EXTRA_REPOS:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"

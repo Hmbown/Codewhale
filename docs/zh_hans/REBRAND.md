@@ -67,13 +67,13 @@ Codewhale 从不自动删除旧目录。
 - **主机**：`api.deepseek.com`（全球）。带拼写错误的旧主机名 `api.deepseeki.com`
   不是 DeepSeek 的官方端点；它仍只在给现有配置做 URL 启发式判断时被接受，
   也不会作为备用地址提供（#1079）。
-- **GitHub 仓库地址**：`https://github.com/Hmbown/CodeWhale`。
+- **GitHub 仓库地址**：`https://github.com/codewhale-hq/CodeWhale`。
   过渡期间，旧的 `Hmbown/DeepSeek-TUI` 地址会重定向到这里。
 - **Homebrew tap 与 formula**：formula 名为 `codewhale`。tap 的 GitHub 仓库
   在改名之前仍是 `Hmbown/homebrew-deepseek-tui`；当前的安装路径是
   `brew tap Hmbown/deepseek-tui && brew install codewhale`。旧的 `deepseek-tui`
   formula 在这一个重叠版本里仍是已弃用的别名。
-- **Docker 镜像**：`ghcr.io/hmbown/codewhale`。
+- **Docker 镜像**：`ghcr.io/codewhale-hq/codewhale`。
 
 ## 弃用 shim（v0.9.0 中移除）
 
@@ -139,7 +139,7 @@ brew upgrade codewhale
 ```
 
 tap 的 GitHub 仓库在改名为 `Hmbown/homebrew-codewhale` 之前仍是
-`Hmbown/homebrew-deepseek-tui`（改名后 `brew tap Hmbown/codewhale` 即可用；
+`Hmbown/homebrew-deepseek-tui`（改名后 `brew tap codewhale-hq/codewhale` 即可用；
 旧 tap 名靠 GitHub 的重定向继续工作）。旧的 `deepseek-tui` formula 在这个重叠
 版本中仍是已弃用的别名，现有的 `brew upgrade deepseek-tui` 定时任务因此照常运行。
 
@@ -221,7 +221,7 @@ Docker 镜像和 CNB 镜像都改成了 Codewhale；官方的 DeepSeek 提供商
 ## 报告改名相关的问题
 
 如果你的安装在迁移期间坏了，请在
-<https://github.com/Hmbown/CodeWhale/issues> 开一个 issue，并附上：
+<https://github.com/codewhale-hq/CodeWhale/issues> 开一个 issue，并附上：
 
 - `codewhale --version` 的输出（如果你还在用 shim，就是 `deepseek --version`）。
 - 你用的安装方式（npm、cargo、brew、手动）。

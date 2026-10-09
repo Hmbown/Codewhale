@@ -5,7 +5,7 @@ const release090 = {
   tag: "v0.9.0",
   version: "0.9.0",
   publishedAt: "2026-07-16T20:05:39Z",
-  url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+  url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.0",
 };
 
 function snapshot(overrides: Partial<RepoFacts> = {}): RepoFacts {
@@ -105,7 +105,7 @@ describe("resolveFacts", () => {
         tag: "v0.9.1",
         version: "0.9.1",
         publishedAt: "2026-07-22T01:00:00Z",
-        url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.1",
+        url: "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.1",
       },
     });
 

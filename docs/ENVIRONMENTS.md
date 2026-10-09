@@ -80,6 +80,12 @@ policy does not govern. Scripts that a command itself calls run under the same
 process scope; the shell tool's approval and sandbox settings, not the
 execution policy, decide what may run.
 
+To let the machine or user policy apply instead, set
+`CODEWHALE_POWERSHELL_EXECUTION_POLICY=inherit` before starting Codewhale: the
+shell tool then omits `-ExecutionPolicy` entirely, so a `Restricted` or
+`AllSigned` policy refuses multiline commands that need the temporary `.ps1`
+script. Unset, `bypass`, or any other value keeps the default `Bypass`.
+
 ## Consolidated runtime commands
 
 The current `codewhale` binary runs the TUI in-process. Release installers copy

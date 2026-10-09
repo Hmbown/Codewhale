@@ -58,6 +58,17 @@ fn task_shell_wait_input(mut input: Value) -> Value {
     input
 }
 
+/// Whether a `task_shell_wait` call asks to stop its task rather than poll it.
+///
+/// Only an absent, null or false `cancel` is a poll. Any other value counts as
+/// a stop here, so approval holds the call and names it as one before
+/// execution judges the value's type.
+pub(crate) fn task_shell_wait_requests_cancel(input: &Value) -> bool {
+    input
+        .get("cancel")
+        .is_some_and(|cancel| !cancel.is_null() && cancel.as_bool() != Some(false))
+}
+
 /// Unified durable-task tool (piagent phase B).
 ///
 /// The model sees one tool, `tasks`, with an `action` parameter routing to
@@ -185,23 +196,23 @@ impl ToolSpec for TasksTool {
                 "Cancel a queued or running durable task through TaskManager. Requires approval because it changes work state."
             }
             Some("gate_run") => {
-                "Run an approved verification gate command and return structured evidence. When inside a durable task, the gate result and log artifact are attached to that task."
+                "Run an approved verification gate command and return structured evidence. When inside a durable task, the gate result and log artifact are attached to that task. Dangerous commands are BLOCKED unless auto-approve is enabled; default timeout 120s."
             }
             Some("pr_attempt_record") => {
-                "Capture current git diff as a durable PR work attempt with patch artifact, changed files, and verification notes."
+                "Capture current git diff as a durable PR work attempt with patch artifact, changed files, and verification notes. Requires approval because it records work state."
             }
             Some("pr_attempt_list") => "List PR attempts recorded on a durable task.",
             Some("pr_attempt_read") => {
                 "Read one recorded PR attempt and its patch artifact reference."
             }
             Some("pr_attempt_preflight") => {
-                "Run `git apply --check` for a recorded attempt patch. This is a no-mutation preflight; actual apply remains explicit and approval-gated elsewhere."
+                "Run `git apply --check` for a recorded attempt patch. This is a no-mutation preflight and itself requires approval; the actual apply stays a separate explicit step."
             }
             _ if self.read_only => {
                 "Inspect durable tasks and their PR attempts. Actions: \"list\", \"read\", \"pr_attempt_list\", \"pr_attempt_read\"."
             }
             _ => {
-                "Manage durable background tasks through TaskManager. Durable tasks are restart-aware executable work, distinct from sub-agents. Actions: \"create\" (enqueue; approval), \"list\", \"read\", \"cancel\" (approval), \"gate_run\" (run an approved verification gate command and return structured evidence; approval), \"pr_attempt_record\", \"pr_attempt_list\", \"pr_attempt_read\", \"pr_attempt_preflight\". Use task_shell_start for long-running shell work."
+                "Manage durable background tasks through TaskManager. Durable tasks are restart-aware executable work, distinct from sub-agents. Actions: \"create\" (enqueue; approval), \"list\", \"read\", \"cancel\" (approval), \"gate_run\" (run an approved verification gate command and return structured evidence; approval), \"pr_attempt_record\" (approval), \"pr_attempt_list\", \"pr_attempt_read\", \"pr_attempt_preflight\" (approval). Use task_shell_start for long-running shell work."
             }
         }
     }
@@ -935,7 +946,7 @@ impl ToolSpec for TaskShellStartTool {
             "properties": {
                 "command": { "type": "string" },
                 "cwd": { "type": "string", "description": "Optional working directory within the workspace." },
-                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000 },
+                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "description": "Accepted for compatibility but not enforced: the command runs in the background until it finishes, the session ends, or task_shell_wait stops it with cancel=true." },
                 "stdin": { "type": "string" },
                 "tty": { "type": "boolean" }
             },
@@ -993,16 +1004,17 @@ impl ToolSpec for TaskShellWaitTool {
     }
 
     fn description(&self) -> &'static str {
-        "Poll a background shell task without blocking the agent indefinitely. Completion is delivered automatically; use this only for early output, explicit barriers, or gate evidence. If `gate` is supplied and the shell task has completed, records structured gate evidence on the active durable task."
+        "Poll a background shell task without blocking the agent indefinitely, or stop it with cancel=true. Completion is delivered automatically; use this only for early output, explicit barriers, or gate evidence. If `gate` is supplied and the shell task has completed, records structured gate evidence on the active durable task."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "task_id": { "type": "string", "description": "Background shell task id returned by task_shell_start." },
+                "task_id": { "type": "string", "description": "Background shell task id." },
                 "wait": { "type": "boolean", "default": false },
                 "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000 },
+                "cancel": { "type": "boolean", "description": "Stop (kill) the task instead of polling; not valid with gate." },
                 "gate": { "type": "string", "enum": ["fmt", "check", "clippy", "test", "custom"] },
                 "command": { "type": "string", "description": "Original command, used when recording gate evidence." }
             },
@@ -1031,11 +1043,31 @@ impl ToolSpec for TaskShellWaitTool {
     }
 
     fn is_read_only_for(&self, input: &Value) -> bool {
-        input.get("gate").is_none_or(Value::is_null)
+        // Recording a gate writes task evidence and `cancel` kills a process;
+        // neither is a read-only poll.
+        input.get("gate").is_none_or(Value::is_null) && !task_shell_wait_requests_cancel(input)
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         crate::core::engine::tool_catalog::enforce_tool_denial(context, self.name(), &input)?;
+        // The shell cancel action lives on the hidden compatibility tool, which
+        // no model catalog offers. Without this route a model that owns a stuck
+        // background command can watch it but never stop it. The delegate
+        // re-checks deny rules under `exec_shell_cancel` and only kills a task
+        // this session owns.
+        if optional_bool(&input, "cancel", false)? {
+            if optional_str(&input, "gate")?.is_some() {
+                return Err(ToolError::invalid_input(
+                    "cancel=true stops the task and cannot record a gate; nothing was stopped. Send `gate` on a separate call without cancel.",
+                ));
+            }
+            return BashTool::alias("exec_shell_cancel", "cancel")
+                .execute(
+                    json!({"task_id": required_str(&input, "task_id")?}),
+                    context,
+                )
+                .await;
+        }
         let shell_input = task_shell_wait_input(input.clone());
         let result = BashTool::alias("exec_shell_wait", "wait")
             .execute(shell_input, context)
@@ -1609,6 +1641,45 @@ mod tests {
         assert!(wait_schema["properties"]["gate"].is_object());
     }
 
+    // `timeout_ms` rides along for interface compatibility only: the shell
+    // always starts in the background, where no deadline enforces it. The
+    // schema must say so instead of implying a bounded run.
+    #[test]
+    fn background_shell_timeout_disclosure_admits_it_is_not_enforced() {
+        let schema = TaskShellStartTool.input_schema();
+        let timeout_ms = schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .expect("timeout_ms must carry a description");
+        assert!(
+            timeout_ms.contains("not enforced"),
+            "timeout_ms must disclose that the background run is unbounded: {timeout_ms}"
+        );
+        assert!(
+            timeout_ms.contains("task_shell_wait") && timeout_ms.contains("cancel=true"),
+            "timeout_ms must point at the callable cancel path that can stop the run: {timeout_ms}"
+        );
+        assert!(
+            !timeout_ms.contains("exec_shell"),
+            "timeout_ms must not name the hidden exec_shell tool, which no model can call: {timeout_ms}"
+        );
+    }
+
+    // The gate blocks dangerous commands unless auto-approve is on, and the
+    // description is where the model learns that before composing a command.
+    #[test]
+    fn gate_run_description_discloses_dangerous_command_block_and_budget() {
+        let gate_run = TasksTool::alias("task_gate_run", "gate_run");
+        let description = gate_run.description();
+        assert!(
+            description.contains("BLOCKED") && description.contains("auto-approve"),
+            "gate_run description must disclose the dangerous-command block: {description}"
+        );
+        assert!(
+            description.contains("120s"),
+            "gate_run description must disclose the default gate timeout: {description}"
+        );
+    }
+
     #[test]
     fn runtime_surface_hardening_task_gate_recording_requires_approval() {
         let tool = TaskShellWaitTool;
@@ -1699,6 +1770,74 @@ mod tests {
             .execute(json!({"task_id": task_id}), &context)
             .await
             .expect("cancel background shell");
+    }
+
+    // A foreground command that outlives its wait moves to the background, and
+    // the model that owns it sees only the task shell tools: the shell cancel
+    // action is on a hidden tool. `task_shell_wait` has to be able to stop the
+    // task it polls, and stopping is not a read-only poll.
+    #[tokio::test]
+    async fn task_shell_wait_cancel_stops_the_background_task() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let context = ToolContext::new(workspace.path());
+        let started = TaskShellStartTool
+            .execute(
+                json!({"command": "sleep 30", "timeout_ms": 5_000}),
+                &context,
+            )
+            .await
+            .expect("start background shell");
+        let task_id = started
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("task_id"))
+            .and_then(Value::as_str)
+            .expect("task id")
+            .to_string();
+
+        let tool = TaskShellWaitTool;
+        assert!(tool.input_schema()["properties"]["cancel"].is_object());
+        for held in [json!(true), json!("true"), json!(1)] {
+            let input = json!({"task_id": task_id, "cancel": held});
+            assert_eq!(
+                tool.approval_requirement_for(&input),
+                ApprovalRequirement::Required,
+                "{input}"
+            );
+            assert!(!tool.is_read_only_for(&input), "{input}");
+        }
+        for polled in [json!(false), Value::Null] {
+            let input = json!({"task_id": task_id, "cancel": polled});
+            assert!(tool.is_read_only_for(&input), "{input}");
+        }
+
+        let with_gate = tool
+            .execute(
+                json!({"task_id": task_id, "cancel": true, "gate": "test"}),
+                &context,
+            )
+            .await
+            .expect_err("cancel cannot record a gate");
+        assert!(with_gate.to_string().contains("cancel=true"), "{with_gate}");
+
+        let canceled = tool
+            .execute(json!({"task_id": task_id, "cancel": true}), &context)
+            .await
+            .expect("cancel background shell");
+        assert!(
+            canceled.content.contains("Canceled background command")
+                && canceled.content.contains(&task_id),
+            "{}",
+            canceled.content
+        );
+        assert_eq!(
+            canceled
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("status"))
+                .and_then(Value::as_str),
+            Some("Killed")
+        );
     }
 
     /// Creating a task from a session runs it on the posture that session

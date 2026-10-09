@@ -1469,7 +1469,7 @@ fn codewhale_api_base_env_refuses_cleartext_off_loopback() {
 
 #[test]
 fn opencode_zen_resolver_selects_protocol_from_documented_model_catalog() {
-    use super::offering::{
+    use crate::catalog::reviewed::constants::{
         OPENCODE_ZEN_CHAT_MODELS, OPENCODE_ZEN_MESSAGES_MODELS, OPENCODE_ZEN_RESPONSES_MODELS,
     };
 
@@ -1758,6 +1758,7 @@ fn priced_deepseek_resolver() -> RouteResolver {
             output: Some(0.42),
             cache_read: Some(0.028),
             cache_write: None,
+            ..Default::default()
         }),
         source: CatalogSource::Bundled,
         ..Default::default()

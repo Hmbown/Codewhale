@@ -323,12 +323,21 @@ impl Default for SetupRuntimeFacts {
 impl SetupRuntimeFacts {
     fn from_app_config(app: &App, config: &Config) -> Self {
         let expert_override = SetupExpertOverrideState::load();
-        let readiness = crate::provider_readiness::resolve_for_model(
-            config,
-            app.api_provider,
-            if app.auto_model { "auto" } else { &app.model },
-            &app.provider_health,
-        );
+        let readiness = app
+            .admitted_provider_identity()
+            .ok()
+            .filter(|identity| config.verify_provider_identity(identity).is_ok())
+            .map_or(
+                crate::provider_readiness::ResolvedProviderReadiness::InvalidRoute,
+                |identity| {
+                    crate::provider_readiness::resolve_for_model(
+                        config,
+                        identity,
+                        if app.auto_model { "auto" } else { &app.model },
+                        &app.provider_health,
+                    )
+                },
+            );
         // A failed observed check remains retryable in route pickers, but the
         // setup receipt must not certify it as healthy. Saved-unchecked and
         // local-unchecked are honest reviewed configuration states; an actual
@@ -339,11 +348,14 @@ impl SetupRuntimeFacts {
             StepStatus::Configured | StepStatus::Verified
         );
         let model = app.model_display_label();
-        let provider_name = if app.api_provider == crate::config::ApiProvider::Custom {
-            app.provider_identity_for_persistence().to_string()
-        } else {
-            app.api_provider.display_name().to_string()
-        };
+        let provider_name = app
+            .admitted_provider_identity()
+            .map_or("unavailable", |identity| {
+                identity
+                    .compatibility()
+                    .map_or(identity.key.as_str(), |row| row.label)
+            })
+            .to_string();
         let context_window = crate::route_budget::route_context_window_tokens(
             app.api_provider,
             &app.model,
@@ -360,7 +372,7 @@ impl SetupRuntimeFacts {
             crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
         ) {
             format!("{}; retry or open /provider", readiness.label())
-        } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
+        } else if app.api_provider == crate::config::ProviderKind::OpenaiCodex {
             format!(
                 "{}; Sign in with ChatGPT via `codewhale auth chatgpt` or /provider setup openai-codex (subscription billing). Codex CLI import remains an explicit alternative.",
                 readiness.label()

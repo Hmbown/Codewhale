@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` has twenty-two independently optional facet slots, all
+//! `CommandContexts` has twenty-five independently optional facet slots, all
 //! constructed here. The diagnostics adapter joins the host bundle in FEAT-029. Important behavior (mode transitions, model
 //! invalidation, cost accounting, skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -31,9 +31,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub(in crate::commands) mod config_policy;
+#[cfg(test)]
+mod config_policy_baseline;
+use config_policy::{ConfigStatusAdapter, PermissionsAdapter};
 mod debug_diagnostics;
 pub(in crate::commands) mod debug_operations;
 use debug_operations::DebugOperationsAdapter;
+mod config_policy_messages;
 mod diagnostics_messages;
 #[cfg(test)]
 pub(crate) use debug_diagnostics::CostComponents as DebugCostComponents;
@@ -151,7 +156,7 @@ fn from_command_currency(currency: CommandCurrency) -> CostCurrency {
 
 /// Stable provider identity text at the command boundary.
 ///
-/// The TUI persists either the canonical `ApiProvider::as_str()` spelling or —
+/// The TUI persists either the canonical `ProviderKind::as_str()` spelling or —
 /// for named custom providers — the exact configured identity text. This
 /// function never leaks URLs, credentials, or filesystem paths.
 pub(crate) fn to_provider_id(identity: &str) -> CommandProviderId {
@@ -280,6 +285,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
 /// return owned values. Command handlers never receive or name `App`.
 struct CommandHost<'a> {
     app: RefCell<&'a mut App>,
+    config: Option<&'a crate::config::Config>,
 }
 
 type SharedCommandHost<'a> = Rc<CommandHost<'a>>;
@@ -346,6 +352,13 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             .as_ref()
             .map(|j| j.entries.len())
             .unwrap_or(0);
+        // An entry a bounded save archived (#6842) is restored, with any
+        // ancestors the journal no longer holds, before branching to it.
+        if let Err(e) = manager.restore_archived_journal_chain(&mut session, entry_id) {
+            return Err(format!(
+                "branch failed: could not restore {entry_id} from the session's journal archive: {e}"
+            ));
+        }
         match session.journal_branch_to(entry_id) {
             Ok(()) => {
                 if let Err(e) = manager.save_session(&session) {
@@ -397,7 +410,22 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             if let Ok(mut session) = manager.load_session(&session_id) {
                 session.ensure_journal();
                 if let Some(journal) = session.journal.as_ref() {
-                    let rendered = crate::session_tree::render_tree(journal);
+                    let mut rendered = crate::session_tree::render_tree(journal);
+                    match manager.load_journal_archive(&session_id) {
+                        Ok(archived) if !archived.is_empty() => {
+                            rendered.push_str(&format!(
+                                "{} older off-branch entries are archived in {}/{}.jsonl \
+                                 (not drawn); `/branch <id>` restores one.\n",
+                                archived.len(),
+                                crate::session_manager::JOURNAL_ARCHIVE_DIR,
+                                session_id,
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            rendered.push_str(&format!("journal archive could not be read: {e}\n"))
+                        }
+                    }
                     return Ok(TreeBodyProjection::Journal { rendered });
                 }
             }
@@ -1047,6 +1075,7 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         };
         RelayProjection {
             compact_template: crate::prompts::COMPACT_TEMPLATE.to_string(),
+            handoff_path: crate::prompts::HANDOFF_RELATIVE_PATH.to_string(),
             workspace: app.workspace.display().to_string(),
             mode: app.mode.label().to_string(),
             model: app.model_display_label(),
@@ -1853,12 +1882,38 @@ impl CommandModelContext for ModelAdapter<'_> {
 
     fn set_model_selection(&mut self, model: String, provider: Option<CommandProviderId>) {
         let mut app = self.host.app.borrow_mut();
-        if let Some(provider) = provider {
-            let identity = provider.0;
-            let provider = crate::config::ApiProvider::parse(&identity)
-                .unwrap_or(crate::config::ApiProvider::Custom);
-            app.set_provider_identity(provider, identity);
-        }
+        let admission = (|| {
+            let config = self.host.config.ok_or_else(|| {
+                "The model command has no active provider configuration.".to_string()
+            })?;
+            let identity = match provider {
+                Some(provider) => {
+                    let identity = config.resolve_provider_identity(&provider.0)?;
+                    if identity.key.as_str() != provider.0 {
+                        return Err(
+                            "The model command must name the exact admitted provider route."
+                                .to_string(),
+                        );
+                    }
+                    identity
+                }
+                None => app.admitted_provider_identity()?.clone(),
+            };
+            config.verify_provider_identity(&identity)?;
+            Ok(identity)
+        })();
+        let identity = match admission {
+            Ok(identity) => identity,
+            Err(reason) => {
+                app.push_status_toast(
+                    reason,
+                    crate::tui::app::StatusToastLevel::Error,
+                    Some(8_000),
+                );
+                return;
+            }
+        };
+        app.set_provider_identity_record(identity);
         app.set_model_selection(model);
     }
 
@@ -1996,7 +2051,7 @@ impl CommandSkillsContext for SkillsAdapter<'_> {
             .borrow()
             .active_skill_provenance
             .as_ref()
-            .map(|authority| authority.plugin_name.clone())
+            .map(|provenance| provenance.authority().plugin_name.clone())
     }
 
     fn refresh_skill_cache(&mut self) {
@@ -2053,6 +2108,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| key_to_plugin_message_id(key))
             .or_else(|| key_to_session_message_id(key))
             .or_else(|| diagnostics_messages::resolve(key))
+            .or_else(|| config_policy_messages::resolve(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -2703,7 +2759,7 @@ fn discover_visible(app: &App) -> crate::skills::SkillRegistry {
         &app.workspace,
         &app.skills_dir,
         app.skills_discovery_mode,
-        Some(app.plugin_registry.as_ref()),
+        Some(app.extension_plugin_view().as_ref()),
     )
     .into_enabled()
 }
@@ -2848,21 +2904,18 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                     reason: "frontmatter does not allow user invocation".into(),
                 });
             }
-            let plugin_provenance = match &skill.source {
-                crate::skills::SkillSource::Native => None,
-                crate::skills::SkillSource::Plugin { authority, .. } => {
-                    if let Err(reason) = crate::plugins::registry::verify_plugin_component_authority(
-                        authority,
-                        crate::plugins::activation::PluginActivationCapability::Skills,
-                    ) {
-                        return Err(SkillActivationError::PluginRejected {
-                            name: skill.name.clone(),
-                            reason,
-                        });
-                    }
-                    Some(authority.as_ref().clone())
-                }
-            };
+            let plugin_provenance = skill.source.provenance();
+            if let Some(provenance) = &plugin_provenance
+                && let Err(reason) = provenance.verify_for(
+                    &self.host.app.borrow().workspace,
+                    Some(self.host.app.borrow().extension_plugin_view().as_ref()),
+                )
+            {
+                return Err(SkillActivationError::PluginRejected {
+                    name: skill.name.clone(),
+                    reason,
+                });
+            }
             let skill = skill.clone();
             let instruction = format!(
                 "You are now using a skill. Follow these instructions:\n\n# Skill: {}\n\n{}\n\n---\n\nNow respond to the user's request following the above skill instructions.",
@@ -3176,10 +3229,17 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         if tokio::runtime::Handle::try_current().is_err() {
             return restore();
         }
+        // A sealed test's home must follow the work onto the blocking pool.
+        #[cfg(test)]
+        let ticket = crate::test_support::env_scope_ticket();
         run_async(async move {
-            tokio::task::spawn_blocking(restore)
-                .await
-                .map_err(|error| format!("Restore task failed: {error}"))?
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                restore()
+            })
+            .await
+            .map_err(|error| format!("Restore task failed: {error}"))?
         })
     }
 
@@ -3911,6 +3971,11 @@ impl CommandPluginContext for PluginAdapter<'_> {
         }
         let mut app = self.host.app.borrow_mut();
         std::sync::Arc::make_mut(&mut app.plugin_registry).enable(selector)?;
+        // Rediscover, as install and reload do: an in-place enable keeps the
+        // pinned Native selection, so a host plugin enabled after a preset
+        // catalog was already active would never be activated.
+        let workspace = app.workspace.clone();
+        app.plugin_registry = app.plugin_registry.rediscover_for_workspace(&workspace);
         app.refresh_skill_cache();
         Ok(())
     }
@@ -4136,37 +4201,58 @@ impl CommandPluginContext for PluginAdapter<'_> {
         &self,
         package: &Path,
     ) -> Result<codewhale_command_contract::facets::PluginDshPreview, String> {
-        let canonical = package
-            .canonicalize()
-            .map_err(|_| format!("DSH package not found at {}", package.display()))?;
-        let (conversion, content_hash) = crate::plugins::install::preview_dsh(&canonical)
-            .map_err(|error| format!("{error:#}"))?;
-        Ok(codewhale_command_contract::facets::PluginDshPreview {
-            package_path: canonical,
-            plugin_name: conversion.plugin_name,
-            source_package: conversion.source_package,
-            source_version: conversion.source_version,
-            content_hash,
-            skills: conversion.skills,
-            remote_servers: conversion.remote_servers,
-            local_servers: conversion.local_servers,
-            network_hosts: conversion.network_hosts,
-            requires_node: conversion.requires_node,
-            manual_ports: conversion
-                .outcomes
-                .iter()
-                .filter(|outcome| outcome.needs_manual_port())
-                .map(|outcome| {
-                    format!(
-                        "{} ({}) {}: {}",
-                        outcome.row.as_deref().unwrap_or("unlabeled"),
-                        outcome.package.as_deref().unwrap_or("unlabeled"),
-                        outcome.kind,
-                        outcome.reason
-                    )
-                })
-                .collect(),
-            diagnostics: conversion.diagnostics,
+        let package = package.to_path_buf();
+        let preview = move || {
+            let canonical = package
+                .canonicalize()
+                .map_err(|_| format!("DSH package not found at {}", package.display()))?;
+            let (conversion, content_hash) = crate::plugins::install::preview_dsh(&canonical)
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(codewhale_command_contract::facets::PluginDshPreview {
+                package_path: canonical,
+                plugin_name: conversion.plugin_name,
+                source_package: conversion.source_package,
+                source_version: conversion.source_version,
+                content_hash,
+                skills: conversion.skills,
+                remote_servers: conversion.remote_servers,
+                local_servers: conversion.local_servers,
+                network_hosts: conversion.network_hosts,
+                native_rows: conversion.native_rows,
+                requires_node: conversion.requires_node,
+                manual_ports: conversion
+                    .outcomes
+                    .iter()
+                    .filter(|outcome| outcome.needs_manual_port())
+                    .map(|outcome| {
+                        format!(
+                            "{} ({}) {}: {}",
+                            outcome.row.as_deref().unwrap_or("unlabeled"),
+                            outcome.package.as_deref().unwrap_or("unlabeled"),
+                            outcome.kind,
+                            outcome.reason
+                        )
+                    })
+                    .collect(),
+                diagnostics: conversion.diagnostics,
+            })
+        };
+        // Native composition review owns a bounded async process runner. Like
+        // the Runtime API and installer, keep the complete filesystem/reviewer
+        // operation off the TUI worker before entering that runner.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return preview();
+        }
+        #[cfg(test)]
+        let ticket = crate::test_support::env_scope_ticket();
+        run_async(async move {
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                preview()
+            })
+            .await
+            .map_err(|error| format!("DSH preview task failed: {error}"))?
         })
     }
 
@@ -4417,7 +4503,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns twenty-three facet objects sharing one synchronous TUI host proxy.
+/// Owns twenty-five facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -4446,6 +4532,8 @@ pub(crate) struct CommandContextBundle<'a> {
     debug_diff: DebugOperationsAdapter<'a>,
     debug_undo: DebugOperationsAdapter<'a>,
     debug_diagnostics: DebugDiagnosticsAdapter<'a>,
+    permissions: PermissionsAdapter<'a>,
+    config_status: ConfigStatusAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4521,6 +4609,12 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::DEBUG_DIAGNOSTICS) {
             contexts = contexts.with_debug_diagnostics(&mut self.debug_diagnostics);
         }
+        if capabilities.contains(CommandCapabilities::PERMISSIONS) {
+            contexts = contexts.with_permissions(&mut self.permissions);
+        }
+        if capabilities.contains(CommandCapabilities::CONFIG_STATUS) {
+            contexts = contexts.with_config_status(&mut self.config_status);
+        }
         contexts
     }
 
@@ -4549,7 +4643,9 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::DEBUG_HISTORY)
             .union(CommandCapabilities::DEBUG_DIFF)
             .union(CommandCapabilities::DEBUG_UNDO)
-            .union(CommandCapabilities::DEBUG_DIAGNOSTICS);
+            .union(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .union(CommandCapabilities::PERMISSIONS)
+            .union(CommandCapabilities::CONFIG_STATUS);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4557,9 +4653,18 @@ impl<'a> CommandContextBundle<'a> {
 impl App {
     /// Build an App-free capability envelope backed by authoritative TUI
     /// operations. The shared proxy is synchronous and local to one dispatch.
+    #[cfg(test)]
     pub(crate) fn command_contexts(&mut self) -> CommandContextBundle<'_> {
+        self.command_contexts_with_config(None)
+    }
+
+    pub(crate) fn command_contexts_with_config<'a>(
+        &'a mut self,
+        config: Option<&'a crate::config::Config>,
+    ) -> CommandContextBundle<'a> {
         let host = Rc::new(CommandHost {
             app: RefCell::new(self),
+            config,
         });
         CommandContextBundle {
             session: SessionAdapter { host: host.clone() },
@@ -4584,7 +4689,9 @@ impl App {
             debug_history: DebugOperationsAdapter { host: host.clone() },
             debug_diff: DebugOperationsAdapter { host: host.clone() },
             debug_undo: DebugOperationsAdapter { host: host.clone() },
-            debug_diagnostics: DebugDiagnosticsAdapter { host },
+            debug_diagnostics: DebugDiagnosticsAdapter { host: host.clone() },
+            permissions: PermissionsAdapter { host: host.clone() },
+            config_status: ConfigStatusAdapter { host },
         }
     }
 }
@@ -4745,8 +4852,9 @@ mod tests {
     fn model_adapter_delegates_selection_and_route_invalidation_to_app() {
         let mut app = test_app();
         app.last_effective_model = Some("stale-model".to_string());
+        let config = crate::config::Config::default();
         {
-            let mut bundle = app.command_contexts();
+            let mut bundle = app.command_contexts_with_config(Some(&config));
             let mut parts = bundle.parts();
             let model = parts.model.as_mut().expect("model facet");
             model.set_model_selection("auto".to_string(), Some(to_provider_id("deepseek")));
@@ -4759,6 +4867,92 @@ mod tests {
         }
         assert!(app.last_effective_model.is_none());
         assert_eq!(app.provider_identity_for_persistence(), "deepseek");
+    }
+
+    #[test]
+    fn model_adapter_admits_cross_provider_and_case_distinct_custom_routes_from_borrowed_config() {
+        use crate::config::{Config, ProviderConfig, ProvidersConfig};
+        let config = Config {
+            provider: Some("openai".to_string()),
+            providers: Some(ProvidersConfig {
+                custom: [
+                    ("CustomA".to_string(), "http://127.0.0.1:4111/v1"),
+                    ("customa".to_string(), "http://127.0.0.1:4222/v1"),
+                ]
+                .into_iter()
+                .map(|(key, endpoint)| {
+                    (
+                        key,
+                        ProviderConfig {
+                            kind: Some("openai-compatible".to_string()),
+                            base_url: Some(endpoint.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut app = test_app();
+        app.set_provider_identity_record(config.active_provider_identity().unwrap());
+        for (key, model) in [
+            ("CustomA", "private-a"),
+            ("customa", "private-b"),
+            ("openai", "gpt-5.5"),
+        ] {
+            {
+                let mut bundle = app.command_contexts_with_config(Some(&config));
+                let mut parts = bundle.parts();
+                parts
+                    .model
+                    .as_mut()
+                    .unwrap()
+                    .set_model_selection(model.to_string(), Some(to_provider_id(key)));
+            }
+            assert_eq!(
+                app.admitted_provider_identity().unwrap(),
+                &config.resolve_provider_identity(key).unwrap()
+            );
+            assert_eq!(app.provider_identity_for_persistence(), key);
+            assert_eq!(app.model, model);
+        }
+        // Exact keys do not inherit a same-kind sibling or a generic custom route.
+        for refused in ["CUSTOMA", "custom", "antigravity"] {
+            let captured = app.admitted_provider_identity().unwrap().clone();
+            {
+                let mut bundle = app.command_contexts_with_config(Some(&config));
+                let mut parts = bundle.parts();
+                parts.model.as_mut().unwrap().set_model_selection(
+                    "must-not-apply".to_string(),
+                    Some(to_provider_id(refused)),
+                );
+            }
+            assert_eq!(app.admitted_provider_identity().unwrap(), &captured);
+            assert_eq!(app.model, "gpt-5.5");
+        }
+    }
+
+    #[test]
+    fn model_adapter_without_active_config_refuses_before_route_or_model_mutation() {
+        let mut app = test_app();
+        let model = app.model.clone();
+        let captured = app.admitted_provider_identity().unwrap().clone();
+        app.last_effective_model = Some("captured-live-route".to_string());
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.model.as_mut().unwrap();
+            facet.set_model_selection("must-not-apply".to_string(), Some(to_provider_id("openai")));
+            facet.set_model_selection("must-not-apply".to_string(), None);
+        }
+        assert_eq!(app.model, model);
+        assert_eq!(app.admitted_provider_identity().unwrap(), &captured);
+        assert_eq!(
+            app.last_effective_model.as_deref(),
+            Some("captured-live-route")
+        );
     }
 
     #[test]
@@ -4867,7 +5061,12 @@ mod tests {
         harness.app.system_prompt = Some(SystemPrompt::Text("policy".to_string()));
         harness.app.session.last_prompt_tokens = None;
         harness.app.session.last_completion_tokens = Some(0);
-        let expected_provider = harness.app.api_provider.display_name().to_string();
+        let expected_provider = harness
+            .app
+            .api_provider
+            .provider()
+            .display_name()
+            .to_string();
         let expected_support = crate::config::provider_has_balance_api(harness.app.api_provider);
         let mut bundle = harness.app.command_contexts();
         let mut parts = bundle
@@ -5885,37 +6084,10 @@ mod tests {
 
     // ─── FEAT-022 skill-group adapter tests ───────────────────────────────────
 
-    /// Pins HOME to a tempdir for the duration of the test under the
+    /// Seals the user's home for the duration of the test under the
     /// crate-wide env mutex (keeps global skill/snapshot discovery hermetic).
-    struct ScopedHome {
-        prev: Option<std::ffi::OsString>,
-        _home: TempDir,
-        _guard: crate::test_support::TestEnvLock,
-    }
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn scoped_home(_workspace: &TempDir) -> ScopedHome {
-        let guard = crate::test_support::lock_test_env();
-        let prev = std::env::var_os("HOME");
-        let home = TempDir::new().expect("home tempdir");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        ScopedHome {
-            prev,
-            _home: home,
-            _guard: guard,
-        }
+    fn scoped_home(_workspace: &TempDir) -> crate::test_support::SealedHome {
+        crate::test_support::SealedHome::new()
     }
 
     /// The fixture's skills dir lives inside its workspace, so the workspace
@@ -6352,6 +6524,37 @@ mod tests {
         // Registry diagnostics empty for a clean bundle.
         assert!(plugin.registry_diagnostics().is_empty());
         assert!(plugin.validation_is_clean());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_adapter_dsh_preview_runs_from_live_runtime() {
+        let _home = crate::test_support::SealedHome::new();
+        if crate::extension_host::tests::node_for_tests(
+            "plugin_adapter_dsh_preview_runs_from_live_runtime",
+        )
+        .is_none()
+        {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut app = plugin_test_app(&tmp);
+        let before = app.plugin_registry.len();
+        let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/extension_host/raw-agent-presets/source");
+        let mut bundle = app.command_contexts();
+        let mut parts = bundle.contexts(CommandCapabilities::PLUGIN).into_parts();
+        let plugin = parts.plugin.as_deref_mut().unwrap();
+        let review = plugin
+            .dsh_preview(&package)
+            .expect("live TUI Native review");
+        assert_eq!(review.plugin_name, "raw-agent-presets");
+        assert_eq!(
+            review.source_package.as_deref(),
+            Some("@demo/raw-agent-presets")
+        );
+        assert_eq!(review.content_hash.len(), 64);
+        assert!(review.manual_ports.is_empty(), "{:?}", review.manual_ports);
+        assert_eq!(plugin.len(), before, "preview must not install a bundle");
     }
 
     #[test]
@@ -6880,6 +7083,10 @@ mod tests {
                 projection.compact_template.trim(),
                 crate::prompts::COMPACT_TEMPLATE.trim()
             );
+            assert_eq!(
+                projection.handoff_path,
+                crate::prompts::HANDOFF_RELATIVE_PATH
+            );
             assert!(matches!(projection.todos, TodoProjection::Absent));
             assert!(matches!(projection.plan, PlanProjection::Absent));
         }
@@ -6938,7 +7145,7 @@ mod tests {
         let mut app = control_test_app(&tmpdir);
         init_control_git_repo(
             tmpdir.path(),
-            &format!("https://hunter:{secret}@github.com/Hmbown/CodeWhale.git"),
+            &format!("https://hunter:{secret}@github.com/codewhale-hq/CodeWhale.git"),
             "main",
         );
 
@@ -6947,11 +7154,11 @@ mod tests {
             let mut parts = bundle.parts();
             let facet = parts.control.as_deref_mut().expect("control slot");
             let target = facet.resolve_hosted_work_target().expect("target");
-            assert_eq!(target.repo, "Hmbown/CodeWhale");
+            assert_eq!(target.repo, "codewhale-hq/CodeWhale");
             assert_eq!(target.branch, "main");
             assert_eq!(
                 target.url,
-                "https://app.codewhale.net/work?repo=Hmbown%2FCodeWhale&branch=main"
+                "https://app.codewhale.net/work?repo=codewhale-hq%2FCodeWhale&branch=main"
             );
             assert!(!target.url.contains(secret));
             assert!(!target.repo.contains(secret));
@@ -7260,7 +7467,11 @@ mod tests {
         std::fs::write(&import_file, &json).unwrap();
 
         // This window is on a non-default route; the import must bind to it.
-        app.api_provider = crate::config::ApiProvider::Openai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Openai.as_str())
+                .expect("captured fixture provider"),
+        );
         let receipt = {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();

@@ -2,8 +2,10 @@
 
 > 英文原文：[ARCHITECTURE.md](../ARCHITECTURE.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐单一回合循环的私有阶段与 ACP 投影边界。
 
-本文面向开发者和贡献者，概览 Codewhale 的架构。
+Codewhale Engine 是现有 Rust 执行运行时。[Runtime API](RUNTIME_API.md) 是客户端
+接口，[TypeScript mods](EXTENSIONS.md) 提供经审查的扩展。
 
 当前边界说明（工作区版本以 `Cargo.toml` 为准；该边界自 v0.9.1 起保持不变）：
 - `crates/tui` 仍是 TUI、运行时 API、任务管理器和工具执行循环的现行终端用户运行时。
@@ -75,13 +77,18 @@
 
 ### 入口点
 
-- **`main.rs`** - CLI 参数解析（clap）、配置加载、入口点路由
+- **`crates/cli/src/main.rs`** - 唯一可执行程序的入口。`crates/cli/src/lib.rs` 拥有命令接口；终端和无头运行时通过 `crates/tui/src/lib.rs` 中的 `codewhale_tui` 库在同一进程内启动。
 
 ### 核心组件
 
 - **`core/`** - 主要引擎组件
   - `engine.rs` - 引擎状态、操作处理、消息处理
-  - `engine/turn_loop.rs` - 流式回合循环与工具执行编排
+  - `engine/turn_loop.rs` - 现有 Engine 外层回合循环、共享工具规划/执行/结果处理与
+    流解码。私有 `turn_loop/` 阶段包括准备（`preparation.rs`）、模型派发与接纳
+    （`model_step.rs`）、有序续接（`continuation.rs`）、内联 REPL 编排
+    （`inline_repl.rs`）及直接模型工具批次（`tool_batch.rs`）。它们借用同一个
+    Engine 与 TurnContext，不引入第二个运行时、会话、提示词、审批、事件或持久化
+    权威。重试、循环终止与立即返回仍不同，只有现有有效工作路径推进步骤。
   - `session.rs` - 会话状态管理
   - `turn.rs` - 基于回合的对话处理
   - `events.rs` - 用于 UI 更新的事件系统
@@ -94,15 +101,16 @@
 
 ### 工作区 crate
 
-- **`crates/cli`** - `codewhale` 二进制：一个命令行门面，自身拥有 `auth`、
-  `metrics` 和 `update` 等命令，其余命令（`run`、`exec`、`doctor`、`sessions`……）
-  转交给由 `crates/tui` 构建的 `codewhale-tui` 二进制。
+- **`crates/cli`** - 唯一的 `codewhale` 可执行程序及命令接口。它自身拥有
+  `auth`、`metrics`、`update` 等命令，并通过 `codewhale_tui::run(RuntimeOptions, args)`
+  在同一进程内启动终端和无头模式（`run`、`exec`、`doctor`、`sessions`……）。
+  `crates/tui` 是库；`codew` 和旧发布文件名的别名包含相同的可执行程序。
 - **`crates/tools`** - 共享的工具调用原语，包括 TUI 运行时使用的工具结果/错误/能力类型。
 - **`crates/agent`** - 模型/提供商（provider）注册表（ModelRegistry），用于把模型 ID
   解析到提供商端点。
 - **`crates/app-server`** - 用于无头智能体工作流的 HTTP/SSE + JSON-RPC 应用服务器
-  传输层。注意 `app-server --http`/`--mobile` 会委托给 TUI 二进制，运行时 API
-  实际就在那里。
+  传输层。唯一的可执行程序将 `app-server --http`/`--mobile` 在同一进程内
+  路由到由 `codewhale_tui` 库承载的运行时 API。
 - **`crates/config`** - 配置加载、profile、环境变量优先级、CLI 运行时覆盖。
 - **`crates/cloud-facts`** - 拉取已签名的 Codewhale 云端事实信道（`facts/v1`），
   校验其 Ed25519 信封，并维护一份已验证的磁盘缓存；从不是启动依赖。
@@ -113,7 +121,15 @@
   `crates/tui/src/core/engine/turn_loop.rs` 里的 `Engine::run_turn`，而
   `crates/tui/src/core/` 是 TUI crate 内部的模块，不是这个 crate 的。这里曾有一棵
   占位的 `engine/` 目录树让人误解——它没有任何调用方，还会在不接触模型的情况下
-  发出 `TurnComplete`——已在 v0.9.11 移除，因此工作区里只有一个回合循环。
+  发出 `TurnComplete`——已在 v0.9.11 移除。源码守卫跟踪已解析的本地阶段调用，
+  仍拒绝未登记的循环 owner。ACP stdio 投影现有 Runtime manager 与 Engine，
+  不保留独立提供商/工具回合循环或历史。
+  递归 RLM 和普通 Python RPC 现在使用同一个 Engine 生产者与 Session；RLM
+  不再有独立循环。Python 保存上下文与变量，每轮只借用调用方已捕获的路由、
+  Native 选择、原有代码审批、取消信号和截止时间。任务指导有界且追加到 Core
+  策略；递归历史完整保留，超过预算时拒绝而不压缩。持久 `rlm` 上下文只属于
+  调用方会话，`share_session=true` 明确拒绝。子智能体也以已捕获的准入事实
+  使用同一个 Engine；两种嵌套宿主都不再保留独立循环例外。
 - **`crates/execpolicy`** - 用于工具执行决策的审批（approval）/沙箱（sandbox）策略引擎。
 - **`crates/hooks`** - 响应、工具、作业和审批生命周期事件的事件接收端（sink：stdout、
   JSONL 文件、webhook、Unix socket），外加可选启用的 lifecycle outbox。

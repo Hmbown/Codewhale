@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo="Hmbown/CodeWhale"
+repo="codewhale-hq/CodeWhale"
 version="${CODEWHALE_VERSION:-latest}"
 release_base="${CODEWHALE_RELEASE_BASE_URL:-${DEEPSEEK_TUI_RELEASE_BASE_URL:-}}"
 
@@ -18,6 +18,9 @@ Environment:
   CODEWHALE_VERSION        Release tag for a fresh directory. Default: latest
   CODEWHALE_RELEASE_BASE_URL
                            Custom release asset base URL ending in /download
+  CODEWHALE_INSTALL_COMPILED_HOST=1
+                           Also install a qualified optional Bun image + notices/source
+                           Node remains the default; missing eligibility fails loudly
   CODEWHALE_SKIP_GLIBC_CHECK=1
                            Skip Linux arm64 glibc compatibility preflight
 
@@ -187,13 +190,13 @@ detect_platform() {
   arch="$(uname -m)"
 
   if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Android" ]; then
-    fail "Android/Termux needs the Android arm64 preview archive, not a Linux binary. See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md"
+    fail "Android/Termux needs the Android arm64 preview archive, not a Linux binary. See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md"
   fi
 
   case "$os" in
     Darwin) platform="macos" ;;
     Linux) platform="linux" ;;
-    *) fail "unsupported OS: $os. Use the matching asset at https://github.com/Hmbown/CodeWhale/releases/latest; npm and Cargo are secondary options." ;;
+    *) fail "unsupported OS: $os. Use the matching asset at https://github.com/codewhale-hq/CodeWhale/releases/latest; npm and Cargo are secondary options." ;;
   esac
 
   case "$arch" in
@@ -259,9 +262,10 @@ esac
 check_destination() {
   destination="$1"
   source="$2"
+  mode="${3:-755}"
   destination_exists=0
   if [ -e "$destination" ] || [ -L "$destination" ]; then
-    if [ ! -L "$destination" ] && [ -f "$destination" ] && [ -x "$destination" ] && cmp -s "$source" "$destination"; then
+    if [ ! -L "$destination" ] && [ -f "$destination" ] && { [ "$mode" != 755 ] || [ -x "$destination" ]; } && cmp -s "$source" "$destination"; then
       destination_exists=1
       return
     fi
@@ -284,6 +288,32 @@ EOF
 
 # Check every command before publishing any of them. Existing identical release
 # files are an idempotent install; anything different uses the canonical updater.
+# An enabled companion must exist in this same checksummed release. No
+# installer fetches a Bun runtime or invents Android/musl/cross-arch support.
+if [ "${CODEWHALE_INSTALL_COMPILED_HOST:-}" = 1 ]; then
+  host_asset="codewhale-extension-host-$target"
+  for companion in "$host_asset" "$host_asset-LICENSES.txt" "$host_asset-relink-source.tar.gz" codewhale-extension-hosts.json; do
+    download "$release_base/$companion" "$tmpdir/$companion"
+    verify_asset "$companion" "$tmpdir/$companion" "$tmpdir/codewhale-artifacts-sha256.txt"
+  done
+  mv "$tmpdir/$host_asset" "$tmpdir/codewhale-extension-host"
+  mv "$tmpdir/$host_asset-LICENSES.txt" "$tmpdir/codewhale-extension-host.LICENSES.txt"
+  mv "$tmpdir/$host_asset-relink-source.tar.gz" "$tmpdir/codewhale-extension-host.relink-source.tar.gz"
+  mv "$tmpdir/codewhale-extension-hosts.json" "$tmpdir/codewhale-extension-host.release.json"
+  if [ "$target" = linux-x64 ] || [ "$target" = linux-arm64 ]; then
+    required="$(grep -aoE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' "$tmpdir/codewhale-extension-host" 2>/dev/null | sed 's/GLIBC_//' | awk -F. '{ code=$1*1000000+$2*1000+$3; if(code>best){best=code; value=$0} } END {print value}' || true)"
+    if [ -n "$required" ]; then
+      available="$(glibc_version || true)"
+      [ -n "$available" ] && version_at_least "$available" "$required" || fail "optional Bun host requires GLIBC_$required; CLI remains static musl. Use Node on this installation."
+    fi
+  fi
+  for companion in codewhale-extension-host codewhale-extension-host.LICENSES.txt codewhale-extension-host.relink-source.tar.gz codewhale-extension-host.release.json; do
+    mode=644
+    [ "$companion" != codewhale-extension-host ] || mode=755
+    check_destination "$install_dir/$companion" "$tmpdir/$companion" "$mode"
+  done
+fi
+
 check_destination "$install_dir/codewhale" "$tmpdir/codewhale"
 check_destination "$install_dir/codew" "$tmpdir/codew"
 legacy_tui="$install_dir/codewhale-tui"
@@ -297,17 +327,16 @@ stage_dir=""
 # again, but only while each is still the exact file this run wrote, so a
 # failed install leaves no half-installed pair and never touches a file that
 # was already installed.
-published_codewhale=""
-published_codew=""
+published="$tmpdir/.published"
+: > "$published"
 rollback_published() {
-  if [ -n "$published_codewhale" ] && [ ! -L "$published_codewhale" ] && [ -f "$published_codewhale" ] && cmp -s "$tmpdir/codewhale" "$published_codewhale"; then
-    rm -f "$published_codewhale"
-    say "Removed $published_codewhale: this install did not complete." >&2
-  fi
-  if [ -n "$published_codew" ] && [ ! -L "$published_codew" ] && [ -f "$published_codew" ] && cmp -s "$tmpdir/codew" "$published_codew"; then
-    rm -f "$published_codew"
-    say "Removed $published_codew: this install did not complete." >&2
-  fi
+  while IFS= read -r name; do
+    destination="$install_dir/$name"
+    if [ ! -L "$destination" ] && [ -f "$destination" ] && cmp -s "$tmpdir/$name" "$destination"; then
+      rm -f "$destination"
+      say "Removed $destination: this install did not complete." >&2
+    fi
+  done < "$published"
 }
 on_exit() {
   status=$?
@@ -324,7 +353,7 @@ install_binary() {
   destination="$2"
   # Recheck immediately before publication. Never replace a file another
   # process created since preflight: linking the staged inode is no-clobber.
-  check_destination "$destination" "$source"
+  check_destination "$destination" "$source" "${3:-755}"
   if [ "$destination_exists" -eq 1 ]; then
     say "Already installed: $destination"
     return
@@ -332,15 +361,12 @@ install_binary() {
   stage_dir="$(mktemp -d "$install_dir/.codewhale-install.XXXXXX")"
   stage="$stage_dir/$(basename "$destination")"
   cp "$source" "$stage"
-  chmod 755 "$stage"
+  chmod "${3:-755}" "$stage"
   # Pass the intended parent as the directory operand. Passing destination
   # itself would make ln treat a raced-in directory/symlink as a container.
   ln "$stage" "$install_dir/" || fail "destination appeared during install: $destination; it was not replaced"
   [ ! -L "$destination" ] && [ -f "$destination" ] && cmp -s "$stage" "$destination" || fail "installed path changed during publication: $destination"
-  case "$destination" in
-    */codewhale) published_codewhale="$destination" ;;
-    */codew) published_codew="$destination" ;;
-  esac
+  basename "$destination" >> "$published"
   rm -f "$stage"
   rmdir "$stage_dir"
   stage=""
@@ -349,6 +375,13 @@ install_binary() {
 
 install_binary "$tmpdir/codewhale" "$install_dir/codewhale"
 install_binary "$tmpdir/codew" "$install_dir/codew"
+if [ "${CODEWHALE_INSTALL_COMPILED_HOST:-}" = 1 ]; then
+  install_binary "$tmpdir/codewhale-extension-host" "$install_dir/codewhale-extension-host"
+  for companion in codewhale-extension-host.LICENSES.txt codewhale-extension-host.relink-source.tar.gz codewhale-extension-host.release.json; do
+    install_binary "$tmpdir/$companion" "$install_dir/$companion" 644
+  done
+  say "Installed qualified opt-in image and its notice/relink-source closure; Node remains default."
+fi
 
 say "Installed checksummed release commands:"
 say "  $install_dir/codewhale"
@@ -427,7 +460,7 @@ if [ "$path_selected" -eq 0 ]; then
       ;;
   esac
   say "Verify: command -v codewhale codew"
-  say "PATH help: https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md#put-it-on-your-path"
+  say "PATH help: https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md#put-it-on-your-path"
 fi
 if ! command -v node >/dev/null 2>&1; then
   say "Computer Use is included and needs Node.js 20 or newer on PATH."

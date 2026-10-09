@@ -1,0 +1,5 @@
+- insert:
+  - id: author-row
+    name: ./modules/author.mjs
+    config:
+      text: initial text

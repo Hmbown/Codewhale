@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "skills-root",
+  "version": "0.1.0",
+  "description": "Test fixture: Native-reviewed disposable Skill roots reuse the existing catalog.",
+  "license": "MIT",
+  "extensions": { "net.codewhale": { "native": { "path": "index.mts" } } }
+}

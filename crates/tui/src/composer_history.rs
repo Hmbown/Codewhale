@@ -41,6 +41,12 @@ const HISTORY_FILE_NAME: &str = "composer_history.jsonl";
 const LEGACY_HISTORY_FILE_NAME: &str = "composer_history.txt";
 
 fn default_history_path() -> Option<PathBuf> {
+    // Submitting a prompt in a UI test appends to the history; an unsealed test
+    // must not write the developer's real `~/.codewhale/composer_history.jsonl`.
+    #[cfg(test)]
+    if let Some(home) = crate::test_support::unsealed_state_dir(".") {
+        return history_path_with_home(Some(home));
+    }
     history_path_with_home(crate::config::effective_home_dir())
 }
 

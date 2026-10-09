@@ -25,7 +25,7 @@ use crate::compaction::{
 use crate::config::Config;
 #[cfg(test)]
 use crate::context_budget::PressureLevel;
-use crate::prompts::{CORE_EXECUTION_PROFILE_PROMPT, Personality};
+use crate::prompts::CORE_EXECUTION_PROFILE_PROMPT;
 use crate::route_budget::route_context_window_tokens;
 use crate::tui::app::App;
 use codewhale_config::AppMode;
@@ -350,9 +350,20 @@ pub fn build_prompt_context(app: &App) -> PromptContext {
 
 pub fn build_headless_context_report(config: &Config, workspace: &Path) -> PromptSourceMap {
     let model = config.default_model();
-    let provider = config.api_provider();
-    let provider_identity = config.provider_identity_for(provider);
-    let route = crate::route_runtime::resolve_runtime_route(config, provider, Some(&model)).ok();
+    let identity = config.active_provider_identity().ok();
+    let provider = identity
+        .as_ref()
+        .map_or(crate::config::ProviderKind::Custom, |identity| {
+            identity.provider
+        });
+    let provider_identity = identity
+        .as_ref()
+        .map(|identity| identity.key.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let route = identity.as_ref().and_then(|identity| {
+        crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(&model))
+            .ok()
+    });
     // A route we could not resolve does not erase an operator-configured
     // window: doctor must report the same number the session would use.
     let context_window = route.as_ref().map_or_else(
@@ -361,8 +372,12 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
                 provider,
                 &model,
                 None,
-                config.context_window_for_provider_config(provider),
-                config.model_context_windows_for(provider),
+                identity
+                    .as_ref()
+                    .and_then(|identity| config.context_window_for_provider_config(identity)),
+                identity
+                    .as_ref()
+                    .and_then(|identity| config.model_context_windows_for(identity)),
             )
         },
         |route| route.context_window,
@@ -449,7 +464,7 @@ fn base_source_entries(
 ) -> ReportBuilder {
     let mut builder = ReportBuilder::new();
 
-    let constitution = crate::prompts::compose_default_static_layers(Personality::Calm, model);
+    let constitution = crate::prompts::compose_default_static_layers(model);
     builder.push(SourceEntry::text(
         SourceKind::Constitution,
         "Bundled constitution, language policy, and output policy",
@@ -734,9 +749,7 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
 }
 
 fn add_handoff_entry(builder: &mut ReportBuilder, workspace: &Path) {
-    let primary = workspace.join(crate::prompts::HANDOFF_RELATIVE_PATH);
-    let legacy = workspace.join(".deepseek/handoff.md");
-    let path = if primary.exists() { primary } else { legacy };
+    let (path, _) = crate::prompts::resolve_handoff_path(workspace);
     let Some(raw) = std::fs::read_to_string(&path)
         .ok()
         .filter(|raw| !raw.trim().is_empty())
@@ -867,16 +880,22 @@ fn pressure_label(percent: Option<f64>) -> &'static str {
 
 #[cfg(test)]
 pub fn format_context_report(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::format_context_report(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::format_context_report(&project_source_map(
+        report.clone(),
+    ))
 }
 
 #[cfg(test)]
 pub fn format_context_summary(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::format_context_summary(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::format_context_summary(&project_source_map(
+        report.clone(),
+    ))
 }
 
 pub fn context_report_json(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::context_report_json(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::context_report_json(&project_source_map(
+        report.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -885,7 +904,7 @@ mod pressure_fixture_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::route_runtime::{ContextWindowResolution, ContextWindowSource};
     use codewhale_config::route::RouteLimits;
     use codewhale_models::Role;
@@ -1049,6 +1068,7 @@ mod tests {
                 custom: std::collections::HashMap::from([(
                     "custom".to_string(),
                     crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
                         api_key: Some("test-private-key".to_string()),
                         base_url: Some("https://private.test/v1".to_string()),
                         model: Some("private-1m-deployment-v9".to_string()),
@@ -1336,7 +1356,7 @@ mod tests {
             output_tokens: None,
         };
         let resolved = crate::route_runtime::resolve_context_window(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-pro",
             Some(limits),
             None,

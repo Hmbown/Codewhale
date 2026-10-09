@@ -15,74 +15,15 @@ use serde::{Deserialize, Serialize};
 /// The exact `dsh` release this integration was verified against.
 pub(crate) const VERIFIED_DSH_VERSION: &str = "0.1.0-rc.6";
 
-/// Parsed `MAJOR.MINOR.PATCH[-rc.N]` version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct DshVersion {
-    pub(crate) major: u64,
-    pub(crate) minor: u64,
-    pub(crate) patch: u64,
-    /// `None` = a final release (sorts after every rc of the same base).
-    pub(crate) rc: Option<u64>,
-}
-
-impl DshVersion {
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        let raw = raw.trim().trim_start_matches('v');
-        let (base, pre) = match raw.split_once('-') {
-            Some((base, pre)) => (base, Some(pre)),
-            None => (raw, None),
-        };
-        let mut parts = base.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        let rc = match pre {
-            None => None,
-            Some(pre) => {
-                let n = pre.strip_prefix("rc.")?.parse().ok()?;
-                Some(n)
-            }
-        };
-        Some(Self {
-            major,
-            minor,
-            patch,
-            rc,
-        })
-    }
-
-    fn base(self) -> (u64, u64, u64) {
-        (self.major, self.minor, self.patch)
-    }
-
-    /// Prerelease ordering: any rc sorts *before* the final release of the
-    /// same base, so `Option<u64>` derives the wrong order and is compared
-    /// here explicitly.
-    fn cmp_semver(self, other: Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        match self.base().cmp(&other.base()) {
-            Ordering::Equal => match (self.rc, other.rc) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(&b),
-            },
-            ordering => ordering,
-        }
-    }
-}
-
-impl std::fmt::Display for DshVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
-        if let Some(rc) = self.rc {
-            write!(f, "-rc.{rc}")?;
-        }
-        Ok(())
-    }
+/// Parse the text `dsh --version` prints as a semver version.
+///
+/// DSH releases carry semver prerelease tags (`0.1.7-alpha.2`, `0.2.0-rc.1`,
+/// or a bare `0.1.0`), so this accepts any valid semver rather than a fixed
+/// suffix shape. A leading `v` is tolerated. Text that is not a version is
+/// `None`.
+pub(crate) fn parse_dsh_version(raw: &str) -> Option<semver::Version> {
+    let raw = raw.trim();
+    semver::Version::parse(raw.strip_prefix('v').unwrap_or(raw)).ok()
 }
 
 /// How the installed `dsh` relates to the verified release.
@@ -116,13 +57,15 @@ impl DshCompatibility {
 /// Classify a version string against [`VERIFIED_DSH_VERSION`] and whether the
 /// launcher advertises `--patch`.
 pub(crate) fn classify_version(raw: &str, supports_patch: bool) -> DshCompatibility {
-    let Some(version) = DshVersion::parse(raw) else {
+    let Some(version) = parse_dsh_version(raw) else {
         return DshCompatibility::Unparsed {
             raw: raw.trim().to_string(),
         };
     };
-    let verified = DshVersion::parse(VERIFIED_DSH_VERSION).expect("verified version parses");
-    match version.cmp_semver(verified) {
+    let verified = parse_dsh_version(VERIFIED_DSH_VERSION).expect("verified version parses");
+    // Semver precedence: prereleases sort before their release and
+    // alpha < beta < rc; build metadata is ignored.
+    match version.cmp_precedence(&verified) {
         std::cmp::Ordering::Less => DshCompatibility::Incompatible {
             reason: format!("{version} is older than the verified {verified}"),
         },

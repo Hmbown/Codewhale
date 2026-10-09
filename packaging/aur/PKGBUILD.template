@@ -8,15 +8,18 @@ pkgdesc='Provider-neutral coding agent for the terminal (prebuilt binary)'
 arch=('x86_64' 'aarch64')
 url='https://codewhale.net'
 license=('MIT')
+if [[ "${CODEWHALE_INSTALL_COMPILED_HOST:-}" == 1 ]]; then
+    license+=('custom:compiled-Bun-runtime')
+fi
 depends=('glibc' 'gcc-libs' 'dbus')
 provides=("codewhale=${pkgver}" 'codewhale-tui' 'deepseek' 'deepseek-tui')
 conflicts=('codewhale' 'codewhale-tui' 'deepseek' 'deepseek-tui' 'deepseek-tui-bin')
 replaces=('deepseek-tui-bin')
 options=('!strip')
 
-_release_url="https://github.com/Hmbown/CodeWhale/releases/download/v${pkgver}"
+_release_url="https://github.com/codewhale-hq/CodeWhale/releases/download/v${pkgver}"
 
-source=("LICENSE-${pkgver}::https://raw.githubusercontent.com/Hmbown/CodeWhale/v${pkgver}/LICENSE")
+source=("LICENSE-${pkgver}::https://raw.githubusercontent.com/codewhale-hq/CodeWhale/v${pkgver}/LICENSE")
 sha256sums=('@LICENSE_SHA256@')
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::${_release_url}/codewhale-linux-x64.tar.gz")
 sha256sums_x86_64=('@X86_64_SHA256@')
@@ -35,6 +38,20 @@ package() {
         "${pkgdir}/usr/bin/codewhale"
     install -Dm755 "${srcdir}/codewhale-linux-${release_arch}/codew" \
         "${pkgdir}/usr/bin/codew"
+    # Optional qualified image, not a default/runtime replacement. Existing
+    # package-manager ownership keeps these files outside Core self-update.
+    if [[ "${CODEWHALE_INSTALL_COMPILED_HOST:-}" == 1 ]]; then
+        local archive="${srcdir}/codewhale-linux-${release_arch}"
+        local file
+        for file in codewhale-extension-host codewhale-extension-host.LICENSES.txt codewhale-extension-host.relink-source.tar.gz codewhale-extension-host.release.json; do
+            [[ -f "${archive}/${file}" && ! -L "${archive}/${file}" ]] || { printf 'compiled host requested but qualified payload is absent: %s\n' "${file}" >&2; return 1; }
+        done
+        install -Dm755 "${archive}/codewhale-extension-host" "${pkgdir}/usr/bin/codewhale-extension-host"
+        install -Dm644 "${archive}/codewhale-extension-host.release.json" "${pkgdir}/usr/bin/codewhale-extension-host.release.json"
+        for file in codewhale-extension-host.LICENSES.txt codewhale-extension-host.relink-source.tar.gz; do
+            install -Dm644 "${archive}/${file}" "${pkgdir}/usr/share/licenses/${pkgname}/${file}"
+        done
+    fi
     ln -s codewhale "${pkgdir}/usr/bin/codewhale-tui"
     install -Dm644 "${srcdir}/LICENSE-${pkgver}" \
         "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"

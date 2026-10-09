@@ -15,7 +15,7 @@
 #![cfg(unix)]
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -216,7 +216,7 @@ fn preserve_host_env(command: &mut Command) {
 }
 
 fn exec_command(server: &MockServer, workspace: &Path, home: &Path) -> Command {
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace)
@@ -275,22 +275,6 @@ fn join_pipe(handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>, label: &
         .unwrap_or_else(|_| panic!("{label} reader thread panicked"))
         .unwrap_or_else(|error| panic!("{label} read failed: {error}"));
     String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }
 
 fn stream_events(stdout: &str) -> Vec<Value> {
@@ -354,7 +338,7 @@ async fn successful_exec_releases_persisted_service() {
 
     let mut child = exec_command(&server, workspace.path(), home.path())
         .spawn()
-        .expect("spawn codewhale-tui exec");
+        .expect("spawn codewhale exec");
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
     let status = child
@@ -415,7 +399,7 @@ async fn failed_exec_kills_pending_service_and_exits_nonzero() {
 
     let mut child = exec_command(&server, workspace.path(), home.path())
         .spawn()
-        .expect("spawn codewhale-tui exec");
+        .expect("spawn codewhale exec");
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 
@@ -497,7 +481,7 @@ async fn terminating_signal_kills_pending_service_and_exits_nonzero() {
 
     let mut child = exec_command(&server, workspace.path(), home.path())
         .spawn()
-        .expect("spawn codewhale-tui exec");
+        .expect("spawn codewhale exec");
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 

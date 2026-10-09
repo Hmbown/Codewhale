@@ -80,7 +80,7 @@ for (const kind of ["website", "archive"]) {
     if (kind === "website") {
       const downloads = fs.readFileSync(f.env.INSTALL_TEST_DOWNLOADS, "utf8").trim().split("\n");
       assert.equal(downloads.length, 3);
-      assert.ok(downloads.every(url => url.startsWith("https://github.com/Hmbown/CodeWhale/releases/download/v0.9.11/")));
+      assert.ok(downloads.every(url => url.startsWith("https://github.com/codewhale-hq/CodeWhale/releases/download/v0.9.11/")));
     }
     f.untouched();
   });
@@ -251,3 +251,52 @@ test("website: Termux never downloads a Linux binary", t => {
   assert.equal(fs.existsSync(path.join(f.destination, "codewhale")), false);
   f.untouched();
 });
+
+function addHostPayload(f) {
+  const payloads = {
+    'codewhale-extension-host': '#!/bin/sh\nexit 0\n',
+    'codewhale-extension-host.LICENSES.txt': 'offline runtime notice fixture\n',
+    'codewhale-extension-host.relink-source.tar.gz': 'offline relink fixture\n',
+    'codewhale-extension-host.release.json': '{"fixture":"already qualified by release producer"}\n',
+  };
+  let manifest = fs.readFileSync(path.join(f.assets, 'codewhale-artifacts-sha256.txt'), 'utf8');
+  for (const [name, content] of Object.entries(payloads)) {
+    fs.writeFileSync(path.join(f.archive, name), content, { mode: name === 'codewhale-extension-host' ? 0o755 : 0o644 });
+    const asset = name === 'codewhale-extension-host.release.json' ? 'codewhale-extension-hosts.json' : name.replace('codewhale-extension-host', 'codewhale-extension-host-macos-arm64').replace('.LICENSES.txt', '-LICENSES.txt').replace('.relink-source.tar.gz', '-relink-source.tar.gz');
+    fs.writeFileSync(path.join(f.assets, asset), content);
+    manifest += `${crypto.createHash('sha256').update(content).digest('hex')}  ${asset}\n`;
+  }
+  fs.writeFileSync(path.join(f.assets, 'codewhale-artifacts-sha256.txt'), manifest);
+  return payloads;
+}
+for (const kind of ['website', 'archive']) {
+  test(`${kind}: qualified companion presence stays inert until explicit installer choice`, t => {
+    const f = fixture(t, kind), payloads = addHostPayload(f);
+    f.env.CODEWHALE_INSTALL_COMPILED_HOST = '0';
+    assert.equal(f.run().status, 0);
+    assert.equal(fs.existsSync(path.join(f.destination, 'codewhale-extension-host')), false);
+    f.env.CODEWHALE_INSTALL_COMPILED_HOST = '1';
+    const result = f.run(); assert.equal(result.status, 0, result.stderr);
+    for (const [name, content] of Object.entries(payloads)) {
+      const file = path.join(f.destination, name);
+      assert.equal(fs.readFileSync(file, 'utf8'), content);
+      assert.equal(fs.statSync(file).mode & 0o777, name === 'codewhale-extension-host' ? 0o755 : 0o644);
+    }
+    f.untouched();
+  });
+  test(`${kind}: a conflicting companion prevents the first command publication`, t => {
+    const f = fixture(t, kind); addHostPayload(f); f.prepare(); f.env.CODEWHALE_INSTALL_COMPILED_HOST = '1';
+    const foreign = path.join(f.destination, 'codewhale-extension-host.LICENSES.txt'); fs.writeFileSync(foreign, 'foreign');
+    const result = f.run(); assert.notEqual(result.status, 0); assert.ok(result.stderr.includes(foreign), result.stderr);
+    assert.equal(fs.readFileSync(foreign, 'utf8'), 'foreign'); assert.equal(fs.existsSync(path.join(f.destination, 'codewhale')), false);
+    f.untouched();
+  });
+  test(`${kind}: late companion collision rolls back every new command and image`, t => {
+    const f = fixture(t, kind); addHostPayload(f); f.env.CODEWHALE_INSTALL_COMPILED_HOST = '1';
+    executable(path.join(f.bin, 'ln'), `#!/bin/sh\ncase "$(basename "$1")" in codewhale-extension-host.LICENSES.txt) printf 'another writer' > "$2codewhale-extension-host.LICENSES.txt" ;; esac\nexec /bin/ln "$@"\n`);
+    const result = f.run(); assert.notEqual(result.status, 0, result.stdout);
+    for (const name of ['codewhale', 'codew', 'codewhale-extension-host', 'codewhale-extension-host.release.json']) assert.equal(fs.existsSync(path.join(f.destination, name)), false, name);
+    assert.equal(fs.readFileSync(path.join(f.destination, 'codewhale-extension-host.LICENSES.txt'), 'utf8'), 'another writer');
+    f.untouched();
+  });
+}

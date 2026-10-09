@@ -1,10 +1,10 @@
-/* Generated from Codewhale GPUI design 1.1.1; sha256 c08d7d4b253afe340207658b1f233dd1a9dbe94fa57e925bde025a3db70543ee. Do not edit. */
+/* Generated from Codewhale GPUI design 1.1.2; sha256 433b18a41c526da0b5a1bbaa461c37feac987c7688fbe7de660acfbbdafa9bd5. Do not edit. */
 :root {
   --outside: #191a1c;
   --surface: #202123;
   --panel: #2a2b2e;
   --text: #efeeeb;
-  --muted: #b1b1ad;
+  --muted: #c2c1bd;
   --line: #3b3c3f;
   --accent: #90b9ff;
   --button: #90b9ff;
@@ -23,7 +23,7 @@
   --surface: #faf8f5;
   --panel: #ffffff;
   --text: #28292b;
-  --muted: #5f605d;
+  --muted: #535451;
   --line: #d9d5cf;
   --accent: #245bc7;
   --button: #245bc7;

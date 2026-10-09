@@ -1,116 +1,134 @@
 import type { HomeDict } from "../types";
 
-/**
- * Indonesian home dictionary — native copy for the Tidal Folio landing page,
- * in the current direction: your models, more capable together; agents
- * and control on your own machine; availability stated per surface as it
- * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
- * Auto-Review / Full Access, Codewhale, TUI, codewhale exec, Fleet).
- */
+/** Indonesian home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale — Bangun dan otomatisasikan dengan model pilihan Anda",
+  metaTitle: "Codewhale: berkarya dengan model dan alat pilihanmu",
   metaDescription:
-    "Bangun perangkat lunak, kelola berkas Anda, dan otomatisasikan tugas sehari-hari dengan agen sumber terbuka serta model AI yang dihosting atau dijalankan secara lokal sesuai pilihan Anda.",
-  heroTitle: "Bangun dan otomatisasikan dengan model pilihan Anda",
+    "Buat aplikasi, otomatisasikan alur kerja, dan gunakan alat terhubung dengan Codewhale. Sumber terbuka, dengan API model milikmu atau inferensi lokal dan mandiri.",
+  heroTitle: "Buat aplikasi dan otomatisasikan pekerjaanmu.",
   heroIntro:
-    "{brand} menyediakan agen yang dapat membangun perangkat lunak, mengelola berkas Anda, dan mengubah tugas berulang menjadi alur kerja yang dapat digunakan kembali. Sampaikan apa yang ingin Anda capai dan pilih model yang dihosting atau dijalankan secara lokal sesuai kebutuhan tugas, dengan kebebasan untuk berganti penyedia selama bekerja.",
-  getCodewhale: "Dapatkan Codewhale",
+    "{brand} adalah agen sumber terbuka yang menulis kode, menjalankan perintah, dan bekerja dengan alat yang kamu hubungkan. Gunakan API model yang sudah kamu pakai, atau jalankan model secara lokal dan di servermu sendiri.",
+  getCodewhale: "Instal Codewhale",
   heroInstallAria: "Perintah instalasi",
-  exploreProduct: "Jelajahi produk",
+  exploreProduct: "Jelajahi Codewhale",
   shotPreview: "Pratinjau terminal",
-  shotBuild: "build pengembangan v{version}",
   screenshotAlt:
-    "Build pengembangan Codewhale v{version}: tanda paus, sesi baru, kolom pesan, izin Ask, mode Work, dan status model. Dirender dari keluaran nyata terminal terisolasi.",
+    "Codewhale v{version}: tangkapan terminal berisi percakapan, kolom pesan, dan kontrol sesi.",
   latestRelease: "Rilis terbaru {tag}",
   releaseUnavailable: "Status rilis tidak tersedia",
   currentSource: "Sumber",
   sourceCandidate: "Belum dirilis",
   publishedRelease: "dirilis",
-  figcaptionSourceCandidate: "belum dirilis",
-  chapterTerminal: "Terminal Anda",
-  chapterTerminalTitle: "Mulai dengan sesuatu yang ingin Anda buat",
-  gainHeading:
-    "Yang dapat Anda lakukan dengan Codewhale",
+  gainHeading: "Yang bisa kamu lakukan",
   gainLede:
-    "Mulailah dengan proyek, pertanyaan, atau tugas yang ingin Anda otomatisasikan, lalu bekerja dengan satu agen atau bagi pekerjaan yang lebih besar ke beberapa agen.",
+    "Jelaskan apa yang ingin kamu buat atau otomatisasikan. Codewhale dapat mengedit berkas, menjalankan perintah, dan memeriksa hasilnya, dengan akses yang kamu kendalikan.",
   gain: [
     [
-      "Bangun sesuatu",
-      "Jelaskan apa yang ingin Anda buat dan bekerja dengan agen yang dapat membaca kode Anda, mengedit berkas, menjalankan perintah, dan memeriksa hasilnya."
+      "Buat aplikasi dan alat",
+      "Buat aplikasi, tambahkan fitur, atau tulis skrip. Codewhale dapat mengerjakan berkas proyek, menjalankan kode, dan menguji hasil yang dibuatnya."
     ],
     [
-      "Otomatisasikan pekerjaan sehari-hari",
-      "Buat skrip dan alur kerja untuk tugas yang sering Anda ulangi, sehingga Anda dapat menjalankannya lagi dari terminal kapan pun dibutuhkan."
+      "Otomatiskan pekerjaan berulang",
+      "Jalankan alur kerja dari terminal, skrip, atau CI. Untuk tugas yang lebih besar, delegasikan sebagian pekerjaan ke Fleet agen dengan model yang berbeda."
     ],
     [
-      "Bekerja dengan berbagai model",
-      "Gunakan model yang dihosting atau dijalankan secara lokal untuk agen Anda, dengan model dan peran yang berbeda menangani bagian pekerjaan yang sesuai."
+      "Hubungkan alat yang kamu pakai",
+      "Tambahkan alat melalui plugin dan server MCP, atau gunakan API dari skripmu sendiri. Setiap layanan memerlukan penyiapan dan autentikasi tersendiri."
     ]
   ],
   chapterModels: "Model Anda",
-  modelsHeading: "Pilihan model untuk setiap tugas",
+  modelsHeading: "Gunakan model pilihanmu",
   modelsBody:
-    "Hubungkan langsung ke penyedia model yang dihosting, gunakan gateway untuk mengakses beberapa penyedia, atau jalankan model secara lokal, lalu pilih model yang digunakan setiap sesi selama Anda bekerja.",
+    "Hubungkan akun penyedia, endpoint yang kompatibel dengan OpenAI, atau model lokal dan yang kamu host sendiri. Pilih model untuk sesi dan untuk setiap agen dalam Fleet.",
   modelsFacts: [
-    ["Hosted", "Kunci API Anda sendiri, disimpan dengan codewhale auth set --provider <id>"],
-    ["Gateway", "Satu endpoint untuk banyak model, penyedia tetap Anda yang pilih"],
-    ["Lokal", "vLLM, SGLang, Ollama di localhost — biasanya tanpa kunci"],
-  ],
-  modelsLink: "Jelajahi model dan penyedia",
-  startHeading: "Mulai menggunakan Codewhale",
-  startLede:
-    "Setelah menginstal Codewhale dan menghubungkan model, Anda dapat menjelaskan tugas pertama di terminal dan menambahkan Fleet saat ingin beberapa agen berbagi pekerjaan.",
-  startGuideLink: "Baca panduan memulai",
-  startVocabularyLink: "Lihat kosakata produk",
-  chapterAvailability: "Tempat menjalankan",
-  availabilityHeading:
-    "Tempat Anda dapat menggunakan Codewhale",
-  availabilityLede:
-    "Anda dapat menggunakan Codewhale di terminal sekarang, sementara kami mengembangkan aplikasi web, aplikasi desktop, dan komputer cloud.",
-  availability: [
     [
-      "Terminal",
-      "Dirilis",
-      "Biner rilis GitHub untuk Linux, macOS, dan Windows; npm dan Cargo tersedia sebagai alternatif. Android di Termux masih dalam tahap pratinjau."
+      "Akun API milikmu",
+      "Hubungkan OpenAI, Anthropic, Google, atau DeepSeek dengan kuncimu sendiri."
     ],
     [
-      "Aplikasi web",
+      "Gateway milikmu",
+      "Gunakan endpoint yang kompatibel dengan OpenAI dan pilih model yang disediakannya."
+    ],
+    [
+      "Inferensi milikmu",
+      "Jalankan model lokal atau yang dihosting sendiri dengan Ollama, vLLM, atau SGLang."
+    ]
+  ],
+  modelsLink: "Lihat model dan penyedia",
+  startHeading: "Mulai menggunakan",
+  startLede:
+    "Instal Codewhale, hubungkan model, dan buka folder proyek. Kamu bisa menambahkan plugin dan agen lain saat membutuhkannya.",
+  startGuideLink: "Ikuti panduan memulai",
+  startVocabularyLink: "Lihat kosakata produk",
+  chapterAvailability: "Tempat menjalankan",
+  availabilityHeading: "Tersedia sekarang dan sedang dikembangkan",
+  availabilityLede:
+    "Terminal dan klien peramban lokal sudah tersedia. Aplikasi desktop native dan aplikasi web yang dihosting sedang dikembangkan ulang.",
+  availability: [
+    [
+      "Terminal dan peramban lokal",
+      "Dirilis",
+      "Instal di Linux, macOS, atau Windows, lalu jalankan codewhale, atau codewhale web untuk klien peramban lokal. npm dan Cargo juga dapat digunakan; Android di Termux masih berupa pratinjau."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Tersedia",
+      "Proyek terpisah yang dipelihara oleh komunitas: obrolan, utas, dan perubahan berkas di sidebar VS Code di atas Codewhale Runtime yang sama. Pasang dari VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
+    ],
+    [
+      "Aplikasi web hosted",
       "Pratinjau pengembangan",
-      "Akses akun dan penautan peramban dalam pratinjau pengembangan."
+      "Sedang dibangun ulang agar sesuai dengan aplikasi desktop. Saat ini Anda dapat masuk, lalu mengetik /rc di sesi terminal yang sedang berjalan untuk melanjutkannya di web; eksekusi tugas hosted masih dalam kualifikasi."
     ],
     [
       "Desktop",
       "Build pengembangan",
-      "Aplikasi macOS masih dalam pengembangan; unduhan untuk publik akan tersedia nanti."
+      "Aplikasi native yang sedang menjadi klien utama Codewhale: folder, percakapan, dan koneksi model dalam satu jendela. Belum ada unduhan publik."
     ],
     [
       "Komputer cloud",
       "Dalam pengembangan",
-      "Komputer yang dihosting untuk menjalankan tugas Anda."
+      "Komputer yang dihosting yang menjalankan tugas Anda."
     ]
   ],
   availabilityNote:
-    "Anda dapat menggunakan terminal tanpa akun Codewhale, dan penggunaan model yang dihosting ditagih oleh penyedia Anda.",
+    "Terminal, peramban lokal, dan GUI tidak memerlukan akun Codewhale. Web hosted dan aplikasi desktop menggunakan akun. Jika Anda memakai kunci penyedia milik Anda sendiri, penyedia tersebut menagih penggunaan itu.",
   accountLink: "Buat akun",
-  surfacesHeading: "Cara bekerja dengan Codewhale",
+  surfacesHeading: "Bekerja dengan berkas dan alat",
   surfaces: [
-    ["TUI", "Kerja terminal interaktif"],
-    ["codewhale exec", "Skrip dan CI"],
-    ["Klien web lokal","Antarmuka localhost; ruang kerja peramban yang dihosting masih dalam pengembangan"],
-    ["Runtime API + MCP", "Integrasi lokal"],
-    ["Fleet","Beberapa agen mengerjakan satu tugas"],
+    [
+      "Berkas dan terminal",
+      "Buat berkas, jalankan perintah, periksa data, dan uji hasilmu. Kamu menentukan folder kerja dan izin."
+    ],
+    [
+      "Plugin dan aplikasi terhubung",
+      "Tambahkan keterampilan dan alat melalui plugin dan MCP. Tinjau dan aktifkan koneksi yang boleh digunakan agen."
+    ],
+    [
+      "Peramban dan komputer · pratinjau",
+      "Gunakan alat peramban dan plugin Computer Use untuk bekerja di aplikasi dan situs dengan akses yang kamu berikan."
+    ],
+    [
+      "Sesi yang bisa dilanjutkan",
+      "Simpan percakapan, hasil alat, dan riwayat kerja bersama. Lanjutkan tugas di terminal atau klien peramban lokal."
+    ],
+    [
+      "Tim agen",
+      "Gunakan Fleet untuk membagi pekerjaan besar ke agen dengan peran dan model berbeda, lalu ikuti kemajuannya di satu tempat."
+    ]
   ],
-  runtimeLink: "Jelajahi integrasi",
-  installBandHeading: "Instal Codewhale di macOS atau Linux",
+  runtimeLink: "Jelajahi alat dan integrasi",
+  installBandHeading: "Instal di macOS atau Linux",
   copy: "Salin",
   copied: "Tersalin ✓",
   binaries: "Biner",
   chinaMirrors: "Mirror Tiongkok",
   installGuideLink: "Baca panduan instalasi",
-  communityHeading: "Bantu membuat Codewhale lebih baik",
+  communityHeading: "Berkontribusi pada Codewhale",
   communityBody:
-    "Baik Anda menemukan bug, memiliki ide untuk fitur, maupun ingin mengirim pull request pertama, kami ingin mendengar dari Anda dan bekerja sama menentukan langkah berikutnya.",
+    "Laporkan bug, perbaiki dokumentasi, atau sumbangkan kode di GitHub. Kamu juga bisa membuat plugin dan berbagi alur kerja dengan pengguna lain.",
   communityLinksAria: "Tautan komunitas",
-  contribute: "Kirim pull request",
+  contribute: "Berkontribusi di GitHub",
 };
