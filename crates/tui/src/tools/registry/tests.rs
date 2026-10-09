@@ -1399,7 +1399,10 @@ async fn fleet_authority_rejects_fim_edit_outside_its_write_scope() {
     std::fs::create_dir(tmp.path().join("docs")).expect("docs");
     std::fs::write(tmp.path().join("docs/outside.txt"), "before\nafter\n").expect("fixture");
     let registry = ToolRegistryBuilder::new()
-        .with_fim_tool(None, "fixture-model".to_string())
+        .with_tool(Arc::new(crate::tools::fim::FimEditTool::new(
+            None,
+            "fixture-model".to_string(),
+        )))
         .build(scoped_context(tmp.path()));
 
     let error = registry

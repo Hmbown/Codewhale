@@ -13,7 +13,7 @@
 #   id           Codewhale wire id (the seed key, sent on the wire)
 #   upstream_id  upstream id when it differs by more than letter case
 #   from         a sibling upstream provider to take the row from
-#   base_model   Codewhale's canonical join (upstream provider rows have none)
+#   base_model   legacy canonical join; must agree with upstream canonical_model_id
 #   curated      true for a row upstream does not list; data in [[curated]]
 # Exactly one model per provider is its `default`, matching the provider's
 # built-in DEFAULT_*_MODEL.

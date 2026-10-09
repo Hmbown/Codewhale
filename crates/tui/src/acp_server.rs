@@ -2426,8 +2426,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test(flavor = "current_thread")]
-    async fn acp_full_access_keeps_safety_floor_and_repo_law_without_permission_modal() -> Result<()>
-    {
+    async fn acp_full_access_keeps_repo_law_without_permission_modal() -> Result<()> {
         let mut config = fixture_config();
         config.approval_policy = Some("full-access".into());
         config.allow_shell = Some(true);
@@ -2439,11 +2438,11 @@ mod tests {
                     "write",
                     r#"{"path":"ordinary.txt","content":"allowed"}"#,
                 ),
-                // ACP reviews even foreground bash as Headless. Reuse the
-                // harmless Core catastrophic-command fixture: a regression
-                // can only overwrite this private sentinel.
+                // ACP reviews even foreground bash as Headless. Full Access
+                // skips the deterministic floor, so the harmless fixture
+                // writes its own sentinel instead of holding.
                 canned::tool_call_turn(
-                    "floor-held",
+                    "floor-run",
                     "bash",
                     r#"{"command":"echo \"rm -rf /\" > floor-sentinel.txt"}"#,
                 ),
@@ -2485,7 +2484,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(rig.workspace.join("floor-sentinel.txt"))?,
-            "guarded\n"
+            "rm -rf /\n"
         );
         assert!(!rig.workspace.join("CHANGELOG.md").exists());
         assert!(
@@ -2506,21 +2505,21 @@ mod tests {
                 .iter()
                 .filter(|status| **status == "in_progress")
                 .count(),
-            1
+            2
         );
         assert_eq!(
             statuses
                 .iter()
                 .filter(|status| **status == "completed")
                 .count(),
-            1
+            2
         );
         assert_eq!(
             statuses
                 .iter()
                 .filter(|status| **status == "failed")
                 .count(),
-            2
+            1
         );
         let requests = rig.mock.captured_requests();
         assert_eq!(requests.len(), 4, "no guardian or provider replay");
@@ -2535,12 +2534,7 @@ mod tests {
         let history = rig.history(&session).await;
         for (request, call, error, refusal_reason) in [
             (1, "ordinary-write", false, None),
-            (
-                2,
-                "floor-held",
-                true,
-                Some("destructive background/headless action requires durable review"),
-            ),
+            (2, "floor-run", false, None),
             (3, "law-held", true, Some("Release notes need human review")),
         ] {
             let results: Vec<_> = history

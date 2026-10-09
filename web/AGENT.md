@@ -106,8 +106,8 @@ One-time setup before the first `npm run deploy`:
    npx wrangler kv namespace create CURATED_KV
    npx wrangler kv namespace create NEXT_INC_CACHE_KV
    ```
-   Copy the returned `id` values and paste them into the matching
-   `wrangler.jsonc` bindings, replacing each `"REPLACE_WITH_KV_ID"`.
+   Copy the returned `id` values into the matching `CURATED_KV` and
+   `NEXT_INC_CACHE_KV` bindings in `cloudflare.config.ts`.
 
 2. **Set secrets:**
    ```bash
@@ -132,12 +132,12 @@ One-time setup before the first `npm run deploy`:
 
 To disable the community agent entirely:
 
-1. Remove all cron triggers from `wrangler.jsonc` except the original `0 */6 * * *` (curate).
+1. Remove all cron triggers from `cloudflare.config.ts` except the original `0 */6 * * *` (curate).
 2. Redeploy: `npm run deploy`.
 
 The curate cron (Today's Dispatch) continues working independently. Individual tasks remain callable manually for testing through `/api/cron?task=triage`, `/api/cron?task=pr-review`, etc.
 
-To disable a specific cron task, remove its cron expression from `wrangler.jsonc` and redeploy.
+To disable a specific cron task, remove its cron expression from `cloudflare.config.ts` and redeploy.
 
 ## Bilingual output
 

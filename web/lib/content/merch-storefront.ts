@@ -131,7 +131,7 @@ const text = {
   notReady: { en: "Samples before sales. Ordering is not open for this design yet; no payment will be taken.", zh: "先确认样品，再开售。此图案尚未开放订购，不会收取付款。" },
   checking: { en: "Checking ordering availability…", zh: "正在确认是否可订购……" },
   statusError: { en: "Ordering availability could not be checked. Please try again later.", zh: "暂时无法确认是否可订购，请稍后重试。" },
-  quoteError: { en: "We couldn't review delivery for this address. Check the details and try again.", zh: "无法确认此地址的配送价格，请检查信息后重试。" },
+  quoteError: { en: "Delivery could not be reviewed for this address. Check the details and try again.", zh: "无法确认此地址的配送价格，请检查信息后重试。" },
   routeUnavailable: { en: "This design and destination still need a print and delivery review.", zh: "此图案与目的地仍需完成印刷及配送确认。" },
   tryLater: { en: "Please wait a minute, then try again.", zh: "请稍等一分钟后重试。" },
   checkoutError: { en: "Payment could not be opened. Your order has not been placed. Try again or review delivery again.", zh: "无法打开付款页面，订单尚未提交。请重试或重新确认配送价格。" },

@@ -2205,6 +2205,8 @@ pub struct Config {
     #[serde(skip)]
     pub(crate) account_model_access:
         std::sync::Arc<parking_lot::RwLock<Option<AccountModelAccess>>>,
+    #[serde(skip)]
+    pub(crate) required_account_model_owner: Option<String>,
     /// Persisted exact-route declarations, separate from provider credentials.
     #[serde(
         default,
@@ -2593,6 +2595,13 @@ pub struct Config {
     #[serde(skip)]
     pub loaded_config_path: Option<PathBuf>,
 
+    /// Runtime-only receipt that a higher-precedence layer supplied `[network]`
+    /// — a managed overlay. The resolved policy is then not the user
+    /// document's to replace: a mid-session re-read of that document must not
+    /// widen what the higher layer set.
+    #[serde(skip)]
+    pub(crate) network_layer_is_managed: bool,
+
     /// A resolved startup snapshot never reads remembered route choices again.
     /// False means an explicit config/profile owns the route instead.
     #[serde(skip)]
@@ -2750,14 +2759,17 @@ pub struct AutoReviewRuleConfig {
 }
 
 impl AutoReviewConfig {
-    fn to_runtime_policy(&self) -> crate::tui::auto_review::AutoReviewPolicy {
-        crate::tui::auto_review::AutoReviewPolicy {
+    fn to_runtime_policy(&self) -> crate::core::authority::auto_review::AutoReviewPolicy {
+        crate::core::authority::auto_review::AutoReviewPolicy {
             allow_rules: self
                 .allow
                 .iter()
                 .enumerate()
                 .map(|(index, rule)| {
-                    rule.to_runtime_rule(index, crate::tui::auto_review::AutoReviewAction::Allow)
+                    rule.to_runtime_rule(
+                        index,
+                        crate::core::authority::auto_review::AutoReviewAction::Allow,
+                    )
                 })
                 .collect(),
             block_rules: self
@@ -2765,7 +2777,10 @@ impl AutoReviewConfig {
                 .iter()
                 .enumerate()
                 .map(|(index, rule)| {
-                    rule.to_runtime_rule(index, crate::tui::auto_review::AutoReviewAction::Block)
+                    rule.to_runtime_rule(
+                        index,
+                        crate::core::authority::auto_review::AutoReviewAction::Block,
+                    )
                 })
                 .collect(),
         }
@@ -2782,12 +2797,12 @@ impl AutoReviewRuleConfig {
     fn to_runtime_rule(
         &self,
         index: usize,
-        action: crate::tui::auto_review::AutoReviewAction,
-    ) -> crate::tui::auto_review::AutoReviewRule {
+        action: crate::core::authority::auto_review::AutoReviewAction,
+    ) -> crate::core::authority::auto_review::AutoReviewRule {
         let id_prefix = match action {
-            crate::tui::auto_review::AutoReviewAction::Allow => "allow",
-            crate::tui::auto_review::AutoReviewAction::Block => "block",
-            crate::tui::auto_review::AutoReviewAction::AskUser => "ask",
+            crate::core::authority::auto_review::AutoReviewAction::Allow => "allow",
+            crate::core::authority::auto_review::AutoReviewAction::Block => "block",
+            crate::core::authority::auto_review::AutoReviewAction::AskUser => "ask",
         };
         let id = self
             .id
@@ -2804,14 +2819,14 @@ impl AutoReviewRuleConfig {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("configured auto-review {id_prefix} rule"));
         let mut rule = match action {
-            crate::tui::auto_review::AutoReviewAction::Allow => {
-                crate::tui::auto_review::AutoReviewRule::allow(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::Allow => {
+                crate::core::authority::auto_review::AutoReviewRule::allow(id, reason)
             }
-            crate::tui::auto_review::AutoReviewAction::Block => {
-                crate::tui::auto_review::AutoReviewRule::block(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::Block => {
+                crate::core::authority::auto_review::AutoReviewRule::block(id, reason)
             }
-            crate::tui::auto_review::AutoReviewAction::AskUser => {
-                crate::tui::auto_review::AutoReviewRule::block(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::AskUser => {
+                crate::core::authority::auto_review::AutoReviewRule::block(id, reason)
             }
         };
 
@@ -2884,16 +2899,20 @@ fn validate_auto_review_rules(kind: &str, rules: &[AutoReviewRuleConfig]) -> Res
     Ok(())
 }
 
-fn parse_auto_review_action_kind(raw: &str) -> Option<crate::tui::auto_review::ToolActionKind> {
+fn parse_auto_review_action_kind(
+    raw: &str,
+) -> Option<crate::core::authority::auto_review::ToolActionKind> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "read" | "mcp_read" => Some(crate::tui::auto_review::ToolActionKind::Read),
-        "write" => Some(crate::tui::auto_review::ToolActionKind::Write),
-        "shell" => Some(crate::tui::auto_review::ToolActionKind::Shell),
+        "read" | "mcp_read" => Some(crate::core::authority::auto_review::ToolActionKind::Read),
+        "write" => Some(crate::core::authority::auto_review::ToolActionKind::Write),
+        "shell" => Some(crate::core::authority::auto_review::ToolActionKind::Shell),
         "external" | "network" | "git" | "mcp_action" | "browser" | "unknown" => {
-            Some(crate::tui::auto_review::ToolActionKind::External)
+            Some(crate::core::authority::auto_review::ToolActionKind::External)
         }
-        "publish" => Some(crate::tui::auto_review::ToolActionKind::Publish),
-        "destructive" | "secret" => Some(crate::tui::auto_review::ToolActionKind::Destructive),
+        "publish" => Some(crate::core::authority::auto_review::ToolActionKind::Publish),
+        "destructive" | "secret" => {
+            Some(crate::core::authority::auto_review::ToolActionKind::Destructive)
+        }
         _ => None,
     }
 }
@@ -3055,6 +3074,33 @@ impl NetworkPolicyToml {
             audit: self.audit,
         }
     }
+}
+
+/// Re-read the `[network]` table from a configuration document.
+///
+/// Deliberately narrower than [`Config::load`]: this runs on the tool-context
+/// build path, where re-applying the environment, managed, and credential
+/// layers would be both wasteful and wrong. Only the document's own table comes
+/// back — the same table `/network allow <host>` edits.
+///
+/// `None` means there is nothing usable to adopt: the document is missing,
+/// unreadable, unparseable, or carries no `[network]` table. Callers keep the
+/// policy they already hold, which is the conservative direction for an
+/// allow/deny gate.
+///
+/// Known limitation: `[profiles.<name>.network]` is not consulted. `/network`
+/// does not write it either, so a live session and the command agree on this
+/// base table.
+#[must_use]
+pub fn network_policy_from_document(path: &Path) -> Option<crate::network_policy::NetworkPolicy> {
+    #[derive(Deserialize)]
+    struct NetworkTable {
+        network: Option<NetworkPolicyToml>,
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    let parsed: NetworkTable = toml::from_str(&contents).ok()?;
+    parsed.network.map(NetworkPolicyToml::into_runtime)
 }
 
 /// `[lsp]` table — mirrors [`crate::lsp::LspConfig`]. Documented in
@@ -4286,7 +4332,7 @@ impl Config {
     }
 
     #[must_use]
-    pub fn auto_review_policy(&self) -> crate::tui::auto_review::AutoReviewPolicy {
+    pub fn auto_review_policy(&self) -> crate::core::authority::auto_review::AutoReviewPolicy {
         self.auto_review
             .as_ref()
             .map(AutoReviewConfig::to_runtime_policy)
@@ -6308,6 +6354,30 @@ impl Config {
                 && base_url_uses_local_host(&self.active_route_base_url()))
     }
 
+    pub(crate) fn bind_account_model_owner(&mut self, owner: &str) -> Result<()> {
+        anyhow::ensure!(
+            !owner.is_empty()
+                && owner.len() <= 240
+                && !owner.chars().any(|c| c.is_control() || c.is_whitespace()),
+            "Invalid account model owner"
+        );
+        let access = self
+            .account_model_access
+            .read()
+            .clone()
+            .context("Connect account model access before running the Codewhale agent")?;
+        self.account_model_access = std::sync::Arc::new(parking_lot::RwLock::new(Some(access)));
+        self.required_account_model_owner = Some(owner.to_string());
+        let identity = self
+            .resolve_persisted_provider_identity(Some("codewhale"), Some("codewhale"))
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            self.account_model_api_key(&identity).is_some(),
+            "Codewhale agent model access must belong to the signed-in account"
+        );
+        Ok(())
+    }
+
     pub(crate) fn account_model_api_key(&self, identity: &ProviderIdentity) -> Option<String> {
         let provider = identity.provider;
         // Exact endpoint binding, including path. A custom Codewhale route
@@ -6336,7 +6406,11 @@ impl Config {
         .runtime_info_at(chrono::Utc::now())
         .ok()?;
         (account.state == codewhale_secrets::account::AccountSessionState::Authenticated
-            && account.session_id.as_deref() == Some(access.session_id.as_str()))
+            && account.session_id.as_deref() == Some(access.session_id.as_str())
+            && self
+                .required_account_model_owner
+                .as_ref()
+                .is_none_or(|owner| account.account_id.as_ref() == Some(owner)))
         .then(|| access.credential.expose_secret().to_string())
     }
 
@@ -6347,6 +6421,9 @@ impl Config {
         &self,
         identity: &ProviderIdentity,
     ) -> Option<crate::route_receipt::CredentialGeneration> {
+        if self.required_account_model_owner.is_some() {
+            return None;
+        }
         self.verify_provider_identity(identity).ok()?;
         let mut scoped = self.clone();
         scoped.scope_to_provider_identity(identity).ok()?;
@@ -6503,6 +6580,12 @@ impl Config {
             .map_err(anyhow::Error::msg)?;
 
         let mut diagnostic = self.clone();
+        if identity.provider == ProviderKind::Anthropic
+            && self.auth_mode_for_provider(&identity).as_deref() == Some("oauth")
+        {
+            diagnostic.plugin_oauth_read_only = true;
+            return Ok(diagnostic);
+        }
         if identity.provider == ProviderKind::Custom
             && self
                 .provider_config_for(&identity)
@@ -6525,6 +6608,11 @@ impl Config {
             .map_err(anyhow::Error::msg)?;
         self.verify_provider_identity(&identity)
             .map_err(anyhow::Error::msg)?;
+        if self.required_account_model_owner.is_some() {
+            return self.account_model_api_key(&identity)
+                .map(|key| (key, "Codewhale account".to_string()))
+                .context("The selected account model access is unavailable; no credential fallback is allowed");
+        }
         let provider = identity.provider;
         let keyless = || (String::new(), "none (keyless route)".to_string());
 
@@ -6557,6 +6645,26 @@ impl Config {
 
         if auth_mode_disables_api_key(auth_mode.as_deref()) {
             return Ok(keyless());
+        }
+        if provider == ProviderKind::Anthropic && auth_mode.as_deref() == Some("oauth") {
+            anyhow::ensure!(
+                matches!(
+                    self.base_url_for_route(&identity).trim_end_matches('/'),
+                    "https://api.anthropic.com" | "https://api.anthropic.com/v1"
+                ),
+                "Claude subscription credentials require the native Anthropic endpoint"
+            );
+            if read_only {
+                return Ok((
+                    crate::oauth::get_owned_credentials_read_only(
+                        crate::oauth::OAuthProvider::Claude,
+                        self,
+                    )?
+                    .access_token,
+                    "Claude sign-in".to_string(),
+                ));
+            }
+            return Ok((String::new(), "Claude sign-in".to_string()));
         }
         let custom_endpoint = self.provider_uses_custom_endpoint(&identity);
         let explicit_cli_key = explicit_cli_api_key_override();
@@ -7998,13 +8106,28 @@ fn root_deepseek_model_is_foreign_to_direct_provider(provider: ProviderKind, mod
 // the workspace-trust/config-load logic that stays in this file (#3311).
 mod home;
 mod paths;
+#[cfg(test)]
+pub(crate) use paths::clipboard_images_dir_for_home;
 use paths::{
     canonicalize_or_keep, codewhale_home_dir, default_config_path, default_managed_config_path,
     default_mcp_config_path, default_memory_path, default_notes_path, default_requirements_path,
     default_skills_dir, env_config_path, expand_pathbuf, try_default_config_path,
     workspace_config_key,
 };
-pub(crate) use paths::{effective_home_dir, expand_path, home_config_path, is_home_config_path};
+pub(crate) use paths::{
+    clipboard_images_dir, effective_home_dir, expand_path, home_config_path, is_home_config_path,
+};
+
+/// Activate facts only at accepted inference runtime settings boundaries.
+/// Identical settings preserve the shared ticket; readers track its generation.
+pub(crate) fn initialize_cloud_facts(config: &Config) {
+    let settings = config.cloud_facts_config().settings();
+    codewhale_cloud_facts::configure(&settings);
+    codewhale_cloud_facts::maybe_load_persisted_cache(&settings);
+    if tokio::runtime::Handle::try_current().is_ok() {
+        codewhale_cloud_facts::spawn_background_refresh(settings, None);
+    }
+}
 
 pub(crate) fn workspace_trust_config_candidate_paths() -> Vec<PathBuf> {
     #[cfg(test)]
@@ -10443,6 +10566,8 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         notifications: override_cfg.notifications.or(base.notifications),
         approval: override_cfg.approval.or(base.approval),
         network: override_cfg.network.or(base.network),
+        network_layer_is_managed: override_cfg.network_layer_is_managed
+            || base.network_layer_is_managed,
         verifier: override_cfg.verifier.or(base.verifier),
         advisor: override_cfg.advisor.or(base.advisor),
         skills: merge_skills_config(base.skills, override_cfg.skills),
@@ -10477,6 +10602,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         legacy_root: base.legacy_root,
         legacy_root_custom_generation: base.legacy_root_custom_generation,
         account_model_access: base.account_model_access,
+        required_account_model_owner: base.required_account_model_owner,
         account_profile: override_cfg.account_profile.or(base.account_profile),
         plugin_oauth_read_only: base.plugin_oauth_read_only || override_cfg.plugin_oauth_read_only,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
@@ -10967,6 +11093,12 @@ fn apply_managed_overrides(config: &mut Config) -> Result<()> {
             merged.provider_config_for_mut(&owner)?.base_url = None;
         }
         merged.base_url_env_receipt = BaseUrlEnvReceipt::NoOwner;
+    }
+    // A managed `[network]` table outranks the user document. Record that the
+    // resolved policy is not the document's to replace, so a mid-session
+    // re-read of that document folds onto it instead of widening it.
+    if managed.network.is_some() {
+        merged.network_layer_is_managed = true;
     }
     *config = merged;
     Ok(())
@@ -11467,6 +11599,8 @@ fn provider_uses_oauth_credentials(config: &Config, identity: &ProviderIdentity)
     !auth_mode_disables_api_key(config.auth_mode_for_provider(identity).as_deref())
         && !config.provider_uses_custom_endpoint(identity)
         && (provider == ProviderKind::OpenaiCodex
+            || (provider == ProviderKind::Anthropic
+                && config.auth_mode_for_provider(identity).as_deref() == Some("oauth"))
             || (provider == ProviderKind::Moonshot
                 && config
                     .provider_config_for(identity)
@@ -11848,6 +11982,15 @@ pub(crate) fn save_api_key_for_identity(
             save_api_key_for_identity_unlocked(identity, route_config, api_key)
         });
     }
+    if identity.provider == ProviderKind::Anthropic {
+        return codewhale_config::with_xai_oauth_lifecycle_lock(|_| {
+            let saved = save_api_key_for_identity_unlocked(identity, route_config, api_key)?;
+            codewhale_config::clear_all_claude_oauth_credentials_locked().context(
+                "API-key billing was selected and saved, but old Claude sign-in cleanup failed",
+            )?;
+            Ok(saved)
+        });
+    }
     save_api_key_for_identity_unlocked(identity, route_config, api_key)
 }
 
@@ -11938,7 +12081,7 @@ fn save_api_key_for_identity_unlocked(
                                     doc,
                                     &["providers", key_inside, "external_credentials"],
                                 )?;
-                                if provider == ProviderKind::Xai {
+                                if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
                                     crate::config_persistence::unset_document_value(
                                         doc,
                                         &["providers", key_inside, "oauth_credential_generation"],
@@ -12025,7 +12168,7 @@ fn save_api_key_for_identity_unlocked(
             doc,
             &["providers", key_inside, "external_credentials"],
         )?;
-        if provider == ProviderKind::Xai {
+        if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
             crate::config_persistence::unset_document_value(
                 doc,
                 &["providers", key_inside, "oauth_credential_generation"],

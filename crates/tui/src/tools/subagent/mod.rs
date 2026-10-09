@@ -343,12 +343,13 @@ fn child_runtime_budget_context(
 ) -> String {
     let wall = match runtime.worker_profile.wall_deadline_ms {
         Some(deadline_ms) => {
-            let remaining =
-                crate::elapsed::format_elapsed_ms(deadline_ms.saturating_sub(epoch_millis_now()));
+            let remaining = codewhale_command_contract::elapsed::format_elapsed_ms(
+                deadline_ms.saturating_sub(epoch_millis_now()),
+            );
             match runtime.worker_profile.wall_time_secs {
                 Some(total_secs) => format!(
                     "task work stops about {remaining} from now (total run budget {}); model and tool time count against it",
-                    crate::elapsed::format_elapsed_secs(total_secs)
+                    codewhale_command_contract::elapsed::format_elapsed_secs(total_secs)
                 ),
                 None => format!("task work stops about {remaining} from now"),
             }
@@ -444,10 +445,10 @@ fn child_budget_pacing_notice(
             let remaining = deadline.saturating_duration_since(Instant::now());
             consumed.push(format!(
                 "wall clock: ~{} remains of ~{}",
-                crate::elapsed::format_elapsed_ms(
+                codewhale_command_contract::elapsed::format_elapsed_ms(
                     u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
                 ),
-                crate::elapsed::format_elapsed_ms(
+                codewhale_command_contract::elapsed::format_elapsed_ms(
                     u64::try_from(total.as_millis()).unwrap_or(u64::MAX)
                 ),
             ));
@@ -2939,7 +2940,7 @@ pub struct SubAgentRuntime {
     pub parent_mode: AppMode,
     /// The session's deterministic Auto-Review policy (configured allow/block
     /// rules plus the built-in safety floor), shared with every descendant.
-    pub auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
+    pub auto_review_policy: std::sync::Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
     /// Whether the host can answer an approval prompt for a child (an
     /// interactive TUI). Headless hosts keep the fail-closed denial.
     pub parent_can_prompt: bool,
@@ -3018,7 +3019,7 @@ impl SubAgentRuntime {
             todos: crate::tools::todo::new_shared_todo_list(),
             parent_mode: AppMode::Agent,
             auto_review_policy: std::sync::Arc::new(
-                crate::tui::auto_review::AutoReviewPolicy::default(),
+                crate::core::authority::auto_review::AutoReviewPolicy::default(),
             ),
             parent_can_prompt: false,
             approval_receipt_store: None,
@@ -3055,7 +3056,7 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_permission_posture(
         mut self,
-        auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
+        auto_review_policy: std::sync::Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
         parent_can_prompt: bool,
     ) -> Self {
         self.auto_review_policy = auto_review_policy;
@@ -8632,7 +8633,7 @@ impl SubAgentManager {
                 let elapsed = existing.started_at.elapsed();
                 let since = format!(
                     "{} ago",
-                    crate::elapsed::format_elapsed_secs(elapsed.as_secs())
+                    codewhale_command_contract::elapsed::format_elapsed_secs(elapsed.as_secs())
                 );
                 return Err(anyhow!(
                     "Sub-agent session name '{name}' is already in use by agent_id '{}' \

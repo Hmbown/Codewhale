@@ -60,7 +60,7 @@ pub fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: Prov
     let provider_config = store.config.providers.for_provider_mut(provider);
     provider_config.auth_mode = Some("api_key".to_string());
     provider_config.external_credentials = None;
-    if provider == ProviderKind::Xai {
+    if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
         provider_config.oauth_credential_generation = None;
     }
 }
@@ -91,6 +91,15 @@ pub fn set_provider_api_key(
     if provider == ProviderKind::Xai {
         return crate::with_xai_oauth_revocation_transaction(|| {
             set_provider_api_key_unlocked(store, secrets, provider, api_key)
+        });
+    }
+    if provider == ProviderKind::Anthropic {
+        return crate::with_xai_oauth_lifecycle_lock(|_| {
+            let saved = set_provider_api_key_unlocked(store, secrets, provider, api_key)?;
+            crate::clear_all_claude_oauth_credentials_locked().context(
+                "API-key billing was selected and saved, but old Claude sign-in cleanup failed",
+            )?;
+            Ok(saved)
         });
     }
     set_provider_api_key_unlocked(store, secrets, provider, api_key)

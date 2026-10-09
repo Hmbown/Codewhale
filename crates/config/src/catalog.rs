@@ -48,7 +48,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::models_dev::{ModelsDevCatalog, ModelsDevCost, ModelsDevLimit, ModelsDevModalities};
+use crate::models_dev::{
+    ModelsDevCatalog, ModelsDevCost, ModelsDevInterleaved, ModelsDevLimit, ModelsDevModalities,
+    ModelsDevModelTransport,
+};
 use crate::route::{ModelId, ProviderId, ProviderModelOffering, RouteLimits, WireModelId};
 
 pub mod configured;
@@ -132,6 +135,44 @@ pub struct CatalogOffering {
     /// Model family/series as exposed for this offering (e.g. `glm`, `deepseek`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
+    pub model_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_weights: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interleaved: Option<ModelsDevInterleaved>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ModelsDevModelTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_npm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmarks: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fact_sources: BTreeMap<String, CatalogSource>,
     /// Token limits for this offering, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<ModelsDevLimit>,
@@ -169,11 +210,232 @@ pub struct CatalogOffering {
     /// expose different effort vocabularies without lossy collapsing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_options: Vec<Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_options_present: bool,
     /// Where this row came from.
     pub source: CatalogSource,
 }
 
 impl CatalogOffering {
+    #[must_use]
+    pub fn fact_source(&self, field: &str) -> &CatalogSource {
+        match field {
+            "cost" => self.pricing_source(),
+            "modalities" => self.modalities_source(),
+            _ => self.fact_sources.get(field).unwrap_or(&self.source),
+        }
+    }
+
+    pub fn retain_fact_sources(&mut self) {
+        macro_rules! retain {
+            ($field:ident) => {
+                if self.$field.is_some() {
+                    self.fact_sources
+                        .entry(stringify!($field).to_string())
+                        .or_insert_with(|| self.source.clone());
+                }
+            };
+        }
+        retain!(canonical_model);
+        retain!(family);
+        retain!(name);
+        retain!(description);
+        retain!(model_type);
+        retain!(knowledge);
+        retain!(release_date);
+        retain!(last_updated);
+        retain!(temperature);
+        retain!(open_weights);
+        retain!(interleaved);
+        retain!(transport);
+        retain!(provider_api);
+        retain!(provider_npm);
+        retain!(status);
+        retain!(experimental);
+        retain!(license);
+        retain!(links);
+        retain!(weights);
+        retain!(benchmarks);
+        retain!(attachment);
+        retain!(reasoning);
+        retain!(tool_call);
+        retain!(structured_output);
+        if let Some(limit) = &self.limit {
+            for (field, value) in [
+                ("limit.context", limit.context),
+                ("limit.input", limit.input),
+                ("limit.output", limit.output),
+            ] {
+                if value.is_some() {
+                    self.fact_sources
+                        .entry(field.to_string())
+                        .or_insert_with(|| self.source.clone());
+                }
+            }
+        }
+        if self.reasoning_options_present || !self.reasoning_options.is_empty() {
+            self.fact_sources
+                .entry("reasoning_options".to_string())
+                .or_insert_with(|| self.source.clone());
+        }
+    }
+
+    pub fn complete_from(&mut self, lower: &Self, base_url: Option<&str>) -> bool {
+        let normalize = |id: &str| {
+            crate::descriptors::compatibility_for_id(id)
+                .or_else(|| crate::descriptors::compatibility_for_selector(id))
+                .map(|provider| provider.catalog_id.to_string())
+                .unwrap_or_else(|| id.to_string())
+        };
+        if normalize(&self.provider) != normalize(&lower.provider)
+            || self.wire_model_id != lower.wire_model_id
+            || self.endpoint_key != lower.endpoint_key
+            || self
+                .canonical_model
+                .as_ref()
+                .zip(lower.canonical_model.as_ref())
+                .is_some_and(|(current, prior)| current != prior)
+            || matches!(
+                self.source,
+                CatalogSource::Bundled | CatalogSource::ModelsDevLive { .. }
+            )
+        {
+            return false;
+        }
+        let published_base = lower
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.api.as_deref())
+            .or(lower.provider_api.as_deref())
+            .or_else(|| {
+                crate::ProviderKind::parse(&lower.provider)
+                    .filter(|provider| *provider != crate::ProviderKind::Custom)
+                    .map(|provider| provider.provider().default_base_url())
+            });
+        match (&self.source, &lower.source) {
+            (
+                CatalogSource::Live {
+                    base_url_fingerprint: current,
+                    ..
+                },
+                CatalogSource::Live {
+                    base_url_fingerprint: prior,
+                    ..
+                },
+            ) if current == prior
+                && base_url.is_none_or(|url| base_url_fingerprint(url) == *current) => {}
+            (
+                CatalogSource::Live {
+                    base_url_fingerprint: current,
+                    ..
+                },
+                CatalogSource::Bundled
+                | CatalogSource::ModelsDevLive { .. }
+                | CatalogSource::CloudFacts { .. }
+                | CatalogSource::CodewhaleBundled { .. },
+            ) if published_base.is_some_and(|url| base_url_fingerprint(url) == *current)
+                && base_url.is_none_or(|url| base_url_fingerprint(url) == *current) => {}
+            (
+                CatalogSource::ConfigOverride | CatalogSource::UserOverride,
+                CatalogSource::Bundled
+                | CatalogSource::ModelsDevLive { .. }
+                | CatalogSource::CloudFacts { .. }
+                | CatalogSource::CodewhaleBundled { .. },
+            ) if base_url
+                .zip(published_base)
+                .is_some_and(|(current, prior)| {
+                    base_url_fingerprint(current) == base_url_fingerprint(prior)
+                }) => {}
+            _ => return false,
+        }
+        self.complete_facts_from(lower)
+    }
+
+    pub(crate) fn complete_facts_from(&mut self, lower: &Self) -> bool {
+        let mut changed = false;
+        macro_rules! fill {
+            ($field:ident) => {
+                if self.$field.is_none() && lower.$field.is_some() {
+                    self.$field.clone_from(&lower.$field);
+                    self.fact_sources.insert(
+                        stringify!($field).to_string(),
+                        lower.fact_source(stringify!($field)).clone(),
+                    );
+                    changed = true;
+                }
+            };
+        }
+        fill!(canonical_model);
+        fill!(family);
+        fill!(name);
+        fill!(description);
+        fill!(model_type);
+        fill!(knowledge);
+        fill!(release_date);
+        fill!(last_updated);
+        fill!(temperature);
+        fill!(open_weights);
+        fill!(interleaved);
+        fill!(transport);
+        fill!(provider_api);
+        fill!(provider_npm);
+        fill!(status);
+        fill!(experimental);
+        fill!(license);
+        fill!(links);
+        fill!(weights);
+        fill!(benchmarks);
+        fill!(attachment);
+        fill!(reasoning);
+        fill!(tool_call);
+        fill!(structured_output);
+        if let Some(lower_limit) = &lower.limit {
+            let mut limit = self.limit.clone().unwrap_or_default();
+            for (field, target, value) in [
+                ("limit.context", &mut limit.context, lower_limit.context),
+                ("limit.input", &mut limit.input, lower_limit.input),
+                ("limit.output", &mut limit.output, lower_limit.output),
+            ] {
+                if target.is_none() && value.is_some() {
+                    *target = value;
+                    self.fact_sources
+                        .insert(field.to_string(), lower.fact_source(field).clone());
+                    changed = true;
+                }
+            }
+            if self.limit.is_some() || limit != ModelsDevLimit::default() {
+                self.limit = Some(limit);
+            }
+        }
+        if self.cost.is_none()
+            && self.cost_source.is_none()
+            && (lower.cost.is_some() || lower.cost_source.is_some())
+        {
+            self.cost.clone_from(&lower.cost);
+            self.cost_source = Some(lower.pricing_source().clone());
+            changed = true;
+        }
+        if self.modalities.is_none() && lower.modalities.is_some() {
+            self.modalities.clone_from(&lower.modalities);
+            self.modalities_source = Some(lower.modalities_source().clone());
+            changed = true;
+        }
+        if !self.reasoning_options_present
+            && self.reasoning_options.is_empty()
+            && (lower.reasoning_options_present || !lower.reasoning_options.is_empty())
+            && self.reasoning != Some(false)
+        {
+            self.reasoning_options.clone_from(&lower.reasoning_options);
+            self.reasoning_options_present = true;
+            self.fact_sources.insert(
+                "reasoning_options".to_string(),
+                lower.fact_source("reasoning_options").clone(),
+            );
+            changed = true;
+        }
+        changed
+    }
+
     #[must_use]
     pub fn pricing_source(&self) -> &CatalogSource {
         self.cost_source.as_ref().unwrap_or(&self.source)
@@ -314,7 +576,7 @@ pub fn bundled_catalog_offerings() -> Vec<CatalogOffering> {
 /// catalog but are excluded from route candidates, matching
 /// [`ModelsDevCatalog::provider_offerings`]). Each row is tagged
 /// [`CatalogSource::Bundled`]. Provider rows link canonical models only through
-/// an explicit `base_model`. Namespaced entries in the canonical `models` map
+/// an explicit `canonical_model_id` or legacy `base_model`. Namespaced entries in the canonical `models` map
 /// fill missing offerings, retaining their map key as the canonical identity.
 ///
 /// Provider-row ids are kept verbatim from the Models.dev payload (the
@@ -426,10 +688,24 @@ fn offerings_from_models_dev(
             out.push(CatalogOffering {
                 provider: provider_id.clone(),
                 wire_model_id: wire_model_id.to_string(),
-                canonical_model: model.base_model.clone(),
+                canonical_model: model.canonical_id().map(str::to_string),
                 endpoint_key: endpoint_key.to_string(),
                 default_for_provider: model.default_for_provider,
                 family: model.family.clone(),
+                name: model.name.clone(),
+                description: model.description.clone(),
+                model_type: model.model_type.clone(),
+                knowledge: model.knowledge.clone(),
+                release_date: model.release_date.clone(),
+                last_updated: model.last_updated.clone(),
+                temperature: model.temperature,
+                open_weights: model.open_weights,
+                interleaved: model.interleaved.clone(),
+                transport: model.provider.clone(),
+                provider_api: provider.api.clone(),
+                provider_npm: provider.npm.clone(),
+                status: model.status.clone(),
+                experimental: model.experimental.clone(),
                 limit: model.limit.clone(),
                 cost: model.cost.clone(),
                 modalities: model.modalities.clone(),
@@ -437,10 +713,12 @@ fn offerings_from_models_dev(
                 reasoning: model.reasoning,
                 tool_call: model.tool_call,
                 structured_output: model.structured_output,
-                reasoning_options: model.reasoning_options.clone(),
+                reasoning_options: model.reasoning_options.clone().unwrap_or_default(),
+                reasoning_options_present: model.reasoning_options.is_some(),
                 source: source.clone(),
                 cost_source: None,
                 modalities_source: None,
+                ..Default::default()
             });
         }
     }
@@ -474,6 +752,18 @@ fn offerings_from_models_dev(
             canonical_model: Some(canonical_id.trim().to_string()),
             endpoint_key: "chat".to_string(),
             family: model.family.clone(),
+            name: model.name.clone(),
+            description: model.description.clone(),
+            model_type: model.model_type.clone(),
+            knowledge: model.knowledge.clone(),
+            release_date: model.release_date.clone(),
+            last_updated: model.last_updated.clone(),
+            temperature: model.temperature,
+            open_weights: model.open_weights,
+            license: model.license.clone(),
+            links: model.links.clone(),
+            weights: model.weights.clone(),
+            benchmarks: model.benchmarks.clone(),
             limit: model.limit.clone(),
             modalities: model.modalities.clone(),
             attachment: model.attachment,
@@ -921,12 +1211,15 @@ impl CatalogCompiler {
         if let Some((facts, fetched_at)) = self.cloud_facts {
             crate::cloud_facts::catalog_patch::apply_model_patches(&mut merged, &facts, fetched_at);
         }
-        for row in self
+        for mut row in self
             .provider_live
             .into_iter()
             .chain(self.config)
             .chain(self.overrides)
         {
+            if let Some(lower) = merged.get(&row.merge_key()) {
+                row.complete_from(lower, None);
+            }
             merged.insert(row.merge_key(), row);
         }
         let offerings = merged

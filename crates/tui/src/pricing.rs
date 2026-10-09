@@ -1741,7 +1741,7 @@ fn verified_catalog_offering(
     recorded_at: DateTime<Utc>,
     allow_cloud_catalog: bool,
 ) -> VerifiedOffering {
-    let Some(offering) = crate::provider_lake::catalog_offering_for_model_identity(
+    let Some(mut offering) = crate::provider_lake::catalog_offering_for_model_identity(
         provider,
         provider_identity,
         catalog_model,
@@ -1784,24 +1784,18 @@ fn verified_catalog_offering(
             .map(VerifiedOffering::Usable)
             .unwrap_or(VerifiedOffering::Absent);
     }
-    // Models.dev is a capabilities catalog. A live overlay from that fetch
-    // must never be treated as a rate source — leftover `cost` fields are
-    // not provider prices, and `https://api.codewhale.net/session` 503
-    // (`control_plane_not_attached`) is not a healthy live price list
-    // (#5241). Prefer the bundled snapshot (curated in-repo rates, when
-    // present) and otherwise ignore live cost so hand/bundled fallbacks
-    // can restore a usable session total.
-    if matches!(
-        offering.pricing_source(),
-        codewhale_config::catalog::CatalogSource::ModelsDevLive { .. }
-    ) || (!cloud_price
-        && crate::provider_lake::live_catalog_origin(provider, catalog_model)
-            == Some(crate::provider_lake::LiveSource::ModelsDev))
-    {
-        let offering =
-            crate::provider_lake::bundled_catalog_offering_for_model(provider, catalog_model)
-                .unwrap_or_else(|| capabilities_only_offering(offering));
-        return VerifiedOffering::Usable(offering);
+    let models_dev_live_fetched_at = match offering.pricing_source() {
+        codewhale_config::catalog::CatalogSource::Live { fetched_at, .. }
+            if crate::provider_lake::live_catalog_origin(provider, catalog_model)
+                == Some(crate::provider_lake::LiveSource::ModelsDev) =>
+        {
+            Some(*fetched_at)
+        }
+        _ => None,
+    };
+    if let Some(fetched_at) = models_dev_live_fetched_at {
+        offering.cost_source =
+            Some(codewhale_config::catalog::CatalogSource::ModelsDevLive { fetched_at });
     }
     let Some(pricing) = OfferingPricing::from_catalog_offering_at(
         &offering,
@@ -1833,15 +1827,6 @@ fn verified_catalog_offering(
         },
         None => VerifiedOffering::Unusable(defect),
     }
-}
-
-/// Drop any cost on a Models.dev live overlay so leftover price fields cannot
-/// be billed as `provider_live` (#5241).
-fn capabilities_only_offering(
-    mut offering: codewhale_config::catalog::CatalogOffering,
-) -> codewhale_config::catalog::CatalogOffering {
-    offering.cost = None;
-    offering
 }
 
 /// Project a hand-sourced provider row into an audit.
@@ -2675,6 +2660,7 @@ mod tests {
                 output: Some(30.0),
                 cache_read: Some(0.05),
                 cache_write: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4098,6 +4084,7 @@ mod tests {
                 output: Some(50.0),
                 cache_read: Some(1.0),
                 cache_write: Some(12.5),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -5063,28 +5050,28 @@ mod tests {
     #[test]
     fn format_cost_amount_precise_keeps_report_precision() {
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.1234,
                 codewhale_command_contract::types::CommandCurrency::Usd
             ),
             "$0.1234"
         );
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.1234,
                 codewhale_command_contract::types::CommandCurrency::Cny
             ),
             "¥0.1234"
         );
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.0,
                 codewhale_command_contract::types::CommandCurrency::Usd
             ),
             "$0.0000"
         );
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.00001,
                 codewhale_command_contract::types::CommandCurrency::Usd
             ),
@@ -5217,7 +5204,7 @@ mod tests {
     }
 
     #[test]
-    fn models_dev_live_cost_is_capabilities_only_and_falls_back_to_bundled_rates() {
+    fn models_dev_live_rates_price_the_published_estimate() {
         let _live = crate::provider_lake::lock_live_snapshot();
         crate::provider_lake::clear_live_snapshot();
         let now = Utc::now();
@@ -5233,6 +5220,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "models-dev-capabilities".to_string(),
@@ -5257,12 +5245,12 @@ mod tests {
             audit.unpriced_reason,
             Some(UnpricedReason::UnverifiedLivePricing)
         );
-        assert_eq!(audit.provenance, Some(PricingProvenance::ProviderDocs));
+        assert_eq!(audit.provenance, Some(PricingProvenance::ModelsDevBundled));
         assert_eq!(audit.live_pricing_defect, None);
         let estimate = audit.estimate.expect("priced");
         assert!(
-            (estimate.usd - 0.14).abs() < 1e-12,
-            "models.dev leftover cost must not be billed: {}",
+            (estimate.usd - 99.0).abs() < 1e-12,
+            "live models.dev input rate must price the estimate: {}",
             estimate.usd
         );
     }
@@ -5284,6 +5272,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "other-endpoint".to_string(),
@@ -5329,6 +5318,7 @@ mod tests {
                         output: Some(18.0),
                         cache_read: Some(1.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -5387,6 +5377,7 @@ mod tests {
                         output: Some(18.0),
                         cache_read: Some(1.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -5423,11 +5414,12 @@ mod tests {
 
     /// The fixture deliberately stamps `Live` rather than the `ModelsDevLive`
     /// the refresh now emits: this pins the *second*, independent check — the
-    /// live partition the row sits in — which is what still catches a row
-    /// mislabelled by an older publisher or a stale on-disk cache. Do not
-    /// "correct" the source here; that would delete this belt's only coverage.
+    /// live partition the row sits in — which is what decides the price basis
+    /// of a row mislabelled by an older publisher or a stale on-disk cache. Do
+    /// not "correct" the source here; that would delete this belt's only
+    /// coverage.
     #[test]
-    fn models_dev_live_overlay_does_not_replace_bundled_catalog_rates() {
+    fn models_dev_partition_live_rows_price_the_live_catalog_rate() {
         let _live = crate::provider_lake::lock_live_snapshot();
         crate::provider_lake::clear_live_snapshot();
         let now = Utc::now();
@@ -5443,6 +5435,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "models-dev-capabilities".to_string(),
@@ -5469,8 +5462,8 @@ mod tests {
         assert_eq!(audit.live_pricing_defect, None);
         let estimate = audit.estimate.expect("priced");
         assert!(
-            (estimate.usd - 0.05).abs() < 1e-12,
-            "bundled OpenAI rate must win over models.dev leftover cost: {}",
+            (estimate.usd - 0.99).abs() < 1e-12,
+            "the models.dev live rate must price the estimate: {}",
             estimate.usd
         );
     }
@@ -5525,6 +5518,7 @@ mod tests {
                         output: Some(1.5),
                         cache_read: None,
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),

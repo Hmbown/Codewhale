@@ -927,6 +927,7 @@ pub enum ViewEvent {
     },
     /// Emitted by provider/setup UI when xAI device-code OAuth is requested.
     ProviderPickerXaiOAuthRequested,
+    ProviderPickerClaudeOAuthRequested,
     /// Emitted by provider/setup UI when native ChatGPT PKCE sign-in is requested.
     ProviderPickerChatgptOAuthRequested,
     /// Emitted by provider/setup UI when OrcaRouter OAuth 2.0 + PKCE sign-in is

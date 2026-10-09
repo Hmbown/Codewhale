@@ -1057,10 +1057,10 @@ reason = "read_file is allowed"
     config.validate()?;
 
     let policy = config.auto_review_policy();
-    let shell_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+    let shell_context = crate::core::authority::auto_review::AutoReviewContext::from_tool_call(
         "exec_shell",
         &serde_json::json!({"command": "cargo test"}),
-        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::core::authority::auto_review::RunOrigin::Interactive,
         codewhale_execpolicy::ApprovalMode::Auto,
         true,
         None,
@@ -1068,14 +1068,14 @@ reason = "read_file is allowed"
     let shell_decision = policy.evaluate(&shell_context);
     assert_eq!(
         shell_decision.action,
-        crate::tui::auto_review::AutoReviewAction::Block
+        crate::core::authority::auto_review::AutoReviewAction::Block
     );
     assert_eq!(shell_decision.rule_id.as_deref(), Some("block-shell"));
 
-    let read_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+    let read_context = crate::core::authority::auto_review::AutoReviewContext::from_tool_call(
         "read_file",
         &serde_json::json!({"path": "README.md"}),
-        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::core::authority::auto_review::RunOrigin::Interactive,
         codewhale_execpolicy::ApprovalMode::Auto,
         true,
         None,
@@ -1083,7 +1083,7 @@ reason = "read_file is allowed"
     let read_decision = policy.evaluate(&read_context);
     assert_eq!(
         read_decision.action,
-        crate::tui::auto_review::AutoReviewAction::Allow
+        crate::core::authority::auto_review::AutoReviewAction::Allow
     );
     assert_eq!(read_decision.rule_id.as_deref(), Some("allow-read-file"));
 
@@ -1111,7 +1111,7 @@ fn auto_review_scenario() -> Result<()> {
         assert_eq!(policy.block_rules.len(), 1);
         assert_eq!(
             policy.block_rules[0].action_kind,
-            Some(crate::tui::auto_review::ToolActionKind::External)
+            Some(crate::core::authority::auto_review::ToolActionKind::External)
         );
     }
     // from auto_review_text_contains_fails_closed_instead_of_broadening_a_rule

@@ -601,6 +601,37 @@ fn run_world(
                         pose["style"][key] = json!(value);
                     }
                 }
+                let hollow = pose["style"]["hollow"].as_bool().unwrap_or(true);
+                let lit = pose["state"]["lit"]
+                    .as_f64()
+                    .unwrap_or(1.0)
+                    .clamp(0.18, 1.0);
+                let light = saved
+                    .appearance
+                    .background
+                    .iter()
+                    .map(|v| f64::from(*v))
+                    .sum::<f64>()
+                    > 510.0;
+                if let Some(materials) = pose["materials"].as_array_mut() {
+                    for material in materials {
+                        if let Some(channels) = material.as_array_mut().filter(|c| c.len() == 4) {
+                            for k in 0..3 {
+                                let value = if hollow {
+                                    [153., 176., 184.][k]
+                                } else if !saved.appearance.event_colors {
+                                    f64::from(saved.appearance.particle[k])
+                                } else {
+                                    channels[k].as_f64().unwrap_or(160.0)
+                                };
+                                channels[k] = json!(if light { value * 0.48 } else { value });
+                            }
+                            let alpha = channels[3].as_f64().unwrap_or(0.5);
+                            channels[3] =
+                                json!((alpha * saved.appearance.brightness * lit).clamp(0.0, 1.0));
+                        }
+                    }
+                }
                 pose["style"]["alpha"] = json!(
                     (pose["style"]["alpha"].as_f64().unwrap_or(0.5) * saved.appearance.brightness)
                         .clamp(0.0, 1.0)

@@ -916,6 +916,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-commands"
+version = "0.10.2"
+dependencies = [
+ "codewhale-command-contract",
+ "serde_json",
+]
+
+[[package]]
 name = "codewhale-config"
 version = "0.10.2"
 dependencies = [
@@ -1082,14 +1090,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codewhale-portable-debug-diagnostics"
-version = "0.10.2"
-dependencies = [
- "codewhale-command-contract",
- "serde_json",
-]
-
-[[package]]
 name = "codewhale-portable-session"
 version = "0.10.2"
 dependencies = [
@@ -1146,6 +1146,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "chrono",
+ "codewhale-command-contract",
  "codewhale-config",
  "codewhale-core",
  "codewhale-memory",
@@ -1261,6 +1262,7 @@ dependencies = [
  "codewhale-build-support",
  "codewhale-cloud-facts",
  "codewhale-command-contract",
+ "codewhale-commands",
  "codewhale-config",
  "codewhale-core",
  "codewhale-execpolicy",

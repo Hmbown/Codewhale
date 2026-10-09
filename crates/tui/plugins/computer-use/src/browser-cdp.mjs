@@ -91,7 +91,11 @@ export function findBrowserApp(platform = process.platform, env = process.env, e
   return null;
 }
 
-/** Launch detached so the browser is its own process, never a child we must reap. */
+/**
+ * Launch detached so the browser is its own process, never a child we must
+ * reap. Returns a handle that keeps the tail of its stderr and its exit, so a
+ * browser that dies at start can say why instead of timing out silently.
+ */
 function defaultLaunch({ app, profileDir, url, platform = process.platform }) {
   const flags = ["--remote-debugging-port=0", `--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check"];
   const target = url || "about:blank";
@@ -100,9 +104,30 @@ function defaultLaunch({ app, profileDir, url, platform = process.platform }) {
   // the person already has Chrome running — the args never reach a new process.
   if (platform === "darwin") { cmd = "open"; args = ["-g", "-n", "-a", app, "--args", ...flags, target]; }
   else { cmd = app; args = [...flags, target]; }
-  const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
-  child.on("error", () => {});
+  const child = spawn(cmd, args, { detached: true, stdio: ["ignore", "ignore", "pipe"] });
+  const handle = { stderr: "", exit: null };
+  child.stderr.on("data", (chunk) => { handle.stderr = (handle.stderr + chunk).slice(-4000); });
+  child.on("error", (error) => { handle.exit = { code: null, signal: null, error: error.message }; });
+  child.on("exit", (code, signal) => { handle.exit = { code, signal }; });
   child.unref();
+  return handle;
+}
+
+/**
+ * The error for a browser that did not produce a debugging endpoint. Chromium
+ * refuses to run as root without --no-sandbox; Codewhale does not add that
+ * flag, so that case names the two supported ways forward instead.
+ */
+export function browserStartFailure(handle, profileDir) {
+  const tail = handle?.stderr ?? "";
+  if (/Running as root without --no-sandbox/.test(tail)) {
+    return Object.assign(new ExecError("Chromium refused to start because it runs as root without its sandbox. Codewhale does not disable the sandbox. Run the Computer Use server as a non-root user, or set CODEWHALE_CU_BROWSER_APP to a launcher you control that supplies the flags you accept."), { code: "browser_unavailable" });
+  }
+  const exit = handle?.exit
+    ? `the browser exited before it opened its debugging endpoint (${handle.exit.error ?? `code ${handle.exit.code ?? "none"}${handle.exit.signal ? `, signal ${handle.exit.signal}` : ""}`})`
+    : "the browser started but its debugging endpoint never came up";
+  const detail = tail.trim().split("\n").slice(-2).join(" | ").slice(-300);
+  return Object.assign(new ExecError(`${exit} (profile ${profileDir})${detail ? `: ${detail}` : ""}`), { code: "browser_unavailable" });
 }
 
 /** The CDP bridge socket to attach to, or null for launch mode. */
@@ -459,7 +484,7 @@ export function createBrowser({
         else { try { fs.rmSync(portFile, { force: true }); } catch {} }
       }
       if (!ws) {
-        await launch({ app, profileDir: dir, url: "about:blank", platform });
+        const launched = await launch({ app, profileDir: dir, url: "about:blank", platform });
         const deadline = Date.now() + 20_000;
         for (;;) {
           if (currentSignal()?.aborted) throw Object.assign(new ExecError("computer request cancelled"), { code: "cancelled" });
@@ -468,7 +493,9 @@ export function createBrowser({
             ws = await attempt(file);
             if (ws) { state.port = file.port; break; }
           }
-          if (Date.now() > deadline) throw Object.assign(new ExecError(`the browser started but its debugging endpoint never came up (profile ${dir}); is it running with a usable profile?`), { code: "browser_unavailable" });
+          // A browser that already exited will not open the endpoint: report
+          // now, with its stderr, rather than after the full timeout.
+          if (launched?.exit || Date.now() > deadline) throw browserStartFailure(launched, dir);
           await sleep(300);
         }
       }

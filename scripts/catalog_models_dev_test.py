@@ -178,7 +178,7 @@ UPSTREAM_FIXTURE = {
                     "limit": {"context": 1048576, "output": 131072},
                     "cost": {"input": 3, "output": 15, "tiers": [{"input": 6}]},
                     "modalities": {"input": ["text", "image"], "output": ["text"]},
-                    "description": "not carried",
+                    "description": "public model description",
                     "client_secret": "sk-row-secret",
                 },
                 "glm-5.2": {"id": "glm-5.2", "reasoning": True},
@@ -254,13 +254,13 @@ class SeedGeneratorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         text = self.lock.read_text(encoding="utf-8")
         self.assertNotIn("sk-", text)
-        self.assertNotIn("description", text)
-        self.assertNotIn("tiers", text)
-        self.assertNotIn("benchmarks", text)
         lock = json.loads(text)
         expected = hashlib.sha256(self.upstream.read_bytes()).hexdigest()
         self.assertEqual(lock["source"]["sha256"], expected)
         rows = lock["providers"]["moonshotai"]
+        self.assertEqual(rows["kimi-k3"]["description"], "public model description")
+        self.assertEqual(rows["kimi-k3"]["cost"]["tiers"], [{"input": 6}])
+        self.assertEqual(lock["models"]["vendor/demo-pro"]["benchmarks"], [{"name": "x"}])
         # Case-insensitive match keeps upstream's id in the lock.
         self.assertIn("glm-5.2", rows)
         self.assertNotIn("kimi-new", rows, "only referenced rows are pinned")

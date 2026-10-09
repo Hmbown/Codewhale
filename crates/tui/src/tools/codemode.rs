@@ -761,6 +761,20 @@ impl CodemodeInvoker {
     /// session pool (same dispatcher as a direct call), everything else
     /// through its registry spec under the turn's authority envelope.
     async fn execute(&self, name: &str, input: Value) -> Result<RichToolResult, ToolError> {
+        let action_id = super::activity::action_id(name, &input);
+        let activity_kind = if McpPool::is_mcp_tool(name) {
+            if let Some(pool) = self.gate.as_ref().and_then(|gate| gate.mcp_pool.as_ref()) {
+                pool.lock()
+                    .await
+                    .resolved_tool_servers()
+                    .get(name)
+                    .map(|server| super::activity::mcp_activity_kind(server))
+            } else {
+                None
+            }
+        } else {
+            super::activity::registry_activity_kind(name, &input)
+        };
         let future: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<RichToolResult, ToolError>> + Send>,
         > = if McpPool::is_mcp_tool(name) {
@@ -797,11 +811,50 @@ impl CodemodeInvoker {
             };
             enforce_tool_authority(name, &input, spec.as_ref(), &self.context)?;
             let context = self.context.clone();
+            crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
+                .map_err(ToolError::not_available)?;
             Box::pin(async move {
                 crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
                     .map_err(ToolError::not_available)?;
                 spec.execute_rich(input, &context).await
             })
+        };
+        let tx = self.gate.as_ref().map(|gate| gate.tx_event.clone());
+        let cancel = self.context.cancel_token.clone();
+        let call_id = self
+            .context
+            .origin_tool_call_id
+            .clone()
+            .unwrap_or_else(|| self.spill_prefix.clone());
+        let future = async move {
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Err(ToolError::cancelled("Nested dispatch admission cancelled."));
+            }
+            let span = match (tx.as_ref(), activity_kind) {
+                (Some(tx), Some(kind)) => Some(
+                    crate::core::engine::tool_execution::OperationSpanGuard::start(
+                        tx,
+                        &call_id,
+                        kind,
+                        Some(action_id),
+                        cancel.clone(),
+                    )
+                    .await,
+                ),
+                _ => None,
+            };
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Err(ToolError::cancelled("Nested dispatch admission cancelled."));
+            }
+            let outcome = future.await;
+            if let Some(span) = span {
+                span.complete(super::activity::operation_outcome(
+                    &outcome,
+                    cancel.as_ref().is_some_and(CancellationToken::is_cancelled),
+                ))
+                .await;
+            }
+            outcome
         };
         match self.runtime.as_ref() {
             Some(runtime) => {

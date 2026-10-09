@@ -19,22 +19,23 @@ Implementation sources:
 
 ## Default-active contract
 
-New turns start with eleven eager native names plus synthetic `tool_search`:
+New turns start with twelve eager native names plus synthetic `tool_search`:
 
 1. `read`
 2. `write`
 3. `edit`
-4. `bash`
-5. `agent`
-6. `workflow`
-7. `todo_write`
-8. `create_goal`
-9. `get_goal`
-10. `update_goal`
-11. `load_skill`
-12. `tool_search` (synthetic, always active)
+4. `file_search`
+5. `bash`
+6. `agent`
+7. `workflow`
+8. `todo_write`
+9. `create_goal`
+10. `get_goal`
+11. `update_goal`
+12. `load_skill`
+13. `tool_search` (synthetic, always active)
 
-The eleven native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
+The twelve native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
 `crates/tui/src/core/engine/tool_catalog.rs`, pinned by
 `default_active_contract_keeps_discovery_and_core_tools_eager`. An authority
 boundary may remove `agent` at the maximum child depth, but route size alone
@@ -350,7 +351,7 @@ above must report `1 passed` (the ignored metrics test reports `1 passed`
 only because `--ignored` selects it); `0 passed` means the filter matched
 nothing and the check did not run.
 
-The provider-free receipt must report the eleven default-active names listed
+The provider-free receipt must report the twelve default-active names listed
 above. A separate repository-wide tool count may include deferred, dynamic,
 feature-gated, and compatibility-only registrations; it is not the number of
 tools placed in the first-turn model catalog.

@@ -1,38 +1,39 @@
 # Release Checklist
 
-A pre-tag checklist that the v0.8.21/v0.8.22 CHANGELOG gap proved we needed.
-Step through this in order from a clean worktree on the final release source.
-Treat any unchecked box as a release blocker.
+Follow this sequence from the canonical `/Volumes/VIXinSSD/CW/codewhale`
+checkout on `main`. Agent-owned preparation lands as verified slices on `main`;
+it requires no release branch, worktree, nested clone or preparation PR.
+Contributor PRs still land as PRs. Treat any unchecked required gate as a release
+blocker.
 
 For deeper context on the underlying tools (preflight scripts, npm smoke,
 publish-crates), see [`RELEASE_RUNBOOK.md`](RELEASE_RUNBOOK.md).
 For larger milestone releases, add any version-specific acceptance matrix to
-the release branch before tagging; use it for provider routes, feature gates,
-GUI/runtime smoke, remote-workbench decisions, and credit hygiene that the
-generic checklist does not enumerate.
+the existing release packet before tagging; use it for provider routes, feature
+gates, GUI/runtime smoke, remote-workbench decisions, and credit hygiene that the
+generic checklist does not enumerate. Record its candidate SHA, owners, local
+check results, hosted run URLs, artifact inventory, install/provider receipts,
+known limitations and publication approval. These proofs are separate.
 
-## 0. Release source is frozen
+## 0. Reconcile the canonical checkout
 
-- [ ] The live milestone and PR queue no longer contain work intended for this
-      version:
+- [ ] Inspect the branch, status, upstream and alternate checkouts before editing:
+      ```bash
+      git branch --show-current
+      git status --short --branch
+      git log -5 --oneline
+      git worktree list
+      git fetch origin main
+      git log --left-right --oneline main...origin/main
       ```
-      gh issue list --repo codewhale-hq/CodeWhale --milestone "vX.Y.Z" --state open
-      gh pr list --repo codewhale-hq/CodeWhale --state open --limit 100
-      ```
-- [ ] Any remaining same-theme work is explicitly retargeted to a later
-      version or called out as a known issue. Do not bump/tag while still
-      planning to merge more same-version fixes.
-- [ ] The release tag does not already point at an older source SHA, or the
-      maintainer has deliberately chosen to publish exactly that older SHA:
-      ```
-      git ls-remote origin refs/heads/main refs/tags/vX.Y.Z
-      gh release view vX.Y.Z --repo codewhale-hq/CodeWhale
-      ./scripts/release/check-published.sh X.Y.Z
-      ```
-- [ ] If `vX.Y.Z` exists with no GitHub Release/packages and `main` has moved
-      on, stop. Choose one of: publish the existing tag as-is, bump the later
-      work to the next patch version, or explicitly approve deleting/recreating
-      the unpublished tag. Do not silently move tags during PR cleanup.
+- [ ] The canonical checkout is on `main`. Recover stranded work only after
+      preserving dirty/untracked files and comparing commits with current
+      `origin/main`. Keep a recoverable backup and unresolved inventory; do not
+      reset away work, stash it indefinitely or create another development lane.
+- [ ] Partition files among active writers. Check status before staging and
+      stage only owned paths. Historical branches/checkouts are inventoried;
+      deleting them requires explicit Hunter approval even if a helper calls
+      their tips safe to delete.
 
 ## 1. CHANGELOG entry exists for the version
 
@@ -48,6 +49,7 @@ generic checklist does not enumerate.
       For each contributor, link both their display name and (when known)
       `@github-handle`. Then inspect linked issues and harvested PRs so
       reporters/helpers are not lost just because they did not author commits.
+      Keep `docs/CONTRIBUTORS.md` and `web/lib/release-credits.ts` consistent.
 - [ ] The entry uses the Keep a Changelog headers — `Added`, `Changed`,
       `Fixed`, `Security`, `Removed`, `Deprecated`. Add `Known issues` only
       if there is something material the user must work around.
@@ -63,7 +65,9 @@ generic checklist does not enumerate.
 
 ## 2. Version pins are in sync
 
-- [ ] Run `./scripts/release/prepare-release.sh X.Y.Z` — it bumps the
+- [ ] Use `./scripts/release/prepare-release.sh X.Y.Z` when version pins or
+      generated sources need preparation. Reuse a valid preparation receipt
+      when those sources are already current. The helper bumps the
       workspace version, every per-crate dependency pin, the npm wrapper
       (`version` + `codewhaleBinaryVersion`), Runtime SDK, VS Code extension
       and lock, remote-smoke default, public source-candidate facts, and README
@@ -83,125 +87,130 @@ generic checklist does not enumerate.
       `nix` 0.28/0.29, `portable-pty`, `starlark`, `arboard`, or `keyring`
       crates.
 
-## 3. Preflight gates
+## 3. Verify and land preparation slices
 
-Run, in order, from the repo root:
-
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo check --workspace --all-targets --locked`
-- [ ] `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-- [ ] `cargo test --workspace --all-features --locked`
-      (Re-run any single failure in isolation with
-      `cargo test -p PKG --bin BIN -- TEST_NAME` before declaring it a flake.
-      Tests that mutate process-wide state — `HOME`, `cwd`, `RUST_LOG` —
-      can race in parallel. Document confirmed flakes in `Known issues`.)
-- [ ] `./scripts/release/publish-crates.sh dry-run`
-
-## 4. npm wrapper smoke
-
-- [ ] `cargo build --release --locked -p codewhale-cli --bin codewhale`
-- [ ] `node scripts/release/npm-wrapper-smoke.js`
-      (Set `DEEPSEEK_TUI_KEEP_SMOKE_DIR=1` if you need to inspect the temp
-      install afterwards.)
-
-## 5. Branch and PR
-
-- [ ] Branch is pushed: `git push -u origin work/vX.Y.Z-...`
-- [ ] PR opened with `gh pr create --base main --title "chore(release): prepare vX.Y.Z"`
-- [ ] The PR targets `main` and will be merged before any `vX.Y.Z` tag is
-      pushed. Do not tag a release-only branch; GitHub will not process
-      `Closes #N` keywords until those commits reach the default branch.
-- [ ] PR body includes:
-  - one-paragraph summary of the release theme
-  - a punch list of the new commits since the last release
-  - explicit call-out of any **Security** items so reviewers see them
-  - the contributor thank-you list
-  - the `Known issues` block from the CHANGELOG, if any
-- [ ] PR title is **neutral** — do not put CVE-style language or specific
-      attack details in the title. Save those for the GitHub release notes
-      after the tag is pushed.
-
-## 5b. Branch hygiene (post-merge)
-
-After the release/integration merge lands, make it obvious where the release
-tip lives and clean up stale branches **safely**. A working checkout left on a
-scratch/renovate branch (even when `HEAD` already matches the tag) creates
-release anxiety: contributors cannot tell whether their work merged.
-
-- [ ] Run the dry-run report first (read-only, deletes nothing):
-
-      ```sh
-      ./scripts/release/branch-hygiene.sh --release-branch codex/vX.Y.Z
+- [ ] Run the existing checks appropriate to each changed surface once; batch
+      coherent Rust edits before compiling. Web changes use
+      `npm test && npm run check:web` from the repository root. Record actual
+      results and failures in commit messages; hosted CI owns exhaustive
+      workspace and platform coverage.
+- [ ] Commit verified owned paths directly to `main` and push normally. Resolve
+      push rejection with the other writer while preserving dirty work; never
+      force-push. Reuse valid receipts instead of rebuilding merely to commit
+      or push. Existing contributor PRs retain their review and merge process.
+- [ ] The live milestone and PR queue no longer contain work intended for this
+      version:
       ```
-
-      It prints: the current checkout branch, the local + remote release tips,
-      and the main ref; the branches that are **safe to delete** (tip already
-      contained in the configured main ref or the release branch); and a
-      **keep / needs review** list naming each branch, its unique commit count,
-      the author(s), and the keep reason. The summary line reports how many are
-      safe-deletes, how many were kept for contributor work, and how many need a
-      human decision. A diverged local/remote release tip exits non-zero. Use
-      `--remote upstream` when the canonical release refs live on `upstream`
-      instead of `origin`.
-- [ ] If the working checkout is parked on a stale branch, switch to the
-      release branch and fast-forward it:
-
-      ```sh
-      git switch codex/vX.Y.Z
-      git fetch origin && git merge --ff-only origin/codex/vX.Y.Z   # if behind
+      gh issue list --repo codewhale-hq/CodeWhale --milestone "vX.Y.Z" --state open
+      gh pr list --repo codewhale-hq/CodeWhale --state open --limit 100
       ```
-- [ ] Only after reviewing the dry-run, delete the **safe** branches. Local
-      first; add `--prune-remote` to also delete remote safe-deletes:
-
-      ```sh
-      ./scripts/release/branch-hygiene.sh --release-branch codex/vX.Y.Z --prune --yes
+- [ ] Any remaining same-theme work is explicitly retargeted to a later
+      version or called out as a known issue. Do not freeze/tag while still
+      planning to merge more same-version fixes.
+- [ ] The release tag does not already point at an older source SHA, or the
+      maintainer has deliberately chosen to publish exactly that older SHA:
       ```
+      git ls-remote origin refs/heads/main refs/tags/vX.Y.Z
+      gh release view vX.Y.Z --repo codewhale-hq/CodeWhale
+      ./scripts/release/check-published.sh X.Y.Z
+      ```
+- [ ] If `vX.Y.Z` exists with no GitHub Release/packages and `main` has moved
+      on, stop. Choose one of: publish the existing tag as-is, bump the later
+      work to the next patch version, or explicitly approve deleting/recreating
+      the unpublished tag. Publishing older source after canonical `main` has
+      advanced needs a separately authorized recovery plan; do not silently
+      move tags or switch the shared checkout. An absent release/unpublished
+      packages are expected at this stage, not permission to alter a tag.
+- [ ] Freeze the final source: all intended work is committed and pushed;
+      clean local `HEAD`, `main` and freshly fetched `origin/main` agree.
+      Record the full 40-character SHA/version and coordinate with shared
+      writers to preserve that source through packaging and publication.
+- [ ] `./scripts/release/check-versions.sh --require-dated-release` and
+      `python3 scripts/check-contributor-credit.py` pass for the candidate.
+- [ ] `./scripts/release/publish-crates.sh dry-run` passes for the frozen
+      candidate. Cargo 1.90+ verifies every release tarball and its real size
+      without uploading. CI/RC does not replace this check. Retain the receipt;
+      do not repeat it for unchanged source just to commit or push. Publish mode
+      necessarily verifies the packages again before uploading.
 
-      The script **never** auto-deletes a branch with unique commits from a
-      contributor other than Hunter unless that work is already merged. Those
-      land in the keep/review list with author and reason; review, merge,
-      harvest with credit, or explicitly preserve them before removing the
-      branch. When in doubt, leave the branch and record the decision.
+## 4. Exact-SHA full CI and release candidate
 
-## 6. CI green and review
-
-- [ ] All required CI jobs are green. The `versions` job should mirror the
-      preflight `check-versions.sh` and is your last line of defense.
-- [ ] After the final source reaches `main`, dispatch exact-head full CI and the
-      non-publishing release-candidate build with the same 40-character SHA:
+- [ ] Dispatch full CI and the build-only release candidate against frozen
+      `main` with the same independent SHA guard:
       ```bash
-      candidate_sha="$(git rev-parse origin/main)"
+      candidate_sha="$(git rev-parse HEAD)"
       gh workflow run ci.yml --ref main -f expected_sha="${candidate_sha}"
       gh workflow run release-candidate.yml --ref main -f expected_sha="${candidate_sha}"
       ```
-      Both runs must resolve to that SHA. The candidate must report all seven
+- [ ] Both runs resolve to that SHA and all required jobs execute and succeed.
+      A green workflow badge alone is insufficient: ordinary main-push CI can
+      delegate Linux work to CNB and omit some smoke coverage. Manual full CI
+      forces the release gates on Linux, macOS and Windows.
+- [ ] The candidate's Parity job succeeds, and its artifact jobs report all seven
       targets and the complete 34-file asset inventory, including Android
       arm64, Windows arm64, `codew`, the NSIS installer, archives, checksum
       manifests, and seven compatibility-only `codewhale-tui-*` release
-      filenames that are not installed commands. These are Actions artifacts
-      only and are not a release.
-- [ ] PR has been reviewed.
+      filenames that are not installed commands. The packed npm wrapper installs
+      against those assets and runs its delegated entrypoints. Keep run URLs and
+      required evidence before the Actions artifacts expire; these are not a
+      public release.
+- [ ] Complete the version-specific acceptance packet. Cross-building Android
+      does not prove a real Termux/device session. Local install, actual provider
+      calls and customer acceptance need separate receipts; provider spend still
+      requires authorization. Required unproven acceptance blocks release;
+      disclose an explicitly accepted limitation as such.
+- [ ] If source changes or `main` moves before tagging, deliberately choose the
+      new candidate and replace affected proofs. Tag only a SHA with its exact
+      CI/RC evidence. Do not duplicate hosted exhaustive gates locally.
 
-## 7. Tag and release (after review)
+## 5. Publication approval
 
-- [ ] Release PR is merged into `main`, then local `main` is fast-forwarded:
-      `git switch main && git fetch origin main && git merge --ff-only origin/main`
+- [ ] Hunter explicitly approves the exact version/SHA and publication targets:
+      tag, GitHub Release, npm, GHCR, CNB release tag and legacy Homebrew
+      automation, plus Cargo or other downstream publication where intended.
+      Source readiness and build-only CI/RC do not authorize a tag, registry
+      write, deployment or public launch.
+
+## 6. Tag and publish the approved source
+
+- [ ] Fetch `origin/main` again and verify that clean canonical `main`,
+      `origin/main` and the approved SHA still agree.
 - [ ] The release source is reachable from `main`:
       `./scripts/release/ensure-release-on-main.sh HEAD`
 - [ ] Create `vX.Y.Z` from the final `main` SHA using the **Create release tag**
       workflow, or create and push a signed local tag:
       `git tag -s vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`
-- [ ] The `release.yml` workflow has built and uploaded artifacts to the
-      GitHub release for this tag.
+      Tagging can start public automation immediately. If no run appears,
+      first exclude a queued/active tag-triggered run, then dispatch only the
+      existing tag: `gh workflow run release.yml --ref vX.Y.Z -f version=X.Y.Z`.
+      Do not dispatch `release.yml` from `main` or start duplicate runs.
+- [ ] The Release workflow succeeds: it repeats parity/build gates, verifies
+      the draft asset inventory before GitHub publication, then runs dependent
+      npm, GHCR, CNB and Homebrew publication. It requires an exact-SHA green
+      RC receipt and does not publish Cargo crates.
 - [ ] The public GitHub Release assets are proven to match the tag commit
       before publishing Cargo or npm:
       ```
+      git fetch origin tag vX.Y.Z
       ./scripts/release/verify-release-assets.sh X.Y.Z
+      ./scripts/release/require-release-tag-checkout.sh X.Y.Z
       ```
       This checks the local tag, remote tag, successful Release workflow SHA,
       full binary/archive/installer asset set, and both checksum manifests. If
-      it fails, rerun or repair the GitHub Release workflow before touching any
-      registry.
+      it fails, stop publication and follow the runbook's recovery gates.
+      Publish from the same clean canonical checkout on `main` when `HEAD`
+      matches the immutable remote tag. Do not create a detached worktree,
+      switch release lanes or force-fetch a conflicting tag. If `main` advanced,
+      coordinate with Hunter for a new candidate or separately authorized
+      recovery plan.
+- [ ] Publish Cargo manually within the approved scope:
+      `./scripts/release/publish-crates.sh publish`. It verifies every package,
+      skips already-published versions and waits for each new dependency to
+      appear. npm normally uses Trusted Publishing; manual recovery keeps the
+      same clean-source and public-asset guards.
+
+## 7. Verify public results
+
 - [ ] The live GitHub Release body has its own `## Contributors` or
       `## Credits` section; do not rely on "see CHANGELOG" alone. Verify with:
       ```
@@ -217,26 +226,38 @@ release anxiety: contributors cannot tell whether their work merged.
       codewhale`, `curl .../install.sh | sh`); Homebrew is labeled as legacy
       compatibility; the shell installer uses codewhale-native names as documented
       in `docs/REBRAND.md#homebrew`.
-- [ ] `crates.io` has the new version (or the `publish-crates.sh` job has
-      pushed it).
+- [ ] Every release crate has the new version on crates.io; there is no
+      automated Cargo publish job. Partial publication is incomplete.
 - [ ] `ghcr.io/codewhale-hq/codewhale:vX.Y.Z` and `:latest` are updated.
+- [ ] The CNB release tag and approved downstream results are verified
+      separately; a successful GitHub Release does not prove them.
 - [ ] The final registry verification passes:
       ```
       ./scripts/release/check-published.sh X.Y.Z
       ```
+- [ ] Published install/upgrade smoke has its own receipt; candidate installs
+      do not prove public delivery. Deployment/customer acceptance remain
+      separate gates where required.
 
-## 8. Post-tag
+## 8. Handoff and tracking
 
 - [ ] Edit the GitHub release notes to expand any CVE-style or attack
-      details that were intentionally omitted from the PR title/body.
+      details within the approved publication scope.
 - [ ] Re-run the GitHub Release body check after any release-workflow rerun;
       workflows can overwrite notes and accidentally remove contributor credit.
 - [ ] Note any deferred items in the next release's tracking issue.
 - [ ] Close any issues that this release fixed.
+- [ ] Update existing tracking with evidence; agents do not post GitHub
+      issue/PR comments. Handle the existing `sync-release-record` workflow's
+      metadata proposal after publication: it currently opens a bot PR, not a
+      required preparation branch. A source record does not prove deployment.
+- [ ] Report canonical path, branch, SHA, upstream state and dirty/stranded
+      work. Historical branch/checkout removal needs explicit cleanup approval
+      and does not block a release whose source is already reconciled.
 
 ---
 
 If a step fails, **fix the underlying cause** rather than skipping it. Pre-commit
-hooks, signing, and CI are all here to catch real problems. `--no-verify`,
-`--no-gpg-sign`, and force-pushing a release branch over reviewers should
-remain hard-disabled by convention.
+hooks, signing, and CI are all here to catch real problems. Do not skip hooks or
+signing, force-push shared refs, replace public assets or move release tags to
+make the checklist look green.

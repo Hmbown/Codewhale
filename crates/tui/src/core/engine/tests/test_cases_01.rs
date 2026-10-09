@@ -736,6 +736,7 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
                 Event::OperationActivityStarted {
                     span_id,
                     activity_kind,
+                    ..
                 } => Some((span_id, activity_kind)),
                 _ => None,
             })
@@ -748,6 +749,7 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
                     span_id,
                     activity_kind,
                     outcome,
+                    ..
                 } => Some((span_id, activity_kind, outcome)),
                 _ => None,
             })
@@ -765,9 +767,17 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
             })
             .collect();
         if fill_queue {
+            assert_eq!(
+                completed.len(),
+                1,
+                "the span reserved at admission keeps its completion on a full queue"
+            );
+            assert_eq!(completed[0].0, starts[0].0, "retain the span relationship");
+            assert_eq!(completed[0].1, starts[0].1);
+            assert_eq!(*completed[0].2, OwnerOperationOutcome::Succeeded);
             assert!(
-                completed.is_empty() && calls.is_empty(),
-                "cancelled full waits release without inventing delivery"
+                calls.is_empty(),
+                "cancelled full waits do not invent tool-call delivery"
             );
         } else {
             assert_eq!(

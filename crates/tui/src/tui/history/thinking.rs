@@ -149,7 +149,7 @@ pub(crate) fn render_thinking_with_preview_limit(
     } else if let Some(duration) = duration_secs {
         tr(locale, MessageId::TranscriptThoughtFor).replace(
             "{duration}",
-            &crate::elapsed::format_elapsed_ms((duration * 1000.0) as u64),
+            &codewhale_command_contract::elapsed::format_elapsed_ms((duration * 1000.0) as u64),
         )
     } else {
         tr(locale, MessageId::TranscriptThought).into_owned()
@@ -360,7 +360,7 @@ pub(super) fn render_hidden_thinking_activity(
     if let Some(dur) = duration_secs {
         header_spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
         header_spans.push(Span::styled(
-            crate::elapsed::format_elapsed_ms((dur * 1000.0) as u64),
+            codewhale_command_contract::elapsed::format_elapsed_ms((dur * 1000.0) as u64),
             thinking_meta_style(),
         ));
     }

@@ -55,13 +55,14 @@ base prompt". Two more corollaries earned here:
 - Search for behavior and symbols before reviving work from an old branch. If a
   lane is obsolete, preserve its intent and evidence rather than merging stale
   code mechanically.
-- A small coherent change may be committed directly to `main` when that checkout
-  is current, clean, and owns the affected files. Default to the checkout that
-  already exists: when several agents share it, partition by file, stage only
-  the paths your slice touched, and retry a commit that fails on `index.lock`.
-  A fresh worktree is for conflicting, dirty, stale, or independent lanes
-  (see `cw-land`), not for parallel agents on the same lane. Local commit
-  permission never implies push, merge, tag, release, or deploy permission.
+- Agent-owned work uses the canonical `/Volumes/VIXinSSD/CW/codewhale` checkout
+  on current `main`. Do not create branches, worktrees, nested clones or
+  task-specific integration lanes to handle dirty, stale or conflicting work.
+  Preserve that work and reconcile it with its owner first. When agents share
+  the checkout, partition by file, check status before staging, stage only owned
+  verified paths and retry an `index.lock` failure. Verified main slices may be
+  committed and pushed normally under the rule below; tag, release, deployment
+  and destructive cleanup still require their explicit authorization.
 - **Maintainers do not open PR branches** (founder, 2026-10-08: more PRs means
   more CI and slower work). Verified slices land directly on `main` and are
   pushed: run the focused gate, put the real counts in the commit message,

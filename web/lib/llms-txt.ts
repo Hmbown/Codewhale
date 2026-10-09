@@ -70,6 +70,36 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     description: "The pull-request workflow: scoped issue, fork, test the change, explain the result.",
   },
   {
+    path: "/changelog",
+    title: "Changelog",
+    description:
+      "Codewhale release record: the latest published release, the unreleased source candidate, and the notes for each version, drawn from CHANGELOG.md in the repository.",
+  },
+  {
+    path: "/plugins",
+    title: "Plugins and marketplace",
+    description:
+      "Let the agent operate the desktop apps you choose with Computer Use, and install reviewed plugins from the Codewhale catalog, a GitHub repository, or a tarball.",
+  },
+  {
+    path: "/ratatui",
+    title: "Codewhale Ratatui",
+    description:
+      "Explore Codewhale’s reusable Ratatui components. Compare terminal themes and widths, inspect real rendered previews, and use the Rust examples in your app.",
+  },
+  {
+    path: "/signin",
+    title: "Sign in",
+    description:
+      "Access your Codewhale account and the app’s development preview. Connect to a terminal session from your browser with /rc.",
+  },
+  {
+    path: "/signup",
+    title: "Create account",
+    description:
+      "Create a Codewhale account to keep your conversations and connected providers together. Using the terminal needs no account.",
+  },
+  {
     path: "/legal/terms",
     title: "Terms of service",
     description: "Terms that govern your use of Codewhale, a Shannon Labs product.",

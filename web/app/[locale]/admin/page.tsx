@@ -11,7 +11,10 @@ export const dynamic = "force-dynamic";
 // Maintainer-only surface: keep it out of search indexes (robots.ts also
 // disallows /*/admin).
 export const metadata: Metadata = {
+  title: "Maintainer panel · Codewhale",
   robots: { index: false, follow: false },
+  alternates: {},
+  openGraph: { title: "Maintainer panel · Codewhale" },
 };
 
 const TYPE_LABELS: Record<string, { en: string; zh: string }> = {
@@ -145,8 +148,8 @@ export default async function AdminPage({
           title={isZh ? "暂无草稿" : "No drafts yet"}
           body={
             isZh
-              ? "草稿将在 cron 运行后出现。可在 wrangler.jsonc 中配置触发时间。"
-              : "Drafts will appear here after cron runs. Configure triggers in wrangler.jsonc."
+              ? "草稿将在 cron 运行后出现。可在 cloudflare.config.ts 中配置触发时间。"
+              : "Drafts will appear here after cron runs. Configure triggers in cloudflare.config.ts."
           }
         />
       )}

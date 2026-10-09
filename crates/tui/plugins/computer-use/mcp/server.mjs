@@ -859,6 +859,51 @@ async function consentCheck(computer, name, args) {
   return grant ? { grant } : null;
 }
 
+// ---------- input ownership ----------
+// Keystrokes and pointer events go to whichever window the OS routes them to,
+// which is not necessarily the app the agent last observed. A backend that
+// implements input_owner reports the app behind that window (keyboard: the
+// active window; pointer: the topmost window under the point), and the
+// consent ledger decides on that identity. Backends without input_owner keep
+// the bound-app and element checks above.
+const KEYBOARD_INPUT_TOOLS = new Set(["type", "key", "hold_key"]);
+const POINTER_INPUT_TOOLS = new Set(["left_click", "double_click", "triple_click", "right_click", "middle_click", "mouse_move", "scroll", "left_mouse_down"]);
+
+/** Every ledger key that identifies this owner: its window class, its process name and its pid. */
+function ownerKeys(owner) {
+  const keys = new Set();
+  for (const name of [owner.name, owner.comm]) for (const key of consent.appKeys({ name })) keys.add(key);
+  for (const key of consent.appKeys({ pid: owner.pid })) keys.add(key);
+  return [...keys];
+}
+
+async function inputOwnerCheck(computer, name, prepared, backend) {
+  if (computer.transport !== "local" || computer.owned === true || typeof backend.input_owner !== "function") return;
+  const checks = [];
+  if (KEYBOARD_INPUT_TOOLS.has(name)) checks.push({ kind: "keyboard" });
+  else if (name === "left_click_drag") checks.push({ kind: "pointer", at: prepared.from_target }, { kind: "pointer", at: prepared.to });
+  else if (POINTER_INPUT_TOOLS.has(name)) checks.push({ kind: "pointer", at: prepared.target });
+  else return;
+  for (const check of checks) {
+    const at = check.at && Number.isFinite(check.at.x) && Number.isFinite(check.at.y) ? { x: check.at.x, y: check.at.y } : undefined;
+    const owner = await backend.input_owner({ kind: check.kind, ...(at ? { point: at } : {}) });
+    if (!owner) continue; // the desktop itself: no application receives this input
+    const verdict = consent.decisionFor(computer.id, ownerKeys(owner));
+    const desc = owner.name ?? (owner.pid ? `pid ${owner.pid}` : "the application");
+    const arg = owner.name ?? `pid:${owner.pid}`;
+    if (verdict.state === "denied") {
+      throw new ServerError("app_denied",
+        `the user denied access to ${desc} on this computer — do not work around it; only they can change it (consent {action:"revoke"}).`,
+        { app: owner });
+    }
+    if (verdict.state === "undecided") {
+      throw new ServerError("consent_required",
+        `Codewhale needs the user's permission to use ${desc} on this computer — ask them, then record their answer with consent {action:"allow"|"deny", app:"${arg}"}. This ${check.kind} input would reach ${desc}, the app that owns the window receiving it.`,
+        { app: owner });
+    }
+  }
+}
+
 // ---------- irreversible-action confirmation ----------
 // A click or press on a control labelled pay, buy, send, transfer, delete (and
 // their close relatives) moves money or destroys something, and the text that
@@ -1166,9 +1211,15 @@ async function callTool(params, bindWhen = null) {
   }
 
   if (name === "computer_switch") {
-    const c = registry.get(args.computer);
-    activeComputerId = c.id;
-    return { content: [{ type: "text", text: JSON.stringify(receipt(c, { ok: true, active: c.id })) }] };
+    // An unknown id is the caller's mistake: report it as a tool failure with
+    // the registry's code, not as a protocol error.
+    try {
+      const c = registry.get(args.computer);
+      activeComputerId = c.id;
+      return { content: [{ type: "text", text: JSON.stringify(receipt(c, { ok: true, active: c.id })) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: JSON.stringify(fail(null, err.code ?? "computer_error", err.message ?? String(err), { tool: name })) }], isError: true };
+    }
   }
 
   // Everything below acts on a computer.
@@ -1393,6 +1444,7 @@ async function callTool(params, bindWhen = null) {
       }
       const resolve = typeof backend.resolve_element === "function" ? (req) => backend.resolve_element(req) : null;
       const prepared = await prepareArgs(computer, name, args, resolve, sink);
+      await inputOwnerCheck(computer, name, prepared, backend);
       throwIfAborted();
       await assertCurrentRoute(computer, binding);
       if (controlStopped && !READ_ONLY_TOOLS.has(name)) throw new ServerError("control_stopped", "stop_computer_control is active; no further actions are permitted this session");

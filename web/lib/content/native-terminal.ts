@@ -27,15 +27,15 @@ export const NATIVE_TERMINAL_VIEWS = {
   "workbar-fleet": {
     label: { en: "Fleet", zh: "智能体团队" },
     description: {
-      en: "The Fleet view in the session workbar.",
-      zh: "会话工作栏中的智能体团队视图。",
+      en: "A delegated reviewer and its completed task in the Fleet workbar.",
+      zh: "团队工作栏中受委派的审阅智能体及其已完成任务。",
     },
   },
   "provider-picker": {
     label: { en: "Providers", zh: "提供商" },
     description: {
-      en: "Choose a provider for your model connection.",
-      zh: "为模型连接选择提供商。",
+      en: "The provider list and connection details, captured with a local demo model.",
+      zh: "使用本地演示模型实录的提供商列表和连接详情。",
     },
   },
   help: {
@@ -54,6 +54,9 @@ export const NATIVE_TERMINAL_COPY = {
     zh: "Codewhale 演示会话的实录画面。查看对话、任务工作栏、模型连接与帮助。",
   },
   viewsLabel: { en: "Terminal views", zh: "终端视图" },
+  showFull: { en: "Show full terminal", zh: "查看完整终端" },
+  showDetail: { en: "Focus on this panel", zh: "聚焦此面板" },
+  detailLabel: { en: "Panel detail from the captured terminal", zh: "终端实录中的面板详情" },
   scrollHint: { en: "Scroll sideways to see the full terminal.", zh: "左右滚动，查看完整终端。" },
   componentsLink: { en: "Build with these components", zh: "使用这些组件构建应用" },
 } satisfies Record<string, LocalizedText>;
@@ -63,6 +66,9 @@ export function getNativeTerminalCopy(locale: string) {
     title: pickText(NATIVE_TERMINAL_COPY.title, locale),
     description: pickText(NATIVE_TERMINAL_COPY.description, locale),
     viewsLabel: pickText(NATIVE_TERMINAL_COPY.viewsLabel, locale),
+    showFull: pickText(NATIVE_TERMINAL_COPY.showFull, locale),
+    showDetail: pickText(NATIVE_TERMINAL_COPY.showDetail, locale),
+    detailLabel: pickText(NATIVE_TERMINAL_COPY.detailLabel, locale),
     scrollHint: pickText(NATIVE_TERMINAL_COPY.scrollHint, locale),
     componentsLink: pickText(NATIVE_TERMINAL_COPY.componentsLink, locale),
     views: Object.fromEntries(Object.entries(NATIVE_TERMINAL_VIEWS).map(([id, view]) => [id, {

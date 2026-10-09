@@ -53,7 +53,7 @@ a raster ID. Browser viewport points use the browser's separate contract.
 ## Apps & computers
 - `open_application {name|bundle_id|pid, activate?}` — bind the input target; `app_not_found` when the selector resolves nowhere.
 - `list_apps {installed:true}` — the installed catalog (openable apps, running or not, one subdirectory deep) instead of the running list.
-- `kill_app {name|bundle_id|pid, force?}` — quit an app; refuses an ambiguous name match (pass pid); never the helper itself.
+- `kill_app {name|bundle_id|pid, force?}` — quit an app; refuses an ambiguous name match (pass pid); never the helper itself. Linux: closes the window first; `still_running` means the app refused to quit; `force:true` sends SIGKILL and discards unsaved work.
 - `set_window_frame {app_ref?, window_id, frame:{x,y,w,h}}` — move/resize one window; readbacks report what the app actually did (`verified`, `ax_errors`).
 - `preview {enabled}` — floating panel: captured window + agent/user cursors; live while bound.
 - `computer {action, id?}` — list / switch / register / **spawn** / remove.
@@ -61,7 +61,7 @@ a raster ID. Browser viewport points use the browser's separate contract.
   Linux desktop (registered `owned:true`, becomes active) — the default
   workspace for anything that does not need the user's own session. `remove`
   or session end destroys it. `local` stays for work in the user's session.
-- `recording {action, …}` — start / stop / status / list (opt-in screen recordings).
+- `recording {action, …}` — start / stop / status / list (opt-in screen recordings: macOS ScreenCaptureKit, Linux X11 ffmpeg; Windows unavailable).
 
 ## Browser (CDP)
 - `browser {action:"start", url?}` — self-owned Chromium profile + this session's tab; the user's own browser is never touched.

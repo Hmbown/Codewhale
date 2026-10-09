@@ -1183,7 +1183,7 @@ pub(crate) fn mirror_saved_api_key_in_config(
     entry.auth_mode = Some("api_key".to_string());
     entry.api_key = Some(api_key);
     entry.external_credentials = None;
-    if provider == ProviderKind::Xai {
+    if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
         entry.oauth_credential_generation = None;
     }
     Ok(())

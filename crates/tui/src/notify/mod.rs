@@ -3,19 +3,19 @@
 //! per-event sound policy and audio cues.
 //!
 //! Runtime code owns *what* may notify and *which* sound it selects. The
-//! terminal UI owns *delivery*: `tui::notifications` is the only code that
-//! writes OSC 9 / 99 / 777 escapes, the taskbar progress sequence or the
-//! window title. Runtime callers that need a delivery (the `notify` tool,
-//! headless exec) reach it through `crate::host_terminal`, never by
-//! importing the TUI.
+//! terminal UI owns the *terminal*: `tui::notifications` is the only code that
+//! hands a real terminal to [`delivery::notify_with_sinks`], writes the taskbar
+//! progress sequence or the window title. Runtime callers that need a delivery
+//! (the `notify` tool, headless exec) reach it through `crate::host_terminal`,
+//! never by importing the TUI.
 //!
-//! Known limitation: `tui::notifications::notify_with_sinks` still combines
-//! the policy below with transport selection, so the runtime API's native
-//! notification preparation calls it with null sinks. Splitting transport
-//! out of it is the remaining step before this module can own the whole
-//! decision.
+//! Known limitation: [`delivery::notify_with_sinks`] builds the escape bytes
+//! for every transport but writes only to the sink it is handed; the runtime
+//! API's native notification preparation hands it a null sink and never
+//! reaches a terminal transport.
 
 pub mod audio;
+pub mod delivery;
 pub mod payload;
 pub mod sound_policy;
 
@@ -28,7 +28,7 @@ use payload::NotificationKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Method {
     /// Automatically pick the best protocol for the current terminal.
-    /// See `tui::notifications::resolve_method` for the canonical resolution table.
+    /// See [`delivery::resolve_method`] for the canonical resolution table.
     #[default]
     Auto,
     /// OSC 9 escape: `\x1b]9;<msg>\x07`
@@ -41,7 +41,7 @@ pub enum Method {
     /// terminals that expose no notification escape of their own (Apple
     /// Terminal, the VS Code and JetBrains embedded terminals, plain tmux
     /// without `LC_TERMINAL`). iTerm2, WezTerm, Ghostty, and kitty are
-    /// matched earlier in `tui::notifications::resolve_method` and never get here.
+    /// matched earlier in [`delivery::resolve_method`] and never get here.
     ///
     /// Known limitation (#4834): `display notification` is a Standard
     /// Additions command, so the banner is attributed to the *bundled*

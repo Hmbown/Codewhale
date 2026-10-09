@@ -1447,6 +1447,35 @@ impl From<&crate::tool_inspection::TurnStopDiagnostics> for RuntimeTurnRequestDi
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOperationSpan {
+    pub span_id: String,
+    pub activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOperationCompletion {
+    pub span_id: String,
+    pub activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    pub completed_at: DateTime<Utc>,
+    pub outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOperationActivity {
+    pub observed_at: DateTime<Utc>,
+    pub active: Vec<RuntimeOperationSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_completed: Option<RuntimeOperationCompletion>,
+    #[serde(default)]
+    pub overflowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRecord {
     /// Admitted per-request allowance. Older turns have no explicit allowance.
     #[serde(
@@ -1601,6 +1630,8 @@ pub struct TurnRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub model_request_diagnostics: Option<RuntimeTurnRequestDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_activity: Option<RuntimeOperationActivity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
@@ -1635,6 +1666,24 @@ pub struct TurnRecord {
 
 impl TurnRecord {
     fn validate_output_token_limit(&self) -> Result<()> {
+        if let Some(activity) = &self.operation_activity {
+            let safe_id =
+                |id: &str| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control);
+            anyhow::ensure!(
+                activity.active.len() <= 256
+                    && activity.active.iter().all(|span| {
+                        safe_id(&span.span_id)
+                            && span.action_id.as_deref().is_none_or(safe_id)
+                            && span.started_at <= activity.observed_at
+                    })
+                    && activity.last_completed.as_ref().is_none_or(|span| {
+                        safe_id(&span.span_id)
+                            && span.action_id.as_deref().is_none_or(safe_id)
+                            && span.completed_at <= activity.observed_at
+                    }),
+                "Turn operation activity exceeds its bound"
+            );
+        }
         if self.decision_receipts.len() > MAX_ROUTED_USAGE_RECORDS_PER_TURN
             || self.decision_receipts.iter().any(|r| !r.is_bounded())
         {
@@ -1962,6 +2011,7 @@ fn settle_unaccepted_routed_usage(
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: Some(UNACCEPTED_TURN_REASON.to_string()),
             item_ids: Vec::new(),
             steer_count: 0,
@@ -4894,6 +4944,8 @@ pub struct UpdateThreadRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StartTurnRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_model_owner: Option<String>,
     /// Account-authorized data, rendered only by the Engine for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_constitution:
@@ -7354,7 +7406,7 @@ impl RuntimeThreadManager {
         let workshop_activation = crate::tools::large_output_router::WorkshopConfig::install_active(
             new_config.workshop.as_ref(),
         );
-        crate::initialize_cloud_facts(&new_config);
+        crate::config::initialize_cloud_facts(&new_config);
         crate::provider_catalog_live::maybe_load_persisted_cache_for_config(&new_config);
         let workflow_table = new_config.workflow_config();
         {
@@ -7603,7 +7655,7 @@ impl RuntimeThreadManager {
             binding.validate_existing_store()?;
         }
         let store = RuntimeThreadStore::open(manager_cfg.data_dir.clone())?;
-        crate::initialize_cloud_facts(&config);
+        crate::config::initialize_cloud_facts(&config);
         let (event_tx, _event_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let manager = Self {
             host_profile,
@@ -8849,6 +8901,7 @@ impl RuntimeThreadManager {
         continuation_index: u32,
     ) -> Result<TurnRecord> {
         let req = StartTurnRequest {
+            account_model_owner: None,
             profile_constitution: None,
             expected_workspace: None,
             max_output_tokens: None,
@@ -9379,6 +9432,7 @@ impl RuntimeThreadManager {
             .start_turn_with_source(
                 thread_id,
                 StartTurnRequest {
+                    account_model_owner: None,
                     profile_constitution: None,
                     expected_workspace: None,
                     max_output_tokens: None,
@@ -13240,6 +13294,7 @@ impl RuntimeThreadManager {
                     routed_usage_source_ids: Vec::new(),
                     routed_usage_dropped_records: 0,
                     model_request_diagnostics: None,
+                    operation_activity: None,
                     error: None,
                     item_ids,
                     steer_count: 0,
@@ -13644,6 +13699,9 @@ impl RuntimeThreadManager {
                         .saturating_add(background_residual);
                     if turn.status == RuntimeTurnStatus::InProgress {
                         turn.status = RuntimeTurnStatus::Failed;
+                        if let Some(activity) = &mut turn.operation_activity {
+                            activity.active.clear();
+                        }
                         turn.ended_at = Some(now);
                         turn.duration_ms = turn.started_at.map(|start| duration_ms(start, now));
                         turn.error = Some(reason.to_string());
@@ -14221,7 +14279,7 @@ impl RuntimeThreadManager {
                 )
             };
         let mode = policy.mode;
-        let cfg_snapshot = self.config.read().clone();
+        let mut cfg_snapshot = self.config.read().clone();
         // Optional per-turn provider override: routes this turn only. The
         // saved thread keeps its provider; `route_thread` is the view the
         // route, fingerprint and turn receipt are resolved from.
@@ -14245,6 +14303,13 @@ impl RuntimeThreadManager {
             }
             None => req.model.as_deref().unwrap_or(&thread.model).to_string(),
         };
+        if req.account_model_owner.is_some() {
+            let identity = self.provider_identity_for_thread(&cfg_snapshot, &route_thread)?;
+            anyhow::ensure!(identity.provider == ProviderKind::Codewhale && identity.key.as_str() == "codewhale"
+                && requested_model.split_once('/').is_some_and(|(provider, model)| !provider.is_empty() && !provider.eq_ignore_ascii_case("codewhale") && !model.is_empty())
+                && !requested_model.chars().any(|c| c.is_whitespace() || c.is_control()),
+                "The agent model requires an exact account provider and model");
+        }
         let auto_model = requested_model.trim().eq_ignore_ascii_case("auto");
         if !image_blocks.is_empty() && (requested_model.is_empty() || requested_model.trim() != requested_model) {
             bail!("image inputs require an exact nonempty named model");
@@ -14270,7 +14335,11 @@ impl RuntimeThreadManager {
         if req.max_output_tokens.is_some() && auto_model {
             bail!("maxOutputTokens requires an exact model; Auto routing is unsupported");
         }
-        if let Some(snapshot) = &req.profile_constitution { snapshot.validate()?; }
+        if let Some(snapshot) = &req.profile_constitution {
+            snapshot.validate()?;
+            anyhow::ensure!(req.account_model_owner.as_ref().is_none_or(|owner| &snapshot.account_id == owner),
+                "The profile constitution and agent model must belong to the same account");
+        }
         let operation = if let Some(operation_key) = req.operation_key.as_deref() {
             validate_runtime_turn_operation_key(operation_key)?;
             let request_fingerprint = runtime_turn_request_fingerprint(
@@ -14302,6 +14371,13 @@ impl RuntimeThreadManager {
                     "profile_constitution": snapshot,
                 })).as_bytes())
             } else { request_fingerprint };
+            let request_fingerprint = if let Some(owner) = &req.account_model_owner {
+                crate::hashing::sha256_hex(crate::client::canonical_json(&json!({
+                    "domain": "codewhale:account-model-owner-turn:v1",
+                    "historical_fingerprint": request_fingerprint,
+                    "account_model_owner": owner,
+                })).as_bytes())
+            } else { request_fingerprint };
             let request_fingerprint=narrowing.request_fingerprint(request_fingerprint);
             self.prepare_runtime_turn_operation(
                 thread_id,
@@ -14316,6 +14392,9 @@ impl RuntimeThreadManager {
             && let Some(original_turn) = self.replay_turn_for_operation(operation)?
         {
             return Ok((original_turn, true));
+        }
+        if let Some(owner) = &req.account_model_owner {
+            cfg_snapshot.bind_account_model_owner(owner)?;
         }
         if !image_blocks.is_empty() || req.max_output_tokens.is_some() {
             let identity = self.provider_identity_for_thread(&cfg_snapshot, &route_thread)?;
@@ -14449,7 +14528,7 @@ impl RuntimeThreadManager {
                 None,
             )
         };
-        let route = if client_preflight_required || turn_provider.is_some() {
+        let route = if client_preflight_required || turn_provider.is_some() || req.account_model_owner.is_some() {
             route
                 .preflight()
                 .map_err(|reason| anyhow!("Failed to validate runtime thread route: {reason}"))?
@@ -14519,6 +14598,7 @@ impl RuntimeThreadManager {
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: None,
             item_ids: Vec::new(),
             steer_count: 0,
@@ -14575,7 +14655,11 @@ impl RuntimeThreadManager {
         let turn_goal_status = turn_goal
             .as_ref()
             .map(|goal| {
-                crate::tools::goal::thread_goal_status_projection(goal.status.clone()).0
+                crate::tools::goal::thread_goal_status_projection(
+                    goal.status.clone(),
+                    goal.pause_reason,
+                )
+                .0
             })
             .unwrap_or(crate::tools::goal::GoalStatus::Active);
 
@@ -15025,6 +15109,7 @@ impl RuntimeThreadManager {
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: None,
             item_ids: Vec::new(),
             steer_count: 0,
@@ -15308,9 +15393,11 @@ impl RuntimeThreadManager {
                         )
                     } else {
                         let snapshot = crate::tools::goal::GoalSnapshot::from_thread_goal(goal);
-                        let status =
-                            crate::tools::goal::thread_goal_status_projection(goal.status.clone())
-                                .0;
+                        let status = crate::tools::goal::thread_goal_status_projection(
+                            goal.status.clone(),
+                            goal.pause_reason,
+                        )
+                        .0;
                         (
                             Some(objective.to_string()),
                             snapshot.token_budget,
@@ -16747,6 +16834,77 @@ impl RuntimeThreadManager {
                         json!({ "item": item, "tool": { "id": id, "name": name, "input": input } }),
                     )
                     .await?;
+                }
+                operation @ (EngineEvent::OperationActivityStarted { .. }
+                | EngineEvent::OperationActivityCompleted { .. }
+                | EngineEvent::ToolCallHeartbeat) => {
+                    if !saw_turn_started {
+                        continue;
+                    }
+                    if !matches!(operation, EngineEvent::ToolCallHeartbeat) {
+                        saw_engine_activity = true;
+                    }
+                    let projection_lock = self.projection_lock(&thread_id);
+                    let _projection = projection_lock.lock().await;
+                    let store = self.store.clone();
+                    let operation_turn_id = turn_id.clone();
+                    let projected = tokio::task::spawn_blocking(move || {
+                        let _turn_mutation = store.turn_mutation.lock();
+                        let mut turn = store.load_turn(&operation_turn_id)?;
+                        if turn.status != RuntimeTurnStatus::InProgress {
+                            return Ok::<_, anyhow::Error>(None);
+                        }
+                        if matches!(operation, EngineEvent::ToolCallHeartbeat)
+                            && turn.operation_activity.as_ref().is_none_or(|a| a.active.is_empty())
+                        {
+                            return Ok(None);
+                        }
+                        let now = Utc::now();
+                        let activity = turn.operation_activity.get_or_insert_with(|| RuntimeOperationActivity {
+                            observed_at: now,
+                            active: Vec::new(),
+                            last_completed: None,
+                            overflowed: false,
+                        });
+                        let now = now.max(activity.observed_at);
+                        activity.observed_at = now;
+                        let (name, mut payload) = match operation {
+                            EngineEvent::OperationActivityStarted { span_id, activity_kind, action_id } => {
+                                let span_id = format!("operation:{}", crate::hashing::sha256_hex(span_id));
+                                let action_id = action_id.filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control));
+                                if !activity.active.iter().any(|span| span.span_id == span_id) {
+                                    if activity.active.len() < 256 {
+                                        activity.active.push(RuntimeOperationSpan {
+                                            span_id: span_id.clone(), activity_kind, action_id: action_id.clone(), started_at: now,
+                                        });
+                                    } else {
+                                        activity.overflowed = true;
+                                    }
+                                }
+                                ("operation.activity_started", json!({"span_id":span_id,"activity_kind":activity_kind,"action_id":action_id,"observed_at":now}))
+                            }
+                            EngineEvent::OperationActivityCompleted { span_id, activity_kind, action_id, outcome } => {
+                                let span_id = format!("operation:{}", crate::hashing::sha256_hex(span_id));
+                                let action_id = action_id.filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control));
+                                activity.active.retain(|span| span.span_id != span_id);
+                                activity.last_completed = Some(RuntimeOperationCompletion {
+                                    span_id: span_id.clone(), activity_kind, action_id: action_id.clone(), completed_at: now, outcome,
+                                });
+                                ("operation.activity_completed", json!({"span_id":span_id,"activity_kind":activity_kind,"action_id":action_id,"outcome":outcome,"observed_at":now}))
+                            }
+                            EngineEvent::ToolCallHeartbeat => ("operation.heartbeat", json!({"observed_at":now})),
+                            _ => unreachable!(),
+                        };
+                        if payload.get("action_id").is_some_and(Value::is_null) {
+                            payload.as_object_mut().expect("operation payload").remove("action_id");
+                        }
+                        store.save_turn(&turn)?;
+                        Ok(Some((name, payload)))
+                    }).await.context("Runtime operation projection task failed")??;
+                    if let Some((name, payload)) = projected {
+                        self.emit_event(&thread_id, Some(&turn_id), None, name, payload)
+                            .await?;
+                    }
                 }
                 EngineEvent::ToolExecutionStarted { id } => {
                     if let Some(item_id) = tool_items.get(&id) {
@@ -18267,6 +18425,9 @@ impl RuntimeThreadManager {
             let _turn_mutation = self.store.turn_mutation.lock();
             let mut turn = self.store.load_turn(&turn_id)?;
             turn.status = turn_status;
+            if let Some(activity) = &mut turn.operation_activity {
+                activity.active.clear();
+            }
             turn.ended_at = Some(ended_at);
             turn.duration_ms = turn.started_at.map(|start| duration_ms(start, ended_at));
             turn.usage = turn_usage;
@@ -18689,6 +18850,9 @@ impl RuntimeThreadManager {
             }
             if interrupted_candidate {
                 turn.status = RuntimeTurnStatus::Interrupted;
+                if let Some(activity) = &mut turn.operation_activity {
+                    activity.active.clear();
+                }
                 turn.error = Some(RUNTIME_RESTART_REASON.to_string());
                 turn.ended_at = Some(now);
                 if let Some(started_at) = turn.started_at {

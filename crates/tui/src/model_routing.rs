@@ -2107,6 +2107,7 @@ mod tests {
                     output: Some(output),
                     cache_read: Some(input / 2.0),
                     cache_write: None,
+                    ..Default::default()
                 }),
                 ..CatalogOffering::default()
             }],

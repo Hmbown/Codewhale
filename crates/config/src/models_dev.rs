@@ -10,8 +10,8 @@
 //! - `providers.*.models` are provider-scoped wire offerings.
 //!
 //! A provider row may inline inherited facts without exposing a canonical
-//! `base_model` link. CodeWhale must preserve that distinction instead of
-//! inferring canonical ownership from wire IDs or namespace prefixes.
+//! `canonical_model_id` or legacy `base_model` link. CodeWhale must preserve that
+//! distinction instead of inferring canonical ownership from wire IDs or prefixes.
 
 use std::collections::BTreeMap;
 
@@ -51,7 +51,24 @@ impl ModelsDevCatalog {
     /// # Errors
     /// Returns a serde error when the input is not valid Models.dev JSON.
     pub fn parse_json(raw: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(raw)
+        let catalog: Self = serde_json::from_str(raw)?;
+        for provider in catalog.providers.values() {
+            for model in provider.models.values() {
+                if model.canonical_model_id.is_some()
+                    && model.base_model.is_some()
+                    && model.canonical_model_id.as_deref().map(str::trim)
+                        != model.base_model.as_deref().map(str::trim)
+                {
+                    return Err(<serde_json::Error as serde::de::Error>::custom(
+                        "conflicting canonical_model_id and base_model",
+                    ));
+                }
+                if let Some(cost) = &model.cost {
+                    cost.validate()?;
+                }
+            }
+        }
+        Ok(catalog)
     }
 
     /// Look up provider-agnostic model facts by canonical model id.
@@ -77,7 +94,7 @@ impl ModelsDevCatalog {
     }
 
     /// Resolve an intrinsic reasoning fact from canonical data or a
-    /// conflict-free explicit `base_model` join. A provider wire spelling
+    /// conflict-free explicit canonical join. A provider wire spelling
     /// without that join never becomes an unscoped capability (#6032).
     /// Missing and conflicting facts remain unknown.
     #[must_use]
@@ -88,8 +105,8 @@ impl ModelsDevCatalog {
     /// Build a route offering from a provider-scoped Models.dev row.
     ///
     /// The canonical model is set only when the row carries an explicit
-    /// `base_model` id. Generated Models.dev JSON often inlines inherited facts
-    /// without that link, so callers must not guess one from a prefix.
+    /// `canonical_model_id` or legacy `base_model` id; callers never guess a
+    /// canonical relationship from a prefix.
     #[must_use]
     pub fn provider_offering(
         &self,
@@ -102,7 +119,7 @@ impl ModelsDevCatalog {
         let provider_id = provider.effective_id(provider_key);
         Some(ProviderModelOffering {
             provider: ProviderId::from(provider_id.clone()),
-            canonical_model: model.base_model.clone().map(ModelId::from),
+            canonical_model: model.canonical_id().map(ModelId::from),
             wire_model_id: WireModelId::from(model.id.clone()),
             endpoint_key: "chat".to_string(),
             default_for_provider: model.default_for_provider,
@@ -133,7 +150,7 @@ impl ModelsDevCatalog {
                 .filter(|model| model.supports_text_chat())
                 .map(|model| ProviderModelOffering {
                     provider: ProviderId::from(provider_id.clone()),
-                    canonical_model: model.base_model.clone().map(ModelId::from),
+                    canonical_model: model.canonical_id().map(ModelId::from),
                     wire_model_id: WireModelId::from(model.id.clone()),
                     endpoint_key: "chat".to_string(),
                     default_for_provider: model.default_for_provider,
@@ -213,6 +230,16 @@ pub struct ModelsDevModel {
     /// Model family, such as `glm`, `gpt`, or `claude`.
     #[serde(default)]
     pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
+    pub model_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
     /// Whether attachments are accepted.
     #[serde(default)]
     pub attachment: Option<bool>,
@@ -237,6 +264,14 @@ pub struct ModelsDevModel {
     /// Input/output modalities.
     #[serde(default)]
     pub modalities: Option<ModelsDevModalities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmarks: Option<Vec<serde_json::Value>>,
 }
 
 impl ModelsDevModel {
@@ -256,12 +291,24 @@ pub struct ModelsDevProviderModel {
     /// Optional explicit canonical model link from source TOML.
     #[serde(default)]
     pub base_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_model_id: Option<String>,
     /// Human-friendly model name.
     #[serde(default)]
     pub name: Option<String>,
     /// Model family as exposed for this provider row.
     #[serde(default)]
     pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
+    pub model_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
     /// Whether this is the provider's default model in a CodeWhale snapshot.
     #[serde(default, alias = "default")]
     pub default_for_provider: bool,
@@ -272,8 +319,8 @@ pub struct ModelsDevProviderModel {
     #[serde(default)]
     pub reasoning: Option<bool>,
     /// Flexible reasoning-control metadata.
-    #[serde(default)]
-    pub reasoning_options: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_options: Option<Vec<serde_json::Value>>,
     /// Whether tool calling is supported.
     #[serde(default)]
     pub tool_call: Option<bool>,
@@ -308,6 +355,8 @@ pub struct ModelsDevProviderModel {
     /// fact (#6705).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<serde_json::Value>,
 }
 
 /// A Models.dev model row's `provider` override: the AI SDK package that
@@ -317,9 +366,30 @@ pub struct ModelsDevModelTransport {
     /// AI SDK package identifier, such as `@ai-sdk/anthropic`.
     #[serde(default)]
     pub npm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 impl ModelsDevProviderModel {
+    #[must_use]
+    pub fn canonical_id(&self) -> Option<&str> {
+        match (
+            self.canonical_model_id.as_deref(),
+            self.base_model.as_deref(),
+        ) {
+            (Some(current), Some(legacy)) if current.trim() != legacy.trim() => None,
+            (current, legacy) => current.or(legacy),
+        }
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    }
+
     /// True when the provider offering can be used for normal text chat.
     #[must_use]
     pub fn supports_text_chat(&self) -> bool {
@@ -407,9 +477,7 @@ pub struct ModelsDevModalities {
     pub output: Vec<String>,
 }
 
-/// Provider-scoped cost fields. Values are per million tokens unless a future
-/// Models.dev row specifies a richer tiering object in fields CodeWhale does
-/// not yet model.
+/// Provider-scoped base rates and schedules, in USD per million tokens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelsDevCost {
     #[serde(default)]
@@ -420,6 +488,114 @@ pub struct ModelsDevCost {
     pub cache_read: Option<f64>,
     #[serde(default)]
     pub cache_write: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_audio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_audio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<ModelsDevCostTier>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_over_200k: Option<Box<ModelsDevCost>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelsDevCostTier {
+    pub tier: ModelsDevContextTier,
+    #[serde(flatten)]
+    pub cost: ModelsDevCost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelsDevContextTier {
+    #[serde(rename = "type", default = "context_tier_type")]
+    pub kind: String,
+    pub size: u64,
+}
+
+fn context_tier_type() -> String {
+    "context".to_string()
+}
+
+impl ModelsDevCost {
+    fn validate(&self) -> serde_json::Result<()> {
+        if [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.reasoning,
+            self.input_audio,
+            self.output_audio,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|rate| !rate.is_finite() || rate < 0.0)
+        {
+            return Err(<serde_json::Error as serde::de::Error>::custom(
+                "invalid published rate",
+            ));
+        }
+        let mut thresholds = std::collections::BTreeSet::new();
+        for tier in self.tiers.iter().flatten() {
+            if !thresholds.insert((&tier.tier.kind, tier.tier.size)) {
+                return Err(<serde_json::Error as serde::de::Error>::custom(
+                    "duplicate price tier",
+                ));
+            }
+            tier.cost.validate()?;
+        }
+        if let Some(legacy) = &self.context_over_200k {
+            legacy.validate()?;
+            if let Some(current) = self
+                .tiers
+                .iter()
+                .flatten()
+                .find(|tier| tier.tier.kind == "context" && tier.tier.size == 200_000)
+                && current.cost.base_rates() != legacy.base_rates()
+            {
+                return Err(<serde_json::Error as serde::de::Error>::custom(
+                    "conflicting tiers and context_over_200k",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn base_rates(&self) -> [Option<f64>; 7] {
+        [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.reasoning,
+            self.input_audio,
+            self.output_audio,
+        ]
+    }
+
+    #[must_use]
+    pub fn context_tiers(&self) -> Vec<ModelsDevCostTier> {
+        let mut tiers = self.tiers.clone().unwrap_or_default();
+        if !tiers
+            .iter()
+            .any(|tier| tier.tier.kind == "context" && tier.tier.size == 200_000)
+            && let Some(cost) = &self.context_over_200k
+        {
+            tiers.push(ModelsDevCostTier {
+                tier: ModelsDevContextTier {
+                    kind: context_tier_type(),
+                    size: 200_000,
+                },
+                cost: (**cost).clone(),
+            });
+        }
+        tiers.sort_by(|left, right| {
+            (&left.tier.kind, left.tier.size).cmp(&(&right.tier.kind, right.tier.size))
+        });
+        tiers
+    }
 }
 
 /// Interleaved reasoning metadata from a Models.dev provider row.

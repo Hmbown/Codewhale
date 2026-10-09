@@ -744,7 +744,24 @@ mod tests {
             crate::provider_catalog_live::record_success_if_current(&ticket, delta()),
             Some(CatalogStatus::Fresh)
         );
+        let mut strict = config.clone();
+        strict.bind_account_model_owner("fixture-user").unwrap();
+        strict
+            .provider_config_for_mut(&strict.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
+            .api_key = Some("other-local-key".into());
+        assert_eq!(
+            strict.active_route_api_key_read_only().unwrap(),
+            "cwc_fixture_device_credential_not_real"
+        );
+        assert!(
+            config
+                .clone()
+                .bind_account_model_owner("other-account")
+                .is_err()
+        );
         store.clear().unwrap();
+        assert!(strict.active_route_api_key_read_only().is_err());
         invalidate_stale_account_catalog(&config);
         assert!(
             crate::provider_catalog_live::cached_entry_for_route(

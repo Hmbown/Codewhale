@@ -82,7 +82,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 </Fragment>
               ))}
             </p>
-            <HeroInstall ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
+            <HeroInstall locale={locale} ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
             <div className="actions">
               <Link href={`/${locale}/install`} className="btn btn-primary btn-lg">
                 {d.getCodewhale}
