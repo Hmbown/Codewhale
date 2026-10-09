@@ -43,9 +43,10 @@ pub(in crate::commands) fn transition_blocked_message(verb: &str, blockers: &[St
     }
     // `/jobs cancel-all` only kills shell processes and answers "No running
     // commands to cancel." for everything else, so it must not read as the
-    // exit for a turn, dispatch, compaction, or cleanup blocker.
+    // exit for a turn, dispatch, compaction, or cleanup blocker. Name both
+    // exits with the scope each one actually clears.
     message.push_str(
-        "\n\nWait for them to finish, or cancel what is still cancelable: \
+        "\n\nWait for the work to finish, or stop what you can: \
          Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs.",
     );
     message

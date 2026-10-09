@@ -477,7 +477,7 @@ fn new_session_force_cannot_detach_an_in_flight_turn() {
         "{message}"
     );
     assert!(
-        message.contains("a turn is still running"),
+        message.contains("the session is still busy with the current turn"),
         "the refusal names the live turn: {message}"
     );
 }

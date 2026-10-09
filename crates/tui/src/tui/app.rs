@@ -553,8 +553,15 @@ pub(crate) const MAX_AGENT_RECENT_ACTIONS: usize = 3;
 /// an error message must not become a screenful.
 const MAX_TRANSITION_BLOCKER_TASKS: usize = 5;
 
-/// Summary budget for one task row in a blocked-transition message.
-const TRANSITION_BLOCKER_SUMMARY_CHARS: usize = 60;
+/// Display columns one blocked-transition task row may occupy. The row is
+/// rendered as a transcript Note, whose content width in an 80-column
+/// terminal is 74; a wider row wraps into the message and strands its own
+/// continuation lines.
+const TRANSITION_BLOCKER_LINE_WIDTH: usize = 74;
+
+/// Floor for the summary budget when the other columns are unusually wide;
+/// below this a row names an id and nothing useful about it.
+const MIN_TRANSITION_BLOCKER_SUMMARY_WIDTH: usize = 16;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProgressMeta {
@@ -4064,7 +4071,7 @@ impl App {
         }
 
         if self.is_loading {
-            blockers.push("a turn is still running".to_string());
+            blockers.push("the session is still busy with the current turn".to_string());
         }
         if self.dispatch_in_flight {
             blockers.push("an earlier message is still resolving its route".to_string());
@@ -4087,21 +4094,35 @@ impl App {
         blockers
     }
 
-    /// One aligned row per blocking task. Every column but the summary is
-    /// ASCII, so padding by character count matches the rendered width.
+    /// One aligned row per blocking task, bounded to the transcript's content
+    /// width. Every column but the summary is ASCII, so padding by character
+    /// count matches the rendered width there; the summary is truncated by
+    /// display width so CJK text cannot silently double the row.
     fn transition_blocker_task_lines(tasks: &[&TaskPanelEntry]) -> Vec<String> {
         let rows: Vec<(String, String, String, String)> = tasks
             .iter()
             .map(|task| {
+                // `-` keeps the column present for rows without a duration,
+                // the placeholder `format_task_list` already uses.
                 let duration = task
                     .duration_ms
                     .map(crate::agent_roster::format_duration)
-                    .unwrap_or_default();
-                let summary: String = task.prompt_summary.replace(['\n', '\r'], " ");
-                let summary = crate::rlm::turn::truncate_text(
-                    summary.trim(),
-                    TRANSITION_BLOCKER_SUMMARY_CHARS,
-                );
+                    .unwrap_or_else(|| "-".to_string());
+                // Panel summaries carry the `shell: ` prefix the Work rows
+                // strip; a blocker row names the command, not its source kind.
+                let command = task
+                    .prompt_summary
+                    .strip_prefix("shell: ")
+                    .unwrap_or(task.prompt_summary.as_str())
+                    .replace(['\n', '\r'], " ");
+                // An owned shell names its owner: an unclaimed background
+                // command is the case an operator most needs to identify.
+                let summary = match task.owner_agent_name.as_deref() {
+                    Some(owner) if !owner.trim().is_empty() => {
+                        format!("(by {}) {}", owner.trim(), command.trim())
+                    }
+                    _ => command.trim().to_string(),
+                };
                 (task.id.clone(), task.status.clone(), duration, summary)
             })
             .collect();
@@ -4120,8 +4141,14 @@ impl App {
             .map(|row| row.2.chars().count())
             .max()
             .unwrap_or(0);
+        let fixed_width = id_width + 2 + status_width + 2 + duration_width + 2;
+        let summary_width = TRANSITION_BLOCKER_LINE_WIDTH
+            .saturating_sub(fixed_width)
+            .max(MIN_TRANSITION_BLOCKER_SUMMARY_WIDTH);
         rows.iter()
             .map(|(id, status, duration, summary)| {
+                let summary =
+                    crate::tui::ui_text::truncate_line_to_width(summary, summary_width);
                 format!(
                     "{id:<id_width$}  {status:<status_width$}  {duration:<duration_width$}  {summary}"
                 )

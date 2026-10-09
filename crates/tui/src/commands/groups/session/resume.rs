@@ -108,12 +108,12 @@ mod tests {
     fn resume_transition_blocking_wins_before_any_route() {
         let mut fake = control_fake();
         fake.blocked = true;
-        fake.blockers = vec!["a turn is still running".to_string()];
+        fake.blockers = vec!["the session is still busy with the current turn".to_string()];
         let result = resume_portable(&mut fake, Some("anything"));
         assert!(result.is_error);
         assert_eq!(
             message(&result),
-            "Cannot resume while runtime work is active:\n  • a turn is still running\n\nWait for them to finish, or cancel what is still cancelable: Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs."
+            "Cannot resume while runtime work is active:\n  • the session is still busy with the current turn\n\nWait for the work to finish, or stop what you can: Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs."
         );
         assert_eq!(
             fake.calls.borrow().as_slice(),

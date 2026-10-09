@@ -59,7 +59,7 @@ fn branch_composes_exact_baseline_messages() {
     assert_eq!(
         result.message.as_deref(),
         Some(
-            "Error: Cannot branch while runtime work is active:\n  • shell_a3f2  running  5h 18m  cw-leftovers.ps1\n\nWait for them to finish, or cancel what is still cancelable: Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs."
+            "Error: Cannot branch while runtime work is active:\n  • shell_a3f2  running  5h 18m  cw-leftovers.ps1\n\nWait for the work to finish, or stop what you can: Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs."
         )
     );
     assert_eq!(canned.transition_checks.get(), 1);
@@ -291,6 +291,10 @@ fn new_composes_exact_baseline_outcomes() {
     );
     assert!(message.contains("shell_a3f2"), "{message}");
     assert!(message.contains("/jobs cancel-all"), "{message}");
+    assert!(
+        message.contains("`/new --force` only discards draft or queued input"),
+        "the flag's real scope stays stated where the flag exists: {message}"
+    );
     assert_eq!(canned.transition_checks.get(), 1);
     assert!(canned.fresh_forces.is_empty());
 

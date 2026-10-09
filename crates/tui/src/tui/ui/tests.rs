@@ -20675,48 +20675,136 @@ fn session_transition_waits_for_pending_dispatch_and_cancelled_turn() {
     assert!(app.session_transition_blocked());
 }
 
-/// The gate and its explanation derive from one list; a drift would show as
-/// the boolean disagreeing with the named blockers.
+/// Every predicate that closes the gate must also name itself. A predicate
+/// added to the list without an explanation would ship a bare "runtime work is
+/// active" refusal — the defect this change removes — so each arm is driven
+/// alone and checked for its own wording.
 #[test]
-fn transition_blockers_follow_the_gate_and_name_the_blocking_task() {
-    let mut app = create_test_app();
+fn transition_blockers_follow_the_gate_and_name_every_predicate() {
+    fn assert_named(label: &str, arm: impl FnOnce(&mut App), expected: &str) {
+        let mut app = create_test_app();
+        arm(&mut app);
+        let blockers = app.session_transition_blockers();
+        assert!(
+            app.session_transition_blocked(),
+            "{label}: the gate must be closed"
+        );
+        assert!(
+            blockers.iter().any(|blocker| blocker.contains(expected)),
+            "{label}: expected a blocker mentioning {expected:?}, got {blockers:?}"
+        );
+    }
+
+    let app = create_test_app();
     assert!(!app.session_transition_blocked());
     assert!(app.session_transition_blockers().is_empty());
 
+    assert_named(
+        "is_loading",
+        |app| app.is_loading = true,
+        "still busy with the current turn",
+    );
+    assert_named(
+        "dispatch_in_flight",
+        |app| app.dispatch_in_flight = true,
+        "still resolving its route",
+    );
+    assert_named(
+        "suppress_stream_events_until_turn_complete",
+        |app| app.suppress_stream_events_until_turn_complete = true,
+        "cancelled turn is still settling",
+    );
+    assert_named(
+        "runtime_turn_status",
+        |app| app.runtime_turn_status = Some("in_progress".to_string()),
+        "turn in progress",
+    );
+    assert_named(
+        "is_compacting",
+        |app| app.is_compacting = true,
+        "compaction is running",
+    );
+    assert_named(
+        "manual_compaction_queued",
+        |app| app.manual_compaction_queued = true,
+        "manual compaction is queued",
+    );
+    assert_named(
+        "is_purging",
+        |app| app.is_purging = true,
+        "cleanup is running",
+    );
+    assert_named(
+        "task_panel",
+        |app| {
+            app.task_panel.push(crate::tui::app::TaskPanelEntry {
+                exit_code: None,
+                id: "shell_a3f2".to_string(),
+                status: "running".to_string(),
+                prompt_summary: "shell: cw-leftovers.ps1".to_string(),
+                duration_ms: Some(5 * 60 * 60 * 1_000 + 18 * 60 * 1_000),
+                kind: crate::tui::app::TaskPanelEntryKind::Shell,
+                stale: false,
+                elapsed_since_output_ms: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
+                current_tool: None,
+                role: None,
+                files_touched: 0,
+            });
+        },
+        "cw-leftovers.ps1",
+    );
+}
+
+/// The row names the shell, its state, how long it has run, and its command —
+/// stripped of the panel's `shell: ` prefix, with its owner when a sub-agent
+/// owns it.
+#[test]
+fn transition_blocker_rows_name_the_command_and_its_owner() {
+    let mut app = create_test_app();
     app.task_panel.push(crate::tui::app::TaskPanelEntry {
         exit_code: None,
         id: "shell_a3f2".to_string(),
         status: "running".to_string(),
-        prompt_summary: "cw-leftovers.ps1".to_string(),
+        prompt_summary: "shell: cw-leftovers.ps1".to_string(),
         duration_ms: Some(5 * 60 * 60 * 1_000 + 18 * 60 * 1_000),
         kind: crate::tui::app::TaskPanelEntryKind::Shell,
         stale: false,
         elapsed_since_output_ms: None,
-        owner_agent_id: None,
-        owner_agent_name: None,
+        owner_agent_id: Some("agent_9c81".to_string()),
+        owner_agent_name: Some("verifier".to_string()),
         current_tool: None,
         role: None,
         files_touched: 0,
     });
-
     let blockers = app.session_transition_blockers();
     assert_eq!(blockers.len(), 1, "{blockers:?}");
-    assert!(blockers[0].contains("shell_a3f2"), "{blockers:?}");
-    assert!(blockers[0].contains("running"), "{blockers:?}");
-    assert!(blockers[0].contains("5h 18m"), "{blockers:?}");
-    assert!(blockers[0].contains("cw-leftovers.ps1"), "{blockers:?}");
-    assert_eq!(app.session_transition_blocked(), !blockers.is_empty());
+    let row = &blockers[0];
+    assert!(row.contains("shell_a3f2"), "{row:?}");
+    assert!(row.contains("running"), "{row:?}");
+    assert!(row.contains("5h 18m"), "{row:?}");
+    assert!(row.contains("(by verifier) cw-leftovers.ps1"), "{row:?}");
+    assert!(
+        !row.contains("shell: "),
+        "the panel prefix is stripped: {row:?}"
+    );
 }
 
 #[test]
 fn transition_blockers_summarize_past_the_fifth_task_and_bound_each_summary() {
+    use unicode_width::UnicodeWidthStr as _;
+
     let mut app = create_test_app();
     for index in 0..6 {
         app.task_panel.push(crate::tui::app::TaskPanelEntry {
             exit_code: None,
             id: format!("shell_{index:04}"),
             status: "queued".to_string(),
-            prompt_summary: "x".repeat(200),
+            // 100 CJK characters are 200 display columns: a character-count
+            // budget cannot keep this row inside a terminal, display width
+            // can.
+            prompt_summary: "汉".repeat(100),
             duration_ms: None,
             kind: crate::tui::app::TaskPanelEntryKind::Shell,
             stale: false,
@@ -20738,8 +20826,16 @@ fn transition_blockers_summarize_past_the_fifth_task_and_bound_each_summary() {
     assert!(
         blockers[..5]
             .iter()
-            .all(|row| row.chars().count() <= 100 && row.contains("...")),
-        "summaries stay bounded and truncated: {blockers:?}"
+            .all(|row| row.as_str().width() <= 74),
+        "rows must fit the 74-column Note body: {blockers:?}"
+    );
+    assert!(
+        blockers[..5].iter().all(|row| row.contains("...")),
+        "an over-long summary is truncated, not dropped: {blockers:?}"
+    );
+    assert!(
+        blockers[..5].iter().all(|row| row.contains("  -  ")),
+        "a missing duration keeps its column with the shared placeholder: {blockers:?}"
     );
 }
 

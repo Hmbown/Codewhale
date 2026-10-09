@@ -1385,6 +1385,11 @@ pub trait CommandSessionLifecycleContext {
     /// transition is allowed. Consulted only after [`Self::transition_blocked`]
     /// reports a block, so the refusal can name the work that holds the
     /// session instead of restating that it is held.
+    ///
+    /// Display projection, not a data source: the strings are pre-rendered
+    /// for a refusal message and carry no stable shape. A caller that needs
+    /// ids, durations, or owners should add a structured method instead of
+    /// parsing these back out.
     fn transition_blockers(&self) -> Vec<String>;
 
     /// `/branch` with no argument: the current leaf when an active journaled
@@ -1649,6 +1654,11 @@ pub trait CommandSessionControlContext {
     /// Why the transition gate is closed, in operator terms; empty means the
     /// transition is allowed. Consulted only after [`Self::transition_blocked`]
     /// reports a block.
+    ///
+    /// Display projection, not a data source: the strings are pre-rendered
+    /// for a refusal message and carry no stable shape. A caller that needs
+    /// ids, durations, or owners should add a structured method instead of
+    /// parsing these back out.
     fn transition_blockers(&self) -> Vec<String>;
 
     /// `/relay`: authoritative semantic snapshot (workspace/mode/model/goal/
