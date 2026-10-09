@@ -2759,14 +2759,17 @@ pub struct AutoReviewRuleConfig {
 }
 
 impl AutoReviewConfig {
-    fn to_runtime_policy(&self) -> crate::tui::auto_review::AutoReviewPolicy {
-        crate::tui::auto_review::AutoReviewPolicy {
+    fn to_runtime_policy(&self) -> crate::core::authority::auto_review::AutoReviewPolicy {
+        crate::core::authority::auto_review::AutoReviewPolicy {
             allow_rules: self
                 .allow
                 .iter()
                 .enumerate()
                 .map(|(index, rule)| {
-                    rule.to_runtime_rule(index, crate::tui::auto_review::AutoReviewAction::Allow)
+                    rule.to_runtime_rule(
+                        index,
+                        crate::core::authority::auto_review::AutoReviewAction::Allow,
+                    )
                 })
                 .collect(),
             block_rules: self
@@ -2774,7 +2777,10 @@ impl AutoReviewConfig {
                 .iter()
                 .enumerate()
                 .map(|(index, rule)| {
-                    rule.to_runtime_rule(index, crate::tui::auto_review::AutoReviewAction::Block)
+                    rule.to_runtime_rule(
+                        index,
+                        crate::core::authority::auto_review::AutoReviewAction::Block,
+                    )
                 })
                 .collect(),
         }
@@ -2791,12 +2797,12 @@ impl AutoReviewRuleConfig {
     fn to_runtime_rule(
         &self,
         index: usize,
-        action: crate::tui::auto_review::AutoReviewAction,
-    ) -> crate::tui::auto_review::AutoReviewRule {
+        action: crate::core::authority::auto_review::AutoReviewAction,
+    ) -> crate::core::authority::auto_review::AutoReviewRule {
         let id_prefix = match action {
-            crate::tui::auto_review::AutoReviewAction::Allow => "allow",
-            crate::tui::auto_review::AutoReviewAction::Block => "block",
-            crate::tui::auto_review::AutoReviewAction::AskUser => "ask",
+            crate::core::authority::auto_review::AutoReviewAction::Allow => "allow",
+            crate::core::authority::auto_review::AutoReviewAction::Block => "block",
+            crate::core::authority::auto_review::AutoReviewAction::AskUser => "ask",
         };
         let id = self
             .id
@@ -2813,14 +2819,14 @@ impl AutoReviewRuleConfig {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("configured auto-review {id_prefix} rule"));
         let mut rule = match action {
-            crate::tui::auto_review::AutoReviewAction::Allow => {
-                crate::tui::auto_review::AutoReviewRule::allow(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::Allow => {
+                crate::core::authority::auto_review::AutoReviewRule::allow(id, reason)
             }
-            crate::tui::auto_review::AutoReviewAction::Block => {
-                crate::tui::auto_review::AutoReviewRule::block(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::Block => {
+                crate::core::authority::auto_review::AutoReviewRule::block(id, reason)
             }
-            crate::tui::auto_review::AutoReviewAction::AskUser => {
-                crate::tui::auto_review::AutoReviewRule::block(id, reason)
+            crate::core::authority::auto_review::AutoReviewAction::AskUser => {
+                crate::core::authority::auto_review::AutoReviewRule::block(id, reason)
             }
         };
 
@@ -2893,16 +2899,20 @@ fn validate_auto_review_rules(kind: &str, rules: &[AutoReviewRuleConfig]) -> Res
     Ok(())
 }
 
-fn parse_auto_review_action_kind(raw: &str) -> Option<crate::tui::auto_review::ToolActionKind> {
+fn parse_auto_review_action_kind(
+    raw: &str,
+) -> Option<crate::core::authority::auto_review::ToolActionKind> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "read" | "mcp_read" => Some(crate::tui::auto_review::ToolActionKind::Read),
-        "write" => Some(crate::tui::auto_review::ToolActionKind::Write),
-        "shell" => Some(crate::tui::auto_review::ToolActionKind::Shell),
+        "read" | "mcp_read" => Some(crate::core::authority::auto_review::ToolActionKind::Read),
+        "write" => Some(crate::core::authority::auto_review::ToolActionKind::Write),
+        "shell" => Some(crate::core::authority::auto_review::ToolActionKind::Shell),
         "external" | "network" | "git" | "mcp_action" | "browser" | "unknown" => {
-            Some(crate::tui::auto_review::ToolActionKind::External)
+            Some(crate::core::authority::auto_review::ToolActionKind::External)
         }
-        "publish" => Some(crate::tui::auto_review::ToolActionKind::Publish),
-        "destructive" | "secret" => Some(crate::tui::auto_review::ToolActionKind::Destructive),
+        "publish" => Some(crate::core::authority::auto_review::ToolActionKind::Publish),
+        "destructive" | "secret" => {
+            Some(crate::core::authority::auto_review::ToolActionKind::Destructive)
+        }
         _ => None,
     }
 }
@@ -4322,7 +4332,7 @@ impl Config {
     }
 
     #[must_use]
-    pub fn auto_review_policy(&self) -> crate::tui::auto_review::AutoReviewPolicy {
+    pub fn auto_review_policy(&self) -> crate::core::authority::auto_review::AutoReviewPolicy {
         self.auto_review
             .as_ref()
             .map(AutoReviewConfig::to_runtime_policy)

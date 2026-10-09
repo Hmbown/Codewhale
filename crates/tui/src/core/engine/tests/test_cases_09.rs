@@ -338,10 +338,10 @@ fn auto_review_scenario_2() {
     // from auto_review_routes_interactive_destructive_shell_to_reviewer
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "exec_shell",
             &json!({"command": "rm -rf /"}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             None,
@@ -363,10 +363,10 @@ fn auto_review_scenario_2() {
             ("read_secret", json!({"name": "provider-token"})),
         ] {
             let (decision, audit) = auto_review_plan_decision(
-                &crate::tui::auto_review::AutoReviewPolicy::default(),
+                &crate::core::authority::auto_review::AutoReviewPolicy::default(),
                 tool_name,
                 &input,
-                crate::tui::auto_review::RunOrigin::Interactive,
+                crate::core::authority::auto_review::RunOrigin::Interactive,
                 ApprovalMode::Auto,
                 true,
                 None,
@@ -386,20 +386,20 @@ fn auto_review_scenario_2() {
     {
         assert_eq!(
             auto_review_run_origin_for_plan(false),
-            crate::tui::auto_review::RunOrigin::Interactive
+            crate::core::authority::auto_review::RunOrigin::Interactive
         );
         assert_eq!(
             auto_review_run_origin_for_plan(true),
-            crate::tui::auto_review::RunOrigin::Background
+            crate::core::authority::auto_review::RunOrigin::Background
         );
     }
     // from auto_review_policy_holds_background_destructive_under_suggest
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "exec_shell",
             &json!({"command": "rm -rf ~/", "background": true}),
-            crate::tui::auto_review::RunOrigin::Background,
+            crate::core::authority::auto_review::RunOrigin::Background,
             ApprovalMode::Suggest,
             true,
             None,
@@ -418,10 +418,10 @@ fn auto_review_scenario_2() {
     // from auto_review_policy_blocks_background_destructive_under_never
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "exec_shell",
             &json!({"command": "rm -rf ~/", "background": true}),
-            crate::tui::auto_review::RunOrigin::Background,
+            crate::core::authority::auto_review::RunOrigin::Background,
             ApprovalMode::Never,
             true,
             None,
@@ -462,10 +462,10 @@ fn auto_review_routes_shell_commands_requiring_approval_to_reviewer() {
         "cargo test $(curl https://example.com)",
     ] {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "exec_shell",
             &json!({"command": command}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             None,
@@ -492,13 +492,13 @@ fn auto_review_routes_shell_commands_requiring_approval_to_reviewer() {
 
 #[test]
 fn auto_review_plan_decision_uses_configured_policy() {
-    let policy = crate::tui::auto_review::AutoReviewPolicy {
+    let policy = crate::core::authority::auto_review::AutoReviewPolicy {
         block_rules: vec![
-            crate::tui::auto_review::AutoReviewRule::block(
+            crate::core::authority::auto_review::AutoReviewRule::block(
                 "configured-shell-block",
                 "shell requires maintainer review",
             )
-            .action_kind(crate::tui::auto_review::ToolActionKind::Shell),
+            .action_kind(crate::core::authority::auto_review::ToolActionKind::Shell),
         ],
         ..Default::default()
     };
@@ -507,7 +507,7 @@ fn auto_review_plan_decision_uses_configured_policy() {
         &policy,
         "exec_shell",
         &json!({"command": "cargo test"}),
-        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::core::authority::auto_review::RunOrigin::Interactive,
         ApprovalMode::Auto,
         true,
         None,

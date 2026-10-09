@@ -18,7 +18,6 @@ pub(crate) mod agent_roster;
 pub mod ambient_life;
 pub mod app;
 pub mod approval;
-pub mod auto_review;
 pub mod auto_router;
 pub mod automation_panel;
 mod automation_routing;

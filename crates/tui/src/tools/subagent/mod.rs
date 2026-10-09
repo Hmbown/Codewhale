@@ -2940,7 +2940,7 @@ pub struct SubAgentRuntime {
     pub parent_mode: AppMode,
     /// The session's deterministic Auto-Review policy (configured allow/block
     /// rules plus the built-in safety floor), shared with every descendant.
-    pub auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
+    pub auto_review_policy: std::sync::Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
     /// Whether the host can answer an approval prompt for a child (an
     /// interactive TUI). Headless hosts keep the fail-closed denial.
     pub parent_can_prompt: bool,
@@ -3019,7 +3019,7 @@ impl SubAgentRuntime {
             todos: crate::tools::todo::new_shared_todo_list(),
             parent_mode: AppMode::Agent,
             auto_review_policy: std::sync::Arc::new(
-                crate::tui::auto_review::AutoReviewPolicy::default(),
+                crate::core::authority::auto_review::AutoReviewPolicy::default(),
             ),
             parent_can_prompt: false,
             approval_receipt_store: None,
@@ -3056,7 +3056,7 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_permission_posture(
         mut self,
-        auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
+        auto_review_policy: std::sync::Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
         parent_can_prompt: bool,
     ) -> Self {
         self.auto_review_policy = auto_review_policy;
